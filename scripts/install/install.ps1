@@ -56,6 +56,112 @@ function Test-FileBytesEqual {
     return $true
 }
 
+function Resolve-CkApplication {
+    param([string]$SearchPath, [string]$PathExt)
+    foreach ($entry in ($SearchPath -split ';')) {
+        $directory = $entry.Trim().Trim('"')
+        if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+        foreach ($extension in ($PathExt -split ';')) {
+            if ([string]::IsNullOrWhiteSpace($extension)) { continue }
+            try { $file = Join-Path $directory ("ck" + $extension.ToLowerInvariant()) -ErrorAction Stop }
+            catch { continue }
+            if (Test-Path -LiteralPath $file -PathType Leaf) { return $file }
+        }
+    }
+    return $null
+}
+
+function Get-FreshShellEnvironment {
+    $values = @{}
+    foreach ($scope in @('Machine', 'User')) {
+        $keyPath = 'HKCU:\Environment'
+        if ($scope -eq 'Machine') { $keyPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' }
+        $key = $null
+        try {
+            $key = Get-Item -LiteralPath $keyPath -ErrorAction Stop
+            foreach ($name in @('Path', 'PATHEXT')) {
+                $raw = $key.GetValue($name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                $value = [string]$raw
+                if ($null -ne $raw -and $key.GetValueKind($name) -eq [Microsoft.Win32.RegistryValueKind]::ExpandString) {
+                    $value = [Environment]::ExpandEnvironmentVariables($value)
+                }
+                $values["$scope$name"] = $value
+            }
+        }
+        catch { Refuse 'path-update-failed' "could not read $keyPath ($($_.Exception.Message))" }
+        finally { if ($null -ne $key) { $key.Dispose() } }
+    }
+    $extensions = $values['UserPATHEXT']
+    if ([string]::IsNullOrWhiteSpace($extensions)) { $extensions = $values['MachinePATHEXT'] }
+    if ([string]::IsNullOrWhiteSpace($extensions)) { $extensions = '.COM;.EXE;.BAT;.CMD' }
+    return @{ Path = ($values['MachinePath'] + ';' + $values['UserPath']); PathExt = $extensions }
+}
+
+function Get-FinalCliPath {
+    param([string]$Path)
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
+        $parent = [IO.DirectoryInfo]::new([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Path)))
+        $target = $parent.ResolveLinkTarget($true)
+        if ($null -ne $target) { $parent = $target }
+        return (Join-Path $parent.FullName ([IO.Path]::GetFileName($Path)))
+    }
+    if (-not ('CortexKit.CliPath' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+using System.Text;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+namespace CortexKit {
+    public static class CliPath {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandle(SafeFileHandle file, StringBuilder path, uint length, uint flags);
+        public static string Final(string path) {
+            using (var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) {
+                var result = new StringBuilder(32768);
+                uint length = GetFinalPathNameByHandle(file.SafeFileHandle, result, (uint)result.Capacity, 0);
+                if (length == 0 || length >= result.Capacity) throw new IOException("could not resolve final application path: " + path);
+                return result.ToString();
+            }
+        }
+    }
+}
+'@ -ErrorAction Stop
+    }
+    return [CortexKit.CliPath]::Final($Path)
+}
+
+function Test-SameCliFile {
+    param([string]$Left, [string]$Right)
+    if ([string]::IsNullOrWhiteSpace($Left) -or -not (Test-Path -LiteralPath $Left -PathType Leaf) -or -not (Test-Path -LiteralPath $Right -PathType Leaf)) { return $false }
+    try { return (Get-FinalCliPath $Left) -ieq (Get-FinalCliPath $Right) }
+    catch { Refuse 'cli-shadowed' "could not verify application identity for $Left ($($_.Exception.Message))" }
+}
+
+function Retire-LegacyCli {
+    param([string]$Old, [string]$Destination, [string]$DataDir)
+    if (-not (Test-Path -LiteralPath $Old -PathType Leaf) -or (Test-SameCliFile $Old $Destination)) { return }
+    $legacyPath = Join-Path $DataDir 'bin\ck.exe'
+    $legacySignature = $Old -ieq $legacyPath
+    if ($legacySignature) {
+        $linkAttribute = [IO.FileAttributes]::ReparsePoint
+        $legacySignature = ((Get-Item -LiteralPath $Old -Force).Attributes -band $linkAttribute) -eq 0 -and
+            ((Get-Item -LiteralPath (Split-Path -Parent $Old) -Force).Attributes -band $linkAttribute) -eq 0
+    }
+    if (-not $legacySignature) { return }
+    $backup = "$Old.retired-$([DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ'))-$([Guid]::NewGuid().ToString('N'))"
+    $digest = Get-Sha256 -Path $Old
+    try { Move-Item -LiteralPath $Old -Destination $backup -ErrorAction Stop }
+    catch { Refuse 'cli-shadowed' "could not retire $Old to $backup ($($_.Exception.Message))" }
+    $script:Retirements += [ordered]@{ kind = 'legacy-cli-retirement'; path = $backup; original_path = $Old; backup_path = $backup; sha256 = $digest }
+    Write-Output "Retired legacy ck at $Old to $backup."
+}
+
+function Retire-LegacyClis {
+    param([string]$DataDir, [string]$Destination)
+    Retire-LegacyCli -Old (Join-Path $DataDir 'bin\ck.exe') -Destination $Destination -DataDir $DataDir
+}
+
 function Ensure-UserPath {
     param([Parameter(Mandatory = $true)][string]$CmdDir)
 
@@ -65,7 +171,7 @@ function Ensure-UserPath {
     try {
         $key = Get-Item -LiteralPath $environmentKey -ErrorAction Stop
         # The registry provider expands REG_EXPAND_SZ on ordinary reads. Keep
-        # the stored placeholders intact when appending our installation path.
+        # the stored placeholders intact when prioritizing our installation path.
         $currentPath = $key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
         if ($null -ne $currentPath) {
             $pathKind = $key.GetValueKind('Path')
@@ -82,19 +188,22 @@ function Ensure-UserPath {
     if (-not [string]::IsNullOrWhiteSpace($currentPath)) {
         $entries = @($currentPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     }
-    $containsCmdDir = $false
+    $cmdEntry = $CmdDir
+    $kept = @()
     foreach ($entry in $entries) {
         $comparisonEntry = $entry
         if ($pathKind -eq [Microsoft.Win32.RegistryValueKind]::ExpandString) {
             $comparisonEntry = [Environment]::ExpandEnvironmentVariables($entry)
         }
-        if ([string]::Equals($comparisonEntry, $CmdDir, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $containsCmdDir = $true
-            break
+        if ($comparisonEntry.TrimEnd('\', '/') -ieq $CmdDir.TrimEnd('\', '/')) {
+            $cmdEntry = $entry
+        }
+        else {
+            $kept += $entry
         }
     }
-    if (-not $containsCmdDir) {
-        $updatedPath = @($entries + $CmdDir) -join ';'
+    $updatedPath = (@($cmdEntry) + $kept) -join ';'
+    if ($updatedPath -cne $currentPath) {
         try {
             Set-ItemProperty -Path $environmentKey -Name Path -Value $updatedPath -Type $pathKind -ErrorAction Stop
         }
@@ -112,20 +221,22 @@ function Ensure-UserPath {
         }
     }
 
+    # A new process combines machine PATH before user PATH; the installer's
+    # inherited environment cannot prove which application a new shell finds.
+    $destination = Join-Path $CmdDir 'ck.exe'
+    $fresh = Get-FreshShellEnvironment
+    $winner = Resolve-CkApplication -SearchPath $fresh.Path -PathExt $fresh.PathExt
+    if (-not (Test-SameCliFile $winner $destination)) {
+        $pathEntry = '<none>'
+        if (-not [string]::IsNullOrWhiteSpace($winner)) { $pathEntry = Split-Path -Parent $winner }
+        Refuse 'cli-shadowed' "ck resolves to $winner (PATH entry $pathEntry) instead of $destination; machine PATH may require an administrator"
+    }
+
     $sessionEntries = @()
     if (-not [string]::IsNullOrWhiteSpace($env:Path)) {
         $sessionEntries = @($env:Path -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     }
-    $sessionContainsCmdDir = $false
-    foreach ($entry in $sessionEntries) {
-        if ([string]::Equals($entry, $CmdDir, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $sessionContainsCmdDir = $true
-            break
-        }
-    }
-    if (-not $sessionContainsCmdDir) {
-        $env:Path = (@($CmdDir) + $sessionEntries) -join ';'
-    }
+    $env:Path = (@($CmdDir) + @($sessionEntries | Where-Object { $_ -ine $CmdDir })) -join ';'
 }
 
 # A direct registry write preserves both the raw PATH text and its value kind,
@@ -170,6 +281,17 @@ function Write-InstallerManifest {
         [Parameter(Mandatory = $true)][string]$Arch
     )
 
+    $target = $Manifest
+    if (Test-Path -LiteralPath $Manifest) {
+        $target = Join-Path (Split-Path -Parent $Manifest) 'installer-manifest.bootstrap.json'
+    }
+    $history = @()
+    if (Test-Path -LiteralPath $target) {
+        try {
+            $history = @((Get-Content -LiteralPath $target -Raw | ConvertFrom-Json).mutations | Where-Object { $null -ne $_.PSObject.Properties['kind'] -and $_.kind -eq 'legacy-cli-retirement' })
+        }
+        catch { Refuse 'inventory-record-failed' "could not read retirement history in $target ($($_.Exception.Message))" }
+    }
     $manifestObject = [ordered]@{
         schema_version = 1
         installer = 'ck'
@@ -193,7 +315,7 @@ function Write-InstallerManifest {
                 kind = 'ownership-record'
                 path = $Manifest
             }
-        )
+        ) + $history + @($script:Retirements)
     }
     $content = $manifestObject | ConvertTo-Json -Depth 5
     # On an installed machine `ck setup` has extended the manifest with rows
@@ -326,8 +448,14 @@ try {
         Write-Output "Installed ck at $destination."
     }
 
-    Ensure-UserPath -CmdDir $cmdDir
-    Write-InstallerManifest -Manifest $manifest -Binary $destination -BinaryDigest $candidateDigest -ArchiveDigest $expectedDigest -CmdDir $cmdDir -Arch $arch
+    $script:Retirements = @()
+    try {
+        Retire-LegacyClis -DataDir $dataDir -Destination $destination
+        Ensure-UserPath -CmdDir $cmdDir
+    }
+    finally {
+        Write-InstallerManifest -Manifest $manifest -Binary $destination -BinaryDigest $candidateDigest -ArchiveDigest $expectedDigest -CmdDir $cmdDir -Arch $arch
+    }
     Write-Output 'Next: ck setup'
 }
 finally {

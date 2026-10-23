@@ -124,7 +124,7 @@ select_profile() {
 
   case "${SHELL##*/}" in
     zsh)
-      profile_path="$HOME/.zshrc"
+      profile_path="${ZDOTDIR:-$HOME}/.zshrc"
       profile_kind="posix"
       ;;
     fish)
@@ -255,6 +255,80 @@ ensure_profile_path() {
 # which `ck upgrade` reported the daemon as not installed. So an existing
 # manifest is left untouched and the rows go to a sidecar beside it, which
 # the next ck to load the inventory folds in and removes.
+retire_cli() {
+  local old="$1" backup digest
+  [[ "$old" == "$data_dir/bin/ck" && ! -L "$old" && ! -L "$data_dir/bin" ]] || return 0
+  [[ "$old" != "$destination" && -f "$old" ]] || return 0
+  [[ ! "$old" -ef "$destination" ]] || return 0
+  digest=$(sha256_for "$old")
+  backup="$old.retired-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  if [[ -e "$backup" || -L "$backup" ]] || ! mv "$old" "$backup"; then
+    refuse "cli-shadowed" "could not retire $old to $backup"
+  fi
+  record_retirement "$old" "$backup" "$digest"
+  printf 'Retired legacy ck at %s to %s.\n' "$old" "$backup"
+}
+
+record_retirement() {
+  local old="$1" backup="$2" digest="$3" recorded
+  for recorded in "${retirement_backups[@]}"; do
+    [[ "$recorded" != "$backup" ]] || return 0
+  done
+  retirement_backups+=("$backup")
+  retirement_rows="$retirement_rows, {\"kind\":\"legacy-cli-retirement\",\"path\":\"$(json_escape "$backup")\",\"original_path\":\"$(json_escape "$old")\",\"backup_path\":\"$(json_escape "$backup")\",\"sha256\":\"$digest\"}"
+}
+
+collect_retirement_history() {
+  local sidecar="$data_dir/installer-manifest.bootstrap.json" history
+  # Reinstalling before setup adopts the sidecar must not lose the audit trail.
+  [[ -f "$sidecar" ]] || return 0
+  if ! history=$(awk '
+    { document = document $0 "\n" }
+    END {
+      if (!match(document, /"mutations"[[:space:]]*:[[:space:]]*\[/)) exit 1
+      document = substr(document, RSTART + RLENGTH)
+      depth = 0; quoted = 0; escaped = 0
+      for (i = 1; i <= length(document); i++) {
+        c = substr(document, i, 1)
+        if (quoted) {
+          if (escaped) escaped = 0
+          else if (c == "\\") escaped = 1
+          else if (c == "\"") quoted = 0
+        } else if (c == "\"") quoted = 1
+        else if (c == "{") { if (depth++ == 0) start = i }
+        else if (c == "}") {
+          if (--depth == 0) {
+            row = substr(document, start, i - start + 1)
+            if (row ~ /"kind"[[:space:]]*:[[:space:]]*"legacy-cli-retirement"/) print "," row
+          }
+        } else if (c == "]" && depth == 0) exit 0
+      }
+      exit 1
+    }
+  ' "$sidecar"); then
+    refuse "inventory-record-failed" "could not preserve retirement history in $sidecar"
+  fi
+  retirement_rows="$history$retirement_rows"
+}
+
+retire_legacy_clis() {
+  retire_cli "$data_dir/bin/ck"
+}
+
+verify_cli_resolution() {
+  local winner
+  # The quoted programs expand their arguments in the new shell, not here.
+  # shellcheck disable=SC2016
+  if [[ "$profile_kind" == fish ]]; then
+    winner=$("$SHELL" --no-config --interactive -c 'source "$argv[1]" >&2; command --search ck' "$profile_path") || winner='<not found>'
+  elif [[ "${SHELL##*/}" == zsh ]]; then
+    winner=$("$SHELL" -f -i -c '. "$1" >&2; whence -p ck' _ "$profile_path") || winner='<not found>'
+  else
+    winner=$(bash --noprofile --norc -i -c '. "$1" >&2; type -P ck' _ "$profile_path") || winner='<not found>'
+  fi
+  [[ "$winner" -ef "$destination" ]] || refuse "cli-shadowed" "ck resolves to $winner (PATH entry ${winner%/*}) instead of $destination"
+}
+
 write_manifest() {
   local manifest="$1"
   local binary="$2"
@@ -302,7 +376,7 @@ write_manifest() {
     {
       "kind": "ownership-record",
       "path": "$escaped_manifest"
-    }
+    }$retirement_rows
   ]
 }
 EOF
@@ -322,6 +396,9 @@ EOF
 }
 
 cleanup_staging() {
+  if [[ -n "${retirement_rows:-}" && "${retirement_manifest_written:-0}" != 1 ]]; then
+    write_manifest "$manifest" "$destination" "$candidate_digest" "$profile_path" "$expected_digest"
+  fi
   rm -rf "$temp_dir"
   if [[ -n "${placement_stage:-}" ]]; then
     rm -rf "$placement_stage"
@@ -512,6 +589,10 @@ else
 fi
 
 select_profile
+retirement_rows=""
+retirement_backups=()
+retire_legacy_clis
+collect_retirement_history
 # Quote the resolved installation path, rather than assuming the default data
 # home. Shell metacharacters in a user-selected directory must remain literal.
 profile_cmd_dir=${cmd_dir//\\/\\\\}
@@ -529,5 +610,7 @@ $PATH_BLOCK_END"
 fi
 ensure_profile_path "$profile_path" "$path_block"
 write_manifest "$manifest" "$destination" "$candidate_digest" "$profile_path" "$expected_digest"
+retirement_manifest_written=1
+verify_cli_resolution
 
 printf 'Next: ck setup\n'

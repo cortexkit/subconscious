@@ -28,12 +28,26 @@ index, and places only `ck` (`scripts/install/install.sh`,
 
 | Platform | `ck` goes to | PATH change |
 | --- | --- | --- |
-| macOS, Linux | `<data home>/cortexkit/cmd/ck` | A block between `# cortexkit-managed PATH begin` and `# cortexkit-managed PATH end` in `~/.zshrc`, `~/.bashrc` or Fish `config.fish`. |
+| macOS, Linux | `<data home>/cortexkit/cmd/ck` | A block between `# cortexkit-managed PATH begin` and `# cortexkit-managed PATH end` in `~/.zshrc` (or `.zshrc` in the startup-file directory selected by zsh's `ZDOTDIR`), `~/.bashrc` or Fish `config.fish`. |
 | Windows | `%LOCALAPPDATA%\cortexkit\cmd\ck.exe` | The user `PATH` in `HKCU\Environment`. |
 
 `<data home>` is `$XDG_DATA_HOME`, else `~/.local/share`. Only the `cmd/`
-directory goes on PATH; the daemon and modules live in `<data home>/cortexkit/bin/`
-and are reached through `ck`. Open a new shell so the PATH change applies.
+directory is added to PATH; the daemon and modules live in `<data home>/cortexkit/bin/`
+and are reached through `ck`. Existing `bin` PATH entries are left intact.
+The installer retires only the old layout's `<data home>/cortexkit/bin/ck`
+(`%LOCALAPPDATA%\cortexkit\bin\ck.exe` on Windows) by
+renaming it to `ck[.exe].retired-<UTC date>-<unique suffix>` beside the original,
+never deleting it, and records the original path, backup path and digest in
+`installer-manifest.json` (or its bootstrap sidecar on an existing installation).
+An operator's or package manager's `ck` anywhere else is left untouched.
+The installer puts `cmd` first in the user
+PATH on Windows and in the persisted shell-profile block on Unix, then checks
+resolution in a fresh environment. Windows uses registry machine/user PATH and
+PATHEXT, not the installer's inherited environment; Unix reads the updated
+profile in a new shell. If another `ck` still wins, installation refuses as
+`cli-shadowed`, naming the file and its PATH entry without moving it (a Windows
+machine PATH entry may need an administrator). Open a new shell so the
+persisted PATH change applies to your session.
 
 The install script relies on the HTTPS connection to `cortexkit.io` to know
 the index is genuine; it does not check the index's signature itself. The `ck`
@@ -64,6 +78,16 @@ change first and refuses to overwrite a value you set yourself.
 | macOS | launchd agent `cortexkit.subc` at `~/Library/LaunchAgents/cortexkit.subc.plist` |
 | Linux | `systemd --user` unit `cortexkit-subc.service` (needs a reachable user session bus) |
 | Windows | Task Scheduler task `\CortexKit\subc-daemon`, started at logon |
+
+On Windows the setup-owned XML remains at `%USERPROFILE%\cortexkit-subc-daemon.xml`.
+Setup verifies that file against its inventory before comparing the registered
+task's behavioral fields: command, arguments, working directory, principal,
+logon type, run level, triggers, restart policy and explicit non-default settings.
+Windows' registration metadata and implicit defaults are not user edits; a SID
+and its resolved account name identify the same principal. A verified behavioral
+edit refuses with the differing field and is not overwritten. The previous
+owned XML is evidence of what setup registered, not the desired configuration:
+an older owned task is upgraded to the current release's definition.
 
 Verify:
 

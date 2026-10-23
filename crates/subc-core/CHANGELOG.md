@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.124
+
+- Setup compares registered Windows task behavior with its inventory-verified previous definition, treating the registering account's SID and name as the same principal and applying Task Scheduler defaults. Registration metadata no longer looks like a user edit; a real edit refuses with the differing field. A trusted older definition still upgrades to this release's desired definition, including its restart and power policies.
+- Bootstrap installers move only the old-layout `ck` in the module directory to a dated backup, recording its retirement in the installer manifest. All other PATH commands are left untouched. The installers prioritize `cmd`, verify CLI resolution in a fresh environment, and refuse with `cli-shadowed` naming any remaining shadowing application and PATH entry. Existing module PATH entries are retained.
+
 ## 0.20.123
 
 - Daemon restarts on Windows and macOS wait for the previous daemon process to exit before starting its replacement, including after replacing a running Windows executable. A stop that exceeds 40 seconds refuses with the old PID instead of racing another instance. Linux continues to use systemd's synchronous restart.

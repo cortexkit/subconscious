@@ -16,6 +16,13 @@ $function = $ast.Find({
 }, $true)
 Invoke-Expression $function.Extent.Text
 
+# Resolution has a separate filesystem-backed suite. This suite isolates raw
+# registry preservation from application discovery.
+if (-not (Get-PSDrive C -ErrorAction SilentlyContinue)) { New-PSDrive C FileSystem / | Out-Null }
+function Get-FreshShellEnvironment { return @{ Path = ''; PathExt = '' } }
+function Resolve-CkApplication { return (Join-Path $CmdDir 'ck.exe') }
+function Test-SameCliFile { return $true }
+
 function Refuse { param($Type, $Evidence) throw "refusal: ${Type}: $Evidence" }
 function Broadcast-EnvironmentChange {}
 function Get-ItemPropertyValue {
@@ -57,7 +64,7 @@ try {
         $script:writtenKind = $null
         $script:writes = 0
         Ensure-UserPath -CmdDir 'C:\CortexKit\cmd'
-        if ($script:writtenPath -cne '%USERPROFILE%\.dotnet\tools;C:\Other\Bin;C:\CortexKit\cmd') {
+        if ($script:writtenPath -cne 'C:\CortexKit\cmd;%USERPROFILE%\.dotnet\tools;C:\Other\Bin') {
             throw "raw PATH changed: $script:writtenPath"
         }
         if ($script:writtenKind -ne $script:kind) { throw "registry kind changed: $script:writtenKind" }
@@ -71,7 +78,7 @@ try {
     $script:kind = [Microsoft.Win32.RegistryValueKind]::String
     $script:writtenPath = $null
     Ensure-UserPath -CmdDir 'C:\Fixture\User\cortexkit\cmd'
-    if ($script:writtenPath -cne '%USERPROFILE%\cortexkit\cmd;C:\Other\Bin;C:\Fixture\User\cortexkit\cmd') {
+    if ($script:writtenPath -cne 'C:\Fixture\User\cortexkit\cmd;%USERPROFILE%\cortexkit\cmd;C:\Other\Bin') {
         throw 'a literal REG_SZ entry was mistaken for an expandable duplicate'
     }
     $script:rawPath = $null

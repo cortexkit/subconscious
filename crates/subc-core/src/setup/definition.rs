@@ -14,6 +14,65 @@ pub(super) fn canonical_registered_windows(text: &str) -> Result<String, String>
     canonical_with_mode(RuntimePlatform::Windows, text, true)
 }
 
+/// Compare registered behavior, not registration metadata. Identity aliases must
+/// be resolved by Windows before being supplied here; arbitrary SIDs are not aliases.
+pub(super) fn windows_task_difference(
+    expected: &str,
+    installed: &str,
+    principal_aliases: &[&str],
+) -> Result<Option<String>, String> {
+    fn project(node: &Value, path: &str, aliases: &[&str], fields: &mut BTreeMap<String, Value>) {
+        let name = node["name"].as_str().unwrap_or_default();
+        if name == "RegistrationInfo" {
+            return;
+        }
+        let mut text = node["text"].clone();
+        if name == "UserId"
+            && aliases.iter().any(|alias| {
+                text.as_str()
+                    .is_some_and(|value| value.eq_ignore_ascii_case(alias))
+            })
+        {
+            text = json!("current-user");
+        }
+        let mut attributes = node["attributes"].clone();
+        if name == "Task" {
+            attributes.as_object_mut().unwrap().remove(":version");
+        }
+        fields.insert(path.into(), json!({"text":text,"attributes":attributes}));
+        let children = node["children"].as_array().unwrap();
+        // An omitted principal is filled with the registering account. This is
+        // not a wildcard: an explicit different account remains a difference.
+        if name == "Principal" && !children.iter().any(|child| child["name"] == "UserId") {
+            fields.insert(
+                format!("{path}.UserId[0]"),
+                json!({"text":"current-user","attributes":{}}),
+            );
+        }
+        let mut counts = BTreeMap::<&str, usize>::new();
+        for child in children {
+            let name = child["name"].as_str().unwrap();
+            let index = counts.entry(name).or_default();
+            project(child, &format!("{path}.{name}[{index}]"), aliases, fields);
+            *index += 1;
+        }
+    }
+    let projection = |text: &str| -> Result<BTreeMap<String, Value>, String> {
+        let tree: Value = serde_json::from_str(&canonical_registered_windows(text)?)
+            .map_err(|error| error.to_string())?;
+        let mut fields = BTreeMap::new();
+        project(&tree, "Task", principal_aliases, &mut fields);
+        Ok(fields)
+    };
+    let expected = projection(expected)?;
+    let installed = projection(installed)?;
+    Ok(expected
+        .keys()
+        .chain(installed.keys())
+        .find(|key| expected.get(*key) != installed.get(*key))
+        .cloned())
+}
+
 fn canonical_with_mode(
     platform: RuntimePlatform,
     text: &str,
@@ -211,6 +270,39 @@ fn unit(text: &str) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_task_registration_materialization_preserves_behavior() {
+        let source = include_str!("fixtures/legacy-task.xml");
+        let exported = include_str!("fixtures/legacy-task-export.xml");
+        let aliases = [r"FIXTURE\fixture", "S-1-5-21-1-2-3-1001"];
+        assert_eq!(
+            windows_task_difference(source, exported, &aliases).unwrap(),
+            None
+        );
+        let account = exported.replace("S-1-5-21-1-2-3-1001", r"fixture\FIXTURE");
+        assert_eq!(
+            windows_task_difference(source, &account, &aliases).unwrap(),
+            None
+        );
+        let changed = exported.replace("ck-subc.exe", "other.exe");
+        assert!(windows_task_difference(source, &changed, &aliases)
+            .unwrap()
+            .unwrap()
+            .ends_with("Command[0]"));
+        for (from, to, field) in [
+            ("S-1-5-21-1-2-3-1001", "S-1-5-21-1-2-3-1002", "UserId"),
+            ("InteractiveToken", "Password", "LogonType"),
+            ("<LogonType>", "<RunLevel>HighestAvailable</RunLevel><LogonType>", "RunLevel"),
+            ("<Exec>", "<Exec><Arguments>--other</Arguments>", "Arguments"),
+            ("<Exec>", "<Exec><WorkingDirectory>C:\\other</WorkingDirectory>", "WorkingDirectory"),
+            ("<Enabled>true", "<Enabled>false", "Enabled"),
+            ("<Settings>", "<Settings><RestartOnFailure><Interval>PT1M</Interval><Count>1</Count></RestartOnFailure>", "RestartOnFailure"),
+            ("<StopIfGoingOnBatteries>true", "<StopIfGoingOnBatteries>false", "StopIfGoingOnBatteries"),
+        ] {
+            assert!(windows_task_difference(source, &exported.replace(from, to), &aliases).unwrap().unwrap().contains(field), "{field}");
+        }
+    }
 
     #[test]
     fn plist_comparison_sorts_keys_but_preserves_types_and_array_order() {

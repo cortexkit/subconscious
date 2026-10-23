@@ -15,10 +15,13 @@ use lifecycle::{connected_daemon, daemon_processes, wait_for_exit};
 #[cfg(unix)]
 use super::file_modes;
 use super::{
-    definition::{canonical, canonical_registered_windows},
+    definition::{canonical, windows_task_difference},
     inventory::Inventory,
     model::RuntimeState,
 };
+
+#[cfg(all(test, windows))]
+use super::definition::canonical_registered_windows;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimePlatform {
@@ -497,11 +500,15 @@ pub fn definition_state<R: CommandRunner>(
                 result.explanation()
             ));
         }
-        if canonical_registered_windows(&result.stdout)? != canonical_registered_windows(&current)?
+        // The inventory-verified file proves what setup last registered, not
+        // what this release wants. Compare against it to detect edits, then use
+        // the current desired definition below to plan an owned upgrade.
+        if let Some(field) =
+            windows_task_difference(&current, &result.stdout, &[&current_windows_user()?])?
         {
-            return Ok(refusal(
-                "installed task differs from the setup-owned XML (user-edited task)",
-            ));
+            return Ok(refusal(&format!(
+                "installed task differs at {field} (user-edited task)"
+            )));
         }
     }
     if parsed != canonical(platform, &desired)? {
@@ -810,7 +817,7 @@ fn export_windows_task<R: CommandRunner>(
     let task_path = task_path.replace('\'', "''");
     let task_name = task_name.replace('\'', "''");
     let script = format!(
-        r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); $x=[xml](Export-ScheduledTask -TaskPath '{task_path}' -TaskName '{task_name}'); foreach($u in $x.SelectNodes('//*[local-name()="UserId"]')) {{ if($u.InnerText -like 'S-1-*') {{ $u.InnerText=([System.Security.Principal.SecurityIdentifier]::new($u.InnerText)).Translate([System.Security.Principal.NTAccount]).Value }} }}; $x.OuterXml"#
+        r#"$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new(); $me=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $x=[xml](Export-ScheduledTask -TaskPath '{task_path}' -TaskName '{task_name}'); foreach($u in $x.SelectNodes('//*[local-name()="UserId"]')) {{ $sid=if($u.InnerText -like 'S-1-*') {{ [System.Security.Principal.SecurityIdentifier]::new($u.InnerText) }} else {{ ([System.Security.Principal.NTAccount]::new($u.InnerText)).Translate([System.Security.Principal.SecurityIdentifier]) }}; if($sid.Value -eq $me) {{ $u.InnerText=$env:USERDOMAIN+'\'+$env:USERNAME }} else {{ try {{ $u.InnerText=$sid.Translate([System.Security.Principal.NTAccount]).Value }} catch {{ $u.InnerText=$sid.Value }} }} }}; $x.OuterXml"#
     );
     runner.run(
         "powershell.exe",
@@ -2324,6 +2331,51 @@ mod reconciliation_tests {
         registered: true,
         live: true,
     };
+
+    #[test]
+    fn materialized_legacy_task_upgrades_to_current_desired_definition() {
+        let platform = RuntimePlatform::Windows;
+        let (_root, paths, mut inventory, mut manager) = fixture(platform, true, true);
+        let fixture_path = r"C:\Users\fixture\AppData\Local\cortexkit\bin\ck-subc.exe";
+        let source = include_str!("fixtures/legacy-task.xml")
+            .replace(fixture_path, &xml_text(&paths.daemon.to_string_lossy()));
+        // The command runner returns account names after Windows has verified
+        // the exported SID, just as export_windows_task does on a real host.
+        manager.task_xml = include_str!("fixtures/legacy-task-export.xml")
+            .replace(fixture_path, &xml_text(&paths.daemon.to_string_lossy()))
+            .replace(
+                "S-1-5-21-1-2-3-1001",
+                &xml_text(&current_windows_user().unwrap()),
+            );
+        fs::write(&paths.definition, &source).unwrap();
+        assert!(matches!(
+            definition_state(platform, &paths, LIVE, &mut manager, &inventory).unwrap(),
+            RuntimeState::Outdated { .. }
+        ));
+        ensure(platform, &paths, LIVE, &mut manager, &mut inventory).unwrap();
+        assert_eq!(
+            fs::read_to_string(&paths.definition).unwrap(),
+            desired_definition_checked(platform, &paths).unwrap()
+        );
+    }
+
+    #[test]
+    fn edited_registered_command_refuses_with_field_without_writing() {
+        let platform = RuntimePlatform::Windows;
+        let (_root, paths, mut inventory, mut manager) = fixture(platform, false, true);
+        let before = fs::read(&paths.definition).unwrap();
+        manager.task_xml = manager.task_xml.replace("ck-subc", "other-daemon");
+        let error = ensure(platform, &paths, LIVE, &mut manager, &mut inventory).unwrap_err();
+        assert!(
+            error.contains("Command[0]") && error.contains("user-edited task"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&paths.definition).unwrap(), before);
+        assert!(manager
+            .calls
+            .iter()
+            .all(|call| call.contains("Export-ScheduledTask")));
+    }
 
     #[test]
     fn outdated_owned_definition_plans_update() {

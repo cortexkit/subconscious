@@ -83,6 +83,7 @@ Describe 'native ck installer' {
         }
         $registryKey | Add-Member ScriptMethod GetValue {
             param($Name, $Default, $Options)
+            if ($Name -eq 'PATHEXT') { return '.COM;.EXE;.BAT;.CMD' }
             if ($Options -eq [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames -or
                 $this.PathKind -eq [Microsoft.Win32.RegistryValueKind]::String) {
                 return $this.RawPath
@@ -91,8 +92,12 @@ Describe 'native ck installer' {
         }
         $registryKey | Add-Member ScriptMethod GetValueKind { param($Name) return $this.PathKind }
         $registryKey | Add-Member ScriptMethod Dispose {}
+        $machineKey = [pscustomobject]@{}
+        $machineKey | Add-Member ScriptMethod GetValue { param($Name, $Default, $Options) return $null }
+        $machineKey | Add-Member ScriptMethod Dispose {}
         Mock Get-Item { $registryKey } -ParameterFilter { $LiteralPath -eq 'HKCU:\Environment' }
-        Mock Set-ItemProperty {}
+        Mock Get-Item { $machineKey } -ParameterFilter { $LiteralPath -like 'HKLM:*' }
+        Mock Set-ItemProperty { param($Value) $registryKey.RawPath = $Value }
     }
 
     AfterEach {
@@ -177,7 +182,7 @@ Describe 'native ck installer' {
         $registryKey.PathKind = [Microsoft.Win32.RegistryValueKind]::ExpandString
         & $installerPath | Out-Null
         Should -Invoke Set-ItemProperty -Times 1 -ParameterFilter {
-            $Value -eq ('%USERPROFILE%\.dotnet\tools;C:\Other\Bin;' + (Join-Path $env:LOCALAPPDATA 'cortexkit\cmd')) -and
+            $Value -eq ((Join-Path $env:LOCALAPPDATA 'cortexkit\cmd') + ';%USERPROFILE%\.dotnet\tools;C:\Other\Bin') -and
             $Type -eq [Microsoft.Win32.RegistryValueKind]::ExpandString
         }
     }

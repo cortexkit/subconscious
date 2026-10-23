@@ -87,6 +87,8 @@ jobs:
           if ($result.FailedCount -ne 0) {
             throw "Pester reported $($result.FailedCount) failing installer tests."
           }
+          & ./scripts/install/tests/test-user-path.ps1
+          & ./scripts/install/tests/test-legacy-cli.ps1
 
   alpha-contract:
     name: Setup, runtime, MC, and upgrade (${{ matrix.platform }})

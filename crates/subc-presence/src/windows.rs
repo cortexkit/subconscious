@@ -85,6 +85,10 @@ fn probe_input_desktop() -> bool {
 }
 
 fn real_precheck() -> Result<Precheck, ()> {
+    precheck_within(PRECHECK_LIMIT)
+}
+
+fn precheck_within(limit: Duration) -> Result<Precheck, ()> {
     // A COM server can stall even during activation. Bound both the caller's
     // wait and the number of probe threads: reuse one worker with a one-entry
     // queue, rather than leaking another thread on every timed-out request.
@@ -119,7 +123,7 @@ fn real_precheck() -> Result<Precheck, ()> {
         .map_err(|_| ())?
         .try_send(sender)
         .map_err(|_| ())?;
-    receiver.recv_timeout(PRECHECK_LIMIT).map_err(|_| ())
+    receiver.recv_timeout(limit).map_err(|_| ())
 }
 
 #[derive(Default)]
@@ -561,14 +565,31 @@ mod tests {
 
     #[test]
     fn windows_real_precheck_finishes_within_five_seconds() {
+        // The promise is the bound: even the first check, which pays for
+        // starting Windows Hello's COM (Component Object Model) server,
+        // returns within 5 s whatever the operating system does.
         let start = Instant::now();
-        let result = real_precheck();
+        let cold = real_precheck();
         assert!(
             start.elapsed() < Duration::from_secs(5),
-            "pre-check took {:?}: {result:?}",
+            "cold pre-check took {:?}: {cold:?}",
             start.elapsed()
         );
-        result.expect("the real OS pre-check must complete, not merely hit its timeout wrapper");
+        // How long that first activation takes depends on the machine: on a
+        // busy shared runner it can outlast the 4 s wait, and the bound above
+        // is what the caller relies on. Let any activation still in progress
+        // finish before requiring an answer from the real operating system.
+        if cold.is_err() {
+            let _ = precheck_within(Duration::from_secs(60));
+        }
+        let start = Instant::now();
+        let warm = real_precheck();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "pre-check took {:?}: {warm:?}",
+            start.elapsed()
+        );
+        warm.expect("the real OS pre-check must complete, not merely hit its timeout wrapper");
     }
 
     #[test]

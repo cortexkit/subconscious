@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+#[path = "phase1_integration/scope_identity.rs"]
+mod scope_identity;
+
 use cortexkit_test_support::ScratchDir;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
@@ -4620,6 +4623,8 @@ fn spawn_shim(
         .arg("--module-connection-file")
         .arg(module_connection_file)
         .env("CLAUDE_PROJECT_DIR", project_root)
+        // These fixtures use gateway-hosted sessions, whose routes open before MCP initialization.
+        .env("CK_INSTANCE_TOKEN", "mcp-integration-gateway")
         .env("XDG_CONFIG_HOME", xdg_config_home)
         .env("XDG_DATA_HOME", xdg_config_home)
         .env("XDG_RUNTIME_DIR", xdg_config_home)

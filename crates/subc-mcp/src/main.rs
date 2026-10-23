@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
 mod prompts;
+mod session_scope;
+
+use session_scope::{LocalSessionScope, ScopeOwner};
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -16,7 +19,7 @@ use std::{
     process,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
+        Arc, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
     },
     time::{Duration, SystemTime},
 };
@@ -46,6 +49,7 @@ use subc_control::{CatalogEntry, ClientControlRequest, ClientControlResponse, Co
 use subc_jsonc::jsonc_to_json;
 use subc_protocol::{
     manifest::{ConsumerRole, ExecutionMode, ModuleManifest, ProviderRole, Tool as ManifestTool},
+    scope::ScopeSelector,
     session::{
         HealthReport, HealthStatus, ModuleControlRequest, ModuleControlResponse,
         MODULE_CONTROL_OP_HEALTH_CHECK,
@@ -138,9 +142,9 @@ const CLAUDE_CODE_TOOL_USE_ID_META_KEY: &str = "claudecode/toolUseId";
 /// about reaches it on the provider wire; this leaves margin over that.
 const CONVERSATION_RESOLVE_TIMEOUT: Duration = Duration::from_secs(8);
 /// Most conversation-bound routes one MCP connection may hold open. Each
-/// distinct (module, conversation) pair costs one route; a call that would
-/// need one more is refused with a tool error rather than evicting a route a
-/// running subagent may still be using.
+/// distinct (module, conversation, scope selector) tuple costs one route; a
+/// call that would need one more is refused with a tool error rather than
+/// evicting a route a running subagent may still be using.
 const MAX_CONVERSATION_ROUTES: usize = 32;
 
 static NEXT_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -240,6 +244,8 @@ struct RelayPeerState {
 struct RelaySession {
     id: String,
     peer_state: RwLock<RelayPeerState>,
+    local_scope: Option<LocalSessionScope>,
+    scope: OnceLock<ScopeSelector>,
 }
 
 impl RelaySession {
@@ -247,6 +253,8 @@ impl RelaySession {
         Self {
             id,
             peer_state: RwLock::new(RelayPeerState::default()),
+            local_scope: None,
+            scope: OnceLock::new(),
         }
     }
 
@@ -1570,6 +1578,7 @@ struct SubcClient {
     events: broadcast::Sender<SubcEvent>,
     last_corr: Arc<AtomicU64>,
     catalog_poller_started: Arc<AtomicBool>,
+    scope_owner: Arc<OnceLock<ScopeOwner>>,
 }
 
 impl SubcClient {
@@ -1610,6 +1619,7 @@ impl SubcClient {
             events,
             last_corr: Arc::new(AtomicU64::new(0)),
             catalog_poller_started: Arc::new(AtomicBool::new(false)),
+            scope_owner: Arc::new(OnceLock::new()),
         }
     }
 
@@ -2167,17 +2177,26 @@ async fn start_supervision_connection_if_configured(
     };
 
     let mut stream = connect_authenticated(connection_file_path, ConnectionService::Daemon).await?;
-    send_supervision_hello(&mut stream, &module_id).await?;
-    let task_module_id = module_id.clone();
+    let ack = send_supervision_hello(&mut stream, &module_id).await?;
+    let supported = ["scopes/v1", "scope-workdir/v1"].iter().all(|capability| {
+        ack.subc_capabilities
+            .iter()
+            .any(|value| value == capability)
+    }) && ack.subc_ops.iter().any(|op| op == "scope.apply");
+    let (owner, changes) = ScopeOwner::new(module_id.clone(), supported);
+    let _ = subc.scope_owner.set(owner);
     let task = tokio::spawn(async move {
-        if let Err(error) = supervision_control_loop(stream, subc, task_module_id).await {
+        if let Err(error) = session_scope::supervision_loop(stream, subc, changes).await {
             tracing::error!("supervision control loop failed: {error}");
         }
     });
     Ok(Some(task))
 }
 
-async fn send_supervision_hello(stream: &mut TcpStream, module_id: &str) -> Result<()> {
+async fn send_supervision_hello(
+    stream: &mut TcpStream,
+    module_id: &str,
+) -> Result<ModuleHelloAckBody> {
     let nonce = subc_os::launch_nonce()
         .map_err(|error| other_error(format!("launch nonce unavailable: {error}")))?;
     let mut manifest = supervision_manifest(module_id.to_owned());
@@ -2192,8 +2211,8 @@ async fn send_supervision_hello(stream: &mut TcpStream, module_id: &str) -> Resu
         manifest,
         protocol_ver: PROTOCOL_VERSION,
         control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_owned()]),
-        // Echo the one-time launch nonce subc injects for a reserved module; absent
-        // (None) when this module is not reserved.
+        // Echo the supervised launch nonce. It authorizes scope changes for the
+        // current launch independently of reserved-ID configuration.
         launch_nonce: nonce.map(|nonce| nonce.value().to_owned()),
     })
     .map_err(|source| {
@@ -2239,14 +2258,14 @@ async fn send_supervision_hello(stream: &mut TcpStream, module_id: &str) -> Resu
 
     match frame.header.ty {
         FrameType::HelloAck => {
-            let _ack: ModuleHelloAckBody =
+            let ack: ModuleHelloAckBody =
                 serde_json::from_slice(&frame.body).map_err(|source| {
                     other_error(format!(
                     "failed to decode supervision HELLO_ACK for module_id={module_id}: {source}"
                 ))
                 })?;
             tracing::info!("registered for supervision module_id={module_id}");
-            Ok(())
+            Ok(ack)
         }
         FrameType::Error => {
             let body: ErrorBody = serde_json::from_slice(&frame.body).map_err(|source| {
@@ -2262,41 +2281,6 @@ async fn send_supervision_hello(stream: &mut TcpStream, module_id: &str) -> Resu
         ty => Err(other_error(format!(
             "unexpected supervision HELLO_ACK frame type for module_id={module_id}: {ty:?}"
         ))),
-    }
-}
-
-/// Reads and answers daemon-to-module control RPCs on the dedicated supervision
-/// socket. Sending the reply from this same task proves the supervision read
-/// loop is alive instead of only proving that some unrelated writer task runs.
-async fn supervision_control_loop(
-    mut stream: TcpStream,
-    subc: SubcClient,
-    module_id: String,
-) -> Result<()> {
-    loop {
-        let Some(frame) = read_frame(&mut stream).await.map_err(|source| {
-            other_error(format!(
-                "failed to read supervision control frame for module_id={module_id}: {source}"
-            ))
-        })?
-        else {
-            tracing::error!("supervision connection closed for module_id={module_id}");
-            return Ok(());
-        };
-
-        let Some(reply) = handle_supervision_control_frame(&frame, &subc).await? else {
-            return Ok(());
-        };
-        write_frame(&mut stream, &reply).await.map_err(|source| {
-            other_error(format!(
-                "failed to write supervision control reply for module_id={module_id}: {source}"
-            ))
-        })?;
-        stream.flush().await.map_err(|source| {
-            other_error(format!(
-                "failed to flush supervision control reply for module_id={module_id}: {source}"
-            ))
-        })?;
     }
 }
 
@@ -2581,6 +2565,9 @@ async fn handle_shim_connection(
     let mut routes = attached.state.route_handles();
     routes.extend(conversation.close());
     let goodbye_result = send_route_goodbyes(&subc, routes).await;
+    if let Some(local) = &attached.relay_session.local_scope {
+        local.end(&subc).await;
+    }
 
     match (serve_result, goodbye_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -2602,7 +2589,36 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
         bind_session_from_hello(hello)?,
     );
 
-    let relay_session = Arc::new(RelaySession::new(identity.session.clone()));
+    let gateway_owned = hello
+        .instance_token
+        .as_deref()
+        .is_some_and(valid_instance_token);
+    tracing::info!(session = %identity.session, owner = if gateway_owned { "gateway" } else { "subc-mcp" }, "MCP session owner selected");
+    let mut relay_session = RelaySession::new(identity.session.clone());
+    if !gateway_owned {
+        match LocalSessionScope::new(hello.project_root.clone()) {
+            Ok(local) => relay_session.local_scope = Some(local),
+            Err(error) => {
+                tracing::warn!("session attribution unavailable; using unscoped routes: {error}")
+            }
+        }
+    }
+    let relay_session = Arc::new(relay_session);
+    if !gateway_owned {
+        // Roots are a post-initialize client request. Open provider routes after
+        // deciding attribution, including the unscoped fallback when it fails.
+        let inner = SessionInner {
+            catalog_generation: 0,
+            routes: HashMap::new(),
+            tools: Vec::new(),
+            bindings: HashMap::new(),
+            surface_mode: config.effective.surface_mode,
+        };
+        return Ok(AttachedSession {
+            state: Arc::new(SessionState::new(config, identity, inner)),
+            relay_session,
+        });
+    }
     let mut routes = HashMap::new();
     let mut desired = desired;
     // Per-target refusals drop that provider and keep the session; any other
@@ -2620,6 +2636,7 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
             &identity,
             relay_session.consumer_capabilities(),
             Arc::clone(&relay_session),
+            None,
         )
         .await
         {
@@ -2703,8 +2720,9 @@ async fn open_provider_route(
     identity: &BindIdentity,
     consumer_capabilities: Option<Vec<String>>,
     route_session: Arc<RelaySession>,
+    scope: Option<ScopeSelector>,
 ) -> Result<RouteHandle> {
-    open_route(
+    open_scoped_route(
         subc,
         RouteTarget::ToolProvider {
             module_id: module_id.to_owned(),
@@ -2713,6 +2731,7 @@ async fn open_provider_route(
         identity,
         consumer_capabilities,
         route_session,
+        scope,
     )
     .await
 }
@@ -2754,6 +2773,28 @@ async fn open_route(
     consumer_capabilities: Option<Vec<String>>,
     route_session: Arc<RelaySession>,
 ) -> Result<RouteHandle> {
+    open_scoped_route(
+        subc,
+        target,
+        target_label,
+        identity,
+        consumer_capabilities,
+        route_session,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn open_scoped_route(
+    subc: &SubcClient,
+    target: RouteTarget,
+    target_label: &str,
+    identity: &BindIdentity,
+    consumer_capabilities: Option<Vec<String>>,
+    route_session: Arc<RelaySession>,
+    scope: Option<ScopeSelector>,
+) -> Result<RouteHandle> {
     let request = ClientControlRequest::RouteOpen {
         target,
         identity: identity.clone(),
@@ -2761,7 +2802,7 @@ async fn open_route(
         consumer_capabilities,
         role_versions: None,
         admission_facts: None,
-        scope: None,
+        scope,
     };
     let body = serde_json::to_vec(&request)?;
     let corr = subc.next_corr()?;
@@ -4028,8 +4069,19 @@ async fn reconcile_session_from_catalog(
             subc,
             &provider.module_id,
             &state.identity,
-            relay_session.consumer_capabilities(),
+            if state.catalog_generation() == 0 {
+                None
+            } else {
+                relay_session.consumer_capabilities()
+            },
             Arc::clone(relay_session),
+            session_scope::provider_scope(
+                relay_session.scope.get(),
+                catalog
+                    .modules
+                    .iter()
+                    .find(|entry| entry.module_id == provider.module_id),
+            ),
         )
         .await
         {
@@ -4811,13 +4863,15 @@ struct ConversationResolveReply {
     unresolved: Option<bool>,
     #[serde(default)]
     reason: Option<String>,
+    #[serde(default)]
+    scope: Option<ScopeSelector>,
 }
 
 /// What the gateway's `session.resolve` answer says to do with the call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConversationResolution {
     /// Send the call on a route bound to this session.
-    Session(String),
+    Session(String, Option<ScopeSelector>),
     /// The gateway predates per-call resolution: it ignored the tool-use id
     /// and answered the instance-token form (`{session_id, last_traffic_ms}`
     /// or `{session_id: null}`). The call goes on the attach route, as it did
@@ -4860,17 +4914,17 @@ fn parse_conversation_resolve_reply(
             Err(ConversationRouteRefusal::Unresolved(reason))
         }
         (Some(session), None) if !session.is_empty() => {
-            Ok(ConversationResolution::Session(session))
+            Ok(ConversationResolution::Session(session, reply.scope))
         }
         (None, None) => Ok(ConversationResolution::GatewayNotPerCall),
         _ => Err(ConversationRouteRefusal::GatewayReplyMalformed),
     }
 }
 
-type ConversationRouteKey = (String, String);
+type ConversationRouteKey = (String, String, String);
 
 /// Routes for modules declaring `MCP_CONVERSATION_BINDING_CAPABILITY`, one per
-/// (module, conversation) pair, for one MCP connection.
+/// (module, conversation, scope selector) tuple, for one MCP connection.
 ///
 /// Claude Code's lead agent and its subagents share one MCP connection. Its
 /// attach routes are bound to the launch's instance token, so a module that
@@ -4879,8 +4933,9 @@ type ConversationRouteKey = (String, String);
 /// tool-use id is resolved by the gateway (`session.resolve`) to the session
 /// string of the agent that made it, and sent on a route bound to exactly
 /// that string. Those routes are opened on first use with the attach identity
-/// except for the session, reused for later calls, and closed with the MCP
-/// connection.
+/// except for the session. A gateway-supplied scope selector is forwarded,
+/// and the route is reused only while that selector is unchanged. All routes
+/// close with the MCP connection.
 struct ConversationRouter {
     subc: SubcClient,
     /// The attach bind identity. Conversation routes copy it and replace only
@@ -4962,8 +5017,9 @@ impl ConversationRouter {
             binding.module_id
         );
         match self.resolve(instance_token, tool_use_id).await? {
-            ConversationResolution::Session(session) => {
-                self.route_for_session(&binding.module_id, session).await
+            ConversationResolution::Session(session, scope) => {
+                self.route_for_session(&binding.module_id, session, scope)
+                    .await
             }
             ConversationResolution::GatewayNotPerCall => {
                 tracing::debug!(target: "conversation",
@@ -5002,13 +5058,17 @@ impl ConversationRouter {
         parse_conversation_resolve_reply(reply)
     }
 
-    /// The route bound to `session` for `module_id`, opened if missing.
+    /// The route bound to `session` and `scope` for `module_id`, opened if missing.
     async fn route_for_session(
         &self,
         module_id: &str,
         session: String,
+        scope: Option<ScopeSelector>,
     ) -> std::result::Result<RouteHandle, ConversationRouteRefusal> {
-        let key = (module_id.to_owned(), session);
+        // A new epoch or selector must never reuse a route bound to an old one.
+        let scope_key = serde_json::to_string(&scope)
+            .map_err(|_| ConversationRouteRefusal::GatewayReplyMalformed)?;
+        let key = (module_id.to_owned(), session, scope_key);
         if let Some(route) = self.live_route(&key)? {
             return Ok(route);
         }
@@ -5032,6 +5092,7 @@ impl ConversationRouter {
             &identity,
             self.relay_session.consumer_capabilities(),
             Arc::clone(&self.relay_session),
+            scope,
         )
         .await
         .map_err(|error| {
@@ -5225,7 +5286,7 @@ impl ServerHandler for SubcMcpServer {
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
         }
-        // Provider routes exist before the MCP initialized notification arrives. Publish the peer
+        // Gateway-hosted provider routes can exist before the initialized notification. Publish the peer
         // as part of the initialize request so a reverse request cannot observe an open provider
         // route while the corresponding host relay is still absent.
         self.relay_session.record_peer(context.peer.clone());
@@ -5318,6 +5379,11 @@ impl ServerHandler for SubcMcpServer {
             return;
         }
 
+        self.ensure_session_scope(&context.peer).await;
+        if let Err(error) = self.initialize_session_routes().await {
+            tracing::error!("failed to open initial MCP provider routes: {error}");
+        }
+
         self.subc.ensure_catalog_poller();
         let subc = self.subc.clone();
         let state = Arc::clone(&self.state);
@@ -5342,6 +5408,37 @@ impl ServerHandler for SubcMcpServer {
 }
 
 impl SubcMcpServer {
+    async fn ensure_session_scope(&self, peer: &Peer<RoleServer>) {
+        if let Some(local) = &self.relay_session.local_scope {
+            local
+                .ensure(
+                    &self.subc,
+                    &self.state,
+                    &self.relay_session,
+                    peer,
+                    &self.reconcile_gate,
+                )
+                .await;
+        }
+    }
+
+    async fn initialize_session_routes(&self) -> std::result::Result<(), ErrorData> {
+        let _guard = self.reconcile_gate.lock().await;
+        if self.state.catalog_generation() == 0 {
+            let catalog = catalog_list(&self.subc).await.map_err(mcp_internal_error)?;
+            let config = self.state.config_snapshot();
+            reconcile_session_from_catalog(
+                &self.subc,
+                &self.state,
+                &self.relay_session,
+                catalog,
+                &config.effective,
+            )
+            .await
+            .map_err(mcp_internal_error)?;
+        }
+        Ok(())
+    }
     #[allow(clippy::too_many_arguments)]
     fn new(
         subc: SubcClient,
@@ -5370,6 +5467,8 @@ impl SubcMcpServer {
         &self,
         peer: &Peer<RoleServer>,
     ) -> std::result::Result<(), ErrorData> {
+        self.ensure_session_scope(peer).await;
+        self.initialize_session_routes().await?;
         let Some(changes) = refresh_policy_if_changed(
             &self.subc,
             &self.state,
@@ -7439,7 +7538,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             });
             let route_session = Arc::new(RelaySession::new("shim-session".to_owned()));
-            let error = open_provider_route(&subc, "plexus", &identity, None, route_session)
+            let error = open_provider_route(&subc, "plexus", &identity, None, route_session, None)
                 .await
                 .expect_err("an error frame must not produce a route");
             server.abort();
@@ -7669,7 +7768,7 @@ mod tests {
         });
 
         let route_session = Arc::new(RelaySession::new("shim-session".to_owned()));
-        let route = open_provider_route(&subc, "aft", &identity, declared, route_session)
+        let route = open_provider_route(&subc, "aft", &identity, declared, route_session, None)
             .await
             .unwrap();
         assert_eq!((route.channel, route.epoch), (7, 11));
@@ -8994,6 +9093,7 @@ mod tests {
     /// answered, so a request to the gateway on it times out.
     struct FakeDaemon {
         events: Arc<StdMutex<Vec<FakeDaemonEvent>>>,
+        scopes: Arc<StdMutex<Vec<Option<ScopeSelector>>>>,
         task: JoinHandle<()>,
     }
 
@@ -9001,6 +9101,8 @@ mod tests {
         fn start(mut stream: TcpStream) -> Self {
             let events = Arc::new(StdMutex::new(Vec::new()));
             let recorded = Arc::clone(&events);
+            let scopes = Arc::new(StdMutex::new(Vec::new()));
+            let recorded_scopes = Arc::clone(&scopes);
             let task = tokio::spawn(async move {
                 let mut next_channel = 10_u16;
                 while let Ok(Some(frame)) = read_frame(&mut stream).await {
@@ -9009,12 +9111,16 @@ mod tests {
                             let request: ClientControlRequest =
                                 serde_json::from_slice(&frame.body).unwrap();
                             let ClientControlRequest::RouteOpen {
-                                target, identity, ..
+                                target,
+                                identity,
+                                scope,
+                                ..
                             } = request
                             else {
                                 panic!("unexpected control request: {request:?}");
                             };
                             let channel = next_channel;
+                            recorded_scopes.lock().unwrap().push(scope);
                             next_channel += 1;
                             let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
                                 route_channel: channel,
@@ -9051,7 +9157,11 @@ mod tests {
                     recorded.lock().unwrap().push(event);
                 }
             });
-            Self { events, task }
+            Self {
+                events,
+                scopes,
+                task,
+            }
         }
 
         fn events(&self) -> Vec<FakeDaemonEvent> {
@@ -9220,6 +9330,44 @@ mod tests {
             must_never_reach: Vec::new(),
         });
         assert!(opted_in(&entry));
+    }
+
+    #[tokio::test]
+    async fn gateway_selector_is_forwarded_and_epoch_changes_open_new_routes() {
+        let selector = |epoch| {
+            subc_protocol::scope::ScopeSelector::new(
+                subc_protocol::Principal::Reserved {
+                    module_id: "thalamus".into(),
+                },
+                "conversation",
+                Some(epoch),
+            )
+        };
+        let resolver = Arc::new(MockPromptRouteClient::new([
+            Ok(serde_json::json!({"session":"same-session", "scope": selector(1)})),
+            Ok(serde_json::json!({"result":{"session":"same-session", "scope": selector(2)}})),
+            Ok(serde_json::json!({"session":"same-session", "scope": selector(2)})),
+        ]));
+        let (router, daemon) = conversation_router_with(resolver, Some(TEST_INSTANCE_TOKEN)).await;
+        let binding = forward_binding(&router, true);
+        let first = router
+            .route_for_call(&binding, ToolUseIdMeta::Present("tool-1"))
+            .await
+            .unwrap();
+        let second = router
+            .route_for_call(&binding, ToolUseIdMeta::Present("tool-2"))
+            .await
+            .unwrap();
+        let reused = router
+            .route_for_call(&binding, ToolUseIdMeta::Present("tool-3"))
+            .await
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(second, reused);
+        assert_eq!(
+            *daemon.scopes.lock().unwrap(),
+            vec![Some(selector(1)), Some(selector(2))]
+        );
     }
 
     /// A subagent call and a lead-agent call reach the module on two routes

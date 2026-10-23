@@ -117,6 +117,47 @@ args = ["subc-mcp", "shim", "--harness", "codex"]
 
 Any other MCP host: run `ck subc-mcp shim --harness <name>` as a stdio server.
 
+### Session folder and project attribution
+
+Session attribution works when the daemon supervises `subc-mcp`: the module
+registers records using its current supervised launch nonce. Its module entry
+does not need `reserved: true` for this authority. Core setup installs its
+binary but does not currently write that module entry. Attribution requires
+daemon 0.36.35 or newer advertising `scope-workdir/v1` through
+`server.describe`, as well as scope sync/apply support. Older daemons keep
+serving tools without attribution.
+
+Without a valid `CK_INSTANCE_TOKEN`, subc-mcp hosts the MCP session itself;
+Claude Code connected directly to AFT over MCP does not need Thalamus. After
+MCP initialization, subc-mcp requests `roots/list` if the client advertises
+roots. It uses the first root, normalized to the top of the enclosing git
+checkout or linked worktree. With no roots capability or an empty list, it
+uses the shim's resolved project root and logs the fallback. A non-local or
+invalid root, a failed roots request, or a roots timeout also uses the shim's
+project root, with a warning naming the cause.
+
+Before registering the session, subc-mcp asks Entorhinal to resolve that
+folder. Only an explicit project match supplies `project_id`; an implicit
+match, refusal or unavailable Entorhinal leaves it unset. Folder and project
+are fixed for that session's scope epoch, and the record ends when the MCP
+connection closes. Providers declaring `scope-workdir/v1` receive these
+fields on their bind stamp. Other providers keep their existing bind body,
+and the legacy bind identity's `project_root` is unchanged for all providers.
+
+Attribution never gates tool availability. A scope-authority refusal, record
+refusal or attribution timeout logs a warning and falls back to unscoped
+provider routes with the existing bind body; catalog refresh and tools remain
+available. These fallbacks apply to otherwise attested sessions. Startup
+attestation rules are unchanged: a truly hand-run module without a module ID
+and launch nonce is refused, never bound as a trusted direct caller. Running
+the stdio shim by hand is supported as shown above.
+
+A valid `CK_INSTANCE_TOKEN` instead identifies a gateway-hosted session.
+Subc-mcp never creates its own record for it, even if the gateway is down.
+Conversation-bound calls use the gateway's optional `scope` selector from
+`session.resolve`; absent a selector, their routes keep the existing bind
+behavior. The module logs which owner it selected once at session attach.
+
 ## 5. Upgrade
 
 ```sh

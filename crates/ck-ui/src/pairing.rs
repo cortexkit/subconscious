@@ -11,7 +11,8 @@ pub const STEPS_W: i32 = 48;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Claim {
-    pub device_name: String,
+    /// The name the phone gave; `None` when callosum's registry has none.
+    pub device_name: Option<String>,
     pub source_addr: String,
     pub fingerprint: String,
 }

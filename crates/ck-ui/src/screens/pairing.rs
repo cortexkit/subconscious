@@ -5,7 +5,7 @@
 //! person's choice of group, or the code itself.
 
 use crate::draw::{self, Canvas};
-use crate::pairing::flow::{Flow, Stage};
+use crate::pairing::flow::{Flow, Stage, NO_NAME};
 use crate::pairing::{self, PairingState, QUIET, STEPS_W};
 use crate::theme::{Bg, Fg, St};
 use crate::time::Timestamp;
@@ -247,12 +247,12 @@ pub fn from_lines(source_addr: &str, fingerprint: &str) -> Vec<String> {
 
 fn confirmation(flow: &Flow, s: &PairingState) -> Column {
     let mut col = common(s, if s.claim.is_some() { 2 } else { 0 });
-    let name = s
-        .claim
-        .as_ref()
-        .map_or("Your phone", |c| c.device_name.as_str());
     let start = col.height + 2;
-    let mut y = col.wrap(0, start, &format!("{name} scanned the code."), St::B);
+    let mut y = match s.claim.as_ref().map(|c| c.device_name.as_deref()) {
+        Some(Some(name)) => col.wrap(0, start, &format!("{name} scanned the code."), St::B),
+        Some(None) => named(&mut col, 0, start, None, "scanned the code."),
+        None => col.wrap(0, start, "Your phone scanned the code.", St::B),
+    };
     y = col.wrap(0, y, "Type the four words it shows:", St::NONE) + 1;
     for (i, word) in s.words.iter().enumerate() {
         let x = i as i32 * 12;
@@ -294,12 +294,24 @@ fn confirmation(flow: &Flow, s: &PairingState) -> Column {
     col
 }
 
+/// A line naming the phone. A phone callosum's registry has no name for
+/// reads as a dim "(no name)", never as a made-up name.
+fn named(col: &mut Column, x: i32, y: i32, name: Option<&str>, rest: &str) -> i32 {
+    match name {
+        Some(name) => col.wrap(x, y, &format!("{name} {rest}"), St::B),
+        None => {
+            col.put(x, y, NO_NAME, St::D);
+            col.wrap(x + draw::width(NO_NAME) as i32 + 1, y, rest, St::B)
+        }
+    }
+}
+
 /// The last step: the phone is paired.
-fn paired(s: &PairingState, device_name: &str) -> Column {
+fn paired(s: &PairingState, device_name: Option<&str>) -> Column {
     let mut col = common(s, 3);
     let y = col.height + 2;
     col.put(0, y, "✓", St::O.bold());
-    col.wrap(2, y, &format!("{device_name} is paired."), St::B);
+    named(&mut col, 2, y, device_name, "is paired.");
     // "You can remove it any time from Devices" waits for a forget
     // operation in callosum.
     let y = col.wrap(
@@ -397,7 +409,7 @@ pub fn draw(c: &mut Canvas, flow: &Flow, now: Timestamp) {
     let waiting_col = waiting(flow, s, now);
     let confirmation_col = confirmation(flow, s);
     let paired_col = match &flow.stage {
-        Stage::Granted { device_name } => Some(paired(s, device_name)),
+        Stage::Granted { device_name } => Some(paired(s, device_name.as_deref())),
         _ => None,
     };
     let height = waiting_col

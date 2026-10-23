@@ -18,7 +18,6 @@ use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use tokio::sync::oneshot;
 
-use super::map::unwrap_result;
 use crate::pairing::flow::{
     Command, ConfirmFailure, Event, Opened, Refusal, Verdict, WatchEvent, CLASS,
 };
@@ -27,9 +26,6 @@ use crate::time::Timestamp;
 
 /// How long an open may take.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// The shortest timeout a confirm gets, even when its deadline has passed.
-const MIN_CONFIRM: Duration = Duration::from_secs(1);
 
 /// A call that came back without a reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,12 +111,10 @@ impl Pairing {
             Command::Confirm {
                 window_id,
                 words,
-                deadline,
+                timeout,
             } => {
                 let this = Arc::clone(self);
                 tokio::spawn(async move {
-                    let left = deadline.unix_millis() - (this.now)().unix_millis();
-                    let timeout = Duration::from_millis(left.max(0) as u64).max(MIN_CONFIRM);
                     let params = json!({ "window_id": window_id, "words": words });
                     let reply = this
                         .callosum
@@ -178,8 +172,17 @@ impl Pairing {
                 tokio::select! {
                     next = stream.next() => match next {
                         Some(value) => {
-                            let Some(event) = watch_event(&value) else {
-                                continue;
+                            let event = match watch_event(&value) {
+                                Ok(Some(event)) => event,
+                                Ok(None) => continue,
+                                // ck stops at a notice it can't read rather
+                                // than guess what it meant.
+                                Err(_) => {
+                                    this.forget(&window_id);
+                                    stream.close().await;
+                                    (this.sink)(Event::WatchUnreadable { window_id });
+                                    return;
+                                }
                             };
                             let terminal = matches!(
                                 event,
@@ -242,12 +245,12 @@ pub fn open_result(
     if let Some(r) = reply_refusal(&reply) {
         return Err(r);
     }
-    let body = unwrap_result(&reply);
-    let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_string);
+    // Callosum sends the open's fields at the top level, unwrapped.
+    let text = |key: &str| reply.get(key).and_then(Value::as_str).map(str::to_string);
     match (
         text("window_id"),
         text("qr_payload"),
-        body.get("expires_at_ms").and_then(Value::as_i64),
+        reply.get("expires_at_ms").and_then(Value::as_i64),
     ) {
         (Some(window_id), Some(qr_payload), Some(expires_at_ms)) => Ok(Opened {
             window_id,
@@ -270,57 +273,73 @@ pub fn confirm_result(reply: Result<Value, CallFailure>) -> Result<Verdict, Conf
     if let Some(r) = reply_refusal(&reply) {
         return Err(ConfirmFailure::Refused(r));
     }
-    let result = match reply.get("result") {
-        Some(Value::String(s)) => Some(s.as_str()),
-        Some(inner) => inner.get("result").and_then(Value::as_str),
-        None => None,
-    };
-    match result {
+    match reply.get("result").and_then(Value::as_str) {
         Some("granted") => Ok(Verdict::Granted),
         Some("mismatch") => Ok(Verdict::Mismatch),
         _ => Err(ConfirmFailure::Lost),
     }
 }
 
-/// One event from a watch stream. The event's name may come as the whole
-/// value (`"open"`), as its only key (`{"claimed": {...}}`), or in a
-/// `state`, `event`, `kind` or `type` field beside its other fields. An
-/// event ck doesn't know is skipped.
-pub fn watch_event(value: &Value) -> Option<WatchEvent> {
-    let value = unwrap_result(value);
-    let (name, body) = match value {
-        Value::String(s) => (s.as_str(), &Value::Null),
-        Value::Object(map) => {
-            let tagged = ["state", "event", "kind", "type"]
-                .iter()
-                .find_map(|k| map.get(*k).and_then(Value::as_str));
-            match tagged {
-                Some(name) => (name, value),
-                None if map.len() == 1 => {
-                    let (k, v) = map.iter().next()?;
-                    (k.as_str(), v)
-                }
-                None => return None,
-            }
-        }
-        _ => return None,
+/// A watch notice ck can't read: a known state missing a field it requires,
+/// or carrying one in the wrong form, or a notice that isn't an object with
+/// a string `state`. The text says which, for diagnosis.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unreadable(pub String);
+
+/// One `callosum.pairing_qr_watch` notice: a JSON object whose `state` is
+/// `open`, `foreign_attempt {source_addr}`, `claimed {device_name,
+/// source_addr, fingerprint}`, `granted`, `declined` or `expired`. Notices
+/// arrive unwrapped, exactly as callosum builds them. A state ck doesn't know
+/// is skipped (`Ok(None)`); a known state with a missing or invalid field is
+/// unreadable, and ck fills in nothing for it.
+pub fn watch_event(value: &Value) -> Result<Option<WatchEvent>, Unreadable> {
+    let bad = |why: &str| Unreadable(why.to_string());
+    let Some(state) = value.get("state").and_then(Value::as_str) else {
+        return Err(bad("no string state"));
     };
-    let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_string);
-    Some(match name {
+    // Callosum sends an address without a port, so anything else is
+    // unreadable rather than shown in part.
+    let addr = || -> Result<String, Unreadable> {
+        let text = value
+            .get("source_addr")
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad("no source_addr"))?;
+        text.parse::<std::net::IpAddr>()
+            .map_err(|_| bad("source_addr is not an IP address"))?;
+        Ok(text.to_string())
+    };
+    Ok(Some(match state {
         "open" => WatchEvent::Open,
-        "claimed" => WatchEvent::Claimed(Claim {
-            device_name: text("device_name").unwrap_or_else(|| "A phone".into()),
-            source_addr: text("source_addr").unwrap_or_else(|| "an unknown address".into()),
-            fingerprint: text("fingerprint").unwrap_or_else(|| "unknown".into()),
-        }),
-        "foreign_attempt" => WatchEvent::ForeignAttempt(
-            text("source_addr").unwrap_or_else(|| "an unknown address".into()),
-        ),
+        "foreign_attempt" => WatchEvent::ForeignAttempt(addr()?),
+        "claimed" => {
+            let device_name = match value.get("device_name") {
+                Some(Value::String(name)) => Some(name.clone()),
+                // Callosum's registry has no name for the phone.
+                Some(Value::Null) => None,
+                _ => return Err(bad("device_name is neither a string nor null")),
+            };
+            let fingerprint = value
+                .get("fingerprint")
+                .and_then(Value::as_str)
+                .ok_or_else(|| bad("no fingerprint"))?;
+            let hex = fingerprint.len() == 32
+                && fingerprint
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if !hex {
+                return Err(bad("fingerprint is not 32 lowercase hex characters"));
+            }
+            WatchEvent::Claimed(Claim {
+                device_name,
+                source_addr: addr()?,
+                fingerprint: fingerprint.to_string(),
+            })
+        }
         "granted" => WatchEvent::Granted,
         "declined" => WatchEvent::Declined,
         "expired" => WatchEvent::Expired,
-        _ => return None,
-    })
+        _ => return Ok(None),
+    }))
 }
 
 #[cfg(test)]
@@ -405,7 +424,7 @@ mod tests {
         pairing.run(Command::Confirm {
             window_id: "w-c".into(),
             words: ["a", "b", "c", "d"].map(String::from),
-            deadline: Timestamp::from_unix_millis(60_000),
+            timeout: Duration::from_secs(300),
         });
         let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
             .await
@@ -445,37 +464,13 @@ mod tests {
     }
 
     #[test]
-    fn watch_events_are_read_in_every_tagging() {
-        let claimed = WatchEvent::Claimed(Claim {
-            device_name: "iPhone".into(),
-            source_addr: "192.0.2.4".into(),
-            fingerprint: "abcd".into(),
-        });
-        let fields =
-            json!({"device_name": "iPhone", "source_addr": "192.0.2.4", "fingerprint": "abcd"});
-        assert_eq!(watch_event(&json!("open")), Some(WatchEvent::Open));
-        assert_eq!(
-            watch_event(&json!({ "claimed": fields })),
-            Some(claimed.clone())
-        );
-        let mut tagged = fields.clone();
-        tagged["state"] = json!("claimed");
-        assert_eq!(watch_event(&tagged), Some(claimed));
-        assert_eq!(
-            watch_event(&json!({"event": "granted"})),
-            Some(WatchEvent::Granted)
-        );
-        assert_eq!(watch_event(&json!({"something": "else", "more": 1})), None);
-    }
-
-    #[test]
     fn a_confirm_reply_without_a_result_is_an_unknown_outcome() {
         assert_eq!(
             confirm_result(Ok(json!({"result": "granted"}))),
             Ok(Verdict::Granted)
         );
         assert_eq!(
-            confirm_result(Ok(json!({"result": {"result": "mismatch"}}))),
+            confirm_result(Ok(json!({"result": "mismatch"}))),
             Ok(Verdict::Mismatch)
         );
         assert_eq!(confirm_result(Ok(json!({}))), Err(ConfirmFailure::Lost));

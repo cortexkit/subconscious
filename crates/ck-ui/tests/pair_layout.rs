@@ -58,7 +58,7 @@ fn text(buf: &Buffer) -> String {
 fn claim(app: &mut App) {
     let s = app.pairing.window.as_mut().unwrap();
     s.claim = Some(Claim {
-        device_name: "iPhone".into(),
+        device_name: Some("iPhone".into()),
         source_addr: "192.168.1.41".into(),
         fingerprint: "4744 56dd 9c0e 21b8".into(),
     });

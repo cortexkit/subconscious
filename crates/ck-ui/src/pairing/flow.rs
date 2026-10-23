@@ -30,8 +30,15 @@ pub const CLASS: &str = "phone";
 /// How long `⏎` stays ignored after a backoff refusal that names no wait.
 const BACKOFF_MS: i64 = 30_000;
 
-/// The confirm call may run until the window expires, plus this margin.
-const CONFIRM_MARGIN_MS: i64 = 5_000;
+/// How long a confirm call may run. Callosum asks for Touch ID and only then
+/// re-checks the claim, whose own 120 s limit a pending prompt doesn't
+/// extend, so the call can outlive both the claim and the window. The
+/// operator-confirm deadline in the subc SDK is 290 s; this leaves room past
+/// it for callosum's answer to arrive.
+pub const CONFIRM_TIMEOUT_MS: u64 = 300_000;
+
+/// How ck shows a phone callosum's registry has no name for.
+pub const NO_NAME: &str = "(no name)";
 
 /// What the latest `callosum.devices_read` says about the access groups.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +163,8 @@ pub enum Event {
     },
     /// The window's watch failed to open, or ended before a terminal event.
     WatchEnded { window_id: String },
+    /// The window's watch sent a notice ck can't read; its watch is closed.
+    WatchUnreadable { window_id: String },
     Confirmed {
         window_id: String,
         result: Result<Verdict, ConfirmFailure>,
@@ -174,12 +183,12 @@ pub enum Command {
     Watch { window_id: String },
     /// Close that subscription and its route.
     Unwatch { window_id: String },
-    /// `callosum.pairing_qr_confirm {window_id, words}`, which may run until
-    /// `deadline`.
+    /// `callosum.pairing_qr_confirm {window_id, words}`, which may run for
+    /// `timeout`.
     Confirm {
         window_id: String,
         words: [String; 4],
-        deadline: Timestamp,
+        timeout: std::time::Duration,
     },
     /// Show this on Devices as the last action: the result of a window the
     /// overlay no longer shows.
@@ -205,13 +214,11 @@ impl std::fmt::Debug for Command {
                 .field("window_id", window_id)
                 .finish(),
             Command::Confirm {
-                window_id,
-                deadline,
-                ..
+                window_id, timeout, ..
             } => f
                 .debug_struct("Confirm")
                 .field("window_id", window_id)
-                .field("deadline", deadline)
+                .field("timeout", timeout)
                 .finish_non_exhaustive(),
             Command::Record { text, ok } => f
                 .debug_struct("Record")
@@ -247,8 +254,9 @@ pub enum Stage {
         until: Timestamp,
         named: bool,
     },
+    /// `None` when callosum's registry has no name for the phone.
     Granted {
-        device_name: String,
+        device_name: Option<String>,
     },
     Mismatch,
     NotPending,
@@ -257,6 +265,8 @@ pub enum Stage {
     Expired,
     LostContact,
     Unknown,
+    /// Callosum sent a watch notice ck can't read; the overlay stops there.
+    Unreadable,
 }
 
 impl Stage {
@@ -273,6 +283,7 @@ impl Stage {
                 | Stage::Expired
                 | Stage::LostContact
                 | Stage::Unknown
+                | Stage::Unreadable
         )
     }
 }
@@ -288,6 +299,7 @@ enum Outcome {
     Failed(String),
     LostContact,
     Unknown,
+    Unreadable,
     TouchIdRefused,
     Backoff,
 }
@@ -297,7 +309,9 @@ enum Outcome {
 #[derive(Clone, Debug)]
 struct Exchange {
     window_id: String,
-    device_name: Option<String>,
+    /// The claim's device name once the window is claimed; the inner `None`
+    /// when callosum's registry has no name for the phone.
+    device_name: Option<Option<String>>,
     /// Set while a confirm is in flight.
     confirm: Option<Timestamp>,
     /// The last confirm's deadline, which bounds a held watch.
@@ -434,21 +448,28 @@ impl Flow {
                 "Waiting for your phone…".into()
             }
             Stage::TouchId => "Waiting for Touch ID".into(),
-            Stage::TouchIdRefused => {
-                "Touch ID was declined or isn't available · ⏎ try again".into()
-            }
+            Stage::TouchIdRefused => "Touch ID was declined · ⏎ try again".into(),
             Stage::Backoff { until, named } => {
                 if *named {
                     let left = (until.unix_millis() - self.now.unix_millis()).max(0);
-                    format!("Too many tries · try again in {} s", (left + 999) / 1000)
+                    format!(
+                        "Touch ID is cooling down · try again in {} s",
+                        (left + 999) / 1000
+                    )
                 } else {
-                    "Too many tries · try again shortly".into()
+                    "Touch ID is cooling down · try again shortly".into()
                 }
             }
-            Stage::Granted { device_name } => format!("{device_name} is paired."),
+            Stage::Granted { device_name } => {
+                format!("{} is paired.", device_name.as_deref().unwrap_or(NO_NAME))
+            }
             Stage::Mismatch => "The words didn't match · this code is closed · ⏎ new code".into(),
-            Stage::NotPending => "This code is no longer open · ⏎ new code".into(),
-            Stage::Failed(code) => format!("Pairing failed: {code}"),
+            Stage::NotPending => "The claim expired or was cancelled · ⏎ scan a new code".into(),
+            Stage::Failed(code) => match refusal_sentence(code) {
+                Some(sentence) => format!("Pairing failed: {sentence}"),
+                None => format!("Pairing failed: {code}"),
+            },
+            Stage::Unreadable => "Callosum sent a pairing update ck can't read".into(),
             Stage::Declined => "Pairing was declined · ⏎ new code".into(),
             Stage::Expired => "The code expired · ⏎ new code".into(),
             Stage::LostContact => "Lost contact with callosum · ⏎ new code".into(),
@@ -537,6 +558,11 @@ impl Flow {
             Event::Opened { gen, result } => self.opened(gen, result),
             Event::Watch { window_id, event } => self.watch_event(&window_id, event),
             Event::WatchEnded { window_id } => self.watch_ended(&window_id),
+            Event::WatchUnreadable { window_id } => {
+                if let Some(i) = self.exchange(&window_id) {
+                    self.decide(i, Outcome::Unreadable);
+                }
+            }
             Event::Confirmed { window_id, result } => self.confirmed(&window_id, result),
         }
     }
@@ -774,7 +800,9 @@ impl Flow {
             if w.claim.is_some() && !self.stage.closed() && !self.group_gone() {
                 return self.move_word(1);
             }
-            if self.granted() {
+            // After a pairing, or a notice ck couldn't read, the overlay
+            // offers nothing more.
+            if self.granted() || self.stage == Stage::Unreadable {
                 return false;
             }
             let after = w.group.clone();
@@ -951,12 +979,11 @@ impl Flow {
             // Devices lists the new device at its next reading; read now.
             self.outbox.push(Command::ReadGroups);
         }
-        let name = x.device_name.clone();
         if shown {
             self.clear_words();
             self.stage = match outcome {
                 Outcome::Granted => Stage::Granted {
-                    device_name: name.unwrap_or_else(|| "Your phone".into()),
+                    device_name: x.device_name.clone().flatten(),
                 },
                 Outcome::Mismatch => Stage::Mismatch,
                 Outcome::Declined => Stage::Declined,
@@ -965,6 +992,7 @@ impl Flow {
                 Outcome::Failed(code) => Stage::Failed(code),
                 Outcome::LostContact => Stage::LostContact,
                 Outcome::Unknown => Stage::Unknown,
+                Outcome::Unreadable => Stage::Unreadable,
                 Outcome::TouchIdRefused => Stage::TouchIdRefused,
                 Outcome::Backoff => Stage::Backoff {
                     until: self.now.add_millis(BACKOFF_MS),
@@ -973,27 +1001,37 @@ impl Flow {
             };
             return;
         }
-        let who = name.as_deref().unwrap_or("a phone");
+        // Only a claimed window's confirm can outlive the overlay, so a
+        // window recorded here has always been claimed.
+        let who = match &x.device_name {
+            Some(Some(name)) => name.as_str(),
+            Some(None) => NO_NAME,
+            None => "the phone",
+        };
         let (text, ok) = match outcome {
-            Outcome::Granted => (
-                format!("{} is paired", name.as_deref().unwrap_or("A phone")),
-                true,
-            ),
+            Outcome::Granted => (format!("{who} is paired"), true),
             Outcome::Mismatch => (format!("Pairing {who}: the words didn't match"), false),
             Outcome::Declined => (format!("Pairing {who} was declined"), false),
             Outcome::Expired => (format!("Pairing {who}: the code expired"), false),
-            Outcome::NotPending => (format!("Pairing {who}: the code was no longer open"), false),
-            Outcome::Failed(code) => (format!("Pairing {who} failed: {code}"), false),
+            Outcome::NotPending => (
+                format!("Pairing {who}: the claim expired or was cancelled"),
+                false,
+            ),
+            Outcome::Failed(code) => match refusal_sentence(&code) {
+                Some(sentence) => (format!("Pairing {who} failed: {sentence}"), false),
+                None => (format!("Pairing {who} failed: {code}"), false),
+            },
             Outcome::LostContact => (format!("Pairing {who}: lost contact with callosum"), false),
             Outcome::Unknown => (
                 format!("Whether pairing {who} finished is unknown · check Devices"),
                 false,
             ),
-            Outcome::TouchIdRefused => (
-                format!("Pairing {who}: Touch ID was declined or isn't available"),
+            Outcome::Unreadable => (
+                format!("Pairing {who}: callosum sent a pairing update ck can't read"),
                 false,
             ),
-            Outcome::Backoff => (format!("Pairing {who}: too many tries"), false),
+            Outcome::TouchIdRefused => (format!("Pairing {who}: Touch ID was declined"), false),
+            Outcome::Backoff => (format!("Pairing {who}: Touch ID is cooling down"), false),
         };
         self.outbox.push(Command::Record { text, ok });
     }
@@ -1019,7 +1057,7 @@ impl Flow {
             w.word_sel = empty;
             return true;
         }
-        let deadline = w.expires_at.add_millis(CONFIRM_MARGIN_MS);
+        let deadline = self.now.add_millis(CONFIRM_TIMEOUT_MS as i64);
         let window_id = w.window_id.clone();
         let x = &mut self.exchanges[i];
         x.confirm = Some(deadline);
@@ -1029,7 +1067,7 @@ impl Flow {
         self.outbox.push(Command::Confirm {
             window_id,
             words,
-            deadline,
+            timeout: std::time::Duration::from_millis(CONFIRM_TIMEOUT_MS),
         });
         true
     }
@@ -1040,4 +1078,19 @@ impl Flow {
             w.word_sel = 0;
         }
     }
+}
+
+/// The plain sentence for a confirm refusal callosum documents, which reads
+/// after "Pairing failed: ". Codes it doesn't document have none, and show as
+/// they came.
+pub fn refusal_sentence(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "fed_not_authorized" => "callosum didn't authorize ck to confirm it",
+        "fed_bad_request" => "callosum couldn't read the confirm ck sent",
+        "fed_target_unavailable" => {
+            "callosum is missing its rendezvous credential, LAN listener or store"
+        }
+        "fed_not_ready" => "callosum isn't ready yet",
+        _ => return None,
+    })
 }

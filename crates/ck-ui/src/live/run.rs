@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use subc_client_rs::{
     ActivityCursor, ActivityQueryRequest, ActivityQueryResponse, ActivitySubscription, CallError,
     CallOptions, CloseRouteOptions, ConnectionState, ConsumerOptions, RouteHandle,
-    SpawnStreamError, SubcConsumer, SubscribeOptions, Subscription, SubscriptionEnd,
+    SpawnStreamError, SubcConsumer, SubscribeOptions, Subscription,
 };
 use subc_control::ActivityEntry as WireActivity;
 use subc_protocol::{BindIdentity, RouteTarget};
@@ -1389,7 +1389,6 @@ impl pairing::Callosum for DaemonCallosum {
                     consumer: Arc::clone(&conn.consumer),
                     handle,
                     sub,
-                    ended: false,
                 }) as Box<dyn WatchStream>),
                 Err(e) => {
                     let _ = conn
@@ -1408,32 +1407,16 @@ struct DaemonWatch {
     consumer: Arc<SubcConsumer>,
     handle: RouteHandle,
     sub: Subscription,
-    ended: bool,
 }
 
 impl WatchStream for DaemonWatch {
     fn next(&mut self) -> BoxFuture<'_, Option<Value>> {
         Box::pin(async move {
-            while !self.ended {
-                match self.sub.events().recv().await {
-                    Some(bytes) => {
-                        if let Ok(value) = serde_json::from_slice(&bytes) {
-                            return Some(value);
-                        }
-                    }
-                    None => {
-                        self.ended = true;
-                        // The terminal state may come as the subscription's
-                        // final reply rather than as a stream event.
-                        if let SubscriptionEnd::Response(bytes) = self.sub.ended().await {
-                            if let Ok(value) = serde_json::from_slice(&bytes) {
-                                return Some(value);
-                            }
-                        }
-                    }
-                }
-            }
-            None
+            // Each notice is one stream event; after a terminal state the
+            // stream ends. Bytes that aren't JSON come through as `null`,
+            // which the parser reports as unreadable.
+            let bytes = self.sub.events().recv().await?;
+            Some(serde_json::from_slice(&bytes).unwrap_or(Value::Null))
         })
     }
 

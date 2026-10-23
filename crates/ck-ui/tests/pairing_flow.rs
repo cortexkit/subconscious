@@ -186,7 +186,7 @@ impl Rig {
         self.watch(
             window_id,
             WatchEvent::Claimed(Claim {
-                device_name: device.into(),
+                device_name: Some(device.into()),
                 source_addr: "192.168.1.41".into(),
                 fingerprint: "4744 56dd 9c0e 21b8".into(),
             }),
@@ -525,7 +525,7 @@ fn a_held_watch_ends_at_the_confirm_deadline() {
     let mut rig = Rig::claimed("w-a");
     rig.press(KeyCode::Enter);
     rig.press(KeyCode::Esc);
-    rig.advance(600_000 + 4_000);
+    rig.advance(299_000);
     assert_eq!(rig.app.pairing.watched(), 1);
     rig.advance(1_000);
     assert_eq!(rig.app.pairing.watched(), 0);
@@ -560,7 +560,7 @@ fn step_one_wraps_the_from_line_and_fingerprint_without_losing_a_character() {
     rig.watch(
         "w-1",
         WatchEvent::Claimed(Claim {
-            device_name: "iPhone".into(),
+            device_name: Some("iPhone".into()),
             source_addr: addr.into(),
             fingerprint: fingerprint.clone(),
         }),
@@ -678,18 +678,46 @@ fn an_open_refused_for_an_unknown_group_reads_as_no_such_group() {
 }
 
 #[test]
-fn a_confirm_refused_bad_request_reads_pairing_failed() {
-    let mut rig = Rig::claimed("w-1");
-    rig.press(KeyCode::Enter);
-    rig.confirmed(
-        "w-1",
-        Err(ConfirmFailure::Refused(Refusal::code("fed_bad_request"))),
-    );
-    assert_eq!(
-        rig.status().as_deref(),
-        Some("Pairing failed: fed_bad_request")
-    );
-    assert!(rig.screen().contains("Pairing failed: fed_bad_request"));
+fn confirm_refusals_read_as_plain_sentences() {
+    for (code, line) in [
+        (
+            "fed_not_authorized",
+            "Pairing failed: callosum didn't authorize ck to confirm it",
+        ),
+        (
+            "fed_bad_request",
+            "Pairing failed: callosum couldn't read the confirm ck sent",
+        ),
+        (
+            "fed_target_unavailable",
+            "Pairing failed: callosum is missing its rendezvous credential, LAN listener or store",
+        ),
+        ("fed_not_ready", "Pairing failed: callosum isn't ready yet"),
+        (
+            "fed_pairing_not_pending",
+            "The claim expired or was cancelled · ⏎ scan a new code",
+        ),
+        (
+            "fed_operator_confirmation_refused",
+            "Touch ID was declined · ⏎ try again",
+        ),
+        (
+            "fed_operator_confirmation_backoff",
+            "Touch ID is cooling down · try again shortly",
+        ),
+        // A code callosum doesn't document still shows as it came.
+        ("fed_something_new", "Pairing failed: fed_something_new"),
+    ] {
+        let mut rig = Rig::claimed("w-1");
+        rig.press(KeyCode::Enter);
+        rig.confirmed("w-1", Err(ConfirmFailure::Refused(Refusal::code(code))));
+        assert_eq!(rig.status().as_deref(), Some(line), "{code}");
+        let first_words: String = line.chars().take(30).collect();
+        assert!(rig.screen().contains(&first_words), "{code}");
+        if code != "fed_something_new" {
+            assert!(!rig.screen().contains(code), "{code} shown raw");
+        }
+    }
 }
 
 #[test]
@@ -718,7 +746,7 @@ fn every_state_has_its_status_line() {
     );
     assert_eq!(
         rig.status().as_deref(),
-        Some("Touch ID was declined or isn't available · ⏎ try again")
+        Some("Touch ID was declined · ⏎ try again")
     );
     assert_eq!(rig.app.pairing.window.as_ref().unwrap().words[3], "river");
 
@@ -734,7 +762,7 @@ fn every_state_has_its_status_line() {
     );
     assert_eq!(
         rig.status().as_deref(),
-        Some("Too many tries · try again in 13 s")
+        Some("Touch ID is cooling down · try again in 13 s")
     );
     rig.press(KeyCode::Enter);
     assert_eq!(
@@ -754,7 +782,7 @@ fn every_state_has_its_status_line() {
     );
     assert_eq!(
         rig.status().as_deref(),
-        Some("Too many tries · try again shortly")
+        Some("Touch ID is cooling down · try again shortly")
     );
     rig.advance(29_000);
     rig.press(KeyCode::Enter);
@@ -770,7 +798,7 @@ fn every_state_has_its_status_line() {
     );
     assert_eq!(
         rig.status().as_deref(),
-        Some("This code is no longer open · ⏎ new code")
+        Some("The claim expired or was cancelled · ⏎ scan a new code")
     );
     assert_eq!(rig.app.pairing.window.as_ref().unwrap().words[0], "");
 
@@ -822,15 +850,40 @@ fn every_state_has_its_status_line() {
 // ---- timing and races -----------------------------------------------------------------
 
 #[test]
-fn the_confirm_may_run_until_the_window_expires_plus_five_seconds() {
+fn the_confirm_call_may_run_for_300_s() {
     let mut rig = Rig::claimed("w-1");
     rig.press(KeyCode::Enter);
-    let expires = rig.app.pairing.window.as_ref().unwrap().expires_at;
-    let deadline = rig.sent.iter().find_map(|c| match c {
-        Command::Confirm { deadline, .. } => Some(*deadline),
+    let timeout = rig.sent.iter().find_map(|c| match c {
+        Command::Confirm { timeout, .. } => Some(*timeout),
         _ => None,
     });
-    assert_eq!(deadline, Some(expires.add_millis(5_000)));
+    assert_eq!(timeout, Some(std::time::Duration::from_secs(300)));
+}
+
+#[test]
+fn a_confirm_waits_past_the_window_expiry() {
+    let mut rig = Rig::new();
+    rig.open_overlay();
+    rig.reply_to(1, "w-1", &typical_payload(), 30_000);
+    rig.claim("w-1", "iPhone");
+    rig.type_text("maple orbit candle river");
+    rig.press(KeyCode::Enter);
+    // Past the window's expiry and the claim's 120 s, with Touch ID still
+    // pending: the confirm is still waited for.
+    rig.advance(200_000);
+    assert_eq!(rig.status().as_deref(), Some("Waiting for Touch ID"));
+    rig.confirmed("w-1", Ok(Verdict::Granted));
+    assert_eq!(rig.status().as_deref(), Some("iPhone is paired."));
+    // Without a reply, the confirm counts as lost at 300 s.
+    let mut rig = Rig::claimed("w-1");
+    rig.press(KeyCode::Enter);
+    rig.advance(299_000);
+    assert_eq!(rig.status().as_deref(), Some("Waiting for Touch ID"));
+    rig.advance(1_000);
+    assert_eq!(
+        rig.status().as_deref(),
+        Some("Whether pairing finished is unknown · check Devices · ⏎ new code")
+    );
 }
 
 #[test]

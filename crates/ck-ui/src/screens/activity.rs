@@ -447,8 +447,8 @@ fn flatten_into(key: String, v: &Value, home: Option<&str>, out: &mut Vec<Detail
 /// An entry's details as rows, keys in sorted byte order at every level.
 /// A nested object's keys join their parent's with a dot (`a.b`). An array
 /// of scalars is one row, its items joined with ", "; any other array gives
-/// each item its index (`a[0].b`). A string that starts with the home
-/// folder `home` shows it as `~`.
+/// each item its index (`a[0].b`). A string that is the home folder
+/// `home`, or starts with it followed by a path separator, shows it as `~`.
 pub fn detail_rows(details: &Map<String, Value>, home: Option<&str>) -> Vec<DetailRow> {
     let mut out = Vec::new();
     for (k, v) in sorted(details) {
@@ -481,9 +481,10 @@ pub struct DetailsView {
 /// line of its own above its value.
 pub const DETAIL_KEY_MAX: usize = 20;
 
-/// Splits `text` into lines of at most `n` columns, at spaces where it can
-/// and inside a word longer than a line, so that no character is dropped.
-/// A line break in `text` starts a new line.
+/// Splits `text` into lines of at most `n` columns (at least 1), at spaces
+/// where it can and inside a word longer than a line, so that no character
+/// is dropped; a character wider than the limit still takes a line of its
+/// own. A line break in `text` starts a new line.
 fn wrap_whole(text: &str, n: usize) -> Vec<String> {
     let n = n.max(1);
     let mut out = Vec::new();

@@ -74,6 +74,14 @@ A module-authored `fed_` code is rewrapped as serving-authored `executor_error`;
 `end_module_error_rewrapped` pins the canonical bytes and the original input.
 An unknown reason retains its opaque body without parsing it as JSON.
 
+For `end {completed}` and `end {module_error}`, the server writes every notice
+the module sent before ending ahead of the `end` (fed-wire §8.9). If that
+backlog stalls while the session stays up, the subscription ends `lagged`
+instead: none of the remaining notices could be written for 240 s after the
+module ended the stream, so the backlog is discarded. Each notice written
+restarts the 240 s. These vectors carry no time, so this case needs an
+implementation test, like the queue behaviour noted under `sessions.json`.
+
 ## File format
 
 `frames.json` has `format`, `schema`, `cases` and `streams`:

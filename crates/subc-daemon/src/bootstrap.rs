@@ -1150,7 +1150,7 @@ async fn ensure_singleton_inner(
 ) -> Result<Outcome, BootstrapError> {
     let path = config.connection_file_path;
 
-    if matches!(probe_existing(&path).await?, Probe::Live) {
+    if stable_peer(&path).await? {
         return Ok(Outcome::AlreadyRunning);
     }
 
@@ -1159,7 +1159,7 @@ async fn ensure_singleton_inner(
     // Re-probe after acquiring the start lock so a peer that won the race between
     // our first failed probe and the lock acquisition is observed instead of
     // overwritten.
-    if matches!(probe_existing(&path).await?, Probe::Live) {
+    if stable_peer(&path).await? {
         return Ok(Outcome::AlreadyRunning);
     }
 
@@ -1250,6 +1250,19 @@ async fn ensure_singleton_inner(
 enum Probe {
     Live,
     StaleOrAbsent,
+}
+
+async fn stable_peer(path: &Path) -> Result<bool, BootstrapError> {
+    if !matches!(probe_existing(path).await?, Probe::Live) {
+        return Ok(false);
+    }
+    // A terminating peer can still authenticate while its listeners drain.
+    // Require another proof after a short settling interval before reporting
+    // a successful duplicate start. If the peer left, proceed with startup;
+    // any remaining bind/ownership conflict is an error, not exit 0 (which
+    // would suppress launchd's restart-on-failure policy).
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    Ok(matches!(probe_existing(path).await?, Probe::Live))
 }
 
 async fn probe_existing(path: &Path) -> Result<Probe, BootstrapError> {
@@ -2385,6 +2398,32 @@ mod tests {
                 .unwrap()
                 .port,
             9012
+        );
+    }
+
+    #[tokio::test]
+    async fn singleton_does_not_accept_a_peer_that_answers_once_then_exits() {
+        let (_dir, path) = temp_connection_file_path("departing-peer");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let info = make_connection_info(listener.local_addr().unwrap().port());
+        write_connection_file(&path, &info).unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            subc_transport::authenticate_server(
+                &mut stream,
+                &info.key,
+                &info.daemon_id,
+                &info.daemon_ver,
+                PROBE_AUTH_DEADLINE,
+            )
+            .await
+            .unwrap();
+        });
+        let outcome = ensure_singleton(&path, 0).await.unwrap();
+        peer.await.unwrap();
+        assert!(
+            matches!(outcome, Outcome::Bound(_)),
+            "a departing peer is not AlreadyRunning"
         );
     }
 

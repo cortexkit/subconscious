@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.37
+
+- A duplicate daemon start verifies an authenticating peer again after a 1.5-second settling interval before exiting successfully. If the peer disappears, the starter continues through normal singleton locking and binding instead of reporting success for a departing daemon. A remaining bind or ownership conflict still fails, allowing launchd's restart-on-failure policy to retry; a healthy peer still produces exit 0.
+
 ## 0.36.36
 
 - Report the loaded configuration's `configured_enabled` in `supervisor.list` entries, omitting it for modules without a configured entry. Lifecycle acknowledgements are unchanged. This exposes temporary runtime start/stop overrides without changing reconciliation: every rescan or daemon restart reapplies the file's enabled values, even for unchanged entries. Requires subc-control 0.32.6.

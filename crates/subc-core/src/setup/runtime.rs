@@ -2,9 +2,15 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde_json::{Map, Value};
+
+mod lifecycle;
+pub(crate) use lifecycle::wait_for_service_ready;
+use lifecycle::{connected_daemon, daemon_processes, wait_for_exit};
 
 #[cfg(unix)]
 use super::file_modes;
@@ -84,11 +90,33 @@ impl CommandResult {
 
 pub trait CommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String>;
+
+    fn daemon_processes(&mut self, daemon: &Path) -> Result<Vec<DaemonProcess>, String> {
+        daemon_processes(self, daemon)
+    }
+
+    fn process_running(&mut self, process: &DaemonProcess) -> bool {
+        subc_os::start_time(process.pid) == Some(process.start_time)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DaemonProcess {
+    pub pid: u32,
+    pub start_time: u64,
 }
 
 impl<R: CommandRunner + ?Sized> CommandRunner for Box<R> {
     fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String> {
         (**self).run(program, args)
+    }
+
+    fn daemon_processes(&mut self, daemon: &Path) -> Result<Vec<DaemonProcess>, String> {
+        (**self).daemon_processes(daemon)
+    }
+
+    fn process_running(&mut self, process: &DaemonProcess) -> bool {
+        (**self).process_running(process)
     }
 }
 
@@ -852,6 +880,16 @@ pub fn restart_with_definition<R: CommandRunner>(
     runner: &mut R,
     inventory: &mut Inventory,
 ) -> Result<String, String> {
+    restart_with_definition_at(platform, paths, runner, inventory, None)
+}
+
+pub(crate) fn restart_with_definition_at<R: CommandRunner>(
+    platform: RuntimePlatform,
+    paths: &RuntimePaths,
+    runner: &mut R,
+    inventory: &mut Inventory,
+    connection: Option<&Path>,
+) -> Result<String, String> {
     let status = observe(platform, runner)?;
     if let RuntimeState::Unowned { reason } =
         definition_state(platform, paths, status, runner, inventory)?
@@ -859,6 +897,11 @@ pub fn restart_with_definition<R: CommandRunner>(
         return Err(format!("refusal: {reason}"));
     }
     let desired = desired_definition_checked(platform, paths)?;
+    let old = if platform != RuntimePlatform::Linux {
+        connected_daemon(runner, &paths.daemon, connection)?
+    } else {
+        None
+    };
     let mut details = Vec::new();
     let commands = restart_commands(platform, &paths.definition);
     for (index, (program, args)) in commands.into_iter().enumerate() {
@@ -901,6 +944,13 @@ pub fn restart_with_definition<R: CommandRunner>(
             }
         } else {
             details.push(format!("{program} {} completed", args.join(" ")));
+        }
+        if index == 0 && platform != RuntimePlatform::Linux {
+            wait_for_exit(
+                runner,
+                old.as_ref(),
+                Duration::from_secs(DAEMON_STOP_TIMEOUT_SECS + 5),
+            )?;
         }
     }
     Ok(details.join("; "))
@@ -1134,42 +1184,51 @@ fn platform_binary(name: &str) -> String {
 /// after replacing the daemon binary; setup uses it when a live daemon must
 /// pick up a restart-required configuration change. One verb table so the two
 /// callers cannot drift.
-/// Restarts the daemon under its service manager after its binary was
-/// replaced in place. `definition` is the service definition file (the
-/// LaunchAgent plist on macOS); the other platforms restart by unit or
-/// task name and ignore it.
-pub fn restart_via_service_manager(definition: &Path) -> Result<String, String> {
-    restart_via_service_manager_on(RuntimePlatform::current(), definition)
+/// `paths` identifies the installed daemon image and service definition. The
+/// image check prevents a stale connection file from making restart wait for
+/// an unrelated process that reused the old PID.
+pub fn restart_via_service_manager(paths: &RuntimePaths) -> Result<String, String> {
+    let platform = RuntimePlatform::current();
+    let mut runner = SystemCommandRunner;
+    let old = if platform != RuntimePlatform::Linux {
+        connected_daemon(&mut runner, &paths.daemon, None)?
+    } else {
+        None
+    };
+    restart_via_service_manager_on(platform, &paths.definition, &mut runner, old.as_ref())
 }
 
-fn restart_via_service_manager_on(
+fn restart_via_service_manager_on<R: CommandRunner>(
     platform: RuntimePlatform,
     definition: &Path,
+    runner: &mut R,
+    old: Option<&DaemonProcess>,
 ) -> Result<String, String> {
     let mut details = Vec::new();
     for (index, (program, args)) in restart_commands(platform, definition)
         .into_iter()
         .enumerate()
     {
-        let output = Command::new(&program)
-            .args(&args)
-            .output()
-            .map_err(|error| format!("could not run {program}: {error}"))?;
-        if output.status.success() {
+        let output = runner.run(&program, &args)?;
+        // A Windows task that is already stopped still needs /Run, and an
+        // unloaded macOS agent still needs bootstrap. Only the stop command
+        // may fail without aborting; the captured process must still exit.
+        if output.success {
             details.push(format!("{program} {} completed", args.join(" ")));
-            continue;
+        } else if index != 0 || platform == RuntimePlatform::Linux {
+            return Err(format!(
+                "{program} {} failed: {}",
+                args.join(" "),
+                output.explanation()
+            ));
         }
-        // The first step stops what is running and is best-effort on every
-        // platform: a Windows task that is already stopped still needs /Run,
-        // and a macOS agent that is not loaded still needs bootstrap.
-        if index == 0 && matches!(platform, RuntimePlatform::Windows | RuntimePlatform::Macos) {
-            continue;
+        if index == 0 && platform != RuntimePlatform::Linux {
+            wait_for_exit(
+                runner,
+                old,
+                Duration::from_secs(DAEMON_STOP_TIMEOUT_SECS + 5),
+            )?;
         }
-        return Err(format!(
-            "{program} {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
     }
     Ok(details.join("; "))
 }
@@ -2182,6 +2241,8 @@ mod reconciliation_tests {
         calls: Vec<String>,
         paths: RuntimePaths,
         task_xml: String,
+        old: Option<DaemonProcess>,
+        exit_polls: usize,
     }
     impl CommandRunner for Manager {
         fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String> {
@@ -2191,6 +2252,10 @@ mod reconciliation_tests {
                 .first()
                 .is_some_and(|s| s == "bootstrap" || s == "/Run")
             {
+                assert!(
+                    self.old.is_none() || self.exit_polls >= 3,
+                    "start raced old process"
+                );
                 let text = fs::read_to_string(&self.paths.definition).unwrap();
                 assert!(
                     text.contains("RestartOnFailure") || text.contains("SuccessfulExit"),
@@ -2207,6 +2272,15 @@ mod reconciliation_tests {
                 stdout,
                 stderr: String::new(),
             })
+        }
+
+        fn daemon_processes(&mut self, _: &Path) -> Result<Vec<DaemonProcess>, String> {
+            Ok(self.old.iter().cloned().collect())
+        }
+
+        fn process_running(&mut self, _: &DaemonProcess) -> bool {
+            self.exit_polls += 1;
+            self.exit_polls < 3
         }
     }
     fn fixture(
@@ -2232,6 +2306,8 @@ mod reconciliation_tests {
             calls: vec![],
             paths: paths.clone(),
             task_xml: text,
+            old: None,
+            exit_polls: 0,
         };
         (root, paths, inventory, manager)
     }
@@ -2379,6 +2455,43 @@ mod reconciliation_tests {
             .calls
             .iter()
             .all(|s| s.contains("Export-ScheduledTask")));
+    }
+
+    #[test]
+    fn upgrade_definition_restart_waits_for_the_connected_daemon() {
+        for platform in [RuntimePlatform::Windows, RuntimePlatform::Macos] {
+            let (root, paths, mut inventory, mut manager) = fixture(platform, true, true);
+            let connection = root.join("connection.json");
+            subc_transport::write_atomic(
+                &connection,
+                &subc_transport::ConnectionInfo {
+                    schema: subc_transport::SCHEMA_VERSION,
+                    wire_version: Some(subc_protocol::PROTOCOL_VERSION),
+                    endpoints: vec![subc_transport::Endpoint {
+                        host: "127.0.0.1".into(),
+                        port: 1,
+                    }],
+                    key: vec![7; 32],
+                    daemon_id: [8; 16],
+                    pid: 123,
+                    daemon_ver: "test".into(),
+                },
+            )
+            .unwrap();
+            manager.old = Some(DaemonProcess {
+                pid: 123,
+                start_time: 1,
+            });
+            restart_with_definition_at(
+                platform,
+                &paths,
+                &mut manager,
+                &mut inventory,
+                Some(&connection),
+            )
+            .unwrap();
+            assert_eq!(manager.exit_polls, 3);
+        }
     }
 
     #[test]

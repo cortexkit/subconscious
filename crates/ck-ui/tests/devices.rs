@@ -65,12 +65,12 @@ fn live(reply: &Value) -> Snapshot {
 
 #[test]
 fn kind_words_are_computer_simulator_phone_or_unknown() {
-    let mut r = reply(5);
+    let mut r = reply(6);
     for (d, class) in r["result"]["devices"]
         .as_array_mut()
         .unwrap()
         .iter_mut()
-        .zip(["mac", "sim", "phone", "future", "unknown"])
+        .zip(["computer", "mac", "sim", "phone", "future", "unknown"])
     {
         d["device_class"] = json!(class);
     }
@@ -82,7 +82,14 @@ fn kind_words_are_computer_simulator_phone_or_unknown() {
             .iter()
             .map(|d| d.kind.as_str())
             .collect::<Vec<_>>(),
-        ["computer", "simulator", "phone", "unknown", "unknown"]
+        [
+            "computer",
+            "computer",
+            "simulator",
+            "phone",
+            "unknown",
+            "unknown"
+        ]
     );
 }
 

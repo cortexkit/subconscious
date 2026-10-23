@@ -1,4 +1,4 @@
- ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings      This computer  20:48 
 ────────────────━━━━━━──────────────────────────────────────────────────────────────────────────────────────────────────
                                                                                                                         
   ▲ 2 things need attention   ·   23 of 25 modules healthy   ·   5 agents working                                       
@@ -6,7 +6,7 @@
    ▲ engram             Cloud backup 2 days behind · uploading generation 45                       since 18:20      ⏎   
    ▲ thalamus-harness   OpenCode configuration is missing or unreadable                            since 09:30          
                                                                                                                         
-  Modules               23 ok · 2 degraded   Usage                       this week   This Mac                 4f1a9c2e  
+  Modules               23 ok · 2 degraded   Usage                       this week   This computer            4f1a9c2e  
   ────────────────────────────────────────   ─────────────────────────────────────   ─────────────────────────────────  
   ● aft               ● insula               Claude      ███████████████▍██    85%   Daemon       0.36.17 · up 9h 15m   
   ● astrocyte         ● magic-context                    resets in 9h 25m            Clients      366 connected         
@@ -18,7 +18,7 @@
   ● ckbus             ● subc-mcp                         resets in 1d 21h            Backups      ▲ last upload 2d ago  
   ● claustrum         ● synapse              Cursor      ██████████████████     0%                uploading now         
   ● condition-runner  ● thalamus                         resets in 23h 42m                                              
-  ▲ engram            ▲ thalamus-harness                                             Devices      ● Mac 2  ● iPhone +1  
+  ▲ engram            ▲ thalamus-harness                                             Devices      ● Box 2  ● iPhone +1  
   ● entorhinal        ● wernicke                                                     Approvals    none waiting          
   ● fusiform                                                                                                            
                                                                                                                         

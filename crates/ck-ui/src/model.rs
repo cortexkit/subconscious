@@ -356,7 +356,7 @@ pub enum Daemon {
 /// UTC offset for clock times, and its memory, disk and load.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Host {
-    /// How the top bar names this machine, such as "This Mac".
+    /// How the top bar names this machine, such as "This computer".
     pub label: String,
     pub machine_id: Option<String>,
     pub utc_offset: UtcOffset,
@@ -521,7 +521,7 @@ pub struct ActivityRow {
     pub who: Option<String>,
     /// Who asked for it as the detail pane's By row words it, when that
     /// says more than `who`. Only the design fixture has such wording (its
-    /// "ck on this Mac"); the live app leaves it `None`, and the pane reads
+    /// "ck on this computer"); the live app leaves it `None`, and the pane reads
     /// `who`.
     pub by: Option<String>,
     /// Whether the actor carries an agent id: the Agents chip lists these.
@@ -705,7 +705,7 @@ pub struct Devices {
 }
 
 /// A group of operations a paired device may call: one key of the
-/// `expose_profiles` map in this Mac's `fed-profile.json`.
+/// `expose_profiles` map in this computer's `fed-profile.json`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccessGroup {
     pub name: String,
@@ -1153,7 +1153,7 @@ mod fixture {
     /// happened, who did it and a short kind word ("module", "approval",
     /// "config", "agent", "flow"). The rest is the frame's: every entry
     /// recorded at 36 seconds past its minute, seqs counting down from
-    /// 48,213, the ledger kind each kind word stands for, "ck on this Mac"
+    /// 48,213, the ledger kind each kind word stands for, "ck on this computer"
     /// as the By row for ck, and for a restart on a build the old build
     /// 7c3a47b9 with the frame's details.
     fn activity_log(v: &Value, now: Timestamp) -> ActivityLog {
@@ -1187,7 +1187,7 @@ mod fixture {
                     partner: None,
                     row: ActivityRowKind::Entry,
                     at: today(now, &format!("{}:36", a["t"].as_str().unwrap_or("00:00"))),
-                    by: (who == "ck").then(|| "ck on this Mac".to_string()),
+                    by: (who == "ck").then(|| "ck on this computer".to_string()),
                     by_agent: word == "agent",
                     who: Some(who),
                     kind: Some(kind),
@@ -1297,7 +1297,7 @@ mod fixture {
             .map(|l| l.as_str().and_then(|t| t.parse().ok()).unwrap_or(0.0))
             .collect();
         let host = Host {
-            label: "This Mac".into(),
+            label: "This computer".into(),
             machine_id: Some("4f1a9c2e7b3d40c8a6e5d1b2c3f40912".into()),
             utc_offset: UtcOffset::UTC,
             home: None,

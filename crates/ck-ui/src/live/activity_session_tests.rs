@@ -207,7 +207,7 @@ struct Run {
 
 impl Run {
     fn start(ledger: &ScriptedLedger, showing: Showing) -> Run {
-        let state = State::empty("This Mac");
+        let state = State::empty("This computer");
         let (tx, _rx) = watch::channel(assemble(&state, now()));
         let shared = Arc::new(Shared {
             state: Mutex::new(state),

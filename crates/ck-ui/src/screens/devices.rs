@@ -1,4 +1,4 @@
-//! Paired devices and the addresses and feeds this Mac offers.
+//! Paired devices and the addresses and feeds this computer offers.
 //!
 //! The list keeps three rows before dropping either panel below it, lowest
 //! first. When it overflows, its last row counts every device not on screen.
@@ -124,7 +124,7 @@ pub fn draw(c: &mut Canvas, v: &View, state: &DevicesState) {
         &snap.host.data.label,
     );
     let rx = c.w / 2 + 2;
-    heading(c, 2, 3, c.w / 2 - 6, "This Mac", "");
+    heading(c, 2, 3, c.w / 2 - 6, "This computer", "");
     heading(c, rx, 3, c.w - rx - 2, "Reachable as", "");
     let left_room = (rx - 18).max(0) as usize;
     let field = |c: &mut Canvas, y, label, value: &str| {
@@ -147,7 +147,7 @@ pub fn draw(c: &mut Canvas, v: &View, state: &DevicesState) {
     field(c, 6, "Daemon", &daemon);
     if design {
         field(c, 7, "Account", "signed in · relay connected");
-        field(c, 8, "Vault", "88 credentials · Touch ID protected");
+        field(c, 8, "Vault", "88 credentials · protected");
     }
     let room = (c.w - rx - 16).max(0) as usize;
     let lan = devices
@@ -315,12 +315,12 @@ fn recent(c: &mut Canvas, y: i32) {
         ("18:02", "iPhone", "answered an approval for IRIS"),
         (
             "11:31",
-            "CortexKit Mac 2",
+            "CortexKit Box 2",
             "reconnected after its daemon restarted",
         ),
         (
             "09:36",
-            "CortexKit Mac 2",
+            "CortexKit Box 2",
             "connected directly over the LAN",
         ),
     ]

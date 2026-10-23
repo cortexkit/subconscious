@@ -290,7 +290,7 @@ fn fusiform_model_count_is_unknown_until_counted() {
 fn devices_online_means_an_established_tunnel_and_refusals_keep_their_code() {
     let reply = json!({
         "devices": [
-            { "name": "CortexKit Mac 2", "fingerprint": "f1", "device_class": "mac", "trust": "verified",
+            { "name": "CortexKit Box 2", "fingerprint": "f1", "device_class": "computer", "trust": "verified",
               "tunnel": "established", "carrier": "direct", "since_unix_ms": NOW - 9_000,
               "last_seen_unix_ms": NOW - 2_000, "subscriptions_live": 0 },
             { "name": "iPhone", "fingerprint": "f2", "device_class": "phone", "trust": "verified",
@@ -305,7 +305,8 @@ fn devices_online_means_an_established_tunnel_and_refusals_keep_their_code() {
     let d = map::devices(&reply, now()).unwrap();
     assert_eq!(d.online, 1);
     assert_eq!(d.list.len(), 2);
-    assert_eq!(d.list[0].short_name, "Mac 2");
+    assert_eq!(d.list[0].short_name, "Box 2");
+    assert_eq!(d.list[0].kind, "computer");
     assert_eq!(d.list[0].status, Status::Ok);
     assert_eq!(d.list[0].seen, "now");
     assert_eq!(d.list[1].status, Status::Stopped);
@@ -355,10 +356,10 @@ fn agents_join_state_and_place_on_exact_ids() {
     let places = map::agent_places(
         &json!({ "result": { "agents": [
             { "agentId": "a1", "status": "held_here", "known": true, "stale": false },
-            { "agentId": "a2", "status": "held_elsewhere", "holder_name": "Mac 2", "known": true, "stale": false },
+            { "agentId": "a2", "status": "held_elsewhere", "holder_name": "Box 2", "known": true, "stale": false },
             { "agentId": "a3", "status": "unclaimed", "known": true, "stale": false }
         ]}}),
-        "This Mac",
+        "This computer",
     )
     .unwrap();
     let counts = map::fleet_counts(&json!({ "result": {
@@ -374,8 +375,8 @@ fn agents_join_state_and_place_on_exact_ids() {
     assert_eq!(
         rows,
         [
-            ("ARGUS", "working", "This Mac"),
-            ("IRIS", "idle 4m", "Mac 2"),
+            ("ARGUS", "working", "This computer"),
+            ("IRIS", "idle 4m", "Box 2"),
             ("NOX", "unknown", "unclaimed"),
         ]
     );
@@ -404,7 +405,7 @@ fn without_state_every_agent_is_unknown_never_idle() {
 
 #[test]
 fn a_refused_residence_source_shows_its_code_on_the_agents_panel() {
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     s.identities
         .set(map::agent_identities(&identity_reply()).unwrap(), now());
     s.residences.fail("principal_not_permitted");
@@ -419,7 +420,7 @@ fn a_refused_residence_source_shows_its_code_on_the_agents_panel() {
 
 #[test]
 fn a_module_that_isnt_installed_says_so_instead_of_zeros() {
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     s.record_roster(Vec::new(), now());
     s.health.set(Vec::new(), now());
     let snap = assemble(&s, now());
@@ -522,7 +523,7 @@ fn a_restart_reports_the_new_pid_and_its_time_to_healthy() {
         generation: 1,
         spawned_at: started.add_millis(-60_000),
     };
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     s.processes.insert("broca".into(), before);
     let (phase, done) = action_progress(
         &s,
@@ -739,15 +740,15 @@ fn where_many_maps_the_wrapped_reply_and_counts_machines() {
     let ids = map::agent_identities(&identity_reply()).unwrap();
     let reply = json!({ "result": { "agents": [
         { "agent_id": "a1", "status": "held_here", "holder": "m-here", "holder_name": "alex-mac", "epoch": 3, "known": true, "stale": false },
-        { "agent_id": "a2", "status": "held_elsewhere", "holder": "m-2", "holder_name": "Mac 2", "epoch": 9, "known": true, "stale": false },
+        { "agent_id": "a2", "status": "held_elsewhere", "holder": "m-2", "holder_name": "Box 2", "epoch": 9, "known": true, "stale": false },
         { "agent_id": "a3", "status": "unclaimed", "holder": null, "holder_name": null, "epoch": 0, "known": true, "stale": false }
     ]}});
-    let places = map::agent_places(&reply, "This Mac").unwrap();
-    assert_eq!(places.get("a1").map(String::as_str), Some("This Mac"));
-    assert_eq!(places.get("a2").map(String::as_str), Some("Mac 2"));
+    let places = map::agent_places(&reply, "This computer").unwrap();
+    assert_eq!(places.get("a1").map(String::as_str), Some("This computer"));
+    assert_eq!(places.get("a2").map(String::as_str), Some("Box 2"));
     assert_eq!(places.get("a3").map(String::as_str), Some("unclaimed"));
     let a = map::agents(&ids, None, Some(&places), (None, None), now());
-    // This Mac and Mac 2; the unclaimed agent is on no machine.
+    // This computer and Box 2; the unclaimed agent is on no machine.
     assert_eq!(a.machines, Some(2));
 }
 
@@ -755,12 +756,12 @@ fn where_many_maps_the_wrapped_reply_and_counts_machines() {
 fn devices_list_online_first() {
     let reply = json!({ "devices": [
         { "name": "alex-iphone-sim", "device_class": "sim", "trust": "verified", "tunnel": "closed:idle", "subscriptions_live": 0 },
-        { "name": "CortexKit Mac 2", "device_class": "mac", "trust": "verified", "tunnel": "established", "subscriptions_live": 0 },
+        { "name": "CortexKit Box 2", "device_class": "mac", "trust": "verified", "tunnel": "established", "subscriptions_live": 0 },
         { "name": "iPhone", "device_class": "phone", "trust": "verified", "tunnel": "established", "subscriptions_live": 1 }
     ]});
     let d = map::devices(&reply, now()).unwrap();
     let names: Vec<&str> = d.list.iter().map(|x| x.short_name.as_str()).collect();
-    assert_eq!(names, ["Mac 2", "iPhone", "alex-iphone-sim"]);
+    assert_eq!(names, ["Box 2", "iPhone", "alex-iphone-sim"]);
     assert_eq!(d.online, 2);
 }
 
@@ -798,7 +799,7 @@ fn the_caches_truncation_marker_is_never_shown_as_metrics() {
     ));
 
     // With the module selected, its pane shows the fresh probe's metrics.
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     let roster: Vec<subc_control::SupervisorEntry> = serde_json::from_value(json!([
         { "module_id": "aft", "state": "running", "enabled": true, "live": true, "health": "ok" }
     ]))
@@ -854,20 +855,20 @@ async fn where_many_waits_for_identity_then_asks_in_batches_of_64() {
                 sent.lock().unwrap().push(params);
                 let rows: Vec<Value> = ids
                     .iter()
-                    .map(|id| json!({ "agent_id": id, "status": "held_elsewhere", "holder_name": "Mac 2" }))
+                    .map(|id| json!({ "agent_id": id, "status": "held_elsewhere", "holder_name": "Box 2" }))
                     .collect();
                 Ok::<Value, ck_ui::model::Fault>(json!({ "result": { "agents": rows } }))
             }
         }
     };
     // No agent ids yet: no call at all.
-    let none = ck_ui::live::where_many_round(&[], "This Mac", call(Arc::clone(&sent))).await;
+    let none = ck_ui::live::where_many_round(&[], "This computer", call(Arc::clone(&sent))).await;
     assert!(none.is_none());
     assert!(sent.lock().unwrap().is_empty());
 
     // 70 agents: two calls, 64 and 6 ids, merged.
     let ids: Vec<String> = (0..70).map(|i| format!("agent-{i}")).collect();
-    let places = ck_ui::live::where_many_round(&ids, "This Mac", call(Arc::clone(&sent)))
+    let places = ck_ui::live::where_many_round(&ids, "This computer", call(Arc::clone(&sent)))
         .await
         .unwrap()
         .unwrap();
@@ -876,7 +877,7 @@ async fn where_many_waits_for_identity_then_asks_in_batches_of_64() {
     assert_eq!(sent[0]["agentIds"].as_array().unwrap().len(), 64);
     assert_eq!(sent[1]["agentIds"].as_array().unwrap().len(), 6);
     assert_eq!(places.len(), 70);
-    assert_eq!(places["agent-69"], "Mac 2");
+    assert_eq!(places["agent-69"], "Box 2");
 }
 
 // ---- usage rows shared with ck quota ----------------------------------------------------
@@ -1059,7 +1060,7 @@ fn motor_roster_and_truncated_cache(s: &mut State) {
 
 #[test]
 fn a_truncated_cache_entry_is_read_from_the_modules_direct_probe() {
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     motor_roster_and_truncated_cache(&mut s);
     // Due for a probe, and nothing to show until it arrives.
     assert_eq!(s.truncated_due(now()), ["motor"]);
@@ -1141,7 +1142,7 @@ fn running(id: &str) -> Value {
 
 #[test]
 fn a_module_starting_up_reads_as_starting_not_unknown() {
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     // insula's new process started 5 s ago and has had no health check.
     s.processes.insert(
         "insula".into(),
@@ -1187,7 +1188,7 @@ fn a_module_starting_up_reads_as_starting_not_unknown() {
 
 #[test]
 fn a_usage_code_never_shows_as_the_value() {
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     s.record_roster(roster(json!([running("insula")])), now());
     let reply = json!({ "result": [
         { "provider": "claude", "account": "acct-1", "error": "upstream returned 500",
@@ -1208,7 +1209,7 @@ fn a_usage_code_never_shows_as_the_value() {
 
 #[test]
 fn three_problems_keep_the_spacer_and_give_up_a_row() {
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     let entries = ["aft", "broca", "engram", "motor"]
         .iter()
         .map(|id| {
@@ -1237,7 +1238,7 @@ fn three_problems_keep_the_spacer_and_give_up_a_row() {
 #[test]
 fn the_sources_own_typing_decides_code_or_sentence() {
     let devices_row = |reply: Value| -> String {
-        let mut s = State::empty("This Mac");
+        let mut s = State::empty("This computer");
         s.record_roster(roster(json!([running("callosum")])), now());
         match map::devices(&reply, now()) {
             Ok(d) => s.devices.set(d, now()),
@@ -1335,7 +1336,7 @@ fn retained_exit(module: &str, at_ms: i64) -> Vec<ProcessEvent> {
 
 #[test]
 fn an_exit_from_both_feeds_renders_once() {
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     first_page(&mut s, page(vec![], None));
     // The spawn feed saw the exit (with its pid) 2 s after the daemon's
     // journal stamped it; the journal keeps it too.
@@ -1354,7 +1355,7 @@ fn an_exit_from_both_feeds_renders_once() {
 
 #[test]
 fn a_ledger_restart_renders_once() {
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     let started = lifecycle(11, NOW as u64 + 2_000, "started", "plexus", json!({}));
     let restarted = lifecycle(10, NOW as u64, "restarted", "plexus", json!({}));
     first_page(&mut s, page(vec![started, restarted], None));
@@ -1388,7 +1389,7 @@ fn a_ledger_restart_renders_once() {
 /// Activity list and Home read it: the summary after the subject, the Build
 /// row, and Home's row.
 fn restart_reads(old: Value, new: Value) -> (String, Option<String>, String) {
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     first_page(
         &mut s,
         page(
@@ -1496,7 +1497,7 @@ fn restart_evidence_reads_on_every_platform() {
 #[test]
 fn an_actor_reads_its_agent_id_until_identity_names_it() {
     use ck_ui::live::schedule::Source;
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     let by_agent = activity(
         5,
         NOW as u64,
@@ -1521,7 +1522,7 @@ fn an_actor_reads_its_agent_id_until_identity_names_it() {
 #[test]
 fn a_restart_pair_split_across_a_page_boundary_merges_after_paging_and_keeps_the_selection() {
     let digest = |d: &str| json!({ "method": "linux_proc_sha256", "digest": d });
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     // The first page ends with the start; its restart is the first entry of
     // the next page.
     let started = lifecycle(
@@ -1587,7 +1588,7 @@ fn a_restart_pair_split_across_a_page_boundary_merges_after_paging_and_keeps_the
 
 #[test]
 fn an_empty_ledger_with_one_retained_exit_shows_it_and_counts_it() {
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     s.terminals
         .insert("motor".into(), retained_exit("motor", NOW - 60_000));
     // Before the first page answers, the exit waits: it can't be placed
@@ -1611,7 +1612,7 @@ fn an_empty_ledger_with_one_retained_exit_shows_it_and_counts_it() {
 
 #[test]
 fn an_exit_older_than_the_oldest_retained_entry_shows_once_history_is_exhausted() {
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     let newer: Vec<WireActivity> = (2..=3)
         .rev()
         .map(|seq| {
@@ -1667,7 +1668,7 @@ fn when_history_ends_before_a_loaded_entry_a_label_separates_the_ranges() {
             })
             .collect()
     };
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     first_page(&mut s, page(entries(1..=100), None));
     // The feed's head was refused, and the daemon now keeps seq 301 onward:
     // seqs 101 to 300 are gone.
@@ -1705,7 +1706,7 @@ fn a_live_entry_waits_while_the_newest_entries_are_dropped() {
             })
             .collect()
     };
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     first_page(&mut s, page(entries(2_001..=2_100), Some(2_001)));
     // Paging down to the start of history, the view on the oldest row: the
     // newest 100 are dropped to keep 2,000 loaded.
@@ -1747,7 +1748,7 @@ fn a_live_entry_waits_while_the_newest_entries_are_dropped() {
 fn a_quiet_open_feed_stays_live_and_a_closed_one_ages_against_15_s() {
     use ck_ui::model::Freshness;
     use ck_ui::screens::View;
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     first_page(&mut s, page(vec![], None));
     s.record_feed_open(now());
     s.spawn_feed.set((), now());

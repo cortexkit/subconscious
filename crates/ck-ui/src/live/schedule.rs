@@ -155,7 +155,7 @@ pub struct Showing {
     /// The tab on screen.
     pub tab: Tab,
     /// The Add a phone overlay is open. It reads `callosum.devices_read`
-    /// for this Mac's access groups.
+    /// for this computer's access groups.
     pub add_phone: bool,
     /// The Add a phone overlay shows a pairing window (its code, or a later
     /// step for the same window), whose watch must stay open.
@@ -453,7 +453,7 @@ mod tests {
     fn devices_reply() -> Value {
         json!({
             "devices": [
-                { "name": "Mac 2", "fingerprint": "f1", "device_class": "mac", "trust": "verified",
+                { "name": "Box 2", "fingerprint": "f1", "device_class": "mac", "trust": "verified",
                   "tunnel": "established", "carrier": "direct", "since_unix_ms": BASE_MS,
                   "last_seen_unix_ms": BASE_MS, "subscriptions_live": 0 }
             ],
@@ -481,7 +481,7 @@ mod tests {
             let gate = Gate::new(demand.subscribe());
             let sent: Sent = Arc::default();
             let params_sent: Arc<Mutex<Vec<(&'static str, Value)>>> = Arc::default();
-            let state = Arc::new(Mutex::new(State::empty("This Mac")));
+            let state = Arc::new(Mutex::new(State::empty("This computer")));
             let began = tokio::time::Instant::now();
             let call = {
                 let sent = Arc::clone(&sent);
@@ -789,7 +789,7 @@ mod tests {
         // minute, so it stays fresh throughout.
         {
             let mut st = run.state.lock().unwrap();
-            let places = [("a1", "This Mac"), ("a2", "Mac 2")]
+            let places = [("a1", "This computer"), ("a2", "Box 2")]
                 .map(|(id, m)| (id.to_string(), m.to_string()));
             st.places
                 .set(places.into_iter().collect(), clock(run.began));

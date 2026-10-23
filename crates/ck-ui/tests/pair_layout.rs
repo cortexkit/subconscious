@@ -108,7 +108,7 @@ fn maximum_payload_confirmation_keeps_four_fields_and_pair_beside_the_code() {
         "river",
         "Pair",
         "From 192.168.1.41",
-        "Touch ID confirms",
+        "You confirm the pairing on this computer.",
     ] {
         let line = rows
             .iter()

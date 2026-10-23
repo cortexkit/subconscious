@@ -4018,73 +4018,73 @@
    "ARGUS",
    "web-app",
    "working",
-   "This Mac"
+   "This computer"
   ],
   [
    "IRIS",
    "api-server",
    "working",
-   "This Mac"
+   "This computer"
   ],
   [
    "ORION",
    "mobile-app",
    "working",
-   "This Mac"
+   "This computer"
   ],
   [
    "NOVA",
    "docs-site",
    "idle 4m",
-   "This Mac"
+   "This computer"
   ],
   [
    "ECHO",
    "data-pipeline",
    "working",
-   "This Mac"
+   "This computer"
   ],
   [
    "KITE",
    "design-system",
    "idle 12m",
-   "This Mac"
+   "This computer"
   ],
   [
    "MOSS",
    "infra",
    "idle 31m",
-   "This Mac"
+   "This computer"
   ],
   [
    "PIKE",
    "billing",
    "idle 1h",
-   "This Mac"
+   "This computer"
   ],
   [
    "REED",
    "search",
    "working",
-   "This Mac"
+   "This computer"
   ],
   [
    "SAGE",
    "analytics",
    "idle 22m",
-   "This Mac"
+   "This computer"
   ],
   [
    "WREN",
    "ios-app",
    "idle 2h",
-   "This Mac"
+   "This computer"
   ],
   [
    "scratch",
    "notes",
    "idle 3d",
-   "CortexKit Mac 2"
+   "CortexKit Box 2"
   ]
  ],
  "doing": {
@@ -4102,7 +4102,7 @@
  },
  "devices": [
   {
-   "name": "CortexKit Mac 2",
+   "name": "CortexKit Box 2",
    "kind": "computer",
    "status": "ok",
    "path": "direct · LAN",

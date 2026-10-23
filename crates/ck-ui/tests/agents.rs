@@ -70,7 +70,7 @@ fn live_with(agents: Agents) -> Snapshot {
     s
 }
 
-const MACHINES: [&str; 3] = ["This Mac", "Mac 2", "Mac 3"];
+const MACHINES: [&str; 3] = ["This computer", "Box 2", "Box 3"];
 
 /// Agent `i` of a crowded fleet: every third works, each has a role, and
 /// every other one reports how many of its questions wait.
@@ -176,7 +176,7 @@ fn every_size_says_how_many_agents_it_leaves_out_and_keeps_the_panels_below() {
         // rows each.
         assert_eq!(ws_y + 4, h - 3, "{w}×{h}");
         assert!(row(&buf, h - 3).contains("ws-3"), "{w}×{h}");
-        assert!(row(&buf, h - 3).contains("Mac 3"), "{w}×{h}");
+        assert!(row(&buf, h - 3).contains("Box 3"), "{w}×{h}");
         assert!(
             row(&buf, h - 2).starts_with("───"),
             "{w}×{h}: the footer rule"
@@ -394,7 +394,7 @@ fn residence_reply(token: &str) -> Value {
 fn places_reply() -> Value {
     json!({ "result": { "agents": [
         { "agent_id": "a1", "status": "held_here", "holder_name": "alex-mac", "known": true, "stale": false },
-        { "agent_id": "a2", "status": "held_elsewhere", "holder_name": "Mac 2", "known": true, "stale": false },
+        { "agent_id": "a2", "status": "held_elsewhere", "holder_name": "Box 2", "known": true, "stale": false },
         { "agent_id": "a3", "status": "unclaimed", "holder_name": null, "known": true, "stale": false }
     ]}})
 }
@@ -424,7 +424,7 @@ fn identity_gives_role_and_workspace_and_state_gives_waiting_questions() {
 fn workspaces_and_machines_count_the_joined_agents() {
     let ids = map::agent_identities(&identity_reply("t")).unwrap();
     let states = map::agent_residences(&residence_reply("r")).unwrap();
-    let places = map::agent_places(&places_reply(), "This Mac").unwrap();
+    let places = map::agent_places(&places_reply(), "This computer").unwrap();
     let a = map::agents(
         &ids,
         Some(&states),
@@ -450,8 +450,14 @@ fn workspaces_and_machines_count_the_joined_agents() {
     assert_eq!(
         rows,
         [
-            ("ARGUS", "working", "This Mac", Some("builder"), Some(2)),
-            ("IRIS", "idle 4m", "Mac 2", None, None),
+            (
+                "ARGUS",
+                "working",
+                "This computer",
+                Some("builder"),
+                Some(2)
+            ),
+            ("IRIS", "idle 4m", "Box 2", None, None),
             ("NOX", "unknown", "unclaimed", None, None),
         ]
     );
@@ -478,12 +484,12 @@ fn workspaces_and_machines_count_the_joined_agents() {
         a.machine_list,
         [
             Machine {
-                name: "Mac 2".into(),
+                name: "Box 2".into(),
                 agents: 1,
                 online: None
             },
             Machine {
-                name: "This Mac".into(),
+                name: "This computer".into(),
                 agents: 1,
                 online: None
             },
@@ -498,7 +504,7 @@ fn workspaces_and_machines_count_the_joined_agents() {
 
 #[test]
 fn fleet_polls_carry_their_token_and_an_unchanged_reply_keeps_the_rows_and_resets_their_age() {
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     // The first polls carry no token.
     assert_eq!(s.poll_params(Source::Identity), json!({}));
     assert_eq!(s.poll_params(Source::Residence), json!({}));
@@ -537,7 +543,7 @@ fn fleet_polls_carry_their_token_and_an_unchanged_reply_keeps_the_rows_and_reset
 
     // An unchanged reply with no rows on hand can't be shown: it records
     // nothing and drops the token, so the next poll asks for every row.
-    let mut fresh = State::empty("This Mac");
+    let mut fresh = State::empty("This computer");
     fresh.identity_token = Some(json!("old"));
     let unchanged = json!({ "result": { "agents": [], "token": "old", "unchanged": true }});
     assert!(!fresh.record_module_reply(Source::Identity, Ok(unchanged), at(0.0)));
@@ -549,7 +555,7 @@ fn fleet_polls_carry_their_token_and_an_unchanged_reply_keeps_the_rows_and_reset
 /// core's refused when `refused` is set, assembled with the fixture's
 /// roster so the Agents tab shows.
 fn live_state(refused: Option<&str>) -> Snapshot {
-    let mut s = State::empty("This Mac");
+    let mut s = State::empty("This computer");
     s.record_module_reply(Source::Identity, Ok(identity_reply("t1")), at(0.0));
     let state = match refused {
         Some(code) => Err(Fault::code(code)),
@@ -562,7 +568,7 @@ fn live_state(refused: Option<&str>) -> Snapshot {
         at(0.0),
     );
     s.places.set(
-        map::agent_places(&places_reply(), "This Mac").unwrap(),
+        map::agent_places(&places_reply(), "This computer").unwrap(),
         at(0.0),
     );
     let mut snap = assemble(&s, at(1.0));
@@ -608,7 +614,7 @@ fn the_live_screen_hides_what_no_source_reports() {
     assert!(
         row(&buf, FIRST).contains("ARGUS")
             && row(&buf, FIRST).contains("Checkout page")
-            && row(&buf, FIRST).contains("This Mac"),
+            && row(&buf, FIRST).contains("This computer"),
         "{screen}"
     );
     let ws_y = (0..36)
@@ -635,7 +641,7 @@ fn the_live_screen_hides_what_no_source_reports() {
     );
     assert_eq!(
         text(&buf, 62, ws_y + 2, 56).trim_end(),
-        format!("Mac 2{}1 agent lives here", " ".repeat(13))
+        format!("Box 2{}1 agent lives here", " ".repeat(13))
     );
     for y in ws_y + 2..ws_y + 4 {
         assert!(!text(&buf, 62, y, 56).contains('●'), "{screen}");

@@ -163,11 +163,7 @@ impl LiveOptions {
         LiveOptions {
             connection_file,
             service,
-            host_label: if cfg!(target_os = "macos") {
-                "This Mac".into()
-            } else {
-                "This computer".into()
-            },
+            host_label: "This computer".into(),
             utc_offset: local_utc_offset(),
             home: home_folder(),
         }

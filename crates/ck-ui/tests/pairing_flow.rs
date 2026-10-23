@@ -293,11 +293,11 @@ fn a_malformed_field_offers_nothing_and_opens_no_window() {
         rig.press(KeyCode::Enter);
         assert_eq!(
             rig.status().as_deref(),
-            Some("Couldn't read this Mac's access groups")
+            Some("Couldn't read this computer's access groups")
         );
         assert!(rig
             .screen()
-            .contains("Couldn't read this Mac's access groups"));
+            .contains("Couldn't read this computer's access groups"));
         assert_eq!(rig.opens(), [], "{field}");
         assert!(rig.app.pairing.window.is_none());
     }
@@ -311,9 +311,11 @@ fn with_no_reply_yet_the_overlay_reads_at_once_and_opens_nothing() {
     rig.open_overlay();
     assert_eq!(
         rig.status().as_deref(),
-        Some("Reading this Mac's access groups…")
+        Some("Reading this computer's access groups…")
     );
-    assert!(rig.screen().contains("Reading this Mac's access groups…"));
+    assert!(rig
+        .screen()
+        .contains("Reading this computer's access groups…"));
     assert_eq!(rig.sent, [Command::ReadGroups]);
     assert_eq!(rig.opens(), []);
     rig.set_groups(groups(&[("phone", 38)]));
@@ -327,7 +329,7 @@ fn a_failed_read_shows_its_code_and_enter_reads_again() {
     rig.open_overlay();
     assert_eq!(
         rig.status().as_deref(),
-        Some("Couldn't read this Mac's access groups: fed_not_authorized")
+        Some("Couldn't read this computer's access groups: fed_not_authorized")
     );
     assert_eq!(rig.opens(), []);
     rig.sent.clear();
@@ -343,9 +345,9 @@ fn an_empty_list_offers_no_group() {
     rig.press(KeyCode::Tab);
     assert_eq!(
         rig.status().as_deref(),
-        Some("This Mac has no access groups")
+        Some("This computer has no access groups")
     );
-    assert!(rig.screen().contains("This Mac has no access groups"));
+    assert!(rig.screen().contains("This computer has no access groups"));
     assert_eq!(rig.opens(), []);
 }
 
@@ -386,12 +388,12 @@ fn a_group_removed_after_claimed_keeps_its_name_and_says_so() {
     rig.set_groups(groups(&[("sim", 9)]));
     assert_eq!(
         rig.status().as_deref(),
-        Some("phone is no longer offered on this Mac · tab picks another")
+        Some("phone is no longer offered on this computer · tab picks another")
     );
     let screen = rig.screen();
     assert!(screen.contains("Access  phone "), "{screen}");
     assert!(!screen.contains("phone · 38 operations"), "{screen}");
-    assert!(screen.contains("phone is no longer offered on this Mac"));
+    assert!(screen.contains("phone is no longer offered on this computer"));
     assert_eq!(rig.opens().len(), 1);
     // A confirm is still sent as typed.
     rig.press(KeyCode::Enter);
@@ -590,7 +592,11 @@ fn step_one_wraps_the_from_line_and_fingerprint_without_losing_a_character() {
     }
     assert_eq!(joined.strip_prefix("key ").unwrap(), fingerprint);
     let screen: String = (0..36).map(|y| row(&buf, y) + "\n").collect();
-    for word in ["⏎  Pair", "esc  Close", "Touch ID confirms the pairing."] {
+    for word in [
+        "⏎  Pair",
+        "esc  Close",
+        "You confirm the pairing on this computer.",
+    ] {
         assert!(screen.contains(word), "{word}");
     }
     assert!(
@@ -652,7 +658,7 @@ fn an_open_refused_for_an_unknown_group_reads_as_no_such_group() {
         });
         assert_eq!(
             rig.status().as_deref(),
-            Some("This Mac has no access group named phone · tab changes the group"),
+            Some("This computer has no access group named phone · tab changes the group"),
             "{code}"
         );
         assert!(rig.app.pairing.window.is_none());
@@ -699,11 +705,11 @@ fn confirm_refusals_read_as_plain_sentences() {
         ),
         (
             "fed_operator_confirmation_refused",
-            "Touch ID was declined · ⏎ try again",
+            "Confirmation declined · ⏎ try again",
         ),
         (
             "fed_operator_confirmation_backoff",
-            "Touch ID is cooling down · try again shortly",
+            "Confirmation is cooling down · try again shortly",
         ),
         // A code callosum doesn't document still shows as it came.
         ("fed_something_new", "Pairing failed: fed_something_new"),
@@ -735,8 +741,13 @@ fn every_state_has_its_status_line() {
     assert_eq!(rig.status(), None);
     rig.type_text("maple orbit candle river");
     rig.press(KeyCode::Enter);
-    assert_eq!(rig.status().as_deref(), Some("Waiting for Touch ID"));
-    assert!(rig.screen().contains("Waiting for Touch ID"));
+    assert_eq!(
+        rig.status().as_deref(),
+        Some("Waiting for confirmation on this computer")
+    );
+    assert!(rig
+        .screen()
+        .contains("Waiting for confirmation on this computer"));
 
     rig.confirmed(
         "w-1",
@@ -746,7 +757,7 @@ fn every_state_has_its_status_line() {
     );
     assert_eq!(
         rig.status().as_deref(),
-        Some("Touch ID was declined · ⏎ try again")
+        Some("Confirmation declined · ⏎ try again")
     );
     assert_eq!(rig.app.pairing.window.as_ref().unwrap().words[3], "river");
 
@@ -762,7 +773,7 @@ fn every_state_has_its_status_line() {
     );
     assert_eq!(
         rig.status().as_deref(),
-        Some("Touch ID is cooling down · try again in 13 s")
+        Some("Confirmation is cooling down · try again in 13 s")
     );
     rig.press(KeyCode::Enter);
     assert_eq!(
@@ -782,7 +793,7 @@ fn every_state_has_its_status_line() {
     );
     assert_eq!(
         rig.status().as_deref(),
-        Some("Touch ID is cooling down · try again shortly")
+        Some("Confirmation is cooling down · try again shortly")
     );
     rig.advance(29_000);
     rig.press(KeyCode::Enter);
@@ -840,7 +851,7 @@ fn every_state_has_its_status_line() {
     assert_eq!(rig.status().as_deref(), Some("iPhone is paired."));
     let screen = rig.screen();
     assert!(screen.contains("iPhone is paired."));
-    assert!(screen.contains("It has phone access to this Mac."));
+    assert!(screen.contains("It has phone access to this computer."));
     assert!(screen.contains("⏎  Done"));
     assert!(!screen.contains("remove it any time"));
     rig.press(KeyCode::Enter);
@@ -868,17 +879,23 @@ fn a_confirm_waits_past_the_window_expiry() {
     rig.claim("w-1", "iPhone");
     rig.type_text("maple orbit candle river");
     rig.press(KeyCode::Enter);
-    // Past the window's expiry and the claim's 120 s, with Touch ID still
+    // Past the window's expiry and the claim's 120 s, with confirmation still
     // pending: the confirm is still waited for.
     rig.advance(200_000);
-    assert_eq!(rig.status().as_deref(), Some("Waiting for Touch ID"));
+    assert_eq!(
+        rig.status().as_deref(),
+        Some("Waiting for confirmation on this computer")
+    );
     rig.confirmed("w-1", Ok(Verdict::Granted));
     assert_eq!(rig.status().as_deref(), Some("iPhone is paired."));
     // Without a reply, the confirm counts as lost at 300 s.
     let mut rig = Rig::claimed("w-1");
     rig.press(KeyCode::Enter);
     rig.advance(299_000);
-    assert_eq!(rig.status().as_deref(), Some("Waiting for Touch ID"));
+    assert_eq!(
+        rig.status().as_deref(),
+        Some("Waiting for confirmation on this computer")
+    );
     rig.advance(1_000);
     assert_eq!(
         rig.status().as_deref(),
@@ -934,7 +951,10 @@ fn declined_during_the_confirm_waits_and_the_mismatch_reply_decides() {
     let mut rig = Rig::claimed("w-1");
     rig.press(KeyCode::Enter);
     rig.watch("w-1", WatchEvent::Declined);
-    assert_eq!(rig.status().as_deref(), Some("Waiting for Touch ID"));
+    assert_eq!(
+        rig.status().as_deref(),
+        Some("Waiting for confirmation on this computer")
+    );
     rig.confirmed("w-1", Ok(Verdict::Mismatch));
     assert_eq!(
         rig.status().as_deref(),
@@ -963,7 +983,10 @@ fn both_channels_lost_reads_unknown_and_sends_no_second_confirm() {
     rig.deliver(Event::WatchEnded {
         window_id: "w-1".into(),
     });
-    assert_eq!(rig.status().as_deref(), Some("Waiting for Touch ID"));
+    assert_eq!(
+        rig.status().as_deref(),
+        Some("Waiting for confirmation on this computer")
+    );
     rig.confirmed("w-1", Err(ConfirmFailure::Lost));
     assert_eq!(
         rig.status().as_deref(),

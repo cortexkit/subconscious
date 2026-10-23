@@ -1,4 +1,4 @@
- ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings      This computer  20:48 
 ─────────────────────────────────────━━━━━━━━━━─────────────────────────────────────────────────────────────────────────
                                                                                                                         
   Activity     All   Modules   Agents   Approvals   Settings                                                    live ●  
@@ -6,7 +6,7 @@
   Today                                                                     │  engram restarted on build 9d8a178c       
   18:20  engram            restarted on build 9d8a178c                  ck  │  18:20:36 local · UTC+2                   
   18:15  motor             restarted on build 222d833f                  ck  │                                           
-  18:02  cingulate         approved a tool permission for IRIS on …    you  │  By        ck on this Mac                 
+  18:02  cingulate         approved a tool permission for IRIS on …    you  │  By        ck on this computer            
   17:54  motor             settings changed: hosted spill off           ck  │  Subject   module engram                  
   17:53  motor             restarted on build 17c0a7d6                  ck  │  Kind      subc.module_restarted          
   17:21  prefrontal-core   started worker for llm-runner 0.3.8        IRIS  │  Seq       48,213                         

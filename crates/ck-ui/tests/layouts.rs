@@ -214,7 +214,7 @@ fn home_140x40_agents_show_their_projects() {
 fn home_200x60_caps_usage_bars_and_grows_the_sparkline() {
     let buf = render(&App::new(Theme::test()), &Snapshot::fixture(), 200, 60);
     let bar = |c: &str| "█▏▎▍▌▋▊▉".contains(c);
-    // Usage starts at column 61; This Mac follows it.
+    // Usage starts at column 61; This computer follows it.
     let mut widest = 0;
     for y in 10..21 {
         let mut run = 0;
@@ -228,8 +228,8 @@ fn home_200x60_caps_usage_bars_and_grows_the_sparkline() {
         }
     }
     assert_eq!(widest, 46, "usage bars stop at 46 cells");
-    assert!(row(&buf, 8).contains("This Mac"));
-    // This Mac starts at 128 and the sparkline at 141, so it gets
+    assert!(row(&buf, 8).contains("This computer"));
+    // This computer starts at 128 and the sparkline at 141, so it gets
     // 70 - 13 - 6 - "wait 3m" = 44 samples, then "3h" and the wait.
     let line = text(&buf, 141, 14, 44);
     assert!(line.chars().all(|c| "▁▂▃▄▅▆▇█".contains(c)), "{line:?}");

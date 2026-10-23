@@ -1548,7 +1548,7 @@ mod tests {
 
     #[tokio::test]
     async fn what_the_app_shows_decides_the_sources_wanted() {
-        let state = State::empty("This Mac");
+        let state = State::empty("This computer");
         let (tx, _rx) = watch::channel(assemble(&state, now()));
         let shared = Arc::new(Shared {
             state: Mutex::new(state),

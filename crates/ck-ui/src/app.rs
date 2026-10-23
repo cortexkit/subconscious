@@ -1486,7 +1486,10 @@ mod tests {
     #[test]
     fn the_run_loop_tells_the_live_layer_what_shows_each_time_it_changes() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let snap = assemble(&State::empty("This Mac"), Timestamp::from_unix_millis(0));
+        let snap = assemble(
+            &State::empty("This computer"),
+            Timestamp::from_unix_millis(0),
+        );
         let mut app = App::new(Theme::test());
         let mut told = Told::default();
         let mut sent = || {

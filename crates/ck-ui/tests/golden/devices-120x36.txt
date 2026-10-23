@@ -1,18 +1,18 @@
- ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings           This Mac  20:48 
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings      This computer  20:48 
 ───────────────────────────────────────────────────────────────────────━━━━━━━━━────────────────────────────────────────
                                                                                                                         
-  This Mac                                                    Reachable as                                              
+  This computer                                               Reachable as                                              
   ──────────────────────────────────────────────────────      ────────────────────────────────────────────────────────  
   Machine id    4f1a9c2e7b3d40c8a6e5d1b2c3f40912              LAN           192.168.1.20:7841                           
   Daemon        0.36.17 · up 9h 15m                           Relay         rdv.cortexkit.io                            
   Account       signed in · relay connected                   Live feeds    10 offered to phones                        
-  Vault         88 credentials · Touch ID protected                                                                     
+  Vault         88 credentials · protected                                                                              
                                                                                                                         
                                                                                                                         
   Paired devices                                                                                                     3  
   ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  
     Device                Kind          Connection        Live feeds        Last seen                                   
-  ● CortexKit Mac 2       computer      direct · LAN      —                 now                                         
+  ● CortexKit Box 2       computer      direct · LAN      —                 now                                         
   ● iPhone                phone         direct · LAN      3 live feeds      now                                         
   ○ test-sim              simulator     —                 —                 2h ago                                      
                                                                                                                         
@@ -25,8 +25,8 @@
   20:49  iPhone            opened live feeds: approvals, location, identity                                             
   20:41  iPhone            connected directly over the LAN                                                              
   18:02  iPhone            answered an approval for IRIS                                                                
-  11:31  CortexKit Mac 2   reconnected after its daemon restarted                                                       
-  09:36  CortexKit Mac 2   connected directly over the LAN                                                              
+  11:31  CortexKit Box 2   reconnected after its daemon restarted                                                       
+  09:36  CortexKit Box 2   connected directly over the LAN                                                              
                                                                                                                         
                                                                                                                         
                                                                                                                         

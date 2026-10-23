@@ -489,12 +489,12 @@ fn the_devices_row_agrees_with_the_online_count() {
     let buf = render(&App::new(Theme::test()), &s, 160, 48);
     assert!(row(&buf, 3).contains("2 devices online"));
     let devices = row(&buf, 18);
-    let first_chip = devices.find("● Mac 2").unwrap();
+    let first_chip = devices.find("● Box 2").unwrap();
     let offline = devices.find("○ test-sim").unwrap();
     assert!(first_chip < offline, "{devices}");
     // 120×36 has room for two chips: the online ones, then "+1".
     let buf = render(&App::new(Theme::test()), &s, 120, 36);
-    assert!(row(&buf, 20).ends_with("● Mac 2  ● iPhone +1  "));
+    assert!(row(&buf, 20).ends_with("● Box 2  ● iPhone +1  "));
 }
 
 #[test]
@@ -519,7 +519,7 @@ fn a_long_provider_name_keeps_a_space_before_its_value() {
 }
 
 #[test]
-fn this_macs_memory_disk_and_load_fit_their_rows() {
+fn this_computers_memory_disk_and_load_fit_their_rows() {
     let mut s = Snapshot::fixture();
     let h = &mut s.host.data;
     h.memory_used_gb = Some(82.613);
@@ -947,7 +947,7 @@ fn a_roster_entry_counts_whether_or_not_it_runs() {
     use ck_ui::live::{assemble, State};
     use ck_ui::model::Serves;
     let now = Snapshot::fixture_now();
-    let mut state = State::empty("This Mac");
+    let mut state = State::empty("This computer");
     let roster: Vec<subc_control::SupervisorEntry> = serde_json::from_value(serde_json::json!([
         { "module_id": "insula", "state": "disabled", "enabled": false, "live": false,
           "health": "unknown" },
@@ -1028,7 +1028,7 @@ fn a_long_device_name_is_cut_so_every_online_device_shows() {
     };
     s.devices.data.list = vec![
         device("lab-iphone-sim-pool-1", Status::Ok),
-        device("Mac 2", Status::Ok),
+        device("Box 2", Status::Ok),
         device("old-ipad", Status::Stopped),
         device("test-sim", Status::Stopped),
         device("spare-mac", Status::Stopped),
@@ -1042,10 +1042,10 @@ fn a_long_device_name_is_cut_so_every_online_device_shows() {
     // Both online devices, the long name cut, then the three offline ones
     // as "+3".
     assert!(devices.contains("● lab-iphone-sim"), "{devices}");
-    assert!(devices.contains("…  ● Mac 2 +3"), "{devices}");
+    assert!(devices.contains("…  ● Box 2 +3"), "{devices}");
     // Never cut below eight characters and the ellipsis.
     let (names, shown) =
-        ck_ui::screens::home::device_chips(&["lab-iphone-sim-pool-1", "Mac 2"], 2, 12);
+        ck_ui::screens::home::device_chips(&["lab-iphone-sim-pool-1", "Box 2"], 2, 12);
     assert!(names.iter().all(|n| n.chars().count() >= 5));
     assert!(names[0].chars().count() >= 9, "{names:?}");
     assert!(shown <= 2);
@@ -1236,7 +1236,7 @@ fn the_restart_question_names_brocas_runs_in_flight() {
     }
     metrics.insert("runs_in_flight".into(), serde_json::json!(37));
     let now = Snapshot::fixture_now();
-    let mut state = State::empty("This Mac");
+    let mut state = State::empty("This computer");
     let roster: Vec<subc_control::SupervisorEntry> = serde_json::from_value(serde_json::json!([
         { "module_id": "broca", "state": "running", "enabled": true, "live": true,
           "health": "ok", "drain_timeout_ms": 30000 }

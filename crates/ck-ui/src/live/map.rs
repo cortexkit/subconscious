@@ -783,7 +783,7 @@ pub fn devices(reply: &Value, now: Timestamp) -> Result<Devices, Fault> {
         out.push(Device {
             short_name: name.strip_prefix("CortexKit ").unwrap_or(&name).to_string(),
             kind: match d.get("device_class").and_then(Value::as_str) {
-                Some("mac") => "computer",
+                Some("computer" | "mac") => "computer",
                 Some("sim") => "simulator",
                 Some("phone") => "phone",
                 _ => "unknown",

@@ -30,10 +30,10 @@ pub const CLASS: &str = "phone";
 /// How long `⏎` stays ignored after a backoff refusal that names no wait.
 const BACKOFF_MS: i64 = 30_000;
 
-/// How long a confirm call may run. Callosum asks for Touch ID and only then
+/// How long a confirm call may run. Callosum asks for confirmation and only then
 /// re-checks the claim, whose own 120 s limit a pending prompt doesn't
 /// extend, so the call can outlive both the claim and the window. Callosum
-/// waits up to 290 s for Touch ID (`operator.confirm`'s deadline in
+/// waits up to 290 s for confirmation (`operator.confirm`'s deadline in
 /// subc-client-rs, the module SDK it is built on); this leaves room past it
 /// for callosum's answer to arrive.
 pub const CONFIRM_TIMEOUT_MS: u64 = 300_000;
@@ -246,9 +246,9 @@ pub enum Stage {
     // With a window.
     /// Open, or claimed and waiting for the words.
     Waiting,
-    /// A confirm is in flight: callosum is asking for Touch ID.
-    TouchId,
-    TouchIdRefused,
+    /// A confirm is in flight: callosum is asking for confirmation.
+    Confirming,
+    ConfirmationRefused,
     /// Too many tries: `⏎` is ignored until `until`. `named` says whether
     /// callosum gave the wait.
     Backoff {
@@ -301,7 +301,7 @@ enum Outcome {
     LostContact,
     Unknown,
     Unreadable,
-    TouchIdRefused,
+    ConfirmationRefused,
     Backoff,
 }
 
@@ -425,21 +425,23 @@ impl Flow {
     /// The status line the overlay shows now.
     pub fn status(&self) -> Option<String> {
         let line: String = match &self.stage {
-            Stage::ReadingGroups => "Reading this Mac's access groups…".into(),
+            Stage::ReadingGroups => "Reading this computer's access groups…".into(),
             Stage::GroupsFailed(code) => {
-                format!("Couldn't read this Mac's access groups: {code}")
+                format!("Couldn't read this computer's access groups: {code}")
             }
-            Stage::GroupsMalformed => "Couldn't read this Mac's access groups".into(),
-            Stage::NoGroups => "This Mac has no access groups".into(),
+            Stage::GroupsMalformed => "Couldn't read this computer's access groups".into(),
+            Stage::NoGroups => "This computer has no access groups".into(),
             Stage::Choose => "Choose this phone's access · tab".into(),
             Stage::Opening => "Opening a code…".into(),
             Stage::OpenFailed(code) => format!("Couldn't open a code: {code} · ⏎ try again"),
             Stage::NoSuchGroup(group) => {
-                format!("This Mac has no access group named {group} · tab changes the group")
+                format!("This computer has no access group named {group} · tab changes the group")
             }
-            Stage::Waiting | Stage::Backoff { .. } | Stage::TouchIdRefused if self.group_gone() => {
+            Stage::Waiting | Stage::Backoff { .. } | Stage::ConfirmationRefused
+                if self.group_gone() =>
+            {
                 let group = self.window.as_ref().map_or("", |w| w.group.as_str());
-                format!("{group} is no longer offered on this Mac · tab picks another")
+                format!("{group} is no longer offered on this computer · tab picks another")
             }
             Stage::Waiting => {
                 let claimed = self.window.as_ref().is_some_and(|w| w.claim.is_some());
@@ -448,17 +450,17 @@ impl Flow {
                 }
                 "Waiting for your phone…".into()
             }
-            Stage::TouchId => "Waiting for Touch ID".into(),
-            Stage::TouchIdRefused => "Touch ID was declined · ⏎ try again".into(),
+            Stage::Confirming => "Waiting for confirmation on this computer".into(),
+            Stage::ConfirmationRefused => "Confirmation declined · ⏎ try again".into(),
             Stage::Backoff { until, named } => {
                 if *named {
                     let left = (until.unix_millis() - self.now.unix_millis()).max(0);
                     format!(
-                        "Touch ID is cooling down · try again in {} s",
+                        "Confirmation is cooling down · try again in {} s",
                         (left + 999) / 1000
                     )
                 } else {
-                    "Touch ID is cooling down · try again shortly".into()
+                    "Confirmation is cooling down · try again shortly".into()
                 }
             }
             Stage::Granted { device_name } => {
@@ -700,7 +702,7 @@ impl Flow {
             Err(_) if declined => self.decide(i, Outcome::Declined),
             Err(ConfirmFailure::Refused(r)) => {
                 let outcome = match r.code.as_str() {
-                    "fed_operator_confirmation_refused" => Outcome::TouchIdRefused,
+                    "fed_operator_confirmation_refused" => Outcome::ConfirmationRefused,
                     "fed_operator_confirmation_backoff" => {
                         let named = r.retry_after_ms.is_some();
                         let wait = r.retry_after_ms.map_or(BACKOFF_MS, |ms| ms as i64);
@@ -716,9 +718,9 @@ impl Flow {
                     "fed_pairing_not_pending" => Outcome::NotPending,
                     code => Outcome::Failed(code.to_string()),
                 };
-                if outcome == Outcome::TouchIdRefused && self.shows(i) {
+                if outcome == Outcome::ConfirmationRefused && self.shows(i) {
                     // The window stays pending and the words stay typed.
-                    self.stage = Stage::TouchIdRefused;
+                    self.stage = Stage::ConfirmationRefused;
                     return;
                 }
                 self.decide(i, outcome);
@@ -783,7 +785,7 @@ impl Flow {
                 self.close();
                 true
             }
-            Stage::Waiting | Stage::TouchIdRefused => self.confirm(),
+            Stage::Waiting | Stage::ConfirmationRefused => self.confirm(),
             Stage::Backoff { until, .. } => {
                 if self.now < until {
                     return false;
@@ -994,7 +996,7 @@ impl Flow {
                 Outcome::LostContact => Stage::LostContact,
                 Outcome::Unknown => Stage::Unknown,
                 Outcome::Unreadable => Stage::Unreadable,
-                Outcome::TouchIdRefused => Stage::TouchIdRefused,
+                Outcome::ConfirmationRefused => Stage::ConfirmationRefused,
                 Outcome::Backoff => Stage::Backoff {
                     until: self.now.add_millis(BACKOFF_MS),
                     named: false,
@@ -1031,8 +1033,13 @@ impl Flow {
                 format!("Pairing {who}: callosum sent a pairing update ck can't read"),
                 false,
             ),
-            Outcome::TouchIdRefused => (format!("Pairing {who}: Touch ID was declined"), false),
-            Outcome::Backoff => (format!("Pairing {who}: Touch ID is cooling down"), false),
+            Outcome::ConfirmationRefused => {
+                (format!("Pairing {who}: confirmation declined"), false)
+            }
+            Outcome::Backoff => (
+                format!("Pairing {who}: confirmation is cooling down"),
+                false,
+            ),
         };
         self.outbox.push(Command::Record { text, ok });
     }
@@ -1064,7 +1071,7 @@ impl Flow {
         x.confirm = Some(deadline);
         x.deadline = Some(deadline);
         x.declined = false;
-        self.stage = Stage::TouchId;
+        self.stage = Stage::Confirming;
         self.outbox.push(Command::Confirm {
             window_id,
             words,

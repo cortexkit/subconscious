@@ -2,7 +2,7 @@
 //!
 //! Three layouts. Below 120×36 the answer and the essentials; from 120
 //! columns the full set of panels; from 150 columns the same panels with
-//! more facts in them (CPU beside every module, account totals, this Mac's
+//! more facts in them (CPU beside every module, account totals, this computer's
 //! memory, disk and load). Activity and agent lists run to the footer at any
 //! height. A list with more entries than rows ends in a "+N more" note, so
 //! nothing is dropped without saying so.
@@ -141,7 +141,7 @@ pub(super) fn error_cell(err: &str, kind: FaultKind, what: &str, room: usize) ->
     }
 }
 
-/// One fact row of This Mac: its label, then the value, or the source's
+/// One fact row of This computer: its label, then the value, or the source's
 /// error in amber while it is failing without a reading to show. A row
 /// whose source is only a last good reading draws dimmed.
 fn fact_row<T>(
@@ -788,8 +788,8 @@ fn draw_regular(c: &mut Canvas, v: &View) {
     // Usage
     usage_panel(c, v, (bx, 8 + dy, bw, 18), 6, false);
 
-    // This Mac
-    this_mac_heading(c, v, (cx, 8 + dy), cw);
+    // This computer
+    this_computer_heading(c, v, (cx, 8 + dy), cw);
     let (daemon, clients) = daemon_line(v);
     fact_row(
         c,
@@ -914,11 +914,11 @@ fn queue_text(queued: Option<u32>, wait_secs: Option<f64>) -> String {
     }
 }
 
-/// This Mac's heading. Its rows come from several sources; while any of
+/// This computer's heading. Its rows come from several sources; while any of
 /// them is aging or failing, the heading's meta names one of those (a
 /// last good reading first) instead of the machine id, so the panel never
 /// looks current when part of it isn't.
-fn this_mac_heading(c: &mut Canvas, v: &View, (cx, y): (i32, i32), cw: i32) {
+fn this_computer_heading(c: &mut Canvas, v: &View, (cx, y): (i32, i32), cw: i32) {
     let snap = v.snap;
     let id = snap
         .host
@@ -943,11 +943,11 @@ fn this_mac_heading(c: &mut Canvas, v: &View, (cx, y): (i32, i32), cw: i32) {
             cx,
             y,
             cw,
-            "This Mac",
+            "This computer",
             &format!("{name} {}", m.text),
             St::W,
         ),
-        None => heading_st(c, cx, y, cw, "This Mac", &id, St::D),
+        None => heading_st(c, cx, y, cw, "This computer", &id, St::D),
     }
 }
 
@@ -1023,8 +1023,8 @@ fn draw_large(c: &mut Canvas, v: &View) {
     // move down by as many, and Activity and Agents give them up.
     let dy = band_shift(c, v);
 
-    // Three panels: modules with CPU, usage with totals, this Mac with host
-    // facts. This Mac is at least 46 wide and takes whatever Usage leaves.
+    // Three panels: modules with CPU, usage with totals, this computer with host
+    // facts. This computer is at least 46 wide and takes whatever Usage leaves.
     let (ax, aw) = (2, 56);
     let bx = ax + aw + 3;
     let bw = (r - 46 - 3 - bx).min(USAGE_MAX_W);
@@ -1062,7 +1062,7 @@ fn draw_large(c: &mut Canvas, v: &View) {
 
     let host_panel = &snap.host;
     let host = &host_panel.data;
-    this_mac_heading(c, v, (cx, 8 + dy), cw);
+    this_computer_heading(c, v, (cx, 8 + dy), cw);
     let (daemon, clients) = daemon_line(v);
     fact_row(
         c,

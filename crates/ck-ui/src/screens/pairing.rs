@@ -125,7 +125,7 @@ fn common(s: &PairingState, done: usize) -> Column {
 fn status(col: &mut Column, y: i32, flow: &Flow, text: &str) -> i32 {
     let style = match flow.stage {
         Stage::Waiting
-        | Stage::TouchId
+        | Stage::Confirming
         | Stage::Opening
         | Stage::ReadingGroups
         | Stage::Choose
@@ -290,7 +290,7 @@ fn confirmation(flow: &Flow, s: &PairingState) -> Column {
     y += 2;
     col.put(0, y, " ⏎  Pair ", St::fg(Fg::OnAcc).on(Bg::Acc).bold());
     col.put(11, y, " esc  Close ", St::bg(Bg::Key));
-    col.wrap(0, y + 2, "Touch ID confirms the pairing.", St::D);
+    col.wrap(0, y + 2, "You confirm the pairing on this computer.", St::D);
     col
 }
 
@@ -317,7 +317,7 @@ fn paired(s: &PairingState, device_name: Option<&str>) -> Column {
     let y = col.wrap(
         0,
         y + 2,
-        &format!("It has {} access to this Mac.", s.group),
+        &format!("It has {} access to this computer.", s.group),
         St::D,
     );
     col.put(0, y + 2, " ⏎  Done ", St::fg(Fg::OnAcc).on(Bg::Acc).bold());

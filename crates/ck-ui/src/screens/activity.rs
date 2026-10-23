@@ -1,4 +1,4 @@
-//! Activity: what happened on this Mac, newest first.
+//! Activity: what happened on this computer, newest first.
 //!
 //! The daemon's activity ledger merged with process exits, one row each, a
 //! restart and the start that followed it as one row. Dim label rows mark

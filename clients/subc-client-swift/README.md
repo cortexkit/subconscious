@@ -27,8 +27,8 @@ all participants must lock the same inode. SQLite transactions are short-lived,
 but the store's ownership lock intentionally lasts across network awaits.
 
 A second opener, including one in the same process, immediately throws the
-public `FedStateStoreInUse` error. This is not a new `FedFailure` case. A share
-extension should defer its operation or ask the app to relinquish ownership,
+public `FedStateStoreInUse` error. This is not a new `FedFailure` case. An
+extension needing an ordinary session should ask the app to relinquish ownership,
 then retry after the app has closed its store. It must not spin, wait while
 holding an open store of its own, delete the lock/database, or mint a
 replacement store and incarnation to work around contention.
@@ -75,6 +75,117 @@ or `FedFailure` enum case. Nonthrowing status access and `disconnect()` remain
 available for teardown. This is a fail-closed backstop, not coordination for
 closing beneath active calls: an interrupted mutation still needs ledger
 reconciliation by the next owner, never blind replay.
+
+## Share sessions beside the app's session
+
+Use `FedShareClient` for share-extension sends to a paired computer advertising
+`share-v1`. It has its own Noise IK connection and never opens the origin SQLite
+store, arbitrates an ordinary session, or opens a rendezvous control socket.
+It dials **LAN, then public direct candidates only**, never relay. The app may
+keep its ordinary session open. Refresh the snapshot below when the app learns
+new authenticated feature facts or candidates, or changes its origin identity.
+
+Adopt two library-owned files in the same App Group directory in both targets:
+
+```swift
+let directory = FedShareDirectory(directoryURL: appGroupURL)
+let ledger = FedShareLedger(directoryURL: appGroupURL)
+
+// In the app, using its already-open shared FedStateStore:
+try await directory.update(
+    computers: [FedShareComputer(
+        publicKey: pairedComputerKey,
+        lanCandidates: learnedLAN,
+        publicCandidates: learnedPublic,
+        advertisedShareV1: negotiatedFeatures.contains("share-v1"))],
+    ownPublicKey: phonePublicKey,
+    stateStore: store)
+
+// In the extension, using the same Keychain identity as the app:
+let computer = try directory.entry(forComputerKey: pairedComputerKey)!
+let client = FedShareClient(keyStore: keys, ledger: ledger,
+                           helloPolicy: try FedHelloPolicy(deviceName: "Phone"))
+let request = try FedShareRequest(module: "messages", body: managementRequestJSON)
+// Persist request.shareID, module and exact body bytes before calling send.
+let report = try await client.send([request], to: computer)
+```
+
+The directory owns its JSON format and writer; the app passes explicit paired
+computers, not JSON. It atomically replaces the whole snapshot, skipping the
+write if unchanged. Its `originIncarnation` and `originLedgerEpoch` are read
+from `stateStore.snapshot().global.localIncarnation/localLedgerEpoch`: the
+**phone's persisted origin values**, exactly those its ordinary hello sends.
+The extension carries them in its hello with `session_kind: "share"` and no
+`connection_attempt_id`. By contrast, the epoch pinned in each ledger mark is
+the **computer's `ledger_epoch` from the authenticated share-session hello**.
+Never substitute the directory's origin epoch for that serving epoch.
+
+`send` waits for `share_ready`, sends at most eight calls, one outstanding at a
+time, stops starting calls after 60 seconds, and closes with `fed_share_done`.
+An outstanding call may finish after the lifetime. Excess/unattempted calls
+return outbox only if unmarked. Results use new share-only types: sent (including
+module errors and withheld outcomes), refused with `neverRan`, unknown (may
+have run), discarded (superseded claim or moved), or outbox. Raw bye codes are
+preserved on the report; none alone licenses fallback for a marked id.
+
+Before any call bytes are written, the ledger durably syncs the claim and the
+immutable mark (share transport, computer key, own key, request digest,
+computer epoch). The mark stores only the SHA-256 `requestDigest` of the exact
+encoded `share_call` bytes, not the request itself. A different mark throws
+`FedShareError.markConflict` from the
+ledger API; the session maps binding changes to unknown and **never resends**.
+An already-marked id stays share-only after silent closes or stale discovery.
+Only the newest claim's answer is recorded; old answers return discarded.
+Keep the ledger across launches, upgrades, key changes and computer re-pairing;
+do not delete it to retry an unknown id, and never mint a new id for that retry.
+
+The ledger stores only outcome metadata (`disposition`, `kind`, `code`,
+`neverRan`), never response bodies; the full body is returned in the session
+report. Keep the exact pending request in the app's own pending record for
+resends. Each ledger entry's `createdAtMs` comes from its UUIDv7 share id, not
+from when a retry happens. Every writing transaction prunes entries more than
+30 days old. Exactly 30 days is still retained.
+
+**A pending share older than 30 days can only be shown as unknown (Edit or
+Delete).** It must not travel as a share or move to the outbox, even if its id
+has no ledger entry: absence may mean its mark was pruned, not that it never
+ran. `FedShareClient` returns unknown without dialing for these ids; the raw
+ledger `claim` and `markIfAbsent` APIs throw `FedShareExpiredID`, and its outbox
+check refuses them. Editing creates a deliberately new operation and id, not
+an automatic retry of the old operation.
+
+The ledger uses one compact version-1 format. Missing required fields,
+unexpected fields and unsupported versions are storage errors; no alternate
+format is converted or treated as an empty ledger.
+
+For an outbox move, obtain a fresh share answer **outside the lock**. Then
+recheck and perform the synchronous outbox file write and move under the same
+ledger lock (using the returned call's id and claim):
+
+```swift
+let moved = try ledger.withLedgerLock { transaction -> Bool in
+    guard try transaction.mayMoveToOutbox(result.shareID, claim: result.claim) else {
+        return false
+    }
+    try writeOutboxEntrySynchronouslyAndDurably(result.shareID)
+    try transaction.markMoved(result.shareID, claim: result.claim)
+    return true
+}
+```
+
+For a marked id this requires `never_ran: true` on the newest claim; a new
+claim immediately revokes old permission. A moved id cannot be claimed again.
+Make the outbox insertion idempotent by share id and recover an interrupted
+outbox move before scheduling more share attempts: the outbox file and ledger
+are separate durable commits. Never enqueue an unknown or discarded result.
+`withLedgerLock<T>` is synchronous and returns its closure's value. Do not
+retain the transaction or reenter the ledger from its closure. Every critical
+section must be file I/O only: **no network calls, async closures or awaits**.
+Use it only while the app/extension is active or holds a background task
+assertion; iOS may kill a suspended App Group lock holder (`0xdead10cc`). The
+per-transaction `flock` releases on process death. Never unlink or replace the
+permanent `fed-share-ledger.lock` inode. Corrupt or unavailable files fail
+closed; do not replace the ledger with an empty one to work around an error.
 
 ## Verification
 

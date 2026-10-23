@@ -374,6 +374,9 @@ public enum FedFrameCodec {
         for type: String,
         negotiatedMaximumBodyLength: UInt32
     ) -> UInt32 {
+        if type == "share_call" { return min(negotiatedMaximumBodyLength, FedShareCodec.maximumRequestBytes) }
+        if type == "share_result" { return min(negotiatedMaximumBodyLength, FedShareCodec.maximumOutcomeBytes) }
+        if type == "share_ready" { return 0 }
         if type == FedFrameType.catalog.rawValue {
             return min(negotiatedMaximumBodyLength, maximumCatalogBodyLength)
         }
@@ -386,6 +389,10 @@ public enum FedFrameCodec {
         negotiationComplete: Bool,
         negotiatedFeatures: Set<String>
     ) throws {
+        if FedShareCodec.frameTypes.contains(type) {
+            try FedShareCodec.validateHeader(header, type: type, complete: negotiationComplete, features: negotiatedFeatures)
+            return
+        }
         if FedSubscriptionCodec.frameTypes.contains(type) {
             try FedSubscriptionCodec.validateHeader(header, type: type, complete: negotiationComplete, features: negotiatedFeatures)
             return
@@ -448,6 +455,11 @@ public enum FedFrameCodec {
                       })
                 else {
                     throw FedFrameError.invalidHeaderField(type: type, field: "connection_attempt_id")
+                }
+            }
+            if let kind = header["session_kind"] {
+                guard kind == .string("share"), header["connection_attempt_id"] == nil else {
+                    throw FedFrameError.invalidHeaderField(type: type, field: "session_kind")
                 }
             }
         case .bye:
@@ -562,6 +574,10 @@ public enum FedFrameCodec {
     }
 
     fileprivate static func validateBody(_ body: Data, type: String, header: FedJSONObject) throws {
+        if FedShareCodec.frameTypes.contains(type) {
+            try FedShareCodec.validateBody(body, type: type, header: header)
+            return
+        }
         if FedSubscriptionCodec.frameTypes.contains(type) {
             try FedSubscriptionCodec.validateBody(body, type: type, header: header)
             return
@@ -722,6 +738,8 @@ public struct FedFrameStreamDecoder: Sendable {
     private var currentHeader: FedJSONObject?
     private var currentType: String?
     private var discardBody = false
+    // Specialized sessions can reject foreign frames before buffering a body.
+    var allowedFrameTypes: Set<String>?
 
     public init(
         negotiatedMaximumBodyLength: UInt32 = FedFrameCodec.defaultMaximumBodyLength,
@@ -793,6 +811,9 @@ public struct FedFrameStreamDecoder: Sendable {
                         throw FedFrameError.invalidHeader(error)
                     }
                     guard let type = header.typeName else { throw FedFrameError.missingType }
+                    if let allowedFrameTypes, !allowedFrameTypes.contains(type) {
+                        throw FedFrameError.invalidHeaderField(type: type, field: "type")
+                    }
                     try FedFrameCodec.validateHeader(
                         header,
                         type: type,
@@ -817,10 +838,10 @@ public struct FedFrameStreamDecoder: Sendable {
                     if currentType == FedFrameType.catalog.rawValue, declared > bodyLimit {
                         throw FedFrameError.catalogBodyTooLarge(declared: declared, maximum: bodyLimit)
                     }
-                    guard declared <= negotiatedMaximumBodyLength else {
+                    guard declared <= bodyLimit else {
                         throw FedFrameError.bodyTooLarge(
                             declared: declared,
-                            maximum: negotiatedMaximumBodyLength
+                            maximum: bodyLimit
                         )
                     }
                     guard let type = currentType, let header = currentHeader else {
@@ -843,6 +864,7 @@ public struct FedFrameStreamDecoder: Sendable {
                     discardBody = FedFrameType(rawValue: type) == nil
                         && !FedEffectsV2Codec.frameTypes.contains(type)
                         && !FedSubscriptionCodec.frameTypes.contains(type)
+                        && !FedShareCodec.frameTypes.contains(type)
                     bodyBuffer = discardBody ? Data() : Data(capacity: bodyLength)
                     if bodyLength == 0 {
                         try completeBody(&frames)

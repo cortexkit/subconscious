@@ -49,6 +49,11 @@ public enum FedHelloCodec {
         guard frame.knownType == .hello else {
             throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
         }
+        // This dial-only library receives responder hellos. Only an initiator
+        // may request a share session, never a responder or pairing peer.
+        guard frame.header["session_kind"] == nil else {
+            throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
+        }
         guard case .array(let versionValues) = frame.header["versions"] else {
             throw FedFailure.protocolViolation(byeCode: "fed_limits_unsupported")
         }

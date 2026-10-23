@@ -103,6 +103,21 @@ public struct FedNetworkDialFactory: FedCandidateDialFactory {
 
     // MARK: - Direct TCP rung
 
+    // Share sessions reuse the established direct carrier and Noise IK stack,
+    // but never create an ordinary engine or open its lifetime-locked store.
+    func dialShare(host: String, port: UInt16, privateKey: Data, responderKey: Data,
+                   clock: any FedMonotonicClock, policy: FedDialPolicy,
+                   entropy: any FedNoiseEntropy) async throws -> any FedSessionByteTransport {
+        let initiator = try FedNoiseIKInitiator(staticKey: FedNoiseKeyPair(privateKey: privateKey),
+                                               pinnedResponderStatic: responderKey)
+        let connect = self.connect
+        let carrier = try await FedTCPRecordCarrier.establish(clock: clock, timeout: policy.carrierConnect) {
+            try await connect(host, port)
+        }
+        let session = try await initiator.establish(on: carrier, clock: clock, timeout: policy.noiseHandshake, entropy: entropy)
+        return FedNoiseSessionByteTransport(session: session)
+    }
+
     func dialPairing(
         hint: FedPairingQR.Hint, qr: FedPairingQR, staticKey: FedNoiseKeyPair,
         clock: any FedMonotonicClock, policy: FedDialPolicy, entropy: any FedNoiseEntropy

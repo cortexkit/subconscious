@@ -485,13 +485,13 @@ pub const DETAIL_KEY_MAX: usize = 20;
 /// path separator, then a space, `-`, `_` or `.`.
 const BREAK_AFTER: [&[char]; 2] = [&['/', '\\'], &[' ', '-', '_', '.']];
 
-/// Splits `text` into lines of at most `n` columns (at least 1), so that no
-/// character is dropped except the space a line breaks at. A line that has
+/// Splits `text` into lines of at most `n` columns (at least 1). Each line
+/// break in `text` starts a new line; past that, the only character
+/// dropped is the space a line breaks at. A line that has
 /// to break ends after the last path separator that fits, or failing that
 /// after the last space, `-`, `_` or `.`, provided the line keeps at least
 /// half of the `n` columns; otherwise it breaks at `n` columns. A character
-/// wider than `n` still takes a line of its own. A line break in `text`
-/// starts a new line.
+/// wider than `n` still takes a line of its own.
 fn wrap_whole(text: &str, n: usize) -> Vec<String> {
     let n = n.max(1);
     let mut out = Vec::new();

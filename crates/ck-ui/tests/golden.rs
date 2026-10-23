@@ -139,6 +139,76 @@ fn modules_120x36() {
 }
 
 #[test]
+fn settings_120x36() {
+    let mut app = app();
+    app.tab = Tab::Settings;
+    let mut snap = Snapshot::fixture();
+    snap.host.data.home = Some("/Users/alex".into());
+    let mut modules = serde_json::Map::new();
+    for module in &snap.modules.data {
+        modules.insert(module.id.clone(), serde_json::json!({"program": "unused"}));
+    }
+    modules.insert(
+        "broca".into(),
+        serde_json::json!({
+            "program": "/Users/alex/.local/share/cortexkit/bin/ck-broca",
+            "env": {"BROCA_STATE_ROOT": "/Users/alex/.local/share/cortexkit/broca"},
+            "reserved": "yes · only a daemon-launched broca may register",
+            "restart": "drains up to 30 s · backoff 100 ms to 30 s",
+            "health": "checked every 30 s"
+        }),
+    );
+    let mut text = serde_json::to_string_pretty(&serde_json::json!({"modules": modules})).unwrap();
+    let comments = "// BROCA_STATE_ROOT is the stable data folder. Its ledgers are not\n// disposable -- anyone writing a cleanup for it cannot tell the\n// difference.\n";
+    let at = text.find("\"BROCA_STATE_ROOT\"").unwrap();
+    text.insert_str(at, comments);
+    snap.settings = ck_ui::live::settings::SettingsReading {
+        config_path: Some(
+            if cfg!(windows) {
+                "C:/design/subc.jsonc"
+            } else {
+                "/design/subc.jsonc"
+            }
+            .into(),
+        ),
+        capable: true,
+        text: Some(text),
+        error: None,
+    };
+    app.on_snapshot(&snap, Snapshot::fixture_now());
+    app.settings.selected = Some("broca".into());
+    subc_jsonc::set_member(
+        &mut app.settings.candidate,
+        &["modules", "broca", "env", "CK_LOG"],
+        &serde_json::json!("info,broca.requests=debug"),
+    )
+    .unwrap();
+    // Use the editor's normal undo history, not a separate golden-only counter.
+    let staged = app.settings.candidate.clone();
+    app.settings.candidate = app.settings.original.clone();
+    app.settings.focus = 2;
+    app.settings.row = 6;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    app.settings.key(key(KeyCode::Char('e')), 24);
+    for ch in "CK_LOG".chars() {
+        app.settings.key(key(KeyCode::Char(ch)), 24);
+    }
+    app.settings.key(key(KeyCode::Enter), 24);
+    for ch in "info,broca.requests=debug".chars() {
+        app.settings.key(key(KeyCode::Char(ch)), 24);
+    }
+    app.settings.key(key(KeyCode::Enter), 24);
+    assert_eq!(
+        app.settings.document(),
+        serde_json::from_str::<serde_json::Value>(&subc_jsonc::jsonc_to_json(&staged).unwrap())
+            .unwrap()
+    );
+    app.settings.focus = 1;
+    check("settings-120x36", &app, &snap);
+}
+
+#[test]
 fn devices_120x36() {
     let mut app = app();
     app.tab = Tab::Devices;

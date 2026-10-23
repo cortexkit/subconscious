@@ -1,4 +1,4 @@
-//! Prints the live app's Home, Modules, Usage, Agents and Devices screens as plain
+//! Prints the live app's Home, Modules, Usage, Agents, Devices and Settings screens as plain
 //! text, for checking them against the real fleet without a terminal:
 //!
 //! ```text
@@ -167,12 +167,14 @@ async fn main() {
     let mut app = App::new(Theme::light());
     app.size = size;
     app.redact = redact;
+    app.on_snapshot(&snap, now);
     for (tab, title) in [
         (Tab::Home, "Home"),
         (Tab::Modules, "Modules"),
         (Tab::Usage, "Usage"),
         (Tab::Agents, "Agents"),
         (Tab::Devices, "Devices"),
+        (Tab::Settings, "Settings"),
     ] {
         app.tab = tab;
         let mut buf = Buffer::empty(Rect::new(0, 0, size.0, size.1));

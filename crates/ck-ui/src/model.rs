@@ -760,6 +760,7 @@ pub struct LogView {
 /// Everything the app shows, as of the times its panels record.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Snapshot {
+    pub settings: crate::live::settings::SettingsReading,
     pub host: Panel<Host>,
     pub daemon: Panel<Daemon>,
     pub modules: Panel<Vec<Module>>,
@@ -981,8 +982,7 @@ impl Serves {
         agent_projects: true,
     };
 
-    /// What the live app does today: Home, Modules, Activity, Usage, Agents
-    /// and Devices, with the `/` filter on Activity and Agents.
+    /// Built screens and their supported actions, independent of the roster.
     pub const LIVE: Serves = Serves {
         tabs: TabSet::of(&[
             Tab::Home,
@@ -991,10 +991,11 @@ impl Serves {
             Tab::Usage,
             Tab::Agents,
             Tab::Devices,
+            Tab::Settings,
         ]),
-        settings: false,
+        settings: true,
         swap: false,
-        list_filter: TabSet::of(&[Tab::Activity, Tab::Agents]),
+        list_filter: TabSet::of(&[Tab::Activity, Tab::Agents, Tab::Settings]),
         multi_select: false,
         double_click: false,
         ckni: false,
@@ -1484,6 +1485,7 @@ mod fixture {
             .collect();
 
         Ok(Snapshot {
+            settings: crate::live::settings::SettingsReading::default(),
             host: Panel::new(now, host),
             daemon: Panel::new(
                 now,

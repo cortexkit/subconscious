@@ -290,12 +290,13 @@ fn stopping_asks_and_names_who_it_serves_and_starting_does_not_ask() {
 }
 
 #[test]
-fn edit_does_nothing_yet() {
+fn edit_opens_settings_without_sending_a_control_request() {
     let s = Snapshot::fixture();
     let mut app = modules_app(&s, "broca");
-    assert!(!press(&mut app, &s, KeyCode::Char('e')));
+    assert!(press(&mut app, &s, KeyCode::Char('e')));
     assert!(app.requests.is_empty());
-    assert_eq!(app.tab, Tab::Modules);
+    assert_eq!(app.tab, Tab::Settings);
+    assert_eq!(app.settings.selected.as_deref(), Some("broca"));
 }
 
 #[test]
@@ -594,13 +595,14 @@ fn the_live_app_advertises_only_what_it_serves() {
         Tab::Usage,
         Tab::Agents,
         Tab::Devices,
+        Tab::Settings,
     ]);
     assert_eq!(s.serves.tabs, served);
     assert_eq!(s.visible_tabs(), served);
-    // Activity's and Agents' filters are the only ones served.
+    // Filters are scoped to their own tabs, never to Modules.
     assert_eq!(
         s.serves.list_filter,
-        TabSet::of(&[Tab::Activity, Tab::Agents])
+        TabSet::of(&[Tab::Activity, Tab::Agents, Tab::Settings])
     );
 
     // The keys page lists the live app's keys, each of them handled below.
@@ -611,7 +613,7 @@ fn the_live_app_advertises_only_what_it_serves() {
     assert_eq!(
         listed,
         [
-            "1 – 6",
+            "1 – 7",
             ":",
             "?",
             "esc",
@@ -624,21 +626,15 @@ fn the_live_app_advertises_only_what_it_serves() {
             "r",
             "s",
             "l",
-            "m"
+            "m",
+            "e"
         ]
     );
     let mut app = App::new(Theme::test());
     app.overlay = Some(Overlay::Help);
     let buf = render(&app, &s, 120, 36);
     let page: String = (0..36).map(|y| row(&buf, y) + "\n").collect();
-    for gone in [
-        "restart, no downtime",
-        "settings",
-        "space",
-        "double-click",
-        "ckni",
-        "7 Settings",
-    ] {
+    for gone in ["restart, no downtime", "space", "double-click", "ckni"] {
         assert!(
             !page.contains(gone),
             "the live keys page offers {gone:?}:\n{page}"
@@ -782,17 +778,16 @@ fn the_live_app_advertises_only_what_it_serves() {
             "the live footer offers {gone:?}: {footer}"
         );
     }
-    // Settings is not served; its number key does nothing.
+    // Settings is served and reachable by its fixed number.
     let mut app = App::new(Theme::test());
-    assert!(!served(&mut app, KeyCode::Char('7')));
-    assert_eq!(app.tab, Tab::Home);
+    assert!(served(&mut app, KeyCode::Char('7')));
+    assert_eq!(app.tab, Tab::Settings);
 
-    // The Modules view shows no filter or settings hint, and only the
-    // tabs that have screens.
+    // Modules offers Settings but no list filter.
     let mut app = modules_app(&s, "broca");
     let buf = render(&app, &s, 120, 36);
     assert!(!row(&buf, 3).contains("/ to filter"), "{}", row(&buf, 3));
-    assert!(!row(&buf, 35).contains("settings"));
+    assert!(row(&buf, 35).contains("settings"));
     assert!(row(&buf, 0).contains("3 Activity"), "{}", row(&buf, 0));
     assert!(row(&buf, 0).contains("4 Usage"), "{}", row(&buf, 0));
     assert!(row(&buf, 0).contains("5 Agents"), "{}", row(&buf, 0));
@@ -814,7 +809,7 @@ fn the_live_app_advertises_only_what_it_serves() {
         .collect();
     assert_eq!(
         tabs_offered,
-        ["Home", "Modules", "Activity", "Usage", "Agents", "Devices"]
+        ["Home", "Modules", "Activity", "Usage", "Agents", "Devices", "Settings"]
     );
 
     // Every palette command runs: a restart request or the log view.
@@ -835,6 +830,7 @@ fn the_live_app_advertises_only_what_it_serves() {
             || app.tab == Tab::Usage
             || app.tab == Tab::Agents
             || app.tab == Tab::Devices
+            || app.tab == Tab::Settings
             || cmd.title == "Home";
         assert!(did, "{:?} did nothing", cmd.title);
     }
@@ -1172,7 +1168,7 @@ fn the_tab_bar_keeps_names_when_they_fit() {
     use ck_ui::model::Serves;
     let mut s = Snapshot::fixture();
     s.serves = Serves::LIVE;
-    let buf = render(&App::new(Theme::test()), &s, 80, 24);
+    let buf = render(&App::new(Theme::test()), &s, 100, 30);
     assert!(
         row(&buf, 0).contains("1 Home  2 Modules"),
         "{}",

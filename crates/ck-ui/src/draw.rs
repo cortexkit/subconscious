@@ -14,6 +14,11 @@ use unicode_width::UnicodeWidthStr;
 use crate::model::{Status, Tab, TabSet};
 use crate::theme::{Bg, Fg, St, Theme};
 
+mod details;
+pub use details::{
+    detail_rows, details_view, value_rows, DetailLine, DetailRow, DetailsView, DETAIL_KEY_MAX,
+};
+
 /// Display width of a string in terminal columns.
 pub fn width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
@@ -61,6 +66,21 @@ pub fn pad_left(s: &str, n: usize) -> String {
     let t = trunc(s, n);
     let pad = n.saturating_sub(width(&t));
     " ".repeat(pad) + &t
+}
+
+/// `text` with the home folder at its start written as `~`, when what
+/// follows it is nothing or a path separator; otherwise `text` as it is.
+pub fn under_home(text: &str, home: Option<&str>) -> String {
+    let home = home
+        .map(|h| h.trim_end_matches(['/', '\\']))
+        .filter(|h| !h.is_empty());
+    let Some(home) = home else {
+        return text.to_string();
+    };
+    match text.strip_prefix(home) {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => format!("~{rest}"),
+        _ => text.to_string(),
+    }
 }
 
 /// A rectangle drawing is limited to, in canvas coordinates (inclusive start,

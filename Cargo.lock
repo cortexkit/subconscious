@@ -327,7 +327,7 @@ dependencies = [
 
 [[package]]
 name = "ck-ui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chrono",
  "ck-ui",
@@ -340,6 +340,7 @@ dependencies = [
  "sha2",
  "subc-client-rs",
  "subc-control",
+ "subc-jsonc",
  "subc-os",
  "subc-protocol",
  "subc-transport",

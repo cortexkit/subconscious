@@ -22,3 +22,15 @@ pub mod time;
 pub use app::{run, run_with, App, Request, RunOptions};
 pub use model::Snapshot;
 pub use theme::Theme;
+
+/// ck-ui ships inside the workspace's ck executable, whose release version
+/// belongs to subc-core rather than to this rendering library.
+pub fn ck_version() -> &'static str {
+    include_str!("../../subc-core/Cargo.toml")
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("version = \"")
+                .and_then(|v| v.strip_suffix('"'))
+        })
+        .unwrap_or("unknown")
+}

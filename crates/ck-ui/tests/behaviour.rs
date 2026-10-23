@@ -310,13 +310,12 @@ fn mouse_clicks_tabs_and_rows_and_scrolls_the_selection() {
     // The fixture serves every tab, so each one the bar draws opens.
     assert!(app.handle_event(&click(41, 0), &snap, (120, 36)));
     assert_eq!(app.tab, Tab::Activity);
-    // The live app's bar has no Devices, so the place it has in the full
-    // bar does nothing.
+    // Settings keeps its fixed tab number and column in live mode.
     let mut live = Snapshot::fixture();
     live.serves = ck_ui::model::Serves::LIVE;
     let mut app = App::new(Theme::test());
-    assert!(!app.handle_event(&click(87, 0), &live, (120, 36)));
-    assert_eq!(app.tab, Tab::Home);
+    assert!(app.handle_event(&click(87, 0), &live, (120, 36)));
+    assert_eq!(app.tab, Tab::Settings);
     // Activity, Usage, Agents and Devices are served live, at the same places as in
     // the full bar.
     assert!(app.handle_event(&click(41, 0), &live, (120, 36)));
@@ -339,12 +338,12 @@ fn quit_keys_and_later_screens_keys() {
         assert!(app.handle_key(key(KeyCode::Char(tab.key())), &snap));
         assert_eq!(app.tab, tab);
     }
-    // Settings is not served live; its number key does nothing.
+    // Settings keeps its fixed number in the live app too.
     let mut live = Snapshot::fixture();
     live.serves = ck_ui::model::Serves::LIVE;
     let mut app = App::new(Theme::light());
-    assert!(!app.handle_key(key(KeyCode::Char('7')), &live));
-    assert_eq!(app.tab, Tab::Home);
+    assert!(app.handle_key(key(KeyCode::Char('7')), &live));
+    assert_eq!(app.tab, Tab::Settings);
     assert!(app.handle_key(key(KeyCode::Char('6')), &live));
     assert_eq!(app.tab, Tab::Devices);
     assert!(app.handle_key(key(KeyCode::Char('5')), &live));
@@ -584,7 +583,7 @@ fn the_sources_follow_the_tab_on_screen() {
     press(&mut app, &live, KeyCode::Char('6'));
     assert_eq!(app.showing(&live), Showing::tab(Tab::Devices));
     press(&mut app, &live, KeyCode::Char('7'));
-    assert_eq!(app.showing(&live), Showing::tab(Tab::Devices));
+    assert_eq!(app.showing(&live), Showing::tab(Tab::Settings));
     press(&mut app, &live, KeyCode::Char('5'));
     assert_eq!(app.showing(&live), Showing::tab(Tab::Agents));
     press(&mut app, &live, KeyCode::Char('2'));

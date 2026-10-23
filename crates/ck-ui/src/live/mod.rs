@@ -17,6 +17,7 @@ pub mod map;
 pub mod pairing;
 mod run;
 pub mod schedule;
+pub mod settings;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -342,6 +343,7 @@ pub struct State {
     pub health: Part<Vec<SupervisorHealthEntry>>,
     pub provenance: Part<SupervisorProvenanceResponse>,
     pub describe: Part<ServerDescription>,
+    pub settings: settings::SettingsReading,
     pub routes: Part<Vec<SupervisorRouteModule>>,
     /// Live processes by module, from the spawn snapshot and events.
     pub processes: HashMap<String, LiveProcess>,
@@ -419,6 +421,7 @@ impl State {
             health: Part::default(),
             provenance: Part::default(),
             describe: Part::default(),
+            settings: settings::SettingsReading::default(),
             routes: Part::default(),
             processes: HashMap::new(),
             exits: HashMap::new(),
@@ -915,6 +918,7 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
         last_result: state.last_result.clone(),
         serves: crate::model::Serves::LIVE,
         pairing: state.pairing.iter().cloned().collect(),
+        settings: state.settings.clone(),
     }
 }
 

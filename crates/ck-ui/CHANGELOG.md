@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.2
+
+- Add the Settings tab. It reads the daemon's config file when the daemon
+  reports its path and supports previewing a candidate config, and lists each
+  module entry with its program, arguments, environment and its comments in
+  file order. Policy blocks such as `health` show as aligned rows, not JSON.
+  A setting the file leaves out shows a dim "default"; one that is present but
+  empty shows "none".
+- Edit module entries, arguments and environment values in memory, with undo
+  and a filter. Quitting with unsaved edits asks first. Nothing is written to
+  the config file yet.
+- `e` on the Modules tab opens that module's entry in Settings.
+
 ## 0.2.1
 
 - No Mac-only wording: every screen says "this computer", and the pairing

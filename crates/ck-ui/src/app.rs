@@ -21,6 +21,7 @@ use crate::screens::activity::ActivityState;
 use crate::screens::agents::AgentsState;
 use crate::screens::devices::DevicesState;
 use crate::screens::logs::{self, LevelFilter, LogState};
+use crate::screens::settings::SettingsState;
 use crate::screens::usage::{Focus, UsageState};
 use crate::screens::{self, overlays, View, MIN_H, MIN_W};
 use crate::theme::{detect_theme, Theme};
@@ -120,6 +121,7 @@ pub struct App {
     pub agents: AgentsState,
     /// The Devices screen's selected row.
     pub devices: DevicesState,
+    pub settings: SettingsState,
     /// The Add a phone exchange: what its overlay shows, and every pairing
     /// window ck still watches.
     pub pairing: Flow,
@@ -158,6 +160,7 @@ impl App {
             usage: UsageState::default(),
             agents: AgentsState::default(),
             devices: DevicesState::default(),
+            settings: SettingsState::default(),
             pairing: Flow::default(),
             pairing_seen: 0,
             redact: false,
@@ -179,6 +182,7 @@ impl App {
         let mut showing = crate::live::schedule::Showing::tab(self.shown_tab(snap));
         showing.add_phone = self.overlay == Some(Overlay::Pairing);
         showing.pairing_window = showing.add_phone && self.pairing.window.is_some();
+        showing.updates = self.tab == Tab::Settings && self.settings.section == 2;
         showing
     }
 
@@ -276,6 +280,7 @@ impl App {
             } else {
                 screens::down::draw(&mut c, &v, d);
             }
+            self.draw_quit_question(&mut c);
             return;
         }
         match (
@@ -300,8 +305,9 @@ impl App {
                 screens::agents::draw(&mut c, &v, &self.agents, self.field.is_some())
             }
             (Tab::Devices, ..) => screens::devices::draw(&mut c, &v, &self.devices),
-            (Tab::Settings, ..) => screens::settings::draw(&mut c, &v),
+            (Tab::Settings, ..) => screens::settings::draw(&mut c, &v, &self.settings),
         }
+        self.draw_quit_question(&mut c);
         screens::result_toast(&mut c, &v);
         if let Some(q) = &self.confirm {
             let title = match q.kind {
@@ -349,14 +355,19 @@ impl App {
             return false;
         }
         self.follow_roster(snap);
+        self.settings.observe(&snap.settings);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
-            self.quit = true;
+            self.request_quit();
+            return true;
+        }
+        if self.settings.quit_asked && key.code == KeyCode::Esc {
+            self.settings.quit_asked = false;
             return true;
         }
         if matches!(snap.daemon.data, Daemon::Down(_)) {
             match key.code {
-                KeyCode::Char('q') => self.quit = true,
+                KeyCode::Char('q') => self.request_quit(),
                 KeyCode::Char('t') => self.theme = self.theme.toggled(),
                 KeyCode::Enter if !self.down_log => self.requests.push(Request::StartDaemon),
                 KeyCode::Char('l') => self.down_log = !self.down_log,
@@ -370,6 +381,14 @@ impl App {
         }
         if self.overlay == Some(Overlay::Pairing) {
             return self.pairing_key(key, snap);
+        }
+        if self.overlay.is_none() && self.tab == Tab::Settings {
+            if let Some(handled) = self
+                .settings
+                .key(key, self.size.1.saturating_sub(12) as usize)
+            {
+                return handled;
+            }
         }
         if let Some(handled) = self.field_key(key) {
             // Activity's and Agents' lists follow their filter as it is
@@ -437,7 +456,7 @@ impl App {
                     _ => Some(Overlay::Help),
                 };
             }
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Char('t') => self.theme = self.theme.toggled(),
             // Each tab keeps its number while others are hidden, so a hidden
             // tab's key does nothing rather than reaching another tab.
@@ -481,6 +500,14 @@ impl App {
                 }
                 self.log = Some(LogState::default());
             }
+            KeyCode::Char('e') if self.tab == Tab::Modules && snap.serves.settings => {
+                self.settings.section = 0;
+                self.settings.focus = 1;
+                self.settings.selected = self.selected(snap).map(|m| m.id.clone());
+                self.settings.filter.clear();
+                self.settings.row = 0;
+                self.switch(Tab::Settings);
+            }
             KeyCode::Enter if self.tab == Tab::Home => {
                 let att = snap.attention();
                 let Some(m) = att.get(self.home_sel) else {
@@ -495,6 +522,25 @@ impl App {
             _ => return false,
         }
         true
+    }
+
+    fn request_quit(&mut self) {
+        if self.settings.changes() > 0 && !self.settings.quit_asked {
+            self.settings.quit_asked = true;
+        } else {
+            self.quit = true;
+        }
+    }
+
+    fn draw_quit_question(&self, c: &mut Canvas) {
+        if self.settings.quit_asked {
+            c.fill(0, c.h - 1, c.w, 1, ' ', crate::theme::St::NONE);
+            let line = format!(
+                "{} unsaved changes · q again quits · esc stays",
+                self.settings.changes()
+            );
+            c.put(2, c.h - 1, &line, crate::theme::St::W);
+        }
     }
 
     /// `r` on Modules: always asks first, naming what the restart
@@ -606,6 +652,7 @@ impl App {
     /// pairing results not yet applied, and the exchange's timeouts.
     /// Returns whether the frame needs redrawing.
     pub fn on_snapshot(&mut self, snap: &Snapshot, now: Timestamp) -> bool {
+        let settings_changed = self.settings.observe(&snap.settings);
         let before = self.pairing.stage.clone();
         let mut applied = false;
         self.pairing.tick(now);
@@ -618,7 +665,7 @@ impl App {
             }
         }
         self.pump_pairing();
-        applied || before != self.pairing.stage
+        settings_changed || applied || before != self.pairing.stage
     }
 
     /// Keys for the open text field, ahead of every app-wide key. Printable
@@ -1058,7 +1105,7 @@ impl App {
                     match title.as_str() {
                         "Keys" => self.overlay = Some(Overlay::Help),
                         "Light or dark" => self.theme = self.theme.toggled(),
-                        "Quit" => self.quit = true,
+                        "Quit" => self.request_quit(),
                         // A tab's name switches to it; the list holds only
                         // the tabs that show.
                         name => {

@@ -311,7 +311,16 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
         |sh, c| match c.consumer.server_describe().await {
             Ok(d) => {
                 sh.raw("server.describe", format!("{d:?}"));
-                sh.update(|s| s.describe.set(d, now()))
+                let reading = super::settings::SettingsReading::read(
+                    d.config_path
+                        .as_ref()
+                        .map(|p| p.to_string_lossy().into_owned()),
+                    &d.capabilities,
+                );
+                sh.update(|s| {
+                    s.settings = reading;
+                    s.describe.set(d, now());
+                })
             }
             Err(e) => {
                 sh.raw("server.describe", control_error(&e));

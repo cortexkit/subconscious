@@ -161,9 +161,14 @@ jobs:
         run: |
           set -euo pipefail
           for directory in vectors/*/; do
-            python3 -m pip install -r "${directory}requirements.txt"
-            python3 "${directory}generate.py" --check
-            (cd "$directory" && sha256sum --check SHA256SUMS)
+            # Sets generated in this repository are regenerated and compared.
+            # Sets vendored from another repository (no generate.py) are
+            # checked against their published SHA256SUMS only.
+            if [ -f "${directory}generate.py" ]; then
+              python3 -m pip install -r "${directory}requirements.txt"
+              python3 "${directory}generate.py" --check
+            fi
+            (cd "$directory" && sha256sum --check --strict SHA256SUMS)
           done
 
   path-dependencies:

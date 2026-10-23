@@ -9,10 +9,10 @@ mod stand_in;
 pub mod test_support;
 pub use activity::*;
 pub use consumer::{
-    is_retryable_route_open_code, CallError, CallOptions, CancelHandle, CancelOutcome, CatalogList,
-    CloseRouteOptions, ConnectionState, ConsumerCapabilityError, ConsumerError, ConsumerOptions,
-    ControlPush, HealthProbeResponse, OutcomeUnknownCause, PushEvent, RetryBackoff,
-    ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
+    is_retryable_route_open_code, CallError, CallOptions, CallReply, CancelHandle, CancelOutcome,
+    CatalogList, CloseRouteOptions, ConnectionState, ConsumerCapabilityError, ConsumerError,
+    ConsumerOptions, ControlPush, HealthProbeResponse, OutcomeUnknownCause, PushEvent,
+    RetryBackoff, ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
     ReverseRequestRegistry, RouteCloseDisposition, RouteCloseReason, RouteEndReason,
     RoutePollResult, ScopeBindProofRefusal, ScopeSelector, ServerDescription, SpawnStreamError,
     SpawnSubscription, StderrTailResponse, SubcConsumer, SubscribeOptions, Subscription,
@@ -1664,6 +1664,7 @@ pub struct RequestCtx {
     egress: mpsc::Sender<Frame>,
     module_handle: ModuleHandle,
     cancelled: CancellationToken,
+    binary_reply: Arc<AtomicBool>,
 }
 
 impl RequestCtx {
@@ -1675,6 +1676,21 @@ impl RequestCtx {
     /// Correlation id for this request.
     pub fn corr(&self) -> u64 {
         self.corr
+    }
+
+    /// Declare this request's terminal [`HandlerOutcome::Response`] as raw bytes,
+    /// not JSON, by setting `FLAG_BINARY` on its frame.
+    ///
+    /// Mark a reply only when the operation's contract defines a raw-byte reply,
+    /// never for JSON contracts such as tool results or JSON management replies.
+    /// The body is sent unchanged either way; the flag only declares that it is
+    /// not JSON, and the daemon forwards it as is. The delivered frame is still
+    /// bounded by [`subc_protocol::MAX_DELIVERED_FRAME_LEN`], including its header.
+    ///
+    /// All clones of this request's context share the mark; other requests do not.
+    /// It has no effect on errors, interim stream frames, or `Streamed` outcomes.
+    pub fn mark_binary_reply(&self) {
+        self.binary_reply.store(true, Ordering::Relaxed);
     }
 
     /// Emit an interim StreamData frame on this request's `(channel, corr)`. Once
@@ -2295,6 +2311,7 @@ where
         egress,
         module_handle,
         cancelled: cancellation,
+        binary_reply: Arc::new(AtomicBool::new(false)),
     };
     let body = frame.body;
     let in_flight = Arc::clone(&dispatcher.in_flight);
@@ -2393,8 +2410,12 @@ async fn send_handler_outcome(
 ) -> Result<(), SubcModuleError> {
     match outcome {
         HandlerOutcome::Response(body) => {
-            ctx.send_frame(FrameType::Response, data_flags(), body)
-                .await
+            let flags = Flags::new(
+                ctx.binary_reply.load(Ordering::Relaxed),
+                Priority::Interactive,
+                false,
+            );
+            ctx.send_frame(FrameType::Response, flags, body).await
         }
         HandlerOutcome::Error { code, message } => {
             let body = serde_json::to_vec(&ErrorBody::new(code, message))
@@ -3904,6 +3925,7 @@ mod tests {
             egress: tx,
             module_handle: module_handle.clone(),
             cancelled: CancellationToken::new(),
+            binary_reply: Arc::new(AtomicBool::new(false)),
         };
         assert!(module_handle.remove_route(handle).unwrap());
 
@@ -4660,6 +4682,9 @@ mod module_close_tests {
 
 #[cfg(test)]
 mod operator_confirm_tests;
+
+#[cfg(test)]
+mod binary_reply_tests;
 
 #[cfg(test)]
 mod request_pool_tests;

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.30.12
+
+- Add `RequestCtx::mark_binary_reply()` to declare a terminal `HandlerOutcome::Response` body as raw bytes with `FLAG_BINARY`. The mark is shared by clones of one request's context, never by other requests, and does not change errors or stream frames. Bodies are sent unchanged with or without the mark, and the delivered-frame size limit still includes the header. No `HandlerOutcome` variant was added.
+- Add `SubcConsumer::call_with_reply` and `call_cancellable_with_reply`, returning a non-exhaustive `CallReply` with `body()`, `into_body()` and `is_binary()` accessors. Relays can preserve the terminal Response's binary declaration without guessing from its bytes. Existing body-only call APIs keep their signatures and behavior.
+
 ## 0.30.11
 
 - Expose session folder/project through the re-exported scope record builders for scope sync/apply and scope stamps for bind readers. Requires subc-protocol 0.32.11 and subc-control 0.32.5.

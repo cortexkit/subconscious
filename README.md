@@ -18,7 +18,7 @@ channel 0. The `ck` CLI installs, upgrades and operates it.
 | `crates/subc-protocol` | The wire contract: envelope, frames, module control bodies, manifest, scopes. |
 | `crates/subc-control` | Client-facing control-plane bodies. |
 | `crates/subc-transport` | Loopback TCP, the HMAC handshake, the connection file, frame I/O. |
-| `crates/subc-client-rs` | Rust SDK for clients and modules. |
+| `crates/subc-client-rs` | Rust SDK for clients and modules; 0.30.12 adds `RequestCtx::mark_binary_reply()` and `SubcConsumer::call_cancellable_with_reply()` for raw-byte replies and their binary flag. |
 | `crates/subc-os` | Process identity, signalling and the launch-nonce handoff, behind a safe API. |
 | `crates/subc-cgroup`, `crates/subc-jobobject` | Child containment on Linux (cgroups) and Windows (job objects). |
 | `crates/subc-presence` | Operating-system prompts that ask the person at the machine to approve an action. |

@@ -303,6 +303,7 @@ mod tests {
             PendingTerminal::Response {
                 generation: key.generation,
                 body: b"finished".to_vec(),
+                flags: Flags::new(false, Priority::Interactive, false),
             },
         );
         assert_eq!(cancel.cancel().await, CancelOutcome::Settled);

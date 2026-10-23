@@ -844,6 +844,33 @@ pub struct SubcConsumer {
     shared: Arc<Shared>,
 }
 
+/// A managed unary reply with the module's raw-body declaration preserved.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallReply {
+    body: Vec<u8>,
+    binary: bool,
+}
+
+impl CallReply {
+    /// The body bytes, unchanged from the terminal Response frame.
+    /// A StreamEnd without a Response has an empty body.
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Consume the reply and return its body bytes without copying them.
+    pub fn into_body(self) -> Vec<u8> {
+        self.body
+    }
+
+    /// Whether the terminal Response carried `FLAG_BINARY` (raw bytes, not JSON).
+    /// A StreamEnd without a Response returns `false`.
+    pub fn is_binary(&self) -> bool {
+        self.binary
+    }
+}
+
 /// The first terminal outcome of a subscription.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
@@ -2034,6 +2061,20 @@ impl SubcConsumer {
         body: Vec<u8>,
         opts: CallOptions,
     ) -> Result<Vec<u8>, CallError> {
+        self.call_with_reply(target, identity, body, opts)
+            .await
+            .map(CallReply::into_body)
+    }
+
+    /// Like [`Self::call`], retaining the terminal Response's binary flag as well
+    /// as its unchanged body bytes. A StreamEnd yields an empty, non-binary reply.
+    pub async fn call_with_reply(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        body: Vec<u8>,
+        opts: CallOptions,
+    ) -> Result<CallReply, CallError> {
         self.call_inner(target, identity, body, opts, None).await
     }
 
@@ -2054,6 +2095,23 @@ impl SubcConsumer {
         CancelHandle,
         impl Future<Output = Result<Vec<u8>, CallError>> + Send + '_,
     ) {
+        let (cancel, reply) = self.call_cancellable_with_reply(target, identity, body, opts);
+        (cancel, async move { reply.await.map(CallReply::into_body) })
+    }
+
+    /// Like [`Self::call_cancellable`], retaining the terminal Response's binary
+    /// flag and unchanged bytes in [`CallReply`]. Cancellation, retries, deadlines
+    /// and drop behavior are identical. A StreamEnd yields an empty, non-binary reply.
+    pub fn call_cancellable_with_reply(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        body: Vec<u8>,
+        opts: CallOptions,
+    ) -> (
+        CancelHandle,
+        impl Future<Output = Result<CallReply, CallError>> + Send + '_,
+    ) {
         let consumer = self;
         let (cancel, registration) = CancelRegistration::new(Arc::clone(&self.shared));
         let future = async move {
@@ -2072,7 +2130,7 @@ impl SubcConsumer {
         body: Vec<u8>,
         opts: CallOptions,
         cancel: Option<Arc<UnaryCancel>>,
-    ) -> Result<Vec<u8>, CallError> {
+    ) -> Result<CallReply, CallError> {
         let call_deadline = Instant::now() + opts.timeout;
         // One resend per call after a refusal that proves the module never
         // received the request (route dead, or the module draining).
@@ -2145,8 +2203,18 @@ impl SubcConsumer {
             drop(permit);
 
             match response {
-                Ok(TerminalFrame::Response { body, .. }) => return Ok(body),
-                Ok(TerminalFrame::StreamEnd) => return Ok(Vec::new()),
+                Ok(TerminalFrame::Response { body, flags, .. }) => {
+                    return Ok(CallReply {
+                        body,
+                        binary: flags.is_binary(),
+                    });
+                }
+                Ok(TerminalFrame::StreamEnd) => {
+                    return Ok(CallReply {
+                        body: Vec::new(),
+                        binary: false,
+                    });
+                }
                 // unknown_channel is the daemon ROUTER refusing an unrouted channel:
                 // the request provably never reached a module, so one in-place retry
                 // cannot double-execute. The cached bind is dead (module restarted;
@@ -4322,7 +4390,10 @@ impl Shared {
             return;
         };
         if entry.retain_late_route_open && entry.completion_is_closed() {
-            if let PendingTerminal::Response { generation, body } = &terminal {
+            if let PendingTerminal::Response {
+                generation, body, ..
+            } = &terminal
+            {
                 if let Ok(ClientControlResponse::RouteOpen {
                     route_channel,
                     route_epoch,
@@ -5370,15 +5441,30 @@ impl PendingResult {
 }
 
 enum PendingTerminal {
-    Response { generation: u64, body: Vec<u8> },
-    Error { body: ErrorBody, flags: Flags },
+    Response {
+        generation: u64,
+        body: Vec<u8>,
+        flags: Flags,
+    },
+    Error {
+        body: ErrorBody,
+        flags: Flags,
+    },
     StreamEnd,
 }
 
 impl PendingTerminal {
     fn into_terminal_frame(self) -> TerminalFrame {
         match self {
-            Self::Response { generation, body } => TerminalFrame::Response { generation, body },
+            Self::Response {
+                generation,
+                body,
+                flags,
+            } => TerminalFrame::Response {
+                generation,
+                body,
+                flags,
+            },
             Self::Error { body, flags } => TerminalFrame::Error { body, flags },
             Self::StreamEnd => TerminalFrame::StreamEnd,
         }
@@ -5387,8 +5473,15 @@ impl PendingTerminal {
 
 #[derive(Debug)]
 enum TerminalFrame {
-    Response { generation: u64, body: Vec<u8> },
-    Error { body: ErrorBody, flags: Flags },
+    Response {
+        generation: u64,
+        body: Vec<u8>,
+        flags: Flags,
+    },
+    Error {
+        body: ErrorBody,
+        flags: Flags,
+    },
     StreamEnd,
 }
 
@@ -5647,6 +5740,7 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
             PendingTerminal::Response {
                 generation,
                 body: frame.body,
+                flags: frame.header.flags,
             },
         ),
         FrameType::Error => {
@@ -6299,6 +6393,38 @@ mod tests {
             body,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn binary_reply_request_preserves_flagged_non_utf8_bytes() {
+        let (shared, mut receiver, handle) = reverse_test_shared(ReverseRequestRegistry::new());
+        let consumer = SubcConsumer {
+            shared: Arc::clone(&shared),
+        };
+        shared
+            .install_one_shot_route(RouteState {
+                handle,
+                sem: Arc::new(Semaphore::new(1)),
+            })
+            .unwrap();
+        let request = tokio::spawn(async move {
+            consumer
+                .request(&handle, b"bytes".to_vec(), CallOptions::default())
+                .await
+        });
+        let command = receiver.recv().await.unwrap();
+        let bytes = vec![0, 0xff, 0x80, b'{'];
+        let frame = Frame::build(
+            FrameType::Response,
+            Flags::new(true, Priority::Interactive, false),
+            handle.channel,
+            handle.epoch,
+            command.frame.header.corr,
+            bytes.clone(),
+        )
+        .unwrap();
+        assert!(dispatch_frame(&shared, 1, frame).await);
+        assert_eq!(request.await.unwrap().unwrap(), bytes);
     }
 
     async fn capture_route_open(

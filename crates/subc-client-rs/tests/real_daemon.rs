@@ -6335,3 +6335,6 @@ mod call_modes;
 
 #[path = "real_daemon/cancellable.rs"]
 mod cancellable;
+
+#[path = "real_daemon/binary_replies.rs"]
+mod binary_replies;

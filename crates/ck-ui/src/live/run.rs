@@ -184,6 +184,7 @@ async fn supervise(shared: Arc<Shared>, file: Option<PathBuf>) {
                 *shared.conn.lock().unwrap_or_else(|e| e.into_inner()) = Some(conn.clone());
                 shared.update(|s| {
                     s.connection = Connection::Up { daemon_ver };
+                    s.daemon_connection += 1;
                     s.connected_at.set((), now());
                     s.down_note = None;
                 });
@@ -1264,8 +1265,45 @@ async fn handle_requests(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Re
             Request::Act { kind, module } => {
                 tokio::spawn(run_action(Arc::clone(&shared), kind, module));
             }
+            Request::RescanPreview { ticket, candidate } => {
+                tokio::spawn(rescan_preview(Arc::clone(&shared), ticket, candidate));
+            }
         }
     }
+}
+
+/// Asks the daemon what saving `candidate` would do, and records the reply
+/// under `ticket`. Previews run side by side, so replies can arrive in any
+/// order; the app keeps only the one for the request it is waiting for.
+async fn rescan_preview(
+    shared: Arc<Shared>,
+    ticket: super::settings::PreviewTicket,
+    candidate: String,
+) {
+    // A daemon that doesn't advertise the op would refuse it, but the
+    // capability is the promise that it previews the candidate rather than
+    // its file, so nothing is sent without it.
+    let capable = shared.read(|s| s.settings.capable);
+    let outcome = match shared.conn() {
+        _ if !capable => {
+            super::settings::PreviewOutcome::Failed("rescan_checked_not_served".into())
+        }
+        None => super::settings::PreviewOutcome::Failed("daemon_unreachable".into()),
+        Some(conn) => {
+            let result = conn
+                .consumer
+                .supervisor_rescan_checked(true, Some(candidate), None)
+                .await;
+            match &result {
+                Ok(r) => shared.raw("supervisor.rescan_checked", json_text(r)),
+                Err(e) => shared.raw("supervisor.rescan_checked", control_error(e)),
+            }
+            super::settings::preview_outcome(result)
+        }
+    };
+    shared.update(|s| {
+        s.record_preview(super::settings::PreviewReply { ticket, outcome });
+    });
 }
 
 /// Reads `callosum.devices_read` now, for the Add a phone overlay's access

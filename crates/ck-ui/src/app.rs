@@ -70,6 +70,13 @@ pub enum Request {
     },
     /// A call the Add a phone exchange asks for.
     Pairing(crate::pairing::flow::Command),
+    /// Ask the daemon what saving `candidate`, the staged `subc.jsonc`
+    /// text, would do (`supervisor.rescan_checked` with `preview: true`).
+    /// The reply comes back under `ticket` in a later snapshot.
+    RescanPreview {
+        ticket: crate::live::settings::PreviewTicket,
+        candidate: String,
+    },
 }
 
 /// A question waiting for an answer before an action is sent.
@@ -128,6 +135,9 @@ pub struct App {
     /// The last pairing result applied from a snapshot (see
     /// [`Snapshot::pairing`]).
     pairing_seen: u64,
+    /// The last Save preview reply applied from a snapshot (see
+    /// [`Snapshot::previews`]).
+    previews_seen: u64,
     /// Whether account identifiers are hidden, on Usage and in Home's usage
     /// panel alike: each account's email, id and organization, wherever the
     /// app shows them, read as that account's pseudonym. `x` on Usage
@@ -163,6 +173,7 @@ impl App {
             settings: SettingsState::default(),
             pairing: Flow::default(),
             pairing_seen: 0,
+            previews_seen: 0,
             redact: false,
             requests: Vec::new(),
         }
@@ -383,10 +394,14 @@ impl App {
             return self.pairing_key(key, snap);
         }
         if self.overlay.is_none() && self.tab == Tab::Settings {
-            if let Some(handled) = self
-                .settings
-                .key(key, self.size.1.saturating_sub(12) as usize)
-            {
+            let handled = if self.settings.save.open {
+                Some(self.settings.save_key(key, self.size, snap.serves.save))
+            } else {
+                self.settings
+                    .key(key, self.size.1.saturating_sub(12) as usize)
+            };
+            self.pump_settings();
+            if let Some(handled) = handled {
                 return handled;
             }
         }
@@ -641,6 +656,14 @@ impl App {
         self.pump_pairing();
     }
 
+    /// Hands Settings' queued preview requests to whoever feeds the app.
+    fn pump_settings(&mut self) {
+        for (ticket, candidate) in self.settings.save.outbox.drain(..) {
+            self.requests
+                .push(Request::RescanPreview { ticket, candidate });
+        }
+    }
+
     /// Hands the exchange's queued calls to whoever feeds the app.
     fn pump_pairing(&mut self) {
         for command in self.pairing.outbox.drain(..) {
@@ -652,7 +675,17 @@ impl App {
     /// pairing results not yet applied, and the exchange's timeouts.
     /// Returns whether the frame needs redrawing.
     pub fn on_snapshot(&mut self, snap: &Snapshot, now: Timestamp) -> bool {
-        let settings_changed = self.settings.observe(&snap.settings);
+        let mut settings_changed = self.settings.observe(&snap.settings);
+        // A reconnect first, so a reply from before it is not taken for the
+        // one the fresh request waits for.
+        settings_changed |= self.settings.connected(snap.daemon_connection);
+        for (seq, reply) in &snap.previews {
+            if *seq > self.previews_seen {
+                self.previews_seen = *seq;
+                settings_changed |= self.settings.absorb(reply);
+            }
+        }
+        self.pump_settings();
         let before = self.pairing.stage.clone();
         let mut applied = false;
         self.pairing.tick(now);

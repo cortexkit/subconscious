@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.31.1
+
+- Add `SubcConsumer::supervisor_rescan_checked(preview, candidate, expect)`, which sends `supervisor.rescan_checked` and returns the daemon's `SupervisorRescanResult`. A preview sends the candidate config text and changes nothing; an apply sends the `expect` value from that preview. A preview is retried on transport failures like the other reads, while an apply is sent once. A daemon refusal comes back as `CallError::Module` with its code and message. No existing method changes.
+
 ## 0.31.0
 
 - Minor bump because this crate re-exports subc-protocol types, and subc-protocol moves to 0.33.0 (`ToolCallRequest` gains the optional `output_refs` member, breaking for struct literals). Also takes subc-control 0.33 and subc-transport 0.14, which moved for the same reason. Move direct protocol dependencies together with the SDK. No other change.

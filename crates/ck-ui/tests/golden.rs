@@ -3,7 +3,8 @@
 //! style roles with `.styles`. The frames are the specification; there is no
 //! switch to rewrite them from the app's output.
 
-use ck_ui::app::{App, Overlay, Tab};
+use ck_ui::app::{App, Overlay, Request, Tab};
+use ck_ui::live::settings::{PreviewOutcome, PreviewReply};
 use ck_ui::screens::logs::LogState;
 use ck_ui::time::{Timestamp, UtcOffset};
 use ck_ui::{Snapshot, Theme};
@@ -138,54 +139,71 @@ fn modules_120x36() {
     check("modules-120x36", &app, &Snapshot::fixture());
 }
 
-#[test]
-fn settings_120x36() {
+/// What the design's Save overlay says saving does: broca needs a restart
+/// to use its new environment, with 3 runs in flight and a 30 s drain. The
+/// live layer gets this from the daemon's `supervisor.rescan_checked`
+/// preview.
+fn broca_restart_preview() -> PreviewOutcome {
+    PreviewOutcome::Ready(
+        serde_json::from_value(serde_json::json!({
+            "added": [], "removed": [], "changed_pending_reload": ["broca"],
+            "unchanged": 25, "preview": true,
+            "module_actions": [{
+                "module_id": "broca", "action": "restart", "changed": ["environment"],
+                "drain_timeout_ms": 30000,
+                "busy_gauges": [{"gauge": "runs_in_flight", "value": 3}]
+            }],
+            "expect": {
+                "config_sha256": "0".repeat(64),
+                "staged_generation": {"incarnation": "design", "counter": 1}
+            }
+        }))
+        .unwrap(),
+    )
+}
+
+/// Answers the newest preview the app asked for, the way the live layer
+/// records a reply in a later snapshot.
+fn answer_preview(app: &mut App, snap: &mut Snapshot, outcome: PreviewOutcome) {
+    app.on_snapshot(snap, Snapshot::fixture_now());
+    let ticket = app
+        .requests
+        .iter()
+        .rev()
+        .find_map(|r| match r {
+            Request::RescanPreview { ticket, .. } => Some(*ticket),
+            _ => None,
+        })
+        .expect("an edit asks for a preview");
+    let seq = snap.previews.len() as u64 + 1;
+    snap.previews.push((seq, PreviewReply { ticket, outcome }));
+    app.on_snapshot(snap, Snapshot::fixture_now());
+}
+
+/// Settings as the design frames draw it: broca selected, `subc.jsonc` read
+/// from `text` at `config_path`, and the frame's one edit, a new `CK_LOG`
+/// variable, typed through the editor so it is on its undo history and asks
+/// for a preview.
+fn settings_session(text: String, config_path: &str) -> (App, Snapshot) {
     let mut app = app();
     app.tab = Tab::Settings;
     let mut snap = Snapshot::fixture();
     snap.host.data.home = Some("/Users/alex".into());
-    let mut modules = serde_json::Map::new();
-    for module in &snap.modules.data {
-        modules.insert(module.id.clone(), serde_json::json!({"program": "unused"}));
-    }
-    modules.insert(
-        "broca".into(),
-        serde_json::json!({
-            "program": "/Users/alex/.local/share/cortexkit/bin/ck-broca",
-            "env": {"BROCA_STATE_ROOT": "/Users/alex/.local/share/cortexkit/broca"},
-            "reserved": "yes · only a daemon-launched broca may register",
-            "restart": "drains up to 30 s · backoff 100 ms to 30 s",
-            "health": "checked every 30 s"
-        }),
-    );
-    let mut text = serde_json::to_string_pretty(&serde_json::json!({"modules": modules})).unwrap();
-    let comments = "// BROCA_STATE_ROOT is the stable data folder. Its ledgers are not\n// disposable -- anyone writing a cleanup for it cannot tell the\n// difference.\n";
-    let at = text.find("\"BROCA_STATE_ROOT\"").unwrap();
-    text.insert_str(at, comments);
     snap.settings = ck_ui::live::settings::SettingsReading {
-        config_path: Some(
-            if cfg!(windows) {
-                "C:/design/subc.jsonc"
-            } else {
-                "/design/subc.jsonc"
-            }
-            .into(),
-        ),
+        config_path: Some(config_path.into()),
         capable: true,
         text: Some(text),
         error: None,
     };
     app.on_snapshot(&snap, Snapshot::fixture_now());
     app.settings.selected = Some("broca".into());
+    let mut staged = app.settings.candidate.clone();
     subc_jsonc::set_member(
-        &mut app.settings.candidate,
+        &mut staged,
         &["modules", "broca", "env", "CK_LOG"],
         &serde_json::json!("info,broca.requests=debug"),
     )
     .unwrap();
-    // Use the editor's normal undo history, not a separate golden-only counter.
-    let staged = app.settings.candidate.clone();
-    app.settings.candidate = app.settings.original.clone();
     app.settings.focus = 2;
     app.settings.row = 6;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -205,7 +223,96 @@ fn settings_120x36() {
             .unwrap()
     );
     app.settings.focus = 1;
+    (app, snap)
+}
+
+/// The broca entry's comment, as the Settings frame lists it.
+const BROCA_COMMENT: &str = "// BROCA_STATE_ROOT is the stable data folder. Its ledgers are not\n// disposable -- anyone writing a cleanup for it cannot tell the\n// difference.\n";
+
+/// The banner names the restart from the daemon's preview of the edit.
+#[test]
+fn settings_120x36() {
+    let snap = Snapshot::fixture();
+    let mut modules = serde_json::Map::new();
+    for module in &snap.modules.data {
+        modules.insert(module.id.clone(), serde_json::json!({"program": "unused"}));
+    }
+    modules.insert(
+        "broca".into(),
+        serde_json::json!({
+            "program": "/Users/alex/.local/share/cortexkit/bin/ck-broca",
+            "env": {"BROCA_STATE_ROOT": "/Users/alex/.local/share/cortexkit/broca"},
+            "reserved": "yes · only a daemon-launched broca may register",
+            "restart": "drains up to 30 s · backoff 100 ms to 30 s",
+            "health": "checked every 30 s"
+        }),
+    );
+    let mut text = serde_json::to_string_pretty(&serde_json::json!({"modules": modules})).unwrap();
+    let at = text.find("\"BROCA_STATE_ROOT\"").unwrap();
+    text.insert_str(at, BROCA_COMMENT);
+    let path = if cfg!(windows) {
+        "C:/design/subc.jsonc"
+    } else {
+        "/design/subc.jsonc"
+    };
+    let (mut app, mut snap) = settings_session(text, path);
+    answer_preview(&mut app, &mut snap, broca_restart_preview());
     check("settings-120x36", &app, &snap);
+}
+
+/// The Save overlay over the Settings frame. The frame's diff sits at lines
+/// 306-310 of `~/.config/cortexkit/subc.jsonc`, with `"env"` and broca's
+/// comment unindented, so the file is built to put them there; the comment
+/// lines above `"modules"` only fill the lines the frame doesn't show.
+///
+/// Not run on Windows: the frame shows a config path under a Unix home, and
+/// on Windows only a path with a drive is absolute, which ck requires before
+/// it edits a file.
+#[cfg(not(windows))]
+#[test]
+fn diff_120x36() {
+    let snap = Snapshot::fixture();
+    let mut head = vec!["{".to_string(), "  \"modules\": {".to_string()];
+    let mut ids: Vec<&str> = snap.modules.data.iter().map(|m| m.id.as_str()).collect();
+    ids.sort();
+    for id in ids.into_iter().filter(|id| *id != "broca") {
+        head.push(format!("    \"{id}\": {{\"program\": \"unused\"}},"));
+    }
+    head.extend(
+        [
+            "    \"broca\": {",
+            "      \"program\": \"/Users/alex/.local/share/cortexkit/bin/ck-broca\",",
+            "      \"reserved\": \"yes · only a daemon-launched broca may register\",",
+            "      \"restart\": \"drains up to 30 s · backoff 100 ms to 30 s\",",
+        ]
+        .map(String::from),
+    );
+    // Broca's comment starts on line 304, so its last line is line 306.
+    let filler = 303 - head.len();
+    let mut lines = vec![head[0].clone()];
+    lines.extend((0..filler).map(|i| format!("  // line {} of the example's padding", i + 2)));
+    lines.extend(head[1..].iter().cloned());
+    lines.extend(BROCA_COMMENT.lines().map(String::from));
+    lines.extend(
+        [
+            "\"env\": {",
+            "  \"BROCA_STATE_ROOT\": \"/Users/alex/.local/share/cortexkit/broca\"",
+            "},",
+            "      \"health\": \"checked every 30 s\"",
+            "    }",
+            "  }",
+            "}",
+        ]
+        .map(String::from),
+    );
+    assert_eq!(lines[305], "// difference.");
+    let text = lines.join("\n") + "\n";
+    let (mut app, mut snap) = settings_session(text, "/Users/alex/.config/cortexkit/subc.jsonc");
+    answer_preview(&mut app, &mut snap, broca_restart_preview());
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE), &snap);
+    assert!(app.settings.save.open);
+    check("diff-120x36", &app, &snap);
 }
 
 #[test]

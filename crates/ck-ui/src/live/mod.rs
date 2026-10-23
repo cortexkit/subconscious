@@ -403,11 +403,22 @@ pub struct State {
     pub pairing: std::collections::VecDeque<(u64, crate::pairing::flow::Event)>,
     /// The number the next pairing result gets.
     pub pairing_seq: u64,
+    /// The latest Save preview replies, numbered in arrival order (see
+    /// [`State::record_preview`]).
+    pub previews: std::collections::VecDeque<(u64, settings::PreviewReply)>,
+    /// The number the next preview reply gets.
+    pub preview_seq: u64,
+    /// How many times the live layer has connected to the daemon.
+    pub daemon_connection: u64,
 }
 
 /// How many pairing results the snapshot keeps. The app applies them as
 /// each snapshot arrives, so it falls this far behind only if it stops.
 const PAIRING_KEPT: usize = 64;
+
+/// How many preview replies the snapshot keeps. Only the newest request's
+/// reply matters to the app, and it applies replies as snapshots arrive.
+const PREVIEWS_KEPT: usize = 64;
 
 impl State {
     fn new(options: &LiveOptions) -> State {
@@ -455,6 +466,18 @@ impl State {
             down_note: None,
             pairing: std::collections::VecDeque::new(),
             pairing_seq: 1,
+            previews: std::collections::VecDeque::new(),
+            preview_seq: 1,
+            daemon_connection: 0,
+        }
+    }
+
+    /// Queues a preview reply for the app, under the next number.
+    pub fn record_preview(&mut self, reply: settings::PreviewReply) {
+        self.previews.push_back((self.preview_seq, reply));
+        self.preview_seq += 1;
+        while self.previews.len() > PREVIEWS_KEPT {
+            self.previews.pop_front();
         }
     }
 
@@ -918,6 +941,8 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
         last_result: state.last_result.clone(),
         serves: crate::model::Serves::LIVE,
         pairing: state.pairing.iter().cloned().collect(),
+        previews: state.previews.iter().cloned().collect(),
+        daemon_connection: state.daemon_connection,
         settings: state.settings.clone(),
     }
 }

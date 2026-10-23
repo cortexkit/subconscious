@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.3
+
+- `w` in Settings opens the Save overlay: the exact change to `subc.jsonc`
+  with line numbers and comments, scrolled with ↑/↓ and PgUp/PgDn, and what
+  saving would do. Each module the daemon names reads "needs a restart",
+  "applies the change without a restart", "starts" or "stops", with its runs
+  in flight and drain time when it declares busy gauges. Modules still
+  waiting for an earlier restart, sections that apply only when the daemon
+  restarts, and capability warnings are listed too.
+- Every edit and undo makes a new revision of the staged text, which the
+  daemon previews with `supervisor.rescan_checked`. Only the reply to the
+  newest request counts, and a reconnect previews the revision again. A
+  candidate the daemon refuses shows its message as it gave it; any other
+  failure shows "Couldn't check what saving does: <code>".
+- The unsaved-changes banner names the restarts from the preview.
+- Nothing is written yet: the live app's overlay only reviews the change and
+  offers `esc`. Requires subc-client-rs 0.31.1.
+
 ## 0.2.2
 
 - Add the Settings tab. It reads the daemon's config file when the daemon

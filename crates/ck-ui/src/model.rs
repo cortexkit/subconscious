@@ -787,6 +787,13 @@ pub struct Snapshot {
     /// last it applied, so a result is never lost when snapshots come
     /// faster than frames.
     pub pairing: Vec<(u64, crate::pairing::flow::Event)>,
+    /// The latest Save previews' replies, each with its sequence number,
+    /// oldest first, applied like `pairing`'s results.
+    pub previews: Vec<(u64, crate::live::settings::PreviewReply)>,
+    /// Counts the connections the live layer has made to the daemon. It
+    /// moves on every reconnect, which tells the app that a preview it is
+    /// still waiting for may never be answered and must be asked for again.
+    pub daemon_connection: u64,
 }
 
 /// The app's tabs, in the order the tab bar draws them.
@@ -932,6 +939,9 @@ pub struct Serves {
     pub tabs: TabSet,
     /// `e`: the Settings screen.
     pub settings: bool,
+    /// `⏎` and `s` in the Save overlay: writing `subc.jsonc`. Without it
+    /// the overlay only reviews the change and offers `esc` alone.
+    pub save: bool,
     /// `w`: restart without downtime (a blue/green swap).
     pub swap: bool,
     /// The tabs whose list `/` filters. Each tab's filter is served on its
@@ -966,6 +976,7 @@ impl Serves {
     pub const DESIGN: Serves = Serves {
         tabs: TabSet::ALL,
         settings: true,
+        save: true,
         swap: true,
         // The design draws a filter on these lists, and none on Home,
         // Usage or Devices.
@@ -994,6 +1005,7 @@ impl Serves {
             Tab::Settings,
         ]),
         settings: true,
+        save: false,
         swap: false,
         list_filter: TabSet::of(&[Tab::Activity, Tab::Agents, Tab::Settings]),
         multi_select: false,
@@ -1537,6 +1549,8 @@ mod fixture {
             last_result: None,
             serves: Serves::DESIGN,
             pairing: Vec::new(),
+            previews: Vec::new(),
+            daemon_connection: 0,
         })
     }
 }

@@ -1,6 +1,7 @@
 //! Typed channel-0 calls for the supervisor's read and lifecycle operations:
 //! cached health, a fresh health probe, provenance, routes, retained stderr
-//! and exits, the server description, and restart, stop and start.
+//! and exits, the server description, restart, stop and start, and the
+//! checked rescan that previews or applies a config.
 //!
 //! Each attempt sends one `ClientControlRequest` and decodes the matching
 //! `ClientControlResponse` variant. A daemon refusal comes back as
@@ -13,9 +14,9 @@
 //! module, and repeating it would do so a second time.
 
 use subc_control::{
-    CapabilityRequirementStatus, ClientControlRequest, ClientControlResponse,
+    CapabilityRequirementStatus, ClientControlRequest, ClientControlResponse, RescanExpect,
     SupervisorDaemonProvenance, SupervisorHealthEntry, SupervisorModuleProvenance,
-    SupervisorRouteModule,
+    SupervisorRescanResult, SupervisorRouteModule,
 };
 use tokio::time::Instant;
 
@@ -340,6 +341,38 @@ impl SubcConsumer {
         self.lifecycle(&request, "supervisor.set_enabled").await
     }
 
+    /// Sends `supervisor.rescan_checked` and returns the daemon's rescan
+    /// result. With `preview: true` and the full candidate config text, the
+    /// daemon previews that text and writes nothing; the result carries what
+    /// each module would do and the `expect` value an apply must send. With
+    /// `preview: false` and that `expect`, the daemon applies its config file
+    /// only if the file and its staged state still match the preview. Any
+    /// other combination is refused by the daemon. A refusal, such as
+    /// `invalid_daemon_config` for a candidate the daemon can't load, comes
+    /// back as [`CallError::Module`].
+    ///
+    /// Send this only to a daemon whose `server.describe` lists
+    /// `rescan-candidate-preview/v1`. A preview is retried on transport
+    /// failures like the other reads; an apply is sent once and never retried,
+    /// because one whose outcome is unknown may already have applied.
+    pub async fn supervisor_rescan_checked(
+        &self,
+        preview: bool,
+        candidate: Option<String>,
+        expect: Option<RescanExpect>,
+    ) -> Result<SupervisorRescanResult, CallError> {
+        const OP: &str = "supervisor.rescan_checked";
+        let request = ClientControlRequest::SupervisorRescanChecked {
+            preview,
+            candidate,
+            expect,
+        };
+        match self.control_request(&request, OP, preview).await? {
+            ClientControlResponse::SupervisorRescan { result } => Ok(result),
+            _ => Err(unexpected(OP)),
+        }
+    }
+
     async fn lifecycle(
         &self,
         request: &ClientControlRequest,
@@ -606,5 +639,180 @@ mod tests {
         let tail = call.await.unwrap().unwrap();
         assert_eq!(tail.module_id, "broca");
         assert_eq!(tail.tail.entries.len(), 1);
+    }
+
+    fn expect() -> RescanExpect {
+        RescanExpect {
+            config_sha256: "ab".repeat(32),
+            staged_generation: subc_control::StagedGeneration {
+                incarnation: "incarnation-1".into(),
+                counter: 4,
+            },
+        }
+    }
+
+    /// The request on the wire is exactly subc-control's
+    /// `SupervisorRescanChecked` variant with the arguments given, for both
+    /// the preview and the apply form.
+    #[tokio::test]
+    async fn rescan_checked_sends_the_checked_variant_with_its_arguments() {
+        let (consumer, shared, mut rx) = consumer();
+        let consumer = Arc::new(consumer);
+        for (preview, candidate, expect) in [
+            (true, Some("{\"modules\": {}}".to_string()), None),
+            (false, None, Some(expect())),
+        ] {
+            let c = Arc::clone(&consumer);
+            let (sent_candidate, sent_expect) = (candidate.clone(), expect.clone());
+            let call = tokio::spawn(async move {
+                c.supervisor_rescan_checked(preview, sent_candidate, sent_expect)
+                    .await
+            });
+            let command = rx.recv().await.unwrap();
+            assert_eq!(command.frame.header.channel, 0);
+            let sent: ClientControlRequest = serde_json::from_slice(&command.frame.body).unwrap();
+            assert_eq!(
+                sent,
+                ClientControlRequest::SupervisorRescanChecked {
+                    preview,
+                    candidate,
+                    expect,
+                }
+            );
+            let body: serde_json::Value = serde_json::from_slice(&command.frame.body).unwrap();
+            assert_eq!(body["op"], "supervisor.rescan_checked");
+            let reply = serde_json::to_vec(&serde_json::json!({
+                "op": "supervisor.rescan",
+                "added": [], "removed": [], "changed_pending_reload": [], "unchanged": 0
+            }))
+            .unwrap();
+            let corr = command.frame.header.corr;
+            assert!(dispatch_frame(&shared, 1, frame(FrameType::Response, corr, reply)).await);
+            call.await.unwrap().unwrap();
+        }
+    }
+
+    /// Drops the waiting caller's reply channel for `command`, as a transport
+    /// failure before any reply does: the caller sees a retryable `NotSent`.
+    fn lose_reply(shared: &Shared, command: &super::super::WriteCommand) {
+        let key = command.pending.expect("a request waits for its reply");
+        assert!(shared.lock_inner().pending.remove(&key).is_some());
+    }
+
+    /// A preview changes nothing, so a transport failure is retried with a
+    /// second request. An apply whose outcome is unknown may already have
+    /// applied, so it is sent once and the failure is returned.
+    #[tokio::test]
+    async fn rescan_checked_retries_a_preview_but_sends_an_apply_once() {
+        let (consumer, shared, mut rx) = consumer();
+        let consumer = Arc::new(consumer);
+        let c = Arc::clone(&consumer);
+        let call = tokio::spawn(async move {
+            c.supervisor_rescan_checked(true, Some("{}".into()), None)
+                .await
+        });
+        let first = rx.recv().await.unwrap();
+        lose_reply(&shared, &first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a preview is sent again after a transport failure")
+            .unwrap();
+        assert_ne!(second.frame.header.corr, first.frame.header.corr);
+        assert_eq!(second.frame.body, first.frame.body);
+        let reply = serde_json::to_vec(&serde_json::json!({
+            "op": "supervisor.rescan",
+            "added": [], "removed": [], "changed_pending_reload": [], "unchanged": 0,
+            "preview": true
+        }))
+        .unwrap();
+        let corr = second.frame.header.corr;
+        assert!(dispatch_frame(&shared, 1, frame(FrameType::Response, corr, reply)).await);
+        assert!(call.await.unwrap().unwrap().preview);
+
+        let c = Arc::clone(&consumer);
+        let call = tokio::spawn(async move {
+            c.supervisor_rescan_checked(false, None, Some(expect()))
+                .await
+        });
+        let only = rx.recv().await.unwrap();
+        lose_reply(&shared, &only);
+        let err = call.await.unwrap().unwrap_err();
+        assert!(matches!(err, CallError::NotSent(_)), "{err:?}");
+        assert!(
+            rx.try_recv().is_err(),
+            "an apply is never sent a second time"
+        );
+    }
+
+    /// A preview reply decodes with its module actions, earlier-pending list,
+    /// diagnostics and `expect`; a refusal keeps its code and message.
+    #[tokio::test]
+    async fn rescan_checked_decodes_the_preview_and_keeps_a_refusal_typed() {
+        let (consumer, shared, mut rx) = consumer();
+        let consumer = Arc::new(consumer);
+        let c = Arc::clone(&consumer);
+        let call = tokio::spawn(async move {
+            c.supervisor_rescan_checked(true, Some("{}".into()), None)
+                .await
+        });
+        let command = rx.recv().await.unwrap();
+        let reply = serde_json::json!({
+            "op": "supervisor.rescan",
+            "added": [], "removed": [], "changed_pending_reload": ["broca"],
+            "unchanged": 3, "preview": true,
+            "restart_required": ["storage"],
+            "capability_warnings": ["memory.read has no provider"],
+            "module_actions": [{
+                "module_id": "broca", "action": "restart", "changed": ["environment"],
+                "drain_timeout_ms": 30000,
+                "busy_gauges": [{"gauge": "runs_in_flight", "value": 3}]
+            }],
+            "earlier_pending": ["wernicke"],
+            "expect": serde_json::to_value(expect()).unwrap()
+        });
+        let corr = command.frame.header.corr;
+        let reply = serde_json::to_vec(&reply).unwrap();
+        assert!(dispatch_frame(&shared, 1, frame(FrameType::Response, corr, reply)).await);
+        let result = call.await.unwrap().unwrap();
+        assert!(result.preview);
+        assert_eq!(result.restart_required, vec!["storage"]);
+        assert_eq!(
+            result.capability_warnings,
+            vec!["memory.read has no provider"]
+        );
+        assert_eq!(result.earlier_pending, vec!["wernicke"]);
+        assert_eq!(result.expect, Some(expect()));
+        let action = &result.module_actions[0];
+        assert_eq!(action.module_id, "broca");
+        assert_eq!(action.action, subc_control::RescanModuleActionKind::Restart);
+        assert_eq!(action.changed, vec!["environment"]);
+        assert_eq!(action.drain_timeout_ms, Some(30000));
+        assert_eq!(action.busy_gauges[0].gauge, "runs_in_flight");
+        assert_eq!(action.busy_gauges[0].value, Some(serde_json::json!(3)));
+
+        let c = Arc::clone(&consumer);
+        let call = tokio::spawn(async move {
+            c.supervisor_rescan_checked(true, Some("{".into()), None)
+                .await
+        });
+        let command = rx.recv().await.unwrap();
+        let refusal = serde_json::to_vec(&ErrorBody {
+            code: "invalid_daemon_config".into(),
+            message: "supervisor rescan rejected daemon config: unexpected end".into(),
+            detail: None,
+        })
+        .unwrap();
+        let corr = command.frame.header.corr;
+        assert!(dispatch_frame(&shared, 1, frame(FrameType::Error, corr, refusal)).await);
+        match call.await.unwrap().unwrap_err() {
+            CallError::Module(body) => {
+                assert_eq!(body.code, "invalid_daemon_config");
+                assert_eq!(
+                    body.message,
+                    "supervisor rescan rejected daemon config: unexpected end"
+                );
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
+        }
     }
 }

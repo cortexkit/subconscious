@@ -1,12 +1,13 @@
 //! In-memory editing of the daemon's reported JSONC configuration.
 
+use super::save::{self, SaveMode, SaveState};
 use super::View;
 pub use crate::draw::under_home as display_value;
 use crate::draw::{
     chrome, detail_rows, details_view, frame_end, pad_right, trunc, value_rows, width, Canvas,
     DetailRow,
 };
-use crate::live::settings::SettingsReading;
+use crate::live::settings::{PreviewReply, SettingsReading};
 use crate::model::{Daemon, Serves, Tab};
 use crate::theme::{Bg, St};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -47,6 +48,127 @@ pub struct SettingsState {
     undo: Vec<String>,
     pub notice: Option<String>,
     pub quit_asked: bool,
+    /// The candidate's revisions, their previews and the Save overlay.
+    pub save: SaveState,
+    /// Unit tests set this to change the candidate right after a text
+    /// edit, standing in for an edit that lands in the wrong place.
+    #[cfg(test)]
+    after_edit: Option<fn(&mut String)>,
+}
+
+/// One editor action as a change to the parsed document: the JSON path it
+/// targets and what it does there.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Edit {
+    /// Set the member at `path` to `value`, adding it (and any absent
+    /// parent objects) when it is absent.
+    Set { path: Vec<String>, value: Value },
+    /// Remove the member at `path`.
+    Remove { path: Vec<String> },
+    /// Replace element `index` of the array at `path`.
+    SetElement {
+        path: Vec<String>,
+        index: usize,
+        value: Value,
+    },
+    /// Remove element `index` of the array at `path`.
+    RemoveElement { path: Vec<String>, index: usize },
+    /// Append `value` to the array at `path`, creating the array (and any
+    /// absent parent objects) when it is absent.
+    PushElement { path: Vec<String>, value: Value },
+}
+
+impl Edit {
+    /// The path the edit targets, written `modules.<id>.<field>`.
+    pub fn target(&self) -> String {
+        match self {
+            Edit::Set { path, .. }
+            | Edit::Remove { path }
+            | Edit::SetElement { path, .. }
+            | Edit::RemoveElement { path, .. }
+            | Edit::PushElement { path, .. } => path.join("."),
+        }
+    }
+
+    /// `before` with this edit made by plain JSON operations, or `None` when
+    /// the edit can't be made there (a parent that isn't an object, a path
+    /// that isn't an array, an element that doesn't exist).
+    pub fn expected(&self, before: &Value) -> Option<Value> {
+        fn object_at<'a>(
+            mut value: &'a mut Value,
+            path: &[String],
+        ) -> Option<&'a mut serde_json::Map<String, Value>> {
+            for key in path {
+                value = value
+                    .as_object_mut()?
+                    .entry(key.clone())
+                    .or_insert_with(|| Value::Object(Default::default()));
+            }
+            value.as_object_mut()
+        }
+        let mut after = before.clone();
+        match self {
+            Edit::Set { path, value } => {
+                let (last, parents) = path.split_last()?;
+                object_at(&mut after, parents)?.insert(last.clone(), value.clone());
+            }
+            Edit::Remove { path } => {
+                let (last, parents) = path.split_last()?;
+                let mut parent = &mut after;
+                for key in parents {
+                    parent = parent.as_object_mut()?.get_mut(key)?;
+                }
+                parent.as_object_mut()?.remove(last);
+            }
+            Edit::SetElement { path, index, value } => {
+                *after
+                    .pointer_mut(&pointer(path))?
+                    .as_array_mut()?
+                    .get_mut(*index)? = value.clone();
+            }
+            Edit::RemoveElement { path, index } => {
+                let array = after.pointer_mut(&pointer(path))?.as_array_mut()?;
+                if *index >= array.len() {
+                    return None;
+                }
+                array.remove(*index);
+            }
+            Edit::PushElement { path, value } => {
+                let (last, parents) = path.split_last()?;
+                let array = object_at(&mut after, parents)?
+                    .entry(last.clone())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                array.as_array_mut()?.push(value.clone());
+            }
+        }
+        Some(after)
+    }
+}
+
+/// A JSON pointer to `path`, with `~` and `/` escaped as RFC 6901 says.
+fn pointer(path: &[String]) -> String {
+    path.iter()
+        .map(|key| format!("/{}", key.replace('~', "~0").replace('/', "~1")))
+        .collect()
+}
+
+fn parsed(text: &str) -> Option<Value> {
+    subc_jsonc::jsonc_to_json(text)
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+}
+
+/// Whether `after` is exactly `before` with `edit` made and nothing else.
+/// The text edit works on spans of the file, so this checks its result
+/// independently: both texts are parsed and compared with the same edit made
+/// by plain JSON operations. A wrong span would change another member,
+/// leave the intended value out or reorder an array, and every such result
+/// is refused before it can be previewed or saved.
+pub fn edit_is_exact(before: &str, after: &str, edit: &Edit) -> bool {
+    match (parsed(before), parsed(after)) {
+        (Some(before), Some(after)) => edit.expected(&before) == Some(after),
+        _ => false,
+    }
 }
 #[derive(Clone, Debug)]
 pub struct Row {
@@ -102,8 +224,65 @@ impl SettingsState {
             }
         }
         self.reading = reading.clone();
+        if changed_path {
+            self.revised();
+        }
         if !reading.editable() {
             self.field = None;
+            self.save.open = false;
+        }
+        true
+    }
+    /// Whether the staged text differs from the file as read.
+    pub fn dirty(&self) -> bool {
+        self.candidate != self.original
+    }
+    /// The staged text changed: a new revision, previewed when it differs
+    /// from the file and the daemon can preview it.
+    fn revised(&mut self) {
+        let preview = self.dirty() && self.reading.editable();
+        self.save.revise(&self.candidate, preview);
+    }
+    /// Notes the live layer's connection number; after a reconnect the
+    /// current revision is previewed again.
+    pub fn connected(&mut self, connection: u64) -> bool {
+        let preview = self.dirty() && self.reading.editable();
+        self.save.connected(connection, &self.candidate, preview)
+    }
+    /// Takes a preview reply; returns whether it was the one waited for.
+    pub fn absorb(&mut self, reply: &PreviewReply) -> bool {
+        self.save.absorb(reply)
+    }
+    /// Keys while the Save overlay shows. It takes every key: `esc` closes
+    /// it with the edits kept, the arrows and PgUp/PgDn scroll the diff,
+    /// and `⏎` or `s` ask for a save only when this build writes files and
+    /// the preview of the revision on screen allows it.
+    pub fn save_key(&mut self, key: KeyEvent, size: (u16, u16), serves_save: bool) -> bool {
+        let (last, page) = save::scroll_limits(
+            &self.save,
+            &self.original,
+            &self.candidate,
+            i32::from(size.0),
+            i32::from(size.1),
+        );
+        let scroll = &mut self.save.scroll;
+        match key.code {
+            KeyCode::Esc => self.save.open = false,
+            KeyCode::Up => *scroll = scroll.saturating_sub(1),
+            KeyCode::Down => *scroll = (*scroll + 1).min(last),
+            KeyCode::PageUp => *scroll = scroll.saturating_sub(page),
+            KeyCode::PageDown => *scroll = (*scroll + page).min(last),
+            KeyCode::Enter | KeyCode::Char('s') if serves_save => {
+                let mode = if key.code == KeyCode::Enter {
+                    SaveMode::Apply
+                } else {
+                    SaveMode::Only
+                };
+                if let Some(order) = self.save.order(mode, &self.candidate) {
+                    self.save.order = Some(order);
+                }
+            }
+            _ => {}
         }
         true
     }
@@ -237,64 +416,95 @@ impl SettingsState {
         let Some(id) = self.entry() else {
             return;
         };
+        let path = |field: &[&str]| -> Vec<String> {
+            ["modules", id.as_str()]
+                .iter()
+                .chain(field)
+                .map(|s| s.to_string())
+                .collect()
+        };
         let before = self.candidate.clone();
-        let result = match target {
+        let (edit, result) = match target {
             Target::Enabled => {
                 let enabled = self.document()["modules"][&id]["enabled"]
                     .as_bool()
                     .unwrap_or(true);
-                subc_jsonc::set_member(
-                    &mut self.candidate,
-                    &["modules", &id, "enabled"],
-                    &json!(!enabled),
+                let path = path(&["enabled"]);
+                let value = json!(!enabled);
+                let result = set_at(&mut self.candidate, &path, &value);
+                (Edit::Set { path, value }, result)
+            }
+            Target::Program => {
+                let (path, value) = (path(&["program"]), json!(text));
+                let result = set_at(&mut self.candidate, &path, &value);
+                (Edit::Set { path, value }, result)
+            }
+            Target::Argument(i) if remove => {
+                let path = path(&["args"]);
+                let result = subc_jsonc::remove_element(&mut self.candidate, &refs(&path), *i);
+                (Edit::RemoveElement { path, index: *i }, result)
+            }
+            Target::Argument(i) => {
+                let (path, value) = (path(&["args"]), json!(text));
+                let result = subc_jsonc::set_element(&mut self.candidate, &refs(&path), *i, &value);
+                (
+                    Edit::SetElement {
+                        path,
+                        index: *i,
+                        value,
+                    },
+                    result,
                 )
             }
-            Target::Program => subc_jsonc::set_member(
-                &mut self.candidate,
-                &["modules", &id, "program"],
-                &json!(text),
-            ),
-            Target::Argument(i) if remove => {
-                subc_jsonc::remove_element(&mut self.candidate, &["modules", &id, "args"], *i)
+            Target::AddArgument => {
+                let (path, value) = (path(&["args"]), json!(text));
+                let result = subc_jsonc::push_element(&mut self.candidate, &refs(&path), &value);
+                (Edit::PushElement { path, value }, result)
             }
-            Target::Argument(i) => subc_jsonc::set_element(
-                &mut self.candidate,
-                &["modules", &id, "args"],
-                *i,
-                &json!(text),
-            ),
-            Target::AddArgument => subc_jsonc::push_element(
-                &mut self.candidate,
-                &["modules", &id, "args"],
-                &json!(text),
-            ),
             Target::Environment(key) if remove => {
-                subc_jsonc::remove_member(&mut self.candidate, &["modules", &id, "env", key])
-                    .map(|_| ())
+                let path = path(&["env", key]);
+                let result =
+                    subc_jsonc::remove_member(&mut self.candidate, &refs(&path)).map(|_| ());
+                (Edit::Remove { path }, result)
             }
-            Target::Environment(key) => subc_jsonc::set_member(
-                &mut self.candidate,
-                &["modules", &id, "env", key],
-                &json!(text),
-            ),
+            Target::Environment(key) => {
+                let (path, value) = (path(&["env", key]), json!(text));
+                let result = set_at(&mut self.candidate, &path, &value);
+                (Edit::Set { path, value }, result)
+            }
             Target::AddEnvironment => {
                 let key = name.unwrap_or("");
-                if key.is_empty() || self.document()["modules"][&id]["env"].get(key).is_some() {
+                let (path, value) = (path(&["env", key]), json!(text));
+                let result = if key.is_empty()
+                    || self.document()["modules"][&id]["env"].get(key).is_some()
+                {
                     Err("Choose a new, non-empty environment name".into())
                 } else {
-                    subc_jsonc::insert_member(
-                        &mut self.candidate,
-                        &["modules", &id, "env", key],
-                        &json!(text),
-                    )
-                }
+                    subc_jsonc::insert_member(&mut self.candidate, &refs(&path), &value)
+                };
+                (Edit::Set { path, value }, result)
             }
         };
+        #[cfg(test)]
+        if let (Ok(()), Some(hook)) = (&result, self.after_edit) {
+            hook(&mut self.candidate);
+        }
         match result {
             Ok(()) if before != self.candidate => {
+                // Only a result that is exactly the intended edit may become
+                // a revision, which is what gets previewed and saved.
+                if !edit_is_exact(&before, &self.candidate, &edit) {
+                    self.candidate = before;
+                    self.notice = Some(format!(
+                        "This edit changed more than {}; it was not applied",
+                        edit.target()
+                    ));
+                    return;
+                }
                 self.undo.push(before);
                 self.quit_asked = false;
                 self.notice = None;
+                self.revised();
             }
             Ok(()) => {}
             Err(error) => {
@@ -419,6 +629,7 @@ impl SettingsState {
                 if let Some(text) = self.undo.pop() {
                     self.candidate = text;
                     self.quit_asked = false;
+                    self.revised();
                 }
             }
             KeyCode::Enter if self.focus == 0 => self.focus = 1,
@@ -463,11 +674,24 @@ impl SettingsState {
                     self.apply(target, "", None, true);
                 }
             }
-            KeyCode::Char('w') => return Some(false),
+            KeyCode::Char('w') => {
+                if !(self.section < 2 && self.reading.editable() && self.dirty()) {
+                    return Some(false);
+                }
+                self.save.open = true;
+                self.save.scroll = 0;
+                self.save.ensure(&self.candidate);
+            }
             _ => return None,
         }
         Some(true)
     }
+}
+fn refs(path: &[String]) -> Vec<&str> {
+    path.iter().map(String::as_str).collect()
+}
+fn set_at(document: &mut String, path: &[String], value: &Value) -> Result<(), String> {
+    subc_jsonc::set_member(document, &refs(path), value)
 }
 fn plain(key: KeyEvent) -> bool {
     !key.modifiers
@@ -942,23 +1166,30 @@ pub fn draw(c: &mut Canvas, v: &View, state: &SettingsState) {
             }
             if let Some(y) = place.banner {
                 c.fill(x - 1, y, dw + 2, 1, ' ', St::bg(Bg::AccBg));
-                let text = if design {
-                    format!(
-                        "{} · needs a restart of {id}",
-                        change_count(state.changes())
-                    )
-                } else {
+                // The restarts are the daemon's preview of the staged text,
+                // so the banner names none until that preview arrives.
+                let restarts = state.save.restarts();
+                let text = if restarts.is_empty() {
                     change_count(state.changes())
+                } else {
+                    format!(
+                        "{} · needs a restart of {}",
+                        change_count(state.changes()),
+                        restarts.join(", ")
+                    )
                 };
-                c.put(x, y, &trunc(&text, dw as usize), St::bg(Bg::AccBg));
-                if design {
-                    c.right(
-                        x + dw,
-                        y,
-                        " w  review and save ",
-                        St::A.bold().on(Bg::AccBg),
-                    );
-                }
+                let key = if snap.serves.save {
+                    " w  review and save "
+                } else {
+                    " w  review "
+                };
+                let key_x = c.right(x + dw, y, key, St::A.bold().on(Bg::AccBg));
+                c.put(
+                    x,
+                    y,
+                    &trunc(&text, (key_x - x - 1).max(0) as usize),
+                    St::bg(Bg::AccBg),
+                );
             }
         }
         if let Some(error) = &state.reading.error {
@@ -973,8 +1204,8 @@ pub fn draw(c: &mut Canvas, v: &View, state: &SettingsState) {
         }
     });
     let mut hints = vec![("e", "edit"), ("⏎", "toggle")];
-    if design {
-        hints.push(("w", "save"));
+    if state.dirty() {
+        hints.push(("w", if snap.serves.save { "save" } else { "review" }));
     }
     hints.extend([("u", "undo"), ("/", "filter")]);
     if !state.reading.editable() || state.section != 0 {
@@ -996,6 +1227,20 @@ pub fn draw(c: &mut Canvas, v: &View, state: &SettingsState) {
     }
     if let Some(field) = &state.field {
         draw_field(c, field);
+    }
+    if state.save.open {
+        save::draw(
+            c,
+            &save::Overlay {
+                save: &state.save,
+                original: &state.original,
+                candidate: &state.candidate,
+                config_path: state.reading.config_path.as_deref().unwrap_or(""),
+                home: snap.host.data.home.as_deref(),
+                changes: state.changes(),
+                serves_save: snap.serves.save,
+            },
+        );
     }
 }
 
@@ -1032,4 +1277,149 @@ fn draw_field(c: &mut Canvas, field: &EditField) {
     ) as i32;
     c.paint(x + 3 + cursor_x, y + 2, 1, St::bg(Bg::Sel));
     c.put(x + 3, y + 3, "⏎ commit · esc cancel · ←/→ move", St::D);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(p: &str) -> Vec<String> {
+        p.split('.').map(String::from).collect()
+    }
+
+    const BEFORE: &str = r#"{
+  // A comment, so both texts go through the JSONC reader.
+  "modules": {
+    "broca": {"program": "/example/ck-broca", "args": ["--one", "--two"]},
+    "other": {"program": "/example/ck-other"}
+  }
+}"#;
+
+    fn after(change: impl FnOnce(&mut Value)) -> String {
+        let mut value = parsed(BEFORE).unwrap();
+        change(&mut value);
+        value.to_string()
+    }
+
+    #[test]
+    fn the_exact_result_of_each_kind_of_edit_is_accepted() {
+        let set = Edit::Set {
+            path: path("modules.broca.program"),
+            value: json!("/example/next"),
+        };
+        let exact = after(|v| v["modules"]["broca"]["program"] = json!("/example/next"));
+        assert!(edit_is_exact(BEFORE, &exact, &set));
+        let insert = Edit::Set {
+            path: path("modules.broca.env.NEW"),
+            value: json!("1"),
+        };
+        let exact = after(|v| v["modules"]["broca"]["env"] = json!({"NEW": "1"}));
+        assert!(edit_is_exact(BEFORE, &exact, &insert));
+        let remove = Edit::Remove {
+            path: path("modules.other.program"),
+        };
+        let exact = after(|v| v["modules"]["other"] = json!({}));
+        assert!(edit_is_exact(BEFORE, &exact, &remove));
+        let set_element = Edit::SetElement {
+            path: path("modules.broca.args"),
+            index: 1,
+            value: json!("--2"),
+        };
+        let exact = after(|v| v["modules"]["broca"]["args"][1] = json!("--2"));
+        assert!(edit_is_exact(BEFORE, &exact, &set_element));
+        let remove_element = Edit::RemoveElement {
+            path: path("modules.broca.args"),
+            index: 0,
+        };
+        let exact = after(|v| v["modules"]["broca"]["args"] = json!(["--two"]));
+        assert!(edit_is_exact(BEFORE, &exact, &remove_element));
+        let push = Edit::PushElement {
+            path: path("modules.other.args"),
+            value: json!("--x"),
+        };
+        let exact = after(|v| v["modules"]["other"]["args"] = json!(["--x"]));
+        assert!(edit_is_exact(BEFORE, &exact, &push));
+    }
+
+    #[test]
+    fn a_result_that_differs_from_the_intended_edit_is_refused() {
+        let set = Edit::Set {
+            path: path("modules.broca.program"),
+            value: json!("/example/next"),
+        };
+        let other_module = after(|v| {
+            v["modules"]["broca"]["program"] = json!("/example/next");
+            v["modules"]["other"]["program"] = json!("/example/next");
+        });
+        assert!(!edit_is_exact(BEFORE, &other_module, &set));
+        let extra_member = after(|v| {
+            v["modules"]["broca"]["program"] = json!("/example/next");
+            v["modules"]["broca"]["enabled"] = json!(false);
+        });
+        assert!(!edit_is_exact(BEFORE, &extra_member, &set));
+        let missing = after(|v| {
+            v["modules"]["broca"]
+                .as_object_mut()
+                .unwrap()
+                .remove("program");
+        });
+        assert!(!edit_is_exact(BEFORE, &missing, &set));
+        assert!(!edit_is_exact(BEFORE, BEFORE, &set));
+        let push = Edit::PushElement {
+            path: path("modules.broca.args"),
+            value: json!("--three"),
+        };
+        let reordered =
+            after(|v| v["modules"]["broca"]["args"] = json!(["--two", "--one", "--three"]));
+        assert!(!edit_is_exact(BEFORE, &reordered, &push));
+        let no_such_element = Edit::SetElement {
+            path: path("modules.broca.args"),
+            index: 5,
+            value: json!("--x"),
+        };
+        assert!(!edit_is_exact(BEFORE, BEFORE, &no_such_element));
+        assert!(!edit_is_exact(BEFORE, "{ not json", &set));
+    }
+
+    /// An edit whose text lands wrong is undone, says so, and never becomes
+    /// a revision, so nothing is previewed.
+    #[test]
+    fn apply_refuses_an_edit_that_landed_in_the_wrong_place() {
+        let config_path = if cfg!(windows) {
+            "C:/example/subc.jsonc"
+        } else {
+            "/example/subc.jsonc"
+        };
+        let mut state = SettingsState::default();
+        state.observe(&SettingsReading {
+            config_path: Some(config_path.into()),
+            capable: true,
+            text: Some(BEFORE.into()),
+            error: None,
+        });
+        state.selected = Some("broca".into());
+        state.focus = 2;
+        state.row = 0;
+        let revision = state.save.revision;
+        state.after_edit = Some(|text: &mut String| {
+            *text = text.replace("/example/ck-other", "/example/elsewhere");
+        });
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        state.key(enter, 10);
+        assert_eq!(state.candidate, BEFORE, "the candidate is restored");
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("This edit changed more than modules.broca.enabled; it was not applied")
+        );
+        assert_eq!(state.save.revision, revision, "no new revision");
+        assert!(state.save.outbox.is_empty(), "no preview requested");
+        assert!(state.save.pending.is_none());
+
+        // The same edit without the corruption goes through and is previewed.
+        state.after_edit = None;
+        state.key(enter, 10);
+        assert_eq!(state.document()["modules"]["broca"]["enabled"], false);
+        assert_eq!(state.save.outbox.len(), 1);
+        assert_eq!(state.notice, None);
+    }
 }

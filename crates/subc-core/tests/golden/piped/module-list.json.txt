@@ -5,6 +5,7 @@ exit: Some(0)
   "generation": 1,
   "modules": [
     {
+      "configured_enabled": true,
       "drain_timeout_ms": 30000,
       "enabled": true,
       "health": "ok",

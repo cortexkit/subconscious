@@ -5249,6 +5249,9 @@ impl ControlHandler {
                 status.launch_spec_digest.as_ref(),
             ));
             let pending_reload = Some(verdict);
+            let configured_enabled = self
+                .capability_evaluator
+                .configured_enabled(&status.module_id);
             // Keep the retired policy field on the wire for one release so
             // existing status consumers still receive the platform policy.
             modules.push(
@@ -5259,6 +5262,7 @@ impl ControlHandler {
                     status.live,
                     status.health.status,
                 )
+                .with_configured_enabled(configured_enabled)
                 .with_launch_nonce_env(Some(!cfg!(unix)))
                 .with_launch_nonce_source(status.launch_nonce_source)
                 .with_waiting_for_previous_pid(status.waiting_for_previous_pid)
@@ -12424,6 +12428,53 @@ mod tests {
         assert_eq!(event.fields.get("in_flight"), Some(&limit.to_string()));
         assert_eq!(event.fields.get("limit"), Some(&limit.to_string()));
         drop(guards);
+    }
+
+    #[tokio::test]
+    async fn supervisor_list_reports_loaded_config_and_omits_unconfigured() {
+        let registry = Arc::new(Registry::default());
+        let handle = SupervisorHandle::new();
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone());
+        supervisor
+            .supervise_configured(
+                crate::ModuleSpec {
+                    module_id: "drift".into(),
+                    program: PathBuf::from("disabled-module"),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    reserved: false,
+                    reserved_prefixes: Vec::new(),
+                    protocol: ModuleProtocol::Subc,
+                    overlap: Default::default(),
+                },
+                false,
+            )
+            .unwrap();
+        let handler = ControlHandler::new(registry).with_supervisor(handle);
+        for configured in [None, Some(false), Some(true)] {
+            handler.capability_evaluator.configure(
+                configured.map(|enabled| ("drift".to_string(), enabled)),
+                BTreeMap::new(),
+            );
+            let frame =
+                Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+            let replies = handler
+                .handle_supervisor_set_enabled(frame, "drift".into(), false, Principal::Direct)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
+            assert!(body.get("configured_enabled").is_none());
+            assert_eq!(body["op"], "supervisor.ack");
+            let frame =
+                Frame::build(FrameType::Request, control_flags(), 0, 0, 2, Vec::new()).unwrap();
+            let replies = handler.handle_supervisor_list(frame).await.unwrap();
+            let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
+            assert_eq!(
+                body["modules"][0].get("configured_enabled"),
+                configured.map(Value::Bool).as_ref()
+            );
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

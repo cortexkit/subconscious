@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.122
+
+- `ck module start` and `stop` explain when the result differs from `subc.jsonc`, including that any rescan or daemon restart reapplies the file and how to make the change persistent. They read `configured_enabled` from the target's post-acknowledgement list entry, not the unchanged lifecycle acknowledgement. Matching, unconfigured or missing entries keep their plain output unchanged; JSON passes through `configured_enabled` in the nested module entry only.
+- `ck module list` and `status` mark enabled drift as `running (config: disabled)` or `stopped (config: enabled)`. The full-screen app is unchanged. Document both start and stop as runtime-only operations.
+
 ## 0.20.121
 
 - The span-preserving JSONC editor that setup uses to add its entries to `subc.jsonc`, and the reader that loads the file with its text, moved to `subc-jsonc` (0.1.3), which also gains the edits a settings screen needs: setting a member's value (adding the key when absent), removing a member, and replacing, appending or removing an array element. Setup writes exactly the bytes it wrote before; tests pin them for every setup fixture, including a CRLF file and the nats-server health check. Adding a value under a parent that exists but is not an object is now refused instead of adding a second member with the parent's name. Setup writes `subc.jsonc` and its inventory file with sorted keys however `ck` was built; before, a build with serde_json's `preserve_order` feature on wrote some keys in a different order. Release builds already wrote sorted keys, so their output is unchanged.

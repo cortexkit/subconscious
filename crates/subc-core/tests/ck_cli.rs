@@ -4071,6 +4071,118 @@ async fn module_stop_waits_past_ten_seconds_within_running_drain_budget() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_start_stop_print_exact_drift_lines_and_preserve_matching_bytes() {
+    for enabled in [true, false] {
+        for configured_enabled in [None, Some(false), Some(true)] {
+            for listed in [true, false] {
+                for json_output in [false, true] {
+                    let module_id = "drift";
+                    let verb = if enabled { "start" } else { "stop" };
+                    let state = if enabled { "running" } else { "disabled" };
+                    let entry = SupervisorEntry::new(
+                        module_id,
+                        state,
+                        enabled,
+                        enabled,
+                        SupervisorHealthStatus::Unknown,
+                    )
+                    .with_configured_enabled(configured_enabled);
+                    let before = ClientControlResponse::SupervisorList {
+                        generation: 1,
+                        modules: vec![entry
+                            .clone()
+                            .with_configured_enabled(configured_enabled.map(|value| !value))],
+                    };
+                    let unrelated = SupervisorEntry::new(
+                        "another-module",
+                        state,
+                        enabled,
+                        enabled,
+                        SupervisorHealthStatus::Unknown,
+                    )
+                    .with_configured_enabled(Some(!enabled));
+                    let mut modules = vec![unrelated];
+                    if listed {
+                        modules.push(entry);
+                    }
+                    let after = ClientControlResponse::SupervisorList {
+                        generation: 1,
+                        modules,
+                    };
+                    let daemon = ScriptedDaemon::start(
+                        "ck-enabled-drift",
+                        vec![
+                            ScriptedControlStep {
+                                expected: ClientControlRequest::SupervisorList {},
+                                action: ScriptedControlAction::Reply(Box::new(before)),
+                            },
+                            ScriptedControlStep {
+                                expected: ClientControlRequest::SupervisorSetEnabled {
+                                    module_id: module_id.into(),
+                                    enabled,
+                                },
+                                action: ScriptedControlAction::Reply(Box::new(
+                                    ClientControlResponse::SupervisorAck {
+                                        module_id: module_id.into(),
+                                        applied: true,
+                                    },
+                                )),
+                            },
+                            ScriptedControlStep {
+                                expected: ClientControlRequest::SupervisorList {},
+                                action: ScriptedControlAction::Reply(Box::new(after)),
+                            },
+                        ],
+                    )
+                    .await;
+                    let output = if json_output {
+                        ck_with_subc(
+                            &daemon.connection_file_path,
+                            ["module", verb, module_id, "--json"],
+                        )
+                    } else {
+                        ck_with_subc(&daemon.connection_file_path, ["module", verb, module_id])
+                    };
+                    assert_exit(&output, 0);
+                    if json_output {
+                        let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+                        assert!(body.get("configured_enabled").is_none());
+                        assert_eq!(
+                            body["module"].get("configured_enabled"),
+                            configured_enabled
+                                .filter(|_| listed)
+                                .map(Value::Bool)
+                                .as_ref()
+                        );
+                        continue;
+                    }
+                    let notice = match (enabled, configured_enabled.filter(|_| listed)) {
+                    (true, Some(false)) => "started; subc.jsonc has \"enabled\": false, so the next rescan or daemon restart stops it. Set \"enabled\": true to keep it running.\n",
+                    (false, Some(true)) => "stopped; subc.jsonc has \"enabled\": true, so the next rescan or daemon restart starts it again. Set \"enabled\": false to keep it stopped.\n",
+                    _ => "",
+                };
+                    assert_eq!(
+                        text(&output.stdout),
+                        format!(
+                            "module  applied  {}\ndrift   true     {state}\ndaemon: {}\n{notice}",
+                            if !listed {
+                                "state"
+                            } else if enabled {
+                                "state  "
+                            } else {
+                                "state   "
+                            },
+                            daemon.connection_file_path.display(),
+                            state = if listed { state } else { "-    " }
+                        )
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mutating_timeout_exits_outcome_unknown_and_names_status_verification() {
     let module_id = "scripted-stop-timeout";
     let daemon = ScriptedDaemon::start(

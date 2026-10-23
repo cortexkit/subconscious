@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.36
+
+- Report the loaded configuration's `configured_enabled` in `supervisor.list` entries, omitting it for modules without a configured entry. Lifecycle acknowledgements are unchanged. This exposes temporary runtime start/stop overrides without changing reconciliation: every rescan or daemon restart reapplies the file's enabled values, even for unchanged entries. Requires subc-control 0.32.6.
+
 ## 0.36.35
 
 - Test-only release; daemon behaviour is unchanged from 0.36.34, which was never

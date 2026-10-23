@@ -167,6 +167,15 @@ impl Default for CapabilityRequirementEvaluator {
 }
 
 impl CapabilityRequirementEvaluator {
+    pub(crate) fn configured_enabled(&self, module_id: &str) -> Option<bool> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .configured
+            .get(module_id)
+            .map(|module| module.enabled)
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(EvaluatorState::default()),

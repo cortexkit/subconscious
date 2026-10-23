@@ -3659,8 +3659,22 @@ async fn print_ack_with_state(
         // and about the wrong subject, which is the hardest kind of mistake to
         // notice because there is no error to see.
         println!("daemon: {}", client.path.display());
+        if let Some(line) = module
+            .as_ref()
+            .and_then(|entry| enabled_drift_notice(verb, entry))
+        {
+            println!("{line}");
+        }
     }
     Ok(())
+}
+
+fn enabled_drift_notice(verb: &str, module: &Value) -> Option<&'static str> {
+    match (verb, module.get("configured_enabled").and_then(Value::as_bool)) {
+        ("start", Some(false)) => Some("started; subc.jsonc has \"enabled\": false, so the next rescan or daemon restart stops it. Set \"enabled\": true to keep it running."),
+        ("stop", Some(true)) => Some("stopped; subc.jsonc has \"enabled\": true, so the next rescan or daemon restart starts it again. Set \"enabled\": false to keep it stopped."),
+        _ => None,
+    }
 }
 
 async fn health(
@@ -5898,7 +5912,11 @@ fn print_module_table(modules: &[Value], verbose: bool) {
             .map(|module| {
                 let mut row = vec![
                     terminal_safe_string(&display_field(module, "module_id")),
-                    terminal_safe_string(&display_field(module, "state")),
+                    terminal_safe_string(&if enabled_drift_marker(module).is_empty() {
+                        display_field(module, "state")
+                    } else {
+                        module_status_text(module)
+                    }),
                     enabled_word(module.get("enabled").and_then(Value::as_bool)),
                     live_word(module),
                     terminal_safe_string(&human_health_status(&display_field(module, "health"))),
@@ -6316,6 +6334,25 @@ fn print_status_table(
 }
 
 fn module_status_text(module: &Value) -> String {
+    format!(
+        "{}{}",
+        module_runtime_status_text(module),
+        enabled_drift_marker(module)
+    )
+}
+
+fn enabled_drift_marker(module: &Value) -> &'static str {
+    match (
+        module.get("enabled").and_then(Value::as_bool),
+        module.get("configured_enabled").and_then(Value::as_bool),
+    ) {
+        (Some(true), Some(false)) => " (config: disabled)",
+        (Some(false), Some(true)) => " (config: enabled)",
+        _ => "",
+    }
+}
+
+fn module_runtime_status_text(module: &Value) -> String {
     if let Some(pid) = module
         .get("waiting_for_previous_pid")
         .and_then(Value::as_u64)
@@ -8277,6 +8314,43 @@ fn a_successful_command_stays_successful_when_old_image_cleanup_fails() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn start_and_stop_drift_notices_are_exact_and_only_for_divergence() {
+        assert_eq!(enabled_drift_notice("start", &serde_json::json!({"configured_enabled": false})),
+            Some("started; subc.jsonc has \"enabled\": false, so the next rescan or daemon restart stops it. Set \"enabled\": true to keep it running."));
+        assert_eq!(enabled_drift_notice("stop", &serde_json::json!({"configured_enabled": true})),
+            Some("stopped; subc.jsonc has \"enabled\": true, so the next rescan or daemon restart starts it again. Set \"enabled\": false to keep it stopped."));
+        for (verb, module) in [
+            ("start", serde_json::json!({"configured_enabled": true})),
+            ("stop", serde_json::json!({"configured_enabled": false})),
+            ("start", serde_json::json!({})),
+            ("stop", serde_json::json!({})),
+            ("restart", serde_json::json!({"configured_enabled": false})),
+        ] {
+            assert_eq!(enabled_drift_notice(verb, &module), None);
+        }
+    }
+
+    #[test]
+    fn module_status_marks_enabled_drift_both_ways_and_omits_matches() {
+        for (enabled, configured, expected) in [
+            (true, false, "running (config: disabled)"),
+            (false, true, "stopped (config: enabled)"),
+            (true, true, "running"),
+            (false, false, "stopped"),
+        ] {
+            let module = serde_json::json!({"state": if enabled { "running" } else { "disabled" },
+                "enabled": enabled, "live": enabled, "configured_enabled": configured});
+            assert_eq!(module_status_text(&module), expected);
+        }
+        assert_eq!(
+            module_status_text(
+                &serde_json::json!({"state": "running", "enabled": true, "live": true})
+            ),
+            "running"
+        );
+    }
+
     mod piped_daemon_output {
         use super::super::*;
 

@@ -2295,6 +2295,10 @@ pub struct SupervisorEntry {
     pub module_id: String,
     pub state: String,
     pub enabled: bool,
+    /// The enabled value in the daemon's loaded configuration, not a stored
+    /// drift flag. Absent when there is no configured entry or on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_enabled: Option<bool>,
     /// Whether this module is serving.
     ///
     /// For a `Subc` module: enabled, running, process alive, AND registered.
@@ -2438,6 +2442,7 @@ impl SupervisorEntry {
             state: state.into(),
             waiting_for_previous_pid: None,
             enabled,
+            configured_enabled: None,
             live,
             protocol: ModuleProtocol::default(),
             launch_nonce_env: None,
@@ -2465,6 +2470,13 @@ impl SupervisorEntry {
     #[must_use]
     pub fn with_protocol(mut self, protocol: ModuleProtocol) -> Self {
         self.protocol = protocol;
+        self
+    }
+
+    /// Attach the enabled value from the daemon's loaded configuration.
+    #[must_use]
+    pub fn with_configured_enabled(mut self, configured_enabled: Option<bool>) -> Self {
+        self.configured_enabled = configured_enabled;
         self
     }
 
@@ -2723,6 +2735,34 @@ pub struct SupervisorHealthEntry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_enabled_omission_preserves_exact_old_list_bytes() {
+        let entry = r#"{"module_id":"provider","state":"running","enabled":true,"live":true,"protocol":"subc","health":"unknown","last_probe_ms":null}"#;
+        let decoded: SupervisorEntry = serde_json::from_str(entry).unwrap();
+        assert_eq!(decoded.configured_enabled, None);
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), entry);
+    }
+
+    #[test]
+    fn configured_enabled_values_round_trip_in_list() {
+        for enabled in [false, true] {
+            let entry = SupervisorEntry::new(
+                "provider",
+                "running",
+                true,
+                true,
+                SupervisorHealthStatus::Unknown,
+            )
+            .with_configured_enabled(Some(enabled));
+            let entry_json = serde_json::to_value(&entry).unwrap();
+            assert_eq!(entry_json["configured_enabled"], enabled);
+            assert_eq!(
+                serde_json::from_value::<SupervisorEntry>(entry_json).unwrap(),
+                entry
+            );
+        }
+    }
+
     #[test]
     fn windows_running_image_evidence_round_trips_all_sixteen_id_bytes() {
         let evidence = super::RunningImageEvidence::WindowsSpawnFileId {

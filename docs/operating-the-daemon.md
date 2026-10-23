@@ -60,8 +60,8 @@ ck module restart aft                  # drain in-flight requests, then restart
 ck module restart aft --drain-ms 5000  # wait at most 5 s for in-flight requests
 ck module restart aft --now            # do not wait; for a wedged module
 ck module restart aft --swap           # blue/green; needs overlap: "safe"
-ck module stop aft                     # disable and stop until start or a daemon restart
-ck module start aft                    # enable and start
+ck module stop aft                     # disable and stop in the running daemon only
+ck module start aft                    # enable and start in the running daemon only
 ```
 
 A restart closes every route to the module. Clients see `route.closing` and
@@ -74,10 +74,15 @@ loses its reply even though the restart succeeds; see
 Verify with `ck module status <id>` and `ck health <id>`, which open a fresh
 connection.
 
-To reverse `stop`, run `start`. A stop is held in the daemon's memory, not
-written to `subc.jsonc`: after a daemon restart the module's configured
-`enabled` value applies again. To keep a module off, set `"enabled": false`
-in its configuration. A module that hit its crash budget stays down
+To reverse `stop`, run `start`. Both `start` and `stop` change only the running
+daemon's memory, never `subc.jsonc`. The file is the source of truth: a daemon
+restart or any `ck module rescan`, by anyone, applies the configured `enabled`
+value again for every module, even if only a different module's entry changed.
+To keep a module running, set `"enabled": true` in its configuration; to keep
+it stopped, set `"enabled": false`. Start and stop print a reminder when their
+result differs from the file. `ck module list` and `ck module status` mark that
+difference as `running (config: disabled)` or `stopped (config: enabled)`.
+A module that hit its crash budget stays down
 until `ck module start` or `ck module restart`.
 
 ## 4. Change the configuration

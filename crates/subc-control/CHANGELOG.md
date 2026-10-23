@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.6
+
+- Add optional `configured_enabled` and `with_configured_enabled` to non-exhaustive `SupervisorEntry`. Absent values are skipped and older list entries retain their bytes. The value comes from the daemon's loaded configuration; compare it with runtime `enabled` rather than treating it as a drift flag. This is additive: lifecycle acknowledgement types and bytes are unchanged, including `ClientControlResponse::SupervisorAck` literals and field patterns used by published clients and daemons.
+
 ## 0.32.5
 
 - Add optional `ActivityActor.workdir` and `project_id` from the route scope. Absent values preserve existing activity bytes. Code that builds `ActivityActor` with a struct literal must add the two fields.

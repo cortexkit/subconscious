@@ -5,6 +5,7 @@ exit: Some(0)
   "applied": true,
   "daemon": "<kit_temp_paths>/daemon/runtime/subc-connection.json",
   "module": {
+    "configured_enabled": true,
     "drain_timeout_ms": 30000,
     "enabled": true,
     "health": "ok",

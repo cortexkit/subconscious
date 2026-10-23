@@ -63,7 +63,7 @@ so over a second, client connection. Test:
 | `catalog.list` | Registered modules with their manifests' roles, capabilities, readiness and optional `rich_ui` descriptor. Optional `module_id` narrows the list. | An unregistered id gives an empty list, not an error. This is the wire registry, not the supervised roster. `rich_ui` is opaque and fixed for the registration's lifetime; `nonce_verified: true` appears only when HELLO passes the launch-nonce check required for a reserved module or swap candidate. Both fields are omitted when absent/unverified, preserving legacy entry bytes. |
 | `route.open` | Open a route to a target (section 2.1). | Reply: `route_channel`, `route_epoch`. |
 | `route.poll` | Read a bound route's last status (`kind: "status"`) or whether its module process is live (`kind: "liveness"`). | Answered from the daemon's own state; the module is never asked. |
-| `supervisor.list` | Supervised modules with state, health, restart counts and policy. | |
+| `supervisor.list` | Supervised modules with state, health, restart counts and policy. | Each entry's optional `configured_enabled` is the `enabled` value in the daemon's loaded configuration. Compare it with runtime `enabled` to detect drift; it is not a stored flag. |
 | `supervisor.health` | Cached health for every supervised module. | |
 | `supervisor.health_probe` | Send one fresh `health.check` to a module and return its answer. | Refused `health_not_advertised` when the module did not list `health.check` in its HELLO `control_ops`. |
 | `supervisor.routes` | Live routes served by one module or every module. | Answered from the forwarding table; safe during a drain. |
@@ -75,13 +75,21 @@ so over a second, client connection. Test:
 | `supervisor.restart` | Drain and restart a module. Optional `drain_timeout_ms` overrides the drain budget for this restart; `0` tears down without waiting. | Privileged. |
 | `supervisor.swap` | Blue/green restart: start a replacement beside the running process and cut over when it reports ready. Optional `ready_timeout_ms` (default 100 s). | Privileged. Refused unless the module is configured `overlap: "safe"`. Test: `swap_of_an_exclusive_module_is_refused_and_spawns_nothing` (`crates/subc-core/tests/forwarding.rs`). |
 | `supervisor.reload` | Drain a running module's routes, stop its process and spawn it again; routes close with reason `reload`. | Privileged. Refused for a disabled module. |
-| `supervisor.set_enabled` | Stop and disable, or enable and start, a module. Enabling a module that is down after its crash budget ran out starts it again. | Privileged. Held in the daemon's memory only: it is not written to `subc.jsonc`, so a daemon restart applies the configured `enabled` again. |
+| `supervisor.set_enabled` | Stop and disable, or enable and start, a module. Enabling a module that is down after its crash budget ran out starts it again. | Privileged. Held in the daemon's memory only: it is not written to `subc.jsonc`. A daemon restart or any rescan applies the configured `enabled` again for every module, including entries that did not change. |
 | `supervisor.rescan` | Re-read `subc.jsonc` and reconcile the supervised set. `preview: true` computes the change without applying it. | Privileged unless `preview` is true. |
 | `supervisor.release_reserved` | Forget the reserved id of a module removed from config, so another process may register it. | Privileged. |
 | `activity.record`, `activity.query`, `activity.subscribe` | The activity ledger. | Accepted from client and module connections; who may call each is in [`activity-ledger.md`](activity-ledger.md). |
 
 A successful privileged operation that has no other result answers
 `supervisor.ack` with `module_id` and `applied`.
+Lifecycle acknowledgements are unchanged; they do not carry configuration
+values. To compare a start or stop with the configuration, read the target's
+`supervisor.list` entry after the acknowledgement. Its optional
+`configured_enabled` is the module's `enabled` value in the configuration the
+daemon loaded, not a fresh disk read. The field is absent when there is no
+configured entry (for example, a daemon without a config file), and on older
+daemons. Absent values are omitted rather than serialized as `null`, preserving
+older list-entry bytes.
 
 ### 2.1 `route.open`
 

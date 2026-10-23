@@ -284,6 +284,145 @@ async fn disabled_configured_module_is_listed_then_enable_spawns_and_registers()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unrelated_rescan_restores_configured_enabled_after_runtime_start() {
+    let module_id = "temporary-start";
+    let daemon = RunningDaemon::start(
+        "enabled-drift-rescan",
+        Some(config_doc([
+            stub_module(module_id, false, []),
+            stub_module("other", false, []),
+        ])),
+    )
+    .await;
+    let mut client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+    let ack = control_rpc_on_stream(
+        &mut client,
+        1,
+        ClientControlRequest::SupervisorSetEnabled {
+            module_id: module_id.into(),
+            enabled: true,
+        },
+    )
+    .await;
+    assert!(matches!(
+        ack,
+        ClientControlResponse::SupervisorAck { applied: true, .. }
+    ));
+    let entry = wait_for_supervisor_entry(
+        &daemon.connection_file_path,
+        module_id,
+        |entry| entry.enabled && entry.live,
+        STATE_TIMEOUT,
+    )
+    .await;
+    assert_eq!(entry.configured_enabled, Some(false));
+
+    fs::write(
+        &daemon.config_path,
+        config_doc([
+            stub_module(module_id, false, []),
+            stub_module("other", true, []),
+        ]),
+    )
+    .unwrap();
+    let rescan = control_rpc_on_stream(
+        &mut client,
+        2,
+        ClientControlRequest::SupervisorRescan { preview: false },
+    )
+    .await;
+    let ClientControlResponse::SupervisorRescan { result } = rescan else {
+        panic!("unexpected rescan: {rescan:?}")
+    };
+    assert!(result.enabled_changes.contains(&module_id.to_string()));
+    assert!(result.enabled_changes.contains(&"other".to_string()));
+    let entry = wait_for_supervisor_entry(
+        &daemon.connection_file_path,
+        module_id,
+        |entry| !entry.enabled && !entry.live,
+        STATE_TIMEOUT,
+    )
+    .await;
+    assert_eq!(entry.configured_enabled, Some(false));
+    wait_for_supervisor_entry(
+        &daemon.connection_file_path,
+        "other",
+        |entry| entry.enabled && entry.live,
+        STATE_TIMEOUT,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_list_and_status_mark_drift_both_ways_and_clear_when_matching() {
+    let daemon = RunningDaemon::start(
+        "enabled-drift-output",
+        Some(config_doc([
+            stub_module("configured-off", false, []),
+            stub_module("configured-on", true, []),
+        ])),
+    )
+    .await;
+    wait_for_supervisor_entry(
+        &daemon.connection_file_path,
+        "configured-on",
+        |entry| entry.live,
+        STATE_TIMEOUT,
+    )
+    .await;
+    for drift in [false, true, false] {
+        let mut client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+        for (module_id, configured) in [("configured-off", false), ("configured-on", true)] {
+            let enabled = configured != drift;
+            control_rpc_on_stream(
+                &mut client,
+                1,
+                ClientControlRequest::SupervisorSetEnabled {
+                    module_id: module_id.into(),
+                    enabled,
+                },
+            )
+            .await;
+            let entry = wait_for_supervisor_entry(
+                &daemon.connection_file_path,
+                module_id,
+                |entry| entry.enabled == enabled && entry.live == enabled,
+                STATE_TIMEOUT,
+            )
+            .await;
+            assert_eq!(entry.configured_enabled, Some(configured));
+        }
+        for (module_id, configured) in [("configured-off", false), ("configured-on", true)] {
+            let enabled = configured != drift;
+            for args in [
+                vec!["module", "list"],
+                vec!["module", "list", "--verbose"],
+                vec!["module", "status", module_id],
+            ] {
+                let output = ck_under_test_command()
+                    .arg("--subc")
+                    .arg(&daemon.connection_file_path)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                if drift {
+                    let expected = if enabled {
+                        "running (config: disabled)"
+                    } else {
+                        "stopped (config: enabled)"
+                    };
+                    assert!(stdout.contains(expected), "{stdout}");
+                } else {
+                    assert!(!stdout.contains("(config:"), "{stdout}");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_spawn_is_visible_and_good_modules_still_start() {
     let good_module_id = "good-aft";
     let bad_module_id = "missing-aft";

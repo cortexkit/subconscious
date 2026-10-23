@@ -4,8 +4,9 @@
 use ck_ui::app::{App, Request, Tab};
 use ck_ui::model::{ActivityKey, ActivityLog, ActivityRow, ActivityRowKind, Serves};
 use ck_ui::screens::activity::{
-    details_line, details_lines, layout, offset_label, pane_rows, Chip,
+    detail_rows, details_view, layout, offset_label, pane_rows, Chip, DetailRow, DETAIL_KEY_MAX,
 };
+use ck_ui::theme::St;
 use ck_ui::time::UtcOffset;
 use ck_ui::{Snapshot, Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -431,7 +432,7 @@ fn an_entry_shows_by_subject_kind_seq_build_and_its_details() {
     let buf = render(&activity_app(), &snap, 120, 36);
     let pane = pane_text(&buf, 36);
     assert_eq!(
-        pane[..13],
+        pane[..12],
         [
             "engram restarted on build 9d8a178c",
             "20:47:00 local · UTC",
@@ -443,14 +444,14 @@ fn an_entry_shows_by_subject_kind_seq_build_and_its_details() {
             "Build     7c3a47b9 → 9d8a178c",
             "",
             "Details",
-            "  {",
-            "    \"drain_ms\": 412",
-            "  }",
+            "  drain_ms  412",
+            "",
         ]
     );
-    // The details print in the faint role.
-    let faint = Theme::test().style(ck_ui::theme::St::F).fg;
-    assert_eq!(Some(buf[(83, 16)].fg), faint);
+    // Keys are dim and values plain, as in the rows above.
+    let theme = Theme::test();
+    assert_eq!(Some(buf[(81, 15)].fg), theme.style(St::D).fg);
+    assert_ne!(Some(buf[(91, 15)].fg), theme.style(St::D).fg);
 
     // Without a build the Build row is left out, and empty details draw no
     // block.
@@ -462,8 +463,26 @@ fn an_entry_shows_by_subject_kind_seq_build_and_its_details() {
     assert!(pane[7..].iter().all(String::is_empty), "{pane:?}");
 }
 
+fn row_of(key: &str, value: Option<&str>) -> DetailRow {
+    DetailRow {
+        key: key.into(),
+        value: value.map(str::to_string),
+    }
+}
+
+/// The pane's lines from the one under "Details" to the last non-blank one.
+fn details_drawn(buf: &Buffer, h: u16) -> Vec<String> {
+    let pane = pane_text(buf, h);
+    let at = pane.iter().position(|l| l == "Details").unwrap();
+    let mut lines = pane[at + 1..].to_vec();
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
 #[test]
-fn details_print_sorted_at_every_level_whatever_order_they_arrive_in() {
+fn details_flatten_sorted_at_every_level_whatever_order_they_arrive_in() {
     // Inserted out of order. A workspace build turns on serde_json's
     // `preserve_order`, where the map keeps this order; the pane must still
     // sort.
@@ -478,68 +497,154 @@ fn details_print_sorted_at_every_level_whatever_order_they_arrive_in() {
     details.insert("alpha".into(), Value::Object(inner));
     details.insert("Mid".into(), json!("x"));
     details.insert("empty".into(), json!({}));
-    let want = [
-        "{",
-        "  \"Mid\": \"x\",",
-        "  \"alpha\": {",
-        "    \"b\": [",
-        "      {",
-        "        \"c\": 2,",
-        "        \"d\": 1",
-        "      }",
-        "    ],",
-        "    \"y\": 2",
-        "  },",
-        "  \"empty\": {},",
-        "  \"zeta\": 1",
-        "}",
-    ];
-    assert_eq!(details_lines(&details), want);
     assert_eq!(
-        details_line(&details),
-        r#"{"Mid":"x","alpha":{"b":[{"c":2,"d":1}],"y":2},"empty":{},"zeta":1}"#
+        detail_rows(&details, None),
+        [
+            row_of("Mid", Some("x")),
+            row_of("alpha.b[0].c", Some("2")),
+            row_of("alpha.b[0].d", Some("1")),
+            row_of("alpha.y", Some("2")),
+            row_of("empty", None),
+            row_of("zeta", Some("1")),
+        ]
     );
 
+    // Drawn, values start two past the longest key.
     let mut r = entry(9, 60.0, "engram", "restarted", "subc.module_restarted");
     r.details = Some(details);
     let buf = render(&activity_app(), &with_rows(vec![r], true), 120, 40);
-    let pane = pane_text(&buf, 40);
-    let at = pane.iter().position(|l| l == "Details").unwrap();
-    let drawn: Vec<String> = pane[at + 1..at + 1 + want.len()]
-        .iter()
-        .map(|l| l.strip_prefix("  ").unwrap_or(l).to_string())
-        .collect();
-    assert_eq!(drawn, want);
+    assert_eq!(
+        details_drawn(&buf, 40),
+        [
+            "  Mid           x",
+            "  alpha.b[0].c  2",
+            "  alpha.b[0].d  1",
+            "  alpha.y       2",
+            "  empty         –",
+            "  zeta          1",
+        ]
+    );
+    // A value that holds nothing is a dim "–".
+    // "Details" is on row 13, so "empty" is on row 18.
+    assert_eq!(buf[(95, 18)].symbol(), "–");
+    assert_eq!(Some(buf[(95, 18)].fg), Theme::test().style(St::D).fg);
 }
 
 #[test]
-fn details_that_overflow_the_pane_end_with_how_many_lines_more() {
-    // Ten keys: twelve lines with the braces.
-    let details: Map<String, Value> = (0..10).map(|i| (format!("key_{i:02}"), json!(i))).collect();
-    assert_eq!(details_lines(&details).len(), 12);
-    let mut r = entry(9, 60.0, "engram", "restarted", "subc.module_restarted");
-    r.details = Some(details);
-    let snap = with_rows(vec![r], true);
-    // At 120×24 the list ends on row 20: "Details" on 13, then 7 rows, so 6
-    // lines and "+6 more lines".
-    let buf = render(&activity_app(), &snap, 120, 24);
-    let pane = pane_text(&buf, 24);
-    let at = pane.iter().position(|l| l == "Details").unwrap();
-    assert_eq!(pane[at + 1], "  {");
-    assert_eq!(pane[at + 6], "    \"key_04\": 4,");
-    assert_eq!(pane[at + 7], "  +6 more lines");
-    assert_eq!(at + 7, pane.len() - 1, "the note is the pane's last row");
+fn detail_values_read_as_words_not_json() {
+    let details = json!({
+        "array_of_objects": [{"id": "a"}, {"id": "b", "n": 2}],
+        "flags": [true, false, null],
+        "float": 1.5,
+        "negative": -3,
+        "no": false,
+        "none": null,
+        "nothing": [],
+        "path": "/Users/alex/Work/Projects/CortexKit/magic-context",
+        "tags": ["fast", "local"],
+        "yes": true,
+    });
+    let rows = detail_rows(details.as_object().unwrap(), Some("/Users/alex"));
+    assert_eq!(
+        rows,
+        [
+            row_of("array_of_objects[0].id", Some("a")),
+            row_of("array_of_objects[1].id", Some("b")),
+            row_of("array_of_objects[1].n", Some("2")),
+            row_of("flags", Some("yes, no, –")),
+            row_of("float", Some("1.5")),
+            row_of("negative", Some("-3")),
+            row_of("no", Some("no")),
+            row_of("none", None),
+            row_of("nothing", None),
+            row_of("path", Some("~/Work/Projects/CortexKit/magic-context")),
+            row_of("tags", Some("fast, local")),
+            row_of("yes", Some("yes")),
+        ]
+    );
 
-    // At 120×36 thirty keys run out of room the same way.
-    let details: Map<String, Value> = (0..30).map(|i| (format!("key_{i:02}"), json!(i))).collect();
-    let mut r = entry(9, 60.0, "engram", "restarted", "subc.module_restarted");
-    r.details = Some(details);
-    let buf = render(&activity_app(), &with_rows(vec![r], true), 120, 36);
-    let pane = pane_text(&buf, 36);
-    // "Details" on row 13, then rows 14 to 32: 18 lines and the note.
-    assert_eq!(pane.last().unwrap(), "  +14 more lines");
+    // The home folder alone is "~"; a folder that only starts with the
+    // home folder's name is not under it; a home written with a trailing
+    // separator matches the same; without a home nothing changes.
+    let paths = json!({
+        "a": "/Users/alex",
+        "b": "/Users/alexander/notes",
+        "c": "/Users/alex/notes",
+        "d": "C:\\Users\\alex\\notes",
+    });
+    let paths = paths.as_object().unwrap();
+    let values = |home: Option<&str>| -> Vec<Option<String>> {
+        detail_rows(paths, home)
+            .into_iter()
+            .map(|r| r.value)
+            .collect()
+    };
+    let some = |s: &str| Some(s.to_string());
+    assert_eq!(
+        values(Some("/Users/alex/")),
+        [
+            some("~"),
+            some("/Users/alexander/notes"),
+            some("~/notes"),
+            some("C:\\Users\\alex\\notes"),
+        ]
+    );
+    assert_eq!(values(Some("C:\\Users\\alex"))[3], some("~\\notes"));
+    assert_eq!(values(None)[2], some("/Users/alex/notes"));
+    assert_eq!(values(Some("/"))[2], some("/Users/alex/notes"));
 
-    // A line wider than the pane ends with "…".
+    // The pane reads the home folder from the host.
+    let mut r = entry(9, 60.0, "engram", "restarted", "subc.module_restarted");
+    r.details = Some(
+        json!({"project": "/Users/alex/Work/magic-context"})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let mut snap = with_rows(vec![r], true);
+    snap.host.data.home = Some("/Users/alex".into());
+    let buf = render(&activity_app(), &snap, 120, 36);
+    assert_eq!(details_drawn(&buf, 36), ["  project  ~/Work/magic-context"]);
+}
+
+#[test]
+fn long_values_wrap_under_the_value_column_and_are_never_cut() {
+    let rows = [
+        row_of(
+            "path",
+            Some("~/Library/Application Support/cortexkit/modules/engram/bin"),
+        ),
+        row_of("execution", Some("bg_d74d793677582c05d74d793677582c05d74d")),
+    ];
+    let view = details_view(&rows, 37);
+    assert_eq!(view.value_col, 11);
+    let lines: Vec<Vec<(&str, &str)>> = view
+        .rows
+        .iter()
+        .map(|r| {
+            r.iter()
+                .map(|l| (l.key.as_str(), l.value.as_str()))
+                .collect()
+        })
+        .collect();
+    // At spaces where there are any, inside a word that is wider than the
+    // room; no character is dropped.
+    assert_eq!(
+        lines,
+        [
+            vec![
+                ("path", "~/Library/Application"),
+                ("", "Support/cortexkit/modules/"),
+                ("", "engram/bin"),
+            ],
+            vec![
+                ("execution", "bg_d74d793677582c05d74d793"),
+                ("", "677582c05d74d"),
+            ]
+        ]
+    );
+
+    // Drawn in the pane at 120 columns, 37 columns for the lines.
     let mut r = entry(9, 60.0, "engram", "restarted", "subc.module_restarted");
     r.details = Some(
         json!({"path": "/Users/alex/Library/Application Support/cortexkit/modules/engram/bin"})
@@ -547,11 +652,109 @@ fn details_that_overflow_the_pane_end_with_how_many_lines_more() {
             .unwrap()
             .clone(),
     );
+    let mut snap = with_rows(vec![r], true);
+    snap.host.data.home = Some("/Users/alex".into());
+    let buf = render(&activity_app(), &snap, 120, 36);
+    let drawn = details_drawn(&buf, 36);
+    assert_eq!(
+        drawn,
+        [
+            "  path  ~/Library/Application",
+            "        Support/cortexkit/modules/engra",
+            "        m/bin",
+        ]
+    );
+    assert!(drawn.iter().all(|l| !l.contains('…')), "{drawn:?}");
+}
+
+#[test]
+fn a_key_longer_than_the_value_column_takes_its_own_line() {
+    let long = "a_detail_key_of_25_column";
+    assert!(long.len() > DETAIL_KEY_MAX);
+    let mut r = entry(9, 60.0, "engram", "restarted", "subc.module_restarted");
+    let mut details = Map::new();
+    details.insert(long.into(), json!("value"));
+    details.insert("id".into(), json!("bg_1"));
+    r.details = Some(details);
+    let buf = render(&activity_app(), &with_rows(vec![r], true), 120, 36);
+    // Values align to "id", the longest key that fits; the long key's value
+    // starts on the next line, under the others.
+    assert_eq!(
+        details_drawn(&buf, 36),
+        ["  a_detail_key_of_25_column", "      value", "  id  bg_1",]
+    );
+
+    // Aligned to the longest key up to the cap.
+    let rows = [
+        row_of("twenty_column_key_xx", Some("a")),
+        row_of("twenty_one_column_key", Some("b")),
+    ];
+    let view = details_view(&rows, 37);
+    assert_eq!(view.value_col, 22);
+    assert_eq!(view.rows[0].len(), 1);
+    assert_eq!(view.rows[1][0].key, "twenty_one_column_key");
+    assert_eq!(view.rows[1][0].value, "");
+    assert_eq!(view.rows[1][1].key, "");
+    assert_eq!(view.rows[1][1].value, "b");
+
+    // A key wider than the whole line wraps too.
+    let rows = [row_of(&"k".repeat(45), Some("v"))];
+    let view = details_view(&rows, 37);
+    let keys: Vec<String> = view.rows[0].iter().map(|l| l.key.clone()).collect();
+    assert_eq!(keys, ["k".repeat(37), "k".repeat(8), String::new()]);
+    assert_eq!(view.value_col, 2);
+}
+
+#[test]
+fn details_that_overflow_the_pane_end_with_how_many_rows_more() {
+    let details: Map<String, Value> = (0..10).map(|i| (format!("key_{i:02}"), json!(i))).collect();
+    let mut r = entry(9, 60.0, "engram", "restarted", "subc.module_restarted");
+    r.details = Some(details);
+    let snap = with_rows(vec![r], true);
+    // At 120×24 the list ends on row 20: "Details" on 13, then 7 rows, so 6
+    // rows and "+4 more".
+    let buf = render(&activity_app(), &snap, 120, 24);
+    let pane = pane_text(&buf, 24);
+    let at = pane.iter().position(|l| l == "Details").unwrap();
+    assert_eq!(pane[at + 1], "  key_00  0");
+    assert_eq!(pane[at + 6], "  key_05  5");
+    assert_eq!(pane[at + 7], "  +4 more");
+    assert_eq!(at + 7, pane.len() - 1, "the note is the pane's last row");
+    assert_eq!(
+        Some(buf[(81, 5 + at as u16 + 7)].fg),
+        Theme::test().style(St::D).fg
+    );
+
+    // At 120×36 thirty keys run out of room the same way: "Details" on row
+    // 13, then rows 14 to 32, 18 rows and the note.
+    let details: Map<String, Value> = (0..30).map(|i| (format!("key_{i:02}"), json!(i))).collect();
+    let mut r = entry(9, 60.0, "engram", "restarted", "subc.module_restarted");
+    r.details = Some(details);
     let buf = render(&activity_app(), &with_rows(vec![r], true), 120, 36);
     let pane = pane_text(&buf, 36);
-    let long = pane.iter().find(|l| l.contains("\"path\"")).unwrap();
-    assert!(long.ends_with('…'), "{long}");
-    assert_eq!(ck_ui::draw::width(long), 39);
+    assert_eq!(pane.last().unwrap(), "  +12 more");
+
+    // A row shows whole or not at all: five short rows, then one whose
+    // value wraps to three lines, which doesn't fit in the two left.
+    let mut details: Map<String, Value> = ["a", "b", "c", "d", "e"]
+        .iter()
+        .map(|k| (k.to_string(), json!(1)))
+        .collect();
+    details.insert("z".into(), json!("x".repeat(80)));
+    let mut r = entry(9, 60.0, "engram", "restarted", "subc.module_restarted");
+    r.details = Some(details);
+    let buf = render(&activity_app(), &with_rows(vec![r], true), 120, 24);
+    assert_eq!(
+        details_drawn(&buf, 24),
+        [
+            "  a  1",
+            "  b  1",
+            "  c  1",
+            "  d  1",
+            "  e  1",
+            "  +1 more"
+        ]
+    );
 }
 
 #[test]
@@ -731,16 +934,17 @@ fn the_list_at_every_size_says_how_many_rows_it_leaves_out() {
         assert_eq!(*note, format!("+{} more", total - entries), "{w}×{h}");
         assert!(row(&buf, h - 2).contains('─'), "{w}×{h}: the footer rule");
         assert_whole_hints(&buf, w, h);
-        // From 150 columns the list adds kind, seq and details.
+        // From 150 columns the list adds kind and seq. The details show
+        // only in the pane, at every width.
         let first = 6;
+        let list = text(&buf, 0, first, l.lw as u16);
+        assert!(!list.contains("drain_ms"), "{w}×{h}: {list}");
         if w >= 150 {
             assert!(l.wide);
             let kind = text(&buf, l.kind_x as u16, first, 21);
             assert_eq!(kind, "subc.module_restarted", "{w}×{h}");
             let seq = text(&buf, (l.seq_end - 7) as u16, first, 7);
             assert_eq!(seq, " 10,000", "{w}×{h}");
-            let details = text(&buf, l.details_x as u16, first, 12);
-            assert!(details.starts_with(r#"{"drain_ms""#), "{w}×{h}: {details}");
         } else {
             assert!(
                 !row(&buf, first).contains("subc.module_restarted"),
@@ -751,6 +955,62 @@ fn the_list_at_every_size_says_how_many_rows_it_leaves_out() {
     // At 80 columns the status text gives way and the hints stay whole.
     let buf = render(&app, &snap, 80, 24);
     assert!(!row(&buf, 23).contains("today"));
+}
+
+#[test]
+fn the_wide_list_has_no_details_column_and_gives_its_room_to_the_summary() {
+    let what = "approved a tool permission for IRIS on the build server for the release of magic-context 0.9";
+    let mut r = entry(
+        48_213,
+        60.0,
+        "cingulate",
+        what,
+        "cingulate.consent_answered",
+    );
+    r.who = Some("you".into());
+    r.details = Some(
+        json!({
+            "execution": "bg_d74d793677582c05",
+            "model_route": "openai/gpt-6.1-sol",
+            "project": "/Users/alex/Work/Projects/CortexKit/magic-context",
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    );
+    let mut snap = with_rows(vec![r], true);
+    snap.host.data.home = Some("/Users/alex".into());
+    let (w, h) = (250, 60);
+    let buf = render(&activity_app(), &snap, w, h);
+    let l = layout(i32::from(w), i32::from(h));
+    assert!(l.wide);
+    let y = 6;
+    let list = text(&buf, 0, y, l.lw as u16);
+    for leak in ["execution", "bg_d74d", "model_route", "{", "\""] {
+        assert!(!list.contains(leak), "{leak} in the list: {list}");
+    }
+    // The summary reads in full, and the kind and seq follow it.
+    assert_eq!(l.what_w, l.lw - 68);
+    assert_eq!(text(&buf, 27, y, what.len() as u16), what);
+    assert_eq!(l.kind_x, 27 + l.what_w + 2);
+    assert_eq!(text(&buf, l.kind_x as u16, y, 22), "cingulate.consent_ans…");
+    assert_eq!(text(&buf, (l.seq_end - 7) as u16, y, 7), " 48,213");
+    // Who did it ends at the list's right edge, one gap past the seq.
+    assert_eq!(l.seq_end + 1 + l.who_w, l.lw);
+    assert_eq!(text(&buf, (l.lw - 3) as u16, y, 3), "you");
+    assert_eq!(text(&buf, l.lw as u16, y, 2), "  ");
+    // The pane still shows the details.
+    let x = (l.lw + 5) as u16;
+    let pane = rows_between(&buf, x, w - x, 5, l.last as u16);
+    let at = pane.iter().position(|t| t == "Details").unwrap();
+    assert_eq!(
+        pane[at + 1..at + 4],
+        [
+            "  execution    bg_d74d793677582c05",
+            "  model_route  openai/gpt-6.1-sol",
+            "  project      ~/Work/Projects/CortexKit/magic-context",
+        ]
+    );
 }
 
 #[test]

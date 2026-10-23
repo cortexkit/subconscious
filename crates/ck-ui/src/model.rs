@@ -360,6 +360,9 @@ pub struct Host {
     pub label: String,
     pub machine_id: Option<String>,
     pub utc_offset: UtcOffset,
+    /// The home folder of the person running ck, so paths under it can be
+    /// shown as `~/…`; `None` when it isn't known.
+    pub home: Option<String>,
     pub memory_used_gb: Option<f64>,
     pub memory_total_gb: Option<f64>,
     pub disk_used_gb: Option<f64>,
@@ -1260,6 +1263,7 @@ mod fixture {
             label: "This Mac".into(),
             machine_id: Some("4f1a9c2e7b3d40c8a6e5d1b2c3f40912".into()),
             utc_offset: UtcOffset::UTC,
+            home: None,
             memory_used_gb: Some(f(&host["memUsed"])),
             memory_total_gb: Some(f(&host["memTotal"])),
             disk_used_gb: Some(f(&host["diskUsed"])),

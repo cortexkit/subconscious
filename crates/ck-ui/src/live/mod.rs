@@ -153,6 +153,8 @@ pub struct LiveOptions {
     pub host_label: String,
     /// The host's offset from UTC, for clock times.
     pub utc_offset: UtcOffset,
+    /// The home folder, for showing paths under it as `~/…`.
+    pub home: Option<String>,
 }
 
 impl LiveOptions {
@@ -166,8 +168,16 @@ impl LiveOptions {
                 "This computer".into()
             },
             utc_offset: local_utc_offset(),
+            home: home_folder(),
         }
     }
+}
+
+/// The home folder from the environment: `USERPROFILE` on Windows, `HOME`
+/// elsewhere; `None` when unset or empty.
+pub fn home_folder() -> Option<String> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var(var).ok().filter(|h| !h.is_empty())
 }
 
 /// The local offset from UTC right now.
@@ -328,6 +338,7 @@ pub struct LiveProcess {
 pub struct State {
     pub host_label: String,
     pub utc_offset: UtcOffset,
+    pub home: Option<String>,
     pub connection: Connection,
     pub connected_at: Part<()>,
     pub roster: Part<Vec<SupervisorEntry>>,
@@ -395,6 +406,7 @@ impl State {
         State {
             host_label: options.host_label.clone(),
             utc_offset: options.utc_offset,
+            home: options.home.clone(),
             connection: Connection::Connecting,
             connected_at: Part::default(),
             roster: Part::default(),
@@ -442,6 +454,7 @@ impl State {
             service: Arc::new(NoService),
             host_label: host_label.into(),
             utc_offset: UtcOffset::UTC,
+            home: None,
         })
     }
 
@@ -974,6 +987,7 @@ fn host_view(state: &State, h: &HostFacts) -> Host {
             .as_ref()
             .and_then(|d| d.machine_id.clone()),
         utc_offset: state.utc_offset,
+        home: state.home.clone(),
         memory_used_gb: h
             .memory
             .map(|m| m.total_bytes.saturating_sub(m.available_bytes) as f64 / GIB),

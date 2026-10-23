@@ -12,13 +12,16 @@
 //!
 //! From 120 columns a pane follows the selection: what happened, when in
 //! local time, who asked for it, the subject, the ledger's kind and seq,
-//! the build a restart ran, and the entry's details printed as JSON with
-//! keys in sorted order. From 150 columns the list adds each entry's kind,
-//! seq and details on one line.
+//! the build a restart ran, and the entry's details as aligned key and
+//! value rows with keys in sorted order (see [`detail_rows`] and
+//! [`details_view`]). From 150 columns the list adds each entry's kind and
+//! seq, and "what happened" takes the rest of the list's width.
 
 use serde_json::{Map, Value};
 
-use crate::draw::{chrome, frame_end, live_dot, pad_right, trunc, Canvas, Clip};
+use unicode_width::UnicodeWidthChar;
+
+use crate::draw::{chrome, frame_end, live_dot, pad_right, trunc, width, Canvas, Clip};
 use crate::model::{ActivityKey, ActivityLog, ActivityRow, ActivityRowKind, Tab};
 use crate::theme::{Bg, St};
 use crate::time::{thousands, Civil, UtcOffset};
@@ -164,7 +167,7 @@ pub struct Layout {
     pub lw: i32,
     /// Whether the detail pane is drawn.
     pub pane: bool,
-    /// Whether the list has the kind, seq and details columns.
+    /// Whether the list has the kind and seq columns.
     pub wide: bool,
     /// Width of the "what happened" column, from column 27.
     pub what_w: i32,
@@ -172,8 +175,6 @@ pub struct Layout {
     pub kind_x: i32,
     /// The seq column ends just before this column.
     pub seq_end: i32,
-    pub details_x: i32,
-    pub details_w: i32,
     /// The last screen row the list draws on: the row above the blank row
     /// over the footer rule.
     pub last: i32,
@@ -182,9 +183,6 @@ pub struct Layout {
 const WHAT_X: i32 = 27;
 const KIND_W: i32 = 22;
 const SEQ_W: i32 = 7;
-/// The details column's narrowest width; width past what "what happened"
-/// takes goes to it.
-const DETAILS_MIN_W: i32 = 12;
 
 pub fn layout(w: i32, h: i32) -> Layout {
     let pane = w >= 120;
@@ -205,8 +203,6 @@ pub fn layout(w: i32, h: i32) -> Layout {
         who_w: 6,
         kind_x: 0,
         seq_end: 0,
-        details_x: 0,
-        details_w: 0,
         last: h - 4,
     };
     if !wide {
@@ -216,19 +212,18 @@ pub fn layout(w: i32, h: i32) -> Layout {
         };
     }
     // Columns from 27: what happened, a gap, the kind, a gap, the seq, a
-    // gap, the details, a gap, then who did it.
+    // gap, then who did it at the list's right edge. "What happened" takes
+    // every column the others leave, so the kind and seq sit just left of
+    // who did it.
     let who_w = 8;
-    let fixed = WHAT_X + 2 + KIND_W + 1 + SEQ_W + 2 + 1 + who_w;
-    let what_w = (lw - fixed - DETAILS_MIN_W).clamp(24, 40);
+    let fixed = WHAT_X + 2 + KIND_W + 1 + SEQ_W + 1 + who_w;
+    let what_w = (lw - fixed).max(0);
     let kind_x = WHAT_X + what_w + 2;
-    let seq_end = kind_x + KIND_W + 1 + SEQ_W;
     Layout {
         what_w,
         who_w,
         kind_x,
-        seq_end,
-        details_x: seq_end + 2,
-        details_w: (lw - fixed - what_w).max(0),
+        seq_end: kind_x + KIND_W + 1 + SEQ_W,
         ..base
     }
 }
@@ -380,86 +375,201 @@ fn sorted(map: &Map<String, Value>) -> Vec<(&String, &Value)> {
     entries
 }
 
-fn quoted(key: &str) -> String {
-    serde_json::to_string(key).unwrap_or_else(|_| format!("\"{key}\""))
+/// One row of an entry's details as the pane shows them: a key path and its
+/// value as text, or `None` for a value that holds nothing (null, `{}` or
+/// `[]`), which the pane draws as a dim "–".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetailRow {
+    pub key: String,
+    pub value: Option<String>,
 }
 
-fn pretty_into(v: &Value, depth: usize, head: String, tail: &str, out: &mut Vec<String>) {
-    let pad = "  ".repeat(depth);
+/// `text` with the home folder at its start written as `~`, when what
+/// follows it is nothing or a path separator; otherwise `text` as it is.
+fn under_home(text: &str, home: Option<&str>) -> String {
+    let home = home
+        .map(|h| h.trim_end_matches(['/', '\\']))
+        .filter(|h| !h.is_empty());
+    let Some(home) = home else {
+        return text.to_string();
+    };
+    match text.strip_prefix(home) {
+        Some(rest) if rest.is_empty() || rest.starts_with(['/', '\\']) => format!("~{rest}"),
+        _ => text.to_string(),
+    }
+}
+
+/// A scalar's text: strings without quotes, numbers as written, booleans
+/// as "yes" and "no", null as "–".
+fn scalar_text(v: &Value, home: Option<&str>) -> String {
+    match v {
+        Value::String(text) => under_home(text, home),
+        Value::Bool(true) => "yes".into(),
+        Value::Bool(false) => "no".into(),
+        Value::Null => "–".into(),
+        other => other.to_string(),
+    }
+}
+
+fn is_scalar(v: &Value) -> bool {
+    !matches!(v, Value::Object(_) | Value::Array(_))
+}
+
+fn flatten_into(key: String, v: &Value, home: Option<&str>, out: &mut Vec<DetailRow>) {
     match v {
         Value::Object(map) if !map.is_empty() => {
-            out.push(format!("{head}{{"));
-            let entries = sorted(map);
-            let n = entries.len();
-            for (i, (k, val)) in entries.into_iter().enumerate() {
-                let head = format!("{pad}  {}: ", quoted(k));
-                pretty_into(val, depth + 1, head, if i + 1 < n { "," } else { "" }, out);
+            for (k, val) in sorted(map) {
+                flatten_into(format!("{key}.{k}"), val, home, out);
             }
-            out.push(format!("{pad}}}{tail}"));
+        }
+        Value::Array(items) if !items.is_empty() && items.iter().all(is_scalar) => {
+            let joined: Vec<String> = items.iter().map(|i| scalar_text(i, home)).collect();
+            out.push(DetailRow {
+                key,
+                value: Some(joined.join(", ")),
+            });
         }
         Value::Array(items) if !items.is_empty() => {
-            out.push(format!("{head}["));
-            let n = items.len();
             for (i, val) in items.iter().enumerate() {
-                let tail = if i + 1 < n { "," } else { "" };
-                pretty_into(val, depth + 1, format!("{pad}  "), tail, out);
+                flatten_into(format!("{key}[{i}]"), val, home, out);
             }
-            out.push(format!("{pad}]{tail}"));
         }
-        Value::Object(_) => out.push(format!("{head}{{}}{tail}")),
-        Value::Array(_) => out.push(format!("{head}[]{tail}")),
-        scalar => out.push(format!("{head}{scalar}{tail}")),
+        Value::Object(_) | Value::Array(_) | Value::Null => {
+            out.push(DetailRow { key, value: None });
+        }
+        scalar => out.push(DetailRow {
+            key,
+            value: Some(scalar_text(scalar, home)),
+        }),
     }
 }
 
-/// An entry's details pretty-printed with a two-space indent, keys in
-/// sorted byte order at every level, one string per line.
-pub fn details_lines(details: &Map<String, Value>) -> Vec<String> {
+/// An entry's details as rows, keys in sorted byte order at every level.
+/// A nested object's keys join their parent's with a dot (`a.b`). An array
+/// of scalars is one row, its items joined with ", "; any other array gives
+/// each item its index (`a[0].b`). A string that starts with the home
+/// folder `home` shows it as `~`.
+pub fn detail_rows(details: &Map<String, Value>, home: Option<&str>) -> Vec<DetailRow> {
     let mut out = Vec::new();
-    pretty_into(
-        &Value::Object(details.clone()),
-        0,
-        String::new(),
-        "",
-        &mut out,
-    );
-    out
-}
-
-fn compact_into(v: &Value, out: &mut String) {
-    match v {
-        Value::Object(map) => {
-            out.push('{');
-            for (i, (k, val)) in sorted(map).into_iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push_str(&quoted(k));
-                out.push(':');
-                compact_into(val, out);
-            }
-            out.push('}');
-        }
-        Value::Array(items) => {
-            out.push('[');
-            for (i, val) in items.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                compact_into(val, out);
-            }
-            out.push(']');
-        }
-        scalar => out.push_str(&scalar.to_string()),
+    for (k, v) in sorted(details) {
+        flatten_into(k.clone(), v, home, &mut out);
     }
+    out
 }
 
-/// An entry's details on one line, keys in sorted byte order at every
-/// level, for the wide list's details column.
-pub fn details_line(details: &Map<String, Value>) -> String {
-    let mut out = String::new();
-    compact_into(&Value::Object(details.clone()), &mut out);
+/// One screen line of the details view: the key's text at the line's
+/// start, empty on a value's continuation lines, and the value's text from
+/// the value column, empty on a long key's own line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetailLine {
+    pub key: String,
+    pub value: String,
+    /// Whether the value is the dim "–" of a value that holds nothing.
+    pub missing: bool,
+}
+
+/// The details view laid out for lines of a given width.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetailsView {
+    /// Where values start, in columns from the line's start.
+    pub value_col: usize,
+    /// Each row's lines, in the rows' order.
+    pub rows: Vec<Vec<DetailLine>>,
+}
+
+/// The widest key the value column makes room for; a longer key takes a
+/// line of its own above its value.
+pub const DETAIL_KEY_MAX: usize = 20;
+
+/// Splits `text` into lines of at most `n` columns, at spaces where it can
+/// and inside a word longer than a line, so that no character is dropped.
+/// A line break in `text` starts a new line.
+fn wrap_whole(text: &str, n: usize) -> Vec<String> {
+    let n = n.max(1);
+    let mut out = Vec::new();
+    for part in text.split('\n') {
+        let first = out.len();
+        let mut line = String::new();
+        let mut used = 0;
+        for (i, word) in part.split(' ').enumerate() {
+            // The space before a word, except where the word starts a line
+            // that a break began.
+            let gap = usize::from(i > 0 && !(used == 0 && out.len() > first));
+            let ww = width(word);
+            if used + gap + ww <= n {
+                if gap == 1 {
+                    line.push(' ');
+                }
+                line.push_str(word);
+                used += gap + ww;
+                continue;
+            }
+            if used > 0 {
+                out.push(std::mem::take(&mut line));
+                used = 0;
+            }
+            for ch in word.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if used + cw > n && used > 0 {
+                    out.push(std::mem::take(&mut line));
+                    used = 0;
+                }
+                line.push(ch);
+                used += cw;
+            }
+        }
+        out.push(line);
+    }
     out
+}
+
+/// Lays `rows` out on lines `line_w` columns wide. Values start in one
+/// column, two past the longest key, counting keys up to
+/// [`DETAIL_KEY_MAX`] columns. A longer key takes its own line (or lines),
+/// and its value starts on the next line. A value wider than its room wraps
+/// onto lines under the value column rather than being cut.
+pub fn details_view(rows: &[DetailRow], line_w: usize) -> DetailsView {
+    let key_w = rows
+        .iter()
+        .map(|r| width(&r.key))
+        .filter(|w| *w <= DETAIL_KEY_MAX)
+        .max()
+        .unwrap_or(0);
+    let value_col = key_w + 2;
+    let value_w = line_w.saturating_sub(value_col).max(1);
+    let rows = rows
+        .iter()
+        .map(|r| {
+            let (value, missing) = match &r.value {
+                Some(text) => (wrap_whole(text, value_w), false),
+                None => (vec!["–".to_string()], true),
+            };
+            let mut lines = Vec::new();
+            if width(&r.key) > key_w {
+                for part in wrap_whole(&r.key, line_w) {
+                    lines.push(DetailLine {
+                        key: part,
+                        value: String::new(),
+                        missing: false,
+                    });
+                }
+            }
+            for (i, text) in value.into_iter().enumerate() {
+                let key = if i == 0 && lines.is_empty() {
+                    r.key.clone()
+                } else {
+                    String::new()
+                };
+                lines.push(DetailLine {
+                    key,
+                    value: text,
+                    missing,
+                });
+            }
+            lines
+        })
+        .collect();
+    DetailsView { value_col, rows }
 }
 
 /// How "what happened" is coloured: approvals in the accent, settings
@@ -632,10 +742,6 @@ fn list_row(c: &mut Canvas, v: &View, l: &Layout, y: i32, r: &ActivityRow) {
         if let Some(seq) = r.seq {
             c.right(l.seq_end, y, &trunc(&thousands(seq), SEQ_W as usize), St::D);
         }
-        if let Some(details) = r.details.as_ref().filter(|d| !d.is_empty()) {
-            let text = trunc(&details_line(details), l.details_w.max(0) as usize);
-            c.put(l.details_x, y, &text, St::F);
-        }
     }
     if let Some(who) = &r.who {
         c.right(l.lw, y, &trunc(who, l.who_w.max(0) as usize), St::D);
@@ -702,23 +808,32 @@ fn pane(c: &mut Canvas, v: &View, l: &Layout, r: &ActivityRow) {
     }
     c.put(x, y, "Details", St::D);
     y += 1;
-    let text = details_lines(details);
     let room = (l.last - y + 1).max(0) as usize;
     if room == 0 {
         return;
     }
-    let shown = if text.len() > room {
-        room - 1
-    } else {
-        text.len()
-    };
-    let line_w = (dw - 2).max(0) as usize;
-    for line in text.iter().take(shown) {
-        c.put(x + 2, y, &trunc(line, line_w), St::F);
-        y += 1;
+    let rows = detail_rows(details, v.snap.host.data.home.as_deref());
+    let view = details_view(&rows, (dw - 2).max(0) as usize);
+    // Rows show whole. When they all fit they all show; otherwise the
+    // last line says how many rows are left out.
+    let total: usize = view.rows.iter().map(Vec::len).sum();
+    let budget = if total > room { room - 1 } else { room };
+    let (mut used, mut drawn) = (0, 0);
+    for lines in &view.rows {
+        if used + lines.len() > budget {
+            break;
+        }
+        for line in lines {
+            c.put(x + 2, y, &line.key, St::D);
+            let st = if line.missing { St::D } else { St::NONE };
+            c.put(x + 2 + view.value_col as i32, y, &line.value, st);
+            y += 1;
+        }
+        used += lines.len();
+        drawn += 1;
     }
-    if shown < text.len() {
-        let more = format!("+{} more lines", text.len() - shown);
-        c.put(x + 2, y, &trunc(&more, line_w), St::D);
+    if drawn < view.rows.len() {
+        let more = format!("+{} more", view.rows.len() - drawn);
+        c.put(x + 2, y, &trunc(&more, (dw - 2).max(0) as usize), St::D);
     }
 }

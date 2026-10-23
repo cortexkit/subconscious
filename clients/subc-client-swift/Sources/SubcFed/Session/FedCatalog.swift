@@ -5,6 +5,7 @@ public struct FedCatalogOperation: Sendable, Equatable {
     public let name: String
     public let kind: String
     public let delivery: Delivery?
+    public let payload: FedOperationPayload?
 
     public struct Delivery: RawRepresentable, Sendable, Hashable, Codable {
         public let rawValue: String
@@ -17,10 +18,11 @@ public struct FedCatalogOperation: Sendable, Equatable {
         public static let watch = Self(rawValue: "watch")
     }
 
-    public init(name: String, kind: String, delivery: Delivery? = nil) {
+    public init(name: String, kind: String, delivery: Delivery? = nil, payload: FedOperationPayload? = nil) {
         self.name = name
         self.kind = kind
         self.delivery = delivery
+        self.payload = payload
     }
 
     public var isMutation: Bool {
@@ -159,7 +161,16 @@ public enum FedCatalogCodec {
                         throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
                     }
                     seenNames.insert(name)
-                    operations.append(FedCatalogOperation(name: name, kind: kind, delivery: delivery))
+                    var payload: FedOperationPayload?
+                    if peerFeatures.contains(FedFramedBodyCodec.feature), let declaration = op["payload"] {
+                        guard delivery != .watch,
+                              case .object(let object) = declaration,
+                              case .integer(let maximum) = object["max_bytes"],
+                              (1...UInt64(FedFramedBodyCodec.maximumDeclaredPayloadBytes)).contains(maximum)
+                        else { continue }
+                        payload = FedOperationPayload(maxBytes: Int(maximum))
+                    }
+                    operations.append(FedCatalogOperation(name: name, kind: kind, delivery: delivery, payload: payload))
                 }
             }
 

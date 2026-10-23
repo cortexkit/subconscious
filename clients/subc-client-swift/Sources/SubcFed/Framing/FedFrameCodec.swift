@@ -480,6 +480,11 @@ public enum FedFrameCodec {
         case .catalog:
             _ = try requireInteger(header, key: "generation", type: type)
         case .call:
+            if let framed = header["framed"] {
+                guard case .boolean(let enabled) = framed,
+                      !enabled || (negotiationComplete && negotiatedFeatures.contains(FedFramedBodyCodec.feature))
+                else { throw FedFrameError.invalidHeaderField(type: type, field: "framed") }
+            }
             try validateEffect(header, type: type)
             try requireNonEmptyString(header, key: "module", type: type)
             if let surface = header["surface"] {

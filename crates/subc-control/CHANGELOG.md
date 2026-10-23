@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.7
+
+- Add `CatalogEntry::operation_payload` and `with_operation_payload`, mirroring the manifest's operation-name-to-limit map so federation gateways can discover accepted request payloads. Empty maps are omitted and preserve existing catalog bytes. Requires subc-protocol 0.32.12.
+
 ## 0.32.6
 
 - Add optional `configured_enabled` and `with_configured_enabled` to non-exhaustive `SupervisorEntry`. Absent values are skipped and older list entries retain their bytes. The value comes from the daemon's loaded configuration; compare it with runtime `enabled` rather than treating it as a drift flag. This is additive: lifecycle acknowledgement types and bytes are unchanged, including `ClientControlResponse::SupervisorAck` literals and field patterns used by published clients and daemons.

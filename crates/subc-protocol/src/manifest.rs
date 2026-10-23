@@ -111,6 +111,10 @@ pub struct ModuleManifest {
     /// than refusing HELLO. Older daemons silently drop this field.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub operation_delivery: BTreeMap<String, OperationDelivery>,
+    /// Raw request payload limits keyed by declared management operation name.
+    /// Watch operations cannot accept payloads. Empty maps preserve legacy bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operation_payload: BTreeMap<String, OperationPayload>,
     /// An opaque rich-UI manifest descriptor discoverable from `catalog.list`.
     ///
     /// The daemon validates the descriptor's shape at HELLO and relays it without
@@ -135,6 +139,7 @@ pub struct ModuleManifestBuilder {
     self_signals: Option<Vec<SelfSignalDeclaration>>,
     provenance: Option<ManifestProvenance>,
     operation_delivery: BTreeMap<String, OperationDelivery>,
+    operation_payload: BTreeMap<String, OperationPayload>,
     rich_ui: Option<RichUiDescriptor>,
 }
 
@@ -164,6 +169,7 @@ impl ModuleManifest {
             self_signals: None,
             provenance: None,
             operation_delivery: BTreeMap::new(),
+            operation_payload: BTreeMap::new(),
             rich_ui: None,
         }
     }
@@ -259,6 +265,15 @@ impl ModuleManifestBuilder {
         self
     }
 
+    /// Sets raw request payload limits; an empty map preserves legacy wire bytes.
+    pub fn operation_payload(
+        mut self,
+        operation_payload: BTreeMap<String, OperationPayload>,
+    ) -> Self {
+        self.operation_payload = operation_payload;
+        self
+    }
+
     /// Adds an opaque rich-UI manifest descriptor to this module's manifest.
     pub fn rich_ui(mut self, rich_ui: Option<RichUiDescriptor>) -> Self {
         self.rich_ui = rich_ui;
@@ -281,6 +296,7 @@ impl ModuleManifestBuilder {
             self_signals: self.self_signals,
             provenance: self.provenance,
             operation_delivery: self.operation_delivery,
+            operation_payload: self.operation_payload,
             rich_ui: self.rich_ui,
         }
     }
@@ -328,6 +344,8 @@ struct ModuleManifestWire {
     #[serde(default)]
     operation_delivery: Option<Value>,
     #[serde(default)]
+    operation_payload: BTreeMap<String, OperationPayload>,
+    #[serde(default)]
     rich_ui: Option<RichUiDescriptor>,
     // `runtime_computed` belongs to --manifest output rather than the retained
     // manifest model. Deserialize it only long enough to enforce that capability
@@ -370,7 +388,11 @@ impl<'de> Deserialize<'de> for ModuleManifest {
                     .unwrap_or_default(),
             )
             .rich_ui(wire.rich_ui)
+            .operation_payload(wire.operation_payload)
             .build();
+        manifest
+            .validate_operation_payload()
+            .map_err(D::Error::custom)?;
         manifest
             .validate_capability_grammar()
             .map_err(D::Error::custom)?;
@@ -2127,6 +2149,75 @@ pub enum PipelineStageKind {
 pub struct PipelineAppliesTo {
     pub provider: String,
     pub model: String,
+}
+
+/// A management operation's declared raw request payload limit.
+/// Validated with its operation name by [`ModuleManifest::validate_operation_payload`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OperationPayload {
+    max_bytes: usize,
+}
+
+impl OperationPayload {
+    pub fn new(max_bytes: usize) -> Self {
+        Self { max_bytes }
+    }
+
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+}
+
+/// Why a payload declaration cannot be accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OperationPayloadError {
+    UnknownOperation { operation: String },
+    WatchOperation { operation: String },
+    InvalidMaxBytes { operation: String },
+}
+
+impl fmt::Display for OperationPayloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for OperationPayloadError {}
+
+impl ModuleManifest {
+    /// Checks that payload declarations name unary management operations and
+    /// have limits in `1..=MAX_DECLARED_PAYLOAD_BYTES`.
+    pub fn validate_operation_payload(&self) -> Result<(), OperationPayloadError> {
+        for (name, payload) in &self.operation_payload {
+            if !self.provides.iter().any(|role| match role {
+                ProviderRole::ManagementSurface { operations, .. } => {
+                    operations.iter().any(|op| op.name == *name)
+                }
+                _ => false,
+            }) {
+                return Err(OperationPayloadError::UnknownOperation {
+                    operation: name.clone(),
+                });
+            }
+            if self
+                .operation_delivery
+                .get(name)
+                .is_some_and(OperationDelivery::is_watch)
+            {
+                return Err(OperationPayloadError::WatchOperation {
+                    operation: name.clone(),
+                });
+            }
+            if !(1..=crate::framed_body::MAX_DECLARED_PAYLOAD_BYTES).contains(&payload.max_bytes) {
+                return Err(OperationPayloadError::InvalidMaxBytes {
+                    operation: name.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Operation exposed on the management plane.

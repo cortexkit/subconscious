@@ -1665,9 +1665,25 @@ pub struct RequestCtx {
     module_handle: ModuleHandle,
     cancelled: CancellationToken,
     binary_reply: Arc<AtomicBool>,
+    request_flags: Flags,
+    request_body: Arc<[u8]>,
 }
 
 impl RequestCtx {
+    /// Decodes a framed request only when ingress carried `FLAG_BINARY`.
+    /// Call this only for management operations that declared `operation_payload`.
+    /// Return a malformed body's named error as a refusal before doing any work;
+    /// the serve helper deliberately leaves that policy to the handler.
+    pub fn request_payload(
+        &self,
+    ) -> Result<Option<(serde_json::Value, &[u8])>, subc_protocol::framed_body::FramedBodyError>
+    {
+        if !self.request_flags.is_binary() {
+            return Ok(None);
+        }
+        subc_protocol::framed_body::decode(&self.request_body).map(Some)
+    }
+
     /// Full route handle retained from ingress.
     pub fn route_handle(&self) -> RouteHandle {
         self.handle
@@ -2312,6 +2328,8 @@ where
         module_handle,
         cancelled: cancellation,
         binary_reply: Arc::new(AtomicBool::new(false)),
+        request_flags: frame.header.flags,
+        request_body: Arc::from(frame.body.as_slice()),
     };
     let body = frame.body;
     let in_flight = Arc::clone(&dispatcher.in_flight);
@@ -3926,6 +3944,8 @@ mod tests {
             module_handle: module_handle.clone(),
             cancelled: CancellationToken::new(),
             binary_reply: Arc::new(AtomicBool::new(false)),
+            request_flags: Flags::new(false, Priority::Interactive, false),
+            request_body: Arc::from([]),
         };
         assert!(module_handle.remove_route(handle).unwrap());
 

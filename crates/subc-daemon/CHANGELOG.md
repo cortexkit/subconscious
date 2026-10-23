@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.38
+
+- Project manifest `operation_payload` declarations through `catalog.list` alongside `operation_delivery`. Empty declarations preserve the existing catalog response bytes; gateways can join declared limits onto negotiated federation catalog operations. Requires subc-control 0.32.7 and subc-protocol 0.32.12.
+
 ## 0.36.37
 
 - A duplicate daemon start verifies an authenticating peer again after a 1.5-second settling interval before exiting successfully. If the peer disappears, the starter continues through normal singleton locking and binding instead of reporting success for a departing daemon. A remaining bind or ownership conflict still fails, allowing launchd's restart-on-failure policy to retry; a healthy peer still produces exit 0.

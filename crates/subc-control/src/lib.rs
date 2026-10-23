@@ -17,7 +17,7 @@ use serde::{
 use subc_protocol::{
     manifest::{
         CapabilityDeclarations, EventDeclaration, ManifestProvenance, OperationDelivery,
-        ProviderRole, RichUiDescriptor, SelfSignalDeclaration,
+        OperationPayload, ProviderRole, RichUiDescriptor, SelfSignalDeclaration,
     },
     scope::ScopeSelector,
     session::HealthStatus,
@@ -2030,6 +2030,10 @@ pub struct CatalogEntry {
     /// only `"watch"` on a declared management query is subscribable.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub operation_delivery: BTreeMap<String, OperationDelivery>,
+    /// Raw request payload limits mirrored from the module manifest by operation
+    /// name. Empty maps preserve catalog bytes from before payload declarations.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub operation_payload: BTreeMap<String, OperationPayload>,
     /// Rich-UI descriptor mirrored verbatim from the registering manifest.
     /// The daemon does not fetch or interpret the manifest described here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2059,9 +2063,20 @@ impl CatalogEntry {
             self_signals: None,
             events: None,
             operation_delivery: BTreeMap::new(),
+            operation_payload: BTreeMap::new(),
             rich_ui: None,
             nonce_verified: false,
         }
+    }
+
+    /// Set raw request payload limits mirrored from the registered manifest.
+    #[must_use]
+    pub fn with_operation_payload(
+        mut self,
+        operation_payload: BTreeMap<String, OperationPayload>,
+    ) -> Self {
+        self.operation_payload = operation_payload;
+        self
     }
 
     /// Set the module's effective readiness.

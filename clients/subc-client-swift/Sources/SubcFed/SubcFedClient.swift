@@ -374,6 +374,26 @@ public actor SubcFedClient {
         method: String,
         params: FedJSONObject
     ) async throws -> Data {
+        try await callManagementImpl(target: target, method: method, params: params, payload: nil)
+    }
+
+    /// Sends raw bytes only to a payload-declaring operation on a session that
+    /// negotiated framed-calls-v1. Local refusals happen before admission or writes.
+    public func callManagement(
+        target: FedManagementTarget,
+        method: String,
+        params: FedJSONObject,
+        payload: Data
+    ) async throws -> Data {
+        try await callManagementImpl(target: target, method: method, params: params, payload: payload)
+    }
+
+    private func callManagementImpl(
+        target: FedManagementTarget,
+        method: String,
+        params: FedJSONObject,
+        payload: Data?
+    ) async throws -> Data {
         try await checkStateStoreLifetime()
         guard let session = activeSession else { throw FedFailure.disconnected }
         guard case .ready = connectionState else { throw FedFailure.disconnected }
@@ -389,7 +409,8 @@ public actor SubcFedClient {
             moduleID: target.moduleID,
             method: method,
             params: params,
-            policy: policy
+            policy: policy,
+            payload: payload
         )
         let admittedAtNs = clock.nowNanoseconds()
 

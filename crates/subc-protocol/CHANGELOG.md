@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.32.12
+
+- Add `framed_body::{encode, decode, FramedBodyError, MAX_FRAMED_HEAD_BYTES, MAX_DECLARED_PAYLOAD_BYTES}` for a bounded JSON object head and unchanged raw payload, with shared Rust/Swift vectors.
+- Add the optional, empty-omitted `ModuleManifest::operation_payload` map and builder method, `OperationPayload::{new, max_bytes}`, `OperationPayloadError`, and `ModuleManifest::validate_operation_payload`. Declarations must name unary management operations and allow 1 through 8 MiB. `ManagementOperation` remains unchanged and source-compatible.
+
 ## 0.32.11
 
 - Add optional epoch-fixed `ScopeRecord` and `ScopeStamp` workdir/project_id fields and builders, project-id validation, `scope-workdir/v1`, and named workdir/project refusals. Absent fields preserve existing JSON bytes.

@@ -1860,6 +1860,7 @@ impl SubcConsumer {
             .shared
             .send_request_cancellable(
                 RequestSend {
+                    binary: false,
                     expected_handle: Some(*handle),
                     channel: handle.channel,
                     epoch: handle.epoch,
@@ -1932,6 +1933,7 @@ impl SubcConsumer {
         let terminal = self
             .shared
             .send_request(RequestSend {
+                binary: false,
                 expected_handle: Some(*handle),
                 channel: 0,
                 epoch: 0,
@@ -2075,7 +2077,8 @@ impl SubcConsumer {
         body: Vec<u8>,
         opts: CallOptions,
     ) -> Result<CallReply, CallError> {
-        self.call_inner(target, identity, body, opts, None).await
+        self.call_inner(target, identity, (body, false), opts, None)
+            .await
     }
 
     /// Managed unary call with explicit cancellation, like [`Self::request_cancellable`].
@@ -2117,20 +2120,73 @@ impl SubcConsumer {
         let future = async move {
             let guard = registration;
             consumer
-                .call_inner(target, identity, body, opts, Some(Arc::clone(&guard.state)))
+                .call_inner(
+                    target,
+                    identity,
+                    (body, false),
+                    opts,
+                    Some(Arc::clone(&guard.state)),
+                )
                 .await
         };
         (cancel, future)
+    }
+
+    /// Sends a framed JSON object head and opaque payload with `FLAG_BINARY`.
+    /// Only use this for management operations that declare `operation_payload`.
+    /// The caller enforces the operation's limit; the codec only bounds the head.
+    pub async fn call_framed_with_reply(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        head: serde_json::Value,
+        payload: Vec<u8>,
+        opts: CallOptions,
+    ) -> Result<CallReply, CallError> {
+        let body = subc_protocol::framed_body::encode(&head, &payload)
+            .map_err(|error| CallError::not_sent(format!("invalid framed request: {error}")))?;
+        self.call_inner(target, identity, (body, true), opts, None)
+            .await
+    }
+
+    /// Cancellable companion to [`Self::call_framed_with_reply`], with the same
+    /// lazy send, cancellation, retry and deadline behavior as other managed calls.
+    pub fn call_framed_cancellable_with_reply(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        head: serde_json::Value,
+        payload: Vec<u8>,
+        opts: CallOptions,
+    ) -> (
+        CancelHandle,
+        impl Future<Output = Result<CallReply, CallError>> + Send + '_,
+    ) {
+        let (cancel, registration) = CancelRegistration::new(Arc::clone(&self.shared));
+        (cancel, async move {
+            let guard = registration;
+            let body = subc_protocol::framed_body::encode(&head, &payload)
+                .map_err(|error| CallError::not_sent(format!("invalid framed request: {error}")))?;
+            self.call_inner(
+                target,
+                identity,
+                (body, true),
+                opts,
+                Some(Arc::clone(&guard.state)),
+            )
+            .await
+        })
     }
 
     async fn call_inner(
         &self,
         target: RouteTarget,
         identity: BindIdentity,
-        body: Vec<u8>,
+        body: (Vec<u8>, bool),
         opts: CallOptions,
         cancel: Option<Arc<UnaryCancel>>,
     ) -> Result<CallReply, CallError> {
+        let (body, binary) = body;
         let call_deadline = Instant::now() + opts.timeout;
         // One resend per call after a refusal that proves the module never
         // received the request (route dead, or the module draining).
@@ -2191,6 +2247,7 @@ impl SubcConsumer {
                         channel: route.handle.channel,
                         epoch: route.handle.epoch,
                         body: body.clone(),
+                        binary,
                         priority: opts.priority,
                         admission_class: opts.admission_class,
                         deadline: call_deadline,
@@ -3759,6 +3816,7 @@ impl Shared {
     ) -> Result<TerminalFrame, CallError> {
         self.ensure_connected_for_call(deadline).await?;
         self.send_request(RequestSend {
+            binary: false,
             expected_handle: None,
             channel: 0,
             epoch: 0,
@@ -3789,6 +3847,7 @@ impl Shared {
             channel,
             epoch,
             body,
+            binary,
             priority,
             admission_class,
             deadline,
@@ -3835,7 +3894,7 @@ impl Shared {
 
         let frame = Frame::build(
             FrameType::Request,
-            Flags::new(false, priority, false).with_admission_class(admission_class),
+            Flags::new(binary, priority, false).with_admission_class(admission_class),
             channel,
             epoch,
             corr,
@@ -4846,6 +4905,7 @@ struct RequestSend {
     channel: u16,
     epoch: u32,
     body: Vec<u8>,
+    binary: bool,
     priority: Priority,
     admission_class: AdmissionClass,
     deadline: Instant,
@@ -6488,6 +6548,7 @@ mod tests {
         let call = tokio::spawn(async move {
             call_shared
                 .send_request(RequestSend {
+                    binary: false,
                     expected_handle: Some(handle),
                     channel: handle.channel,
                     epoch: handle.epoch,
@@ -6721,6 +6782,7 @@ mod tests {
         let sibling = tokio::spawn(async move {
             sibling_shared
                 .send_request(RequestSend {
+                    binary: false,
                     expected_handle: Some(handle),
                     channel: handle.channel,
                     epoch: handle.epoch,
@@ -8934,6 +8996,7 @@ mod tests {
 
         let err = shared
             .send_request(RequestSend {
+                binary: false,
                 expected_handle: Some(stale),
                 channel: stale.channel,
                 epoch: stale.epoch,
@@ -9090,6 +9153,7 @@ mod tests {
         let request = tokio::spawn(async move {
             request_shared
                 .send_request(RequestSend {
+                    binary: false,
                     expected_handle: None,
                     channel: 0,
                     epoch: 0,
@@ -9109,6 +9173,7 @@ mod tests {
 
         let exhausted = shared
             .send_request(RequestSend {
+                binary: false,
                 expected_handle: None,
                 channel: 0,
                 epoch: 0,

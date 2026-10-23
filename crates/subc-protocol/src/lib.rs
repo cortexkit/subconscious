@@ -38,6 +38,7 @@ pub use machine_id::{MachineId, MachineIdError};
 
 pub mod call_mode;
 pub mod frame;
+pub mod framed_body;
 pub mod machine_id;
 pub mod manifest;
 pub mod scope;

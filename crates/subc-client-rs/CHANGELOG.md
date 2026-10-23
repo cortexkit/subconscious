@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.30.13
+
+- Add `SubcConsumer::call_framed_with_reply` and `call_framed_cancellable_with_reply`, taking an object head plus raw payload and returning `CallReply` with existing cancellation, deadline and retry semantics. Requests carry `FLAG_BINARY`; existing methods are unchanged.
+- Add `RequestCtx::request_payload()` to decode flagged requests into an owned JSON head and borrowed unchanged payload, return `None` for unflagged requests, or a named `FramedBodyError` for malformed bodies. Handlers call it only on payload-declaring management operations and turn decoding errors into refusals before performing work. Tested with a 1 MiB NUL/non-UTF-8 payload through the real daemon.
+
 ## 0.30.12
 
 - Add `RequestCtx::mark_binary_reply()` to declare a terminal `HandlerOutcome::Response` body as raw bytes with `FLAG_BINARY`. The mark is shared by clones of one request's context, never by other requests, and does not change errors or stream frames. Bodies are sent unchanged with or without the mark, and the delivered-frame size limit still includes the header. No `HandlerOutcome` variant was added.

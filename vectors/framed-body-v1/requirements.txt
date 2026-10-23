@@ -1,0 +1,1 @@
+# Standard library only; CI installs this file for every generated vector set.

@@ -1,0 +1,1 @@
+{"module_id":"upload","module_version":"1.0.0","protocol_ver":2,"provides":[{"role":"management_surface","operations":[{"name":"chunk","kind":"mutate"}],"config_schema":{},"observability":[],"identity_scope":[],"concurrency":"serial"}],"operation_payload":{"chunk":{"max_bytes":1048576}}}

@@ -72,7 +72,7 @@ public struct FedHelloPolicy: Sendable, Equatable {
         keepaliveIntervalMs: UInt64 = defaultKeepaliveIntervalMs,
         deviceName: String = "subc-fed",
         // `effects-v2` is used only when the peer's hello carries it too.
-        features: [String] = ["mgmt-v1", "effects-v1", FedEffectsV2Codec.feature, "subscribe-v1"]
+        features: [String] = ["mgmt-v1", "effects-v1", FedEffectsV2Codec.feature, "subscribe-v1", FedFramedBodyCodec.feature]
     ) throws {
         guard (4_096...UInt64(UInt32.max)).contains(maxBodyBytes) else {
             throw FedFailure.invalidProfile(field: "max_body_bytes")

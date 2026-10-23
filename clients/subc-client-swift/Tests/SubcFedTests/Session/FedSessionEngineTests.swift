@@ -42,7 +42,7 @@ final class FedSessionEngineTests: XCTestCase {
         // hellos carry them. An origin announces no serving subscription cap.
         XCTAssertEqual(
             localHello.header["features"],
-            .array([.string("mgmt-v1"), .string("effects-v1"), .string("effects-v2"), .string("subscribe-v1")])
+            .array([.string("mgmt-v1"), .string("effects-v1"), .string("effects-v2"), .string("subscribe-v1"), .string("framed-calls-v1")])
         )
         XCTAssertNil(localHello.header["max_subscriptions"])
         XCTAssertEqual(localHello.header["max_body_bytes"], .integer(16_777_216))
@@ -554,17 +554,18 @@ final class FedSessionEngineTests: XCTestCase {
     private func completeEstablish(
         transport: FedLoopbackByteTransport,
         task: Task<Void, Error>,
-        modulesJSON: String = #"{"modules":[]}"#
+        modulesJSON: String = #"{"modules":[]}"#,
+        features: [String] = ["mgmt-v1", "effects-v1"]
     ) async throws {
         try await waitUntil {
             let sent = try await transport.sentFrames(negotiationComplete: false)
             return sent.contains { $0.knownType == .hello }
         }
-        try await feed(transport, frame: remoteHelloFrame(), negotiationComplete: false)
+        try await feed(transport, frame: remoteHelloFrame(features: features), negotiationComplete: false)
         try await waitUntil {
             let sent = try await transport.sentFrames(
                 negotiationComplete: true,
-                features: ["mgmt-v1", "effects-v1"]
+                features: Set(features)
             )
             return sent.contains { $0.knownType == .catalog }
         }
@@ -589,5 +590,86 @@ final class FedSessionEngineTests: XCTestCase {
             }
             try await Task.sleep(nanoseconds: 2_000_000)
         }
+    }
+}
+
+extension FedSessionEngineTests {
+    private func framedSession(features: [String], declaration: String, kind: String = "mutate") async throws -> (FedSessionEngine, FedLoopbackByteTransport, FedMemoryStateStore) {
+        let transport = FedLoopbackByteTransport()
+        let store = FedMemoryStateStore()
+        let engine = FedSessionEngine(deps: .init(
+            transport: transport, store: store, clock: FedFakeClock(),
+            localPublicKey: localKey, responderStaticPublicKey: responderKey,
+            helloPolicy: try FedHelloPolicy(), connectionAttemptID: String(repeating: "c", count: 32)
+        ))
+        let establish = Task { try await engine.establish() }
+        try await completeEstablish(transport: transport, task: establish,
+            modulesJSON: "{\"modules\":[{\"module_id\":\"upload\",\"management\":{\"operations\":[{\"name\":\"chunk\",\"kind\":\"\(kind)\"\(declaration)}]}}]}",
+            features: features)
+        return (engine, transport, store)
+    }
+
+    private func assertFramedRefusal(features: [String], declaration: String, payload: Data, expected: FedFramedCallError) async throws {
+        let (engine, transport, store) = try await framedSession(features: features, declaration: declaration)
+        do {
+            let prepared = try await engine.prepareManagementCall(moduleID: "upload", method: "chunk", params: [:],
+                policy: FedAdmissionPolicySnapshot(defaultDeadlineMs: 60_000), payload: payload)
+            try await engine.dispatchPreparedCall(prepared)
+            XCTFail("framed call should be refused")
+        } catch {
+            XCTAssertEqual(error as? FedFramedCallError, expected)
+        }
+        let count = await engine.admissionController?.inFlightCount
+        XCTAssertEqual(count, 0, "refusal must precede admission")
+        let rows = try await store.unsettledEffects(forResponderPublicKey: responderKey)
+        XCTAssertTrue(rows.isEmpty, "refusal must precede durable intent")
+        let frames = try await transport.sentFrames(negotiationComplete: true, features: Set(features))
+        XCTAssertFalse(frames.contains { $0.knownType == .call }, "refusal must precede writes")
+    }
+
+    func testFramedCallWithoutNegotiationRefusesBeforeAdmission() async throws {
+        try await assertFramedRefusal(features: ["mgmt-v1", "effects-v1"],
+            declaration: ",\"payload\":{\"max_bytes\":1048576}", payload: Data([0, 255]), expected: .featureNotNegotiated)
+    }
+
+    func testFramedCallWithoutDeclarationRefusesBeforeAdmission() async throws {
+        try await assertFramedRefusal(features: ["mgmt-v1", "effects-v1", FedFramedBodyCodec.feature],
+            declaration: "", payload: Data(), expected: .payloadNotAccepted)
+    }
+
+    func testFramedCallOverDeclaredLimitRefusesBeforeAdmission() async throws {
+        try await assertFramedRefusal(features: ["mgmt-v1", "effects-v1", FedFramedBodyCodec.feature],
+            declaration: ",\"payload\":{\"max_bytes\":1}", payload: Data([0, 255]), expected: .payloadTooLarge(maxBytes: 1))
+    }
+
+    func testFramedCallSendsExactPayloadAndUnframedCallRemainsLegal() async throws {
+        let features = ["mgmt-v1", "effects-v1", FedFramedBodyCodec.feature]
+        let (engine, transport, _) = try await framedSession(features: features,
+            declaration: ",\"payload\":{\"max_bytes\":1048576}", kind: "query")
+        let payload = Data((0..<1_048_576).map { UInt8(truncatingIfNeeded: $0) })
+        let params: FedJSONObject = ["offset": .integer(17)]
+        for bytes: Data? in [payload, Data(), nil] {
+            let prepared = try await engine.prepareManagementCall(moduleID: "upload", method: "chunk", params: params,
+                policy: FedAdmissionPolicySnapshot(defaultDeadlineMs: 60_000), payload: bytes)
+            try await engine.dispatchPreparedCall(prepared)
+            await engine.releasePermit(prepared.permit)
+        }
+        let frames = try await transport.sentFrames(negotiationComplete: true, features: Set(features))
+        let calls = frames.filter { $0.knownType == .call }
+        XCTAssertEqual(calls.count, 3)
+        let head: FedJSONObject = ["method": .string("chunk"), "params": .object(params)]
+        for (call, bytes) in zip(calls.prefix(2), [payload, Data()]) {
+            XCTAssertEqual(call.header["framed"], .boolean(true))
+            XCTAssertNil(call.header["binary"])
+            let decoded = try FedFramedBodyCodec.decode(call.body)
+            XCTAssertEqual(decoded.head, head)
+            XCTAssertEqual(decoded.payload, bytes)
+        }
+        XCTAssertNil(calls[2].header["framed"])
+        XCTAssertEqual(try FedJSONObject(jsonData: calls[2].body), head)
+        let hello = try XCTUnwrap(frames.first { $0.knownType == .hello })
+        if case .array(let advertised) = hello.header["features"] {
+            XCTAssertTrue(advertised.contains(.string(FedFramedBodyCodec.feature)))
+        } else { XCTFail("hello features absent") }
     }
 }

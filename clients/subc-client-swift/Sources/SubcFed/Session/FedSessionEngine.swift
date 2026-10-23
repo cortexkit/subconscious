@@ -402,7 +402,8 @@ public actor FedSessionEngine {
         moduleID: String,
         method: String,
         params: FedJSONObject,
-        policy: FedAdmissionPolicySnapshot
+        policy: FedAdmissionPolicySnapshot,
+        payload: Data? = nil
     ) async throws -> FedPreparedManagementCall {
         guard phase == .ready, role == .primary else {
             throw FedFailure.disconnected
@@ -412,7 +413,28 @@ public actor FedSessionEngine {
         }
 
         let operation = try lookupOperation(moduleID: moduleID, method: method)
+        if let payload {
+            guard negotiation.features.contains(FedFramedBodyCodec.feature) else {
+                throw FedFramedCallError.featureNotNegotiated
+            }
+            guard let declaration = operation.payload else {
+                throw FedFramedCallError.payloadNotAccepted
+            }
+            guard payload.count <= declaration.maxBytes else {
+                throw FedFramedCallError.payloadTooLarge(maxBytes: declaration.maxBytes)
+            }
+        }
         guard operation.delivery != .watch else { throw FedFailure.catalogTargetUnavailable }
+        let head = try FedManagementCallBody(method: method, params: params).jsonData()
+        let body: Data
+        if let payload {
+            body = try FedFramedBodyCodec.encode(head: FedJSONObject(jsonData: head), payload: payload)
+            guard UInt64(body.count) <= negotiation.peerMaxBodyBytes else {
+                throw FedFrameError.bodyTooLarge(declared: UInt32(clamping: body.count), maximum: UInt32(clamping: negotiation.peerMaxBodyBytes))
+            }
+        } else {
+            body = head
+        }
         let classification = FedOriginEffectLog.classify(
             operationKind: operation.kind,
             peerFeatures: negotiation.features
@@ -462,7 +484,7 @@ public actor FedSessionEngine {
             if negotiation.effectsEnabled {
                 (watermark, confirmedRanges) = try await settlementReport(effectLog)
             }
-            let fields = FedCallHeader.fields(
+            var fields = FedCallHeader.fields(
                 effect: effect,
                 module: moduleID,
                 surface: "management",
@@ -471,7 +493,7 @@ public actor FedSessionEngine {
                 confirmedWatermark: watermark,
                 confirmedEffects: confirmedRanges
             )
-            let body = try FedManagementCallBody(method: method, params: params).jsonData()
+            if payload != nil { fields["framed"] = .boolean(true) }
             let frame = FedFrame(type: FedFrameType.call.rawValue, fields: fields, body: body)
             // Intent is durable for mutations; the first network write happens in
             // dispatchPreparedCall, after the caller registers its continuation.

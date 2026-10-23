@@ -3986,6 +3986,7 @@ impl ControlHandler {
                 .with_self_signals(registration.manifest.self_signals)
                 .with_events(registration.manifest.events)
                 .with_operation_delivery(registration.manifest.operation_delivery)
+                .with_operation_payload(registration.manifest.operation_payload)
                 .with_rich_ui(registration.manifest.rich_ui)
                 .with_nonce_verified(nonce_verified)
             })

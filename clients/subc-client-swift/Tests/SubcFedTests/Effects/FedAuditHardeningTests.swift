@@ -400,14 +400,20 @@ final class FedAuditHardeningTests: XCTestCase {
             params: FedJSONObject(["t": .string("x")]),
             policy: try FedAdmissionPolicySnapshot()
         )
+        let frame = FedFrame(
+            type: "call_frame",
+            fields: ["k": .string("error"), "last": .bool(true)],
+            body: Data(#"{"code":"not_a_member","message":"you are not a member of this room","detail":{"last_reset_at":"2026-10-01T00:00:00Z"}}"#.utf8)
+        )
         do {
             _ = try await engine.handleInboundTerminal(
                 effect: admitted.effect,
-                kind: "error",
-                body: Data(),
-                bodyOmitted: false,
-                errorCode: "not_a_member",
-                errorMessage: "you are not a member of this room",
+                kind: frame.terminalKind ?? "error",
+                body: frame.body,
+                bodyOmitted: frame.body.isEmpty,
+                errorCode: frame.terminalCode,
+                errorMessage: frame.terminalMessage,
+                errorDetail: frame.terminalDetail,
                 isMutation: false,
                 permit: admitted.permit
             )
@@ -415,7 +421,11 @@ final class FedAuditHardeningTests: XCTestCase {
         } catch let error as FedFailure {
             XCTAssertEqual(
                 error,
-                .moduleError(code: "not_a_member", message: "you are not a member of this room")
+                .moduleError(
+                    code: "not_a_member",
+                    message: "you are not a member of this room",
+                    detail: .object(FedJSONObject(["last_reset_at": .string("2026-10-01T00:00:00Z")]))
+                )
             )
             XCTAssertNotEqual(error, .disconnected)
         }
@@ -473,6 +483,7 @@ final class FedAuditHardeningTests: XCTestCase {
                 errorCode: frame.terminalCode,
                 errorMessage: frame.terminalMessage,
                 hostRefusal: frame.terminalHostRefusal,
+                errorDetail: frame.terminalDetail,
                 isMutation: false,
                 permit: admitted.permit
             )
@@ -486,7 +497,11 @@ final class FedAuditHardeningTests: XCTestCase {
                     hostRefusal: FedHostRefusalHint(
                         hostRefusal: .moduleWarming,
                         hostReason: .requiredCapabilityUnprovided
-                    )
+                    ),
+                    detail: .object(FedJSONObject([
+                        "host_refusal": .string("module_warming"),
+                        "host_reason": .string("required_capability_unprovided"),
+                    ]))
                 )
             )
         }

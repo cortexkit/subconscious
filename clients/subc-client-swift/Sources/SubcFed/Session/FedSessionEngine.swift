@@ -566,6 +566,7 @@ public actor FedSessionEngine {
         errorCode: String?,
         errorMessage: String? = nil,
         hostRefusal: FedHostRefusalHint? = nil,
+        errorDetail: FedJSONValue? = nil,
         isMutation: Bool,
         permit: FedAdmissionPermit,
         provenance: FedDispatchProvenance = .afterDispatchOrUnknown
@@ -604,7 +605,8 @@ public actor FedSessionEngine {
             throw FedFailure.moduleError(
                 code: errorCode ?? "unspecified",
                 message: errorMessage,
-                hostRefusal: hostRefusal
+                hostRefusal: hostRefusal,
+                detail: errorDetail
             )
         }
         return body

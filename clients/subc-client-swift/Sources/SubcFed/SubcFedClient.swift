@@ -1033,6 +1033,7 @@ public actor SubcFedClient {
             let code = frame.terminalCode
             let message = frame.terminalMessage
             let hostRefusal = frame.terminalHostRefusal
+            let detail = frame.terminalDetail
             await resolvePendingCall(seq: effect.seq) { pending in
                 let handlingStartedAtNs = self.clock.nowNanoseconds()
                 defer {
@@ -1052,6 +1053,7 @@ public actor SubcFedClient {
                         errorCode: code,
                         errorMessage: message,
                         hostRefusal: hostRefusal,
+                        errorDetail: detail,
                         isMutation: pending.isMutation,
                         permit: pending.permit
                     )

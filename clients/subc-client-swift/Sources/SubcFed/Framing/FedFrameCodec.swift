@@ -140,6 +140,17 @@ public struct FedFrame: Sendable, Equatable {
         errorBodyField("message")
     }
 
+    /// The module's JSON error context, preserving objects, arrays and scalars.
+    /// Missing or null detail and unreadable error bodies have no context.
+    public var terminalDetail: FedJSONValue? {
+        guard let object = try? FedJSONObject(jsonData: body),
+              let detail = object["detail"], detail != .null
+        else {
+            return nil
+        }
+        return detail
+    }
+
     /// The host-warming hint from a terminal `call_frame` error body, applying
     /// the closed-set decoding rule documented on `FedHostRefusalHint`.
     ///

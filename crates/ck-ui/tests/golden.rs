@@ -147,6 +147,29 @@ fn devices_120x36() {
 }
 
 #[test]
+fn pair_120x36() {
+    let mut app = app();
+    app.tab = Tab::Devices;
+    app.devices.sel = Some(1);
+    app.overlay = Some(Overlay::Pairing);
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("golden/fixture.json")).unwrap();
+    let group = &fixture["pairing"]["groups"][0];
+    let now = Snapshot::fixture_now();
+    app.pairing = Some(
+        ck_ui::pairing::PairingState::new(
+            fixture["pairing"]["payload"].as_str().unwrap(),
+            group[0].as_str().unwrap().into(),
+            group[1].as_u64(),
+            now.add_millis(-1_000),
+            now.add_millis(599_000),
+        )
+        .unwrap(),
+    );
+    check("pair-120x36", &app, &Snapshot::fixture());
+}
+
+#[test]
 fn modules_160x48() {
     let mut app = app();
     app.tab = Tab::Modules;

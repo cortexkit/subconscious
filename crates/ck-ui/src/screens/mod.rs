@@ -9,6 +9,7 @@ pub mod logs;
 pub mod metrics;
 pub mod modules;
 pub mod overlays;
+pub mod pairing;
 pub mod settings;
 pub mod usage;
 

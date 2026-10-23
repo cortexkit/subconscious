@@ -31,6 +31,7 @@ pub use crate::model::Tab;
 pub enum Overlay {
     Palette,
     Help,
+    Pairing,
 }
 
 /// A one-line text field that has the keyboard, such as a list filter, a
@@ -116,6 +117,7 @@ pub struct App {
     pub agents: AgentsState,
     /// The Devices screen's selected row.
     pub devices: DevicesState,
+    pub pairing: Option<crate::pairing::PairingState>,
     /// Whether account identifiers are hidden, on Usage and in Home's usage
     /// panel alike: each account's email, id and organization, wherever the
     /// app shows them, read as that account's pseudonym. `x` on Usage
@@ -148,6 +150,7 @@ impl App {
             usage: UsageState::default(),
             agents: AgentsState::default(),
             devices: DevicesState::default(),
+            pairing: None,
             redact: false,
             requests: Vec::new(),
         }
@@ -162,10 +165,11 @@ impl App {
         self.selected(snap).map(|m| m.id.clone())
     }
 
-    /// What is on screen, for the sources it needs: the tab that shows.
-    /// No screen yet opens the Add a phone overlay or Settings → Updates.
+    /// What is on screen, for the sources it needs.
     pub fn showing(&self, snap: &Snapshot) -> crate::live::schedule::Showing {
-        crate::live::schedule::Showing::tab(self.shown_tab(snap))
+        let mut showing = crate::live::schedule::Showing::tab(self.shown_tab(snap));
+        showing.add_phone = self.overlay == Some(Overlay::Pairing);
+        showing
     }
 
     /// The module whose palette commands list first: the selected one while
@@ -309,6 +313,11 @@ impl App {
                 self.preferred_module(snap),
             ),
             Some(Overlay::Help) => overlays::help(&mut c, snap.serves, snap.visible_tabs()),
+            Some(Overlay::Pairing) => {
+                if let Some(state) = &self.pairing {
+                    screens::pairing::draw(&mut c, state, now);
+                }
+            }
             None => {}
         }
     }
@@ -349,6 +358,9 @@ impl App {
         }
         if self.confirm.is_some() {
             return self.confirm_key(key);
+        }
+        if self.overlay == Some(Overlay::Pairing) {
+            return self.pairing_key(key);
         }
         if let Some(handled) = self.field_key(key) {
             // Activity's and Agents' lists follow their filter as it is
@@ -527,6 +539,34 @@ impl App {
                 interruption(m, ActionKind::Stop)
             ),
         });
+        true
+    }
+
+    fn pairing_key(&mut self, key: KeyEvent) -> bool {
+        if key.code == KeyCode::Esc {
+            self.overlay = None;
+            self.field = None;
+            self.pairing = None;
+            return true;
+        }
+        let Some(state) = &self.pairing else {
+            return false;
+        };
+        if state.claim.is_none() {
+            return false;
+        }
+        let i = state.word_sel % 4;
+        self.field = Some(TextField {
+            text: state.words[i].clone(),
+        });
+        let handled = self.field_key(key);
+        let state = self.pairing.as_mut().unwrap();
+        state.words[i] = self.field.take().unwrap().text;
+        match key.code {
+            KeyCode::Tab | KeyCode::Right | KeyCode::Down => state.word_sel = (i + 1) % 4,
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Up => state.word_sel = (i + 3) % 4,
+            _ => return handled.unwrap_or(false),
+        }
         true
     }
 

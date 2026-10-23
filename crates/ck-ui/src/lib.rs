@@ -13,6 +13,7 @@ pub mod draw;
 pub mod live;
 pub mod metrics;
 pub mod model;
+pub mod pairing;
 pub mod quota;
 pub mod screens;
 pub mod theme;

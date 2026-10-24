@@ -1,10 +1,4 @@
-exit: 1
+exit: 0
 stdout:
-ck upgrade manages only what ck setup installed. ck setup did not install these, so ck upgrade won't replace them:
-  ~/.local/share/cortexkit/bin/ck-subc
-  ~/.local/share/cortexkit/bin/ck-subc-mcp
-  ~/.local/share/cortexkit/bin/ck-aft
-  ~/.local/share/cortexkit/bin/ck-claustrum
-  ~/.local/share/cortexkit/bin/ck-auth
-Move them aside and run ck setup again. Nothing was changed.
+Everything is up to date.
 stderr:

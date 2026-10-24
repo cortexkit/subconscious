@@ -83,49 +83,6 @@ pub fn discover_current_upgrade_targets(
     discover_managed_upgrade_targets(&inventory, executable, daemon_catalog)
 }
 
-/// Refuse incomplete ownership before reporting currency or planning writes.
-/// The inventory authorizes destinations; the presence of a binary alone does not.
-pub fn upgrade_ownership_outcomes(
-    executable: &Path,
-    discovered: &[ManagedUpgradeTarget],
-) -> Result<Vec<super::PlanOutcome>, String> {
-    let inventory = load_current_inventory()?;
-    let binary_home = load_current_inventory_root()?.join("bin");
-    let mut outcomes = Vec::new();
-    if let super::PlatformObservation::Supported(target) = super::PlatformObservation::current() {
-        let mut unowned = Vec::new();
-        for binaries in Component::ALL
-            .into_iter()
-            .map(|component| super::components::component_binaries_for_target(component, target))
-            .chain(std::iter::once(&["ck"][..]))
-        {
-            for (_, path) in
-                super::components::unowned_binary_paths(binaries, &binary_home, &inventory)
-            {
-                unowned.push(path);
-            }
-        }
-        if !discovered.is_empty()
-            && unowned.is_empty()
-            && !discovered
-                .iter()
-                .any(|item| item.target.is_self_replacing())
-        {
-            unowned.push(executable.to_path_buf());
-        }
-        if !unowned.is_empty() {
-            outcomes.push(super::PlanOutcome::Refusal {
-                reason: super::text::upgrade_unowned_binaries_refusal(&unowned),
-            });
-        } else if discovered.is_empty() {
-            outcomes.push(super::PlanOutcome::Refusal {
-                reason: super::text::upgrade_nothing_managed_refusal(),
-            });
-        }
-    }
-    Ok(outcomes)
-}
-
 /// Reads only inventory evidence for the dashboard. It avoids probing binaries:
 /// a bare `ck` must not assume every managed sibling shares its own crate version.
 pub fn dashboard_installed_binaries() -> Result<BTreeMap<String, InstalledBinary>, String> {

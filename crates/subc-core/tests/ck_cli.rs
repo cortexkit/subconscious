@@ -1230,7 +1230,7 @@ fn setup_unowned_refusals_match_dry_run_without_downloads_or_changes() {
             assert!(outputs[0].contains("ck setup will not downgrade it. Nothing was changed."));
         } else {
             assert!(outputs[0]
-                .contains("ck setup did not install ~/.local/share/cortexkit/bin/ck-subc-mcp, so it won't replace it. Move it aside and run ck setup again."));
+                .contains("ck setup did not install it. Move it aside and run ck setup again."));
         }
         assert_eq!(
             *index.requests.lock().unwrap(),
@@ -2152,8 +2152,7 @@ fn upgrade_and_check_say_everything_is_current_in_one_line() {
 }
 
 // These byte pins protect redirected output as the terminal UI evolves. The
-// index offers and installed versions are fixed; timestamps and URLs never
-// enter these outputs, so no clock or path is masked.
+// signed index and installed versions are fixed; no clock or path is masked.
 #[test]
 #[cfg(target_os = "linux")]
 fn upgrade_check_piped_pins() {
@@ -2242,161 +2241,13 @@ fn upgrade_unowned_piped_pin() {
             &"55".repeat(32),
         )
     });
-    for args in [
-        &["upgrade"][..],
-        &["upgrade", "--check"][..],
-        &["upgrade", "--verbose"][..],
-        &["upgrade", "--check", "--verbose"][..],
-    ] {
+    for args in [&["upgrade"][..], &["upgrade", "--check"][..]] {
         let output = fixture.command(&index, args).output().unwrap();
         assert_piped_upgrade_pin(&output, include_str!("golden/piped/upgrade-unowned.txt"));
     }
     assert_eq!(fs::read(binary).unwrap(), bytes);
     assert!(!inventory.exists());
-    assert!(index.requests.lock().unwrap().is_empty());
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn upgrade_unowned_inline_pin() {
-    let fixture = UpgradeFixture::new("upgrade-unowned-inline-pin");
-    fs::remove_file(
-        fixture
-            .home
-            .join(".local/share/cortexkit/installer-manifest.json"),
-    )
-    .unwrap();
-    let index = serve_signed_index(|base| core_release_index(base, "0.17.9"));
-    for args in [&["upgrade"][..], &["upgrade", "--verbose"][..]] {
-        let command = fixture.command(&index, args);
-        let output = upgrade_terminal_output(&command);
-        assert_piped_upgrade_pin(&output, include_str!("golden/piped/upgrade-unowned.txt"));
-    }
-    assert!(index.requests.lock().unwrap().is_empty());
-}
-
-#[cfg(target_os = "linux")]
-fn upgrade_terminal_output(command: &Command) -> Output {
-    let quote =
-        |word: &std::ffi::OsStr| format!("'{}'", word.to_str().unwrap().replace('\'', "'\\''"));
-    let shell_command = std::iter::once(command.get_program())
-        .chain(command.get_args())
-        .map(quote)
-        .collect::<Vec<_>>()
-        .join(" ");
-    // util-linux script supplies a real terminal and preserves the child's exit
-    // code. Only the terminal driver's LF-to-CRLF translation is undone.
-    let mut terminal = Command::new("script");
-    terminal.args(["-qec", &shell_command, "/dev/null"]);
-    for (name, value) in command.get_envs() {
-        if let Some(value) = value {
-            terminal.env(name, value);
-        } else {
-            terminal.env_remove(name);
-        }
-    }
-    let mut output = terminal
-        .output()
-        .expect("util-linux script is required for the terminal pin");
-    output.stdout = text(&output.stdout).replace("\r\n", "\n").into_bytes();
-    output
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn upgrade_without_managed_binaries_is_not_current() {
-    for empty_inventory in [false, true] {
-        let fixture = UpgradeFixture::new("upgrade-nothing-managed");
-        let cortexkit = fixture.home.join(".local/share/cortexkit");
-        fs::remove_dir_all(cortexkit.join("bin")).unwrap();
-        let inventory = cortexkit.join("installer-manifest.json");
-        if empty_inventory {
-            fs::write(&inventory, br#"{"schema_version":1,"mutations":[]}"#).unwrap();
-        } else {
-            fs::remove_file(&inventory).unwrap();
-        }
-        let before = fs::read(&inventory).ok();
-        let index = serve_signed_index(|base| core_release_index(base, "0.17.9"));
-        for args in [
-            &["upgrade"][..],
-            &["upgrade", "--check"][..],
-            &["upgrade", "--check", "--verbose"][..],
-            &["upgrade", "--dry-run"][..],
-        ] {
-            let output = fixture.command(&index, args).output().unwrap();
-            assert_piped_upgrade_pin(
-                &output,
-                include_str!("golden/piped/upgrade-nothing-managed.txt"),
-            );
-            assert_eq!(fs::read(&inventory).ok(), before);
-        }
-        assert!(index.requests.lock().unwrap().is_empty());
-    }
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn upgrade_mixed_ownership_refuses_before_checking_or_changing_binaries() {
-    let fixture = UpgradeFixture::new("upgrade-mixed-ownership");
-    let cortexkit = fixture.home.join(".local/share/cortexkit");
-    let inventory = cortexkit.join("installer-manifest.json");
-    let mut document: Value = serde_json::from_slice(&fs::read(&inventory).unwrap()).unwrap();
-    document["mutations"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|entry| !entry["path"].as_str().unwrap().ends_with("ck-auth"));
-    fs::write(&inventory, serde_json::to_vec(&document).unwrap()).unwrap();
-    let before = fs::read(&inventory).unwrap();
-    let binary = cortexkit.join("bin/ck-auth");
-    let marker = fixture._root.path().join("unowned-was-executed");
-    let bytes = format!("#!/bin/sh\ntouch '{}'\n", marker.display());
-    write_executable(&binary, &bytes);
-    let index = serve_signed_index(|base| core_release_index(base, "0.17.9"));
-    for args in [
-        &["upgrade", "--check"][..],
-        &["upgrade"][..],
-        &["upgrade", "--verbose"][..],
-    ] {
-        let output = fixture.command(&index, args).output().unwrap();
-        assert_exit(&output, 1);
-        assert!(output.stderr.is_empty());
-        let reason = "ck upgrade manages only what ck setup installed. ck setup did not install these, so ck upgrade won't replace them:\n  ~/.local/share/cortexkit/bin/ck-auth\nMove them aside and run ck setup again. Nothing was changed.";
-        let expected = format!("{reason}\n");
-        assert_eq!(text(&output.stdout), expected);
-        assert_eq!(fs::read(&inventory).unwrap(), before);
-        assert_eq!(fs::read(&binary).unwrap(), bytes.as_bytes());
-        assert!(
-            !marker.exists(),
-            "unowned discovery must not execute the binary"
-        );
-    }
-    assert!(index.requests.lock().unwrap().is_empty());
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-fn upgrade_refuses_an_unowned_running_cli_even_when_other_binaries_are_managed() {
-    let fixture = UpgradeFixture::new("upgrade-unowned-running-cli");
-    let inventory = fixture
-        .home
-        .join(".local/share/cortexkit/installer-manifest.json");
-    let mut document: Value = serde_json::from_slice(&fs::read(&inventory).unwrap()).unwrap();
-    let cli = document["mutations"].as_array_mut().unwrap().remove(0)["path"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    fs::write(&inventory, serde_json::to_vec(&document).unwrap()).unwrap();
-    let before = fs::read(&inventory).unwrap();
-    let index = serve_signed_index(|base| core_release_index(base, "0.17.9"));
-    let output = fixture
-        .command(&index, &["upgrade", "--check"])
-        .output()
-        .unwrap();
-    assert_exit(&output, 1);
-    assert!(output.stderr.is_empty());
-    assert_eq!(text(&output.stdout), format!("ck upgrade manages only what ck setup installed. ck setup did not install these, so ck upgrade won't replace them:\n  {cli}\nMove them aside and run ck setup again. Nothing was changed.\n"));
-    assert_eq!(fs::read(&inventory).unwrap(), before);
-    assert!(index.requests.lock().unwrap().is_empty());
+    assert_eq!(*index.requests.lock().unwrap(), ["/index.json"]);
 }
 
 fn core_release_index(base: &str, version: &str) -> (Value, BTreeMap<String, Vec<u8>>) {

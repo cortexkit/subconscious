@@ -1,4 +1,0 @@
-exit: 1
-stdout:
-No CortexKit programs installed by ck setup were found. ck upgrade manages only what ck setup installed. Run ck setup to install them or take over the ones already here. Nothing was changed.
-stderr:

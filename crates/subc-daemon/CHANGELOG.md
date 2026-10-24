@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.7
+
+- Keep health-probe and slow-retry uptime-reset deadlines absolute until their timer is polled, so a delayed executor poll does not postpone recovery. Paused-clock supervision tests now wait for the running process's current select and advance from its recorded uptime origin rather than treating `Running` as a timer-readiness barrier. The readiness timeout is unchanged.
+
 ## 0.37.6
 
 - After a module exhausts its crash or health restart budget, retry it automatically after 10, 20, 40, then 60 minutes, capped at hourly retries. Each retry starts normally with a fresh restart budget. Healthy checks spanning the module's `RestartPolicy::window` reset the slow schedule. Operator start runs immediately; stop, disable, removal and daemon shutdown cancel pending retries. Rescans that retain the module retain its schedule. Timers use the daemon's monotonic clock, which pauses during sleep on macOS, so delays count awake time. `supervisor.list` includes an optional next-retry estimate for failed modules, and scheduling and starting each attempt produce INFO logs.

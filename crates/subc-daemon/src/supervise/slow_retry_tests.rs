@@ -88,13 +88,19 @@ async fn revision_daemon_initial_spawn_failure_schedules_recovery() {
 #[tokio::test(start_paused = true)]
 async fn revision_no_health_checks_reset_after_an_uninterrupted_budget_window() {
     let module = failed_module().await;
+    clock_sample(&module, "failed");
     module.update_spec_for_test(sleeping_spec()).await.unwrap();
+    clock_sample(&module, "before-600");
     tokio::time::advance(Duration::from_secs(600)).await;
+    clock_sample(&module, "after-600");
     wait_for("slow recovery", || {
         module.state().unwrap() == ModuleState::Running
     })
     .await;
-    tokio::time::advance(Duration::from_secs(3599)).await;
+    let deadline = running_window_deadline(&module).await;
+    clock_sample(&module, "ready-before-window");
+    advance_to(deadline - Duration::from_secs(1)).await;
+    clock_sample(&module, "one-second-before-deadline");
     tokio::task::yield_now().await;
     assert_eq!(
         lock_snapshot(&module.inner.snapshot)
@@ -103,7 +109,10 @@ async fn revision_no_health_checks_reset_after_an_uninterrupted_budget_window() 
             .attempt,
         1
     );
-    tokio::time::advance(Duration::from_secs(1)).await;
+    // Tokio rounds timers to milliseconds. Cross the recorded deadline rather
+    // than assuming that observing Running started the uptime window.
+    advance_to(deadline + Duration::from_millis(1)).await;
+    clock_sample(&module, "after-recorded-deadline");
     wait_for("uptime reset", || {
         lock_snapshot(&module.inner.snapshot)
             .unwrap()
@@ -112,7 +121,67 @@ async fn revision_no_health_checks_reset_after_an_uninterrupted_budget_window() 
             == 0
     })
     .await;
+    clock_sample(&module, "reset");
     module.stop().await.unwrap();
+}
+
+async fn running_window_deadline(module: &SupervisedModule) -> Instant {
+    // Running is published before macOS exec confirmation. Wait until this
+    // generation reaches its select, keeping paused time frozen during real I/O.
+    wait_for("running supervisor select", || {
+        let state = lock_snapshot(&module.inner.snapshot).unwrap();
+        state.state == ModuleState::Running
+            && state.reported_pid().is_some()
+            && state
+                .actor_select
+                .is_some_and(|select| select.generation == state.spawn_generation)
+    })
+    .await;
+    let state = lock_snapshot(&module.inner.snapshot).unwrap();
+    state.failed_retry.running_since.unwrap() + module.inner.restart_policy.window
+}
+
+async fn advance_to(deadline: Instant) {
+    tokio::time::advance(deadline.saturating_duration_since(Instant::now())).await;
+}
+
+fn clock_sample(module: &SupervisedModule, step: &str) {
+    if std::env::var_os("SUBC_SLOW_RETRY_CLOCK_TRACE").is_some() {
+        let state = lock_snapshot(&module.inner.snapshot).unwrap();
+        eprintln!("CLOCK step={step} now={:?} spawned_at_ms={:?} running_since={:?} deadline={:?} attempt={} actor_select={:?}",
+            Instant::now(), state.spawned_at_ms, state.failed_retry.running_since,
+            state.failed_retry.running_since.map(|since| since + module.inner.restart_policy.window),
+            state.failed_retry.attempt, state.actor_select);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn delayed_timer_poll_cannot_postpone_uptime_reset() {
+    let running_since = Instant::now();
+    let window = Duration::from_secs(30);
+    let mut retry = FailedRetry {
+        attempt: 1,
+        running_since: Some(running_since),
+        ..FailedRetry::default()
+    };
+    let deadline = retry.uptime_reset_at(true, window).unwrap();
+    let timer = supervisor_sleep(Some(deadline));
+    tokio::pin!(timer);
+    eprintln!(
+        "CLOCK delayed-poll created now={:?} running_since={running_since:?} deadline={deadline:?}",
+        Instant::now()
+    );
+    // Make the first poll unambiguously overdue even with millisecond timers.
+    tokio::time::advance(window + Duration::from_millis(1)).await;
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    let observed = std::future::Future::poll(timer.as_mut(), &mut context);
+    eprintln!("CLOCK delayed-poll polled now={:?} running_since={running_since:?} deadline={deadline:?} poll={observed:?}", Instant::now());
+    assert!(
+        observed.is_ready(),
+        "an elapsed uptime deadline must be ready on its first poll"
+    );
+    retry.uptime_reset_at(true, window);
+    assert_eq!(retry.attempt, 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -120,6 +189,7 @@ async fn operator_start_clears_the_slow_retry_timer_and_starts_now() {
     let module = failed_module().await;
     module.update_spec_for_test(sleeping_spec()).await.unwrap();
     assert!(module.set_enabled(true).await.unwrap());
+    let _ = running_window_deadline(&module).await;
     let status = module.status().unwrap();
     assert_eq!(status.state, ModuleState::Running);
     assert_eq!(module.next_retry_at_ms().unwrap(), None);
@@ -623,7 +693,8 @@ async fn configured_health_does_not_reset_from_uptime_alone() {
         module.state().unwrap() == ModuleState::Running
     })
     .await;
-    tokio::time::advance(Duration::from_secs(3600)).await;
+    let deadline = running_window_deadline(&module).await;
+    advance_to(deadline + Duration::from_millis(1)).await;
     tokio::task::yield_now().await;
     assert_eq!(
         lock_snapshot(&module.inner.snapshot)

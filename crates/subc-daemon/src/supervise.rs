@@ -4652,12 +4652,11 @@ impl HealthProbeRuntime {
         }
     }
 
-    fn wake_after(&self) -> Option<Duration> {
+    fn wake_at(&self) -> Option<Instant> {
         if !self.advertised {
             return None;
         }
         self.next_probe_at
-            .map(|next| next.saturating_duration_since(Instant::now()))
     }
 
     fn due(&self) -> bool {
@@ -6853,20 +6852,13 @@ async fn supervise_loop(
                     .failed_retry
                     .uptime_reset_at(no_checks, runtime.restart_policy.window)
             });
-            let wake_after = match (health_probe.wake_after(), uptime_reset) {
-                (probe, Some(reset)) => Some(
-                    probe
-                        .unwrap_or(Duration::MAX)
-                        .min(reset.saturating_duration_since(Instant::now())),
-                ),
+            let wake_at = match (health_probe.wake_at(), uptime_reset) {
+                (probe, Some(reset)) => Some(probe.map_or(reset, |probe| probe.min(reset))),
                 (probe, None) => probe,
             };
-            let probe_sleep = async move {
-                match wake_after {
-                    Some(delay) => sleep(delay).await,
-                    None => std::future::pending().await,
-                }
-            };
+            #[cfg(test)]
+            let wake_after = wake_at.map(|at| at.saturating_duration_since(Instant::now()));
+            let probe_sleep = supervisor_sleep(wake_at);
             tokio::pin!(probe_sleep);
             // A `protocol: "none"` child (a plain process that never registers
             // over the subc wire, such as nats-server) with no HTTP health
@@ -7192,6 +7184,15 @@ async fn supervise_loop(
                 return;
             }
         }
+    }
+}
+
+// Preserve the deadline until the future is polled. Starting a relative sleep
+// after the executor yields would restart part of the countdown.
+async fn supervisor_sleep(wake_at: Option<Instant>) {
+    match wake_at {
+        Some(deadline) => sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 

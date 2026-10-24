@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     error::Error,
     fmt,
     future::Future,
@@ -2983,6 +2983,7 @@ struct Inner {
     route_by_channel: HashMap<u16, RouteKey>,
     one_shot_routes: HashMap<u16, RouteState>,
     route_epochs: HashMap<u16, RouteHandle>,
+    retired_routes: HashSet<RouteHandle>,
     route_modules: HashMap<u16, String>,
     route_end_reasons: HashMap<u16, (RouteEndReason, bool)>,
     legacy_channel_reasons: HashMap<u16, RouteCloseReason>,
@@ -3061,11 +3062,46 @@ impl Inner {
     }
 
     fn remove_route(&mut self, key: &RouteKey) -> Option<RouteState> {
+        let route = self.evict_route(key)?;
+        release_reverse_request_registry(route.handle);
+        Some(route)
+    }
+
+    fn evict_route(&mut self, key: &RouteKey) -> Option<RouteState> {
         let route = self.routes.remove(key)?;
         let indexed = self.route_by_channel.remove(&route.handle.channel);
         debug_assert_eq!(indexed.as_ref(), Some(key));
-        release_reverse_request_registry(route.handle);
         Some(route)
+    }
+
+    fn reap_retired_route(&mut self, handle: RouteHandle) {
+        // The pending map is authoritative, including subscriptions and calls
+        // dropped by their owner. Scan only on retired routes instead of
+        // maintaining a second count on every registration/removal path.
+        if !self.retired_routes.contains(&handle)
+            || self.pending.keys().any(|key| {
+                key.generation == handle.connection_token()
+                    && key.channel == handle.channel
+                    && key.epoch == handle.epoch
+            })
+        {
+            return;
+        }
+        let handle = self
+            .retired_routes
+            .take(&handle)
+            .expect("retired route exists");
+        if self.route_epochs.get(&handle.channel) == Some(&handle) {
+            self.route_epochs.remove(&handle.channel);
+            self.push_event_receivers.remove(&handle);
+        }
+        release_reverse_request_registry(handle);
+    }
+
+    fn remove_pending(&mut self, key: &PendingKey) -> Option<PendingEntry> {
+        let entry = self.pending.remove(key);
+        self.reap_retired_route(RouteHandle::new(key.channel, key.epoch, key.generation));
+        entry
     }
 
     fn remove_route_by_handle(&mut self, handle: RouteHandle) -> Option<RouteState> {
@@ -3092,6 +3128,9 @@ impl Inner {
     }
 
     fn drain_routes(&mut self) -> Vec<RouteState> {
+        for handle in self.retired_routes.drain() {
+            release_reverse_request_registry(handle);
+        }
         self.route_by_channel.clear();
         let routes = self
             .routes
@@ -3128,6 +3167,7 @@ impl Shared {
                 route_by_channel: HashMap::new(),
                 one_shot_routes: HashMap::new(),
                 route_epochs: HashMap::new(),
+                retired_routes: HashSet::new(),
                 route_modules: HashMap::new(),
                 route_end_reasons: HashMap::new(),
                 legacy_channel_reasons: HashMap::new(),
@@ -3871,6 +3911,7 @@ impl Shared {
                 if expected.connection_token() != generation
                     || !route_pair_matches
                     || inner.route_epochs.get(&expected.channel) != Some(&expected)
+                    || inner.retired_routes.contains(&expected)
                 {
                     return Err(CallError::StaleRouteHandle(expected));
                 }
@@ -3916,7 +3957,9 @@ impl Shared {
                 ));
             }
             if let Some(expected) = expected_handle {
-                if inner.route_epochs.get(&expected.channel) != Some(&expected) {
+                if inner.route_epochs.get(&expected.channel) != Some(&expected)
+                    || inner.retired_routes.contains(&expected)
+                {
                     return Err(CallError::StaleRouteHandle(expected));
                 }
             }
@@ -4145,6 +4188,7 @@ impl Shared {
                     || expected.channel != channel
                     || expected.epoch != epoch
                     || inner.route_epochs.get(&channel) != Some(&expected)
+                    || inner.retired_routes.contains(&expected)
                 {
                     return Err(CallError::StaleRouteHandle(expected));
                 }
@@ -4198,7 +4242,9 @@ impl Shared {
                 ));
             }
             if let Some(expected) = expected_handle {
-                if inner.route_epochs.get(&expected.channel) != Some(&expected) {
+                if inner.route_epochs.get(&expected.channel) != Some(&expected)
+                    || inner.retired_routes.contains(&expected)
+                {
                     return Err(CallError::StaleRouteHandle(expected));
                 }
             }
@@ -4255,6 +4301,7 @@ impl Shared {
         if let Some(entry) = entry {
             entry.settle_subscription_result(Ok(()));
             self.send_cancel(handle, key.corr, priority);
+            self.lock_inner().reap_retired_route(handle);
         }
         Ok(())
     }
@@ -4303,6 +4350,11 @@ impl Shared {
                 key.corr,
                 priority,
             );
+            self.lock_inner().reap_retired_route(RouteHandle::new(
+                key.channel,
+                key.epoch,
+                key.generation,
+            ));
         }
     }
 
@@ -4444,7 +4496,7 @@ impl Shared {
     }
 
     fn settle_pending(self: &Arc<Self>, key: PendingKey, terminal: PendingTerminal) {
-        let entry = self.lock_inner().pending.remove(&key);
+        let entry = self.lock_inner().remove_pending(&key);
         let Some(entry) = entry else {
             return;
         };
@@ -4628,12 +4680,14 @@ impl Shared {
             let mut inner = self.lock_inner();
             match inner.routes.get(key) {
                 Some(route) if expected_handle.is_none_or(|expected| expected == route.handle) => {
-                    let removed = inner.remove_route(key);
+                    let removed = inner.evict_route(key);
                     if let Some(route) = &removed {
-                        if inner.route_epochs.get(&route.handle.channel) == Some(&route.handle) {
-                            inner.route_epochs.remove(&route.handle.channel);
-                        }
-                        inner.push_event_receivers.remove(&route.handle);
+                        // Eviction stops new calls, but siblings may already be
+                        // executing or awaiting their own refusal. Keep ingress
+                        // until those pending entries settle; never resend them
+                        // merely because another call was refused.
+                        inner.retired_routes.insert(route.handle);
+                        inner.reap_retired_route(route.handle);
                     }
                     removed
                 }
@@ -4733,10 +4787,11 @@ impl Shared {
 
     fn uninstall_route_handle(&self, handle: RouteHandle) {
         let mut inner = self.lock_inner();
+        inner.retired_routes.remove(&handle);
         if inner.route_epochs.get(&handle.channel) == Some(&handle) {
-            inner.route_epochs.remove(&handle.channel);
+            let installed = inner.route_epochs.remove(&handle.channel).unwrap();
             inner.push_event_receivers.remove(&handle);
-            release_reverse_request_registry(handle);
+            release_reverse_request_registry(installed);
         }
     }
 
@@ -5460,8 +5515,7 @@ impl PendingRegistration {
         self.active = false;
         self.shared
             .lock_inner()
-            .pending
-            .remove(&self.key)
+            .remove_pending(&self.key)
             .map(|entry| entry.accepted)
     }
 
@@ -5960,8 +6014,10 @@ impl Shared {
             if inner.route_epochs.get(&handle.channel) != Some(&handle) {
                 return;
             }
-            inner.route_epochs.remove(&handle.channel);
+            let installed = inner.route_epochs.remove(&handle.channel).unwrap();
+            inner.retired_routes.remove(&handle);
             inner.push_event_receivers.remove(&handle);
+            release_reverse_request_registry(installed);
             inner
                 .remove_route_by_handle(handle)
                 .into_iter()
@@ -7488,6 +7544,335 @@ mod tests {
 
     fn reloading() -> ErrorBody {
         ErrorBody::new(error_codes::MODULE_RELOADING, "module is reloading")
+    }
+
+    fn drain_call<'a>(
+        consumer: &'a SubcConsumer,
+        body: &'static [u8],
+    ) -> impl Future<Output = Result<Vec<u8>, CallError>> + 'a {
+        consumer.call(
+            restart_target("plexus"),
+            restart_identity(),
+            body.to_vec(),
+            CallOptions {
+                timeout: Duration::from_secs(5),
+                ..CallOptions::default()
+            },
+        )
+    }
+
+    async fn refuse_during_drain(shared: &Arc<Shared>, request: &Frame) {
+        let frame = Frame::build(
+            FrameType::Error,
+            request.header.flags,
+            request.header.channel,
+            request.header.epoch,
+            request.header.corr,
+            serde_json::to_vec(&reloading()).unwrap(),
+        )
+        .unwrap();
+        assert!(dispatch_frame(shared, 1, frame).await);
+    }
+
+    async fn reply_to_drain_call(shared: &Arc<Shared>, request: Frame) {
+        assert_eq!(request.header.ty, FrameType::Request);
+        assert!(
+            dispatch_frame(
+                shared,
+                1,
+                response_frame(
+                    request.header.channel,
+                    request.header.epoch,
+                    request.header.corr,
+                    request.body,
+                ),
+            )
+            .await
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_route_drain_delivers_both_refusals_and_resends_both_calls() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
+        let (_, old) = open_answered(
+            &shared,
+            &consumer,
+            &mut receiver,
+            None,
+            41,
+            "initial shared route",
+        )
+        .await;
+        let mut seed = Box::pin(drain_call(&consumer, b"seed"));
+        assert_pending(seed.as_mut()).await;
+        reply_to_drain_call(&shared, receiver.recv().await.unwrap().frame).await;
+        assert_eq!(seed.await.unwrap(), b"seed");
+        shared.control_push(
+            &serde_json::to_vec(&serde_json::json!({
+                "op": "route.closing", "module_id": "plexus",
+                "channels": [old.channel], "terminal": false
+            }))
+            .unwrap(),
+        );
+        let mut first = Box::pin(drain_call(&consumer, b"first"));
+        let mut second = Box::pin(drain_call(&consumer, b"second"));
+        assert_pending(first.as_mut()).await;
+        assert_pending(second.as_mut()).await;
+        let first_command = receiver.recv().await.unwrap();
+        let second_command = receiver.recv().await.unwrap();
+        // Observing a frame at the daemon means the real writer accepted it.
+        assert!(shared.mark_pending_accepted(first_command.pending.unwrap()));
+        assert!(shared.mark_pending_accepted(second_command.pending.unwrap()));
+        let first_request = first_command.frame;
+        let second_request = second_command.frame;
+        assert_eq!(first_request.header.channel, old.channel);
+        assert_eq!(second_request.header.channel, old.channel);
+
+        refuse_during_drain(&shared, &first_request).await;
+        assert_pending(first.as_mut()).await;
+        // Holding route.open unanswered is the barrier: the first call has
+        // invalidated the old route before its sibling's refusal arrives.
+        let (open_corr, _) = next_route_open(&mut receiver, "replacement route barrier").await;
+        refuse_during_drain(&shared, &second_request).await;
+        for (ty, channel, epoch, corr) in [
+            (FrameType::Goodbye, old.channel, old.epoch, 0),
+            (FrameType::Ping, 0, 0, 991),
+        ] {
+            let frame = Frame::build(
+                ty,
+                Flags::new(false, Priority::Interactive, false),
+                channel,
+                epoch,
+                corr,
+                Vec::new(),
+            )
+            .unwrap();
+            assert!(dispatch_frame(&shared, 1, frame).await);
+        }
+        // The same dispatcher used by the socket reader emits Pong only after
+        // processing the second refusal and the old-route GOODBYE.
+        let pong = receiver.recv().await.unwrap().frame;
+        assert_eq!(pong.header.ty, FrameType::Pong);
+        assert_eq!(pong.header.corr, 991);
+        assert_pending(second.as_mut()).await;
+        assert!(dispatch_frame(&shared, 1, route_open_answer(open_corr, 42, None)).await);
+        assert_pending(first.as_mut()).await;
+        assert_pending(second.as_mut()).await;
+        while let Ok(command) = receiver.try_recv() {
+            assert_eq!(command.frame.header.channel, 42);
+            reply_to_drain_call(&shared, command.frame).await;
+        }
+        assert_eq!(first.await.expect("first call resends"), b"first");
+        assert_eq!(
+            second.await.expect("second refusal must not time out"),
+            b"second"
+        );
+        assert!(shared.lock_inner().pending.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shared_route_drain_preserves_unrefused_reply_without_resending() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
+        let (_, old) = open_answered(
+            &shared,
+            &consumer,
+            &mut receiver,
+            None,
+            41,
+            "initial shared route",
+        )
+        .await;
+        let mut first = Box::pin(drain_call(&consumer, b"refused"));
+        let mut second = Box::pin(drain_call(&consumer, b"executing"));
+        assert_pending(first.as_mut()).await;
+        assert_pending(second.as_mut()).await;
+        let first_request = receiver.recv().await.unwrap().frame;
+        let second_request = receiver.recv().await.unwrap().frame;
+        let executing_corr = second_request.header.corr;
+        assert_eq!(second_request.header.channel, old.channel);
+        let mut executing_requests = 1;
+
+        refuse_during_drain(&shared, &first_request).await;
+        assert_pending(first.as_mut()).await;
+        let (open_corr, _) = next_route_open(&mut receiver, "replacement route barrier").await;
+        assert_pending(second.as_mut()).await;
+        assert!(dispatch_frame(&shared, 1, route_open_answer(open_corr, 42, None)).await);
+        assert_pending(first.as_mut()).await;
+        assert_pending(second.as_mut()).await;
+        while let Ok(command) = receiver.try_recv() {
+            assert_eq!(command.frame.header.ty, FrameType::Request);
+            // Managed resends allocate a new corr; count the logical request's
+            // body as well so an unsafe resend cannot hide behind a new corr.
+            if command.frame.header.corr == executing_corr || command.frame.body == b"executing" {
+                executing_requests += 1;
+            }
+            reply_to_drain_call(&shared, command.frame).await;
+        }
+        reply_to_drain_call(&shared, second_request).await;
+        assert_eq!(first.await.expect("refused call resends"), b"refused");
+        assert_eq!(
+            second.await.expect("real old-route reply arrives"),
+            b"executing"
+        );
+        assert_eq!(executing_requests, 1, "unrefused call must never resend");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalidated_route_ingress_is_uninstalled_after_last_pending_settles() {
+        let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
+        let (_, old) = open_answered(
+            &shared,
+            &consumer,
+            &mut receiver,
+            None,
+            41,
+            "initial shared route",
+        )
+        .await;
+        let mut first = Box::pin(drain_call(&consumer, b"first"));
+        let mut second = Box::pin(drain_call(&consumer, b"second"));
+        assert_pending(first.as_mut()).await;
+        assert_pending(second.as_mut()).await;
+        let first_request = receiver.recv().await.unwrap().frame;
+        let second_request = receiver.recv().await.unwrap().frame;
+        refuse_during_drain(&shared, &first_request).await;
+        assert_pending(first.as_mut()).await;
+        let _ = next_route_open(&mut receiver, "replacement route barrier").await;
+        assert_eq!(shared.ingress_handle(1, old.channel, old.epoch), Some(old));
+        assert!(route_reverse_request_registry(old.reverse_request_registry_id()).is_ok());
+        reply_to_drain_call(&shared, second_request).await;
+        assert_eq!(second.await.unwrap(), b"second");
+        assert_eq!(shared.ingress_handle(1, old.channel, old.epoch), None);
+        assert!(shared.lock_inner().retired_routes.is_empty());
+        assert!(route_reverse_request_registry(old.reverse_request_registry_id()).is_err());
+        drop(first);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalidated_route_ingress_cleans_up_on_drop_deadline_goodbye_and_disconnect() {
+        for ending in ["drop", "deadline", "goodbye", "disconnect"] {
+            let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
+            let (_, old) = open_answered(
+                &shared,
+                &consumer,
+                &mut receiver,
+                None,
+                41,
+                "initial shared route",
+            )
+            .await;
+            let mut first = Box::pin(drain_call(&consumer, b"refused"));
+            let mut second = Box::pin(drain_call(&consumer, b"executing"));
+            assert_pending(first.as_mut()).await;
+            assert_pending(second.as_mut()).await;
+            let first_request = receiver.recv().await.unwrap().frame;
+            let second_command = receiver.recv().await.unwrap();
+            assert!(shared.mark_pending_accepted(second_command.pending.unwrap()));
+            refuse_during_drain(&shared, &first_request).await;
+            assert_pending(first.as_mut()).await;
+            let _ = next_route_open(&mut receiver, "replacement route barrier").await;
+            match ending {
+                "drop" => drop(second),
+                "deadline" => {
+                    assert_eq!(
+                        second.await.unwrap_err().outcome_cause(),
+                        Some(OutcomeUnknownCause::Deadline)
+                    );
+                }
+                "goodbye" => {
+                    let frame = Frame::build(
+                        FrameType::Goodbye,
+                        Flags::new(false, Priority::Interactive, false),
+                        old.channel,
+                        old.epoch,
+                        0,
+                        Vec::new(),
+                    )
+                    .unwrap();
+                    assert!(dispatch_frame(&shared, 1, frame).await);
+                    assert_eq!(
+                        second.await.unwrap_err().outcome_cause(),
+                        Some(OutcomeUnknownCause::RouteEnded)
+                    );
+                }
+                "disconnect" => {
+                    shared.handle_generation_drop(1, "test disconnect".into());
+                    assert_eq!(
+                        second.await.unwrap_err().outcome_cause(),
+                        Some(OutcomeUnknownCause::ConnectionFailed)
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                shared.ingress_handle(1, old.channel, old.epoch),
+                None,
+                "{ending}"
+            );
+            assert!(shared.lock_inner().retired_routes.is_empty(), "{ending}");
+            assert!(
+                route_reverse_request_registry(old.reverse_request_registry_id()).is_err(),
+                "{ending}"
+            );
+            drop(first);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalidated_route_subscription_cancel_and_overflow_uninstall_ingress() {
+        for overflow in [false, true] {
+            let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
+            let (_, old) = open_answered(
+                &shared,
+                &consumer,
+                &mut receiver,
+                None,
+                41,
+                "initial shared route",
+            )
+            .await;
+            let mut subscription = consumer
+                .subscribe_route(&old, b"watch".to_vec(), SubscribeOptions::default())
+                .await
+                .unwrap();
+            let request = receiver.recv().await.unwrap().frame;
+            let mut call = Box::pin(drain_call(&consumer, b"refused"));
+            assert_pending(call.as_mut()).await;
+            let refused = receiver.recv().await.unwrap().frame;
+            refuse_during_drain(&shared, &refused).await;
+            assert_pending(call.as_mut()).await;
+            let _ = next_route_open(&mut receiver, "replacement route barrier").await;
+            assert_eq!(shared.ingress_handle(1, old.channel, old.epoch), Some(old));
+            assert!(matches!(
+                consumer
+                    .request(&old, b"new".to_vec(), CallOptions::default())
+                    .await,
+                Err(CallError::StaleRouteHandle(_))
+            ));
+            if overflow {
+                for _ in 0..=DEFAULT_SUBSCRIPTION_EVENT_BUFFER {
+                    assert!(
+                        dispatch_frame(
+                            &shared,
+                            1,
+                            watch_terminal(&request, FrameType::StreamData, vec![1])
+                        )
+                        .await
+                    );
+                }
+                assert_eq!(subscription.ended().await, SubscriptionEnd::Backpressure);
+            } else {
+                subscription.unsubscribe().unwrap();
+                assert_eq!(subscription.ended().await, SubscriptionEnd::Cancelled);
+            }
+            assert_eq!(
+                receiver.recv().await.unwrap().frame.header.ty,
+                FrameType::Cancel
+            );
+            assert_eq!(shared.ingress_handle(1, old.channel, old.epoch), None);
+            assert!(shared.lock_inner().retired_routes.is_empty());
+            drop(call);
+        }
     }
 
     #[tokio::test(start_paused = true)]

@@ -59,6 +59,12 @@ mod swap;
 #[path = "supervise_activity.rs"]
 mod activity;
 
+mod slow_retry;
+use slow_retry::{FailedRetry, FailureContext};
+
+#[cfg(all(test, unix))]
+mod slow_retry_tests;
+
 /// Command-line flag used by supervised modules to find subc.
 ///
 /// subc launches module-mode children as `<module> --subc <connection-file-path>`.
@@ -1226,6 +1232,7 @@ struct ActorSelectCheckpoint {
 
 #[derive(Debug, Clone, PartialEq)]
 struct SupervisorSnapshot {
+    failed_retry: FailedRetry,
     exec_outcome: Option<Arc<crate::activity::ExecOutcome>>,
     #[cfg(windows)]
     pipe_consumed: Option<Arc<OnceLock<()>>>,
@@ -1379,6 +1386,7 @@ impl SupervisorSnapshot {
 
     fn new(state: ModuleState, enabled: bool) -> Self {
         Self {
+            failed_retry: FailedRetry::default(),
             exec_outcome: None,
             #[cfg(test)]
             actor_turns: 0,
@@ -1909,12 +1917,15 @@ enum RespawnKind {
 struct PendingRespawn {
     deadline: Instant,
     kind: RespawnKind,
+    daemon_initiated: bool,
 }
 
 type ReloadReply = oneshot::Sender<Result<(), SuperviseError>>;
 
 #[derive(Debug, Clone)]
 struct SupervisorRuntimeConfig {
+    /// Retained across an operation's deferred backoff, until its child starts.
+    recovery_is_daemon: bool,
     start_requester: Option<Principal>,
     pending_activity_restart: bool,
     provenance_probe: ExecutableIdentityProbe,
@@ -1955,6 +1966,15 @@ struct SupervisorRuntimeConfig {
     test_seed_stale_facts_before_enable_spawn: bool,
     #[cfg(test)]
     test_reload_exit_record_gate: Option<Arc<ReloadExitRecordGate>>,
+}
+
+impl SupervisorRuntimeConfig {
+    fn failure_context(&self, daemon_initiated: bool) -> FailureContext {
+        FailureContext {
+            daemon_initiated,
+            shutdown: self.child_roster.shutdown_flag(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3227,7 +3247,8 @@ impl Supervisor {
             drain_timeout_ms,
             restart_policy,
         )?;
-        self.start_registered_configured(registered, requester)
+        let daemon_initiated = requester.is_none();
+        self.start_registered_configured(registered, requester, daemon_initiated)
     }
 
     /// Record a configured module as starting or disabled, without launching a
@@ -3287,6 +3308,7 @@ impl Supervisor {
         &self,
         registered: RegisteredConfiguredModule,
         requester: Option<Principal>,
+        daemon_initiated: bool,
     ) -> Result<SupervisedModule, SuperviseError> {
         let RegisteredConfiguredModule {
             spec,
@@ -3295,6 +3317,7 @@ impl Supervisor {
             commands,
         } = registered;
         runtime.start_requester = requester;
+        runtime.recovery_is_daemon = daemon_initiated;
         let snapshot = &module.inner.snapshot;
         let should_spawn = {
             let state = lock_snapshot(snapshot)?;
@@ -3338,10 +3361,12 @@ impl Supervisor {
                             "configured module failed to spawn; marking failed and continuing"
                         );
                     }
-                    update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                        state.state = ModuleState::Failed;
-                        clear_current_process_facts(state);
-                    })?;
+                    fail_snapshot(
+                        snapshot,
+                        Some(&spec.module_id),
+                        None,
+                        &runtime.failure_context(daemon_initiated),
+                    );
                     None
                 }
             }
@@ -3355,6 +3380,7 @@ impl Supervisor {
     fn runtime_config(&self) -> SupervisorRuntimeConfig {
         let effective_drain_timeout = Arc::new(Mutex::new(self.drain_timeout));
         SupervisorRuntimeConfig {
+            recovery_is_daemon: true,
             start_requester: None,
             pending_activity_restart: false,
             provenance_probe: self.provenance_probe.clone(),
@@ -3606,6 +3632,25 @@ impl SupervisedModule {
             .map(|(status, _)| status)
     }
 
+    pub(crate) fn next_retry_at_ms(&self) -> Result<Option<u64>, SuperviseError> {
+        let state = lock_snapshot(&self.inner.snapshot)?;
+        Ok(state
+            .failed_retry
+            .pending
+            .filter(|_| state.state == ModuleState::Failed && state.enabled)
+            .map(|retry| {
+                unix_ms_now().saturating_add(
+                    u64::try_from(
+                        retry
+                            .deadline
+                            .saturating_duration_since(Instant::now())
+                            .as_millis(),
+                    )
+                    .unwrap_or(u64::MAX),
+                )
+            }))
+    }
+
     pub(crate) fn record_deliberate_severance(
         &self,
         identity: ProcessIdentity,
@@ -3848,8 +3893,17 @@ impl SupervisedModule {
         requester: Option<Principal>,
     ) -> Result<(), SuperviseError> {
         match self.state()? {
-            ModuleState::Stopped | ModuleState::Failed => return Ok(()),
-            ModuleState::Starting
+            ModuleState::Stopped => return Ok(()),
+            ModuleState::Failed
+                if lock_snapshot(&self.inner.snapshot)?
+                    .failed_retry
+                    .pending
+                    .is_none() =>
+            {
+                return Ok(())
+            }
+            ModuleState::Failed
+            | ModuleState::Starting
             | ModuleState::Running
             | ModuleState::Unresponsive
             | ModuleState::Restarting
@@ -3882,8 +3936,17 @@ impl SupervisedModule {
         requester: Option<Principal>,
     ) -> Result<(), SuperviseError> {
         match self.state()? {
-            ModuleState::Stopped | ModuleState::Failed => return Ok(()),
-            ModuleState::Starting
+            ModuleState::Stopped => return Ok(()),
+            ModuleState::Failed
+                if lock_snapshot(&self.inner.snapshot)?
+                    .failed_retry
+                    .pending
+                    .is_none() =>
+            {
+                return Ok(())
+            }
+            ModuleState::Failed
+            | ModuleState::Starting
             | ModuleState::Running
             | ModuleState::Unresponsive
             | ModuleState::Restarting
@@ -5168,6 +5231,10 @@ async fn handle_health_report(
         state.health.detail = detail.clone();
         state.health.metrics = metrics.clone();
         state.health.consecutive_failures = 0;
+        state.failed_retry.observe_health(
+            report.status == HealthStatus::Ok,
+            runtime.restart_policy.window,
+        );
     });
 
     let action = match report.status {
@@ -5209,6 +5276,9 @@ async fn handle_health_probe_failure(
     // tell which one is proof of anything.
     let detail = format!("[{}] {err}", err.label());
     let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state
+            .failed_retry
+            .observe_health(false, runtime.restart_policy.window);
         // A failed wire probe invalidates the last report, even before the
         // restart threshold. HTTP probes already mark failures as Failing.
         if state.spawned_protocol.unwrap_or(spec.protocol) == ModuleProtocol::Subc {
@@ -5377,7 +5447,7 @@ async fn health_restart_child(
         update_snapshot(snapshot, Some(&spec.module_id), |state| {
             state.drain_disposition_detail = Some(runtime.restart_policy.budget_exhausted_detail());
         })?;
-        drain_optional_child(
+        let result = drain_optional_child(
             &spec.module_id,
             spec.protocol,
             stop_notice,
@@ -5390,8 +5460,15 @@ async fn health_restart_child(
             runtime.drain_timeout,
             ModuleState::Failed,
             Some(true),
+            &runtime.failure_context(true),
         )
-        .await?;
+        .await;
+        update_snapshot(snapshot, Some(&spec.module_id), |state| {
+            if state.state == ModuleState::Failed && !runtime.child_roster.is_closed() {
+                state.failed_retry.schedule(&spec.module_id);
+            }
+        })?;
+        result?;
         process_liveness.untrack_if_current(&spec.module_id, snapshot);
         return Ok(());
     }
@@ -5437,6 +5514,7 @@ async fn health_restart_child(
         runtime.drain_timeout,
         ModuleState::Restarting,
         Some(true),
+        &runtime.failure_context(true),
     )
     .await?;
     schedule_respawn(
@@ -5445,6 +5523,7 @@ async fn health_restart_child(
         &spec.module_id,
         schedule.delay,
         RespawnKind::Spawn,
+        true,
     )
 }
 
@@ -5468,6 +5547,7 @@ fn schedule_respawn(
     module_id: &str,
     delay: Duration,
     kind: RespawnKind,
+    daemon_initiated: bool,
 ) -> Result<(), SuperviseError> {
     cancel_deferred_reload(runtime, module_id, "respawn superseded by another restart");
     update_snapshot(snapshot, Some(module_id), |state| {
@@ -5479,6 +5559,7 @@ fn schedule_respawn(
         .unwrap_or_else(|p| p.into_inner()) = Some(PendingRespawn {
         deadline: Instant::now() + delay,
         kind,
+        daemon_initiated,
     });
     Ok(())
 }
@@ -5855,6 +5936,7 @@ mod tests {
             &snapshot,
             &mut child,
             true,
+            &runtime.failure_context(false),
         )
         .await;
 
@@ -5891,7 +5973,8 @@ mod tests {
             &supervisor.process_liveness,
             &snapshot,
             &mut child,
-            true
+            true,
+            &runtime.failure_context(false),
         )
         .await
         .unwrap());
@@ -5904,7 +5987,8 @@ mod tests {
             &supervisor.process_liveness,
             &snapshot,
             &mut child,
-            true
+            true,
+            &runtime.failure_context(false),
         )
         .await
         .unwrap());
@@ -6035,6 +6119,7 @@ mod tests {
                 signal: None,
                 at_ms: unix_ms_now(),
             },
+            true,
         )
         .await;
         assert!(
@@ -6684,6 +6769,7 @@ async fn supervise_loop(
             .unwrap_or_else(|p| p.into_inner())
             .take()
         {
+            runtime.recovery_is_daemon = scheduled.daemon_initiated;
             pending_respawn = Some(scheduled);
         }
         if pending_respawn.is_some() && (child.is_some() || !respawn_still_pending(&snapshot)) {
@@ -6703,6 +6789,7 @@ async fn supervise_loop(
                 &spec.module_id,
                 "respawn cancelled before a replacement was spawned",
             );
+            let mut stranded = false;
             let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| {
                 state.respawn_pending = false;
                 state.coalesced_restart_pending = false;
@@ -6715,10 +6802,17 @@ async fn supervise_loop(
                 ) {
                     error!(module_id = %spec.module_id, state = ?state.state,
                         "supervision operation ended without a child or pending respawn; marking failed so start can retry");
-                    state.state = ModuleState::Failed;
-                    clear_current_process_facts(state);
+                    stranded = true;
                 }
             });
+            if stranded {
+                fail_snapshot(
+                    &snapshot,
+                    Some(&spec.module_id),
+                    None,
+                    &runtime.failure_context(runtime.recovery_is_daemon),
+                );
+            }
         }
         if let Some(command) = requeued.pop_front() {
             if !handle_supervisor_command(
@@ -6745,12 +6839,28 @@ async fn supervise_loop(
             continue;
         }
         if child.is_some() {
+            runtime.recovery_is_daemon = true;
             #[cfg(test)]
             {
                 lock_snapshot(&snapshot).unwrap().actor_turns += 1;
             }
             health_probe.refresh_registration(&spec, &runtime, &registry, &snapshot);
-            let wake_after = health_probe.wake_after();
+            let no_checks = runtime.health.http.is_none()
+                && (running_protocol(&spec, &snapshot) == ModuleProtocol::None
+                    || (health_probe.registered_connection.is_some() && !health_probe.advertised));
+            let uptime_reset = lock_snapshot(&snapshot).ok().and_then(|mut state| {
+                state
+                    .failed_retry
+                    .uptime_reset_at(no_checks, runtime.restart_policy.window)
+            });
+            let wake_after = match (health_probe.wake_after(), uptime_reset) {
+                (probe, Some(reset)) => Some(
+                    probe
+                        .unwrap_or(Duration::MAX)
+                        .min(reset.saturating_duration_since(Instant::now())),
+                ),
+                (probe, None) => probe,
+            };
             let probe_sleep = async move {
                 match wake_after {
                     Some(delay) => sleep(delay).await,
@@ -6781,6 +6891,9 @@ async fn supervise_loop(
             let active_child = child.as_mut().expect("child checked above");
             tokio::select! {
                 wait_result = active_child.wait() => {
+                    if let Ok(mut state) = lock_snapshot(&snapshot) {
+                        state.failed_retry.uptime_reset_at(no_checks, runtime.restart_policy.window);
+                    }
                     #[cfg(test)]
                     { lock_snapshot(&snapshot).unwrap().actor_select = None; }
                     // Every arm below that gives up on the CHILD must keep the
@@ -6801,6 +6914,7 @@ async fn supervise_loop(
                                 &runtime.terminal_ring,
                                 &runtime.spawn_events,
                                 format!("failed to wait for supervised module: {err}"),
+                            &runtime.failure_context(true),
                             );
                             untrack_if_registration_released(
                                 &process_liveness,
@@ -6824,6 +6938,7 @@ async fn supervise_loop(
                         &runtime.spawn_events,
                         &runtime.child_roster,
                         exit_report,
+                        true,
                     ).await;
                     runtime.start_requester = None;
                     runtime.pending_activity_restart = false;
@@ -6853,7 +6968,7 @@ async fn supervise_loop(
                             // arrives during the backoff must cancel the pending
                             // respawn instead of waiting for it to spawn first.
                             child = None;
-                            pending_respawn = Some(PendingRespawn { deadline: Instant::now() + delay, kind: RespawnKind::Spawn });
+                            pending_respawn = Some(PendingRespawn { deadline: Instant::now() + delay, kind: RespawnKind::Spawn, daemon_initiated: true });
                              let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = true);
                         }
                     }
@@ -6936,8 +7051,8 @@ async fn supervise_loop(
                         runtime.forwarding.as_deref(),
                         &snapshot,
                         &spec.module_id,
+                        &runtime.failure_context(runtime.recovery_is_daemon),
                     ).await {
-                        fail_snapshot(&snapshot, Some(&spec.module_id), None);
                         error!(module_id = %spec.module_id, error = %err, "registration did not release before restart");
                         continue;
                     }
@@ -6963,7 +7078,7 @@ async fn supervise_loop(
                             debug!(module_id = %spec.module_id, "supervised module restarted after crash");
                         }
                         Err(err) => {
-                            fail_snapshot(&snapshot, Some(&spec.module_id), None);
+                            fail_snapshot(&snapshot, Some(&spec.module_id), None, &runtime.failure_context(runtime.recovery_is_daemon));
                             process_liveness.untrack_if_current(&spec.module_id, &snapshot);
                             error!(module_id = %spec.module_id, error = %err, "failed to restart supervised module");
                         }
@@ -6997,6 +7112,11 @@ async fn supervise_loop(
                 }
             }
         } else {
+            let slow_retry = lock_snapshot(&snapshot).ok().and_then(|state| {
+                (state.enabled && state.state == ModuleState::Failed)
+                    .then_some(state.failed_retry.pending)
+                    .flatten()
+            });
             let command = if lock_snapshot(&snapshot)
                 .is_ok_and(|state| state.waiting_for_previous_pid.is_some())
             {
@@ -7010,7 +7130,7 @@ async fn supervise_loop(
                                 match spawn_and_mark_running(&spec, &runtime, &snapshot) {
                                     Ok(next_child) => child = Some(next_child),
                                     Err(error) => {
-                                        fail_snapshot(&snapshot, Some(&spec.module_id), None);
+                                        fail_snapshot(&snapshot, Some(&spec.module_id), None, &runtime.failure_context(true));
                                         error!(module_id = %spec.module_id, %error, "failed to start module after its previous instance exited");
                                     }
                                 }
@@ -7025,7 +7145,33 @@ async fn supervise_loop(
                     }
                 }
             } else {
-                commands.recv().await
+                tokio::select! {
+                    biased;
+                    command = commands.recv() => command,
+                    _ = async {
+                        match slow_retry {
+                            Some(retry) => sleep_until(retry.deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let retry = slow_retry.expect("only a scheduled slow retry can wake");
+                        let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| {
+                            state.failed_retry.pending = None;
+                        });
+                        if runtime.child_roster.is_closed() {
+                            continue;
+                        }
+                        info!(module_id = %spec.module_id, attempt = retry.attempt,
+                            delay_secs = retry.delay.as_secs(), "starting failed module retry");
+                        if let Err(error) = set_child_enabled(
+                            &spec, &runtime, &registry, &process_liveness, &snapshot, &mut child, true,
+                            &runtime.failure_context(true),
+                        ).await {
+                            error!(module_id = %spec.module_id, %error, "failed module retry could not start");
+                        }
+                        continue;
+                    }
+                }
             };
             let Some(command) = command else {
                 return;
@@ -7091,6 +7237,20 @@ async fn handle_supervisor_command(
     commands: &mut mpsc::Receiver<SupervisorCommand>,
     requeued: &mut VecDeque<SupervisorCommand>,
 ) -> bool {
+    if !matches!(command, SupervisorCommand::UpdateConfiguration { .. }) {
+        runtime.recovery_is_daemon = false;
+    }
+    if matches!(
+        command,
+        SupervisorCommand::Drain { .. }
+            | SupervisorCommand::Retire { .. }
+            | SupervisorCommand::SetEnabled { .. }
+            | SupervisorCommand::Restart { .. }
+    ) {
+        let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+            state.failed_retry.cancel()
+        });
+    }
     let command =
         if let Some((pid, reason)) = runtime.child_roster.previous_instance(&spec.module_id) {
             match command {
@@ -7130,6 +7290,7 @@ async fn handle_supervisor_command(
                 runtime.drain_timeout,
                 ModuleState::Stopped,
                 None,
+                &FailureContext::operator(),
             )
             .await;
             let registration_released = result.is_ok();
@@ -7170,6 +7331,7 @@ async fn handle_supervisor_command(
                     runtime.drain_timeout,
                     ModuleState::Stopped,
                     None,
+                    &FailureContext::operator(),
                 )
                 .await
             }
@@ -7341,6 +7503,7 @@ async fn handle_supervisor_command(
                 snapshot,
                 child,
                 enabled,
+                &runtime.failure_context(false),
             )
             .await;
             if matches!(result, Ok(true)) {
@@ -7468,6 +7631,7 @@ async fn restart_child(
             drain_timeout,
             ModuleState::Restarting,
             Some(true),
+            &FailureContext::operator(),
         )
         .await?;
     } else {
@@ -7481,6 +7645,7 @@ async fn restart_child(
             runtime.forwarding.as_deref(),
             snapshot,
             &spec.module_id,
+            &runtime.failure_context(false),
         )
         .await?;
     }
@@ -7493,6 +7658,7 @@ async fn restart_child(
         &spec.module_id,
         runtime.restart_policy.backoff,
         RespawnKind::Spawn,
+        false,
     )
 }
 
@@ -7534,6 +7700,7 @@ async fn reload_child(
             runtime.drain_timeout,
             ModuleState::Restarting,
             Some(true),
+            &FailureContext::operator(),
         )
         .await?;
     } else {
@@ -7547,6 +7714,7 @@ async fn reload_child(
             runtime.forwarding.as_deref(),
             snapshot,
             &spec.module_id,
+            &runtime.failure_context(false),
         )
         .await?;
     }
@@ -7559,6 +7727,7 @@ async fn reload_child(
         &spec.module_id,
         runtime.restart_policy.backoff,
         RespawnKind::Reload,
+        false,
     )
 }
 
@@ -7677,6 +7846,7 @@ async fn finish_reload_child(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn set_child_enabled(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
@@ -7685,6 +7855,7 @@ async fn set_child_enabled(
     snapshot: &SharedSnapshot,
     child: &mut Option<SupervisedChild>,
     enabled: bool,
+    failure: &FailureContext,
 ) -> Result<bool, SuperviseError> {
     let (current_enabled, current_state, respawn_pending) = {
         let state = lock_snapshot(snapshot)?;
@@ -7732,6 +7903,7 @@ async fn set_child_enabled(
             runtime.forwarding.as_deref(),
             snapshot,
             &spec.module_id,
+            failure,
         )
         .await?;
         reset_restart_count(snapshot, &spec.module_id)?;
@@ -7739,12 +7911,7 @@ async fn set_child_enabled(
         let next_child = match spawn_and_mark_running(spec, runtime, snapshot) {
             Ok(next_child) => next_child,
             Err(err) => {
-                if let Err(state_err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                    state.state = ModuleState::Failed;
-                    clear_current_process_facts(state);
-                }) {
-                    error!(module_id = %spec.module_id, error = %state_err, "failed to record enable spawn failure");
-                }
+                fail_snapshot(snapshot, Some(&spec.module_id), None, failure);
                 process_liveness.untrack_if_current(&spec.module_id, snapshot);
                 return Err(err);
             }
@@ -7775,6 +7942,7 @@ async fn set_child_enabled(
             runtime.drain_timeout,
             ModuleState::Disabled,
             Some(false),
+            failure,
         )
         .await?;
         debug!(module_id = %spec.module_id, "supervised module disabled");
@@ -7792,6 +7960,7 @@ async fn on_child_exit(
     spawn_events: &SpawnEventFeed,
     roster: &ChildRoster,
     exit_report: ExitReport,
+    daemon_initiated: bool,
 ) -> NextAction {
     // Once the daemon has begun shutting down, no exit is a crash to recover
     // from: the module is exiting because the daemon is going away (EOF on its
@@ -7957,6 +8126,12 @@ async fn on_child_exit(
                     update_snapshot(snapshot, Some(&spec.module_id), |state| {
                         state.state = final_state;
                         clear_current_process_facts(state);
+                        if final_state == ModuleState::Failed
+                            && daemon_initiated
+                            && !roster.is_closed()
+                        {
+                            state.failed_retry.schedule(&spec.module_id);
+                        }
                         state.last_exit = Some(exit_report.clone());
                     })
                 },
@@ -8130,6 +8305,7 @@ fn fail_after_wait_error(
     terminal_ring: &Arc<Mutex<TerminalRing>>,
     spawn_events: &SpawnEventFeed,
     detail: String,
+    failure: &FailureContext,
 ) {
     let report = wait_error_exit_report();
     publish_after_terminal_record(
@@ -8144,7 +8320,7 @@ fn fail_after_wait_error(
                 Some(detail),
             )
         },
-        || fail_snapshot(snapshot, Some(module_id), Some(report.clone())),
+        || fail_snapshot(snapshot, Some(module_id), Some(report.clone()), failure),
     );
 }
 
@@ -10698,6 +10874,7 @@ async fn handle_reload_child_registration_failure(
         &runtime.spawn_events,
         &runtime.child_roster,
         exit_report,
+        runtime.recovery_is_daemon,
     )
     .await
     {
@@ -10721,6 +10898,7 @@ async fn handle_reload_child_registration_failure(
                 &spec.module_id,
                 delay,
                 RespawnKind::Spawn,
+                true,
             )?;
         }
     }
@@ -10747,6 +10925,12 @@ async fn handle_reload_spawn_failure(
             state.state = if schedule.is_some() {
                 ModuleState::Restarting
             } else {
+                if runtime
+                    .failure_context(runtime.recovery_is_daemon)
+                    .may_retry()
+                {
+                    state.failed_retry.schedule(&spec.module_id);
+                }
                 ModuleState::Failed
             };
         } else {
@@ -10760,6 +10944,7 @@ async fn handle_reload_spawn_failure(
             &spec.module_id,
             schedule.delay,
             RespawnKind::Spawn,
+            true,
         )?;
     } else {
         process_liveness.untrack_if_current(&spec.module_id, snapshot);
@@ -10788,6 +10973,7 @@ async fn drain_optional_child(
     drain_timeout: Duration,
     final_state: ModuleState,
     enabled: Option<bool>,
+    failure: &FailureContext,
 ) -> Result<(), SuperviseError> {
     if let Some(child) = child.take() {
         drain_child_to_state(
@@ -10803,17 +10989,21 @@ async fn drain_optional_child(
             drain_timeout,
             final_state,
             enabled,
+            failure,
         )
         .await
     } else {
         update_snapshot(snapshot, Some(module_id), |state| {
             state.state = final_state;
+            if final_state == ModuleState::Failed {
+                state.failed_retry.failed_at = Some(Instant::now());
+            }
             if let Some(enabled) = enabled {
                 state.enabled = enabled;
             }
             clear_current_process_facts(state);
         })?;
-        release_dead_registration(registry, forwarding, snapshot, module_id).await
+        release_dead_registration(registry, forwarding, snapshot, module_id, failure).await
     }
 }
 
@@ -10831,6 +11021,7 @@ async fn drain_child_to_state(
     drain_timeout: Duration,
     final_state: ModuleState,
     enabled: Option<bool>,
+    failure: &FailureContext,
 ) -> Result<(), SuperviseError> {
     let protocol = child.protocol;
     update_snapshot(snapshot, Some(module_id), |state| {
@@ -10872,6 +11063,7 @@ async fn drain_child_to_state(
                 terminal_ring,
                 spawn_events,
                 format!("failed to wait during drain: {source}"),
+                failure,
             );
             return Err(SuperviseError::Wait {
                 module_id: module_id.to_string(),
@@ -10906,6 +11098,7 @@ async fn drain_child_to_state(
                     terminal_ring,
                     spawn_events,
                     format!("failed to kill during drain: {source}"),
+                    failure,
                 );
                 SuperviseError::Kill {
                     module_id: module_id.to_string(),
@@ -10919,6 +11112,7 @@ async fn drain_child_to_state(
                     terminal_ring,
                     spawn_events,
                     format!("failed to wait after drain kill: {source}"),
+                    failure,
                 );
                 SuperviseError::Wait {
                     module_id: module_id.to_string(),
@@ -10945,6 +11139,9 @@ async fn drain_child_to_state(
         || {
             update_snapshot(snapshot, Some(module_id), |state| {
                 state.state = final_state;
+                if final_state == ModuleState::Failed {
+                    state.failed_retry.failed_at = Some(Instant::now());
+                }
                 if let Some(enabled) = enabled {
                     state.enabled = enabled;
                 }
@@ -10958,7 +11155,7 @@ async fn drain_child_to_state(
     )?;
     child.drain_stderr(module_id).await;
 
-    release_dead_registration(registry, forwarding, snapshot, module_id).await
+    release_dead_registration(registry, forwarding, snapshot, module_id, failure).await
 }
 
 /// Ask a child that nothing else has asked to stop, by signal.
@@ -11048,6 +11245,7 @@ async fn release_dead_registration(
     forwarding: Option<&ForwardingTable>,
     snapshot: &SharedSnapshot,
     module_id: &str,
+    failure: &FailureContext,
 ) -> Result<(), SuperviseError> {
     let result = async {
         let registration = registry
@@ -11084,7 +11282,7 @@ async fn release_dead_registration(
     }
     .await;
     if let Err(err) = &result {
-        fail_snapshot(snapshot, Some(module_id), None);
+        fail_snapshot(snapshot, Some(module_id), None, failure);
         error!(module_id, error = %err, "registration release failed after child exit; module is failed and start can retry");
     }
     result
@@ -11187,6 +11385,7 @@ mod slot_registration_wait_tests {
             &snapshot,
             &mut child,
             true,
+            &runtime.failure_context(false),
         )
         .await
         .unwrap_err();
@@ -11205,6 +11404,7 @@ mod slot_registration_wait_tests {
             &snapshot,
             &mut child,
             true,
+            &runtime.failure_context(false),
         )
         .await
         .unwrap_err();
@@ -11398,6 +11598,9 @@ fn set_running(
     state.health.detail = None;
     state.health.metrics = None;
     state.health.last_probe_ms = None;
+    state.failed_retry.healthy_since = None;
+    state.failed_retry.failed_at = None;
+    state.failed_retry.running_since = Some(child.spawned_at);
     #[cfg(windows)]
     {
         state.pipe_consumed = child
@@ -11419,6 +11622,8 @@ fn set_running(
 }
 
 fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
+    state.failed_retry.healthy_since = None;
+    state.failed_retry.running_since = None;
     state.waiting_for_previous_pid = None;
     state.waiting_for_previous_detail = None;
     state.process_alive = false;
@@ -11481,10 +11686,16 @@ fn fail_snapshot(
     snapshot: &SharedSnapshot,
     module_id: Option<&str>,
     last_exit: Option<ExitReport>,
+    failure: &FailureContext,
 ) {
     if let Err(err) = update_snapshot(snapshot, module_id, |state| {
         state.state = ModuleState::Failed;
         clear_current_process_facts(state);
+        if failure.may_retry() && state.enabled {
+            state.failed_retry.schedule(module_id.unwrap_or("unknown"));
+        } else if failure.shutdown.is_set() {
+            state.failed_retry.cancel();
+        }
         if let Some(last_exit) = last_exit {
             state.last_exit = Some(last_exit);
         }
@@ -12229,6 +12440,7 @@ mod terminal_history_tests {
                         signal: None,
                         at_ms: 1,
                     },
+                    true,
                 ))
         });
         let mut reached = [0];
@@ -12290,6 +12502,7 @@ mod terminal_history_tests {
                         signal: None,
                         at_ms: 1,
                     },
+                    true,
                 ))
         });
 
@@ -12491,6 +12704,7 @@ mod terminal_history_tests {
                         &runtime.terminal_ring,
                         &runtime.spawn_events,
                         "wait failed".into(),
+                        &runtime.failure_context(true),
                     );
                 } else {
                     tokio::runtime::Builder::new_current_thread()
@@ -12511,6 +12725,7 @@ mod terminal_history_tests {
                                 signal: None,
                                 at_ms: 1,
                             },
+                            true,
                         ));
                 }
             });
@@ -12648,6 +12863,7 @@ mod terminal_history_tests {
                 &runtime.spawn_events,
                 &runtime.child_roster,
                 crash_exit_report(1),
+                true,
             )
             .await,
             NextAction::Stop { .. }
@@ -12690,6 +12906,7 @@ mod terminal_history_tests {
                     &runtime.spawn_events,
                     &runtime.child_roster,
                     crash_exit_report(1),
+                    true,
                 ))
         }));
         let panic = result.err().expect("recording must still unwind");
@@ -12893,6 +13110,7 @@ mod terminal_history_tests {
                     signal: None,
                     at_ms: 1,
                 },
+                true,
             )
             .await,
             NextAction::Restart { schedule: _ }
@@ -12998,6 +13216,7 @@ mod terminal_history_tests {
                 &runtime.spawn_events,
                 &runtime.child_roster,
                 exit_report,
+                true,
             )
             .await,
             NextAction::Restart { schedule: _ }
@@ -13041,6 +13260,7 @@ mod terminal_history_tests {
                     signal: None,
                     at_ms: 1,
                 },
+                true,
             )
             .await,
             NextAction::Restart { schedule: _ }
@@ -13100,6 +13320,7 @@ mod terminal_history_tests {
                         &runtime.spawn_events,
                         &runtime.child_roster,
                         crash_exit_report(attempt),
+                        true,
                     )
                     .await,
                     NextAction::Restart { schedule: _ }
@@ -13118,6 +13339,7 @@ mod terminal_history_tests {
                 &runtime.spawn_events,
                 &runtime.child_roster,
                 crash_exit_report(3),
+                true,
             )
             .await,
             NextAction::Stop { .. }
@@ -13180,6 +13402,7 @@ mod terminal_history_tests {
                     &runtime.spawn_events,
                     &runtime.child_roster,
                     crash_exit_report(attempt),
+                    true,
                 )
                 .await,
                 NextAction::Restart { schedule: _ }
@@ -13204,6 +13427,7 @@ mod terminal_history_tests {
                     &runtime.spawn_events,
                     &runtime.child_roster,
                     crash_exit_report(3),
+                    true,
                 )
                 .await,
                 NextAction::Restart { schedule: _ }
@@ -13249,6 +13473,7 @@ mod terminal_history_tests {
                     &runtime.spawn_events,
                     &runtime.child_roster,
                     crash_exit_report(attempt),
+                    true,
                 )
                 .await,
                 NextAction::Restart { schedule: _ }
@@ -13279,6 +13504,7 @@ mod terminal_history_tests {
                     &runtime.spawn_events,
                     &runtime.child_roster,
                     crash_exit_report(3),
+                    true,
                 )
                 .await,
                 NextAction::Restart { schedule: _ }
@@ -13369,6 +13595,7 @@ mod terminal_history_tests {
             Duration::from_secs(1),
             ModuleState::Stopped,
             Some(false),
+            &super::FailureContext::operator(),
         )
         .await
         .unwrap();
@@ -13424,6 +13651,7 @@ mod terminal_history_tests {
             Duration::from_secs(1),
             ModuleState::Stopped,
             Some(false),
+            &super::FailureContext::operator(),
         )
         .await
         .unwrap();
@@ -13588,7 +13816,7 @@ mod restart_ordering_tests {
             .unwrap();
         let module = registered.module.clone();
         let startup = tokio::task::spawn_blocking(move || {
-            supervisor.start_registered_configured(registered, None)
+            supervisor.start_registered_configured(registered, None, true)
         });
         spawned_rx.await.unwrap();
         let old_pid = tokio::time::timeout(Duration::from_secs(10), async {
@@ -16353,6 +16581,7 @@ mod job_containment_tests {
                 Duration::from_millis(500),
                 ModuleState::Stopped,
                 Some(false),
+                &FailureContext::operator(),
             )
             .await
             .expect("drain the supervised fixture");
@@ -16701,6 +16930,7 @@ mod privacy_exec_boundary_tests {
                 &runtime.spawn_events,
                 &runtime.child_roster,
                 report,
+                true,
             )
             .await;
             let state = lock_snapshot(&snapshot).unwrap();
@@ -16955,6 +17185,7 @@ mod cgroup_containment_tests {
                 Duration::from_millis(100),
                 ModuleState::Stopped,
                 Some(false),
+                &FailureContext::operator(),
             )
             .await
             .expect("real supervisor teardown");

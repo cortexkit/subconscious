@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.37.6
+
+- After a module exhausts its crash or health restart budget, retry it automatically after 10, 20, 40, then 60 minutes, capped at hourly retries. Each retry starts normally with a fresh restart budget. Healthy checks spanning the module's `RestartPolicy::window` reset the slow schedule. Operator start runs immediately; stop, disable, removal and daemon shutdown cancel pending retries. Rescans that retain the module retain its schedule. Timers use the daemon's monotonic clock, which pauses during sleep on macOS, so delays count awake time. `supervisor.list` includes an optional next-retry estimate for failed modules, and scheduling and starting each attempt produce INFO logs.
+- Slow recovery now also covers daemon-initiated initial spawn failures, failed automatic respawns or previous-instance starts, wait errors, registration-release failures and stranded operations. Failures in operator start/restart/reload/swap operations and during shutdown do not arm retries. Operation ownership is carried explicitly through deferred respawns and failure helpers; repeated publication of one failure preserves its existing timer.
+- Modules with no health checks reset slow-retry escalation after uninterrupted uptime spanning `RestartPolicy::window`. Modules with configured HTTP checks or advertised wire health checks still require healthy samples; a wire module waiting for HELLO is not assumed to have no checks. Both reset paths use the same monotonic awake-time clock.
+
+## 0.37.5
+
+- Shutdown always sends TERM before KILL: a late shutdown poll could kill a module without ever having sent TERM.
+- Saving the running-module record no longer holds the live-roster lock across file and directory sync, so a slow disk can't make shutdown overrun its bounded wait for children. A process admitted while a record write is queued is published first, and a failed admission keeps its roster entry until the rejected child is killed and reaped.
+- New INFO lines report shutdown drain and completion timings.
+
 ## 0.37.4
 
 - Test-only: the role-declarations catalog test compares JSON values, not bytes. Workspace builds unify serde_json's `preserve_order`, so the byte comparison failed in CI; 0.37.3 was never published for that reason.

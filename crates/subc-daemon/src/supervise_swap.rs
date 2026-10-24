@@ -358,7 +358,7 @@ async fn run_swap_inner(
             .await
             {
                 warn!(module_id, error = %err, "plain restart after a lost swap cutover failed");
-                fail_snapshot(snapshot, Some(module_id), None);
+                fail_snapshot(snapshot, Some(module_id), None, &FailureContext::operator());
             }
             return;
         }

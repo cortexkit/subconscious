@@ -104,6 +104,17 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
         },
     );
     assert_golden("supervisor_entry", &supervisor_entry());
+    assert_golden(
+        "supervisor_entry_with_next_retry",
+        &SupervisorEntry::new(
+            "nats-server",
+            "failed",
+            true,
+            false,
+            SupervisorHealthStatus::Failing,
+        )
+        .with_next_retry_at_ms(Some(1_700_000_000_123)),
+    );
     let evidence = |digest: &str| RunningImageEvidence::LinuxProcSha256 {
         digest: digest.to_string(),
     };
@@ -1316,6 +1327,19 @@ fn supervisor_entry_policy_fields_round_trip_and_old_wire_stays_unknown() {
     assert_eq!(decoded.drain_timeout_ms, None);
     assert_eq!(decoded.restart_backoff_ms, None);
     assert_eq!(decoded.restart_max_backoff_ms, None);
+}
+
+#[test]
+fn supervisor_entry_retry_is_optional_and_preserves_old_bytes() {
+    let old_wire = include_str!("golden/supervisor_entry.json");
+    let entry: SupervisorEntry = serde_json::from_str(old_wire).unwrap();
+    assert_eq!(entry.next_retry_at_ms, None);
+    let old_value: serde_json::Value = serde_json::from_str(old_wire).unwrap();
+    assert_eq!(serde_json::to_value(&entry).unwrap(), old_value);
+    let new_entry = entry.with_next_retry_at_ms(Some(1_700_000_000_123));
+    let new_wire = serde_json::to_string(&new_entry).unwrap();
+    let decoded: SupervisorEntry = serde_json::from_str(&new_wire).unwrap();
+    assert_eq!(decoded.next_retry_at_ms, Some(1_700_000_000_123));
 }
 
 /// A payload with no `protocol` key comes from a daemon that had only one kind

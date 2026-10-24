@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.132
+
+- `ck module list` and `ck module status` show failed modules' automatic recovery countdown as `failed, retrying in 9m` when the daemon supplies a next-retry time. Older daemons and failures without a scheduled retry keep their existing output on every OS.
+
 ## 0.20.131
 
 - Take subc-client-rs 0.32: handler panics now fail module serving. After the module handshake completes, daemon disconnects remain clean exits on every OS, with EOF/reset reported through the connection-end hook; handshake disconnects remain errors. Includes IPv6 connection, bounded-reply and cooperative-stop fixes.

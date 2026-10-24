@@ -6391,6 +6391,14 @@ fn module_runtime_status_text(module: &Value) -> String {
         "spawning" | "starting" => "starting".to_string(),
         "restarting" => "restarting".to_string(),
         "failed" => {
+            if let Some(retry_at) = module.get("next_retry_at_ms").and_then(Value::as_u64) {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis() as u64)
+                    .unwrap_or(0);
+                let minutes = retry_at.saturating_sub(now).div_ceil(60_000);
+                return format!("failed, retrying in {minutes}m");
+            }
             let mut detail = Vec::new();
             if let Some(exit) = format_exit(
                 module.get("last_exit_signal").and_then(Value::as_i64),
@@ -8352,6 +8360,24 @@ mod tests {
             ),
             "running"
         );
+    }
+
+    #[test]
+    fn module_status_shows_failed_retry_countdown_and_preserves_legacy_failure() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let mut module = serde_json::json!({"state": "failed", "enabled": true,
+            "next_retry_at_ms": now + 539_000, "last_exit_code": 17, "restart_count": 3});
+        assert_eq!(module_status_text(&module), "failed, retrying in 9m");
+        module["next_retry_at_ms"] = serde_json::json!(now.saturating_sub(1));
+        assert_eq!(module_status_text(&module), "failed, retrying in 0m");
+        module.as_object_mut().unwrap().remove("next_retry_at_ms");
+        assert_eq!(module_status_text(&module), "failed (exit 17, 3 restarts)");
+        module["enabled"] = serde_json::json!(false);
+        module["next_retry_at_ms"] = serde_json::json!(now + 539_000);
+        assert_eq!(module_status_text(&module), "stopped");
     }
 
     mod piped_daemon_output {

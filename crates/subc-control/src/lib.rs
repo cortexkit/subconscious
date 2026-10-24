@@ -2324,6 +2324,11 @@ pub struct SupervisorEntry {
     pub waiting_for_previous_pid: Option<u32>,
     pub module_id: String,
     pub state: String,
+    /// Estimated Unix milliseconds of the next retry after restart-budget
+    /// exhaustion. Recomputed from the daemon's monotonic remaining delay on
+    /// each read; on macOS the countdown pauses during sleep. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_retry_at_ms: Option<u64>,
     pub enabled: bool,
     /// The enabled value in the daemon's loaded configuration, not a stored
     /// drift flag. Absent when there is no configured entry or on older daemons.
@@ -2458,6 +2463,13 @@ pub struct SupervisorEntry {
 }
 
 impl SupervisorEntry {
+    /// Set the estimated time of a failed module's next automatic retry.
+    #[must_use]
+    pub fn with_next_retry_at_ms(mut self, next_retry_at_ms: Option<u64>) -> Self {
+        self.next_retry_at_ms = next_retry_at_ms;
+        self
+    }
+
     /// Construct an entry with its required fields and wire-compatible defaults.
     #[must_use]
     pub fn new(
@@ -2470,6 +2482,7 @@ impl SupervisorEntry {
         Self {
             module_id: module_id.into(),
             state: state.into(),
+            next_retry_at_ms: None,
             waiting_for_previous_pid: None,
             enabled,
             configured_enabled: None,

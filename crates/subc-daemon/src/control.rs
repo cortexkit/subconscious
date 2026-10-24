@@ -5358,6 +5358,13 @@ impl ControlHandler {
                     format!("failed to read module configuration: {err}"),
                 )
             })?;
+            let next_retry_at_ms = module.next_retry_at_ms().map_err(|err| {
+                RouterError::backend(
+                    0,
+                    frame.header.corr,
+                    format!("failed to read retry time: {err}"),
+                )
+            })?;
             // Status and configuration snapshots release their locks before the image probe awaits.
             let image = module.running_image_agreement().await;
             // Read per request so the figure is current when the operator asks;
@@ -5385,6 +5392,7 @@ impl ControlHandler {
                     status.health.status,
                 )
                 .with_configured_enabled(configured_enabled)
+                .with_next_retry_at_ms(next_retry_at_ms)
                 .with_launch_nonce_env(Some(!cfg!(unix)))
                 .with_launch_nonce_source(status.launch_nonce_source)
                 .with_waiting_for_previous_pid(status.waiting_for_previous_pid)
@@ -12782,6 +12790,54 @@ mod tests {
         assert_eq!(event.fields.get("in_flight"), Some(&limit.to_string()));
         assert_eq!(event.fields.get("limit"), Some(&limit.to_string()));
         drop(guards);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn supervisor_list_shows_a_failed_modules_next_retry() {
+        let registry = Arc::new(Registry::default());
+        let handle = SupervisorHandle::new();
+        let supervisor =
+            Supervisor::new_for_test(registry.clone(), RestartPolicy::new(0, Duration::ZERO))
+                .with_handle(handle.clone());
+        let module = supervisor
+            .spawn(crate::ModuleSpec {
+                module_id: "retry-list".into(),
+                program: PathBuf::from("/bin/sh"),
+                args: vec!["-c".into(), "exit 17".into()],
+                env: vec![],
+                reserved: false,
+                reserved_prefixes: vec![],
+                protocol: ModuleProtocol::None,
+                overlap: Default::default(),
+            })
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while module.state().unwrap() != crate::ModuleState::Failed {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "waiting for budget failure"
+            );
+            tokio::task::yield_now().await;
+        }
+        let handler = ControlHandler::new(registry).with_supervisor(handle);
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 2, Vec::new()).unwrap();
+        let replies = handler.handle_supervisor_list(frame).await.unwrap();
+        let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
+        assert_eq!(body["modules"][0]["state"], "failed");
+        let retry = body["modules"][0]["next_retry_at_ms"]
+            .as_u64()
+            .expect("scheduled retry on the wire");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!((599_000..=600_000).contains(&retry.saturating_sub(now)));
+        module.set_enabled(false).await.unwrap();
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 3, Vec::new()).unwrap();
+        let replies = handler.handle_supervisor_list(frame).await.unwrap();
+        let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
+        assert!(body["modules"][0].get("next_retry_at_ms").is_none());
     }
 
     #[tokio::test]

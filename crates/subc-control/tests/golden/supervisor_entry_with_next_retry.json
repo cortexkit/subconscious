@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "health": "failing",
+  "last_probe_ms": null,
+  "live": false,
+  "module_id": "nats-server",
+  "next_retry_at_ms": 1700000000123,
+  "protocol": "subc",
+  "state": "failed"
+}

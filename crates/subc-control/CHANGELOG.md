@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.2
+
+- Add optional `SupervisorEntry::next_retry_at_ms` and its builder method so operators can see when a failed module will retry after exhausting its restart budget. This Unix-millisecond estimate is recomputed from the daemon's monotonic countdown on each read; macOS sleep pauses the countdown. `SupervisorEntry` remains non-exhaustive, and absent retry times are omitted so existing response bytes are unchanged.
+
 ## 0.33.1
 
 - Add `CatalogEntry::role_declarations` and `with_role_declarations`, mirroring opaque per-role objects from the registered manifest. Empty maps are omitted, preserving legacy catalog bytes. `CatalogEntry` remains non-exhaustive and builder-compatible.

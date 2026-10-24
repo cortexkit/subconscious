@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.128
+
+- Internal only: name the setup rescan-preview function type. No behaviour
+  change.
+
 ## 0.20.127
 
 - The setup engine and shared upgrade text are available from the subc-core

@@ -9488,15 +9488,15 @@ mod tests {
             .unwrap()
             .unwrap()
             .manifest;
+        // Compared as JSON values, not bytes: object key order is not part of
+        // the relay's promise, and workspace builds unify serde_json's
+        // preserve_order feature, which changes the order a literal keeps.
         assert_eq!(
-            serde_json::to_vec(&registered.role_declarations).unwrap(),
-            serde_json::to_vec(&declarations).unwrap()
+            serde_json::to_value(&registered.role_declarations).unwrap(),
+            declarations
         );
         let (raw, entry) = role_declarations_catalog(&handler);
-        assert_eq!(
-            serde_json::to_vec(&raw["role_declarations"]).unwrap(),
-            serde_json::to_vec(&declarations).unwrap()
-        );
+        assert_eq!(raw["role_declarations"], declarations);
         assert_eq!(entry.role_declarations, registered.role_declarations);
 
         let request =

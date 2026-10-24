@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.4
+
+- Test-only: the role-declarations catalog test compares JSON values, not bytes. Workspace builds unify serde_json's `preserve_order`, so the byte comparison failed in CI; 0.37.3 was never published for that reason.
+
 ## 0.37.3
 
 - Validate manifest `role_declarations` at HELLO for capability-name keys, object values and a 16,384-byte compact whole-map limit. Malformed or oversized maps are dropped whole with a WARN naming the module and reason, without refusing HELLO. Retain valid declarations in the registry and relay them unchanged through `catalog.list`, including after catalog updates, without interpreting any role's schema.

@@ -2,7 +2,7 @@
 
 ## 0.1.17
 
-- Take subc-client-rs 0.32: handler panics and unrequested transport disconnects now fail serving for supervisor recovery; orderly EOF and requested stops still exit cleanly.
+- Take subc-client-rs 0.32: handler panics now fail serving for supervisor recovery. After the module handshake completes, daemon disconnects still exit cleanly on every OS, with EOF/reset reported through the connection-end hook; handshake disconnects remain errors.
 
 ## 0.1.16
 

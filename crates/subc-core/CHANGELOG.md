@@ -2,7 +2,7 @@
 
 ## 0.20.131
 
-- Take subc-client-rs 0.32: handler panics and unrequested transport disconnects now fail module serving; orderly EOF and requested stops remain clean exits. Includes IPv6 connection, bounded-reply and cooperative-stop fixes.
+- Take subc-client-rs 0.32: handler panics now fail module serving. After the module handshake completes, daemon disconnects remain clean exits on every OS, with EOF/reset reported through the connection-end hook; handshake disconnects remain errors. Includes IPv6 connection, bounded-reply and cooperative-stop fixes.
 
 ## 0.20.130
 

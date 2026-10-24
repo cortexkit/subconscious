@@ -111,7 +111,7 @@ async fn declarer_sdk_receives_scope_modes_and_the_described_run_deadline() {
     assert_eq!(reply.scope, Some(described));
     consumer.close().await;
     run.daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 // Capture raw binds so SDK fallback cannot conceal a missing field, and typed

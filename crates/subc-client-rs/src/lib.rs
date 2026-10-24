@@ -114,8 +114,8 @@ const HANDLER_TASK_CAPACITY: usize = 64;
 const DISPATCH_SATURATION_WAIT: Duration = Duration::from_secs(2);
 const HELLO_CORR: u64 = 1;
 const DEFAULT_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
-/// When a module's daemon connection ends (GOODBYE, EOF, or the module closing
-/// it), how long the serve loop waits for each `on_draining` hook it already
+/// When a module's daemon connection ends (GOODBYE, EOF, reset, or module stop),
+/// how long the serve loop waits for each `on_draining` hook it already
 /// spawned to start running before it cancels requests and calls
 /// `on_connection_end`. The wait is only for the hook's first step, which is
 /// normally immediate; the bound matters because the daemon kills a module
@@ -1633,17 +1633,19 @@ pub trait ModuleHandler: Send + Sync + 'static {
     /// that have not finished within the drain budget.
     async fn on_draining(&self, _reason: RouteCloseReason, _deadline: SystemTime) {}
 
-    /// The read loop ended orderly: a daemon GOODBYE is a planned stop, clean
-    /// EOF means the daemon went away without one, and `Closed` is a module
-    /// stop. Called once, after request tasks have finished or been cancelled.
-    /// Not called for handler failures or unrequested transport errors observed
-    /// before that end. A later, unexpected writer failure can still make
-    /// serving return an error.
+    /// The connection ended orderly: a daemon GOODBYE is a planned stop, EOF
+    /// or Reset means the daemon went away without one, and `Closed` is a
+    /// module stop. Called once, after request tasks have finished or been
+    /// cancelled. A module that wants a different exit code for an unannounced
+    /// end can decide here. Not called for handler or protocol failures. A
+    /// later, unexpected writer failure can still make serving return an error.
     async fn on_connection_end(&self, _end: ConnectionEnd) {}
 }
 
-/// How a module's daemon connection ended. Orderly ends return `Ok(())`;
-/// unrequested transport failures return an error instead.
+/// How a registered module's daemon connection ended. After the handshake, EOF
+/// and socket disconnects are orderly ends on every platform: serving calls
+/// `on_connection_end` and returns `Ok(())`. Handshake, handler, protocol and
+/// other transport failures return errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnectionEnd {
@@ -1651,8 +1653,8 @@ pub enum ConnectionEnd {
     Goodbye,
     /// The daemon closed the connection without GOODBYE.
     Eof,
-    /// Legacy end classification. Unrequested resets now return a transport
-    /// error and are no longer reported through `on_connection_end`.
+    /// The socket was reset or aborted, or its writer disconnected. This is how
+    /// Windows reports a daemon that died, which Unix reports as [`Self::Eof`].
     Reset,
     /// The module closed the connection itself, including a [`ModuleStopHandle`] stop.
     Closed,
@@ -1959,7 +1961,7 @@ enum BindDecisionKind {
 /// Run a module to completion. Reads `--subc <connection-file>` from args, uses
 /// `SUBC_MODULE_ID` when set by the process that launched the module, connects,
 /// authenticates, sends HELLO, waits for HELLO_ACK, then serves frames until
-/// GOODBYE or clean EOF. Which of those ended it is passed to
+/// GOODBYE, clean EOF or a socket disconnect. How it ended is passed to
 /// [`ModuleHandler::on_connection_end`].
 pub async fn serve<H>(manifest: ModuleManifest, handler: H) -> Result<(), SubcModuleError>
 where
@@ -2261,9 +2263,16 @@ where
             result = module_loop(read_half, &tx, Arc::clone(&handler), serve_handle.clone(), &dispatcher, &options.stop_handle) => result,
             result = &mut writer => {
                 writer_finished = true;
-                Err(writer_ended(result))
+                writer_connection_end(result)
             }
         };
+        // A failed terminal enqueue can win the select just before the writer
+        // reports why it closed. Classify that same disconnect before calling
+        // the connection-end hook, rather than exposing a scheduling race.
+        if matches!(loop_result, Err(SubcModuleError::WriterClosed)) && !writer_finished {
+            writer_finished = true;
+            loop_result = writer_connection_end((&mut writer).await);
+        }
         let deadline = Instant::now() + options.writer_drain_timeout;
         dispatcher.wait_for_draining_hooks_to_start().await;
         dispatcher.tasks.close();
@@ -2393,6 +2402,16 @@ where
             Ok(Some(frame)) => frame,
             // Clean EOF: the daemon closed the connection.
             Ok(None) => return Ok(ConnectionEnd::Eof),
+            // A killed daemon can close with FIN on Unix and RST on Windows.
+            // Both end serving and run the same connection-end teardown hook.
+            Err(FrameIoError::Io(error))
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return Ok(ConnectionEnd::Reset);
+            }
             Err(err) => return Err(SubcModuleError::FrameIo(err)),
         };
         if !handle_frame(
@@ -3098,6 +3117,17 @@ fn writer_ended(
         Ok(Ok(())) => SubcModuleError::WriterClosed,
         Ok(Err(error)) => SubcModuleError::FrameIo(error.error),
         Err(error) => SubcModuleError::WriterTask(error),
+    }
+}
+
+fn writer_connection_end(
+    result: Result<Result<(), WriterFailure>, tokio::task::JoinError>,
+) -> Result<ConnectionEnd, SubcModuleError> {
+    match writer_ended(result) {
+        SubcModuleError::FrameIo(FrameIoError::Io(error)) if is_disconnect(&error) => {
+            Ok(ConnectionEnd::Reset)
+        }
+        error => Err(error),
     }
 }
 

@@ -1294,7 +1294,7 @@ async fn module_handle_catalog_update_refreshes_catalog_without_dropping_open_ro
     assert_eq!(response.body, b"after-update");
 
     daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1338,7 +1338,7 @@ async fn a_registering_module_receives_the_daemons_machine_id_in_hello_ack() {
     );
 
     daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1382,7 +1382,7 @@ async fn daemon_capabilities_round_trip_from_real_hello_ack() {
     assert!(!handle.daemon_supports("not-advertised/v1"));
 
     daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1421,7 +1421,7 @@ async fn module_handle_catalog_update_surfaces_frozen_field_rejections() {
     assert!(matches!(error, CatalogUpdateError::FrozenField(_)));
 
     daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1457,7 +1457,7 @@ async fn module_handle_catalog_update_fails_fast_after_connection_death() {
     wait_for_catalog_module(&daemon.connection_file, module_id, START_TIMEOUT).await;
 
     daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 
     let result = timeout(
         Duration::from_secs(1),
@@ -2016,7 +2016,7 @@ async fn subc_consumer_push_events_delivers_registered_push() {
     assert_eq!(event.body, b"registered-push");
 
     daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2084,7 +2084,7 @@ async fn subc_consumer_counts_pushes_dropped_without_receiver() {
     );
 
     daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2154,7 +2154,7 @@ async fn subc_consumer_push_events_end_when_route_closes() {
     );
 
     daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2658,29 +2658,12 @@ struct PolicyHarness {
     handler: PolicyModuleHandler,
 }
 
-// Killing the daemon can produce FIN (orderly EOF) or an unrequested socket
-// reset/abort, depending on the platform and pending writes. Only those
-// transport outcomes are valid here; handler/protocol failures must stay red.
-fn assert_killed_daemon_exit(result: Result<(), SubcModuleError>) {
-    match result {
-        Ok(()) => {}
-        Err(SubcModuleError::FrameIo(subc_transport::FrameIoError::Io(error)))
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::BrokenPipe
-            ) => {}
-        Err(error) => panic!("unexpected serve error after killing daemon: {error:?}"),
-    }
-}
-
 impl PolicyHarness {
     async fn stop(mut self) {
         self.handler.close_bumps();
         self.daemon.kill_and_wait();
         drop(self.module);
-        assert_killed_daemon_exit(self.serve_task.await.unwrap());
+        assert!(self.serve_task.await.unwrap().is_ok());
     }
 }
 
@@ -3394,7 +3377,7 @@ async fn subc_consumer_push_burst_counts_overflow_and_keeps_the_subscription() {
     assert_eq!(event.body, b"after-burst");
 
     daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 /// Emits stale_route_epoch on the FIRST request, then echoes. Stands in for
@@ -3477,7 +3460,7 @@ async fn subc_consumer_retries_once_in_place_on_stale_route_epoch() {
     assert_eq!(reply, payload);
 
     daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5800,7 +5783,7 @@ async fn an_owner_syncs_a_scope_and_both_it_and_another_module_describe_it_live(
     );
 
     run.daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5850,7 +5833,7 @@ async fn a_refused_scope_sync_carries_the_daemons_typed_code() {
     );
 
     run.daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 const SDK_SCOPE_PROVIDER: &str = "subc-client-rs-sdk-scope-provider";
@@ -6031,7 +6014,7 @@ async fn every_operation_on_a_detached_route_handle_fails_as_a_stale_route() {
 
     drop(consumer);
     daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 /// One bind's session and the scope stamp it carried.
@@ -6203,7 +6186,7 @@ async fn an_applied_run_scope_expires_and_closes_its_route_without_an_owner_resy
 
     consumer.close().await;
     run.daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 /// A module served through the SDK sees the daemon's scope stamp in `on_bind`,
@@ -6299,7 +6282,7 @@ async fn a_served_modules_on_bind_receives_the_daemons_scope_stamp() {
 
     drop(consumer);
     run.daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -6338,7 +6321,7 @@ async fn describing_an_unknown_ref_answers_not_live_with_the_owners_state() {
     assert_eq!(unknown_owner.scope, None);
 
     run.daemon.kill_and_wait();
-    assert_killed_daemon_exit(serve_task.await.unwrap());
+    assert!(serve_task.await.unwrap().is_ok());
 }
 
 // These tests share the wire helpers but have a separate, feature-enabled daemon.

@@ -11,6 +11,20 @@ impl ModuleHandler for Echo {
     }
 }
 
+#[derive(Clone, Default)]
+struct EndRecorder(Arc<Mutex<Vec<ConnectionEnd>>>);
+
+#[async_trait]
+impl ModuleHandler for EndRecorder {
+    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        HandlerOutcome::Response(body)
+    }
+
+    async fn on_connection_end(&self, end: ConnectionEnd) {
+        self.0.lock().unwrap().push(end);
+    }
+}
+
 fn ack() -> ModuleHelloAckBody {
     ModuleHelloAckBody {
         negotiated_ver: PROTOCOL_VERSION,
@@ -539,36 +553,140 @@ async fn idle_eof_is_ok() {
 }
 
 #[tokio::test]
-async fn read_reset_and_abort_are_errors() {
+async fn read_reset_and_abort_end_the_connection_as_reset() {
     for kind in [
         io::ErrorKind::ConnectionReset,
         io::ErrorKind::ConnectionAborted,
     ] {
-        let (_, serve) = start(
+        let recorder = EndRecorder::default();
+        let (handle, serve) = start(
             ReadError(kind),
             tokio::io::sink(),
-            Echo,
+            recorder.clone(),
             ServeOptions::default(),
         );
-        assert!(
-            matches!(serve.await.unwrap(), Err(SubcModuleError::FrameIo(FrameIoError::Io(error))) if error.kind() == kind)
-        );
+        serve.await.unwrap().unwrap();
+        assert_eq!(*recorder.0.lock().unwrap(), [ConnectionEnd::Reset]);
+        assert!(handle.is_closed());
     }
 }
 
 #[tokio::test]
-async fn write_disconnect_while_read_side_open_is_error() {
+async fn write_disconnect_while_read_side_open_ends_the_connection_as_reset() {
     for kind in [
         io::ErrorKind::BrokenPipe,
         io::ErrorKind::ConnectionReset,
         io::ErrorKind::ConnectionAborted,
     ] {
         let (module, mut daemon) = tokio::io::duplex(1024);
-        let (_, serve) = start(module, FlushError(kind), Echo, ServeOptions::default());
-        request(&mut daemon).await;
-        assert!(
-            matches!(timeout(Duration::from_secs(3), serve).await.unwrap().unwrap(), Err(SubcModuleError::FrameIo(FrameIoError::Io(error))) if error.kind() == kind)
+        let recorder = EndRecorder::default();
+        let (handle, serve) = start(
+            module,
+            FlushError(kind),
+            recorder.clone(),
+            ServeOptions::default(),
         );
+        request(&mut daemon).await;
+        timeout(Duration::from_secs(3), serve)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(*recorder.0.lock().unwrap(), [ConnectionEnd::Reset]);
+        assert!(handle.is_closed());
+    }
+}
+
+#[tokio::test]
+async fn non_disconnect_transport_failures_remain_errors() {
+    let kind = io::ErrorKind::PermissionDenied;
+    let recorder = EndRecorder::default();
+    let (_, serve) = start(
+        ReadError(kind),
+        tokio::io::sink(),
+        recorder.clone(),
+        ServeOptions::default(),
+    );
+    assert!(
+        matches!(serve.await.unwrap(), Err(SubcModuleError::FrameIo(FrameIoError::Io(error))) if error.kind() == kind)
+    );
+    assert!(recorder.0.lock().unwrap().is_empty());
+
+    let (module, mut daemon) = tokio::io::duplex(1024);
+    let (_, serve) = start(
+        module,
+        FlushError(kind),
+        recorder.clone(),
+        ServeOptions::default(),
+    );
+    request(&mut daemon).await;
+    assert!(
+        matches!(timeout(Duration::from_secs(3), serve).await.unwrap().unwrap(), Err(SubcModuleError::FrameIo(FrameIoError::Io(error))) if error.kind() == kind)
+    );
+    assert!(recorder.0.lock().unwrap().is_empty());
+}
+
+struct HandshakeDisconnect {
+    read_error: Option<io::ErrorKind>,
+    write_error: Option<io::ErrorKind>,
+}
+
+impl AsyncRead for HandshakeDisconnect {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.read_error {
+            Some(kind) => Poll::Ready(Err(io::Error::from(kind))),
+            None => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for HandshakeDisconnect {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Poll::Ready(Ok(buf.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(
+            self.write_error
+                .map_or(Ok(()), |kind| Err(io::Error::from(kind))),
+        )
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn disconnect_before_hello_ack_remains_an_error_without_an_end_hook() {
+    for (read_error, write_error) in [
+        (Some(io::ErrorKind::ConnectionReset), None),
+        (Some(io::ErrorKind::ConnectionAborted), None),
+        (None, Some(io::ErrorKind::BrokenPipe)),
+        (None, Some(io::ErrorKind::ConnectionReset)),
+        (None, Some(io::ErrorKind::ConnectionAborted)),
+    ] {
+        let recorder = EndRecorder::default();
+        let result = register_connection(
+            HandshakeDisconnect {
+                read_error,
+                write_error,
+            },
+            ModuleManifest::builder("test", "0.1.0").build(),
+            recorder.clone(),
+            ServeOptions::default(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(SubcModuleError::FrameIo(FrameIoError::Io(error))) if Some(error.kind()) == read_error.or(write_error))
+        );
+        assert!(recorder.0.lock().unwrap().is_empty());
     }
 }
 

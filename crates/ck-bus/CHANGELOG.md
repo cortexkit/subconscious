@@ -2,7 +2,7 @@
 
 ## 0.4.12
 
-- Take subc-client-rs 0.32: a module handler panic or unrequested transport disconnect now fails serving instead of being silently ignored. Orderly EOF and requested stops remain clean exits.
+- Take subc-client-rs 0.32: a module handler panic now fails serving instead of being silently ignored. After the module handshake completes, daemon disconnects remain clean exits on every OS, with EOF/reset reported through the connection-end hook; handshake disconnects remain errors.
 
 ## 0.4.11
 

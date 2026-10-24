@@ -231,6 +231,26 @@ describe("daemon-originated control pushes", () => {
 });
 
 describe("SubcClient capability resolution", () => {
+  test("catalogList preserves opaque role declarations and tolerates their absence", async () => {
+    const { connFile } = tempConnectionFile();
+    const role_declarations = {
+      "routing/v1": { consumers: [{ name: "chat", default_demand: 2 }] },
+      "future/v2": { unknown: [null, true, { nested: "λ" }] },
+    };
+    const entry = { ...catalogEntry("role-provider", undefined), role_declarations };
+    const legacy = catalogEntry("legacy-provider", undefined);
+    const daemon = await startFakeDaemon({ stats: newStats(), catalogModules: [entry, legacy] });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile });
+    try {
+      const modules = await client.catalogList();
+      expect(modules.find((module) => module.module_id === "role-provider")?.role_declarations).toEqual(role_declarations);
+      expect(modules.find((module) => module.module_id === "legacy-provider")).not.toHaveProperty("role_declarations");
+    } finally {
+      client.close();
+    }
+  });
+
   test("catalogList preserves open operation delivery and tolerates unknown entry fields", async () => {
     const { connFile } = tempConnectionFile();
     const operation_delivery = { status: "watch", future: "stream-v2" };

@@ -1,0 +1,16 @@
+{
+  "control_ops": [],
+  "module_id": "role-test",
+  "ready": true,
+  "role_declarations": {
+    "routing/v1": {
+      "consumers": [
+        {
+          "default_demand": 2,
+          "name": "chat"
+        }
+      ]
+    }
+  },
+  "roles": []
+}

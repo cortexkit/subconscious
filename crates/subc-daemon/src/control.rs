@@ -22,9 +22,9 @@ use subc_protocol::{
     error_codes,
     manifest::{
         validate_hello_capability_grammar, validate_hello_event_declarations,
-        validate_hello_rich_ui_descriptor, validate_hello_self_signal_declarations,
-        CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
-        ProviderRole,
+        validate_hello_rich_ui_descriptor, validate_hello_role_declarations,
+        validate_hello_self_signal_declarations, CapabilityDeclarations, CapabilityNeed,
+        Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
     },
     scope::{
         ScopeEnd, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
@@ -2343,6 +2343,12 @@ impl ControlHandler {
                 )?]);
             }
         }
+        if let Err(reason) = validate_hello_role_declarations(&hello_value) {
+            let module_id = hello_value["manifest"]["module_id"]
+                .as_str()
+                .unwrap_or("<unknown>");
+            warn!(module_id, %reason, "dropping whole role_declarations map from HELLO");
+        }
         let hello = match serde_json::from_value::<ModuleHelloBody>(hello_value) {
             Ok(hello) => hello,
             Err(err) => {
@@ -3999,6 +4005,7 @@ impl ControlHandler {
                 .with_operation_delivery(registration.manifest.operation_delivery)
                 .with_operation_payload(registration.manifest.operation_payload)
                 .with_rich_ui(registration.manifest.rich_ui)
+                .with_role_declarations(registration.manifest.role_declarations)
                 .with_nonce_verified(nonce_verified)
             })
             .collect();
@@ -9418,6 +9425,161 @@ mod tests {
             descriptor
         );
         assert!(modules[0].nonce_verified);
+    }
+
+    fn hello_with_role_declarations(declarations: Value) -> Frame {
+        let mut body = serde_json::to_value(ModuleHelloBody {
+            manifest: manifest("role-test", PROTOCOL_VERSION),
+            protocol_ver: PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: None,
+        })
+        .unwrap();
+        body["manifest"]["role_declarations"] = declarations;
+        Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            301,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn role_declarations_catalog(handler: &ControlHandler) -> (Value, CatalogEntry) {
+        let request = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            302,
+            serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None }).unwrap(),
+        )
+        .unwrap();
+        let response = handler.handle_catalog_list(request, None).unwrap();
+        let raw: Value = serde_json::from_slice(&response[0].body).unwrap();
+        let ClientControlResponse::CatalogList { mut modules, .. } =
+            serde_json::from_slice(&response[0].body).unwrap()
+        else {
+            panic!("expected catalog.list");
+        };
+        (raw["modules"][0].clone(), modules.remove(0))
+    }
+
+    #[test]
+    fn catalog_list_mirrors_role_declarations_through_hello_and_catalog_update() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let declarations = json!({
+            "routing/v1": {"consumers": [{"name": "chat", "default_demand": 2}]},
+            "future/v2": {"unknown": [null, true, {"nested": "λ"}]}
+        });
+        let connection = ConnectionId::new(301);
+        let response = handler
+            .handle_control(
+                connection,
+                hello_with_role_declarations(declarations.clone()),
+            )
+            .unwrap();
+        assert_eq!(response[0].header.ty, FrameType::HelloAck);
+        let registered = registry
+            .get_module_by_connection(connection)
+            .unwrap()
+            .unwrap()
+            .manifest;
+        assert_eq!(
+            serde_json::to_vec(&registered.role_declarations).unwrap(),
+            serde_json::to_vec(&declarations).unwrap()
+        );
+        let (raw, entry) = role_declarations_catalog(&handler);
+        assert_eq!(
+            serde_json::to_vec(&raw["role_declarations"]).unwrap(),
+            serde_json::to_vec(&declarations).unwrap()
+        );
+        assert_eq!(entry.role_declarations, registered.role_declarations);
+
+        let request =
+            Frame::build(FrameType::Request, control_flags(), 0, 0, 303, Vec::new()).unwrap();
+        handler
+            .handle_catalog_update(connection, request, registered.provides, None, Some(false))
+            .unwrap();
+        let (raw, entry) = role_declarations_catalog(&handler);
+        assert_eq!(raw["role_declarations"], declarations);
+        assert_eq!(entry.role_declarations, registered.role_declarations);
+    }
+
+    fn assert_hello_drops_role_declarations_with_warning(declarations: Value, reason: &str) {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let response = handler
+            .handle_control(
+                ConnectionId::new(301),
+                hello_with_role_declarations(declarations),
+            )
+            .unwrap();
+        assert_eq!(response[0].header.ty, FrameType::HelloAck);
+        assert!(registry
+            .get_module_by_connection(ConnectionId::new(301))
+            .unwrap()
+            .unwrap()
+            .manifest
+            .role_declarations
+            .is_empty());
+        let (raw, entry) = role_declarations_catalog(&handler);
+        assert!(raw.get("role_declarations").is_none());
+        assert!(entry.role_declarations.is_empty());
+        let warnings: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("message").map(String::as_str)
+                    == Some("dropping whole role_declarations map from HELLO")
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].level, tracing::Level::WARN);
+        assert_eq!(warnings[0].fields["module_id"], "\"role-test\"");
+        assert_eq!(warnings[0].fields["reason"], reason);
+    }
+
+    #[test]
+    fn hello_non_object_role_declarations_drop_whole_map_and_warn() {
+        for value in [
+            json!(null),
+            json!(false),
+            json!(0),
+            json!("opaque"),
+            json!([]),
+        ] {
+            assert_hello_drops_role_declarations_with_warning(
+                json!({"routing/v1": {}, "broken/v1": value}),
+                "role_declarations values must be objects",
+            );
+        }
+        assert_hello_drops_role_declarations_with_warning(
+            json!([]),
+            "role_declarations must be an object",
+        );
+    }
+
+    #[test]
+    fn hello_bad_role_declaration_key_drops_whole_map_and_warns() {
+        assert_hello_drops_role_declarations_with_warning(
+            json!({"routing/v1": {}, "bad key": {}}),
+            "role_declarations key must use capability-name grammar",
+        );
+    }
+
+    #[test]
+    fn hello_oversized_role_declarations_drop_whole_map_and_warn() {
+        assert_hello_drops_role_declarations_with_warning(
+            json!({"routing/v1": {}, "overflow/v1": {"padding": "x".repeat(16_384)}}),
+            "role_declarations exceeds 16384 compact JSON bytes",
+        );
     }
 
     #[test]

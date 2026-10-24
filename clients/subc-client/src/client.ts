@@ -206,6 +206,8 @@ export interface CatalogEntry {
   operation_delivery?: Record<string, string>;
   /** Opaque rich-UI descriptor for the provider's manifest, mirrored from HELLO. */
   rich_ui?: CatalogRichUiDescriptor;
+  /** Opaque per-role objects mirrored unchanged from the registered manifest. */
+  role_declarations?: Record<string, Record<string, unknown>>;
   /** True only when HELLO passes the launch-nonce check required for a reserved module or swap candidate. */
   nonce_verified?: true;
 }

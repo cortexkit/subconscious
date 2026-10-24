@@ -243,6 +243,23 @@ describe("Rust golden fixtures", () => {
     expect(normalizeManifest(manifest, undefined)).not.toHaveProperty("rich_ui");
   });
 
+  test("role declarations reach HELLO unchanged and omit absent or empty maps", () => {
+    const manifest = managementSurfaceManifest({ moduleId: "roles", operations: ["describe"] });
+    const role_declarations = {
+      "routing/v1": { consumers: [{ name: "chat", default_demand: 2 }] },
+      "future/v2": { unknown: [null, true, { nested: "λ" }] },
+    };
+    const normalized = normalizeManifest({ ...manifest, role_declarations }, undefined);
+    expect(JSON.stringify(normalized.role_declarations)).toBe(JSON.stringify(role_declarations));
+    expect(normalized.role_declarations).not.toBe(role_declarations);
+    expect(normalizeManifest(manifest, undefined)).not.toHaveProperty("role_declarations");
+    expect(normalizeManifest({ ...manifest, role_declarations: {} }, undefined)).not.toHaveProperty("role_declarations");
+    const declared = { "routing/v1": role_declarations["routing/v1"] };
+    const helloManifest = loadGolden("module_hello_body_with_role_declarations").manifest as Record<string, unknown>;
+    expect(helloManifest.role_declarations).toEqual(declared);
+    expect(loadControlGolden("catalog_entry_with_role_declarations").role_declarations).toEqual(declared);
+  });
+
   test("route targets keep the discriminator the client switches on", () => {
     // RouteTarget is a tagged union on `kind`; the client builds these and the
     // daemon matches them, so the tag values are a contract rather than a detail.

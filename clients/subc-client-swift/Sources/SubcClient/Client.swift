@@ -25,6 +25,8 @@ public struct CatalogEntry {
     public let controlOps: [String]
     public let events: [CatalogEventDeclaration]?
     public let richUi: CatalogRichUiDescriptor?
+    /// Raw per-role JSON declarations; each role owns its entry's schema.
+    public let roleDeclarations: Any?
     public let nonceVerified: Bool?
 }
 
@@ -147,6 +149,7 @@ public final class SubcClient {
                 controlOps: module["control_ops"] as? [String] ?? [],
                 events: eventsOf(module["events"]),
                 richUi: richUiOf(module["rich_ui"]),
+                roleDeclarations: module["role_declarations"],
                 nonceVerified: module["nonce_verified"] as? Bool
             )
         }

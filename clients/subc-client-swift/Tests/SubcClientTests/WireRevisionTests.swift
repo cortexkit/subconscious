@@ -425,6 +425,7 @@ final class ClientWireRevisionTests: XCTestCase {
         XCTAssertEqual(modules[0].events?[1].name, "task_failed")
         XCTAssertEqual(modules[0].events?[1].summary, nil)
         XCTAssertNil(modules[0].richUi)
+        XCTAssertNil(modules[0].roleDeclarations)
         XCTAssertNil(modules[0].nonceVerified)
     }
 
@@ -456,6 +457,30 @@ final class ClientWireRevisionTests: XCTestCase {
         XCTAssertEqual(modules[0].richUi?.bytes, 4096)
         XCTAssertEqual(modules[0].richUi?.chunks, 4)
         XCTAssertEqual(modules[0].nonceVerified, true)
+    }
+
+    func testCatalogListPreservesOpaqueRoleDeclarations() throws {
+        let transport = ScriptedTransport()
+        let declarations: [String: Any] = [
+            "routing/v1": ["consumers": [["name": "chat", "default_demand": 2]]],
+            "future/v2": ["unknown": [NSNull(), true, ["nested": "λ"]] as [Any]],
+        ]
+        try transport.append(makeFrame(
+            ty: .response,
+            channel: 0,
+            epoch: 0,
+            corr: 1,
+            json: ["modules": [[
+                "module_id": "provider",
+                "roles": [],
+                "control_ops": [],
+                "role_declarations": declarations,
+            ]]]
+        ))
+
+        let modules = try SubcClient(transport: transport).catalogList()
+        let retained = try XCTUnwrap(modules[0].roleDeclarations as? [String: Any])
+        XCTAssertEqual(retained as NSDictionary, declarations as NSDictionary)
     }
 
     func testStaleEpochIngressIsDroppedWithoutSettlingCurrentRequest() throws {

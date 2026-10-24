@@ -179,6 +179,22 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     assert_golden("principal_unverified", &Principal::Unverified);
     assert_golden("module_hello_body", &module_hello_body());
     assert_golden(
+        "module_hello_body_with_role_declarations",
+        &ModuleHelloBody {
+            manifest: ModuleManifest::builder("role-test", "1.0.0")
+                .role_declarations(
+                    serde_json::from_value(serde_json::json!({
+                        "routing/v1": {"consumers": [{"name": "chat", "default_demand": 2}]}
+                    }))
+                    .unwrap(),
+                )
+                .build(),
+            protocol_ver: subc_protocol::PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: None,
+        },
+    );
+    assert_golden(
         "module_hello_body_with_provenance",
         &module_hello_body_with_provenance(),
     );

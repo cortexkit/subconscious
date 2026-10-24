@@ -101,6 +101,8 @@ export interface ManifestInput {
   operation_delivery?: Record<string, string>;
   /** Opaque rich-UI manifest descriptor relayed to `catalog.list`. */
   rich_ui?: RichUiDescriptor;
+  /** Opaque per-role objects; each role owns its schema, and older daemons drop this field. */
+  role_declarations?: Record<string, Record<string, unknown>>;
 }
 
 /**
@@ -1688,6 +1690,9 @@ export function normalizeManifest(manifest: ManifestInput, sentNonce: string | u
       ? {}
       : { operation_delivery: { ...manifest.operation_delivery } }),
     ...(manifest.rich_ui === undefined ? {} : { rich_ui: { ...manifest.rich_ui } }),
+    ...(manifest.role_declarations === undefined || Object.keys(manifest.role_declarations).length === 0
+      ? {}
+      : { role_declarations: { ...manifest.role_declarations } }),
   };
 }
 

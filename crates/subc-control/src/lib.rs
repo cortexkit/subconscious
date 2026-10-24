@@ -2038,6 +2038,10 @@ pub struct CatalogEntry {
     /// The daemon does not fetch or interpret the manifest described here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rich_ui: Option<RichUiDescriptor>,
+    /// Opaque per-role objects mirrored unchanged from the registered manifest.
+    /// Each role owns its schema; the daemon validates only keys, shape and size.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub role_declarations: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
     /// True only when HELLO passes the launch-nonce check required for a reserved
     /// module or swap candidate.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -2065,6 +2069,7 @@ impl CatalogEntry {
             operation_delivery: BTreeMap::new(),
             operation_payload: BTreeMap::new(),
             rich_ui: None,
+            role_declarations: BTreeMap::new(),
             nonce_verified: false,
         }
     }
@@ -2136,6 +2141,16 @@ impl CatalogEntry {
     #[must_use]
     pub fn with_rich_ui(mut self, rich_ui: Option<RichUiDescriptor>) -> Self {
         self.rich_ui = rich_ui;
+        self
+    }
+
+    /// Set opaque per-role declarations mirrored from the registered manifest.
+    #[must_use]
+    pub fn with_role_declarations(
+        mut self,
+        role_declarations: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+    ) -> Self {
+        self.role_declarations = role_declarations;
         self
     }
 

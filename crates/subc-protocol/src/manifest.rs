@@ -16,6 +16,9 @@ use serde_json::Value;
 
 use crate::PROTOCOL_VERSION;
 
+/// Maximum compact JSON size of the complete per-role declaration map.
+pub const MAX_ROLE_DECLARATIONS_BYTES: usize = 16_384;
+
 /// A module's full declared participation in the subc mesh.
 ///
 /// Construct via [`ModuleManifest::builder()`], never a struct literal. Adding a
@@ -121,6 +124,16 @@ pub struct ModuleManifest {
     /// interpreting its schema or content. Absence preserves existing manifest bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rich_ui: Option<RichUiDescriptor>,
+    /// Opaque declarations keyed by role name, using the capability-name grammar.
+    ///
+    /// Each role's contract owns its entry's schema. The daemon never interprets
+    /// the content: it checks object shape, keys and the whole-map size limit,
+    /// then relays the map through `catalog.list`. Malformed or oversized maps
+    /// are dropped whole at HELLO with a warning, without refusing registration.
+    /// Older daemons silently drop unknown manifest fields, so modules may declare
+    /// entries before every daemon understands this slot.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub role_declarations: BTreeMap<String, serde_json::Map<String, Value>>,
 }
 
 /// Incrementally constructs a [`ModuleManifest`] without fabricating absent facts.
@@ -141,6 +154,7 @@ pub struct ModuleManifestBuilder {
     operation_delivery: BTreeMap<String, OperationDelivery>,
     operation_payload: BTreeMap<String, OperationPayload>,
     rich_ui: Option<RichUiDescriptor>,
+    role_declarations: BTreeMap<String, serde_json::Map<String, Value>>,
 }
 
 impl ModuleManifest {
@@ -171,6 +185,7 @@ impl ModuleManifest {
             operation_delivery: BTreeMap::new(),
             operation_payload: BTreeMap::new(),
             rich_ui: None,
+            role_declarations: BTreeMap::new(),
         }
     }
 
@@ -280,6 +295,15 @@ impl ModuleManifestBuilder {
         self
     }
 
+    /// Sets opaque declarations owned by each role's contract.
+    pub fn role_declarations(
+        mut self,
+        role_declarations: BTreeMap<String, serde_json::Map<String, Value>>,
+    ) -> Self {
+        self.role_declarations = role_declarations;
+        self
+    }
+
     /// Finishes the manifest.
     pub fn build(self) -> ModuleManifest {
         ModuleManifest {
@@ -298,6 +322,7 @@ impl ModuleManifestBuilder {
             operation_delivery: self.operation_delivery,
             operation_payload: self.operation_payload,
             rich_ui: self.rich_ui,
+            role_declarations: self.role_declarations,
         }
     }
 }
@@ -314,8 +339,10 @@ impl ModuleManifestBuilder {
 /// - There is deliberately NO untyped extension bag on this struct: a
 ///   retained-verbatim Value map becomes an unversioned de-facto wire
 ///   contract nobody authored (the drift class module-owned payload crates
-///   exist to prevent). When a daemon consumer materializes for a fact, the
-///   fact gets a typed optional field with a CONSUMER-IMPACT commit instead.
+///   exist to prevent). The explicit `role_declarations` slot is bounded and
+///   schema-owned by each role, not a catch-all for unknown manifest keys.
+///   If the daemon needs to interpret a value, expose it as a typed optional
+///   field in a dedicated change rather than reading it from `role_declarations`.
 ///
 /// `CapabilityDeclarations` below is strict by contrast because claims are
 /// routed on: an unparseable claim must refuse loudly, never partially apply.
@@ -352,6 +379,8 @@ struct ModuleManifestWire {
     // declarations cannot be omitted as runtime-varying data.
     #[serde(default)]
     runtime_computed: Option<Value>,
+    #[serde(default)]
+    role_declarations: Option<Value>,
 }
 
 impl<'de> Deserialize<'de> for ModuleManifest {
@@ -388,6 +417,12 @@ impl<'de> Deserialize<'de> for ModuleManifest {
                     .unwrap_or_default(),
             )
             .rich_ui(wire.rich_ui)
+            .role_declarations(
+                wire.role_declarations
+                    .filter(|value| validate_role_declarations_value(Some(value)).is_ok())
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default(),
+            )
             .operation_payload(wire.operation_payload)
             .build();
         manifest
@@ -401,6 +436,56 @@ impl<'de> Deserialize<'de> for ModuleManifest {
         }
         Ok(manifest)
     }
+}
+
+/// Why a complete role-declaration map must be dropped without refusing HELLO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleDeclarationsError(&'static str);
+
+impl fmt::Display for RoleDeclarationsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RoleDeclarationsError {}
+
+/// Checks raw HELLO declarations so the daemon can warn before lenient decoding.
+pub fn validate_hello_role_declarations(hello: &Value) -> Result<(), RoleDeclarationsError> {
+    validate_role_declarations_value(
+        hello
+            .get("manifest")
+            .and_then(|manifest| manifest.get("role_declarations")),
+    )
+}
+
+fn validate_role_declarations_value(value: Option<&Value>) -> Result<(), RoleDeclarationsError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let map = value
+        .as_object()
+        .ok_or(RoleDeclarationsError("role_declarations must be an object"))?;
+    for (role, declaration) in map {
+        if !is_valid_capability_identifier(role) {
+            return Err(RoleDeclarationsError(
+                "role_declarations key must use capability-name grammar",
+            ));
+        }
+        if !declaration.is_object() {
+            return Err(RoleDeclarationsError(
+                "role_declarations values must be objects",
+            ));
+        }
+    }
+    let bytes = serde_json::to_vec(value)
+        .map_err(|_| RoleDeclarationsError("role_declarations could not be serialized"))?;
+    if bytes.len() > MAX_ROLE_DECLARATIONS_BYTES {
+        return Err(RoleDeclarationsError(
+            "role_declarations exceeds 16384 compact JSON bytes",
+        ));
+    }
+    Ok(())
 }
 
 /// Opaque metadata locating a provider's rich-UI manifest.

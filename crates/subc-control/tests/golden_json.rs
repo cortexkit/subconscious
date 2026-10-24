@@ -62,6 +62,15 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
     }
     assert_golden("catalog_entry", &catalog_entry());
     assert_golden(
+        "catalog_entry_with_role_declarations",
+        &CatalogEntry::new("role-test", vec![], vec![]).with_role_declarations(
+            serde_json::from_value(serde_json::json!({
+                "routing/v1": {"consumers": [{"name": "chat", "default_demand": 2}]}
+            }))
+            .unwrap(),
+        ),
+    );
+    assert_golden(
         "catalog_entry_with_self_signals",
         &catalog_entry_with_self_signals(),
     );

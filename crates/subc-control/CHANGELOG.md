@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.1
+
+- Add `CatalogEntry::role_declarations` and `with_role_declarations`, mirroring opaque per-role objects from the registered manifest. Empty maps are omitted, preserving legacy catalog bytes. `CatalogEntry` remains non-exhaustive and builder-compatible.
+
 ## 0.33.0
 
 - Minor bump because this crate's public types come from subc-protocol, which moves to 0.33.0 (`ToolCallRequest` gains the optional `output_refs` member). A consumer that also depends on subc-protocol directly must move both together, or two incompatible copies of the protocol types would meet. No other change.

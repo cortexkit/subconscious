@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.22.10
+
+- Add optional opaque `role_declarations` objects to provider manifests and catalog entries. HELLO normalization preserves nonempty declarations without interpreting role-owned schemas and omits absent or empty maps, preserving legacy bytes. Older daemons silently drop the manifest field.
+
 ## 0.22.9
 
 - Add optional `rich_ui` metadata to provider manifests and catalog entries, and the optional `nonce_verified` catalog fact. Both fields are additive and absent from legacy HELLO/catalog bytes; TypeScript catalog decoding remains permissive.

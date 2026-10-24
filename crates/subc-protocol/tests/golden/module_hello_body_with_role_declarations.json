@@ -1,0 +1,20 @@
+{
+  "control_ops": null,
+  "manifest": {
+    "module_id": "role-test",
+    "module_version": "1.0.0",
+    "protocol_ver": 2,
+    "provides": [],
+    "role_declarations": {
+      "routing/v1": {
+        "consumers": [
+          {
+            "default_demand": 2,
+            "name": "chat"
+          }
+        ]
+      }
+    }
+  },
+  "protocol_ver": 2
+}

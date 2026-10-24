@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.3
+
+- Validate manifest `role_declarations` at HELLO for capability-name keys, object values and a 16,384-byte compact whole-map limit. Malformed or oversized maps are dropped whole with a WARN naming the module and reason, without refusing HELLO. Retain valid declarations in the registry and relay them unchanged through `catalog.list`, including after catalog updates, without interpreting any role's schema.
+
 ## 0.37.2
 
 - Reset process-local health samples and consecutive failures on every accepted spawn, including restarts, starts after failure, and promoted swap candidates. HTTP-only children now get a fresh full probe cadence (plus the existing jitter) to start instead of inheriting an overdue probe from their predecessor. Wire children still wait for HELLO. Health-triggered restarts keep spending the same restart budget; sustained failures still end in `failed`. Escalation history and restart ledgers remain available across replacements.

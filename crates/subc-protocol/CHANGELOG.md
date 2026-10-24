@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.1
+
+- Add the empty-omitted `ModuleManifest::role_declarations` map and builder method for opaque per-role JSON objects. Keys use capability-name grammar and the complete compact map is bounded by `MAX_ROLE_DECLARATIONS_BYTES` (16,384). Invalid maps are dropped whole without refusing HELLO; the daemon relays valid maps through `catalog.list` without interpreting role-owned schemas. Older daemons silently drop the field.
+
 ## 0.33.0
 
 - **Breaking for Rust struct literals.** `ToolCallRequest` gains `output_refs: Option<OutputRefs>`, the llm-runner's output-refs descriptor: which stored set of tool-output snapshots an agent's references resolved to, so a provider can read them back from the runner. It is a top-level member beside the arguments, so the model cannot write it; a runner attaches it only to a call whose provider declares `output_refs: true`. The struct stays exhaustive, so every module that builds one with a literal must decide what to send (`ToolCallRequest::new` sets `None`). The member is omitted when `None`, so every request without it keeps its exact bytes, and the struct still accepts unknown members, so providers on 0.32 ignore it.

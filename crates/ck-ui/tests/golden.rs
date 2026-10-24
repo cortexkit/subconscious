@@ -418,6 +418,17 @@ fn usage_120x36() {
     check("usage-120x36", &app, &snap);
 }
 
+/// Settings → Updates as the Upgrade frame draws it, before an upgrade
+/// runs: the fixture's plan rows, checked twelve minutes before the
+/// fixture's moment.
+#[test]
+fn upgrade_120x36() {
+    let mut app = app();
+    app.tab = Tab::Settings;
+    app.settings.section = 2;
+    check("upgrade-120x36", &app, &Snapshot::fixture());
+}
+
 /// The Agents frame: nothing selected, so no row is highlighted.
 #[test]
 fn agents_120x36() {

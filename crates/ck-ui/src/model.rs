@@ -795,6 +795,9 @@ pub struct Snapshot {
     /// moves on every reconnect, which tells the app that a preview it is
     /// still waiting for may never be answered and must be asked for again.
     pub daemon_connection: u64,
+    /// Settings → Updates: the session's update check and the run started
+    /// from it.
+    pub upgrade: crate::upgrade::Updates,
 }
 
 /// The app's tabs, in the order the tab bar draws them.
@@ -1224,6 +1227,37 @@ mod fixture {
         parse_duration(text).map(|secs| now.add_secs(secs))
     }
 
+    /// Settings → Updates as the Upgrade frame draws it: the file's plan
+    /// rows, checked twelve minutes before `now`, the frame's "Checked 12
+    /// minutes ago". A row replaces its component when its versions differ,
+    /// and the row named "daemon …" is the daemon.
+    fn upgrade(v: &Value, now: Timestamp) -> crate::upgrade::Updates {
+        use crate::upgrade::{Checked, PlanRow, Updates, UpgradeCheck};
+        let rows = arr(&v["upgrade"])
+            .iter()
+            .map(|r| PlanRow {
+                component: s(&r[0]),
+                installed: s(&r[1]),
+                new: s(&r[2]),
+                what: s(&r[3]),
+                replaces: r[1] != r[2],
+                daemon: s(&r[0]).starts_with("daemon"),
+            })
+            .collect();
+        Updates {
+            served: true,
+            check: Some(Checked {
+                at: now.add_secs(-12.0 * 60.0),
+                result: Ok(UpgradeCheck {
+                    rows,
+                    refusal: None,
+                    stages: Vec::new(),
+                }),
+            }),
+            run: None,
+        }
+    }
+
     pub(super) fn build(json: &str) -> Result<Snapshot, String> {
         let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
         let now = Timestamp::parse_utc(v["now_utc"].as_str().ok_or("now_utc")?)
@@ -1553,6 +1587,7 @@ mod fixture {
             previews: Vec::new(),
             applies: Vec::new(),
             daemon_connection: 0,
+            upgrade: upgrade(&v, now),
         })
     }
 }

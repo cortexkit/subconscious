@@ -158,6 +158,9 @@ pub struct LiveOptions {
     pub utc_offset: UtcOffset,
     /// The home folder, for showing paths under it as `~/…`.
     pub home: Option<String>,
+    /// The setup engine behind Settings → Updates. Without one, Updates
+    /// says this program can't check for updates.
+    pub upgrade: Option<Arc<dyn crate::upgrade::UpgradeService>>,
 }
 
 impl LiveOptions {
@@ -168,6 +171,7 @@ impl LiveOptions {
             host_label: "This computer".into(),
             utc_offset: local_utc_offset(),
             home: home_folder(),
+            upgrade: None,
         }
     }
 }
@@ -414,6 +418,9 @@ pub struct State {
     pub apply_seq: u64,
     /// How many times the live layer has connected to the daemon.
     pub daemon_connection: u64,
+    /// The session's update check and the run started from Settings →
+    /// Updates.
+    pub upgrade: crate::upgrade::Updates,
 }
 
 /// How many pairing results the snapshot keeps. The app applies them as
@@ -476,6 +483,10 @@ impl State {
             applies: std::collections::VecDeque::new(),
             apply_seq: 1,
             daemon_connection: 0,
+            upgrade: crate::upgrade::Updates {
+                served: options.upgrade.is_some(),
+                ..crate::upgrade::Updates::default()
+            },
         }
     }
 
@@ -513,6 +524,7 @@ impl State {
             host_label: host_label.into(),
             utc_offset: UtcOffset::UTC,
             home: None,
+            upgrade: None,
         })
     }
 
@@ -960,6 +972,7 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
         applies: state.applies.iter().cloned().collect(),
         daemon_connection: state.daemon_connection,
         settings: state.settings.clone(),
+        upgrade: state.upgrade.clone(),
     }
 }
 

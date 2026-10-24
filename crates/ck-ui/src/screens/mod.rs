@@ -12,6 +12,7 @@ pub mod overlays;
 pub mod pairing;
 pub mod save;
 pub mod settings;
+pub mod upgrade;
 pub mod usage;
 
 use crate::draw::{chrome, frame_end, trunc, Canvas};

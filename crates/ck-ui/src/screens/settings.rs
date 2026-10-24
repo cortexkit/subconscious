@@ -1090,41 +1090,38 @@ pub fn draw(c: &mut Canvas, v: &View, state: &SettingsState) {
             if i == state.section { St::B } else { St::D },
         );
         c.put(2, y, if i == state.section { "▸" } else { " " }, St::A);
-        if design && i == 2 {
+        // Updates is marked once this session's check found a newer
+        // version.
+        if i == 2 && snap.upgrade.marked() {
             c.put(nav - 3, y, "●", St::A);
         }
     }
     let sx = nav + 3;
+    if state.section == 2 {
+        super::upgrade::draw(c, v, sx);
+        return;
+    }
     if state.section >= 2 {
         c.put(sx, 3, SECTIONS[state.section], St::B);
-        if state.section == 3 {
-            c.put(sx, 6, &format!("ck {}", crate::ck_version()), St::NONE);
-            let daemon = match &snap.daemon.data {
-                Daemon::Running(d) => d.version.as_str(),
-                _ => "unknown",
-            };
-            c.put(sx, 8, &format!("Daemon {daemon}"), St::NONE);
-            let path = state.reading.config_path.as_deref().unwrap_or("unknown");
-            c.put(
-                sx,
-                10,
-                &trunc(
-                    &format!(
-                        "Config {}",
-                        display_value(path, snap.host.data.home.as_deref())
-                    ),
-                    (c.w - sx - 2) as usize,
+        c.put(sx, 6, &format!("ck {}", crate::ck_version()), St::NONE);
+        let daemon = match &snap.daemon.data {
+            Daemon::Running(d) => d.version.as_str(),
+            _ => "unknown",
+        };
+        c.put(sx, 8, &format!("Daemon {daemon}"), St::NONE);
+        let path = state.reading.config_path.as_deref().unwrap_or("unknown");
+        c.put(
+            sx,
+            10,
+            &trunc(
+                &format!(
+                    "Config {}",
+                    display_value(path, snap.host.data.home.as_deref())
                 ),
-                St::D,
-            );
-        } else {
-            c.put(
-                sx,
-                6,
-                "Update checks will appear here when available.",
-                St::D,
-            );
-        }
+                (c.w - sx - 2) as usize,
+            ),
+            St::D,
+        );
     } else if !state.reading.editable() {
         c.put(sx, 3, SECTIONS[state.section], St::B);
         // Wrap the compatibility explanation rather than losing its update instruction.

@@ -241,7 +241,7 @@ fn modules_e_opens_the_selected_config_entry_and_sections_are_keyboard_reachable
     assert!(app.showing(&snap).updates);
     assert!(render(&app, &snap, 120, 36)
         .join("\n")
-        .contains("Update checks"));
+        .contains("CortexKit 0.20.110 is available"));
     press(&mut app, &snap, KeyCode::Down);
     let about = render(&app, &snap, 120, 36).join("\n");
     assert!(about.contains(&format!("ck {}", ck_ui::ck_version())));

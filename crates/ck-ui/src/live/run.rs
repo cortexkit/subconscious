@@ -65,6 +65,9 @@ struct Shared {
     /// The latest reply or error recorded for each daemon and module
     /// request, for diagnosis.
     raw: Arc<Mutex<BTreeMap<String, String>>>,
+    /// The setup engine behind Settings → Updates, when the program running
+    /// the app supplied one.
+    upgrade: Option<Arc<dyn crate::upgrade::UpgradeService>>,
 }
 
 /// One connection and the module routes opened on it. Routes are opened
@@ -129,10 +132,21 @@ pub(super) fn spawn(
         demand: watch::Sender::new(schedule::wanted(&schedule::Showing::default())),
         identity_ready: Notify::new(),
         raw,
+        upgrade: options.upgrade.clone(),
     });
     tokio::spawn(supervise(Arc::clone(&shared), options.connection_file));
     tokio::spawn(handle_requests(Arc::clone(&shared), requests));
     let gate = shared.gate();
+    // The update check needs no daemon, so it runs outside the connection's
+    // sources and survives a reconnect: once per session, the first time
+    // Settings → Updates shows.
+    if shared.upgrade.is_some() {
+        schedule::gated_once(
+            &gate,
+            Source::UpgradeCheck,
+            check_updates(Arc::clone(&shared)),
+        );
+    }
     tokio::spawn(host_facts(shared, gate));
 }
 
@@ -1274,6 +1288,7 @@ async fn handle_requests(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Re
             Request::RescanPreview { ticket, candidate } => {
                 tokio::spawn(rescan_preview(Arc::clone(&shared), ticket, candidate));
             }
+            Request::Upgrade => start_upgrade(&shared),
             Request::RescanApply {
                 revision,
                 expect,
@@ -1311,6 +1326,70 @@ async fn handle_requests(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Re
 }
 
 struct DaemonApply(Arc<Shared>);
+
+/// The session's update check: the setup engine plans an upgrade, off the
+/// async runtime because planning reads the release index and runs the
+/// installed binaries for their versions.
+async fn check_updates(shared: Arc<Shared>) {
+    let Some(service) = shared.upgrade.clone() else {
+        return;
+    };
+    let result = tokio::task::spawn_blocking(move || service.check())
+        .await
+        .unwrap_or_else(|e| Err(format!("the update check stopped: {e}")));
+    shared.update(|s| {
+        s.upgrade.check = Some(crate::upgrade::Checked { at: now(), result });
+    });
+}
+
+/// Starts the run the wizard confirmed, unless one is already running. The
+/// stages the check planned show as pending until the run's own plan
+/// arrives. The run is not tied to the daemon connection: it restarts the
+/// daemon, and its reports keep arriving while the live layer reconnects.
+fn start_upgrade(shared: &Arc<Shared>) {
+    let Some(service) = shared.upgrade.clone() else {
+        return;
+    };
+    let mut started = false;
+    shared.update(|s| {
+        if s.upgrade.running() {
+            return;
+        }
+        let stages = s
+            .upgrade
+            .plan()
+            .map(|p| p.stages.clone())
+            .unwrap_or_default();
+        s.upgrade.run = Some(crate::upgrade::Run::new(now(), &stages));
+        started = true;
+    });
+    if !started {
+        return;
+    }
+    let shared = Arc::clone(shared);
+    tokio::spawn(async move {
+        let reporter = Arc::clone(&shared);
+        let outcome = tokio::task::spawn_blocking(move || {
+            service.run(&mut |event| {
+                reporter.update(|s| {
+                    if let Some(run) = &mut s.upgrade.run {
+                        run.record(event);
+                    }
+                })
+            })
+        })
+        .await
+        .unwrap_or_else(|e| crate::upgrade::UpgradeOutcome {
+            installed: Vec::new(),
+            error: Some(format!("the upgrade stopped: {e}")),
+        });
+        shared.update(|s| {
+            if let Some(run) = &mut s.upgrade.run {
+                run.outcome = Some((now(), outcome));
+            }
+        });
+    });
+}
 
 impl super::apply::Service for DaemonApply {
     fn rescan(

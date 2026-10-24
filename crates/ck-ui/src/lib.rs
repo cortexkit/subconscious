@@ -19,6 +19,7 @@ pub mod save_file;
 pub mod screens;
 pub mod theme;
 pub mod time;
+pub mod upgrade;
 
 pub use app::{run, run_with, App, Request, RunOptions};
 pub use model::Snapshot;

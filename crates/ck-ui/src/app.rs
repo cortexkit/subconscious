@@ -82,6 +82,9 @@ pub enum Request {
         expect: subc_control::RescanExpect,
         restarts: Vec<String>,
     },
+    /// Run the upgrade Settings → Updates planned, after the person
+    /// confirmed it.
+    Upgrade,
 }
 
 /// A question waiting for an answer before an action is sent.
@@ -151,6 +154,8 @@ pub struct App {
     pub redact: bool,
     /// Requests made since the run loop last collected them.
     pub requests: Vec<Request>,
+    /// The upgrade confirmation is open over Settings → Updates.
+    pub upgrade_confirm: bool,
 }
 
 impl App {
@@ -183,6 +188,7 @@ impl App {
             applies_seen: 0,
             redact: false,
             requests: Vec::new(),
+            upgrade_confirm: false,
         }
     }
 
@@ -285,21 +291,26 @@ impl App {
             redact: self.redact,
         };
         if let Daemon::Down(d) = &snap.daemon.data {
-            if self.down_log {
-                let panel = Panel::new(
-                    snap.daemon.received_at,
-                    LogView {
-                        module: "daemon".into(),
-                        lines: d.log_tail.clone(),
-                        source: "the daemon's own log".into(),
-                    },
-                );
-                screens::logs::draw(&mut c, &v, &panel, &LogState::default());
-            } else {
-                screens::down::draw(&mut c, &v, d);
+            // An upgrade restarts the daemon on purpose; its wizard stays on
+            // screen until the daemon is back rather than giving way to the
+            // daemon-down screen.
+            if !upgrade_holds_screen(snap, now) {
+                if self.down_log {
+                    let panel = Panel::new(
+                        snap.daemon.received_at,
+                        LogView {
+                            module: "daemon".into(),
+                            lines: d.log_tail.clone(),
+                            source: "the daemon's own log".into(),
+                        },
+                    );
+                    screens::logs::draw(&mut c, &v, &panel, &LogState::default());
+                } else {
+                    screens::down::draw(&mut c, &v, d);
+                }
+                self.draw_quit_question(&mut c);
+                return;
             }
-            self.draw_quit_question(&mut c);
-            return;
         }
         match (
             self.shown_tab(snap),
@@ -339,6 +350,17 @@ impl App {
                 ActionKind::Start => "Start",
             };
             overlays::confirm(&mut c, &title, std::slice::from_ref(&q.consequence), yes);
+            return;
+        }
+        if self.upgrade_confirm {
+            if let Some(plan) = snap.upgrade.plan() {
+                overlays::confirm(
+                    &mut c,
+                    "Upgrade CortexKit?",
+                    &screens::upgrade::confirmation(plan),
+                    "Upgrade",
+                );
+            }
             return;
         }
         match self.overlay {
@@ -383,6 +405,17 @@ impl App {
             self.settings.quit_asked = false;
             return true;
         }
+        if self.upgrade_confirm {
+            return self.upgrade_confirm_key(key);
+        }
+        if matches!(snap.daemon.data, Daemon::Down(_))
+            && upgrade_holds_screen(snap, snap.daemon.received_at)
+        {
+            // The daemon-down screen isn't showing, so none of its keys act:
+            // in particular ⏎ must not start a daemon the upgrade is
+            // restarting.
+            return false;
+        }
         if matches!(snap.daemon.data, Daemon::Down(_)) {
             match key.code {
                 KeyCode::Char('q') => self.request_quit(),
@@ -401,6 +434,11 @@ impl App {
             return self.pairing_key(key, snap);
         }
         if self.overlay.is_none() && self.tab == Tab::Settings {
+            if self.settings.section == 2 && !self.settings.save.open {
+                if let Some(handled) = self.updates_key(key, snap) {
+                    return handled;
+                }
+            }
             let handled = if self.settings.save.open {
                 Some(self.settings.save_key(key, self.size, snap.serves.save))
             } else {
@@ -777,6 +815,45 @@ impl App {
                 }
             }
             KeyCode::Esc | KeyCode::Char('n') => self.confirm = None,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Keys for Settings → Updates: ⏎ asks to run the planned upgrade, `l`
+    /// (later) goes back to Settings' first section. Nothing is written
+    /// anywhere, so the next session checks and offers it again. `None`
+    /// leaves the key to Settings.
+    fn updates_key(&mut self, key: KeyEvent, snap: &Snapshot) -> Option<bool> {
+        let updates = &snap.upgrade;
+        match key.code {
+            KeyCode::Enter => {
+                let offered = updates.run.is_none()
+                    && updates
+                        .plan()
+                        .is_some_and(crate::upgrade::UpgradeCheck::newer);
+                if offered {
+                    self.upgrade_confirm = true;
+                }
+                Some(offered)
+            }
+            KeyCode::Char('l') if !updates.running() => {
+                self.settings.section = 0;
+                self.settings.focus = 0;
+                Some(true)
+            }
+            _ => None,
+        }
+    }
+
+    /// The upgrade confirmation: ⏎ runs it, esc goes back.
+    fn upgrade_confirm_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Enter => {
+                self.upgrade_confirm = false;
+                self.requests.push(Request::Upgrade);
+            }
+            KeyCode::Esc => self.upgrade_confirm = false,
             _ => return false,
         }
         true
@@ -1285,6 +1362,25 @@ impl App {
             MouseEventKind::ScrollDown => self.move_by(1, snap),
             _ => false,
         }
+    }
+}
+
+/// How long after an upgrade run ends its wizard keeps the screen while
+/// the daemon is still down: long enough for the live layer, which looks for
+/// the daemon every two seconds, to reconnect to the one the run restarted.
+const UPGRADE_RECONNECT_GRACE_SECS: f64 = 10.0;
+
+/// Whether Settings → Updates keeps the screen while the daemon is down:
+/// its run is going (an upgrade restarts the daemon on purpose), or it ended
+/// moments before `now`. Past that, a daemon that is still down gets the
+/// daemon-down screen and its start key.
+pub fn upgrade_holds_screen(snap: &Snapshot, now: Timestamp) -> bool {
+    match &snap.upgrade.run {
+        None => false,
+        Some(run) => match &run.outcome {
+            None => true,
+            Some((at, _)) => now.secs_since(*at) < UPGRADE_RECONNECT_GRACE_SECS,
+        },
     }
 }
 

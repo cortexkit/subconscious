@@ -66,10 +66,10 @@ build_timeout_s = 1800
 id = "sdk-health-bypasses-data-permits"
 guards = "Health answers while all data request permits are occupied"
 file = "crates/subc-client-rs/src/lib.rs"
-old = "let report = dispatcher.fold_health(handler.health().await);"
+old = "let report = catch_handler_panic(async { handler.health().await }).await;"
 new = """
 let _permit = dispatcher.pools.default.permits.acquire().await.unwrap(); // NON-VACUITY BREAK
-            let report = dispatcher.fold_health(handler.health().await);"""
+                let report = catch_handler_panic(async { handler.health().await }).await;"""
 edits = []
 test_file = "crates/subc-client-rs/src/lib.rs"
 runner = "nextest"

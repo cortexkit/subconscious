@@ -317,16 +317,22 @@ fn a_ready_preview_allows_saving_exactly_the_previewed_text() {
         ready(json!([restart("broca", json!([]))]), &[], &[], &[]),
     );
     app.on_snapshot(&snap, Snapshot::fixture_now());
-    press(&mut app, &snap, KeyCode::Char('s'));
-    let order = app.settings.save.order.clone().expect("s asks for a save");
+    let order = app
+        .settings
+        .save
+        .order(SaveMode::Only, &app.settings.candidate)
+        .expect("s can save");
     assert_eq!(order.mode, SaveMode::Only);
     assert_eq!(order.candidate, candidate);
     assert_eq!(order.revision, ticket.revision);
     assert_eq!(order.restarts, vec!["broca"]);
     assert_eq!(order.expect.staged_generation.counter, 2);
-    press(&mut app, &snap, KeyCode::Enter);
     assert_eq!(
-        app.settings.save.order.as_ref().unwrap().mode,
+        app.settings
+            .save
+            .order(SaveMode::Apply, &app.settings.candidate)
+            .unwrap()
+            .mode,
         SaveMode::Apply
     );
 }
@@ -496,8 +502,11 @@ fn a_reconnect_drops_outstanding_previews_and_previews_again() {
 
     reply(&mut snap, again, ready(json!([]), &[], &[], &[]));
     app.on_snapshot(&snap, Snapshot::fixture_now());
-    press(&mut app, &snap, KeyCode::Enter);
-    assert!(app.settings.save.order.is_some());
+    assert!(app
+        .settings
+        .save
+        .order(SaveMode::Apply, &app.settings.candidate)
+        .is_some());
     assert_eq!(app.settings.changes(), 1, "edits stay across a reconnect");
 }
 
@@ -532,8 +541,7 @@ fn undo_makes_a_new_revision_and_w_needs_a_change() {
 #[test]
 fn the_live_app_without_save_shows_no_save_button_and_its_keys_do_nothing() {
     let (mut app, mut snap) = session(0, false);
-    // The live build doesn't write files yet.
-    assert!(!std::hint::black_box(Serves::LIVE).save);
+    assert!(std::hint::black_box(Serves::LIVE).save);
     toggle(&mut app, &snap);
     let footer = render(&app, &snap, 120, 36).last().unwrap().clone();
     assert!(footer.contains("w  review"), "{footer}");

@@ -74,6 +74,15 @@ pub struct SaveState {
     connection: u64,
     /// The latest save asked for with a preview that allowed it.
     pub order: Option<SaveOrder>,
+    /// A written candidate may be explicitly retried after a refusal, but never
+    /// after losing its acknowledgement.
+    pub retry: Option<SaveOrder>,
+    pub applying: bool,
+    pub unknown: bool,
+    pub recheck_disk: bool,
+    pub notice: Option<String>,
+    pub conflicts: Vec<crate::save_file::Conflict>,
+    pub conflict: usize,
 }
 
 impl SaveState {
@@ -86,6 +95,10 @@ impl SaveState {
         self.pending = None;
         self.outcome = None;
         self.order = None;
+        self.retry = None;
+        self.unknown = false;
+        self.recheck_disk = false;
+        self.notice = None;
         if preview {
             self.request(candidate);
         } else {
@@ -134,6 +147,9 @@ impl SaveState {
         self.pending = None;
         self.outcome = None;
         self.order = None;
+        if self.applying || self.retry.is_some() || self.unknown || self.recheck_disk {
+            return true;
+        }
         if preview {
             self.request(candidate);
         }
@@ -166,6 +182,16 @@ impl SaveState {
     /// one: it has arrived, the daemon could load the text, and it carries
     /// the value an apply needs.
     pub fn order(&self, mode: SaveMode, candidate: &str) -> Option<SaveOrder> {
+        if self.applying || self.unknown || self.recheck_disk || !self.conflicts.is_empty() {
+            return None;
+        }
+        if mode == SaveMode::Apply {
+            if let Some(order) = &self.retry {
+                return Some(order.clone());
+            }
+        } else if self.retry.is_some() {
+            return None;
+        }
         let preview = self.preview()?;
         Some(SaveOrder {
             mode,
@@ -411,6 +437,27 @@ fn after_rows(save: &SaveState, w: i32) -> Vec<Row> {
             .map(|l| Row::one(l, st))
             .collect()
     };
+    if !save.conflicts.is_empty() {
+        let mut rows = save
+            .notice
+            .as_ref()
+            .map(|notice| lines(notice, St::W))
+            .unwrap_or_default();
+        rows.extend(save.conflicts.iter().enumerate().flat_map(|(i, conflict)| {
+            lines(
+                &format!(
+                    "{} {} changed on disk · k keep mine · d drop mine",
+                    if i == save.conflict { "›" } else { " " },
+                    conflict.path.join(".")
+                ),
+                St::W,
+            )
+        }));
+        return rows;
+    }
+    if let Some(notice) = &save.notice {
+        return lines(notice, St::W);
+    }
     match (&save.pending, &save.outcome) {
         (None, Some(PreviewOutcome::Refused(message))) => lines(message, St::E),
         (None, Some(PreviewOutcome::Failed(code))) => {

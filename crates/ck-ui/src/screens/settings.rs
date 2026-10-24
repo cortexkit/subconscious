@@ -50,8 +50,7 @@ pub struct SettingsState {
     pub quit_asked: bool,
     /// The candidate's revisions, their previews and the Save overlay.
     pub save: SaveState,
-    /// Unit tests set this to change the candidate right after a text
-    /// edit, standing in for an edit that lands in the wrong place.
+    /// Unit tests corrupt text-edit results to exercise the exact-edit guards.
     #[cfg(test)]
     after_edit: Option<fn(&mut String)>,
 }
@@ -216,6 +215,9 @@ impl SettingsState {
             self.quit_asked = false;
             self.original.clear();
             self.candidate.clear();
+            self.save.retry = None;
+            self.save.applying = false;
+            self.save.conflicts.clear();
         }
         if changed_path || self.original.is_empty() {
             if let Some(text) = &reading.text {
@@ -253,11 +255,71 @@ impl SettingsState {
     pub fn absorb(&mut self, reply: &PreviewReply) -> bool {
         self.save.absorb(reply)
     }
-    /// Keys while the Save overlay shows. It takes every key: `esc` closes
-    /// it with the edits kept, the arrows and PgUp/PgDn scroll the diff,
-    /// and `⏎` or `s` ask for a save only when this build writes files and
-    /// the preview of the revision on screen allows it.
+    /// Save owns the keyboard until it closes. An apply in flight ignores keys;
+    /// conflicts require explicit keep/drop decisions. Otherwise the arrows
+    /// scroll the diff and escape keeps the edits. Fresh saves require a ready
+    /// preview of the current revision. Enter can also retry a refused apply
+    /// from its cached order, or re-read the disk file for a fresh preview after
+    /// the apply precondition changed.
     pub fn save_key(&mut self, key: KeyEvent, size: (u16, u16), serves_save: bool) -> bool {
+        if self.save.applying {
+            return true;
+        }
+        if !self.save.conflicts.is_empty() {
+            match key.code {
+                KeyCode::Up => self.save.conflict = self.save.conflict.saturating_sub(1),
+                KeyCode::Down => {
+                    self.save.conflict = (self.save.conflict + 1).min(self.save.conflicts.len() - 1)
+                }
+                KeyCode::Char('k' | 'd') => {
+                    let conflict = self.save.conflicts[self.save.conflict].clone();
+                    if key.code == KeyCode::Char('d') {
+                        #[cfg(test)]
+                        let after_edit = self.after_edit;
+                        if let Err(error) = crate::save_file::replace_with(
+                            &mut self.candidate,
+                            &conflict.path,
+                            conflict.disk.as_ref(),
+                            |_text| {
+                                #[cfg(test)]
+                                if let Some(hook) = after_edit {
+                                    hook(_text);
+                                }
+                            },
+                        ) {
+                            self.save.notice = Some(error);
+                            return true;
+                        }
+                    }
+                    self.save.conflicts.remove(self.save.conflict);
+                    self.save.conflict = self
+                        .save
+                        .conflict
+                        .min(self.save.conflicts.len().saturating_sub(1));
+                    self.revised();
+                    if !self.dirty() {
+                        self.save.ensure(&self.candidate);
+                    }
+                    self.save.open = true;
+                }
+                KeyCode::Esc => self.save.open = false,
+                _ => {}
+            }
+            return true;
+        }
+        if key.code == KeyCode::Enter && self.save.recheck_disk && serves_save {
+            let path = self.reading.config_path.as_deref().unwrap();
+            match subc_jsonc::read_document(std::path::Path::new(path)) {
+                Ok((text, _)) => {
+                    self.original = text.clone();
+                    self.candidate = text;
+                    self.save.revise(&self.candidate, true);
+                    self.save.open = true;
+                }
+                Err(error) => self.save.notice = Some(error),
+            }
+            return true;
+        }
         let (last, page) = save::scroll_limits(
             &self.save,
             &self.original,
@@ -285,6 +347,104 @@ impl SettingsState {
             _ => {}
         }
         true
+    }
+
+    /// Writes once. A changed file is rebased for review and never replaced by
+    /// this attempt. A successful write becomes the baseline even if apply fails.
+    pub fn write_order(&mut self, order: &super::save::SaveOrder) -> bool {
+        if self.save.retry.is_some() {
+            return true;
+        }
+        let Some(path) = self.reading.config_path.as_deref() else {
+            return false;
+        };
+        match crate::save_file::write(std::path::Path::new(path), &self.original, &order.candidate)
+        {
+            Ok(_) => {
+                self.original = order.candidate.clone();
+                self.candidate = order.candidate.clone();
+                self.undo.clear();
+                self.quit_asked = false;
+                if order.mode == SaveMode::Only {
+                    self.save.open = false;
+                    self.save.outcome = None;
+                    self.notice = Some("Saved; not applied".into());
+                } else {
+                    self.save.retry = Some(order.clone());
+                }
+                true
+            }
+            Err(crate::save_file::WriteError::Changed(disk)) => {
+                #[cfg(test)]
+                let after_edit = self.after_edit;
+                match crate::save_file::rebase_with(
+                    &self.original,
+                    &self.candidate,
+                    &disk,
+                    |_text| {
+                        #[cfg(test)]
+                        if let Some(hook) = after_edit {
+                            hook(_text);
+                        }
+                    },
+                ) {
+                    Ok((candidate, conflicts)) => {
+                        self.original = disk;
+                        self.candidate = candidate;
+                        self.undo.clear();
+                        self.revised();
+                        self.save.conflicts = conflicts;
+                        self.save.conflict = 0;
+                        self.save.open = true;
+                        self.save.notice =
+                            Some("The file changed on disk; review the new diff".into());
+                    }
+                    Err(error) => self.save.notice = Some(error),
+                }
+                false
+            }
+            Err(crate::save_file::WriteError::Failed(error)) => {
+                self.save.notice = Some(format!("Couldn't save: {error}"));
+                false
+            }
+        }
+    }
+
+    pub fn applied(&mut self, reply: &crate::live::settings::ApplyReply) -> bool {
+        if !self.save.applying
+            || self.save.retry.as_ref().map(|o| o.revision) != Some(reply.revision)
+        {
+            return false;
+        }
+        self.save.applying = false;
+        match &reply.outcome {
+            crate::live::settings::ApplyOutcome::Ready(_) => {
+                self.save.open = false;
+                self.save.retry = None;
+                self.save.outcome = None;
+                self.save.notice = None;
+                true
+            }
+            crate::live::settings::ApplyOutcome::Refused(code)
+                if code == "config_changed_since_preview" =>
+            {
+                self.save.retry = None;
+                self.save.recheck_disk = true;
+                self.save.notice = Some("The configuration changed after the preview; nothing was applied · ⏎ checks again".into());
+                false
+            }
+            crate::live::settings::ApplyOutcome::Refused(code) => {
+                self.save.notice = Some(format!("Saved, not applied: {code}"));
+                false
+            }
+            crate::live::settings::ApplyOutcome::Unknown => {
+                self.save.retry = None;
+                self.save.unknown = true;
+                self.save.notice =
+                    Some("Saved; whether it applied is unknown · check ck module list".into());
+                false
+            }
+        }
     }
     pub fn document(&self) -> Value {
         subc_jsonc::jsonc_to_json(&self.candidate)
@@ -1178,7 +1338,9 @@ pub fn draw(c: &mut Canvas, v: &View, state: &SettingsState) {
                         restarts.join(", ")
                     )
                 };
-                let key = if snap.serves.save {
+                let key = if snap.serves.save && dw < 40 {
+                    " w  save "
+                } else if snap.serves.save {
                     " w  review and save "
                 } else {
                     " w  review "
@@ -1421,5 +1583,152 @@ mod tests {
         assert_eq!(state.document()["modules"]["broca"]["enabled"], false);
         assert_eq!(state.save.outbox.len(), 1);
         assert_eq!(state.notice, None);
+    }
+
+    fn staged_argument(path: &std::path::Path) -> SettingsState {
+        std::fs::write(path, BEFORE).unwrap();
+        let mut state = SettingsState::default();
+        state.observe(&SettingsReading {
+            config_path: Some(path.to_string_lossy().into_owned()),
+            capable: true,
+            text: Some(BEFORE.into()),
+            error: None,
+        });
+        state.selected = Some("broca".into());
+        state.apply(&Target::Argument(0), "--mine", None, false);
+        state.save.open = true;
+        state.save.outbox.clear();
+        state.save.pending = None;
+        state
+    }
+
+    fn save_order(state: &SettingsState) -> save::SaveOrder {
+        save::SaveOrder {
+            mode: SaveMode::Only,
+            revision: state.save.revision,
+            candidate: state.candidate.clone(),
+            expect: serde_json::from_value(json!({
+                "config_sha256": "ab".repeat(32),
+                "staged_generation": {"incarnation": "test", "counter": 1}
+            }))
+            .unwrap(),
+            restarts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rebase_refuses_an_edit_that_landed_in_the_wrong_place() {
+        let root = cortexkit_test_support::ScratchDir::new("settings-exact-rebase");
+        let path = root.join("subc.jsonc");
+        let mut state = staged_argument(&path);
+        let order = save_order(&state);
+        let disk = BEFORE.replace("A comment", "Another writer's comment");
+        std::fs::write(&path, &disk).unwrap();
+        let candidate = state.candidate.clone();
+        let undo = state.undo.clone();
+        let revision = state.save.revision;
+        state.after_edit = Some(|text| {
+            *text = text
+                .replace("/example/ck-other", "/example/elsewhere")
+                .replace("/example/ck-broca", "/example/misplaced");
+        });
+
+        assert!(!state.write_order(&order));
+        assert_eq!(state.save.notice.as_deref(), Some("Couldn't rebase your edits onto the changed file (modules.broca.program); nothing was saved"));
+        assert_eq!(state.original, BEFORE);
+        assert_eq!(state.candidate, candidate, "the staged text is untouched");
+        assert_eq!(state.undo, undo);
+        assert_eq!(state.save.revision, revision);
+        assert!(state.save.open);
+        assert!(state.save.conflicts.is_empty());
+        assert!(
+            state.save.outbox.is_empty(),
+            "wrong text is never previewed"
+        );
+        assert!(state.save.pending.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), disk);
+        assert_eq!(
+            std::fs::read_dir(root.path()).unwrap().count(),
+            1,
+            "no backup or replacement was written"
+        );
+
+        state.after_edit = None;
+        assert!(
+            !state.write_order(&order),
+            "a successful rebase still requires review"
+        );
+        assert_eq!(state.original, disk);
+        assert_eq!(state.document()["modules"]["broca"]["args"][0], "--mine");
+        assert_eq!(
+            state.document()["modules"]["broca"]["program"],
+            "/example/ck-broca"
+        );
+        assert_eq!(state.save.outbox.len(), 1);
+    }
+
+    #[test]
+    fn conflict_drop_refuses_an_edit_that_landed_in_the_wrong_place() {
+        let root = cortexkit_test_support::ScratchDir::new("settings-exact-conflict-drop");
+        let path = root.join("subc.jsonc");
+        let mut state = staged_argument(&path);
+        let disk = BEFORE.replace("--one", "--theirs");
+        std::fs::write(&path, &disk).unwrap();
+        assert!(!state.write_order(&save_order(&state)));
+        assert_eq!(state.save.conflicts.len(), 1);
+        state.save.outbox.clear();
+        state.save.pending = None;
+        let candidate = state.candidate.clone();
+        let revision = state.save.revision;
+        state.after_edit = Some(|text| {
+            *text = text.replace("/example/ck-other", "/example/elsewhere");
+        });
+        let drop = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE);
+
+        state.save_key(drop, (120, 36), true);
+        assert_eq!(
+            state.save.notice.as_deref(),
+            Some("Couldn't drop your edit (modules.other.program); the conflict is still open")
+        );
+        assert_eq!(
+            state.candidate, candidate,
+            "the failed drop is transactional"
+        );
+        assert_eq!(state.original, disk);
+        assert_eq!(state.save.conflicts.len(), 1);
+        assert_eq!(
+            state.save.conflicts[0].path,
+            self::path("modules.broca.args.0")
+        );
+        assert_eq!(state.save.revision, revision);
+        assert!(state.save.open);
+        assert!(
+            state.save.outbox.is_empty(),
+            "wrong text is never previewed"
+        );
+        assert!(state.save.pending.is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), disk);
+
+        let mut app = crate::App::new(crate::Theme::test());
+        app.tab = Tab::Settings;
+        app.settings = state.clone();
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 120, 36));
+        app.render(
+            &mut buffer,
+            &crate::Snapshot::fixture(),
+            crate::Snapshot::fixture_now(),
+        );
+        let shown: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            shown.contains("Couldn't drop your edit (modules.other.program)"),
+            "the notice is visible while the conflict stays open"
+        );
+
+        state.after_edit = None;
+        state.save_key(drop, (120, 36), true);
+        assert_eq!(state.candidate, disk);
+        assert!(state.save.conflicts.is_empty());
+        assert!(state.save.revision > revision);
+        assert_eq!(state.save.outbox.len(), 1);
     }
 }

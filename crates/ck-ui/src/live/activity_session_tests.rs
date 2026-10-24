@@ -210,6 +210,7 @@ impl Run {
         let state = State::empty("This computer");
         let (tx, _rx) = watch::channel(assemble(&state, now()));
         let shared = Arc::new(Shared {
+            connection_file: None,
             state: Mutex::new(state),
             tx,
             service: Arc::new(NoService),

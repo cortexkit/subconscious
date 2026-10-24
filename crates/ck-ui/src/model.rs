@@ -790,6 +790,7 @@ pub struct Snapshot {
     /// The latest Save previews' replies, each with its sequence number,
     /// oldest first, applied like `pairing`'s results.
     pub previews: Vec<(u64, crate::live::settings::PreviewReply)>,
+    pub applies: Vec<(u64, crate::live::settings::ApplyReply)>,
     /// Counts the connections the live layer has made to the daemon. It
     /// moves on every reconnect, which tells the app that a preview it is
     /// still waiting for may never be answered and must be asked for again.
@@ -1005,7 +1006,7 @@ impl Serves {
             Tab::Settings,
         ]),
         settings: true,
-        save: false,
+        save: true,
         swap: false,
         list_filter: TabSet::of(&[Tab::Activity, Tab::Agents, Tab::Settings]),
         multi_select: false,
@@ -1550,6 +1551,7 @@ mod fixture {
             serves: Serves::DESIGN,
             pairing: Vec::new(),
             previews: Vec::new(),
+            applies: Vec::new(),
             daemon_connection: 0,
         })
     }

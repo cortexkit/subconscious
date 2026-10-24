@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.4
+
+- Save reviewed configuration bytes atomically with retained backups (owner-only
+  on Unix; on Windows a backup inherits the config folder's access). Rebase
+  concurrent changes and require explicit conflict resolution.
+- Apply once with the fleet drain budget, then follow only the reviewed restarts
+  in order, stopping at the first unsuccessful outcome.
+
 ## 0.2.3
 
 - `w` in Settings opens the Save overlay: the exact change to `subc.jsonc`

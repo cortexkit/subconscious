@@ -4,7 +4,9 @@
 
 use std::path::Path;
 
+use std::time::Duration;
 use subc_client_rs::CallError;
+use subc_control::SupervisorEntry;
 use subc_control::SupervisorRescanResult;
 
 pub const CAPABILITY: &str = "rescan-candidate-preview/v1";
@@ -12,6 +14,40 @@ pub const CAPABILITY: &str = "rescan-candidate-preview/v1";
 /// The refusal code the daemon gives a candidate it can't load. Its message
 /// says what is wrong with the text, so the overlay shows it as it is.
 pub const INVALID_CONFIG: &str = "invalid_daemon_config";
+
+/// Rescans drain modules sequentially. Include every attested budget, the
+/// daemon's 30-second fallback for older entries, and teardown/scheduling time;
+/// keep the ordinary control window even when the fleet has no drains.
+pub fn fleet_drain_response_timeout(modules: &[SupervisorEntry]) -> Duration {
+    let budget = modules
+        .iter()
+        .map(|m| Duration::from_millis(m.drain_timeout_ms.unwrap_or(30_000)))
+        .fold(Duration::ZERO, Duration::saturating_add);
+    Duration::from_secs(10).max(budget.saturating_add(Duration::from_secs(2)))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ApplyOutcome {
+    Ready(Box<SupervisorRescanResult>),
+    Refused(String),
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ApplyReply {
+    pub revision: u64,
+    pub restarts: Vec<String>,
+    pub outcome: ApplyOutcome,
+}
+
+pub fn apply_outcome(result: Result<SupervisorRescanResult, CallError>) -> ApplyOutcome {
+    match result {
+        Ok(result) if !result.preview => ApplyOutcome::Ready(Box::new(result)),
+        Err(CallError::Module(body)) => ApplyOutcome::Refused(body.code),
+        // Without a valid apply acknowledgement, replay could apply twice.
+        _ => ApplyOutcome::Unknown,
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SettingsReading {

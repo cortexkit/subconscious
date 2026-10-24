@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.20.126
+
+- Settings can save the reviewed configuration with a retained backup (owner-only
+  on Unix; on Windows it inherits the config folder's access), apply it once,
+  and restart the reviewed modules in order. `ck module rescan` shares the same
+  fleet drain-response budget as Settings.
+
 ## 0.20.125
 
 - Takes subc-daemon 0.37, subc-protocol 0.33, subc-control 0.33, subc-transport 0.14 and subc-client-rs 0.31 (`ToolCallRequest` gains the optional `output_refs` member). No behavior change.

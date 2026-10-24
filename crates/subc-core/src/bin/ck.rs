@@ -1686,25 +1686,6 @@ async fn module_drain_response_timeout(
     Ok(drain_timeout.saturating_add(DRAIN_RESPONSE_MARGIN))
 }
 
-/// A rescan can retire or disable several modules sequentially before replying.
-/// Sum every running module's attested drain budget; an older daemon contributes
-/// the same built-in fallback as a targeted stop. Keep at least the ordinary RPC
-/// window for a rescan that has nothing to drain.
-async fn fleet_drain_response_timeout(client: &mut CkClient) -> Result<Duration, CkError> {
-    let modules = supervisor_list(client).await?;
-    let drain_budget = modules_array(&modules)
-        .iter()
-        .map(|module| {
-            module
-                .get("drain_timeout_ms")
-                .and_then(Value::as_u64)
-                .map(Duration::from_millis)
-                .unwrap_or(DEFAULT_DRAIN_TIMEOUT)
-        })
-        .fold(Duration::ZERO, Duration::saturating_add);
-    Ok(CONTROL_RESPONSE_TIMEOUT.max(drain_budget.saturating_add(DRAIN_RESPONSE_MARGIN)))
-}
-
 async fn module_list(
     client: &mut CkClient,
     json_output: bool,
@@ -3190,7 +3171,11 @@ async fn module_rescan(
     let result = if preview {
         client.rpc_value(request).await?
     } else {
-        let response_timeout = fleet_drain_response_timeout(client).await?;
+        let listed = supervisor_list(client).await?;
+        let modules: Vec<subc_control::SupervisorEntry> =
+            serde_json::from_value(Value::Array(modules_array(&listed).to_vec()))
+                .map_err(|e| CkError::Message(format!("invalid supervisor list: {e}")))?;
+        let response_timeout = ck_ui::live::settings::fleet_drain_response_timeout(&modules);
         client
             .mutating_rpc_value(
                 request,
@@ -8714,7 +8699,10 @@ mod tests {
                 ),
                 (
                     ClientControlRequest::SupervisorRescan { preview: false },
-                    json!({"modules": [{"module_id": "aft", "drain_timeout_ms": 5_000}, {"module_id": "other", "drain_timeout_ms": 11_000}]}),
+                    json!({"modules": [
+                        subc_control::SupervisorEntry::new("aft", "running", true, true, subc_control::SupervisorHealthStatus::Ok).with_drain_timeout_ms(Some(5_000)),
+                        subc_control::SupervisorEntry::new("other", "running", true, true, subc_control::SupervisorHealthStatus::Ok).with_drain_timeout_ms(Some(11_000))
+                    ]}),
                     308,
                 ),
                 (

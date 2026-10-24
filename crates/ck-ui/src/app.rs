@@ -77,6 +77,11 @@ pub enum Request {
         ticket: crate::live::settings::PreviewTicket,
         candidate: String,
     },
+    RescanApply {
+        revision: u64,
+        expect: subc_control::RescanExpect,
+        restarts: Vec<String>,
+    },
 }
 
 /// A question waiting for an answer before an action is sent.
@@ -138,6 +143,7 @@ pub struct App {
     /// The last Save preview reply applied from a snapshot (see
     /// [`Snapshot::previews`]).
     previews_seen: u64,
+    applies_seen: u64,
     /// Whether account identifiers are hidden, on Usage and in Home's usage
     /// panel alike: each account's email, id and organization, wherever the
     /// app shows them, read as that account's pseudonym. `x` on Usage
@@ -174,6 +180,7 @@ impl App {
             pairing: Flow::default(),
             pairing_seen: 0,
             previews_seen: 0,
+            applies_seen: 0,
             redact: false,
             requests: Vec::new(),
         }
@@ -656,11 +663,24 @@ impl App {
         self.pump_pairing();
     }
 
-    /// Hands Settings' queued preview requests to whoever feeds the app.
+    /// Writes requested saves, then hands previews and applies to the data source.
     fn pump_settings(&mut self) {
         for (ticket, candidate) in self.settings.save.outbox.drain(..) {
             self.requests
                 .push(Request::RescanPreview { ticket, candidate });
+        }
+        if let Some(order) = self.settings.save.order.take() {
+            if self.settings.write_order(&order)
+                && order.mode == crate::screens::save::SaveMode::Apply
+            {
+                self.settings.save.applying = true;
+                self.settings.save.notice = Some("Saved; applying…".into());
+                self.requests.push(Request::RescanApply {
+                    revision: order.revision,
+                    expect: order.expect,
+                    restarts: order.restarts,
+                });
+            }
         }
     }
 
@@ -683,6 +703,20 @@ impl App {
             if *seq > self.previews_seen {
                 self.previews_seen = *seq;
                 settings_changed |= self.settings.absorb(reply);
+            }
+        }
+        for (seq, reply) in &snap.applies {
+            if *seq > self.applies_seen {
+                self.applies_seen = *seq;
+                if self.settings.applied(reply) {
+                    self.tab = Tab::Modules;
+                    if let Some(first) = reply.restarts.first() {
+                        if let Some(index) = snap.modules.data.iter().position(|m| &m.id == first) {
+                            self.mod_sel = index;
+                        }
+                    }
+                }
+                settings_changed = true;
             }
         }
         self.pump_settings();

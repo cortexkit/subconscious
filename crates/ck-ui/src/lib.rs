@@ -15,6 +15,7 @@ pub mod metrics;
 pub mod model;
 pub mod pairing;
 pub mod quota;
+pub mod save_file;
 pub mod screens;
 pub mod theme;
 pub mod time;

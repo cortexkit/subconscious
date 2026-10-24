@@ -47,6 +47,7 @@ const ACTION_WATCH: Duration = Duration::from_secs(120);
 const LOG_LINES: u32 = 1000;
 
 struct Shared {
+    connection_file: Option<PathBuf>,
     state: Mutex<State>,
     tx: watch::Sender<Snapshot>,
     service: Arc<dyn DaemonService>,
@@ -116,6 +117,7 @@ pub(super) fn spawn(
     raw: Arc<Mutex<BTreeMap<String, String>>>,
 ) {
     let shared = Arc::new(Shared {
+        connection_file: options.connection_file.clone(),
         state: Mutex::new(state),
         tx,
         service: Arc::clone(&options.service),
@@ -185,6 +187,7 @@ async fn supervise(shared: Arc<Shared>, file: Option<PathBuf>) {
                 shared.update(|s| {
                     s.connection = Connection::Up { daemon_ver };
                     s.daemon_connection += 1;
+                    s.pending_restarts.clear();
                     s.connected_at.set((), now());
                     s.down_note = None;
                 });
@@ -1263,12 +1266,129 @@ async fn handle_requests(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Re
                 tokio::spawn(start_daemon(Arc::clone(&shared)));
             }
             Request::Act { kind, module } => {
-                tokio::spawn(run_action(Arc::clone(&shared), kind, module));
+                let shared = Arc::clone(&shared);
+                tokio::spawn(async move {
+                    let _ = run_action(shared, kind, module, None).await;
+                });
             }
             Request::RescanPreview { ticket, candidate } => {
                 tokio::spawn(rescan_preview(Arc::clone(&shared), ticket, candidate));
             }
+            Request::RescanApply {
+                revision,
+                expect,
+                restarts,
+            } => {
+                let shared = Arc::clone(&shared);
+                tokio::spawn(async move {
+                    let roster = match shared.conn() {
+                        Some(conn) => conn
+                            .consumer
+                            .supervisor_list()
+                            .await
+                            .ok()
+                            .map(|r| r.modules),
+                        None => None,
+                    };
+                    let Some(roster) = roster else {
+                        shared.update(|s| {
+                            s.record_apply(super::settings::ApplyReply {
+                                revision,
+                                restarts,
+                                outcome: super::settings::ApplyOutcome::Refused(
+                                    "daemon_unreachable".into(),
+                                ),
+                            })
+                        });
+                        return;
+                    };
+                    super::apply::run(&DaemonApply(shared), revision, expect, restarts, &roster)
+                        .await;
+                });
+            }
         }
+    }
+}
+
+struct DaemonApply(Arc<Shared>);
+
+impl super::apply::Service for DaemonApply {
+    fn rescan(
+        &self,
+        expect: subc_control::RescanExpect,
+        timeout: Duration,
+    ) -> BoxFuture<'_, super::settings::ApplyOutcome> {
+        Box::pin(async move {
+            use super::settings::{apply_outcome, ApplyOutcome};
+            if !self.0.read(|s| s.settings.editable()) {
+                return ApplyOutcome::Refused("rescan_checked_not_served".into());
+            }
+            let discovered = match connection_file::discover(self.0.connection_file.as_deref()) {
+                Ok(file) => file,
+                Err(_) => return ApplyOutcome::Refused("daemon_unreachable".into()),
+            };
+            // Control calls use the consumer's deadline. A separate connection
+            // gives this drain-capable operation its budget without extending
+            // ordinary reads or changing their routes.
+            let consumer = match SubcConsumer::connect(
+                &discovered.path,
+                ConsumerOptions {
+                    call_timeout: timeout,
+                    ..ConsumerOptions::default()
+                },
+            )
+            .await
+            {
+                Ok(consumer) => consumer,
+                Err(_) => return ApplyOutcome::Refused("daemon_unreachable".into()),
+            };
+            let result = consumer
+                .supervisor_rescan_checked(false, None, Some(expect))
+                .await;
+            match &result {
+                Ok(r) => self.0.raw("supervisor.rescan_checked", json_text(r)),
+                Err(e) => self.0.raw("supervisor.rescan_checked", control_error(e)),
+            }
+            consumer.close().await;
+            apply_outcome(result)
+        })
+    }
+
+    fn acknowledged(&self, reply: super::settings::ApplyReply) {
+        self.0.update(|s| {
+            if matches!(reply.outcome, super::settings::ApplyOutcome::Ready(_)) {
+                s.pending_restarts.extend(reply.restarts.iter().cloned());
+            }
+            s.record_apply(reply);
+        });
+    }
+
+    fn restart(&self, module: String, notes: String) -> BoxFuture<'_, super::apply::RestartResult> {
+        Box::pin(async move {
+            let result = run_action(
+                Arc::clone(&self.0),
+                ActionKind::Restart,
+                module.clone(),
+                Some(notes),
+            )
+            .await;
+            if result.healthy {
+                self.0.update(|s| {
+                    s.pending_restarts.remove(&module);
+                });
+            }
+            result
+        })
+    }
+
+    fn result(&self, ok: bool, text: String) {
+        self.0.update(|s| {
+            s.last_result = Some(ActionResult {
+                at: now(),
+                text,
+                ok,
+            })
+        });
     }
 }
 
@@ -1492,21 +1612,37 @@ async fn start_daemon(shared: Arc<Shared>) {
 
 /// Sends one lifecycle request and follows it until the daemon shows its
 /// outcome, updating the module's phase as spawn events and health arrive.
-async fn run_action(shared: Arc<Shared>, kind: ActionKind, module: String) {
+async fn run_action(
+    shared: Arc<Shared>,
+    kind: ActionKind,
+    module: String,
+    progress_notes: Option<String>,
+) -> super::apply::RestartResult {
     let started = now();
-    let finish = |ok: bool, text: String| {
+    let finish = |ok: bool, text: String, state: &str| {
         shared.update(|s| {
             s.actions.remove(&module);
+            if ok && state == "healthy" {
+                s.pending_restarts.remove(&module);
+            }
             s.last_result = Some(ActionResult {
                 at: now(),
-                text,
+                text: text.clone(),
                 ok,
             });
         });
+        super::apply::RestartResult {
+            healthy: ok && state == "healthy",
+            state: state.into(),
+            detail: text,
+        }
     };
     let Some(conn) = shared.conn() else {
-        finish(false, format!("{module}: the daemon isn't connected"));
-        return;
+        return finish(
+            false,
+            format!("{module}: the daemon isn't connected"),
+            "disconnected",
+        );
     };
     let before = shared.read(|s| s.processes.get(&module).copied());
     shared.update(|s| {
@@ -1540,8 +1676,11 @@ async fn run_action(shared: Arc<Shared>, kind: ActionKind, module: String) {
                 }
                 _ => control_error(&e),
             };
-            finish(false, format!("{module}: {} refused: {why}", kind.verb()));
-            return;
+            return finish(
+                false,
+                format!("{module}: {} refused: {why}", kind.verb()),
+                "refused",
+            );
         }
         Ok(ack) if !ack.applied => {
             let text = match kind {
@@ -1549,8 +1688,7 @@ async fn run_action(shared: Arc<Shared>, kind: ActionKind, module: String) {
                 ActionKind::Start => format!("{module} was already running"),
                 ActionKind::Restart => format!("{module}: the daemon didn't restart it"),
             };
-            finish(true, text);
-            return;
+            return finish(true, text, "not restarted");
         }
         Ok(_) => {}
     }
@@ -1560,24 +1698,43 @@ async fn run_action(shared: Arc<Shared>, kind: ActionKind, module: String) {
         let (phase, done) =
             shared.read(|s| action_progress(s, kind, &module, before, started, now()));
         if let Some((ok, text)) = done {
-            finish(ok, text);
-            return;
+            let state = if ok {
+                if text.ends_with("health unknown") {
+                    "health unknown"
+                } else {
+                    "healthy"
+                }
+            } else {
+                shared.read(|s| match s.health_of(&module).map(|h| h.status) {
+                    Some(subc_control::SupervisorHealthStatus::Degraded) => "degraded",
+                    Some(subc_control::SupervisorHealthStatus::Failing) => "failing",
+                    _ => "unresponsive",
+                })
+            };
+            return finish(ok, text, state);
         }
         shared.update(|s| {
             if let Some(a) = s.actions.get_mut(&module) {
                 a.phase = phase;
+                if let Some(notes) = &progress_notes {
+                    s.last_result = Some(ActionResult {
+                        at: now(),
+                        text: super::apply::progress_line(&module, a, notes),
+                        ok: true,
+                    });
+                }
             }
         });
         if tokio::time::Instant::now() >= deadline {
-            finish(
+            return finish(
                 false,
                 format!(
                     "{module}: no outcome seen within {} s of the {}",
                     ACTION_WATCH.as_secs(),
                     kind.verb()
                 ),
+                "follow deadline",
             );
-            return;
         }
     }
 }
@@ -1598,6 +1755,7 @@ mod tests {
         let state = State::empty("This computer");
         let (tx, _rx) = watch::channel(assemble(&state, now()));
         let shared = Arc::new(Shared {
+            connection_file: None,
             state: Mutex::new(state),
             tx,
             service: Arc::new(NoService),

@@ -13,6 +13,7 @@
 //! daemon-down screen and the layer tries again every two seconds.
 
 pub mod activity;
+pub mod apply;
 pub mod map;
 pub mod pairing;
 mod run;
@@ -393,6 +394,7 @@ pub struct State {
     pub terminals: HashMap<String, Vec<ProcessEvent>>,
     pub actions: HashMap<String, ModuleAction>,
     pub last_result: Option<ActionResult>,
+    pub pending_restarts: std::collections::HashSet<String>,
     /// The status each module had when ck last looked, and since when.
     pub status_since: HashMap<String, (Status, Option<Timestamp>)>,
     pub service: String,
@@ -408,6 +410,8 @@ pub struct State {
     pub previews: std::collections::VecDeque<(u64, settings::PreviewReply)>,
     /// The number the next preview reply gets.
     pub preview_seq: u64,
+    pub applies: std::collections::VecDeque<(u64, settings::ApplyReply)>,
+    pub apply_seq: u64,
     /// How many times the live layer has connected to the daemon.
     pub daemon_connection: u64,
 }
@@ -460,6 +464,7 @@ impl State {
             terminals: HashMap::new(),
             actions: HashMap::new(),
             last_result: None,
+            pending_restarts: std::collections::HashSet::new(),
             status_since: HashMap::new(),
             service: "unknown".into(),
             daemon_log: Vec::new(),
@@ -468,6 +473,8 @@ impl State {
             pairing_seq: 1,
             previews: std::collections::VecDeque::new(),
             preview_seq: 1,
+            applies: std::collections::VecDeque::new(),
+            apply_seq: 1,
             daemon_connection: 0,
         }
     }
@@ -478,6 +485,14 @@ impl State {
         self.preview_seq += 1;
         while self.previews.len() > PREVIEWS_KEPT {
             self.previews.pop_front();
+        }
+    }
+
+    pub fn record_apply(&mut self, reply: settings::ApplyReply) {
+        self.applies.push_back((self.apply_seq, reply));
+        self.apply_seq += 1;
+        while self.applies.len() > PREVIEWS_KEPT {
+            self.applies.pop_front();
         }
     }
 
@@ -942,6 +957,7 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
         serves: crate::model::Serves::LIVE,
         pairing: state.pairing.iter().cloned().collect(),
         previews: state.previews.iter().cloned().collect(),
+        applies: state.applies.iter().cloned().collect(),
         daemon_connection: state.daemon_connection,
         settings: state.settings.clone(),
     }
@@ -1191,7 +1207,12 @@ fn module_view(state: &State, e: &SupervisorEntry) -> Module {
         summary,
         routes: serving.as_ref().map(|s| s.len() as u32),
         serving,
-        pending_restart: map::pending_restart(e.pending_reload.as_ref()),
+        pending_restart: map::pending_restart(e.pending_reload.as_ref()).or_else(|| {
+            state
+                .pending_restarts
+                .contains(&e.module_id)
+                .then(|| "settings".into())
+        }),
         health_checked_at: health
             .and_then(|h| h.last_probe_ms)
             .or(e.last_probe_ms)

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.30.14
+
+- Keep invalidated consumer routes readable until their last pending call or subscription settles, or the daemon closes the route. New calls open a fresh route, but sibling calls still receive their own drain refusals or real replies on the old route. Only a call that receives a not-forwarded refusal resends, within its existing retry budget and deadline. Once the old route's last call settles, including after a timeout, a dropped call or the connection ending, release what the client kept for it: the entry that routes the daemon's frames for that route to its calls, and the table of requests the module may send back on it.
+
 ## 0.30.13
 
 - Add `SubcConsumer::call_framed_with_reply` and `call_framed_cancellable_with_reply`, taking an object head plus raw payload and returning `CallReply` with existing cancellation, deadline and retry semantics. Requests carry `FLAG_BINARY`; existing methods are unchanged.

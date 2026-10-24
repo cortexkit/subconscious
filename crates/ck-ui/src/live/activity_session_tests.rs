@@ -222,6 +222,7 @@ impl Run {
             demand: watch::Sender::new(schedule::wanted(&showing)),
             identity_ready: Notify::new(),
             raw: Arc::default(),
+            upgrade: None,
         });
         let gate = shared.gate();
         let source: Arc<dyn LedgerSource> = Arc::new(ledger.clone());

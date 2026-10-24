@@ -408,6 +408,7 @@ async fn every_planned_stage_is_pending_before_the_run_and_a_failure_reads_verba
         outcome: UpgradeOutcome {
             installed: Vec::new(),
             error: Some(format!("refusal: ck-subc rollback-copy failed: {reason}")),
+            warnings: Vec::new(),
         },
         gate: Mutex::new(Some(gate)),
     });
@@ -528,6 +529,7 @@ fn the_wizard_stays_through_the_daemon_restart_and_ends_with_what_happened() {
         UpgradeOutcome {
             installed: vec!["ck-subc 0.36.18".into(), "ck 0.20.110".into()],
             error: None,
+            warnings: Vec::new(),
         },
     ));
     let mut back = Snapshot::fixture();
@@ -552,7 +554,10 @@ fn the_wizard_stays_through_the_daemon_restart_and_ends_with_what_happened() {
     let mut reconnecting = down.clone();
     reconnecting.upgrade = back.upgrade.clone();
     let text = screen(&render(&app, &reconnecting));
-    assert!(text.contains("Waiting for the daemon to report its"), "{text}");
+    assert!(
+        text.contains("Waiting for the daemon to report its"),
+        "{text}"
+    );
     // Long after, a daemon that is still down gets its own screen back.
     let later = Snapshot::fixture_now().add_secs(60.0);
     let text = screen(&render_at(&app, &reconnecting, 120, 36, later));

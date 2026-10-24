@@ -106,6 +106,9 @@ pub struct UpgradeOutcome {
     /// Why the run stopped short, as the engine said it: a refusal or a
     /// failed stage. `None` when every stage succeeded.
     pub error: Option<String>,
+    /// What the engine warned about along the way, such as a rollback copy
+    /// it couldn't remove, as it said it.
+    pub warnings: Vec<String>,
 }
 
 /// The setup engine, as the update wizard uses it. Both methods block (they

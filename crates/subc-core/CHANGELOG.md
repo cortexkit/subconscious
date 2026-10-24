@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.20.130
+
+- The terminal app's Settings → Updates runs the same setup engine as
+  `ck upgrade` (`setup::wizard::SetupUpgradeService`): the same refusals,
+  word for word, and the same plan, reported stage by stage. `ck upgrade`
+  output is unchanged; its refusal text now comes from
+  `setup::text::upgrade_ownership_refusal` and `upgrade_plan_refusal`, which
+  the wizard uses too.
+- `SystemUpgradeBackend::set_quiet` keeps the completion line off stdout and
+  holds cleanup warnings for the caller (`take_warnings`), for the app,
+  which owns the terminal. `ck upgrade` doesn't set it.
+
 ## 0.20.129
 
 - `ck upgrade` no longer says "Everything is up to date." without checking.

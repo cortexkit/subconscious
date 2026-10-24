@@ -1382,6 +1382,7 @@ fn start_upgrade(shared: &Arc<Shared>) {
         .unwrap_or_else(|e| crate::upgrade::UpgradeOutcome {
             installed: Vec::new(),
             error: Some(format!("the upgrade stopped: {e}")),
+            warnings: Vec::new(),
         });
         shared.update(|s| {
             if let Some(run) = &mut s.upgrade.run {
@@ -1846,6 +1847,7 @@ mod tests {
             demand: watch::Sender::new(schedule::wanted(&Showing::default())),
             identity_ready: Notify::new(),
             raw: Arc::default(),
+            upgrade: None,
         });
         let mut gate = shared.gate();
         assert!(

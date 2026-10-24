@@ -380,6 +380,11 @@ pub struct SystemUpgradeBackend {
     /// spell the same transition.
     planned_from: BTreeMap<String, String>,
     supervised_modules: BTreeSet<String>,
+    /// Set when the terminal app runs the upgrade: it owns the screen, so
+    /// the completion line isn't printed and cleanup warnings are kept in
+    /// `warnings` for it to show instead of going to stderr.
+    quiet: bool,
+    warnings: Vec<String>,
 }
 
 impl SystemUpgradeBackend {
@@ -430,7 +435,27 @@ impl SystemUpgradeBackend {
             expected_versions,
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
+            quiet: false,
+            warnings: Vec::new(),
         })
+    }
+
+    /// Prints nothing: see `quiet`.
+    pub fn set_quiet(&mut self) {
+        self.quiet = true;
+    }
+
+    /// The cleanup warnings kept while quiet, oldest first.
+    pub fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
+    }
+
+    fn warn(&mut self, warning: String) {
+        if self.quiet {
+            self.warnings.push(warning);
+        } else {
+            eprintln!("{warning}");
+        }
     }
 
     pub fn set_supervised_modules(&mut self, modules: BTreeSet<String>) {
@@ -755,10 +780,10 @@ impl SystemUpgradeBackend {
         if let Some(rollback) = self.rollback_paths.remove(target.label()) {
             self.rollback_archive_sha256.remove(target.label());
             if let Err(error) = fs::remove_file(&rollback) {
-                eprintln!(
+                self.warn(format!(
                     "warning: could not remove unused rollback copy {}: {error}",
                     rollback.display()
-                );
+                ));
             }
         }
     }
@@ -1005,16 +1030,16 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     fn completed(&mut self, target: UpgradeTarget) {
         // Failed targets keep their recovery evidence; a verified completed
         // replacement no longer needs a private copy of the previous image.
-        if let Some(path) = self.rollback_paths.get(target.label()) {
-            match fs::remove_file(path) {
+        if let Some(path) = self.rollback_paths.get(target.label()).cloned() {
+            match fs::remove_file(&path) {
                 Ok(()) => {
                     self.rollback_paths.remove(target.label());
                     self.rollback_archive_sha256.remove(target.label());
                 }
-                Err(error) => eprintln!(
+                Err(error) => self.warn(format!(
                     "warning: upgrade completed but could not remove rollback copy {}: {error}",
                     path.display()
-                ),
+                )),
             }
         }
         // By now the restarted process runs the new image, so the previous
@@ -1024,12 +1049,14 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         if let Some(aside) = self.replaced_images.remove(target.label()) {
             if let Err(error) = managed_replace::remove_replaced_image(&mut self.inventory, &aside)
             {
-                eprintln!(
+                self.warn(format!(
                     "warning: upgrade completed but {error}; a later ck setup or ck upgrade removes it"
-                );
+                ));
             }
         }
-        println!("{}", self.completion_line(target));
+        if !self.quiet {
+            println!("{}", self.completion_line(target));
+        }
     }
 
     fn rollback_decision(&mut self, _target: UpgradeTarget) -> RollbackDecision {
@@ -1344,6 +1371,8 @@ mod tests {
                 .collect(),
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
+            quiet: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -1559,6 +1588,8 @@ mod tests {
             expected_versions: BTreeMap::from([(target.label().to_string(), "0.2.0".into())]),
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
+            quiet: false,
+            warnings: Vec::new(),
         }
     }
 
@@ -1931,6 +1962,8 @@ mod tests {
             expected_versions: BTreeMap::new(),
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
+            quiet: false,
+            warnings: Vec::new(),
         };
         let result = backend.rollback(aft);
         child.kill().unwrap();
@@ -2286,6 +2319,8 @@ exit 1
                 .collect(),
             planned_from: BTreeMap::new(),
             supervised_modules: ["aft".to_string()].into_iter().collect(),
+            quiet: false,
+            warnings: Vec::new(),
         };
 
         let result = backend.initiate_module_restart(aft, Duration::from_secs(30));
@@ -2336,6 +2371,8 @@ exit 1
                 .collect(),
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
+            quiet: false,
+            warnings: Vec::new(),
         };
 
         // Without the planner's word, the line falls back to the self-report.

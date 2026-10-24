@@ -685,10 +685,20 @@ async fn run_app(subc: Option<&Path>) -> Result<(), CkError> {
     let service = Arc::new(CkDaemonService {
         subc: subc.map(Path::to_path_buf),
     });
-    let live = ck_ui::live::start(ck_ui::live::LiveOptions::new(
-        subc.map(Path::to_path_buf),
-        service,
-    ));
+    let mut options = ck_ui::live::LiveOptions::new(subc.map(Path::to_path_buf), service);
+    // Settings → Updates runs the same engine as `ck upgrade`, for this ck.
+    // Without its own path, ck can't tell which installed ck it is, and the
+    // section says it can't check.
+    if let Ok(executable) = running_executable() {
+        options.upgrade = Some(Arc::new(setup::wizard::SetupUpgradeService::new(
+            executable,
+            Box::new(CkUpgradeDaemon {
+                subc: subc.map(Path::to_path_buf),
+            }),
+            tokio::runtime::Handle::current(),
+        )));
+    }
+    let live = ck_ui::live::start(options);
     ck_ui::run_with(
         live.snapshots,
         ck_ui::RunOptions {
@@ -698,6 +708,31 @@ async fn run_app(subc: Option<&Path>) -> Result<(), CkError> {
     )
     .await
     .map_err(|error| CkError::Message(format!("the ck app stopped: {error}")))
+}
+
+/// What the app's update wizard asks of the daemon, answered as `ck
+/// upgrade` answers it: the connection file post-activation checks read, and
+/// the modules the daemon supervises.
+struct CkUpgradeDaemon {
+    subc: Option<PathBuf>,
+}
+
+impl setup::wizard::UpgradeDaemon for CkUpgradeDaemon {
+    fn connection_path(&self) -> Option<PathBuf> {
+        self.subc.clone().or_else(|| {
+            discover_connection_file(self.subc.as_deref())
+                .ok()
+                .map(|found| found.path)
+        })
+    }
+
+    fn supervised_modules(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<BTreeSet<String>, String>> + Send + '_>,
+    > {
+        Box::pin(fetch_supervised_roster(self.subc.as_deref()))
+    }
 }
 
 /// What the app's daemon-down screen asks of `ck`: the setup engine's view
@@ -7235,10 +7270,8 @@ async fn upgrade_command(
             .map_err(CkError::Rejected)?;
     let ownership_outcomes =
         setup::upgrade_ownership_outcomes(executable, &discovered).map_err(CkError::Rejected)?;
-    if !ownership_outcomes.is_empty() {
-        for outcome in &ownership_outcomes {
-            println!("{}", human_blocking_outcome(outcome));
-        }
+    if let Some(refusal) = setup::text::upgrade_ownership_refusal(&ownership_outcomes) {
+        println!("{refusal}");
         return Err(CkError::RenderedExit { exit_code: 1 });
     }
     let cache = setup::UpdateCache::from_environment();
@@ -7286,13 +7319,7 @@ async fn upgrade_command(
             Err(CkError::RenderedExit { exit_code: 1 })
         };
     }
-    if !plan.is_authorized() {
-        let message = plan
-            .outcomes
-            .iter()
-            .find(|outcome| outcome.blocks_execution())
-            .map(human_blocking_outcome)
-            .unwrap_or_else(|| "upgrade could not continue; nothing was changed".to_string());
+    if let Some(message) = setup::text::upgrade_plan_refusal(&plan) {
         println!("{message}");
         print!(
             "{}",

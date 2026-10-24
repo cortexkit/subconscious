@@ -131,8 +131,9 @@ pub fn draw(c: &mut Canvas, v: &View, x: i32) {
         Some(Err(error)) => {
             lines.push(Line::Title("Updates".into(), None));
             lines.push(Line::Gap);
-            for l in wrap_verbatim(&format!("Couldn't check for updates: {error}"), dw as usize) {
-                lines.push(Line::Text(l, St::E));
+            lines.push(Line::Text("Couldn't check for updates.".into(), St::E));
+            for l in wrap_verbatim(error, dw as usize) {
+                lines.push(Line::Text(l, St::D));
             }
         }
         Some(Ok(plan)) => {
@@ -298,6 +299,11 @@ fn outcome_lines<'a>(lines: &mut Vec<Line<'a>>, v: &View, run: &'a Run, w: usize
     };
     for l in wrap_verbatim(&format!("{what} {health}"), w) {
         lines.push(Line::Text(l, st));
+    }
+    for warning in &outcome.warnings {
+        for l in wrap_verbatim(warning, w) {
+            lines.push(Line::Text(l, St::W));
+        }
     }
 }
 

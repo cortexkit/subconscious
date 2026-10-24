@@ -1,7 +1,7 @@
 //! Text shared by the CLI and terminal upgrade views. Rendering here never
 //! writes to stdout, so each caller controls where the same words appear.
 
-use super::{ManagedUpgradeTarget, PlanOutcome};
+use super::{ManagedUpgradeTarget, PlanOutcome, UpgradePlan};
 
 /// Setup leaves unfamiliar programs in place and names the safe next step.
 pub fn unowned_binary_refusal(path: &std::path::Path) -> String {
@@ -36,6 +36,32 @@ pub fn human_blocking_outcome(outcome: &PlanOutcome) -> String {
         }
         _ => outcome.to_string(),
     }
+}
+
+/// What `ck upgrade` prints, and the terminal app's update wizard shows,
+/// when ownership stops an upgrade before anything is checked: each refusal
+/// on its own line. `None` when nothing refuses.
+pub fn upgrade_ownership_refusal(outcomes: &[PlanOutcome]) -> Option<String> {
+    (!outcomes.is_empty()).then(|| {
+        outcomes
+            .iter()
+            .map(human_blocking_outcome)
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+/// What `ck upgrade` prints, and the update wizard shows, when the plan
+/// itself is refused: its first blocking outcome. `None` for a plan that may
+/// run.
+pub fn upgrade_plan_refusal(plan: &UpgradePlan) -> Option<String> {
+    (!plan.is_authorized()).then(|| {
+        plan.outcomes
+            .iter()
+            .find(|outcome| outcome.blocks_execution())
+            .map(human_blocking_outcome)
+            .unwrap_or_else(|| "upgrade could not continue; nothing was changed".to_string())
+    })
 }
 
 /// Keep diagnostic lines, including their newlines, separate from the summary.

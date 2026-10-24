@@ -29,6 +29,7 @@ mod upgrade_assets;
 mod upgrade_executor;
 mod upgrade_verification;
 mod validation;
+pub mod wizard;
 
 pub use apply::data_directory;
 pub use apply::{

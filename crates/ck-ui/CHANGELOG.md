@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.5
+
+- Settings → Updates shows what an upgrade would do, from the program's own
+  setup engine through a new `upgrade::UpgradeService` (plan rows, the
+  refusal as the engine words it, the stages a run takes, and an event per
+  stage). The check runs once per session, the first time Updates shows,
+  and the section list marks Updates only after it found a newer version.
+  The section names the version you have and when it checked; the release
+  source, date, signer, time estimate and release notes have no source and
+  aren't shown.
+- The daemon-restart sentence, and the confirmation's mention of it, appear
+  only when the plan replaces the daemon. `⏎` asks once; `l` goes back to
+  Settings and is not remembered.
+- A confirmed run lists every planned stage, pending until it starts, then
+  done or failed with the engine's reason as given. The wizard stays on
+  screen while the upgrade restarts the daemon, and ends with the versions
+  installed and how many modules are healthy.
+
 ## 0.2.4
 
 - Save reviewed configuration bytes atomically with retained backups (owner-only

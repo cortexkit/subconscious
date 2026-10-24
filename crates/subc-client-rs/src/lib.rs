@@ -93,7 +93,7 @@ use subc_transport::{
     FrameIoError,
 };
 use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpStream,
     sync::{mpsc, oneshot},
     time::{timeout, timeout_at, Instant},
@@ -2165,7 +2165,7 @@ where
                     let deadline = Instant::now() + options.writer_drain_timeout;
                     let result = timeout_at(deadline, send_goodbye(&tx)).await;
                     drop(tx);
-                    let flush = finish_writer(writer, deadline).await;
+                    let flush = finish_writer_and_drain(writer, &mut read_half, deadline).await;
                     handler.on_connection_end(ConnectionEnd::Closed).await;
                     match result.unwrap_or(Ok(())) {
                         Ok(()) | Err(SubcModuleError::WriterClosed) => {}
@@ -2182,14 +2182,16 @@ where
                 Some(Ok(_)) => unreachable!(),
             };
             drop(tx);
-            let _ = finish_writer(writer, Instant::now() + options.writer_drain_timeout).await;
+            let deadline = Instant::now() + options.writer_drain_timeout;
+            let _ = finish_writer_and_drain(writer, &mut read_half, deadline).await;
             return Err(result);
         }
     };
 
     let Some(connection_token) = checked_increment(&NEXT_MODULE_CONNECTION_TOKEN) else {
         drop(tx);
-        let _ = finish_writer(writer, Instant::now() + options.writer_drain_timeout).await;
+        let deadline = Instant::now() + options.writer_drain_timeout;
+        let _ = finish_writer_and_drain(writer, &mut read_half, deadline).await;
         return Err(SubcModuleError::ConnectionTokenExhausted);
     };
     let close_token = CancellationToken::new();
@@ -2236,7 +2238,7 @@ where
 }
 
 fn connection_serve_future_with_options<R, H>(
-    read_half: R,
+    mut read_half: R,
     tx: mpsc::Sender<Frame>,
     handler: Arc<H>,
     handle: ModuleHandle,
@@ -2260,7 +2262,7 @@ where
         let mut writer_finished = false;
         let mut loop_result = tokio::select! {
             biased;
-            result = module_loop(read_half, &tx, Arc::clone(&handler), serve_handle.clone(), &dispatcher, &options.stop_handle) => result,
+            result = module_loop(&mut read_half, &tx, Arc::clone(&handler), serve_handle.clone(), &dispatcher, &options.stop_handle) => result,
             result = &mut writer => {
                 writer_finished = true;
                 writer_connection_end(result)
@@ -2303,6 +2305,12 @@ where
         dispatcher.abort_all();
         dispatcher.tasks.wait().await;
         let daemon_eof = matches!(loop_result, Ok(ConnectionEnd::Eof));
+        // The module ended the connection itself: a stop, an internal close
+        // or a module-side error. Close it in order, so the daemon reads a
+        // FIN rather than a reset. When the daemon ended it (EOF, GOODBYE or
+        // a reset) or the writer already failed, there is nothing to drain.
+        let module_ended =
+            !writer_finished && matches!(loop_result, Ok(ConnectionEnd::Closed) | Err(_));
         let deadline = Instant::now() + options.writer_drain_timeout;
         if matches!(loop_result, Ok(ConnectionEnd::Closed))
             && options.stop_handle.token.is_cancelled()
@@ -2325,6 +2333,8 @@ where
 
         let (writer_result, undelivered_replies) = if writer_finished {
             (Ok(()), 0)
+        } else if module_ended {
+            finish_writer_and_drain(writer, &mut read_half, deadline).await
         } else {
             finish_writer(writer, deadline).await
         };
@@ -3155,6 +3165,60 @@ struct WriterFailure {
     undelivered_replies: usize,
 }
 
+/// [`finish_writer`] for a connection the module ends itself: once the writer
+/// has flushed and shut down the sending side, drain the reader as
+/// [`drain_until_peer_closes`] describes. A writer that failed means the socket
+/// is already broken, so there is nothing to drain.
+async fn finish_writer_and_drain<R>(
+    writer: tokio::task::JoinHandle<Result<(), WriterFailure>>,
+    reader: &mut R,
+    deadline: Instant,
+) -> (Result<(), SubcModuleError>, usize)
+where
+    R: AsyncRead + Unpin,
+{
+    let flushed = finish_writer(writer, deadline).await;
+    if flushed.0.is_ok() {
+        drain_until_peer_closes(reader, deadline).await;
+    }
+    flushed
+}
+
+/// Orderly close for a connection the module ends itself (a stop, an internal
+/// close or a module-side error), called once the writer has flushed its last
+/// frame and shut down the sending side.
+///
+/// Closing a TCP socket while received bytes are still unread makes the OS
+/// send a reset (RST) instead of an orderly FIN. Linux and Windows do this;
+/// where an OS does not, the drain below only waits for a close that comes
+/// anyway. A daemon that receives the reset can fail its next read with
+/// `ConnectionReset` and lose data it had not read yet, including the module's
+/// GOODBYE, so a planned stop would look like a crash. Frames the daemon sent
+/// after the module stopped reading (a PING, a request, its own GOODBYE) are
+/// exactly such unread bytes. So keep reading and discarding until the daemon
+/// closes its side, which it does once it reads the module's FIN.
+///
+/// `deadline` is the writer drain deadline, so a daemon that never closes
+/// cannot hold the stop past the drain budget. Read errors end the drain: the
+/// socket is already broken and nothing is left to protect.
+async fn drain_until_peer_closes<R>(reader: &mut R, deadline: Instant)
+where
+    R: AsyncRead + Unpin,
+{
+    if Instant::now() >= deadline {
+        return;
+    }
+    let mut discard = [0u8; 4096];
+    let _ = timeout_at(deadline, async {
+        while let Ok(read) = reader.read(&mut discard).await {
+            if read == 0 {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
 fn is_reply(frame: &Frame) -> bool {
     matches!(
         frame.header.ty,
@@ -3180,6 +3244,15 @@ where
             pending_replies = 0;
         }
         writer.flush().await.map_err(FrameIoError::Io)?;
+        // Every sender is gone, so nothing more will be written: shut down the
+        // sending side so the daemon reads a FIN (EOF) right after the last
+        // frame, typically the module's GOODBYE. The socket stays open for
+        // reading, which `drain_until_peer_closes` relies on. When the daemon
+        // ended the connection first, this sends the same FIN that dropping
+        // the socket would. A failure here only means the socket is already
+        // broken; whatever was flushed has been handed to the OS, so it is
+        // not an undelivered-frame error.
+        let _ = writer.shutdown().await;
         Ok(())
     }
     .await;

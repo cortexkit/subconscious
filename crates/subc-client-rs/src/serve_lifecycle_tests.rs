@@ -468,10 +468,77 @@ async fn external_stop_aborts_over_budget_handler_and_tears_down() {
     let started = Instant::now();
     stop.stop();
     assert_eq!(receive(&mut daemon).await.header.ty, FrameType::Goodbye);
+    // The module shuts down its sending side after GOODBYE, then keeps
+    // reading until the daemon closes. Close like a real daemon, so the
+    // elapsed time measures the handler budget alone, not the drain deadline.
+    assert!(read_frame(&mut daemon).await.unwrap().is_none());
+    drop(daemon);
     serve.await.unwrap().unwrap();
     assert_eq!(started.elapsed(), budget);
     assert!(dropped.load(Ordering::SeqCst));
-    assert!(read_frame(&mut daemon).await.unwrap().is_none());
+}
+
+/// How the module ends its own connection in
+/// `module_close_sends_eof_and_waits_for_the_daemon_to_close`.
+#[derive(Debug)]
+enum ModuleEnds {
+    /// An internal close through `ModuleHandle::close_connection`.
+    Close,
+    /// A frame header the module cannot decode, which fails serving.
+    ProtocolError,
+}
+
+// The module must shut down its sending side (the daemon reads EOF) and keep
+// reading until the daemon closes, so the daemon sees no reset from unread data.
+#[tokio::test]
+async fn module_close_sends_eof_and_waits_for_the_daemon_to_close() {
+    for ends in [ModuleEnds::Close, ModuleEnds::ProtocolError] {
+        let (module, mut daemon) = tokio::io::duplex(64 * 1024);
+        let (reader, writer) = tokio::io::split(module);
+        let (handle, serve) = start(
+            reader,
+            writer,
+            Echo,
+            ServeOptions::default().with_writer_drain_timeout(Duration::from_secs(30)),
+        );
+        match ends {
+            ModuleEnds::Close => handle.close_connection(),
+            ModuleEnds::ProtocolError => {
+                // Byte 4 is the protocol version; zero is not a supported one.
+                daemon
+                    .write_all(&[0u8; subc_protocol::HEADER_LEN])
+                    .await
+                    .unwrap();
+            }
+        }
+        let eof = timeout(Duration::from_secs(3), read_frame(&mut daemon))
+            .await
+            .unwrap_or_else(|_| panic!("{ends:?}: module must shut down its sending side"));
+        assert!(eof.unwrap().is_none(), "{ends:?}: expected EOF");
+        // A daemon frame sent now is unread data the module must drain.
+        let ping = Frame::build(FrameType::Ping, control_flags(), 0, 0, 5, Vec::new()).unwrap();
+        write_frame(&mut daemon, &ping).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !serve.is_finished(),
+            "{ends:?}: module closed before the daemon did"
+        );
+        drop(daemon);
+        let result = timeout(Duration::from_secs(3), serve)
+            .await
+            .unwrap_or_else(|_| panic!("{ends:?}: serve must end once the daemon closes"))
+            .unwrap();
+        match ends {
+            ModuleEnds::Close => result.unwrap(),
+            ModuleEnds::ProtocolError => assert!(
+                matches!(
+                    result,
+                    Err(SubcModuleError::FrameIo(FrameIoError::DecodeHeader(_)))
+                ),
+                "{result:?}"
+            ),
+        }
+    }
 }
 
 struct PanickingHealth;

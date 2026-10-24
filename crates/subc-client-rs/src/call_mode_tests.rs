@@ -69,6 +69,11 @@ async fn decoded_bind(scope: Option<serde_json::Value>, mode: Option<&str>) -> R
     assert_eq!(ack.header.corr, 2);
     let request = recorder.0.lock().unwrap().clone().expect("on_bind ran");
     served.handle.close_connection();
+    // Close the stand-in daemon's side as a real daemon does once it reads the
+    // module's EOF. A module that closes its connection keeps reading until
+    // the daemon closes, bounded by the drain budget, so a daemon end left
+    // open would hold serve for the whole budget.
+    drop(served.daemon);
     assert!(timeout(Duration::from_secs(2), served.serve)
         .await
         .unwrap()

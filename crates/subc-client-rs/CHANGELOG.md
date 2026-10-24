@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.3
+
+- A module that ends its own daemon connection now closes it in order, so the daemon reads the module's GOODBYE and then a clean EOF instead of a connection reset. Before, the module dropped its socket while frames the daemon had sent after the stop were still unread, and closing a TCP socket with unread data makes the OS send a reset. On Windows the daemon's read then failed with `ConnectionReset` (10054) before it saw GOODBYE; Linux passed only by timing. After the last frame is flushed, serving now shuts down the socket's sending side and keeps reading and discarding until the daemon closes, bounded by the existing writer drain budget, so a daemon that never closes cannot hold a stop past that budget. This applies to a `ModuleStopHandle` stop (during or after the handshake), an internal close and a module-side error. When the daemon ended the connection (EOF, GOODBYE or a reset), nothing is drained. A test stand-in daemon that keeps its end open after the module closes now holds `serve` until the drain budget; close the stand-in's end, as a real daemon does, to end it at once. No API change.
+
 ## 0.32.2
 
 - Keep invalidated consumer routes readable until their last pending call or subscription settles, or the daemon closes the route. New calls open a fresh route, but sibling calls still receive their own drain refusals or real replies on the old route. Only a call that receives a not-forwarded refusal resends, within its existing retry budget and deadline. Once the old route's last call settles, including after a timeout, a dropped call or the connection ending, release what the client kept for it: the entry that routes the daemon's frames for that route to its calls, and the table of requests the module may send back on it.

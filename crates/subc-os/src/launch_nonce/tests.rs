@@ -88,12 +88,23 @@ mod unix_tests {
             .stdin(Stdio::null())
             .output()
             .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             output.status.success(),
-            "isolated test {name} failed: {}\nstdout:\n{}\nstderr:\n{}",
+            "isolated test {name} failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
             output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
+        );
+        // Libtest also exits successfully when an exact filter matches no test.
+        let passed_test = format!("test {name} ... ok");
+        assert!(
+            stdout.lines().any(|line| line == passed_test),
+            "isolated test {name} missing passing test line {passed_test:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        );
+        let passed_summary = "test result: ok. 1 passed; 0 failed; 0 ignored;";
+        assert!(
+            stdout.lines().any(|line| line.starts_with(passed_summary)),
+            "isolated test {name} missing one-test success summary {passed_summary:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
         );
         false
     }

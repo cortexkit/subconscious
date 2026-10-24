@@ -210,6 +210,9 @@ public struct AskRequest: Codable, Equatable, Identifiable {
     /// its lead agent for display only and confers no approval authority.
     public var headAgentId: String?
     public var taskID: String?
+    /// The review an ask was filed for, as core names it, when the ask came from
+    /// core's review tool. Absent on every other ask.
+    public var review: String?
     public var question: String
     public var context: String?
     public var whyItMatters: String?
@@ -281,6 +284,7 @@ public struct AskRequest: Codable, Equatable, Identifiable {
         case askerSessionID
         case headAgentId
         case taskID
+        case review
         case question
         case context
         case whyItMatters
@@ -349,6 +353,7 @@ extension AskRequest {
         askerSessionID = try container.decodeIfPresent(String.self, forKey: .askerSessionID)
         headAgentId = try container.decodeIfPresent(String.self, forKey: .headAgentId)
         taskID = try container.decodeIfPresent(String.self, forKey: .taskID)
+        review = try container.decodeIfPresent(String.self, forKey: .review)
         question = try container.decode(String.self, forKey: .question)
         context = try container.decodeIfPresent(String.self, forKey: .context)
         whyItMatters = try container.decodeIfPresent(String.self, forKey: .whyItMatters)

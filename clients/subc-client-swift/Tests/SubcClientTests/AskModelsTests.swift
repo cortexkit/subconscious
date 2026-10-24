@@ -67,6 +67,28 @@ final class AskModelsTests: XCTestCase {
         XCTAssertNil(misspelled.headAgentId)
     }
 
+    func testDecodesReviewAskReviewAndRoundTripsIt() throws {
+        let review = try decodeAsk([
+            "requestID": "ask-review",
+            "question": "Approve the review findings?",
+            "askedAt": 1_700_000_000_000 as Int64,
+            "review": "<review-4>",
+        ])
+        XCTAssertEqual(review.review, "<review-4>")
+
+        // Encoding is synthesized from CodingKeys, so a missing key would drop the
+        // field on a round trip even though decoding reads it.
+        let reencoded = try JSONDecoder().decode(AskRequest.self, from: JSONEncoder().encode(review))
+        XCTAssertEqual(reencoded.review, "<review-4>")
+
+        let plain = try decodeAsk([
+            "requestID": "ask-plain",
+            "question": "Continue?",
+            "askedAt": 1_700_000_000_000 as Int64,
+        ])
+        XCTAssertNil(plain.review)
+    }
+
     func testDecodesMinimalAskRecordWithOnlyRequiredFields() throws {
         let ask = try decodeAsk([
             "requestID": "ask-minimal",

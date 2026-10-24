@@ -1385,3 +1385,11 @@ The index summarizes normative requirements; where an index line and a section d
   live generation. A process whose connections each fetch their own credential makes
   them revoke each other: each fetch revokes the key the other connections hold, and
   they never recover without a re-issue.
+- Transient issuance refusals. `ckbus.credential` refuses with
+  `ckbus_census_unavailable` when ck-bus can't read the module's credential census:
+  the broker is down, the census stream is missing, or the read gets no reply within
+  five seconds. Nothing is issued, because issuing over an entry nobody could read
+  would leave the credential it names unrevoked. `ckbus_not_ready`,
+  `ckbus_spawn_snapshot_unavailable` and `ckbus_signing_failed` are transient the same
+  way. These are stable codes a holder may match by name: it keeps using its current
+  credential, if it has one, and retries with backoff.

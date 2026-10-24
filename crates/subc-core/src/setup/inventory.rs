@@ -25,6 +25,7 @@ pub struct Inventory {
     path: PathBuf,
     document: Value,
     changed: bool,
+    windows_separators: bool,
 }
 
 impl Inventory {
@@ -62,6 +63,7 @@ impl Inventory {
             path,
             document,
             changed: false,
+            windows_separators: matches!(platform, "windows-x64" | "windows-arm64"),
         };
         inventory.adopt_bootstrap_sidecar()?;
         Ok(inventory)
@@ -131,10 +133,7 @@ impl Inventory {
     }
 
     pub fn owns_path(&self, kind: &str, path: &Path) -> bool {
-        self.mutations().any(|entry| {
-            entry.get("kind").and_then(Value::as_str) == Some(kind)
-                && entry.get("path").and_then(Value::as_str) == Some(&path.to_string_lossy())
-        })
+        self.entry_for_path(kind, path).is_some()
     }
 
     pub fn paths_for_kind(&self, kind: &str) -> Vec<PathBuf> {
@@ -148,7 +147,7 @@ impl Inventory {
     pub fn entry_for_path(&self, kind: &str, path: &Path) -> Option<&Value> {
         self.mutations().find(|entry| {
             entry.get("kind").and_then(Value::as_str) == Some(kind)
-                && entry.get("path").and_then(Value::as_str) == Some(&path.to_string_lossy())
+                && entry_has_path(entry, &path.to_string_lossy(), self.windows_separators)
         })
     }
 
@@ -194,11 +193,12 @@ impl Inventory {
 
     pub fn remove_owned_path(&mut self, kind: &str, path: &Path) {
         let path = path.to_string_lossy();
+        let windows_separators = self.windows_separators;
         let mutations = self.mutations_mut();
         let before = mutations.len();
         mutations.retain(|entry| {
             !(entry.get("kind").and_then(Value::as_str) == Some(kind)
-                && entry.get("path").and_then(Value::as_str) == Some(path.as_ref()))
+                && entry_has_path(entry, path.as_ref(), windows_separators))
         });
         self.changed |= mutations.len() != before;
     }
@@ -214,9 +214,10 @@ impl Inventory {
         value: String,
     ) -> Result<(), String> {
         let path_text = path.to_string_lossy();
+        let windows_separators = self.windows_separators;
         let entry = self.mutations_mut().iter_mut().find(|entry| {
             entry.get("kind").and_then(Value::as_str) == Some(kind)
-                && entry.get("path").and_then(Value::as_str) == Some(path_text.as_ref())
+                && entry_has_path(entry, path_text.as_ref(), windows_separators)
         });
         let Some(entry) = entry else {
             return Err(format!(
@@ -241,9 +242,10 @@ impl Inventory {
         key: &str,
     ) -> Result<(), String> {
         let path_text = path.to_string_lossy();
+        let windows_separators = self.windows_separators;
         let entry = self.mutations_mut().iter_mut().find(|entry| {
             entry.get("kind").and_then(Value::as_str) == Some(kind)
-                && entry.get("path").and_then(Value::as_str) == Some(path_text.as_ref())
+                && entry_has_path(entry, path_text.as_ref(), windows_separators)
         });
         let Some(entry) = entry else {
             return Err(format!(
@@ -302,6 +304,23 @@ impl Inventory {
     }
 }
 
+/// Ordinary Windows paths accept either separator. Do not rewrite recorded
+/// strings, fold case, resolve symlinks or normalize verbatim/device paths.
+fn entry_has_path(entry: &Value, path: &str, windows_separators: bool) -> bool {
+    let Some(recorded) = entry.get("path").and_then(Value::as_str) else {
+        return false;
+    };
+    let exact_prefix = |path: &str| path.starts_with(r"\\?\") || path.starts_with(r"\\.\");
+    if !windows_separators || exact_prefix(recorded) || exact_prefix(path) {
+        return recorded == path;
+    }
+    let separator = |byte| if byte == b'/' { b'\\' } else { byte };
+    recorded
+        .bytes()
+        .map(separator)
+        .eq(path.bytes().map(separator))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +328,94 @@ mod tests {
 
     fn fixture_path(name: &str) -> ScratchDir {
         ScratchDir::new(name)
+    }
+
+    #[test]
+    fn windows_mixed_separator_paths_find_the_same_owned_entry() {
+        let root = fixture_path("inventory-windows-separators");
+        let recorded = Path::new(r"C:\Users\alex\.local/share/cortexkit\bin\ck-subc.exe");
+        let scanned = Path::new(r"C:\Users\alex\.local/share\cortexkit\bin\ck-subc.exe");
+        assert_ne!(recorded.to_string_lossy(), scanned.to_string_lossy());
+        for platform in ["windows-x64", "windows-arm64"] {
+            let mut inventory =
+                Inventory::load(root.join(format!("{platform}.json")), platform).unwrap();
+            inventory.record("managed-binary", recorded, Map::new());
+            assert!(
+                inventory.owns_path("managed-binary", scanned),
+                "{platform}: recorded={recorded:?}, scanned={scanned:?}"
+            );
+            assert!(inventory
+                .entry_for_path("managed-binary", scanned)
+                .is_some());
+            inventory.record("managed-binary", scanned, Map::new());
+            let paths = inventory.paths_for_kind("managed-binary");
+            assert_eq!(paths.len(), 1);
+            assert_eq!(paths[0].to_string_lossy(), recorded.to_string_lossy());
+            inventory
+                .update_owned_string(
+                    "managed-binary",
+                    scanned,
+                    "archive_sha256",
+                    "verified".into(),
+                )
+                .unwrap();
+            assert_eq!(
+                inventory
+                    .entry_for_path("managed-binary", recorded)
+                    .unwrap()["archive_sha256"],
+                "verified"
+            );
+            inventory
+                .remove_owned_string("managed-binary", scanned, "archive_sha256")
+                .unwrap();
+            assert!(inventory
+                .entry_for_path("managed-binary", recorded)
+                .unwrap()
+                .get("archive_sha256")
+                .is_none());
+            inventory.record("binary-placement", scanned, Map::new());
+            assert!(!inventory.owns_path("managed-binary", recorded));
+            assert!(inventory.owns_path("binary-placement", recorded));
+            inventory.remove_owned_path("binary-placement", recorded);
+            assert!(inventory.paths_for_kind("binary-placement").is_empty());
+        }
+    }
+
+    #[test]
+    fn separator_matching_does_not_grant_other_paths_ownership() {
+        let root = fixture_path("inventory-path-boundaries");
+        let recorded = Path::new(r"C:\Users\alex\.local/share/cortexkit\bin\ck-subc.exe");
+        for platform in ["windows-x64", "windows-arm64"] {
+            let mut inventory =
+                Inventory::load(root.join(format!("{platform}.json")), platform).unwrap();
+            inventory.record("managed-binary", recorded, Map::new());
+            for other in [
+                r"C:\Users\alex\.local/share\cortexkit\bin\ck-subc",
+                r"C:\Users\alex\.local/share\cortexkit\bin\CK-SUBC.exe",
+                r"C:\Users\alex\.local/share\other\bin\ck-subc.exe",
+                r"C:\Users\alex\.local/share\cortexkit\bin\ck-auth.exe",
+                r"C:\Users\alex\.local/share\cortexkit\bin\..\bin\ck-subc.exe",
+            ] {
+                assert!(
+                    !inventory.owns_path("managed-binary", Path::new(other)),
+                    "{other}"
+                );
+            }
+            assert!(!inventory.owns_path("binary-placement", recorded));
+            let verbatim = Path::new(r"\\?\C:\Users\alex\bin\ck.exe");
+            inventory.record("managed-binary", verbatim, Map::new());
+            assert!(inventory.owns_path("managed-binary", verbatim));
+            assert!(
+                !inventory.owns_path("managed-binary", Path::new(r"\\?\C:\Users\alex/bin/ck.exe"))
+            );
+        }
+        for platform in ["linux-x64", "darwin-arm64"] {
+            let mut inventory =
+                Inventory::load(root.join(format!("{platform}.json")), platform).unwrap();
+            inventory.record("managed-binary", Path::new(r"bin\ck-subc"), Map::new());
+            assert!(inventory.owns_path("managed-binary", Path::new(r"bin\ck-subc")));
+            assert!(!inventory.owns_path("managed-binary", Path::new("bin/ck-subc")));
+        }
     }
 
     #[test]

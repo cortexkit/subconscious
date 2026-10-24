@@ -49,12 +49,11 @@ pub use update_check::{
 };
 pub use upgrade::{
     dashboard_installed_binaries, discover_current_upgrade_targets, observed_upgrade_targets,
-    render_execution_report, DaemonCatalogBuild, ManagedUpgradeTarget, SystemUpgradeBackend,
+    render_execution_report, upgrade_ownership_outcomes, DaemonCatalogBuild, ManagedUpgradeTarget,
+    SystemUpgradeBackend,
 };
-// The production apply path prints this line from inside the executor; only
-// the test-support short-circuit in the CLI renders it directly, so the
-// re-export exists for that build alone. Unconditional, it is an unused
-// import in the release binary.
+// Production announces completion from inside the executor after verification;
+// only the fixture CLI's simulated apply renders the completion line directly.
 #[cfg(feature = "test-support")]
 pub use upgrade::upgraded_line;
 pub use upgrade_executor::{

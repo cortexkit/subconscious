@@ -1339,6 +1339,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rescan_preview_uses_the_injected_client_and_preserves_its_result() {
+        let root = ScratchDir::new("setup-injected-preview");
+        let mut backend = backend_without_user_manager(&root);
+        assert_eq!(
+            backend.preview_restart_required().unwrap_err(),
+            "no authenticated rescan preview client was supplied"
+        );
+        backend.set_rescan_preview(|| Ok(vec!["modules".into()]));
+        assert_eq!(backend.preview_restart_required().unwrap(), ["modules"]);
+        backend.set_rescan_preview(|| Err("preview refused".into()));
+        assert_eq!(
+            backend.preview_restart_required().unwrap_err(),
+            "preview refused"
+        );
+    }
+
     /// ck-auth refuses a key path whose directory is missing, so the directory
     /// must exist by the time the command runs: the default one under the data
     /// directory, and a custom one elsewhere.

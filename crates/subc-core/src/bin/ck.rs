@@ -426,7 +426,7 @@ const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info
 
 const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run] [--verbose] [--yes|-y]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without changing anything. Interactive setup shows that plan and\n  asks Continue? [y/N] before changes; --yes (-y) skips the question. Piped or\n  non-terminal setup proceeds without a question. --convert is explicit and requires\n  --confirm before it can apply a conversion plan. --verbose includes plan outcomes\n  and download diagnostics when a network request fails.";
 
-const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade [--dry-run] [--verbose]\n  ck upgrade --check [--verbose]\n\n  --check reports available updates without changing anything. --dry-run prints\n  the complete plan without changing anything. --verbose includes plan outcomes\n  and execution evidence.";
+const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade [--dry-run] [--verbose]\n  ck upgrade --check [--verbose]\n\n  --check reports available updates without changing anything. --dry-run prints\n  the complete plan without changing anything. --verbose includes plan outcomes\n  and execution evidence. --check exits 0 for current binaries or available\n  updates, and 1 when ownership is missing or an unowned destination is found.";
 
 /// Test builds append one line to the file named by `CK_TEST_INVOCATION_LOG`
 /// for every domain probe this process launches, written by the parent at
@@ -7233,6 +7233,14 @@ async fn upgrade_command(
     let discovered =
         setup::discover_current_upgrade_targets(executable, None::<&setup::DaemonCatalogBuild>)
             .map_err(CkError::Rejected)?;
+    let ownership_outcomes =
+        setup::upgrade_ownership_outcomes(executable, &discovered).map_err(CkError::Rejected)?;
+    if !ownership_outcomes.is_empty() {
+        for outcome in &ownership_outcomes {
+            println!("{}", human_blocking_outcome(outcome));
+        }
+        return Err(CkError::RenderedExit { exit_code: 1 });
+    }
     let cache = setup::UpdateCache::from_environment();
     let source = setup::IndexReleaseSource::from_environment(setup::TARGET_CHECK_BUDGET);
     let upgrade_roster = discovered

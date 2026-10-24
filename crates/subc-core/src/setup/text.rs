@@ -3,6 +3,31 @@
 
 use super::{ManagedUpgradeTarget, PlanOutcome};
 
+/// Setup leaves unfamiliar programs in place and names the safe next step.
+pub fn unowned_binary_refusal(path: &std::path::Path) -> String {
+    format!(
+        "ck setup did not install {}, so it won't replace it. \
+         Move it aside and run ck setup again. Nothing was changed.",
+        super::components::display_home_path(path)
+    )
+}
+
+/// Group paths so the explanation and next step appear only once.
+pub fn upgrade_unowned_binaries_refusal(paths: &[std::path::PathBuf]) -> String {
+    let paths = paths
+        .iter()
+        .map(|path| format!("  {}", super::components::display_home_path(path)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "ck upgrade manages only what ck setup installed. ck setup did not install these, so ck upgrade won't replace them:\n{paths}\nMove them aside and run ck setup again. Nothing was changed."
+    )
+}
+
+pub fn upgrade_nothing_managed_refusal() -> String {
+    "No CortexKit programs installed by ck setup were found. ck upgrade manages only what ck setup installed. Run ck setup to install them or take over the ones already here. Nothing was changed.".to_string()
+}
+
 /// Refusals already contain their actionable wording; do not prefix it again.
 pub fn human_blocking_outcome(outcome: &PlanOutcome) -> String {
     match outcome {
@@ -24,7 +49,7 @@ pub fn print_verbose_outcomes(outcomes: &[PlanOutcome], verbose: bool) -> String
         .collect()
 }
 
-/// Put the CLI first and omit the gateway's version, which is not self-reported.
+/// Put the CLI first; the gateway's label has no comparable release version.
 pub fn upgrade_current_summary(discovered: &[ManagedUpgradeTarget]) -> String {
     let mut components = Vec::new();
     let ordered = discovered
@@ -44,7 +69,7 @@ pub fn upgrade_current_summary(discovered: &[ManagedUpgradeTarget]) -> String {
         }
     }
     if components.is_empty() {
-        "Everything is up to date.".to_string()
+        upgrade_nothing_managed_refusal()
     } else {
         format!("Everything is up to date ({}).", components.join(" · "))
     }
@@ -53,6 +78,11 @@ pub fn upgrade_current_summary(discovered: &[ManagedUpgradeTarget]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_upgrade_summary_does_not_claim_currency() {
+        assert_eq!(upgrade_current_summary(&[]), "No CortexKit programs installed by ck setup were found. ck upgrade manages only what ck setup installed. Run ck setup to install them or take over the ones already here. Nothing was changed.");
+    }
 
     #[test]
     fn blocking_outcome_keeps_the_same_refusal_for_every_view() {

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.20.129
+
+- `ck upgrade` no longer says "Everything is up to date." without checking.
+  When ck setup installed nothing here, a managed destination holds a program
+  ck setup didn't install, or the running `ck` isn't the one ck setup
+  installed, upgrade refuses before any release lookup or write. It lists the
+  programs once under one explanation, with setup's next step. `--check` still
+  exits 0 when everything is current or updates are available; these refusals
+  exit 1. Setup's refusal now reads "ck setup did not install <path>, so it
+  won't replace it", from the same shared text.
+- Windows installation records accept `/` and `\` as the same separator in
+  ordinary paths, so a program ck setup installed is recognised whichever
+  separator its recorded path used. Recorded strings, case and verbatim or
+  device paths are unchanged.
+
 ## 0.20.128
 
 - Internal only: name the setup rescan-preview function type. No behaviour

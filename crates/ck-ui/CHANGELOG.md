@@ -10,6 +10,11 @@
   The section names the version you have and when it checked; the release
   source, date, signer, time estimate and release notes have no source and
   aren't shown.
+- A check that is refused before anything is checked (programs ck setup
+  didn't install, or a refused plan) reads "Updates can't be checked" and
+  shows the refusal as the engine gives it, with no component table and no
+  check age. Only a plan that checked and found nothing to do reads "up to
+  date".
 - The daemon-restart sentence, and the confirmation's mention of it, appear
   only when the plan replaces the daemon. `⏎` asks once; `l` goes back to
   Settings and is not remembered.

@@ -279,6 +279,49 @@ fn a_refusal_shows_verbatim_and_offers_no_upgrade() {
     assert!(!app.upgrade_confirm);
 }
 
+/// The check ck setup's ownership rule refused, as `ck upgrade --check`
+/// refuses on a computer where ck setup installed none of the programs it
+/// found. Nothing was checked, so nothing may read as up to date.
+#[test]
+fn an_ownership_refusal_says_updates_cant_be_checked_and_draws_no_table() {
+    let refusal = "ck upgrade manages only what ck setup installed. ck setup did not install these, so ck upgrade won't replace them:\n  ~/.local/share/cortexkit/bin/ck-subc\nMove them aside and run ck setup again. Nothing was changed.";
+    let plan = UpgradeCheck {
+        rows: Vec::new(),
+        refusal: Some(refusal.into()),
+        stages: Vec::new(),
+    };
+    let (app, snap) = updates_session(checked(Ok(plan)));
+    let rows = render(&app, &snap);
+    let text = screen(&rows);
+    assert!(rows[3].contains("Updates can't be checked"), "{text}");
+    for claim in [
+        "up to date",
+        "is available",
+        "Component",
+        "Installed",
+        "What happens",
+        "Checked",
+    ] {
+        assert!(
+            !text.contains(claim),
+            "a refused check shows {claim:?}:\n{text}"
+        );
+    }
+    assert!(
+        !rows[2..33].iter().any(|r| r.contains(&"─".repeat(40))),
+        "a refused check draws the table's rule:\n{text}"
+    );
+    for line in wrap_verbatim(refusal, 92) {
+        assert!(text.contains(line.as_str()), "{line:?} missing:\n{text}");
+    }
+    assert!(!marked(&rows));
+    assert!(
+        rows[35].contains("later") && !rows[35].contains("upgrade"),
+        "{}",
+        rows[35]
+    );
+}
+
 /// A scripted setup engine: counts its checks, and runs by reporting the
 /// plan and the given events once the test opens its gate.
 struct Scripted {

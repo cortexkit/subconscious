@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings      This computer  20:48 
+───────────────────────────────────────────────────────────────────────────────────━━━━━━━━━━───────────────────────────
+                                                                                                                        
+  Settings            │  Updates can't be checked                                                                       
+  ──────────────────  │                                                                                                 
+    Modules           │  ck upgrade manages only what ck setup installed. ck setup did not install these, so ck         
+    Daemon            │  upgrade won't replace them:                                                                    
+  ▸ Updates           │    ~/.local/share/cortexkit/bin/ck-subc                                                         
+    About             │    ~/.local/share/cortexkit/bin/ck-subc-mcp                                                     
+                      │  Move them aside and run ck setup again. Nothing was changed.                                   
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                      │                                                                                                 
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  l  later                                                                                                              

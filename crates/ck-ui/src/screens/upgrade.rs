@@ -15,6 +15,9 @@ use crate::upgrade::{stage_label, PlanRow, Run, StageState, StageView, UpgradeCh
 /// confirmation names it, only when the plan replaces the daemon.
 pub const DAEMON_RESTART: &str = "Upgrading restarts the daemon, which restarts every module.";
 
+/// The title when the check was refused before anything was checked.
+pub const REFUSED: &str = "Updates can't be checked";
+
 /// What the confirmation says the run will do: each component it replaces,
 /// and the daemon restart when the plan replaces the daemon.
 pub fn confirmation(check: &UpgradeCheck) -> Vec<String> {
@@ -136,8 +139,23 @@ pub fn draw(c: &mut Canvas, v: &View, x: i32) {
                 lines.push(Line::Text(l, St::D));
             }
         }
+        // A refused check looked at nothing: no versions, no component
+        // table and no "checked" age, only the refusal as the engine
+        // words it.
+        Some(Ok(UpgradeCheck {
+            refusal: Some(refusal),
+            ..
+        })) => {
+            lines.push(Line::Title(REFUSED.into(), None));
+            lines.push(Line::Gap);
+            for l in wrap_verbatim(refusal, dw as usize) {
+                lines.push(Line::Text(l, St::W));
+            }
+        }
         Some(Ok(plan)) => {
             let ck = plan.ck();
+            // Only a plan that checked every component and found nothing to
+            // do reads as up to date.
             let title = match ck.filter(|r| r.replaces) {
                 Some(r) => format!("CortexKit {} is available", r.new),
                 None if plan.newer() => "Updates are available".to_string(),
@@ -162,11 +180,7 @@ pub fn draw(c: &mut Canvas, v: &View, x: i32) {
             lines.extend(plan.rows.iter().map(Line::Row));
             let rows = start..lines.len();
             lines.push(Line::Gap);
-            if let Some(refusal) = &plan.refusal {
-                for l in wrap_verbatim(refusal, dw as usize) {
-                    lines.push(Line::Text(l, St::W));
-                }
-            } else if plan.newer() {
+            if plan.newer() {
                 if plan.replaces_daemon() {
                     let sentence = if design {
                         format!("{DAEMON_RESTART} It takes about 40 s.")
@@ -209,7 +223,8 @@ pub fn draw(c: &mut Canvas, v: &View, x: i32) {
             lists.push((rows, 0, 1));
         }
     }
-    if updates.run.is_none() {
+    let refused = updates.plan().is_some_and(|p| p.refusal.is_some());
+    if updates.run.is_none() && !refused {
         if let Some(checked) = checked {
             lines.push(Line::Gap);
             lines.push(Line::Gap);
@@ -235,6 +250,9 @@ pub fn draw(c: &mut Canvas, v: &View, x: i32) {
     if !running {
         hints.push(("l", "later"));
     }
+    // The release notes key and source belong to a check that reached the
+    // release index; a refused one didn't.
+    let design = design && !refused;
     if design {
         hints.push(("n", "release notes"));
     }

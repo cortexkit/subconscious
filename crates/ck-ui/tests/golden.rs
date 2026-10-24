@@ -429,6 +429,27 @@ fn upgrade_120x36() {
     check("upgrade-120x36", &app, &Snapshot::fixture());
 }
 
+/// Settings → Updates when the check is refused before anything is checked:
+/// ck setup didn't install the programs it found. The refusal is the mock's
+/// `UPGRADE_REFUSAL` (`mock/data.js`), which `fixture.json` doesn't carry.
+#[test]
+fn updates_refused_120x36() {
+    let mut app = app();
+    app.tab = Tab::Settings;
+    app.settings.section = 2;
+    let mut snap = Snapshot::fixture();
+    let refusal = "ck upgrade manages only what ck setup installed. ck setup did not install these, so ck upgrade won't replace them:\n  ~/.local/share/cortexkit/bin/ck-subc\n  ~/.local/share/cortexkit/bin/ck-subc-mcp\nMove them aside and run ck setup again. Nothing was changed.";
+    snap.upgrade.check = Some(ck_ui::upgrade::Checked {
+        at: Snapshot::fixture_now().add_secs(-7.0),
+        result: Ok(ck_ui::upgrade::UpgradeCheck {
+            rows: Vec::new(),
+            refusal: Some(refusal.into()),
+            stages: Vec::new(),
+        }),
+    });
+    check("updates-refused-120x36", &app, &snap);
+}
+
 /// The Agents frame: nothing selected, so no row is highlighted.
 #[test]
 fn agents_120x36() {

@@ -8,9 +8,14 @@
   output is unchanged; its refusal text now comes from
   `setup::text::upgrade_ownership_refusal` and `upgrade_plan_refusal`, which
   the wizard uses too.
-- `SystemUpgradeBackend::set_quiet` keeps the completion line off stdout and
-  holds cleanup warnings for the caller (`take_warnings`), for the app,
-  which owns the terminal. `ck upgrade` doesn't set it.
+- `SystemUpgradeBackend::new` takes an `UpgradeOutput`, so where its lines go
+  is fixed before it does anything. `Terminal` (what `ck upgrade` passes)
+  prints as before. `Kept`, for the app, which owns the terminal, prints
+  nothing and hands every cleanup warning to `take_warnings`, including those
+  from the sweep of previous images that runs while the backend is built.
+- Sweeping previous images returns its warnings instead of printing them.
+  `ck setup` and `ck upgrade` print them as before: the same text, in the same
+  order, on stderr.
 
 ## 0.20.129
 

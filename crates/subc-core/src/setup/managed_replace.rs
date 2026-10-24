@@ -120,9 +120,12 @@ pub(super) fn remove_replaced_image(inventory: &mut Inventory, aside: &Path) -> 
 
 /// Deletes every previous image an earlier replacement left behind because its
 /// process was still running then. Images still held are kept for the next
-/// sweep, with a warning. An image whose destination is missing is also kept:
-/// it may be the only copy of that binary left on disk.
-pub(super) fn sweep_replaced_images(inventory: &mut Inventory) {
+/// sweep, and a warning for each is returned, oldest row first, for the
+/// caller to print or show: the terminal app owns the screen, so nothing
+/// here writes to stdout or stderr. An image whose destination is missing is
+/// also kept: it may be the only copy of that binary left on disk.
+pub(super) fn sweep_replaced_images(inventory: &mut Inventory) -> Vec<String> {
+    let mut warnings = Vec::new();
     for aside in inventory.paths_for_kind(REPLACED_IMAGE_KIND) {
         let destination_present = inventory
             .entry_for_path(REPLACED_IMAGE_KIND, &aside)
@@ -133,9 +136,12 @@ pub(super) fn sweep_replaced_images(inventory: &mut Inventory) {
             continue;
         }
         if let Err(error) = remove_replaced_image(inventory, &aside) {
-            eprintln!("warning: {error}; it will be removed by a later ck setup or ck upgrade");
+            warnings.push(format!(
+                "warning: {error}; it will be removed by a later ck setup or ck upgrade"
+            ));
         }
     }
+    warnings
 }
 
 fn forget_replaced_image(inventory: &mut Inventory, aside: &Path) {
@@ -333,7 +339,10 @@ mod tests {
         );
         f.inventory.record(REPLACED_IMAGE_KIND, &orphan, fields);
 
-        sweep_replaced_images(&mut f.inventory);
+        assert_eq!(
+            sweep_replaced_images(&mut f.inventory),
+            Vec::<String>::new()
+        );
 
         assert!(!aside.exists());
         assert!(orphan.exists());

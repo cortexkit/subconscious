@@ -483,6 +483,11 @@ fn module_counts() -> (usize, usize) {
     (healthy, modules.len())
 }
 
+/// A warning the engine keeps for the app: a previous image it couldn't
+/// delete while that image's process still ran.
+const HELD_IMAGE: &str =
+    "warning: could not delete previous image ~/bin/.ck-aft.replaced-1-1: in use";
+
 #[test]
 fn the_wizard_stays_through_the_daemon_restart_and_ends_with_what_happened() {
     let plan = daemon_plan();
@@ -529,7 +534,7 @@ fn the_wizard_stays_through_the_daemon_restart_and_ends_with_what_happened() {
         UpgradeOutcome {
             installed: vec!["ck-subc 0.36.18".into(), "ck 0.20.110".into()],
             error: None,
-            warnings: Vec::new(),
+            warnings: vec![HELD_IMAGE.into()],
         },
     ));
     let mut back = Snapshot::fixture();
@@ -544,6 +549,10 @@ fn the_wizard_stays_through_the_daemon_restart_and_ends_with_what_happened() {
         "✓ Upgraded ck-subc 0.36.18 · ck 0.20.110 in 29 s. {healthy} of {total} modules healthy."
     );
     assert!(text.contains(&end), "{end} missing:\n{text}");
+    assert!(
+        text.contains(HELD_IMAGE),
+        "the engine's warning shows as it gave it:\n{text}"
+    );
     assert!(
         !marked(&render(&app, &back)),
         "an installed update isn't marked"

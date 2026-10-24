@@ -20,7 +20,7 @@ use ck_ui::upgrade::{
 
 use super::model::{UpgradeObserved, UpgradeOperation, UpgradeState, UpgradeTarget};
 use super::planner::UpgradePlan;
-use super::upgrade::{ManagedUpgradeTarget, SystemUpgradeBackend};
+use super::upgrade::{ManagedUpgradeTarget, SystemUpgradeBackend, UpgradeOutput};
 use super::upgrade_executor::{RollbackDecision, UpgradeExecutionBackend};
 use super::PlanOutcome;
 
@@ -148,12 +148,13 @@ impl UpgradeService for SetupUpgradeService {
             self.daemon.connection_path(),
             ready.discovered,
             ready.index,
+            // The app owns the terminal, so the engine keeps its lines for it
+            // from the moment it is built.
+            UpgradeOutput::Kept,
         ) {
             Ok(backend) => backend,
             Err(error) => return stopped(error),
         };
-        // The app owns the terminal, so the engine keeps its lines for it.
-        backend.set_quiet();
         backend.set_supervised_modules(ready.observed.supervised_modules.clone());
         let mut versions = BTreeMap::new();
         for &target in &ready.observed.roster {

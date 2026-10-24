@@ -7387,9 +7387,14 @@ async fn upgrade_command(
     }
 
     let index = planning_index.expect("non-check upgrade loaded its planning index");
-    let mut backend =
-        setup::SystemUpgradeBackend::new(executable, connection_path, discovered, index)
-            .map_err(CkError::Rejected)?;
+    let mut backend = setup::SystemUpgradeBackend::new(
+        executable,
+        connection_path,
+        discovered,
+        index,
+        setup::UpgradeOutput::Terminal,
+    )
+    .map_err(CkError::Rejected)?;
     backend.set_supervised_modules(observed.supervised_modules.clone());
     for &target in &observed.roster {
         if let setup::UpgradeState::UpdateAvailable { from, to, .. } = observed.target_state(target)

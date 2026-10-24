@@ -380,11 +380,67 @@ pub struct SystemUpgradeBackend {
     /// spell the same transition.
     planned_from: BTreeMap<String, String>,
     supervised_modules: BTreeSet<String>,
-    /// Set when the terminal app runs the upgrade: it owns the screen, so
-    /// the completion line isn't printed and cleanup warnings are kept in
-    /// `warnings` for it to show instead of going to stderr.
-    quiet: bool,
-    warnings: Vec<String>,
+    /// Where the backend's own lines go, fixed when it is built.
+    lines: Lines,
+}
+
+/// Where [`SystemUpgradeBackend`] sends its own lines: the completion line
+/// after each verified target, and cleanup warnings (a previous image or a
+/// rollback copy it couldn't delete). Chosen when the backend is built, so
+/// nothing it does from then on can print in the wrong mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpgradeOutput {
+    /// `ck upgrade`: completion lines on stdout, warnings on stderr.
+    Terminal,
+    /// The terminal app owns the screen, where a stray write would corrupt
+    /// the frame. Nothing is printed: warnings are kept for
+    /// [`SystemUpgradeBackend::take_warnings`], and the app reports each
+    /// completed target itself.
+    Kept,
+}
+
+/// The one place the backend's lines leave it.
+#[derive(Debug)]
+struct Lines {
+    output: UpgradeOutput,
+    kept: Vec<String>,
+    /// What went to the terminal, so tests can see which branch each line
+    /// took without capturing the process's own stdout and stderr.
+    #[cfg(test)]
+    printed: Vec<String>,
+}
+
+impl Lines {
+    fn new(output: UpgradeOutput) -> Self {
+        Self {
+            output,
+            kept: Vec::new(),
+            #[cfg(test)]
+            printed: Vec::new(),
+        }
+    }
+
+    fn warn(&mut self, warning: String) {
+        match self.output {
+            UpgradeOutput::Terminal => {
+                eprintln!("{warning}");
+                #[cfg(test)]
+                self.printed.push(warning);
+            }
+            UpgradeOutput::Kept => self.kept.push(warning),
+        }
+    }
+
+    fn completed(&mut self, line: String) {
+        match self.output {
+            UpgradeOutput::Terminal => {
+                println!("{line}");
+                #[cfg(test)]
+                self.printed.push(line);
+            }
+            UpgradeOutput::Kept => {}
+        }
+    }
 }
 
 impl SystemUpgradeBackend {
@@ -393,6 +449,7 @@ impl SystemUpgradeBackend {
         subc: Option<PathBuf>,
         targets: Vec<ManagedUpgradeTarget>,
         index: ReleaseIndex,
+        output: UpgradeOutput,
     ) -> Result<Self, String> {
         let platform = match super::model::PlatformObservation::current() {
             super::model::PlatformObservation::Supported(platform) => platform,
@@ -405,9 +462,29 @@ impl SystemUpgradeBackend {
             }
         };
         let data_dir = load_current_inventory_root()?;
-        let mut inventory = load_current_inventory()?;
+        let inventory = load_current_inventory()?;
         tighten_upgrade_permissions(&data_dir, &inventory)?;
-        managed_replace::sweep_replaced_images(&mut inventory);
+        Ok(Self::with_inventory(
+            platform, executable, subc, targets, index, inventory, output,
+        ))
+    }
+
+    /// Builds the backend over an inventory already loaded, first sweeping
+    /// the previous images earlier replacements left behind. Their warnings
+    /// go where `output` sends every other line.
+    fn with_inventory(
+        platform: AlphaTarget,
+        executable: impl Into<PathBuf>,
+        subc: Option<PathBuf>,
+        targets: Vec<ManagedUpgradeTarget>,
+        index: ReleaseIndex,
+        mut inventory: Inventory,
+        output: UpgradeOutput,
+    ) -> Self {
+        let mut lines = Lines::new(output);
+        for warning in managed_replace::sweep_replaced_images(&mut inventory) {
+            lines.warn(warning);
+        }
         let expected_versions = targets
             .iter()
             .map(|item| {
@@ -417,7 +494,7 @@ impl SystemUpgradeBackend {
                 )
             })
             .collect();
-        Ok(Self {
+        Self {
             platform,
             targets: targets
                 .into_iter()
@@ -435,27 +512,18 @@ impl SystemUpgradeBackend {
             expected_versions,
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
-            quiet: false,
-            warnings: Vec::new(),
-        })
+            lines,
+        }
     }
 
-    /// Prints nothing: see `quiet`.
-    pub fn set_quiet(&mut self) {
-        self.quiet = true;
-    }
-
-    /// The cleanup warnings kept while quiet, oldest first.
+    /// The warnings kept under [`UpgradeOutput::Kept`], oldest first; always
+    /// empty under [`UpgradeOutput::Terminal`], which printed them.
     pub fn take_warnings(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.warnings)
+        std::mem::take(&mut self.lines.kept)
     }
 
     fn warn(&mut self, warning: String) {
-        if self.quiet {
-            self.warnings.push(warning);
-        } else {
-            eprintln!("{warning}");
-        }
+        self.lines.warn(warning);
     }
 
     pub fn set_supervised_modules(&mut self, modules: BTreeSet<String>) {
@@ -1054,9 +1122,8 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
                 ));
             }
         }
-        if !self.quiet {
-            println!("{}", self.completion_line(target));
-        }
+        let line = self.completion_line(target);
+        self.lines.completed(line);
     }
 
     fn rollback_decision(&mut self, _target: UpgradeTarget) -> RollbackDecision {
@@ -1371,8 +1438,7 @@ mod tests {
                 .collect(),
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
-            quiet: false,
-            warnings: Vec::new(),
+            lines: Lines::new(UpgradeOutput::Terminal),
         }
     }
 
@@ -1588,8 +1654,7 @@ mod tests {
             expected_versions: BTreeMap::from([(target.label().to_string(), "0.2.0".into())]),
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
-            quiet: false,
-            warnings: Vec::new(),
+            lines: Lines::new(UpgradeOutput::Terminal),
         }
     }
 
@@ -1722,7 +1787,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(30);
         while aside.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
-            managed_replace::sweep_replaced_images(&mut backend.inventory);
+            // A still-held image only warns; the loop retries it.
+            let _ = managed_replace::sweep_replaced_images(&mut backend.inventory);
         }
         assert_eq!(directory_entries(&bin), ["ckdev-aft.exe"]);
         assert!(backend
@@ -1849,7 +1915,8 @@ mod tests {
         // image a moment late, so the sweep is retried briefly.
         let deadline = Instant::now() + Duration::from_secs(30);
         while aside.exists() && Instant::now() < deadline {
-            managed_replace::sweep_replaced_images(&mut backend.inventory);
+            // A still-held image only warns; the loop retries it.
+            let _ = managed_replace::sweep_replaced_images(&mut backend.inventory);
             if aside.exists() {
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -1962,8 +2029,7 @@ mod tests {
             expected_versions: BTreeMap::new(),
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
-            quiet: false,
-            warnings: Vec::new(),
+            lines: Lines::new(UpgradeOutput::Terminal),
         };
         let result = backend.rollback(aft);
         child.kill().unwrap();
@@ -2319,8 +2385,7 @@ exit 1
                 .collect(),
             planned_from: BTreeMap::new(),
             supervised_modules: ["aft".to_string()].into_iter().collect(),
-            quiet: false,
-            warnings: Vec::new(),
+            lines: Lines::new(UpgradeOutput::Terminal),
         };
 
         let result = backend.initiate_module_restart(aft, Duration::from_secs(30));
@@ -2371,8 +2436,7 @@ exit 1
                 .collect(),
             planned_from: BTreeMap::new(),
             supervised_modules: BTreeSet::new(),
-            quiet: false,
-            warnings: Vec::new(),
+            lines: Lines::new(UpgradeOutput::Terminal),
         };
 
         // Without the planner's word, the line falls back to the self-report.
@@ -2385,5 +2449,92 @@ exit 1
             backend.completion_line(mcp),
             "upgraded ck-subc-mcp → release 0.17.36, restarted"
         );
+    }
+
+    /// What a backend built with `output` sends for its two cleanup
+    /// warnings and its completion line: a previous image the construction
+    /// sweep can't delete, then a rollback copy completion can't delete.
+    /// Both are directories, which file removal refuses on every platform.
+    /// Returns the kept warnings and the printed lines, with the scratch
+    /// folder written as `<root>` so both modes compare as text.
+    fn stuck_cleanup_lines(name: &str, output: UpgradeOutput) -> (Vec<String>, Vec<String>) {
+        let root = ScratchDir::new(name);
+        let target = upgrade_target("ck-aft");
+        let destination = root.join("ck-aft");
+        fs::write(&destination, "new image").unwrap();
+        let aside = root.join(".ck-aft.replaced-1-1");
+        fs::create_dir_all(aside.join("held")).unwrap();
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
+        let mut fields = Map::new();
+        fields.insert(
+            "replaces".to_string(),
+            serde_json::Value::String(destination.to_string_lossy().into_owned()),
+        );
+        inventory.record(managed_replace::REPLACED_IMAGE_KIND, &aside, fields);
+        let mut backend = SystemUpgradeBackend::with_inventory(
+            AlphaTarget::LinuxX64,
+            root.join("ck"),
+            None,
+            vec![ManagedUpgradeTarget {
+                target,
+                destination,
+                installed_version: "0.1.0".to_string(),
+                installed_archive_sha256: None,
+            }],
+            ReleaseIndex {
+                schema: 1,
+                channel: "alpha".to_string(),
+                generated_at_ms: 0,
+                components: BTreeMap::new(),
+            },
+            inventory,
+            output,
+        );
+        backend.set_expected_version(target, "0.2.0".to_string());
+        let rollback = root.join(".ck-aft.rollback");
+        fs::create_dir_all(rollback.join("held")).unwrap();
+        backend
+            .rollback_paths
+            .insert(target.label().to_string(), rollback);
+        backend.completed(target);
+        let root_text = root.path().display().to_string();
+        let masked = |lines: Vec<String>| -> Vec<String> {
+            lines
+                .into_iter()
+                .map(|line| line.replace(&root_text, "<root>"))
+                .collect()
+        };
+        let printed = std::mem::take(&mut backend.lines.printed);
+        (masked(backend.take_warnings()), masked(printed))
+    }
+
+    #[test]
+    fn a_kept_backend_returns_the_sweep_and_rollback_warnings_in_order_and_prints_nothing() {
+        let (kept, printed) = stuck_cleanup_lines("kept-cleanup-lines", UpgradeOutput::Kept);
+        assert!(printed.is_empty(), "a kept backend printed {printed:?}");
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        let sep = std::path::MAIN_SEPARATOR;
+        assert!(
+            kept[0].starts_with(&format!(
+                "warning: could not delete previous image <root>{sep}.ck-aft.replaced-1-1: "
+            )) && kept[0].ends_with("; it will be removed by a later ck setup or ck upgrade"),
+            "the construction sweep's warning comes first: {kept:?}"
+        );
+        assert!(
+            kept[1].starts_with(&format!(
+                "warning: upgrade completed but could not remove rollback copy <root>{sep}.ck-aft.rollback: "
+            )),
+            "the rollback copy's warning comes second: {kept:?}"
+        );
+
+        // A terminal backend prints the same warnings, in the same order,
+        // then the completion line, and keeps nothing.
+        let (terminal_kept, terminal_printed) =
+            stuck_cleanup_lines("terminal-cleanup-lines", UpgradeOutput::Terminal);
+        assert!(terminal_kept.is_empty(), "{terminal_kept:?}");
+        let mut expected = kept;
+        expected.push("upgraded ck-aft 0.1.0 → 0.2.0, restarted".to_string());
+        assert_eq!(terminal_printed, expected);
     }
 }

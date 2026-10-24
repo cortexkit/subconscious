@@ -867,7 +867,11 @@ impl SetupExecutor for SetupBackend {
     fn prepare_apply(&mut self, plan: &SetupPlan) -> Result<(), Self::Error> {
         // An earlier upgrade on Windows may have left a previous binary image
         // behind because its process was still running; it is free by now.
-        managed_replace::sweep_replaced_images(&mut self.inventory);
+        // Setup runs in a terminal of its own, so a held image's warning
+        // goes to stderr as it is found.
+        for warning in managed_replace::sweep_replaced_images(&mut self.inventory) {
+            eprintln!("{warning}");
+        }
         if plan
             .operations
             .iter()

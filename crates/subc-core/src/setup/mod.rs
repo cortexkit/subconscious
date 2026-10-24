@@ -51,7 +51,7 @@ pub use update_check::{
 pub use upgrade::{
     dashboard_installed_binaries, discover_current_upgrade_targets, observed_upgrade_targets,
     render_execution_report, upgrade_ownership_outcomes, DaemonCatalogBuild, ManagedUpgradeTarget,
-    SystemUpgradeBackend,
+    SystemUpgradeBackend, UpgradeOutput,
 };
 // Production announces completion from inside the executor after verification;
 // only the fixture CLI's simulated apply renders the completion line directly.

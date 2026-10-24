@@ -2789,6 +2789,7 @@ impl Supervisor {
         let Some(forwarding) = &self.forwarding else {
             return Ok(());
         };
+        let notice_started = Instant::now();
         let modules = forwarding
             .begin_daemon_drain()
             .map_err(SuperviseError::Forwarding)?;
@@ -2868,7 +2869,9 @@ impl Supervisor {
             }
         }
         notices.abort_all();
-        let deadline = Instant::now() + DRAIN_BUDGET;
+        let notice_elapsed = notice_started.elapsed();
+        let drain_started = Instant::now();
+        let deadline = drain_started + DRAIN_BUDGET;
         let mut waits = tokio::task::JoinSet::new();
         for (module_id, endpoint, gauges) in drains {
             let forwarding = Arc::clone(forwarding);
@@ -2903,6 +2906,13 @@ impl Supervisor {
                 warn!(?result, "daemon shutdown drain did not reach quiescence");
             }
         }
+        // Measure only the forwarding drain, not child teardown or the caller's
+        // signal delivery and process-reaping delays.
+        info!(
+            notice_elapsed_ms = notice_elapsed.as_millis() as u64,
+            drain_elapsed_ms = drain_started.elapsed().as_millis() as u64,
+            "daemon shutdown forwarding drain complete"
+        );
         Ok(())
     }
 
@@ -8792,35 +8802,33 @@ fn spawn_child_in_slot(
     );
     let roster_guard = match roster_guard {
         Ok(guard) => guard,
-        Err(source) => {
-            #[cfg(windows)]
-            if let Some(job) = &job {
-                let _ = job.terminate();
-            }
-            #[cfg(target_os = "linux")]
-            kill_module_cgroup(cgroup_placement, &cgroup_name);
-            kill_and_reap_rejected_child(&mut child);
-            #[cfg(target_os = "linux")]
-            if let Some(placement) = cgroup_placement {
-                remove_module_cgroup(placement, &cgroup_name);
-            }
-            return Err(SuperviseError::Spawn {
-                program: spec.program.clone(),
-                source: io::Error::other(format!(
-                    "could not durably record module child: {source}"
-                )),
-                cgroup_path,
+        Err(failure) => {
+            return failure.with_cleanup(|source| {
+                #[cfg(windows)]
+                if let Some(job) = &job {
+                    let _ = job.terminate();
+                }
+                #[cfg(target_os = "linux")]
+                kill_module_cgroup(cgroup_placement, &cgroup_name);
+                kill_and_reap_rejected_child(&mut child);
+                #[cfg(target_os = "linux")]
+                if let Some(placement) = cgroup_placement {
+                    remove_module_cgroup(placement, &cgroup_name);
+                }
+                Err(SuperviseError::Spawn {
+                    program: spec.program.clone(),
+                    source: io::Error::other(format!(
+                        "could not durably record module child: {source}"
+                    )),
+                    cgroup_path,
+                })
             });
         }
     };
-    // The check at the top of this function can pass just before daemon
-    // shutdown begins, and the process is only in the roster from here on.
-    // The shutdown stop returns as soon as it finds the roster empty, so a
-    // process admitted after that look would outlive the daemon. The roster
-    // is closed before the stop first reads it and admission happens under
-    // the roster's lock, so either the stop sees this process or this check
-    // sees the roster closed: end the process now rather than start a module
-    // the daemon is about to stop.
+    // The pre-spawn check can pass just before shutdown begins. Ownership is
+    // published at the start of admission, even while a record write is queued.
+    // If shutdown already saw an empty roster before that publication, this
+    // check sees the roster closed and ends the child before starting a module.
     if roster.is_closed() {
         // This child was never admitted, so there is no module protocol shutdown to wait for.
         #[cfg(target_os = "linux")]

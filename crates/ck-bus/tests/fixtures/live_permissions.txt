@@ -1,0 +1,41 @@
+allow participant publish ck.box_goldenfixture.live.ckbus.>
+allow delivery-authority publish ck.box_goldenfixture.live.prefrontal-core.>
+allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_instance_created.v1
+allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_instance_ended.v1
+allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_instance_expired.v1
+allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_instance_extended.v1
+allow delivery-authority subscribe ck.box_goldenfixture.live.broca.>
+allow flow-engine publish ck.box_goldenfixture.live.basal.>
+allow flow-engine subscribe ck.box_goldenfixture.live.>
+allow astrocyte publish ck.box_goldenfixture.live.astrocyte.>
+allow astrocyte subscribe ck.box_goldenfixture.live.insula.>
+allow broca publish ck.box_goldenfixture.live.broca.>
+allow broca subscribe ck.box_goldenfixture.live.magic-context.compaction.>
+allow magic-context publish ck.box_goldenfixture.live.magic-context.>
+allow magic-context subscribe ck.box_goldenfixture.live.broca.compaction.>
+allow magic-context subscribe ck.box_goldenfixture.live.thalamus-harness.compaction.>
+allow magic-context subscribe ck.box_goldenfixture.live.thalamus.compaction.>
+allow prefrontal-routing publish ck.box_goldenfixture.live.prefrontal-routing.>
+allow prefrontal-routing subscribe ck.box_goldenfixture.live.insula.>
+allow thalamus publish ck.box_goldenfixture.live.thalamus.>
+allow thalamus subscribe ck.box_goldenfixture.live.magic-context.compaction.>
+allow thalamus-harness publish ck.box_goldenfixture.live.thalamus-harness.>
+allow thalamus-harness subscribe ck.box_goldenfixture.live.magic-context.compaction.>
+expect-refused participant publish ck.box_goldenfixture.live.other.pull_request_review.v1 foreign-module-live
+expect-refused delivery-authority publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
+expect-refused delivery-authority publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
+expect-refused delivery-authority subscribe ck.box_goldenfixture.live.basal.> foreign-live-subscribe
+expect-refused bus publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
+expect-refused flow-engine publish ck.box_goldenfixture.live.other.pull_request_review.v1 foreign-module-live
+expect-refused astrocyte publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
+expect-refused astrocyte publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
+expect-refused broca publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
+expect-refused magic-context publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
+expect-refused magic-context publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
+expect-refused prefrontal-routing publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
+expect-refused prefrontal-routing publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
+expect-refused thalamus publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
+expect-refused thalamus publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
+expect-refused thalamus-harness publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
+expect-refused thalamus-harness publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
+expect-refused participant subscribe ck.box_goldenfixture.live.ckbus.step.finished.v1 no-event-reader

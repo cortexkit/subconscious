@@ -136,6 +136,51 @@ fn the_event_stream_is_emitted_with_its_per_subject_cap() {
     assert_eq!(emitted["duplicate_window"], 120_000_000_000_u64);
 }
 
+/// Whether a NATS binding can capture any descendant of the account's live root.
+/// Check namespace overlap rather than a single example kind: an unrelated future
+/// module or kind must not become stored just because a test did not name it.
+fn may_capture_live(pattern: &str, account: &str) -> bool {
+    let mut tokens = pattern.split('.');
+    for fixed in ["ck", account, "live"] {
+        match tokens.next() {
+            Some(">") => return true,
+            Some(token) if token == "*" || token == fixed => {}
+            _ => return false,
+        }
+    }
+    tokens.next().is_some()
+}
+
+#[test]
+fn no_configured_stream_can_store_live_hints() {
+    let names = AccountNames::derive("box_livefixture").unwrap();
+    for pattern in [
+        ">",
+        "ck.>",
+        "ck.*.>",
+        "ck.box_livefixture.>",
+        "ck.box_livefixture.*.>",
+        "ck.box_livefixture.live.>",
+        "ck.box_livefixture.live.other.future.kind.v9",
+    ] {
+        assert!(may_capture_live(pattern, names.account()), "{pattern}");
+    }
+    let mut configs = shipped_streams(&names)
+        .iter()
+        .map(bootstrap::plane::stream_config)
+        .collect::<Vec<_>>();
+    configs.push(bootstrap::plane::census_config(&names));
+    for config in configs {
+        for subject in config.subjects {
+            assert!(
+                !may_capture_live(&subject, names.account()),
+                "stream {} would store live hints through {subject}",
+                config.name
+            );
+        }
+    }
+}
+
 /// The harness signer answering in process, through claustrum's exact wire.
 struct InProcessVault {
     signer: HarnessSigner,

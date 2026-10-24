@@ -6,7 +6,7 @@
 //! permission sets. Rendered as a document, they must equal the naming crate's committed
 //! reference document `permission_golden.txt` (commons, vendored under
 //! `tests/fixtures/foundation/`) except for the header line and the subjects named in
-//! `ADDED_SUBJECTS`. The controls show that a partial-token wildcard, a `deny` entry and
+//! `live_permissions.txt`. The controls show that a partial-token wildcard, a `deny` entry and
 //! an out-of-lexicon account are each refused.
 
 #[allow(dead_code)]
@@ -30,9 +30,9 @@ use sha2::{Digest, Sha256};
 const ROW: &str = "Grant generation";
 const SERVED_BY: &str = "none";
 
-/// Subjects the ck-bus generator emits beyond the vendored golden. The golden diff rule
-/// allows additions only when each is named; this row adds none.
-const ADDED_SUBJECTS: &[&str] = &[];
+/// Explicit local additions, kept separate so the upstream golden retains its SOURCE
+/// digest. These pin the principal and operation as well as the subject of every line.
+const LIVE_GOLDEN: &str = include_str!("fixtures/live_permissions.txt");
 
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/foundation")
@@ -45,6 +45,10 @@ fn read_fixture(name: &str) -> String {
 
 fn vendored_golden() -> String {
     read_fixture("permission_golden.txt")
+}
+
+fn extended_golden() -> String {
+    format!("{}\n{LIVE_GOLDEN}", vendored_golden())
 }
 
 fn report(outcome: &str, detail: &str) {
@@ -61,8 +65,8 @@ fn report(outcome: &str, detail: &str) {
 
 /// Applies the golden diff rule: the first line of each document is its generator
 /// header and must name a generator; every other vendored line appears unchanged and in
-/// order in the regenerated document; any extra regenerated line is an `allow` line.
-/// Returns the added subjects.
+/// order in the regenerated document; extra lines must be declared permissions or
+/// refusal expectations. Returns the full added lines for comparison with the local golden.
 fn golden_diff(vendored: &str, regenerated: &str) -> Result<Vec<String>, String> {
     let mut vendored_lines = vendored.lines();
     let mut regenerated_lines = regenerated.lines();
@@ -84,10 +88,10 @@ fn golden_diff(vendored: &str, regenerated: &str) -> Result<Vec<String>, String>
             continue;
         }
         match line.split_whitespace().collect::<Vec<_>>().as_slice() {
-            ["allow", _, _, subject] => added.push((*subject).to_owned()),
+            ["allow", _, _, _] | ["expect-refused", _, _, _, _] => added.push(line.to_owned()),
             _ => {
                 return Err(format!(
-                    "regenerated line is neither golden nor an added allow: {line:?}"
+                    "regenerated line is neither golden nor an added permission: {line:?}"
                 ))
             }
         }
@@ -132,6 +136,95 @@ fn golden_allows(golden: &str, principal: Principal, operation: Operation) -> BT
 }
 
 #[test]
+fn a_participant_may_publish_only_its_own_live_hints() {
+    let account = grants::derive_account("box_livefixture").unwrap();
+    let grant = grants::issued_grant(&account, "runner-one", "credential", &[]).unwrap();
+    let live = grant
+        .publish_allow()
+        .iter()
+        .filter(|subject| subject.starts_with("ck.box_livefixture.live."))
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(live, ["ck.box_livefixture.live.runner-one.>"]);
+    assert!(grant.publish_allow().iter().any(|pattern| {
+        subject_matches(
+            pattern,
+            "ck.box_livefixture.live.runner-one.step.finished.v1",
+        )
+    }));
+    for subject in [
+        "ck.box_livefixture.live.runner-two.step.finished.v1",
+        "ck.box_livefixture.live.basal.step.finished.v1",
+        "ck.otheraccount.live.runner-one.step.finished.v1",
+    ] {
+        assert!(
+            grant
+                .publish_allow()
+                .iter()
+                .all(|pattern| !subject_matches(pattern, subject)),
+            "foreign live publish must be refused: {subject}"
+        );
+    }
+}
+
+#[test]
+fn live_subscriptions_preserve_event_reader_boundaries() {
+    let account = grants::derive_account("box_livefixture").unwrap();
+    let participant = grants::issued_grant(&account, "runner-one", "credential", &[]).unwrap();
+    let authority = grants::issued_grant(&account, "prefrontal-core", "credential", &[]).unwrap();
+    let flow = grants::issued_grant(&account, "basal", "credential", &[]).unwrap();
+    for (grant, allowed, refused) in [
+        (
+            &participant,
+            vec![],
+            vec![
+                "ck.box_livefixture.live.runner-one.step.finished.v1",
+                "ck.box_livefixture.live.*.step.finished.v1",
+            ],
+        ),
+        (
+            &authority,
+            vec![
+                "ck.box_livefixture.live.broca.run.v1",
+                "ck.box_livefixture.live.basal.flow_instance_created.v1",
+            ],
+            vec![
+                "ck.box_livefixture.live.basal.>",
+                "ck.box_livefixture.live.basal.step.finished.v1",
+                "ck.box_livefixture.live.*.step.finished.v1",
+            ],
+        ),
+        (
+            &flow,
+            vec![
+                "ck.box_livefixture.live.runner-one.step.finished.v1",
+                "ck.box_livefixture.live.*.step.finished.v1",
+            ],
+            vec!["ck.otheraccount.live.runner-one.step.finished.v1"],
+        ),
+    ] {
+        for subject in allowed {
+            assert!(
+                grant
+                    .subscribe_allow()
+                    .iter()
+                    .any(|pattern| subject_matches(pattern, subject)),
+                "existing event reader must be allowed: {subject}"
+            );
+        }
+        for subject in refused {
+            assert!(
+                grant
+                    .subscribe_allow()
+                    .iter()
+                    .all(|pattern| !subject_matches(pattern, subject)),
+                "unauthorized live subscribe must be refused: {subject}"
+            );
+        }
+    }
+}
+
+#[test]
 fn grant_generation_matches_vendored_golden_under_the_diff_rule() {
     let operator_dir = data_home::operator_module_dir();
     let operator_before = data_home::fingerprint(operator_dir.as_deref());
@@ -152,8 +245,9 @@ fn grant_generation_matches_vendored_golden_under_the_diff_rule() {
     let added = golden_diff(&vendored, &regenerated)
         .unwrap_or_else(|error| panic!("golden diff rule violated: {error}"));
     assert_eq!(
-        added, ADDED_SUBJECTS,
-        "every subject added beyond the vendored golden must be named in ADDED_SUBJECTS"
+        added,
+        LIVE_GOLDEN.lines().collect::<Vec<_>>(),
+        "every added permission and refusal must be pinned in the local live golden"
     );
 
     assert_eq!(
@@ -163,14 +257,14 @@ fn grant_generation_matches_vendored_golden_under_the_diff_rule() {
     );
     report(
         "passed",
-        "regenerated golden differs in the header line only; added subjects: none",
+        "upstream golden preserved; live additions equal the local permission golden",
     );
 }
 
 #[test]
 fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
     let fixture = PINNED_GOLDEN_FIXTURE;
-    let golden = vendored_golden();
+    let golden = extended_golden();
     let account = grants::derive_account(fixture.account).expect("pinned account derives");
     let participant = grants::participant_grant(
         &account,

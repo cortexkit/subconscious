@@ -435,6 +435,71 @@ async fn generated_grants_hold_on_a_live_server() {
     p.expect_allowed(&own_event).await;
     assert_eq!(stored(&observer, &streams.event).await, event_before + 1);
 
+    // Live delivery uses the same readers as event durables, but no stream stores it.
+    let flow = mint(&trust, &bus::box_root_id(), &account_public, |user| {
+        grants::flow_engine_grant(&names, user, grants::FLOW_ENGINE_MODULE).unwrap()
+    })
+    .await;
+    let f = connect(&server, &flow, true).await.unwrap();
+    let live = format!("ck.{acct}.live.{PARTICIPANT_MODULE}.step.finished.v1");
+    let wildcard = format!("ck.{acct}.live.*.step.finished.v1");
+    let mut exact_hints = f.client.subscribe(live.clone()).await.unwrap();
+    let mut all_runners = f.client.subscribe(wildcard.clone()).await.unwrap();
+    f.client.flush().await.unwrap();
+    let tracked_streams = [
+        &streams.room,
+        &streams.wake,
+        &streams.peer,
+        &streams.effect,
+        &streams.effect_dead,
+        &streams.event,
+        &census_stream,
+    ];
+    let mut before_live = Vec::new();
+    for stream in tracked_streams {
+        before_live.push(stored(&observer, stream).await);
+    }
+    p.publish(&live, b"").await;
+    p.expect_allowed(&live).await;
+    for hints in [&mut exact_hints, &mut all_runners] {
+        let hint = tokio::time::timeout(Duration::from_secs(5), hints.next())
+            .await
+            .expect("an authorized current subscriber receives the live hint")
+            .expect("the subscription remains open");
+        assert_eq!(hint.subject.as_str(), live);
+        assert!(hint.payload.is_empty());
+    }
+    f.expect_allowed(&live).await;
+    f.expect_allowed(&wildcard).await;
+    let narrow_live = format!("ck.{acct}.live.basal.flow_instance_created.v1");
+    let mut authority_hints = a.client.subscribe(narrow_live.clone()).await.unwrap();
+    a.client.flush().await.unwrap();
+    f.publish(&narrow_live, b"").await;
+    f.expect_allowed(&narrow_live).await;
+    let hint = tokio::time::timeout(Duration::from_secs(5), authority_hints.next())
+        .await
+        .expect("the delivery authority receives its permitted Basal kind")
+        .unwrap();
+    assert_eq!(hint.subject.as_str(), narrow_live);
+    a.expect_allowed(&narrow_live).await;
+    for (stream, before) in tracked_streams.into_iter().zip(before_live) {
+        assert_eq!(
+            stored(&observer, stream).await,
+            before,
+            "live hints must not be stored in {stream}"
+        );
+    }
+    // Keep the refused subscription distinct from publish probes: a publish refusal
+    // must not accidentally reuse an earlier subscription's permissions violation.
+    let unauthorized_live = format!("ck.{acct}.live.basal.unauthorized_subscription.v1");
+    let _unauthorized = p.client.subscribe(unauthorized_live.clone()).await.unwrap();
+    p.client.flush().await.unwrap();
+    p.expect_denied(&unauthorized_live).await;
+    let broad_live = format!("ck.{acct}.live.basal.>");
+    let _broad = a.client.subscribe(broad_live.clone()).await.unwrap();
+    a.client.flush().await.unwrap();
+    a.expect_denied(&broad_live).await;
+
     // Allowed: another agent's durable too, with no reissue (R15).
     let foreign_fire = names.wake_fire(FOREIGN_AGENT).unwrap();
     a.publish(&foreign_fire, b"foreign wake").await;
@@ -488,6 +553,9 @@ async fn generated_grants_hold_on_a_live_server() {
         names
             .event_subject(grants::DELIVERY_AUTHORITY_MODULE, "conformance_probe", 1)
             .unwrap(),
+        format!("ck.{acct}.live.conf-other.step.finished.v1"),
+        format!("ck.{acct}.live.basal.step.finished.v1"),
+        format!("ck.{acct}.live.prefrontal-core.step.finished.v1"),
         "$SYS.REQ.CLAIMS.UPDATE".to_string(),
         names.sentinel_ping(),
     ];
@@ -686,7 +754,7 @@ async fn generated_grants_hold_on_a_live_server() {
         .reached("credential.sign")
         .reached("credential.public_key")
         .emit(&vocabulary());
-    drop((p, a, b, s, d, kicked));
+    drop((p, a, b, s, d, f, kicked));
     server.stop().await;
     run.shutdown().await;
 }

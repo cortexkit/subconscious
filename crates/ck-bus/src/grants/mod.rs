@@ -1,24 +1,25 @@
 //! Generated grants: the subject permissions every user JWT ck-bus builds carries.
 //!
-//! Every subject comes from `cortexkit-bus-naming`. This area picks the set for a role
-//! (participant, bus module, system account), checks it with the naming crate's own
+//! Event subjects come from `cortexkit-bus-naming`; live subjects mirror their root.
+//! This area picks the set for a role (participant, bus module, system account),
+//! checks it with the naming crate's own
 //! permission-file validator, and shapes it as the allow-only `pub`/`sub` lists of a
-//! NATS user JWT. It writes no subject of its own.
+//! NATS user JWT. Live subscriptions use the event durables' exact filters.
 //!
 //! The same generator, fed the fixed fixture identities the naming crate pins for its
 //! reference document (`PINNED_GOLDEN_FIXTURE`), renders a permission document. The
 //! tests compare it with prefrontal's committed reference copy (vendored as
 //! `tests/fixtures/foundation/permission_golden.txt`): it may differ only in the header
-//! line and in added subjects that are named explicitly (the golden diff rule in
+//! line and in added permissions and refusals pinned explicitly (the golden diff rule in
 //! `docs/ck-bus.md`).
 
 use std::{collections::BTreeSet, error::Error, fmt};
 
 use cortexkit_bus_naming::{
-    bus_permissions, delivery_authority_permissions, flow_engine_permissions,
-    generate_permission_golden, participant_permissions, system_permissions,
-    validate_permission_file, AccountNames, AllowEntry, GoldenFixture, GrantError, NamingError,
-    Operation, Principal,
+    bus_permissions, delivery_authority_permissions, event_consumer_specs,
+    flow_engine_consumer_spec, flow_engine_permissions, generate_permission_golden,
+    participant_permissions, system_permissions, validate_permission_file, AccountNames,
+    AllowEntry, GoldenFixture, GrantError, NamingError, Operation, Principal,
 };
 use serde_json::{json, Value};
 
@@ -63,6 +64,8 @@ impl GrantRole {
 pub enum GrantRefusal {
     /// The naming crate refused an input token or the permission shape.
     Generator(GrantError),
+    /// The naming crate could not build the event-reader filters mirrored by live.
+    ReaderFilters(String),
     /// An entry was generated for a different principal than the grant's role.
     WrongPrincipal {
         role: GrantRole,
@@ -78,6 +81,7 @@ impl fmt::Display for GrantRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Generator(error) => write!(f, "grant generation refused: {error}"),
+            Self::ReaderFilters(error) => write!(f, "live reader filters refused: {error}"),
             Self::WrongPrincipal {
                 role,
                 found,
@@ -206,15 +210,17 @@ pub fn derive_account(account: &str) -> Result<AccountNames, GrantRefusal> {
 /// The per-process grant for participant `module_id` bound to `bound_rooms`. It names
 /// no agent: it may pull, inspect and ack any agent's durable on the agent streams, and
 /// publishes no workload subject. It publishes module events on its own event subjects
-/// (`ck.{acct}.event.{module_id}.>`) and on no other module's. `credential_public` is
-/// the user's public key, which names its inbox prefix.
+/// (`ck.{acct}.event.{module_id}.>`) and live hints on its own live subjects, and on no
+/// other module's. Live subscriptions mirror its event durable's filters, if any.
+/// `credential_public` is the user's public key, which names its inbox prefix.
 pub fn participant_grant(
     account: &AccountNames,
     credential_public: &str,
     module_id: &str,
     bound_rooms: &[&str],
 ) -> Result<Grant, GrantRefusal> {
-    let entries = participant_permissions(account, credential_public, module_id, bound_rooms)?;
+    let mut entries = participant_permissions(account, credential_public, module_id, bound_rooms)?;
+    add_live_permissions(account, module_id, GrantRole::Participant, &mut entries)?;
     Grant::from_entries(GrantRole::Participant, account, entries)
 }
 
@@ -228,8 +234,14 @@ pub fn delivery_authority_grant(
     module_id: &str,
     bound_rooms: &[&str],
 ) -> Result<Grant, GrantRefusal> {
-    let entries =
+    let mut entries =
         delivery_authority_permissions(account, credential_public, module_id, bound_rooms)?;
+    add_live_permissions(
+        account,
+        module_id,
+        GrantRole::DeliveryAuthority,
+        &mut entries,
+    )?;
     Grant::from_entries(GrantRole::DeliveryAuthority, account, entries)
 }
 
@@ -242,8 +254,59 @@ pub fn flow_engine_grant(
     credential_public: &str,
     module_id: &str,
 ) -> Result<Grant, GrantRefusal> {
-    let entries = flow_engine_permissions(account, credential_public, module_id)?;
+    let mut entries = flow_engine_permissions(account, credential_public, module_id)?;
+    add_live_permissions(account, module_id, GrantRole::FlowEngine, &mut entries)?;
     Grant::from_entries(GrantRole::FlowEngine, account, entries)
+}
+
+/// Live hints have the same publishers and readers as events, but use Core NATS rather
+/// than a durable. Reuse the naming crate's reader filters so adding a live delivery
+/// mechanism cannot broaden which modules or kinds a credential can observe.
+fn add_live_permissions(
+    account: &AccountNames,
+    module_id: &str,
+    role: GrantRole,
+    entries: &mut Vec<AllowEntry>,
+) -> Result<(), GrantRefusal> {
+    let event_prefix = format!("ck.{}.event.", account.account());
+    let live_prefix = format!("ck.{}.live.", account.account());
+    let publishes = entries
+        .iter()
+        .filter(|entry| {
+            entry.operation == Operation::Publish && entry.subject.starts_with(&event_prefix)
+        })
+        .map(|entry| AllowEntry {
+            subject: entry.subject.replacen(&event_prefix, &live_prefix, 1),
+            ..entry.clone()
+        })
+        .collect::<Vec<_>>();
+    entries.extend(publishes);
+
+    let durable = AccountNames::module_consumer_name(module_id)?;
+    let mut readers = event_consumer_specs(account)
+        .map_err(|error| GrantRefusal::ReaderFilters(error.to_string()))?;
+    if role == GrantRole::FlowEngine {
+        readers.push(
+            flow_engine_consumer_spec(account, module_id)
+                .map_err(|error| GrantRefusal::ReaderFilters(error.to_string()))?,
+        );
+    }
+    for reader in readers {
+        if reader.consumer.durable == durable {
+            entries.extend(
+                reader
+                    .consumer
+                    .filter_subjects
+                    .into_iter()
+                    .map(|subject| AllowEntry {
+                        principal: role.principal(),
+                        operation: Operation::Subscribe,
+                        subject: subject.replacen(&event_prefix, &live_prefix, 1),
+                    }),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The module whose attested credential carries the delivery-authority grant (R15):
@@ -308,9 +371,10 @@ pub fn system_account_grant(
 /// `_INBOX.<module id>.>`, the delivery authority's `_INBOX.<delivery_authority_module>.>`,
 /// the flow engine's `_INBOX.<flow_engine_module>.>`, and the system user's
 /// `_INBOX.<system_credential>.>`, exactly as in the committed reference document. The
-/// `expect-refused` lines are the naming crate's own expectations for the same fixture;
-/// ck-bus adds none and drops none. The result is checked with the same validator the
-/// naming crate applies to its golden, so a partial-token wildcard or a `deny` line
+/// `expect-refused` lines preserve the naming crate's expectations for the same fixture
+/// and add their live counterparts and a non-reader's refused live subscription.
+/// The result is checked with the same validator the naming crate applies to its
+/// golden, so a partial-token wildcard or a `deny` line
 /// never leaves this function.
 pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRefusal> {
     let account = derive_account(fixture.account)?;
@@ -386,6 +450,8 @@ pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRe
         ));
     }
     output.push('\n');
+    let event_prefix = format!("ck.{}.event.", account.account());
+    let live_prefix = format!("ck.{}.live.", account.account());
     for entry in expectations.refused() {
         output.push_str(&format!(
             "expect-refused {} {} {} {}\n",
@@ -394,7 +460,20 @@ pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRe
             entry.subject,
             entry.reason
         ));
+        if entry.subject.starts_with(&event_prefix) {
+            output.push_str(&format!(
+                "expect-refused {} {} {} {}\n",
+                entry.principal.as_str(),
+                entry.operation.as_str(),
+                entry.subject.replacen(&event_prefix, &live_prefix, 1),
+                entry.reason.replace("event", "live")
+            ));
+        }
     }
+    output.push_str(&format!(
+        "expect-refused participant subscribe {live_prefix}{}.step.finished.v1 no-event-reader\n",
+        fixture.module_id
+    ));
     validate_document(&output, &account)?;
     Ok(output)
 }

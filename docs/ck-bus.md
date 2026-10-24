@@ -13,6 +13,31 @@ The daemon supplies the opaque, persistent machine name defined in `docs/machine
 `nats-server` is supervised with `protocol: "none"`, meaning process supervision without the subc HELLO handshake; no separate handshake-bypassing supervision mode is added. The daemon holds no bus credential and opens no subc route to the Claustrum credentials vault. The ck-bus sentinel, not the supervisor's liveness probe, reports message-plane health.
 
 An acceptance row may retire its F-PROV fixture only after every gate covering that row is discharged and no row still runs against that fixture; an absent dependency is a named skip or rig failure, never a pass.
+
+## Live hints
+
+`ck.{acct}.live.<module>.<kind>` is the transient sibling of `event`, for example
+`ck.{acct}.live.<runner>.step.finished.v1`. It uses plain Core NATS publish/subscribe:
+only current subscribers receive a hint, with no stream, replay, or offline delivery.
+Use it for content-free live hints such as “step finished”, never records, model
+content, or billing. History comes from durable reads, not from the bus; deleting a
+session leaves no live-hint history on the bus.
+
+Each participant may publish only on `ck.{acct}.live.<its module>.>`, just as for
+its own event branch. Subscription authorization mirrors the existing event-reader
+durable filters from `cortexkit-bus-naming`, one for one, replacing only `event`
+with `live`. Basal's all-events reader gets `live.>`; named readers get only their
+existing modules and kinds, including prefrontal-core's narrow Basal and broad Broca
+filters. A participant without an event-reader durable gets no live subscription.
+A concrete module or `*` module subscription is allowed only when those filters
+cover it; prefrontal-core still cannot subscribe to broad `live.basal.>`.
+
+No configured stream captures this root: ROOM, WAKE, PEER, EFFECT and EFFECT_DEAD
+bind their own branches, EVENT binds only `ck.{acct}.event.>`, and the census
+backing stream binds only its `$KV` branch. No stream uses a broad `ck.{acct}.>`
+capture, so none needs narrowing. The stream-configuration test rejects any binding
+that could capture a live descendant, including broad wildcard captures.
+
 ## Non-goals
 
 - Porting any workload (rooms, wakes, peer deliveries, effect intents, Pi pushes) onto
@@ -98,7 +123,8 @@ Repository and dependencies.
   subject, stream and grant the foundation enumerates is byte-identical, and nothing is
   removed or modified.
 - Every subject, stream, bucket, grant, consumer and credential-id name comes from
-  `cortexkit-bus-naming`; the module emits no name of its own. A refused name is a
+  `cortexkit-bus-naming`, except that live grants currently replace the root of its
+  generated event subjects and reader filters. A refused name is a
   refused act. At the pinned sha the crate constructs `c_ckbus_dead`
   (`AccountNames::consumer_name`) and not the census key grammar (slice 0 record). The
   names this revision adds and the crate must construct before a row emits them are:

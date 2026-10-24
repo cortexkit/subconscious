@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.13
+
+- Live subjects, `ck.{acct}.live.<module>.<kind>`: plain publishes, delivered only to
+  current subscribers and captured by no stream. A credential publishes live only on
+  its own module's subjects, and its live subscriptions mirror its event durable's
+  filters exactly, so the live root never widens what a module can observe.
+
 ## 0.4.12
 
 - Take subc-client-rs 0.32: a module handler panic now fails serving instead of being silently ignored. After the module handshake completes, daemon disconnects remain clean exits on every OS, with EOF/reset reported through the connection-end hook; handshake disconnects remain errors.

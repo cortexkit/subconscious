@@ -6637,7 +6637,7 @@ mod tests {
         let (request, handle) = capture_route_open_with_options(opts).await;
         assert_eq!(
             request.get("consumer_capabilities"),
-            Some(&serde_json::json!(["tool-result/v1", "elicitation"]))
+            Some(&serde_json::json!(["elicitation", "tool-result/v1"]))
         );
         release_reverse_request_registry(handle);
     }

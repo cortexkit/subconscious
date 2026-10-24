@@ -142,8 +142,8 @@ async fn declared_consumer_capabilities_reach_provider_bind_on_real_daemon() {
         assert_eq!(
             binds.as_slice(),
             &[Some(vec![
-                "tool-result/v1".to_string(),
-                "elicitation".to_string()
+                "elicitation".to_string(),
+                "tool-result/v1".to_string()
             ])],
             "the real provider bind must receive the merged, sorted, unique declaration list"
         );

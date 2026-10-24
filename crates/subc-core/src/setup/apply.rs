@@ -25,6 +25,8 @@ use super::{
     validation::{self, Validator},
 };
 
+type RescanPreview = fn() -> Result<Vec<String>, String>;
+
 pub struct SetupBackend {
     executable: PathBuf,
     paths: SetupPaths,
@@ -37,7 +39,7 @@ pub struct SetupBackend {
     /// Completed changes from this invocation, partitioned so a failure in one
     /// module never rewinds another module or the daemon runtime.
     component_steps: BTreeMap<Component, ComponentSteps>,
-    rescan_preview: Option<fn() -> Result<Vec<String>, String>>,
+    rescan_preview: Option<RescanPreview>,
 }
 
 #[derive(Default)]
@@ -98,7 +100,7 @@ impl SetupBackend {
 
     /// Use the caller's authenticated client for previews, without spawning a
     /// second CLI process that could connect to a different daemon.
-    pub fn set_rescan_preview(&mut self, preview: fn() -> Result<Vec<String>, String>) {
+    pub fn set_rescan_preview(&mut self, preview: RescanPreview) {
         self.rescan_preview = Some(preview);
     }
 

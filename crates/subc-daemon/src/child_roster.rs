@@ -93,6 +93,7 @@ struct RosterInner {
     next_key: AtomicU64,
     closed: DaemonShutdownFlag,
     live: Mutex<HashMap<u64, RosterEntry>>,
+    record_write: Mutex<()>,
     /// Where the live-children record is written; unset means no record, the
     /// default for an in-process daemon (see `BootstrapConfig`).
     record_path: OnceLock<PathBuf>,
@@ -136,8 +137,8 @@ impl RosterInner {
     /// after 2 seconds, so a restart on a busy machine crashed its own
     /// replacement.
     ///
-    /// The wait covers taking the `live` lock as well as the write: the lock
-    /// is held for the whole write, so a caller waiting for it waits as long.
+    /// The wait covers the record-write gate as well as the write. Readers of
+    /// the live roster do not take that gate, so shutdown can still poll them.
     ///
     /// On a multi-threaded runtime `block_in_place` hands this worker's queued
     /// tasks to another thread for the duration. A current-thread runtime
@@ -155,9 +156,9 @@ impl RosterInner {
         }
     }
 
-    /// Rewrite the record from `live`. Called with the `live` lock held, so
-    /// concurrent admits and releases write their snapshots in the order they
-    /// changed the roster and the last write on disk is the current roster.
+    /// Rewrite a snapshot taken after acquiring the record-write gate. Taking
+    /// each snapshot inside that gate prevents an older snapshot from replacing
+    /// a newer record, without locking the live roster across disk syncs.
     fn write_record(&self, live: &HashMap<u64, RosterEntry>) -> std::io::Result<()> {
         let Some(path) = self.record_path.get() else {
             return Ok(());
@@ -208,10 +209,9 @@ impl RosterInner {
     }
 
     fn recheck_retained_now(&self) {
-        // Take `live` before `retained`, matching record writes made when a
-        // newly spawned child joins the roster. This prevents pruning from
-        // racing a write that must preserve a previous instance.
-        let live = lock(&self.live);
+        // Serialize pruning with admits and releases, but leave the live roster
+        // readable while probing retained processes and syncing the record.
+        let _write = lock(&self.record_write);
         let changed = {
             let mut retained = lock(&self.retained);
             let before = retained.len();
@@ -247,6 +247,7 @@ impl RosterInner {
             retained.len() != before
         };
         if changed {
+            let live = lock(&self.live).clone();
             let _ = self.write_record(&live);
         }
     }
@@ -278,12 +279,32 @@ pub(crate) struct RosterGuard {
     key: u64,
 }
 
+#[derive(Debug)]
+pub(crate) struct AdmissionError {
+    source: std::io::Error,
+    guard: RosterGuard,
+}
+
+impl AdmissionError {
+    /// Keep shutdown ownership until the caller has killed and reaped the
+    /// rejected child. A failed record write is not proof that the child exited.
+    pub(crate) fn with_cleanup<T>(self, cleanup: impl FnOnce(std::io::Error) -> T) -> T {
+        let result = cleanup(self.source);
+        drop(self.guard);
+        result
+    }
+}
+
 impl Drop for RosterGuard {
     fn drop(&mut self) {
         self.inner.without_stalling_runtime(|| {
-            let mut live = lock(&self.inner.live);
-            if live.remove(&self.key).is_some() {
-                let _ = self.inner.write_record(&live);
+            let _write = lock(&self.inner.record_write);
+            let snapshot = {
+                let mut live = lock(&self.inner.live);
+                live.remove(&self.key).map(|_| live.clone())
+            };
+            if let Some(snapshot) = snapshot {
+                let _ = self.inner.write_record(&snapshot);
             }
         });
     }
@@ -299,11 +320,20 @@ impl RosterGuard {
         observation: subc_os::Observation,
     ) -> std::io::Result<()> {
         self.inner.without_stalling_runtime(|| {
-            let mut live = lock(&self.inner.live);
-            if let Some(entry) = live.get_mut(&self.key) {
-                entry.recorded.start_time = Some(observation.start_time);
-                entry.recorded.executable = observation.executable.map(ExecutableIdentity::from);
-                self.inner.write_record(&live)?;
+            let _write = lock(&self.inner.record_write);
+            let snapshot = {
+                let mut live = lock(&self.inner.live);
+                if let Some(entry) = live.get_mut(&self.key) {
+                    entry.recorded.start_time = Some(observation.start_time);
+                    entry.recorded.executable =
+                        observation.executable.map(ExecutableIdentity::from);
+                    Some(live.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(snapshot) = snapshot {
+                self.inner.write_record(&snapshot)?;
             }
             Ok(())
         })
@@ -399,41 +429,42 @@ impl ChildRoster {
         protocol: ModuleProtocol,
         start_time: Option<u64>,
         recorded: RecordedIdentity,
-    ) -> std::io::Result<RosterGuard> {
+    ) -> Result<RosterGuard, AdmissionError> {
         let key = self.inner.next_key.fetch_add(1, Ordering::Relaxed);
-        self.inner.without_stalling_runtime(|| {
-            let mut live = lock(&self.inner.live);
-            live.insert(
-                key,
-                RosterEntry {
-                    module_id,
-                    pid,
-                    protocol,
-                    start_time,
-                    recorded,
-                    drain_budget: Arc::clone(&self.drain_budget),
-                },
-            );
-            if let Err(error) = self.inner.write_record(&live) {
-                live.remove(&key);
-                return Err(error);
-            }
-            Ok(())
-        })?;
-        Ok(RosterGuard {
+        // The process is already spawned. Publish ownership before waiting for
+        // another writer, so shutdown can stop it even while that writer syncs.
+        lock(&self.inner.live).insert(
+            key,
+            RosterEntry {
+                module_id,
+                pid,
+                protocol,
+                start_time,
+                recorded,
+                drain_budget: Arc::clone(&self.drain_budget),
+            },
+        );
+        let guard = RosterGuard {
             inner: Arc::clone(&self.inner),
             key,
-        })
+        };
+        let recorded = self.inner.without_stalling_runtime(|| {
+            let _write = lock(&self.inner.record_write);
+            let snapshot = lock(&self.inner.live).clone();
+            self.inner.write_record(&snapshot)
+        });
+        match recorded {
+            Ok(()) => Ok(guard),
+            Err(source) => Err(AdmissionError { source, guard }),
+        }
     }
 
     #[cfg(unix)]
     fn live(&self) -> Vec<(u64, RosterEntry)> {
-        self.inner.without_stalling_runtime(|| {
-            lock(&self.inner.live)
-                .iter()
-                .map(|(key, entry)| (*key, entry.clone()))
-                .collect()
-        })
+        lock(&self.inner.live)
+            .iter()
+            .map(|(key, entry)| (*key, entry.clone()))
+            .collect()
     }
 
     /// Run `hook` at every record write from now on (when a record path is
@@ -469,7 +500,11 @@ pub(crate) use unix_shutdown::end_children_for_daemon_shutdown;
 
 #[cfg(unix)]
 mod unix_shutdown {
-    use std::{collections::HashSet, future::Future, time::Duration};
+    use std::{
+        collections::{HashMap, HashSet},
+        future::Future,
+        time::Duration,
+    };
 
     use rustix::process::{kill_process, Pid, Signal};
     use tokio::time::{sleep, Instant};
@@ -534,7 +569,7 @@ mod unix_shutdown {
         roster.close();
         tokio::pin!(escalate);
         let started = Instant::now();
-        let mut termed = HashSet::new();
+        let mut termed = HashMap::new();
         let mut killed = HashSet::new();
         let mut last_kill: Option<Instant> = None;
         let mut escalated = already_escalated;
@@ -543,7 +578,7 @@ mod unix_shutdown {
             for (key, entry) in roster.live() {
                 if entry.protocol == ModuleProtocol::None {
                     signal(&entry, Signal::TERM);
-                    termed.insert(key);
+                    termed.insert(key, Instant::now());
                 }
             }
         }
@@ -551,7 +586,7 @@ mod unix_shutdown {
         loop {
             let live = roster.live();
             if live.is_empty() {
-                return;
+                break;
             }
             let now = Instant::now();
             for (key, entry) in &live {
@@ -559,15 +594,20 @@ mod unix_shutdown {
                     continue;
                 }
                 let deadline = started + budget(entry);
-                let kill_at = match entry.protocol {
-                    ModuleProtocol::None => deadline,
-                    ModuleProtocol::Subc => deadline + TERM_TO_KILL,
-                };
-                if escalated || now >= kill_at {
+                let due = shutdown_signal(
+                    entry.protocol,
+                    now,
+                    deadline,
+                    termed.get(key).copied(),
+                    escalated,
+                );
+                if due == Some(Signal::KILL) {
                     warn!(
                         module_id = %entry.module_id,
                         pid = entry.pid,
                         escalated,
+                        child_stop_elapsed_ms = started.elapsed().as_millis() as u64,
+                        term_to_kill_ms = termed.get(key).map(|at| at.elapsed().as_millis() as u64),
                         "supervised child did not exit during daemon shutdown; sending SIGKILL"
                     );
                     #[cfg(target_os = "linux")]
@@ -584,20 +624,22 @@ mod unix_shutdown {
                     signal(entry, Signal::KILL);
                     killed.insert(*key);
                     last_kill = Some(now);
-                } else if now >= deadline && termed.insert(*key) {
+                } else if due == Some(Signal::TERM) {
                     warn!(
                         module_id = %entry.module_id,
                         pid = entry.pid,
+                        child_stop_elapsed_ms = started.elapsed().as_millis() as u64,
                         "supervised module still running at its shutdown deadline after EOF; sending SIGTERM"
                     );
                     signal(entry, Signal::TERM);
+                    termed.insert(*key, Instant::now());
                 }
             }
             // Everything left has been SIGKILLed: wait only for the reaps.
             if live.iter().all(|(key, _)| killed.contains(key))
                 && last_kill.is_some_and(|at| now >= at + CHILD_REAP_BOUND)
             {
-                return;
+                break;
             }
             if escalated {
                 sleep(POLL).await;
@@ -612,10 +654,209 @@ mod unix_shutdown {
                 _ = sleep(POLL) => {}
             }
         }
+        info!(
+            child_stop_elapsed_ms = started.elapsed().as_millis() as u64,
+            "supervised child shutdown wait complete"
+        );
     }
 
     fn budget(entry: &RosterEntry) -> Duration {
         (*lock(&entry.drain_budget)).min(CHILD_SHUTDOWN_CAP)
+    }
+
+    fn shutdown_signal(
+        protocol: ModuleProtocol,
+        now: Instant,
+        deadline: Instant,
+        term_sent: Option<Instant>,
+        escalated: bool,
+    ) -> Option<Signal> {
+        // A delayed poll must not skip SIGTERM or consume its grace before the
+        // signal was sent. The second SIGTERM deliberately bypasses that grace.
+        let kill_due = match protocol {
+            ModuleProtocol::None => now >= deadline,
+            ModuleProtocol::Subc => term_sent.is_some_and(|at| now >= at + TERM_TO_KILL),
+        };
+        if escalated || kill_due {
+            Some(Signal::KILL)
+        } else if now >= deadline && term_sent.is_none() {
+            Some(Signal::TERM)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn release_record_sync_does_not_lock_the_shutdown_roster() {
+        let dir = cortexkit_test_support::ScratchDir::new("roster-release-sync");
+        let path = dir.join("children.json");
+        let roster = ChildRoster::default();
+        roster.record_to(path.clone());
+        let guard = roster
+            .admit(
+                "record-only".into(),
+                std::process::id(),
+                ModuleProtocol::Subc,
+                None,
+                super::RecordedIdentity::default(),
+            )
+            .unwrap();
+        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        roster.set_record_write_hook_for_test({
+            let entered = entered.clone();
+            let release = release.clone();
+            move |live| {
+                if live.is_empty() {
+                    entered.wait();
+                    release.wait();
+                }
+            }
+        });
+        let writer = std::thread::spawn(move || drop(guard));
+        entered.wait();
+        let readable = roster.inner.live.try_lock().is_ok();
+        release.wait();
+        writer.join().unwrap();
+        assert!(
+            readable,
+            "a record sync must not block shutdown's live-child snapshot"
+        );
+        assert!(roster.live().is_empty());
+        assert!(crate::live_children::read_record_with_reasons(&path)
+            .unwrap()
+            .0
+            .is_empty());
+    }
+
+    #[test]
+    fn failed_admission_keeps_ownership_until_child_is_killed_and_reaped() {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if self.0.try_wait().is_ok_and(|status| status.is_none()) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+        let dir = cortexkit_test_support::ScratchDir::new("failed-admission-owner");
+        let record = dir.join("children.json");
+        std::fs::create_dir(&record).unwrap();
+        let roster = ChildRoster::default();
+        roster.record_to(record);
+        let mut child = OwnedChild(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let failure = roster
+            .admit(
+                "rejected".into(),
+                pid,
+                ModuleProtocol::Subc,
+                None,
+                super::RecordedIdentity::default(),
+            )
+            .unwrap_err();
+        failure.with_cleanup(|_source| {
+            assert!(
+                roster.live().iter().any(|(_, entry)| entry.pid == pid),
+                "failed admission released ownership before rejection cleanup"
+            );
+            child.0.kill().unwrap();
+            assert!(!child.0.wait().unwrap().success());
+            assert!(
+                roster.live().iter().any(|(_, entry)| entry.pid == pid),
+                "ownership must survive through the reap"
+            );
+        });
+        assert!(
+            child.0.try_wait().unwrap().is_some(),
+            "the rejected child must be reaped"
+        );
+        assert!(
+            roster.live().is_empty(),
+            "cleanup must release the rejected child's roster entry"
+        );
+    }
+
+    #[test]
+    fn queued_admission_remains_visible_to_shutdown() {
+        let roster = ChildRoster::default();
+        let write = lock(&roster.inner.record_write);
+        let worker_roster = roster.clone();
+        let worker = std::thread::spawn(move || {
+            worker_roster
+                .admit(
+                    "queued".into(),
+                    std::process::id(),
+                    ModuleProtocol::Subc,
+                    None,
+                    super::RecordedIdentity::default(),
+                )
+                .unwrap()
+        });
+        // This is a fixture scheduling guard, not a shutdown-policy deadline.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let visible = loop {
+            if !roster.live().is_empty() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        drop(write);
+        let guard = worker.join().unwrap();
+        assert!(
+            visible,
+            "shutdown must see a spawned child queued behind a record write"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn late_shutdown_poll_still_gives_sigterm_its_grace() {
+        let deadline = Instant::now();
+        let late_poll = deadline + Duration::from_secs(1);
+        assert_eq!(
+            shutdown_signal(ModuleProtocol::Subc, late_poll, deadline, None, false),
+            Some(Signal::TERM)
+        );
+        assert_eq!(
+            shutdown_signal(
+                ModuleProtocol::Subc,
+                late_poll,
+                deadline,
+                Some(late_poll),
+                false
+            ),
+            None
+        );
+        assert_eq!(
+            shutdown_signal(
+                ModuleProtocol::Subc,
+                late_poll + TERM_TO_KILL,
+                deadline,
+                Some(late_poll),
+                false
+            ),
+            Some(Signal::KILL)
+        );
+        assert_eq!(
+            shutdown_signal(
+                ModuleProtocol::Subc,
+                late_poll,
+                deadline,
+                Some(late_poll),
+                true
+            ),
+            Some(Signal::KILL)
+        );
     }
 
     fn signal(entry: &RosterEntry, signal: Signal) {

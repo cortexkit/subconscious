@@ -21,6 +21,10 @@ mod common;
 // resources. Serialize this file instead of widening their startup deadlines.
 static DAEMON_GATE: Mutex<()> = Mutex::new(());
 
+// These are fixture liveness limits, not the daemon's drain policy. Socket EOF
+// precedes the child's teardown and reap, which can be descheduled under load.
+const SHUTDOWN_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(15);
+
 struct Fixture {
     root: ScratchDir,
     child: Child,
@@ -209,7 +213,9 @@ impl Fixture {
             }
             assert!(
                 Instant::now() < deadline,
-                "daemon exceeded its shutdown budget"
+                "daemon did not exit within fixture limit {budget:?}\nevents: {:?}\ndaemon log:\n{}",
+                self.events(),
+                daemon_log(self)
             );
             thread::sleep(Duration::from_millis(5));
         }
@@ -295,13 +301,6 @@ fn fresh_dir(label: &str) -> ScratchDir {
         dir.display()
     );
     dir
-}
-
-fn unix_ms_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
 }
 
 fn child_is_recorded(path: &Path, pid: u32, observed: &subc_os::Observation) -> bool {
@@ -565,44 +564,55 @@ fn eof_ignoring_module_is_sigtermed_at_its_deadline_then_killed() {
         None,
     );
     let observer = fixture.pid_of("observer.pid");
-    let started = Instant::now();
-    let term_ms = unix_ms_now();
     fixture.term();
-    fixture.wait_exit(Duration::from_secs(6));
-    let exit_ms = unix_ms_now();
-    let elapsed = started.elapsed();
-    let sigterms: Vec<u64> = fixture
+    fixture.wait_exit(SHUTDOWN_OBSERVATION_TIMEOUT);
+    let sigterms: Vec<_> = fixture
         .events()
         .into_iter()
         .filter(|e| e["kind"] == "sigterm")
-        .map(|e| e["at_ms"].as_u64().unwrap())
         .collect();
     assert_eq!(
         sigterms.len(),
         1,
         "exactly one SIGTERM, at the deadline: {sigterms:?}"
     );
-    // The deadline is counted from the start of the child stop, which follows
-    // the notice and drain, so it lands at least 1 s after the daemon's SIGTERM.
+    let term_at = daemon_measurement(&fixture, "sending SIGTERM", "child_stop_elapsed_ms");
+    let kill_at = daemon_measurement(&fixture, "sending SIGKILL", "child_stop_elapsed_ms");
+    let term_to_kill = daemon_measurement(&fixture, "sending SIGKILL", "term_to_kill_ms");
+    // Both signal times use the daemon's child-stop clock. A module's handler
+    // and the test's process polling can run much later than either signal.
     assert!(
-        sigterms[0] >= term_ms + 1000,
-        "SIGTERM came before the module's 1 s deadline: {} ms after",
-        sigterms[0] - term_ms
+        term_at >= 1000,
+        "SIGTERM came before the module's 1 s deadline: {term_at} ms"
     );
-    let term_to_exit = exit_ms - sigterms[0];
     assert!(
-        (400..1500).contains(&term_to_exit),
-        "SIGKILL must follow the deadline SIGTERM by 0.5 s: {term_to_exit} ms"
+        (500..1500).contains(&term_to_kill),
+        "SIGKILL must follow the deadline SIGTERM by 0.5 s: {term_to_kill} ms"
     );
-    // 1 s deadline + 0.5 s + 0.25 s reap, after a notice and drain of at most
-    // 2.5 s that a quiescent module does not spend.
+    assert!(kill_at >= term_at + 500);
+    let child_stop = daemon_measurement(
+        &fixture,
+        "supervised child shutdown wait complete",
+        "child_stop_elapsed_ms",
+    );
+    let notice = daemon_measurement(
+        &fixture,
+        "daemon shutdown forwarding drain complete",
+        "notice_elapsed_ms",
+    );
+    let drain = daemon_measurement(
+        &fixture,
+        "daemon shutdown forwarding drain complete",
+        "drain_elapsed_ms",
+    );
     assert!(
-        elapsed < Duration::from_millis(4500),
-        "shutdown overran the module's bound: {elapsed:?}"
+        notice + drain + child_stop < 4500,
+        "daemon's shutdown waits overran the module's bound: notice={notice}, drain={drain}, children={child_stop} ms"
     );
     assert!(
         wait_until_gone(observer, Duration::from_secs(5)),
-        "the module must not outlive the daemon"
+        "the module must not outlive the daemon\n{}",
+        daemon_log(&fixture)
     );
 }
 
@@ -784,12 +794,19 @@ fn shutdown_marker_is_durable_and_precedes_provider_notice() {
 #[test]
 fn stubborn_provider_gets_a_bounded_drain_not_a_completion_promise() {
     let mut fixture = Fixture::boot(true);
-    let started = Instant::now();
     fixture.term();
-    fixture.wait_exit(Duration::from_secs(4));
+    fixture.wait_exit(SHUTDOWN_OBSERVATION_TIMEOUT);
+    let drain = daemon_measurement(
+        &fixture,
+        "daemon shutdown forwarding drain complete",
+        "drain_elapsed_ms",
+    );
+    // A forever-busy gauge must get the two-second forwarding wait, but cannot
+    // hold it open until completion. Neither bound includes the EOF teardown.
     assert!(
-        started.elapsed() >= Duration::from_millis(1800),
-        "busy provider did not get its drain wait"
+        (1800..3000).contains(&drain),
+        "busy provider's forwarding drain was not bounded at two seconds: {drain} ms\n{}",
+        daemon_log(&fixture)
     );
 }
 
@@ -797,7 +814,17 @@ fn stubborn_provider_gets_a_bounded_drain_not_a_completion_promise() {
 fn quiescent_provider_does_not_spend_the_whole_drain_budget() {
     let mut fixture = Fixture::boot(false);
     fixture.term();
-    fixture.wait_exit(Duration::from_millis(1500));
+    fixture.wait_exit(SHUTDOWN_OBSERVATION_TIMEOUT);
+    let drain = daemon_measurement(
+        &fixture,
+        "daemon shutdown forwarding drain complete",
+        "drain_elapsed_ms",
+    );
+    assert!(
+        drain < 1500,
+        "quiescent provider spent the forwarding drain budget: {drain} ms\n{}",
+        daemon_log(&fixture)
+    );
 }
 
 /// Every line of the durable terminal journal, in file order.
@@ -844,6 +871,18 @@ fn daemon_log(fixture: &Fixture) -> String {
         .iter()
         .map(|path| fs::read_to_string(path).unwrap_or_default())
         .collect()
+}
+
+fn daemon_measurement(fixture: &Fixture, message: &str, field: &str) -> u64 {
+    let log = daemon_log(fixture);
+    let lines: Vec<_> = log.lines().filter(|line| line.contains(message)).collect();
+    assert_eq!(lines.len(), 1, "expected one {message:?} event\n{log}");
+    lines[0]
+        .split(&format!("{field}="))
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .and_then(|ms| ms.parse().ok())
+        .unwrap_or_else(|| panic!("missing {field} measurement: {}", lines[0]))
 }
 
 /// The supervisor's reap path, not only the record, must know the exit came
@@ -1128,12 +1167,36 @@ fn required_provider_leaving_during_daemon_shutdown_is_logged_at_info_not_error(
 
 #[test]
 fn second_sigterm_cuts_short_a_stubborn_provider_wait() {
-    let mut fixture = Fixture::boot(true);
+    let mut fixture = Fixture::boot_with(
+        true,
+        json!({
+            "drain_timeout_ms": 10000,
+            "env": { "FAKE_AFT_IGNORE_EOF": "1" }
+        }),
+        None,
+    );
     fixture.term();
     fixture.wait_event("draining");
     assert!(fixture.child.try_wait().unwrap().is_none());
     fixture.term();
-    fixture.wait_exit(Duration::from_millis(800));
+    fixture.wait_exit(SHUTDOWN_OBSERVATION_TIMEOUT);
+    let elapsed = daemon_measurement(
+        &fixture,
+        "daemon shutdown wait ended after second SIGTERM",
+        "second_sigterm_elapsed_ms",
+    );
+    assert!(
+        elapsed < 800,
+        "second SIGTERM did not cut short the daemon's waits: {elapsed} ms\n{}",
+        daemon_log(&fixture)
+    );
+    assert!(daemon_log(&fixture)
+        .lines()
+        .any(|line| line.contains("sending SIGKILL") && line.contains("escalated=true")));
+    assert!(
+        wait_until_gone(fixture.pid_of("observer.pid"), Duration::from_secs(5)),
+        "second SIGTERM left the module running"
+    );
 }
 
 async fn open_route(fixture: &Fixture) -> (tokio::net::TcpStream, u16, u32) {
@@ -1228,7 +1291,7 @@ async fn consumer_observes_route_closing_on_channel_zero_before_eof() {
     let (mut stream, _, _) = open_route(&fixture).await;
     fixture.term();
     let mut sequence = Vec::new();
-    tokio::time::timeout(Duration::from_secs(4), async {
+    tokio::time::timeout(SHUTDOWN_OBSERVATION_TIMEOUT, async {
         while let Some(frame) = read_frame(&mut stream).await.unwrap() {
             if serde_json::from_slice::<Value>(&frame.body)
                 .is_ok_and(|body| body["op"] == "route.closing")
@@ -1240,9 +1303,14 @@ async fn consumer_observes_route_closing_on_channel_zero_before_eof() {
         sequence.push("eof");
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|error| {
+        panic!(
+            "waiting for route.closing and EOF: {error}\n{}",
+            daemon_log(&fixture)
+        )
+    });
     assert_eq!(sequence, ["route.closing", "eof"]);
-    fixture.wait_exit(Duration::from_secs(1));
+    fixture.wait_exit(SHUTDOWN_OBSERVATION_TIMEOUT);
 }
 
 #[tokio::test]
@@ -1257,7 +1325,7 @@ async fn in_flight_reply_can_finish_during_the_shutdown_drain() {
             channel,
             epoch,
             2,
-            br#"{"delay_ms":750}"#.to_vec(),
+            br#"{"respond_on_draining":true}"#.to_vec(),
         )
         .unwrap(),
     )
@@ -1266,7 +1334,9 @@ async fn in_flight_reply_can_finish_during_the_shutdown_drain() {
     fixture.wait_event("request_received");
     fixture.term();
     let mut sequence = Vec::new();
-    tokio::time::timeout(Duration::from_secs(4), async {
+    // The module holds this accepted request until the daemon's draining
+    // notice, so the reply cannot accidentally finish before shutdown begins.
+    tokio::time::timeout(SHUTDOWN_OBSERVATION_TIMEOUT, async {
         while let Some(frame) = read_frame(&mut stream).await.unwrap() {
             if frame.header.ty == FrameType::Response && frame.header.corr == 2 {
                 sequence.push("reply");
@@ -1275,9 +1345,14 @@ async fn in_flight_reply_can_finish_during_the_shutdown_drain() {
         sequence.push("eof");
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|error| {
+        panic!(
+            "waiting for in-flight reply and EOF: {error}\n{}",
+            daemon_log(&fixture)
+        )
+    });
     assert_eq!(sequence, ["reply", "eof"]);
-    fixture.wait_exit(Duration::from_secs(1));
+    fixture.wait_exit(SHUTDOWN_OBSERVATION_TIMEOUT);
 }
 
 #[cfg(target_os = "linux")]

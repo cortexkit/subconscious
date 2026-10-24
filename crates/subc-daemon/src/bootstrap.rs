@@ -1082,17 +1082,22 @@ async fn serve_bound_daemon(
         // Dropping the listener stops new accepts, not established connections:
         // their detached tasks must remain live throughout notice and drain.
         drop(serve_task);
-        let escalated = tokio::select! {
+        let second_sigterm = async {
+            terminate.recv().await;
+            std::time::Instant::now()
+        };
+        tokio::pin!(second_sigterm);
+        let mut escalation_started = tokio::select! {
             biased;
-            _ = terminate.recv() => {
+            at = second_sigterm.as_mut() => {
                 info!("second SIGTERM: abandoning daemon shutdown wait");
-                true
+                Some(at)
             }
             result = supervisor.drain_for_daemon_shutdown() => {
                 if let Err(error) = result {
                     warn!(%error, "daemon shutdown drain failed; exiting anyway");
                 }
-                false
+                None
             }
         };
         // Supervised modules lead their own process groups, so a service
@@ -1101,11 +1106,22 @@ async fn serve_bound_daemon(
         // does reach them; see `systemd_kill_mode`.) The daemon ends them
         // itself: EOF (or SIGTERM for a protocol none child) first, then
         // signals at each child's own drain deadline.
+        let already_escalated = escalation_started.is_some();
         supervisor
-            .end_children_for_daemon_shutdown(escalated, async {
-                terminate.recv().await;
+            .end_children_for_daemon_shutdown(already_escalated, async {
+                if already_escalated {
+                    std::future::pending::<()>().await;
+                } else {
+                    escalation_started = Some(second_sigterm.await);
+                }
             })
             .await;
+        if let Some(at) = escalation_started {
+            info!(
+                second_sigterm_elapsed_ms = at.elapsed().as_millis() as u64,
+                "daemon shutdown wait ended after second SIGTERM"
+            );
+        }
         info!("daemon exiting: SIGTERM shutdown complete");
         Ok(())
     }

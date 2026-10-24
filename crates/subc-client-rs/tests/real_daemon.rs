@@ -121,7 +121,7 @@ async fn declared_consumer_capabilities_reach_provider_bind_on_real_daemon() {
         reverse_requests,
         ..fast_call_options()
     }
-    .with_consumer_capability("content/v1")
+    .with_consumer_capability("tool-result/v1")
     .unwrap()
     .with_consumer_capability("elicitation")
     .unwrap();
@@ -142,7 +142,7 @@ async fn declared_consumer_capabilities_reach_provider_bind_on_real_daemon() {
         assert_eq!(
             binds.as_slice(),
             &[Some(vec![
-                "content/v1".to_string(),
+                "tool-result/v1".to_string(),
                 "elicitation".to_string()
             ])],
             "the real provider bind must receive the merged, sorted, unique declaration list"

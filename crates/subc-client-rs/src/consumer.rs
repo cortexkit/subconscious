@@ -504,7 +504,7 @@ impl CloseRouteOptions {
     /// Add a provider-contract capability declaration to the route identity.
     ///
     /// Values are merged with the reverse-request families. For example,
-    /// `content/v1` declares the tool-provider content result format; the
+    /// `tool-result/v1` declares the tool-provider content result format; the
     /// declaration is not verified and grants no privilege.
     ///
     /// Like reverse-request handlers, declarations are kept in the options'
@@ -521,7 +521,7 @@ impl CloseRouteOptions {
     }
 
     /// The extra capability strings added with `with_consumer_capability`, not
-    /// the reverse-request handler families. For example, `content/v1` declares
+    /// the reverse-request handler families. For example, `tool-result/v1` declares
     /// tool-provider content-result support; declarations are unverified and
     /// grant nothing.
     pub fn consumer_capabilities(&self) -> Vec<String> {
@@ -543,7 +543,7 @@ pub struct CallOptions {
     /// Explicit consumer identity for route.open; when absent, non-empty SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used.
     pub consumer_identity: Option<ConsumerIdentity>,
     /// Reverse-request handlers plus extra capability strings added with
-    /// [`Self::with_consumer_capability`]. For example, `content/v1` declares
+    /// [`Self::with_consumer_capability`]. For example, `tool-result/v1` declares
     /// tool-provider content-result support. These declarations are unverified
     /// and grant nothing; both sets are merged and omitted when empty.
     pub reverse_requests: ReverseRequestRegistry,
@@ -582,7 +582,7 @@ impl CallOptions {
     /// Add a provider-contract capability declaration to the route.
     ///
     /// The list is merged with reverse-request handler families, sorted and
-    /// de-duplicated. For example, `content/v1` declares the tool-provider
+    /// de-duplicated. For example, `tool-result/v1` declares the tool-provider
     /// content result format. This remains an unverified declaration and grants
     /// no privilege. Invalid values are rejected here, before route.open can be
     /// sent.
@@ -601,7 +601,7 @@ impl CallOptions {
     }
 
     /// The extra capability strings added with `with_consumer_capability`, not
-    /// the reverse-request handler families. For example, `content/v1` declares
+    /// the reverse-request handler families. For example, `tool-result/v1` declares
     /// tool-provider content-result support; declarations are unverified and
     /// grant nothing.
     pub fn consumer_capabilities(&self) -> Vec<String> {
@@ -628,7 +628,7 @@ pub struct SubscribeOptions {
     /// Explicit consumer identity for route.open; when absent, non-empty SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used.
     pub consumer_identity: Option<ConsumerIdentity>,
     /// Reverse-request handlers plus extra capability strings added with
-    /// [`Self::with_consumer_capability`]. For example, `content/v1` declares
+    /// [`Self::with_consumer_capability`]. For example, `tool-result/v1` declares
     /// tool-provider content-result support. These declarations are unverified
     /// and grant nothing; both sets are merged and omitted when empty.
     pub reverse_requests: ReverseRequestRegistry,
@@ -656,7 +656,7 @@ impl Default for SubscribeOptions {
 impl SubscribeOptions {
     /// Add a provider-contract capability declaration to the subscription route.
     ///
-    /// This merges with reverse-request families. For example, `content/v1`
+    /// This merges with reverse-request families. For example, `tool-result/v1`
     /// declares the tool-provider content result format. The declaration is
     /// unverified and grants no privilege; invalid values are refused before
     /// route.open is sent.
@@ -670,7 +670,7 @@ impl SubscribeOptions {
     }
 
     /// The extra capability strings added with `with_consumer_capability`, not
-    /// the reverse-request handler families. For example, `content/v1` declares
+    /// the reverse-request handler families. For example, `tool-result/v1` declares
     /// tool-provider content-result support; declarations are unverified and
     /// grant nothing.
     pub fn consumer_capabilities(&self) -> Vec<String> {
@@ -1313,7 +1313,7 @@ impl SubcConsumer {
     ///
     /// The route declares the method families of handlers registered on
     /// `opts.reverse_requests`, together with any provider-contract declarations
-    /// in the extra declarations reported by `opts.consumer_capabilities()`. For example, `content/v1` declares the
+    /// in the extra declarations reported by `opts.consumer_capabilities()`. For example, `tool-result/v1` declares the
     /// tool-provider content result format. These are unverified declarations,
     /// not privilege grants. Requests the provider sends back (elicitation,
     /// sampling) reach the registered handlers, exactly as on a managed route.
@@ -6627,17 +6627,17 @@ mod tests {
             reverse_requests: registry,
             ..CallOptions::default()
         }
-        .with_consumer_capability("content/v1")
+        .with_consumer_capability("tool-result/v1")
         .unwrap()
         .with_consumer_capability("elicitation")
         .unwrap()
-        .with_consumer_capability("content/v1")
+        .with_consumer_capability("tool-result/v1")
         .unwrap();
 
         let (request, handle) = capture_route_open_with_options(opts).await;
         assert_eq!(
             request.get("consumer_capabilities"),
-            Some(&serde_json::json!(["content/v1", "elicitation"]))
+            Some(&serde_json::json!(["tool-result/v1", "elicitation"]))
         );
         release_reverse_request_registry(handle);
     }
@@ -6674,18 +6674,18 @@ mod tests {
             .expect_err("close-route declarations use the same validation");
         assert_eq!(close_error.capability(), "bad value");
         let call_options = CallOptions::default()
-            .with_consumer_capability("content/v1")
+            .with_consumer_capability("tool-result/v1")
             .unwrap();
         assert_eq!(
             call_options.consumer_capabilities(),
-            vec!["content/v1".to_string()]
+            vec!["tool-result/v1".to_string()]
         );
         let close_options = CloseRouteOptions::default()
-            .with_consumer_capability("content/v1")
+            .with_consumer_capability("tool-result/v1")
             .unwrap();
         assert_eq!(
             close_options.consumer_capabilities(),
-            vec!["content/v1".to_string()]
+            vec!["tool-result/v1".to_string()]
         );
         shared.close_sync("test complete");
     }
@@ -8033,7 +8033,7 @@ mod tests {
         assert!(undeclared_request.get("consumer_capabilities").is_none());
 
         let declared_opts = CallOptions::default()
-            .with_consumer_capability("content/v1")
+            .with_consumer_capability("tool-result/v1")
             .unwrap();
         let (declared_request, declared) = open_answered_with(
             &shared,
@@ -8046,7 +8046,7 @@ mod tests {
         .await;
         assert_eq!(
             declared_request["consumer_capabilities"],
-            serde_json::json!(["content/v1"])
+            serde_json::json!(["tool-result/v1"])
         );
         assert_ne!(undeclared, declared);
 

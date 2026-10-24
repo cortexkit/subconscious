@@ -1835,7 +1835,7 @@ pub struct RouteBindRequest {
     pub identity: BindIdentity,
     pub principal: Option<Principal>,
     /// Consumer-declared reverse-request families and provider-contract
-    /// capabilities for this bind. For example, `content/v1` declares that a
+    /// capabilities for this bind. For example, `tool-result/v1` declares that a
     /// consumer understands the tool-provider content result format. This is an
     /// unverified declaration, not a privilege grant; providers treat an absent
     /// field as no declared capability. Known MCP method-family values today
@@ -2789,7 +2789,8 @@ fn bounded_terminal(
             &ErrorBody::new("frame_too_large", "module reply exceeds frame limit")
                 .with_detail(serde_json::json!({ "size": size, "limit": limit })),
         )?;
-        return Ok((FrameType::Error, data_flags(), body));
+        // Keep the original priority: a control-plane reply stays passive.
+        return Ok((FrameType::Error, flags, body));
     }
     Ok((ty, flags, body))
 }

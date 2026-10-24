@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.6
+
+- Take subc-client-rs 0.32 with its module-serving lifecycle fixes. Consumer APIs used by the UI are unchanged.
+
 ## 0.2.5
 
 - Settings → Updates shows what an upgrade would do, from the program's own

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Take subc-client-rs 0.32 with typed handler-panic failures, transport exit classification, IPv6 connections, bounded terminal replies and cooperative module stops. Public harness APIs are unchanged.
+
 ## 0.2.0
 
 - Minor bump because this crate's public API carries subc-protocol types (`signer::HarnessSigner::observed_principals` returns subc-protocol `Principal`s), and subc-protocol moves to 0.33.0. Move to subc-protocol 0.33, subc-client-rs 0.31, subc-control 0.33 and subc-transport 0.14 together. No behavior change.

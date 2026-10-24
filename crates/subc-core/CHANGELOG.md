@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.131
+
+- Take subc-client-rs 0.32: handler panics and unrequested transport disconnects now fail module serving; orderly EOF and requested stops remain clean exits. Includes IPv6 connection, bounded-reply and cooperative-stop fixes.
+
 ## 0.20.130
 
 - The terminal app's Settings → Updates runs the same setup engine as

@@ -34,6 +34,7 @@ use std::{
     fmt,
     future::Future,
     io,
+    panic::{catch_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
@@ -97,7 +98,10 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::{timeout, timeout_at, Instant},
 };
-use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
+use tokio_util::{
+    sync::{CancellationToken, WaitForCancellationFuture},
+    task::TaskTracker,
+};
 
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const CATALOG_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -109,9 +113,7 @@ const HANDLER_TASK_CAPACITY: usize = 64;
 /// once a data request has waited more than two seconds for a handler slot.
 const DISPATCH_SATURATION_WAIT: Duration = Duration::from_secs(2);
 const HELLO_CORR: u64 = 1;
-/// How long a closing module waits for its writer to flush the frames still
-/// queued before aborting it; see the serve future in `serve_with_handle`.
-const WRITER_DRAIN_LIMIT: Duration = Duration::from_secs(2);
+const DEFAULT_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// When a module's daemon connection ends (GOODBYE, EOF, or the module closing
 /// it), how long the serve loop waits for each `on_draining` hook it already
 /// spawned to start running before it cancels requests and calls
@@ -336,6 +338,11 @@ struct RequestDispatcher {
     /// Set after the first channel-0 push this SDK could not decode has been
     /// logged, so a daemon that repeats a newer push cannot flood the log.
     undecodable_push_logged: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<SubcModuleError>>>,
+    failed: CancellationToken,
+    tasks: TaskTracker,
+    aborts: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    undelivered_replies: Arc<AtomicU64>,
 }
 
 impl RequestDispatcher {
@@ -352,6 +359,44 @@ impl RequestDispatcher {
             pools,
             draining_hooks: Arc::new(Mutex::new(Vec::new())),
             undecodable_push_logged: Arc::new(AtomicBool::new(false)),
+            failure: Arc::new(Mutex::new(None)),
+            failed: CancellationToken::new(),
+            tasks: TaskTracker::new(),
+            aborts: Arc::new(Mutex::new(Vec::new())),
+            undelivered_replies: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn fail(&self, error: SubcModuleError) {
+        let mut failure = self.failure.lock().unwrap_or_else(|e| e.into_inner());
+        if failure.is_none() {
+            *failure = Some(error);
+        }
+        self.failed.cancel();
+    }
+
+    fn take_failure(&self) -> Option<SubcModuleError> {
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        let task = self.tasks.spawn(future);
+        let mut aborts = self.aborts.lock().unwrap_or_else(|e| e.into_inner());
+        aborts.retain(|task| !task.is_finished());
+        aborts.push(task.abort_handle());
+    }
+
+    fn abort_all(&self) {
+        for task in self
+            .aborts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+        {
+            task.abort();
         }
     }
 
@@ -395,12 +440,8 @@ impl RequestDispatcher {
     fn cancel_all(&self) {
         self.pools.close();
         let cancelled = match self.in_flight.lock() {
-            Ok(mut guard) => guard.drain().map(|(_, token)| token).collect::<Vec<_>>(),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .drain()
-                .map(|(_, token)| token)
-                .collect(),
+            Ok(guard) => guard.values().cloned().collect::<Vec<_>>(),
+            Err(poisoned) => poisoned.into_inner().values().cloned().collect(),
         };
         for cancellation in cancelled {
             cancellation.cancel();
@@ -1587,23 +1628,22 @@ pub trait ModuleHandler: Send + Sync + 'static {
     ///
     /// Called once for each drain notice the daemon sends, on its own task, so
     /// a slow hook never holds up pings, requests, or the GOODBYE that ends the
-    /// drain. It is always called before that GOODBYE is handled (and before
-    /// [`ModuleHandler::on_connection_end`]); it may still be running after
-    /// them.
+    /// drain. It is started before that GOODBYE is handled (and before
+    /// [`ModuleHandler::on_connection_end`]). Connection teardown aborts hooks
+    /// that have not finished within the drain budget.
     async fn on_draining(&self, _reason: RouteCloseReason, _deadline: SystemTime) {}
 
-    /// The daemon connection ended without a protocol error, and serving is
-    /// about to return `Ok(())`. `end` says how: a daemon GOODBYE is a planned
-    /// stop, a clean EOF or a reset means the daemon went away without one.
-    /// Called once, after every in-flight request has been cancelled. Not
-    /// called when serving returns an error.
+    /// The read loop ended orderly: a daemon GOODBYE is a planned stop, clean
+    /// EOF means the daemon went away without one, and `Closed` is a module
+    /// stop. Called once, after request tasks have finished or been cancelled.
+    /// Not called for handler failures or unrequested transport errors observed
+    /// before that end. A later, unexpected writer failure can still make
+    /// serving return an error.
     async fn on_connection_end(&self, _end: ConnectionEnd) {}
 }
 
-/// How a module's daemon connection ended, when it ended without a protocol
-/// error. `serve` returns `Ok(())` for all of these; a module that wants to
-/// log or act on the difference reads it in
-/// [`ModuleHandler::on_connection_end`].
+/// How a module's daemon connection ended. Orderly ends return `Ok(())`;
+/// unrequested transport failures return an error instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnectionEnd {
@@ -1611,10 +1651,10 @@ pub enum ConnectionEnd {
     Goodbye,
     /// The daemon closed the connection without GOODBYE.
     Eof,
-    /// The connection was reset or aborted (how a killed daemon's socket ends
-    /// on Windows).
+    /// Legacy end classification. Unrequested resets now return a transport
+    /// error and are no longer reported through `on_connection_end`.
     Reset,
-    /// The module closed the connection itself through its [`ModuleHandle`].
+    /// The module closed the connection itself, including a [`ModuleStopHandle`] stop.
     Closed,
 }
 
@@ -1751,6 +1791,7 @@ impl RequestCtx {
         body: Vec<u8>,
     ) -> Result<(), SubcModuleError> {
         self.module_handle.validate_route(self.handle)?;
+        let (frame_type, flags, body) = bounded_terminal(frame_type, flags, body)?;
         let frame = Frame::build_with_version(
             self.ver,
             frame_type,
@@ -1924,8 +1965,96 @@ pub async fn serve<H>(manifest: ModuleManifest, handler: H) -> Result<(), SubcMo
 where
     H: ModuleHandler,
 {
-    let (_handle, serve_future) = serve_from_env_with_handle(manifest, handler).await?;
-    serve_future.await
+    ServeOptions::default().serve(manifest, handler).await
+}
+
+/// A cooperative stop signal that can be created before connecting to the daemon.
+/// Clones share the same, irreversible stop request. Await the serving future
+/// after calling [`stop`](Self::stop); dropping it does not perform teardown.
+#[derive(Clone, Debug, Default)]
+pub struct ModuleStopHandle {
+    token: CancellationToken,
+}
+
+impl ModuleStopHandle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stop the handshake or stop admitting requests, drain accepted work, send
+    /// GOODBYE and flush. The serving future completes the teardown.
+    pub fn stop(&self) {
+        self.token.cancel();
+    }
+}
+
+/// Configuration for a module's connection lifecycle. Existing `serve*`
+/// functions use the defaults; use these builder methods to customize serving.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ServeOptions {
+    writer_drain_timeout: Duration,
+    stop_handle: ModuleStopHandle,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            writer_drain_timeout: DEFAULT_WRITER_DRAIN_TIMEOUT,
+            stop_handle: ModuleStopHandle::new(),
+        }
+    }
+}
+
+impl ServeOptions {
+    /// Set the writer drain budget (default: two seconds). A module stop also
+    /// gives in-flight handlers up to this long to finish before sending
+    /// GOODBYE, then gives the writer its own budget to flush. Other connection
+    /// ends cancel handlers immediately. Work still running at a drain
+    /// deadline is aborted.
+    ///
+    /// Keep the combined handler and writer waits below the daemon's per-module
+    /// stop budget: the daemon caps it at 25 seconds, and a module may be
+    /// configured with less. Leave room for lifecycle hooks as well.
+    pub fn with_writer_drain_timeout(mut self, timeout: Duration) -> Self {
+        self.writer_drain_timeout = timeout;
+        self
+    }
+
+    /// Install a stop handle created before calling `serve` or `serve_with`,
+    /// so a stop also interrupts connection establishment and HELLO.
+    pub fn with_stop_handle(mut self, handle: ModuleStopHandle) -> Self {
+        self.stop_handle = handle;
+        self
+    }
+
+    /// Serve using the same launch arguments and environment as [`serve`].
+    pub async fn serve<H: ModuleHandler>(
+        self,
+        mut manifest: ModuleManifest,
+        handler: H,
+    ) -> Result<(), SubcModuleError> {
+        let connection_file = parse_subc_arg(env::args_os().skip(1))?;
+        if let Some(module_id) = module_id_from_env()? {
+            manifest.module_id = module_id;
+        }
+        self.serve_with(&connection_file, manifest, handler).await
+    }
+
+    /// Serve with an explicit connection file and an unchanged manifest.
+    pub async fn serve_with<H: ModuleHandler>(
+        self,
+        connection_file: &Path,
+        manifest: ModuleManifest,
+        handler: H,
+    ) -> Result<(), SubcModuleError> {
+        if let Some((_handle, future)) =
+            prepare_connection(connection_file, manifest, handler, self).await?
+        {
+            future.await?;
+        }
+        Ok(())
+    }
 }
 
 /// Connect and register using the same launch inputs as [`serve`], returning a
@@ -1964,8 +2093,9 @@ pub async fn serve_with<H>(
 where
     H: ModuleHandler,
 {
-    let (_handle, serve_future) = serve_with_handle(connection_file, manifest, handler).await?;
-    serve_future.await
+    ServeOptions::default()
+        .serve_with(connection_file, manifest, handler)
+        .await
 }
 
 /// Connect, register the module, and return a cloneable handle plus the future that
@@ -1978,19 +2108,88 @@ pub async fn serve_with_handle<H>(
 where
     H: ModuleHandler,
 {
-    let stream = connect_to_subc(connection_file).await?;
+    prepare_connection(connection_file, manifest, handler, ServeOptions::default())
+        .await?
+        .ok_or(SubcModuleError::ConnectionClosedBeforeHelloAck)
+}
+
+async fn prepare_connection<H: ModuleHandler>(
+    connection_file: &Path,
+    manifest: ModuleManifest,
+    handler: H,
+    options: ServeOptions,
+) -> Result<Option<(ModuleHandle, ModuleServeFuture)>, SubcModuleError> {
+    let stream = tokio::select! {
+        biased;
+        () = options.stop_handle.token.cancelled() => return Ok(None),
+        stream = connect_to_subc(connection_file) => stream?,
+    };
+    register_connection(stream, manifest, handler, options).await
+}
+
+async fn register_connection<S, H>(
+    stream: S,
+    manifest: ModuleManifest,
+    handler: H,
+    options: ServeOptions,
+) -> Result<Option<(ModuleHandle, ModuleServeFuture)>, SubcModuleError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    H: ModuleHandler,
+{
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
     let connection_runtime = tokio::runtime::Handle::current();
-    let writer = tokio::spawn(drain_writer(write_half, rx));
+    let mut writer = tokio::spawn(drain_writer(write_half, rx));
     let handler = Arc::new(handler);
 
-    send_hello(&tx, manifest).await?;
-    let ack = expect_hello_ack(&mut read_half).await?;
-    handler.on_hello_ack(&ack).await;
+    let handshake = async {
+        send_hello(&tx, manifest).await?;
+        let ack = expect_hello_ack(&mut read_half).await?;
+        handler.on_hello_ack(&ack).await;
+        Ok::<_, SubcModuleError>(ack)
+    };
+    let ack = tokio::select! {
+        biased;
+        () = options.stop_handle.token.cancelled() => None,
+        ack = handshake => Some(ack),
+        result = &mut writer => return Err(writer_ended(result)),
+    };
+    let ack = match ack {
+        Some(Ok(ack)) => ack,
+        other => {
+            let result = match other {
+                None => {
+                    let deadline = Instant::now() + options.writer_drain_timeout;
+                    let result = timeout_at(deadline, send_goodbye(&tx)).await;
+                    drop(tx);
+                    let flush = finish_writer(writer, deadline).await;
+                    handler.on_connection_end(ConnectionEnd::Closed).await;
+                    match result.unwrap_or(Ok(())) {
+                        Ok(()) | Err(SubcModuleError::WriterClosed) => {}
+                        Err(error) => return Err(error),
+                    }
+                    match flush.0 {
+                        Err(SubcModuleError::FrameIo(FrameIoError::Io(error)))
+                            if is_disconnect(&error) => {}
+                        result => result?,
+                    }
+                    return Ok(None);
+                }
+                Some(Err(error)) => error,
+                Some(Ok(_)) => unreachable!(),
+            };
+            drop(tx);
+            let _ = finish_writer(writer, Instant::now() + options.writer_drain_timeout).await;
+            return Err(result);
+        }
+    };
 
-    let connection_token = checked_increment(&NEXT_MODULE_CONNECTION_TOKEN)
-        .ok_or(SubcModuleError::ConnectionTokenExhausted)?;
+    let Some(connection_token) = checked_increment(&NEXT_MODULE_CONNECTION_TOKEN) else {
+        drop(tx);
+        let _ = finish_writer(writer, Instant::now() + options.writer_drain_timeout).await;
+        return Err(SubcModuleError::ConnectionTokenExhausted);
+    };
     let close_token = CancellationToken::new();
     let handle = ModuleHandle::new(
         &ack,
@@ -1999,18 +2198,48 @@ where
         close_token,
         connection_runtime,
     );
-    let serve_future = connection_serve_future(read_half, tx, handler, handle.clone(), writer);
-    Ok((handle, serve_future))
+    let serve_future = connection_serve_future_with_options(
+        read_half,
+        tx,
+        handler,
+        handle.clone(),
+        writer,
+        options,
+    );
+    Ok(Some((handle, serve_future)))
 }
 
 // Both real connections and the in-memory test stand-in run this lifecycle,
 // including request cancellation, connection-end hooks and the writer drain.
+#[cfg(any(test, feature = "test-support"))]
 fn connection_serve_future<R, H>(
     read_half: R,
     tx: mpsc::Sender<Frame>,
     handler: Arc<H>,
     handle: ModuleHandle,
-    writer: tokio::task::JoinHandle<Result<(), FrameIoError>>,
+    writer: tokio::task::JoinHandle<Result<(), WriterFailure>>,
+) -> ModuleServeFuture
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    H: ModuleHandler,
+{
+    connection_serve_future_with_options(
+        read_half,
+        tx,
+        handler,
+        handle,
+        writer,
+        ServeOptions::default(),
+    )
+}
+
+fn connection_serve_future_with_options<R, H>(
+    read_half: R,
+    tx: mpsc::Sender<Frame>,
+    handler: Arc<H>,
+    handle: ModuleHandle,
+    mut writer: tokio::task::JoinHandle<Result<(), WriterFailure>>,
+    options: ServeOptions,
 ) -> ModuleServeFuture
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -2025,9 +2254,58 @@ where
         // Connection loss ends this serve future. Module serving retains no
         // reconnect task or in-flight reconnect gate; a supervisor that needs
         // recovery starts a fresh serve_with_handle invocation.
-        let loop_result =
-            module_loop(read_half, tx, Arc::clone(&handler), serve_handle.clone()).await;
+        let dispatcher = RequestDispatcher::with_pools(serve_handle.dispatch_pools());
+        let mut writer_finished = false;
+        let mut loop_result = tokio::select! {
+            biased;
+            result = module_loop(read_half, &tx, Arc::clone(&handler), serve_handle.clone(), &dispatcher, &options.stop_handle) => result,
+            result = &mut writer => {
+                writer_finished = true;
+                Err(writer_ended(result))
+            }
+        };
+        let deadline = Instant::now() + options.writer_drain_timeout;
+        dispatcher.wait_for_draining_hooks_to_start().await;
+        dispatcher.tasks.close();
+        if matches!(loop_result, Ok(ConnectionEnd::Closed))
+            && options.stop_handle.token.is_cancelled()
+        {
+            // Keep routes live until accepted work has sent its terminal reply.
+            let _ = timeout_at(deadline, dispatcher.tasks.wait()).await;
+        }
+        let orderly = loop_result.is_ok();
+        if let Some(error) = dispatcher.take_failure() {
+            if !orderly || !matches!(error, SubcModuleError::WriterClosed) {
+                loop_result = Err(error);
+            }
+        }
+        dispatcher.cancel_all();
+        let _ = timeout_at(deadline, dispatcher.tasks.wait()).await;
+        let abandoned_replies = dispatcher
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        if let Some(error) = dispatcher.take_failure() {
+            if !orderly || !matches!(error, SubcModuleError::WriterClosed) {
+                loop_result = Err(error);
+            }
+        }
+        dispatcher.abort_all();
+        dispatcher.tasks.wait().await;
+        let daemon_eof = matches!(loop_result, Ok(ConnectionEnd::Eof));
+        let deadline = Instant::now() + options.writer_drain_timeout;
+        if matches!(loop_result, Ok(ConnectionEnd::Closed))
+            && options.stop_handle.token.is_cancelled()
+        {
+            match timeout_at(deadline, send_goodbye(&tx)).await {
+                Ok(Ok(())) | Err(_) => {}
+                Ok(Err(SubcModuleError::WriterClosed)) => {}
+                Ok(Err(error)) => loop_result = Err(error),
+            }
+        }
         serve_handle.close_connection();
+        drop(tx);
         let loop_result = match loop_result {
             Ok(end) => {
                 handler.on_connection_end(end).await;
@@ -2036,62 +2314,59 @@ where
             Err(error) => Err(error),
         };
 
-        // module_loop cancelled every request in flight, so a handler that
-        // honours cancellation lets the writer drain and finish. One that
-        // ignores it keeps an egress sender alive, and the writer would wait on
-        // it forever. It must not keep the process alive past its stop: the
-        // daemon gives a module only its stop budget before killing it. So the
-        // writer gets a bounded drain, then is aborted with whatever it holds.
-        let mut writer = writer;
-        let writer_result = match timeout(WRITER_DRAIN_LIMIT, &mut writer).await {
-            Ok(joined) => joined.map_err(SubcModuleError::WriterTask),
-            Err(_) => {
-                writer.abort();
-                Ok(Ok(()))
-            }
+        let (writer_result, undelivered_replies) = if writer_finished {
+            (Ok(()), 0)
+        } else {
+            finish_writer(writer, deadline).await
         };
+        let undelivered_replies = undelivered_replies as u64
+            + dispatcher.undelivered_replies.load(Ordering::Relaxed)
+            + abandoned_replies as u64;
+        if daemon_eof && undelivered_replies > 0 {
+            tracing::warn!(
+                undelivered_replies,
+                "daemon EOF: replies could not be delivered during drain"
+            );
+        }
         match (loop_result, writer_result) {
+            (Err(SubcModuleError::WriterClosed), Err(writer_error)) => Err(writer_error),
             (Err(loop_err), _) => Err(loop_err),
-            (Ok(()), Ok(Ok(()))) => Ok(()),
-            // The read loop already saw the daemon go away; the writer failing
-            // to flush its remaining frames to that dead socket (BrokenPipe on
-            // Unix, ConnectionReset on Windows) is part of the same terminal,
-            // not a distinct fault.
-            (Ok(()), Ok(Err(FrameIoError::Io(err))))
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::BrokenPipe
-                ) =>
+            (Ok(()), Ok(())) => Ok(()),
+            // EOF or GOODBYE can precede a failed flush, especially when a
+            // daemon restart outlasts its drain budget. Once the daemon has
+            // ended the connection, Windows RST and Unix BrokenPipe are
+            // consequences of that orderly end, not independent failures.
+            (Ok(()), Err(SubcModuleError::FrameIo(FrameIoError::Io(err))))
+                if is_disconnect(&err) =>
             {
                 Ok(())
             }
-            (Ok(()), Ok(Err(writer_err))) => Err(SubcModuleError::FrameIo(writer_err)),
-            (Ok(()), Err(join_err)) => Err(join_err),
+            (Ok(()), Err(error)) => Err(error),
         }
     })
 }
 
 async fn module_loop<R, H>(
     mut reader: R,
-    egress: mpsc::Sender<Frame>,
+    egress: &mpsc::Sender<Frame>,
     handler: Arc<H>,
     module_handle: ModuleHandle,
+    dispatcher: &RequestDispatcher,
+    stop: &ModuleStopHandle,
 ) -> Result<ConnectionEnd, SubcModuleError>
 where
     R: AsyncRead + Unpin,
     H: ModuleHandler,
 {
-    let dispatcher = RequestDispatcher::with_pools(module_handle.dispatch_pools());
-    let result = serve_frames(&mut reader, &egress, &handler, &module_handle, &dispatcher).await;
-    // A drain notice is followed shortly by the daemon's GOODBYE, and the two
-    // can arrive in one read. Let every drain hook start before the
-    // connection's end (GOODBYE or otherwise) is acted on, so a module always
-    // hears about its drain before it hears that the connection is over.
-    dispatcher.wait_for_draining_hooks_to_start().await;
-    dispatcher.cancel_all();
-    result
+    serve_frames(
+        &mut reader,
+        egress,
+        &handler,
+        &module_handle,
+        dispatcher,
+        stop,
+    )
+    .await
 }
 
 async fn serve_frames<R, H>(
@@ -2100,6 +2375,7 @@ async fn serve_frames<R, H>(
     handler: &Arc<H>,
     module_handle: &ModuleHandle,
     dispatcher: &RequestDispatcher,
+    stop: &ModuleStopHandle,
 ) -> Result<ConnectionEnd, SubcModuleError>
 where
     R: AsyncRead + Unpin,
@@ -2107,6 +2383,9 @@ where
 {
     loop {
         let read = tokio::select! {
+            biased;
+            () = dispatcher.failed.cancelled() => return Err(dispatcher.take_failure().expect("failure signalled")),
+            () = stop.token.cancelled() => return Ok(ConnectionEnd::Closed),
             () = module_handle.shared.close_token.cancelled() => return Ok(ConnectionEnd::Closed),
             read = read_frame(reader) => read,
         };
@@ -2114,20 +2393,6 @@ where
             Ok(Some(frame)) => frame,
             // Clean EOF: the daemon closed the connection.
             Ok(None) => return Ok(ConnectionEnd::Eof),
-            // A reset/abort on the read path also means the daemon is gone. On
-            // Unix a killed daemon closes the socket with FIN (clean EOF above),
-            // but Windows sends RST on process death, surfacing here as
-            // ConnectionReset. Both are the same "serve until the daemon goes
-            // away" terminal, so normalize to a clean exit for a
-            // platform-independent serve() contract.
-            Err(FrameIoError::Io(err))
-                if matches!(
-                    err.kind(),
-                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
-                ) =>
-            {
-                return Ok(ConnectionEnd::Reset);
-            }
             Err(err) => return Err(SubcModuleError::FrameIo(err)),
         };
         if !handle_frame(
@@ -2230,6 +2495,7 @@ where
                 handler,
                 sdk_route_close_reason(reason),
                 drain_deadline(deadline_ms),
+                dispatcher,
             );
             dispatcher
                 .draining_hooks
@@ -2263,12 +2529,13 @@ fn spawn_draining_hook<H>(
     handler: Arc<H>,
     reason: RouteCloseReason,
     deadline: SystemTime,
+    dispatcher: &RequestDispatcher,
 ) -> oneshot::Receiver<()>
 where
     H: ModuleHandler,
 {
     let (started_tx, started_rx) = oneshot::channel();
-    tokio::spawn(async move {
+    dispatcher.spawn(async move {
         let mut hook = handler.on_draining(reason, deadline);
         let mut started_tx = Some(started_tx);
         std::future::poll_fn(|cx| {
@@ -2338,7 +2605,7 @@ where
     let (pool, op) = dispatcher.pools.classify(&body);
     let pool = pool.clone();
     let wait = pool.start_waiting((handle.channel, handle.epoch, corr));
-    tokio::spawn(async move {
+    dispatcher.clone().spawn(async move {
         let waiting = WaitingRequest {
             op,
             channel: handle.channel,
@@ -2351,6 +2618,9 @@ where
             PermitWaitOutcome::Cancelled => None,
             PermitWaitOutcome::Closed => {
                 // A closed dispatcher means connection teardown will release every route credit.
+                dispatcher
+                    .undelivered_replies
+                    .fetch_add(1, Ordering::Relaxed);
                 if let Ok(mut guard) = in_flight.lock() {
                     guard.remove(&(handle.channel, handle.epoch, corr));
                 }
@@ -2360,14 +2630,34 @@ where
         // A slot and the cancellation can become ready together and the slot
         // is taken first, so check again before running the handler.
         let outcome = if permit.is_none() || ctx.cancelled.is_cancelled() {
-            HandlerOutcome::Error {
+            Ok(HandlerOutcome::Error {
                 code: "cancelled".to_string(),
                 message: "request cancelled".to_string(),
-            }
+            })
         } else {
-            handler.handle(ctx.clone(), body).await
+            catch_handler_panic(async { handler.handle(ctx.clone(), body).await }).await
         };
-        let _ = send_handler_outcome(&ctx, outcome).await;
+        let panicked = outcome.is_err();
+        let outcome = outcome.unwrap_or_else(|()| HandlerOutcome::Error {
+            code: "internal".to_string(),
+            message: "module handler panicked".to_string(),
+        });
+        match send_handler_outcome(&ctx, outcome).await {
+            // A route GOODBYE/rebind withdraws the reply destination. Dropping
+            // that late terminal is intentional; an egress failure on a live
+            // route is not. A panic remains fatal even if its route is gone.
+            Err(SubcModuleError::StaleRouteHandle(_)) if !panicked => {}
+            Err(error) => {
+                if matches!(error, SubcModuleError::WriterClosed) {
+                    dispatcher
+                        .undelivered_replies
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                dispatcher.fail(error);
+            }
+            Ok(()) if panicked => dispatcher.fail(SubcModuleError::HandlerPanic),
+            Ok(()) => {}
+        }
         if let Ok(mut guard) = in_flight.lock() {
             guard.remove(&(handle.channel, handle.epoch, corr));
         }
@@ -2395,24 +2685,42 @@ where
     }
 
     let in_flight = Arc::clone(&dispatcher.in_flight);
-    tokio::spawn(async move {
+    dispatcher.clone().spawn(async move {
         // Health must not queue behind the data work whose liveness it reports.
         // Registration and cancellation still use the same in-flight registry.
         if !cancellation.is_cancelled() {
-            let report = dispatcher.fold_health(handler.health().await);
-            let response = ModuleControlResponse::from(report);
-            if let Ok(body) = serde_json::to_vec(&response) {
-                if let Ok(frame) = Frame::build_with_version(
-                    ver,
-                    FrameType::Response,
-                    control_flags(),
-                    channel,
-                    epoch,
-                    corr,
-                    body,
-                ) {
-                    let _ = send_outbound(&egress, frame).await;
+            let result = async {
+                let report = catch_handler_panic(async { handler.health().await }).await;
+                let panicked = report.is_err();
+                let (ty, body) = match report {
+                    Ok(report) => (
+                        FrameType::Response,
+                        serde_json::to_vec(&ModuleControlResponse::from(
+                            dispatcher.fold_health(report),
+                        ))?,
+                    ),
+                    Err(()) => (
+                        FrameType::Error,
+                        serde_json::to_vec(&ErrorBody::new("internal", "module handler panicked"))?,
+                    ),
+                };
+                let (ty, flags, body) = bounded_terminal(ty, control_flags(), body)?;
+                let frame = Frame::build_with_version(ver, ty, flags, channel, epoch, corr, body)
+                    .map_err(SubcModuleError::FrameBuild)?;
+                send_outbound(&egress, frame).await?;
+                if panicked {
+                    return Err(SubcModuleError::HandlerPanic);
                 }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                if matches!(error, SubcModuleError::WriterClosed) {
+                    dispatcher
+                        .undelivered_replies
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                dispatcher.fail(error);
             }
         }
         if let Ok(mut guard) = in_flight.lock() {
@@ -2454,6 +2762,36 @@ async fn send_handler_outcome(
                 .await
         }
     }
+}
+
+/// Catch unwinds across every poll, including construction of the handler future.
+/// Never expose the panic payload on the wire: it may contain request data.
+async fn catch_handler_panic<F: Future>(future: F) -> Result<F::Output, ()> {
+    let mut future = std::pin::pin!(future);
+    std::future::poll_fn(
+        |cx| match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(poll) => poll.map(Ok),
+            Err(_) => std::task::Poll::Ready(Err(())),
+        },
+    )
+    .await
+}
+
+fn bounded_terminal(
+    ty: FrameType,
+    flags: Flags,
+    body: Vec<u8>,
+) -> Result<(FrameType, Flags, Vec<u8>), SubcModuleError> {
+    let size = subc_protocol::HEADER_LEN + body.len();
+    let limit = subc_protocol::MAX_DELIVERED_FRAME_LEN;
+    if matches!(ty, FrameType::Response | FrameType::Error) && size > limit {
+        let body = serde_json::to_vec(
+            &ErrorBody::new("frame_too_large", "module reply exceeds frame limit")
+                .with_detail(serde_json::json!({ "size": size, "limit": limit })),
+        )?;
+        return Ok((FrameType::Error, data_flags(), body));
+    }
+    Ok((ty, flags, body))
 }
 
 fn handle_cancel(frame: Frame, in_flight: &InFlight) -> Result<(), SubcModuleError> {
@@ -2702,7 +3040,7 @@ async fn connect_to_subc(connection_file_path: &Path) -> Result<TcpStream, SubcM
             path: connection_file_path.to_path_buf(),
         })?;
     let endpoint_label = format!("{}:{}", endpoint.host, endpoint.port);
-    let mut stream = TcpStream::connect(&endpoint_label)
+    let mut stream = connect_endpoint(&endpoint.host, endpoint.port)
         .await
         .map_err(|source| SubcModuleError::Connect {
             path: connection_file_path.to_path_buf(),
@@ -2729,20 +3067,101 @@ async fn connect_to_subc(connection_file_path: &Path) -> Result<TcpStream, SubcM
     Ok(stream)
 }
 
-async fn drain_writer<W>(write_half: W, mut rx: mpsc::Receiver<Frame>) -> Result<(), FrameIoError>
+async fn connect_endpoint(host: &str, port: u16) -> io::Result<TcpStream> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    TcpStream::connect((host, port)).await
+}
+
+async fn send_goodbye(tx: &mpsc::Sender<Frame>) -> Result<(), SubcModuleError> {
+    let frame = Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 0, Vec::new())
+        .map_err(SubcModuleError::FrameBuild)?;
+    send_outbound(tx, frame).await
+}
+
+fn is_disconnect(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+    )
+}
+
+fn writer_ended(
+    result: Result<Result<(), WriterFailure>, tokio::task::JoinError>,
+) -> SubcModuleError {
+    match result {
+        Ok(Ok(())) => SubcModuleError::WriterClosed,
+        Ok(Err(error)) => SubcModuleError::FrameIo(error.error),
+        Err(error) => SubcModuleError::WriterTask(error),
+    }
+}
+
+async fn finish_writer(
+    mut writer: tokio::task::JoinHandle<Result<(), WriterFailure>>,
+    deadline: Instant,
+) -> (Result<(), SubcModuleError>, usize) {
+    match timeout_at(deadline, &mut writer).await {
+        Ok(Ok(Ok(()))) => (Ok(()), 0),
+        Ok(Ok(Err(failure))) => (
+            Err(SubcModuleError::FrameIo(failure.error)),
+            failure.undelivered_replies,
+        ),
+        Ok(Err(error)) => (Err(SubcModuleError::WriterTask(error)), 0),
+        Err(_) => {
+            writer.abort();
+            let _ = writer.await;
+            (Ok(()), 0)
+        }
+    }
+}
+
+struct WriterFailure {
+    error: FrameIoError,
+    undelivered_replies: usize,
+}
+
+fn is_reply(frame: &Frame) -> bool {
+    matches!(
+        frame.header.ty,
+        FrameType::Response | FrameType::Error | FrameType::StreamEnd
+    )
+}
+
+async fn drain_writer<W>(write_half: W, mut rx: mpsc::Receiver<Frame>) -> Result<(), WriterFailure>
 where
     W: AsyncWrite + Unpin,
 {
     let mut writer = BufWriter::new(write_half);
-    while let Some(frame) = rx.recv().await {
-        write_frame(&mut writer, &frame).await?;
-        while let Ok(frame) = rx.try_recv() {
+    let mut pending_replies = 0;
+    let result = async {
+        while let Some(frame) = rx.recv().await {
+            pending_replies += usize::from(is_reply(&frame));
             write_frame(&mut writer, &frame).await?;
+            while let Ok(frame) = rx.try_recv() {
+                pending_replies += usize::from(is_reply(&frame));
+                write_frame(&mut writer, &frame).await?;
+            }
+            writer.flush().await.map_err(FrameIoError::Io)?;
+            pending_replies = 0;
         }
         writer.flush().await.map_err(FrameIoError::Io)?;
+        Ok(())
     }
-    writer.flush().await.map_err(FrameIoError::Io)?;
-    Ok(())
+    .await;
+    result.map_err(|error| {
+        rx.close();
+        while let Ok(frame) = rx.try_recv() {
+            pending_replies += usize::from(is_reply(&frame));
+        }
+        WriterFailure {
+            error,
+            undelivered_replies: pending_replies,
+        }
+    })
 }
 
 async fn send_outbound(egress: &mpsc::Sender<Frame>, frame: Frame) -> Result<(), SubcModuleError> {
@@ -2797,6 +3216,7 @@ fn data_flags() -> Flags {
 }
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SubcModuleError {
     MissingSubcArg,
     MissingSubcValue,
@@ -2825,6 +3245,8 @@ pub enum SubcModuleError {
     FrameBuild(FrameBuildError),
     Json(serde_json::Error),
     WriterClosed,
+    /// A request handler panicked. Its payload is never sent to the daemon.
+    HandlerPanic,
     StaleRouteHandle(RouteHandle),
     ConnectionTokenExhausted,
     WriterTask(tokio::task::JoinError),
@@ -2884,6 +3306,7 @@ impl fmt::Display for SubcModuleError {
             Self::FrameBuild(err) => write!(f, "frame build error: {err}"),
             Self::Json(err) => write!(f, "JSON error: {err}"),
             Self::WriterClosed => write!(f, "module writer task closed"),
+            Self::HandlerPanic => write!(f, "module handler panicked"),
             Self::StaleRouteHandle(handle) => write!(f, "stale route handle: {handle:?}"),
             Self::ConnectionTokenExhausted => write!(f, "module connection token exhausted"),
             Self::WriterTask(err) => write!(f, "module writer task failed: {err}"),
@@ -2917,6 +3340,7 @@ impl Error for SubcModuleError {
             | Self::NonUnicodeModuleIdEnv { .. }
             | Self::NoEndpoint { .. }
             | Self::WriterClosed
+            | Self::HandlerPanic
             | Self::StaleRouteHandle(_)
             | Self::ConnectionTokenExhausted
             | Self::InFlightPoisoned
@@ -4428,7 +4852,7 @@ mod module_close_tests {
         // Well inside the writer's drain limit: the handler answered its
         // cancellation, so nothing had to be aborted.
         assert!(
-            started.elapsed() < WRITER_DRAIN_LIMIT,
+            started.elapsed() < DEFAULT_WRITER_DRAIN_TIMEOUT,
             "closing took {:?}",
             started.elapsed()
         );
@@ -4443,13 +4867,13 @@ mod module_close_tests {
         let started = Instant::now();
         send(&mut served.daemon, goodbye()).await;
         let result = timeout(
-            WRITER_DRAIN_LIMIT + Duration::from_secs(3),
+            DEFAULT_WRITER_DRAIN_TIMEOUT + Duration::from_secs(3),
             &mut served.serve,
         )
         .await
         .expect("the writer drain must be bounded");
         result.unwrap().unwrap();
-        assert!(started.elapsed() >= WRITER_DRAIN_LIMIT);
+        assert!(started.elapsed() >= DEFAULT_WRITER_DRAIN_TIMEOUT);
     }
 
     #[tokio::test]
@@ -4705,6 +5129,9 @@ mod operator_confirm_tests;
 
 #[cfg(test)]
 mod binary_reply_tests;
+
+#[cfg(test)]
+mod serve_lifecycle_tests;
 
 #[cfg(test)]
 mod request_pool_tests;

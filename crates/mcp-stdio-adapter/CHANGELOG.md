@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.17
+
+- Take subc-client-rs 0.32: handler panics and unrequested transport disconnects now fail serving for supervisor recovery; orderly EOF and requested stops still exit cleanly.
+
 ## 0.1.16
 
 - Move to subc-protocol 0.33 and subc-client-rs 0.31. No behavior change.

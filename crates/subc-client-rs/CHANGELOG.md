@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.32.0
+
+- **Breaking:** `SubcModuleError` is now non-exhaustive. Add a `_` arm anywhere an existing module matches it exhaustively. `serve` now sends a fixed, redacted correlated `internal` error and returns `SubcModuleError::HandlerPanic` on a request-handler panic, rather than silently losing the reply and continuing to serve. A terminal reply that cannot be queued also fails the connection.
+- **Breaking behavior:** an unrequested reset, abort or BrokenPipe while serving now returns an error (previously resets were normalized to `Ok`). EOF remains orderly, including with in-flight work; write disconnects after EOF, GOODBYE or a module stop remain `Ok`. After EOF, undelivered replies are logged once by count, without their contents. Supervisors should restart modules on these new error exits.
+- Connect using host/port pairs, supporting bracketed and unbracketed IPv6 as well as IPv4 and hostnames.
+- Response and Error frames above the delivered-frame limit (header included) now become a small correlated `frame_too_large` Error with `{size, limit}` detail. Exactly-at-limit replies are unchanged; no body is truncated.
+- Add `ServeOptions` with default/builders and a cloneable `ModuleStopHandle`. Create the stop handle before calling `ServeOptions::serve` or `serve_with` to cover connection establishment and the handshake. A stop finishes accepted handlers within the drain budget, sends GOODBYE and flushes; keep awaiting the serving future for teardown. The configurable writer/stop drain budget defaults to two seconds and should remain below the daemon's per-module stop budget (capped at 25 seconds). Existing free `serve*` signatures and defaults are unchanged.
+
 ## 0.31.1
 
 - Add `SubcConsumer::supervisor_rescan_checked(preview, candidate, expect)`, which sends `supervisor.rescan_checked` and returns the daemon's `SupervisorRescanResult`. A preview sends the candidate config text and changes nothing; an apply sends the `expect` value from that preview. A preview is retried on transport failures like the other reads, while an apply is sent once. A daemon refusal comes back as `CallError::Module` with its code and message. No existing method changes.

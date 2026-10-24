@@ -66,7 +66,7 @@ async fn payload_catalog_bridge_preserves_declarations_and_legacy_wire_bytes() {
         .contains("operation_payload"));
     consumer.close().await;
     harness.stop().await;
-    assert!(legacy_serving.await.unwrap().is_ok());
+    assert_killed_daemon_exit(legacy_serving.await.unwrap());
 }
 
 #[async_trait]
@@ -240,7 +240,7 @@ impl BinaryHarness {
 
     async fn stop(mut self) {
         self.daemon.kill_and_wait();
-        assert!(self.serving.await.unwrap().is_ok());
+        assert_killed_daemon_exit(self.serving.await.unwrap());
     }
 }
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.12
+
+- Take subc-client-rs 0.32: a module handler panic or unrequested transport disconnect now fails serving instead of being silently ignored. Orderly EOF and requested stops remain clean exits.
+
 ## 0.4.11
 
 - Takes subc-protocol 0.33 and the matching SDK, daemon, control, transport and bus-testkit releases (`ToolCallRequest` gains the optional `output_refs` member). No behavior change.

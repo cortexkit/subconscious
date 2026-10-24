@@ -107,11 +107,7 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
                     ))
                 }
                 (Some(installed), Some(release)) if installed == release => None,
-                _ => Some(format!(
-                    "{} exists without inventory ownership; ck setup did not install it. \
-                     Move it aside and run ck setup again. Nothing was changed.",
-                    super::components::display_home_path(&binary.path)
-                )),
+                _ => Some(super::text::unowned_binary_refusal(&binary.path)),
             };
             if let Some(reason) = reason {
                 plan.outcomes.push(PlanOutcome::Refusal { reason });
@@ -854,7 +850,7 @@ mod tests {
         assert!(!plan.is_authorized());
         assert_eq!(plan.mutation_count(), 0);
         assert!(plan.blocking_outcome().unwrap().to_string().contains(
-            "/managed/bin/ck-subc-mcp exists without inventory ownership; ck setup did not install it. Move it aside and run ck setup again. Nothing was changed."
+            "ck setup did not install /managed/bin/ck-subc-mcp, so it won't replace it. Move it aside and run ck setup again. Nothing was changed."
         ));
     }
 
@@ -868,7 +864,7 @@ mod tests {
             .blocking_outcome()
             .unwrap()
             .to_string()
-            .contains("ck setup did not install it"));
+            .contains("ck setup did not install /managed/bin/ck-subc-mcp, so it won't replace it"));
     }
 
     #[test]

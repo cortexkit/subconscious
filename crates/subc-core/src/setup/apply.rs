@@ -25,6 +25,8 @@ use super::{
     validation::{self, Validator},
 };
 
+type RescanPreview = fn() -> Result<Vec<String>, String>;
+
 pub struct SetupBackend {
     executable: PathBuf,
     paths: SetupPaths,
@@ -37,7 +39,7 @@ pub struct SetupBackend {
     /// Completed changes from this invocation, partitioned so a failure in one
     /// module never rewinds another module or the daemon runtime.
     component_steps: BTreeMap<Component, ComponentSteps>,
-    rescan_preview: Option<fn() -> Result<Vec<String>, String>>,
+    rescan_preview: Option<RescanPreview>,
 }
 
 #[derive(Default)]
@@ -98,7 +100,7 @@ impl SetupBackend {
 
     /// Use the caller's authenticated client for previews, without spawning a
     /// second CLI process that could connect to a different daemon.
-    pub fn set_rescan_preview(&mut self, preview: fn() -> Result<Vec<String>, String>) {
+    pub fn set_rescan_preview(&mut self, preview: RescanPreview) {
         self.rescan_preview = Some(preview);
     }
 
@@ -1335,6 +1337,23 @@ mod tests {
             component_steps: BTreeMap::new(),
             rescan_preview: None,
         }
+    }
+
+    #[test]
+    fn rescan_preview_uses_the_injected_client_and_preserves_its_result() {
+        let root = ScratchDir::new("setup-injected-preview");
+        let mut backend = backend_without_user_manager(&root);
+        assert_eq!(
+            backend.preview_restart_required().unwrap_err(),
+            "no authenticated rescan preview client was supplied"
+        );
+        backend.set_rescan_preview(|| Ok(vec!["modules".into()]));
+        assert_eq!(backend.preview_restart_required().unwrap(), ["modules"]);
+        backend.set_rescan_preview(|| Err("preview refused".into()));
+        assert_eq!(
+            backend.preview_restart_required().unwrap_err(),
+            "preview refused"
+        );
     }
 
     /// ck-auth refuses a key path whose directory is missing, so the directory

@@ -3,9 +3,15 @@
 ## 0.20.127
 
 - The setup engine and shared upgrade text are available from the subc-core
-  library. CLI summaries, refusal wording and verbose diagnostics are unchanged.
+  library. Summaries and verbose diagnostics for fully managed installations
+  retain their existing wording.
 - Tests pin redirected upgrade checks, current and available releases, and setup
   and upgrade output for binaries without an ownership record.
+- Upgrade refuses when no inventory-owned binaries are installed, a managed
+  destination is unowned, or the running CLI is unowned, instead of claiming
+  those binaries are up to date.
+  The refusal names each unowned destination and directs it through setup.
+  Current and available checks still exit 0; ownership refusals exit 1.
 
 ## 0.20.126
 

@@ -1,4 +1,4 @@
 exit: 1
 stdout:
-~/.local/share/cortexkit/bin/ck-subc-mcp exists without inventory ownership; ck setup did not install it. Move it aside and run ck setup again. Nothing was changed.
+ck setup did not install ~/.local/share/cortexkit/bin/ck-subc-mcp, so it won't replace it. Move it aside and run ck setup again. Nothing was changed.
 stderr:

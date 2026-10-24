@@ -508,30 +508,46 @@ pub(super) fn observe_unowned_binaries(
     target: AlphaTarget,
 ) -> Vec<UnownedBinary> {
     let entry = index.components.get(component.label());
-    component_binaries_for_target(component, target)
+    unowned_binary_paths(
+        component_binaries_for_target(component, target),
+        binary_home,
+        inventory,
+    )
+    .into_iter()
+    .map(|(binary, path)| {
+        let release_version = entry.and_then(|entry| {
+            entry
+                .assets
+                .get(target.label())
+                .and_then(|assets| assets.get(binary))
+                .and_then(|asset| asset.reports.clone())
+                .or_else(|| entry.version.clone())
+        });
+        UnownedBinary {
+            version: observed_binary_version(&path),
+            path,
+            release_version,
+        }
+    })
+    .collect()
+}
+
+/// Ownership checks use directory entries, including broken symlinks. An
+/// upgrade must refuse an unowned destination without executing that binary.
+pub(super) fn unowned_binary_paths<'a>(
+    binaries: &'a [&'a str],
+    binary_home: &Path,
+    inventory: &Inventory,
+) -> Vec<(&'a str, PathBuf)> {
+    binaries
         .iter()
-        .filter_map(|binary| {
+        .filter_map(|&binary| {
             let path = binary_home.join(platform_binary(binary));
-            if fs::symlink_metadata(&path).is_err()
-                || OWNED_BINARY_KINDS
+            (fs::symlink_metadata(&path).is_ok()
+                && !OWNED_BINARY_KINDS
                     .iter()
-                    .any(|kind| inventory.owns_path(kind, &path))
-            {
-                return None;
-            }
-            let release_version = entry.and_then(|entry| {
-                entry
-                    .assets
-                    .get(target.label())
-                    .and_then(|assets| assets.get(*binary))
-                    .and_then(|asset| asset.reports.clone())
-                    .or_else(|| entry.version.clone())
-            });
-            Some(UnownedBinary {
-                version: observed_binary_version(&path),
-                path,
-                release_version,
-            })
+                    .any(|kind| inventory.owns_path(kind, &path)))
+            .then_some((binary, path))
         })
         .collect()
 }

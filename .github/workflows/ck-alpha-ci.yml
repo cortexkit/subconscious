@@ -113,7 +113,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p subc-core --bin ck --locked setup:: 2>&1 | tee "$RUNNER_TEMP/alpha-contract.log"
+          cargo test -p subc-core --lib --locked setup:: 2>&1 | tee "$RUNNER_TEMP/alpha-contract.log"
           grep -Eq 'test result: ok\. [1-9][0-9]* passed;' "$RUNNER_TEMP/alpha-contract.log"
 
       - name: Prove setup, runtime, MC detection, and upgrade contracts
@@ -121,7 +121,7 @@ jobs:
         shell: pwsh
         run: |
           $log = Join-Path $env:RUNNER_TEMP 'alpha-contract.log'
-          & cargo test -p subc-core --bin ck --locked setup:: 2>&1 | Tee-Object -FilePath $log
+          & cargo test -p subc-core --lib --locked setup:: 2>&1 | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }
@@ -148,7 +148,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test -p subc-core --bin ck --locked \
+          cargo test -p subc-core --lib --locked \
             setup::self_update_unix::tests::unix_self_update_keeps_running_process_on_original_inode \
             -- --exact 2>&1 | tee "$RUNNER_TEMP/self-update-unix.log"
           grep -Fq 'test result: ok. 1 passed;' "$RUNNER_TEMP/self-update-unix.log"
@@ -165,7 +165,7 @@ jobs:
         shell: pwsh
         run: |
           $log = Join-Path $env:RUNNER_TEMP 'self-update-windows.log'
-          & cargo test -p subc-core --bin ck --locked setup::self_update_windows::tests::replacement_preserves_old_until_a_successful_next_invocation_cleans_it -- --exact 2>&1 | Tee-Object -FilePath $log
+          & cargo test -p subc-core --lib --locked setup::self_update_windows::tests::replacement_preserves_old_until_a_successful_next_invocation_cleans_it -- --exact 2>&1 | Tee-Object -FilePath $log
           if ($LASTEXITCODE -ne 0) {
             exit $LASTEXITCODE
           }

@@ -1,0 +1,10 @@
+exit: 0
+stdout:
+Everything is up to date (ck 0.17.9 · ck-subc 0.17.9 · ck-subc-mcp · ck-aft 0.55.1 · ck-claustrum 0.8.0 · ck-auth 0.8.0).
+  outcome: no-op: ck-subc is already current
+  outcome: no-op: ck-subc-mcp is already current
+  outcome: no-op: ck-aft is already current
+  outcome: no-op: ck-claustrum is already current
+  outcome: no-op: ck-auth is already current
+  outcome: no-op: ck is already current
+stderr:

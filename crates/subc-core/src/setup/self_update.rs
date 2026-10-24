@@ -117,7 +117,7 @@ pub(crate) fn replace_verified_candidate(
 }
 
 #[cfg(windows)]
-pub(crate) fn cleanup_replaced_windows_ck(executable: &Path) -> Result<(), String> {
+pub fn cleanup_replaced_windows_ck(executable: &Path) -> Result<(), String> {
     let manifest = current_windows_manifest()?;
     let mut inventory = Inventory::load(&manifest, "windows-x64")?;
     super::self_update_windows::cleanup_owned_previous(executable, &mut inventory)

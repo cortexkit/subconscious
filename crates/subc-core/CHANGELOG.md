@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.20.127
+
+- The setup engine and shared upgrade text are available from the subc-core
+  library. CLI summaries, refusal wording and verbose diagnostics are unchanged.
+- Tests pin redirected upgrade checks, current and available releases, and setup
+  and upgrade output for binaries without an ownership record.
+
 ## 0.20.126
 
 - Settings can save the reviewed configuration with a retained backup (owner-only

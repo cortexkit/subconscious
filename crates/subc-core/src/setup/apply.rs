@@ -37,6 +37,7 @@ pub struct SetupBackend {
     /// Completed changes from this invocation, partitioned so a failure in one
     /// module never rewinds another module or the daemon runtime.
     component_steps: BTreeMap<Component, ComponentSteps>,
+    rescan_preview: Option<fn() -> Result<Vec<String>, String>>,
 }
 
 #[derive(Default)]
@@ -91,7 +92,14 @@ impl SetupBackend {
             runtime_status: RuntimeStatus::default(),
             uninstall_report: None,
             component_steps: BTreeMap::new(),
+            rescan_preview: None,
         })
+    }
+
+    /// Use the caller's authenticated client for previews, without spawning a
+    /// second CLI process that could connect to a different daemon.
+    pub fn set_rescan_preview(&mut self, preview: fn() -> Result<Vec<String>, String>) {
+        self.rescan_preview = Some(preview);
     }
 
     pub fn observe(&mut self, request: &SetupRequest) -> Result<SetupObserved, String> {
@@ -1095,7 +1103,10 @@ impl SetupExecutor for SetupBackend {
                 })
                 .unwrap_or_default());
         }
-        crate::preview_rescan_restart_required()
+        let preview = self
+            .rescan_preview
+            .ok_or_else(|| "no authenticated rescan preview client was supplied".to_string())?;
+        preview()
     }
 }
 
@@ -1182,7 +1193,7 @@ pub fn start_installed_service() -> Result<(), String> {
     runtime::start_installed(platform, &paths, &mut SystemCommandRunner)
 }
 
-pub(crate) fn data_directory() -> Result<PathBuf, String> {
+pub fn data_directory() -> Result<PathBuf, String> {
     if cfg!(windows) {
         return env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -1322,6 +1333,7 @@ mod tests {
             runtime_status: RuntimeStatus::default(),
             uninstall_report: None,
             component_steps: BTreeMap::new(),
+            rescan_preview: None,
         }
     }
 
@@ -1419,6 +1431,7 @@ mod adoption_tests {
             runtime_status: RuntimeStatus::default(),
             uninstall_report: None,
             component_steps: BTreeMap::new(),
+            rescan_preview: None,
         };
         backend.component_steps.insert(
             Component::Claustrum,
@@ -1474,6 +1487,7 @@ mod adoption_tests {
             runtime_status: RuntimeStatus::default(),
             uninstall_report: None,
             component_steps: BTreeMap::new(),
+            rescan_preview: None,
         };
 
         backend.adopt_running_ck(&executable).unwrap();
@@ -1564,6 +1578,7 @@ mod adoption_tests {
             runtime_status: RuntimeStatus::default(),
             uninstall_report: None,
             component_steps: BTreeMap::new(),
+            rescan_preview: None,
         };
 
         backend.adopt_running_ck(&executable).unwrap();
@@ -1658,6 +1673,7 @@ mod adoption_tests {
             runtime_status: RuntimeStatus::default(),
             uninstall_report: None,
             component_steps: BTreeMap::new(),
+            rescan_preview: None,
         };
 
         backend.adopt_running_ck(&executable).unwrap();

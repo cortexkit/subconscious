@@ -1,0 +1,4 @@
+exit: 0
+stdout:
+Everything is up to date.
+stderr:

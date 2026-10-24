@@ -5,8 +5,8 @@
 // a small `<domain> <verb>` dispatcher so future domains such as `ck vault ...`,
 // `ck quota ...`, and `ck account ...` can be added without reshaping the CLI.
 
-#[path = "../setup/mod.rs"]
-mod setup;
+use subc_core::setup;
+use subc_core::setup::text::{human_blocking_outcome, upgrade_current_summary};
 
 #[path = "activity/mod.rs"]
 mod activity;
@@ -7021,6 +7021,7 @@ async fn preview_rescan_restart_required_async() -> Result<Vec<String>, String> 
 fn setup_command(program: &Path, request: &setup::SetupRequest) -> Result<(), CkError> {
     let mut backend =
         setup::SetupBackend::current(program.to_path_buf()).map_err(CkError::Message)?;
+    backend.set_rescan_preview(preview_rescan_restart_required);
     let observed = backend.observe(request).map_err(CkError::Message)?;
     let plan = setup::plan_setup(&observed, request);
 
@@ -7076,7 +7077,10 @@ fn setup_command(program: &Path, request: &setup::SetupRequest) -> Result<(), Ck
     backend
         .apply_plan(&plan, request)
         .map_err(CkError::Message)?;
-    print_verbose_outcomes(&plan.outcomes, request.verbose);
+    print!(
+        "{}",
+        setup::text::print_verbose_outcomes(&plan.outcomes, request.verbose)
+    );
     Ok(())
 }
 
@@ -7169,14 +7173,6 @@ fn setup_unavailable_message(
     })
 }
 
-fn human_blocking_outcome(outcome: &setup::PlanOutcome) -> String {
-    match outcome {
-        setup::PlanOutcome::Refusal { reason }
-        | setup::PlanOutcome::TargetRefused { reason, .. } => reason.clone(),
-        _ => outcome.to_string(),
-    }
-}
-
 fn print_verbose_setup_outcomes(plan: &setup::SetupPlan, verbose: bool) {
     if verbose {
         for line in plan
@@ -7185,14 +7181,6 @@ fn print_verbose_setup_outcomes(plan: &setup::SetupPlan, verbose: bool) {
             .filter(|line| line.trim_start().starts_with("outcome:"))
         {
             println!("{line}");
-        }
-    }
-}
-
-fn print_verbose_outcomes(outcomes: &[setup::PlanOutcome], verbose: bool) {
-    if verbose {
-        for outcome in outcomes {
-            println!("  outcome: {outcome}");
         }
     }
 }
@@ -7298,7 +7286,10 @@ async fn upgrade_command(
             .map(human_blocking_outcome)
             .unwrap_or_else(|| "upgrade could not continue; nothing was changed".to_string());
         println!("{message}");
-        print_verbose_outcomes(&plan.outcomes, verbose);
+        print!(
+            "{}",
+            setup::text::print_verbose_outcomes(&plan.outcomes, verbose)
+        );
         return Err(CkError::RenderedExit { exit_code: 1 });
     }
     let planned_mutations = plan
@@ -7327,12 +7318,18 @@ async fn upgrade_command(
                 println!("{update}");
             }
         }
-        print_verbose_outcomes(&plan.outcomes, verbose);
+        print!(
+            "{}",
+            setup::text::print_verbose_outcomes(&plan.outcomes, verbose)
+        );
         return Ok(());
     }
     if planned_mutations == 0 {
         println!("{}", upgrade_current_summary(&discovered));
-        print_verbose_outcomes(&plan.outcomes, verbose);
+        print!(
+            "{}",
+            setup::text::print_verbose_outcomes(&plan.outcomes, verbose)
+        );
         return Ok(());
     }
 
@@ -7347,7 +7344,10 @@ async fn upgrade_command(
             }
         }
         println!("Done.");
-        print_verbose_outcomes(&plan.outcomes, verbose);
+        print!(
+            "{}",
+            setup::text::print_verbose_outcomes(&plan.outcomes, verbose)
+        );
         return Ok(());
     }
 
@@ -7366,7 +7366,10 @@ async fn upgrade_command(
     match setup::execute_upgrade(&plan, &mut backend) {
         Ok(report) => {
             println!("Done.");
-            print_verbose_outcomes(&plan.outcomes, verbose);
+            print!(
+                "{}",
+                setup::text::print_verbose_outcomes(&plan.outcomes, verbose)
+            );
             if verbose {
                 setup::render_execution_report(&report);
             }
@@ -7376,31 +7379,6 @@ async fn upgrade_command(
             setup::render_execution_report(&failure.report);
             Err(CkError::Rejected(failure.to_string()))
         }
-    }
-}
-
-fn upgrade_current_summary(discovered: &[setup::ManagedUpgradeTarget]) -> String {
-    let mut components = Vec::new();
-    let ordered = discovered
-        .iter()
-        .filter(|item| item.target.is_self_replacing())
-        .chain(
-            discovered
-                .iter()
-                .filter(|item| !item.target.is_self_replacing()),
-        );
-    for item in ordered {
-        let target = item.target;
-        if target.label() == "ck-subc-mcp" {
-            components.push(target.to_string());
-        } else {
-            components.push(format!("{target} {}", item.installed_version));
-        }
-    }
-    if components.is_empty() {
-        "Everything is up to date.".to_string()
-    } else {
-        format!("Everything is up to date ({}).", components.join(" · "))
     }
 }
 

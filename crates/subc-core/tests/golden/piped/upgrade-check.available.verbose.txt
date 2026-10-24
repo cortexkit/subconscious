@@ -1,0 +1,11 @@
+exit: 0
+stdout:
+ck-aft 0.55.1 → 0.55.2. Run ck upgrade.
+  outcome: no-op: ck-subc is already current
+  outcome: no-op: ck-subc-mcp is already current
+  outcome: ck-aft 0.55.1 → 0.55.2
+  outcome: ck-aft: module is not supervised on this host; restart omitted, verified by binary version only
+  outcome: no-op: ck-claustrum is already current
+  outcome: no-op: ck-auth is already current
+  outcome: no-op: ck is already current
+stderr:

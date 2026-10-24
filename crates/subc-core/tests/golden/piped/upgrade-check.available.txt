@@ -1,0 +1,4 @@
+exit: 0
+stdout:
+ck-aft 0.55.1 → 0.55.2. Run ck upgrade.
+stderr:

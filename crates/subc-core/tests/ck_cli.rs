@@ -2151,6 +2151,105 @@ fn upgrade_and_check_say_everything_is_current_in_one_line() {
     }
 }
 
+// These byte pins protect redirected output as the terminal UI evolves. The
+// signed index and installed versions are fixed; no clock or path is masked.
+#[test]
+#[cfg(target_os = "linux")]
+fn upgrade_check_piped_pins() {
+    for (available, plain, verbose) in [
+        (
+            false,
+            include_str!("golden/piped/upgrade-check.txt"),
+            include_str!("golden/piped/upgrade-check.verbose.txt"),
+        ),
+        (
+            true,
+            include_str!("golden/piped/upgrade-check.available.txt"),
+            include_str!("golden/piped/upgrade-check.available.verbose.txt"),
+        ),
+    ] {
+        let fixture = UpgradeFixture::new("upgrade-check-pin");
+        let index = serve_signed_index(|base| {
+            upgrade_index(
+                base,
+                if available { "0.55.2" } else { "0.55.1" },
+                &if available { "aa" } else { "22" }.repeat(32),
+                "0.17.9",
+                &"44".repeat(32),
+                "0.8.0",
+                &"55".repeat(32),
+            )
+        });
+        for (args, pin) in [
+            (&["upgrade", "--check"][..], plain),
+            (&["upgrade", "--check", "--verbose"][..], verbose),
+        ] {
+            let output = fixture.command(&index, args).output().unwrap();
+            assert_piped_upgrade_pin(&output, pin);
+        }
+        assert_eq!(*index.requests.lock().unwrap(), ["/index.json"; 2]);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn assert_piped_upgrade_pin(output: &Output, pin: &str) {
+    let captured = format!(
+        "exit: {}\nstdout:\n{}stderr:\n{}",
+        output.status.code().expect("ck exited without a signal"),
+        text(&output.stdout),
+        text(&output.stderr),
+    );
+    assert_eq!(captured, pin);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn setup_unowned_piped_pin() {
+    let fixture = SetupFixture::fresh("setup-unowned-pin");
+    let binary = fixture.data_home.join("cortexkit/bin/ck-subc-mcp");
+    let bytes = "#!/bin/sh\necho 'ck-subc-mcp 0.17.8'\n";
+    write_executable(&binary, bytes);
+    let index = serve_signed_index(|base| setup_index(base, None));
+    let output = fixture.command(&index, &["setup"]).output().unwrap();
+    assert_piped_upgrade_pin(&output, include_str!("golden/piped/setup-unowned.txt"));
+    assert_eq!(fs::read(binary).unwrap(), bytes.as_bytes());
+    assert!(!fixture
+        .data_home
+        .join("cortexkit/installer-manifest.json")
+        .exists());
+    assert_eq!(*index.requests.lock().unwrap(), ["/index.json"]);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn upgrade_unowned_piped_pin() {
+    let fixture = UpgradeFixture::new("upgrade-unowned-pin");
+    let inventory = fixture
+        .home
+        .join(".local/share/cortexkit/installer-manifest.json");
+    fs::remove_file(&inventory).unwrap();
+    let binary = fixture.home.join(".local/share/cortexkit/bin/ck-aft");
+    let bytes = fs::read(&binary).unwrap();
+    let index = serve_signed_index(|base| {
+        upgrade_index(
+            base,
+            "0.55.2",
+            &"aa".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        )
+    });
+    for args in [&["upgrade"][..], &["upgrade", "--check"][..]] {
+        let output = fixture.command(&index, args).output().unwrap();
+        assert_piped_upgrade_pin(&output, include_str!("golden/piped/upgrade-unowned.txt"));
+    }
+    assert_eq!(fs::read(binary).unwrap(), bytes);
+    assert!(!inventory.exists());
+    assert_eq!(*index.requests.lock().unwrap(), ["/index.json"]);
+}
+
 fn core_release_index(base: &str, version: &str) -> (Value, BTreeMap<String, Vec<u8>>) {
     let (mut index, archives) = upgrade_index(
         base,

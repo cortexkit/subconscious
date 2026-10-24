@@ -20,6 +20,7 @@ mod self_update_unix;
 mod self_update_windows;
 #[cfg(all(test, unix))]
 mod test_exec;
+pub mod text;
 mod uninstall;
 mod update_cache;
 mod update_check;
@@ -29,18 +30,18 @@ mod upgrade_executor;
 mod upgrade_verification;
 mod validation;
 
-pub(crate) use apply::data_directory;
+pub use apply::data_directory;
 pub use apply::{
     default_claustrum_key_path, installed_service_facts, start_installed_service, SetupBackend,
 };
-pub(crate) use components::{component_binaries_for_target, module_program};
+pub use components::{component_binaries_for_target, module_program};
 pub use model::{
     version_transition, AlphaTarget, Component, ComponentState, PlanOutcome, PlatformObservation,
-    SetupObserved, SetupRequest, UpgradeState, UpgradeTarget,
+    SetupObserved, SetupRequest, UpgradeOperation, UpgradeState, UpgradeTarget,
 };
-pub use planner::{plan_setup, plan_upgrade, SetupPlan};
+pub use planner::{plan_setup, plan_upgrade, SetupPlan, UpgradePlan};
 #[cfg(windows)]
-pub(crate) use self_update::cleanup_replaced_windows_ck;
+pub use self_update::cleanup_replaced_windows_ck;
 pub use update_cache::{cache_directory, UpdateCache};
 pub use update_check::{
     check_update_metadata, dashboard_update, not_checked_from_cache, IndexReleaseSource,
@@ -56,4 +57,7 @@ pub use upgrade::{
 // import in the release binary.
 #[cfg(feature = "test-support")]
 pub use upgrade::upgraded_line;
-pub use upgrade_executor::execute_upgrade;
+pub use upgrade_executor::{
+    execute_upgrade, RollbackDecision, UpgradeEvidence, UpgradeExecutionBackend,
+    UpgradeExecutionFailure, UpgradeExecutionReport,
+};

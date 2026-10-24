@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.1
+
+- Version 0.32.0 was never published, because the main branch failed CI before release. This release carries every 0.32.0 change below, plus the daemon-disconnect fix.
+
 ## 0.32.0
 
 - **Breaking:** `SubcModuleError` is now non-exhaustive. Add a `_` arm anywhere an existing module matches it exhaustively. `serve` now sends a fixed, redacted correlated `internal` error and returns `SubcModuleError::HandlerPanic` on a request-handler panic, rather than silently losing the reply and continuing to serve. A terminal reply that cannot be queued also fails the connection.

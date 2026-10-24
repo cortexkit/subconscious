@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.20.133
+
+- The terminal app's update wizard asks the person whether to roll back a
+  component that failed after it was replaced, quoting the failing stage's
+  reason, instead of reading `CK_UPGRADE_ROLLBACK`. Inline and piped
+  `ck upgrade` still read `CK_UPGRADE_ROLLBACK` and decline by default.
+
 ## 0.20.132
 
 - `ck module list` and `ck module status` show failed modules' automatic recovery countdown as `failed, retrying in 9m` when the daemon supplies a next-retry time. Older daemons and failures without a scheduled retry keep their existing output on every OS.

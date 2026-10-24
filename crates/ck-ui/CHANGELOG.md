@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.7
+
+- When an upgrade run from Settings → Updates fails after replacing a
+  component, the wizard asks "<component> <new> failed its check:
+  <reason>." with "⏎ Roll back to <old>" and "esc Keep <new>". The run
+  waits for the answer on its own thread with no time limit, and the
+  section then says what happened; when a rollback ran, its account
+  follows as the engine gave it. `UpgradeService::run` takes an `ask` callback for this,
+  and `Request::Rollback` carries the answer.
+- While an upgrade runs, `q`, ctrl-c, `:`, ctrl-k, the tab keys, tab and
+  `l` are refused with "An update is running; ck can quit when it
+  finishes", and the daemon-down screen takes no keys. If the app goes away
+  before the question is answered, the run keeps the new version and says
+  "no answer; kept <new>".
+
 ## 0.2.6
 
 - Take subc-client-rs 0.32 with its module-serving lifecycle fixes. Consumer APIs used by the UI are unchanged.

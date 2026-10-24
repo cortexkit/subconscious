@@ -19,6 +19,8 @@ use subc_transport::connection_file;
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 
+use crate::upgrade::{Rollback, RollbackChoice, RollbackQuestion};
+
 use super::activity::{self, FeedEnd, LedgerFeed, LedgerSource};
 use super::map;
 use super::pairing::{self, CallFailure, WatchStream};
@@ -1240,7 +1242,26 @@ async fn handle_requests(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Re
             now,
         )
     };
-    while let Some(req) = rx.recv().await {
+    // Where a running upgrade's rollback question waits for its answer.
+    // The answer's sender lives only here, so when this loop ends (the app
+    // has gone) the sender is dropped and the run, which waits on the other
+    // end, goes on without an answer.
+    let (asks, mut asked) = mpsc::unbounded_channel::<std::sync::mpsc::Sender<RollbackChoice>>();
+    let mut answer: Option<std::sync::mpsc::Sender<RollbackChoice>> = None;
+    loop {
+        let req = tokio::select! {
+            // A question that is waiting is taken before any request, so an
+            // answer the person sends after seeing it finds it here.
+            biased;
+            Some(sender) = asked.recv() => {
+                answer = Some(sender);
+                continue;
+            }
+            req = rx.recv() => match req {
+                Some(req) => req,
+                None => break,
+            },
+        };
         match req {
             Request::Pairing(Command::ReadGroups) => {
                 tokio::spawn(read_groups(Arc::clone(&shared)));
@@ -1288,7 +1309,12 @@ async fn handle_requests(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Re
             Request::RescanPreview { ticket, candidate } => {
                 tokio::spawn(rescan_preview(Arc::clone(&shared), ticket, candidate));
             }
-            Request::Upgrade => start_upgrade(&shared),
+            Request::Upgrade => start_upgrade(&shared, &asks),
+            Request::Rollback(choice) => {
+                if let Some(sender) = answer.take() {
+                    let _ = sender.send(choice);
+                }
+            }
             Request::RescanApply {
                 revision,
                 expect,
@@ -1346,7 +1372,18 @@ async fn check_updates(shared: Arc<Shared>) {
 /// stages the check planned show as pending until the run's own plan
 /// arrives. The run is not tied to the daemon connection: it restarts the
 /// daemon, and its reports keep arriving while the live layer reconnects.
-fn start_upgrade(shared: &Arc<Shared>) {
+///
+/// The run has a blocking thread of its own. When it asks whether to roll
+/// a component back, the question goes on screen and the thread waits on a
+/// channel for the person's answer with no timeout: the keyboard lock keeps
+/// the app open while a run goes. If the request loop ends anyway (the app
+/// has gone), it drops the answer's sender and the run goes on without an
+/// answer. `asks` carries the answer's sender to the request loop, which
+/// sends the answer when the person gives it.
+fn start_upgrade(
+    shared: &Arc<Shared>,
+    asks: &mpsc::UnboundedSender<std::sync::mpsc::Sender<RollbackChoice>>,
+) {
     let Some(service) = shared.upgrade.clone() else {
         return;
     };
@@ -1367,16 +1404,21 @@ fn start_upgrade(shared: &Arc<Shared>) {
         return;
     }
     let shared = Arc::clone(shared);
+    let asks = asks.clone();
     tokio::spawn(async move {
         let reporter = Arc::clone(&shared);
+        let asker = Arc::clone(&shared);
         let outcome = tokio::task::spawn_blocking(move || {
-            service.run(&mut |event| {
-                reporter.update(|s| {
-                    if let Some(run) = &mut s.upgrade.run {
-                        run.record(event);
-                    }
-                })
-            })
+            service.run(
+                &mut |event| {
+                    reporter.update(|s| {
+                        if let Some(run) = &mut s.upgrade.run {
+                            run.record(event);
+                        }
+                    })
+                },
+                &mut |question| ask_rollback(&asker, &asks, question),
+            )
         })
         .await
         .unwrap_or_else(|e| crate::upgrade::UpgradeOutcome {
@@ -1390,6 +1432,42 @@ fn start_upgrade(shared: &Arc<Shared>) {
             }
         });
     });
+}
+
+/// Puts the run's rollback question on screen and waits, on the run's own
+/// thread, for the person's answer. The answer's sender goes to the request
+/// loop before the question shows, so an answer can't arrive ahead of it.
+/// `None` when nobody can answer: the request loop has ended or dropped
+/// the sender, which happens only when the app has gone.
+fn ask_rollback(
+    shared: &Shared,
+    asks: &mpsc::UnboundedSender<std::sync::mpsc::Sender<RollbackChoice>>,
+    question: RollbackQuestion,
+) -> Option<RollbackChoice> {
+    let (sender, answers) = std::sync::mpsc::channel();
+    let choice = if asks.send(sender).is_ok() {
+        let shown = question.clone();
+        shared.update(|s| {
+            if let Some(run) = &mut s.upgrade.run {
+                run.rollback = Some(Rollback {
+                    question: shown,
+                    answer: None,
+                });
+            }
+        });
+        answers.recv().ok()
+    } else {
+        None
+    };
+    shared.update(|s| {
+        if let Some(run) = &mut s.upgrade.run {
+            run.rollback = Some(Rollback {
+                question,
+                answer: Some(choice.into()),
+            });
+        }
+    });
+    choice
 }
 
 impl super::apply::Service for DaemonApply {

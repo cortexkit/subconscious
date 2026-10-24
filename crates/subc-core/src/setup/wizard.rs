@@ -14,8 +14,8 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use ck_ui::upgrade::{
-    PlanRow, StageEvent, StageRef, StageStatus, UpgradeCheck, UpgradeEvent, UpgradeOutcome,
-    UpgradeService,
+    PlanRow, RollbackChoice, RollbackQuestion, StageEvent, StageRef, StageStatus, UpgradeCheck,
+    UpgradeEvent, UpgradeOutcome, UpgradeService,
 };
 
 use super::model::{UpgradeObserved, UpgradeOperation, UpgradeState, UpgradeTarget};
@@ -127,7 +127,11 @@ impl UpgradeService for SetupUpgradeService {
         self.runtime.block_on(self.plan()).map(|(check, _)| check)
     }
 
-    fn run(&self, report: &mut dyn FnMut(UpgradeEvent)) -> UpgradeOutcome {
+    fn run(
+        &self,
+        report: &mut dyn FnMut(UpgradeEvent),
+        ask: &mut dyn FnMut(RollbackQuestion) -> Option<RollbackChoice>,
+    ) -> UpgradeOutcome {
         let stopped = |error: String| UpgradeOutcome {
             error: Some(error),
             ..UpgradeOutcome::default()
@@ -157,10 +161,12 @@ impl UpgradeService for SetupUpgradeService {
         };
         backend.set_supervised_modules(ready.observed.supervised_modules.clone());
         let mut versions = BTreeMap::new();
+        let mut previous = BTreeMap::new();
         for &target in &ready.observed.roster {
             if let UpgradeState::UpdateAvailable { from, to, .. } =
                 ready.observed.target_state(target)
             {
+                previous.insert(target.label(), from.clone());
                 backend.set_planned_from(target, from);
                 backend.set_expected_version(target, to.clone());
                 versions.insert(target.label(), to);
@@ -169,8 +175,11 @@ impl UpgradeService for SetupUpgradeService {
         let mut reporting = Reporting {
             inner: backend,
             report,
+            ask,
             daemon: daemon_target(&ready.plan),
             versions,
+            previous,
+            failure: None,
             installed: Vec::new(),
         };
         let result = super::execute_upgrade(&ready.plan, &mut reporting);
@@ -299,12 +308,25 @@ fn refusal_for(plan: &UpgradePlan, target: UpgradeTarget) -> Option<String> {
 /// engine calls it. The engine calls a stage's method when the stage starts
 /// and records the method's `Ok` or `Err` as its result, so a report from
 /// here is exactly what the engine's evidence records.
+///
+/// When the engine offers a rollback, the person decides through `ask`.
+/// The inner backend's own decision is never consulted: it reads
+/// `CK_UPGRADE_ROLLBACK`, which is how `ck upgrade` decides without a
+/// person, and the wizard has one.
 struct Reporting<'a, B> {
     inner: B,
     report: &'a mut dyn FnMut(UpgradeEvent),
+    ask: &'a mut dyn FnMut(RollbackQuestion) -> Option<RollbackChoice>,
     daemon: Option<UpgradeTarget>,
-    /// Each replaced target's new version, for the installed list.
+    /// Each replaced target's new version, for the installed list and the
+    /// rollback question.
     versions: BTreeMap<&'static str, String>,
+    /// Each replaced target's version before the run, which a rollback
+    /// restores.
+    previous: BTreeMap<&'static str, String>,
+    /// The reason the last failed stage gave, which the rollback question
+    /// that follows quotes.
+    failure: Option<String>,
     /// "<label> <version>" for each target the engine verified.
     installed: Vec<String>,
 }
@@ -329,6 +351,9 @@ impl<B> Reporting<'_, B> {
         };
         (self.report)(event(StageStatus::Started));
         let result = call(&mut self.inner);
+        if let Err(reason) = &result {
+            self.failure = Some(reason.clone());
+        }
         (self.report)(event(match &result {
             Ok(detail) => StageStatus::Ok(detail.clone()),
             Err(reason) => StageStatus::Failed(reason.clone()),
@@ -419,7 +444,19 @@ impl<B: UpgradeExecutionBackend> UpgradeExecutionBackend for Reporting<'_, B> {
     }
 
     fn rollback_decision(&mut self, target: UpgradeTarget) -> RollbackDecision {
-        self.inner.rollback_decision(target)
+        let label = target.label();
+        let question = RollbackQuestion {
+            component: label.to_string(),
+            old: self.previous.get(label).cloned().unwrap_or_default(),
+            new: self.versions.get(label).cloned().unwrap_or_default(),
+            reason: self.failure.take().unwrap_or_default(),
+        };
+        match (self.ask)(question) {
+            Some(RollbackChoice::RollBack) => RollbackDecision::Accepted,
+            // Without an answer the new version stays, as `ck upgrade`
+            // keeps it unless told to roll back.
+            Some(RollbackChoice::Keep) | None => RollbackDecision::Declined,
+        }
     }
 
     fn rollback(&mut self, target: UpgradeTarget) -> Result<String, String> {
@@ -435,7 +472,9 @@ mod tests {
     use crate::setup::planner::plan_upgrade;
 
     /// Answers every stage `Ok("<stage> done")`, except `fail`, which fails
-    /// with "<stage> broke"; accepts a rollback.
+    /// with "<stage> broke". Its own rollback decision must never be asked:
+    /// in `ck upgrade` that decision reads the environment, and the wizard
+    /// asks the person instead.
     struct Scripted {
         fail: Option<&'static str>,
         completed: Vec<&'static str>,
@@ -491,7 +530,7 @@ mod tests {
             self.completed.push(target.label());
         }
         fn rollback_decision(&mut self, _: UpgradeTarget) -> RollbackDecision {
-            RollbackDecision::Accepted
+            panic!("the wizard asked the backend, not the person, whether to roll back")
         }
         fn rollback(&mut self, _: UpgradeTarget) -> Result<String, String> {
             Ok("restored the previous binary".to_string())
@@ -518,12 +557,31 @@ mod tests {
         observed
     }
 
-    fn run(plan: &UpgradePlan, fail: Option<&'static str>) -> (Vec<StageEvent>, Vec<String>) {
+    /// What a scripted run reported: its stage events, what it installed,
+    /// and every rollback question it asked.
+    struct Ran {
+        events: Vec<StageEvent>,
+        installed: Vec<String>,
+        asked: Vec<RollbackQuestion>,
+    }
+
+    /// Runs `plan` against the scripted backend, failing the `fail` stage,
+    /// and answers any rollback question with `answer`.
+    fn run_answering(
+        plan: &UpgradePlan,
+        fail: Option<&'static str>,
+        answer: Option<RollbackChoice>,
+    ) -> Ran {
         let mut events = Vec::new();
         let mut report = |event| {
             if let UpgradeEvent::Stage(event) = event {
                 events.push(event);
             }
+        };
+        let mut asked = Vec::new();
+        let mut ask = |question| {
+            asked.push(question);
+            answer
         };
         let mut reporting = Reporting {
             inner: Scripted {
@@ -531,13 +589,25 @@ mod tests {
                 completed: Vec::new(),
             },
             report: &mut report,
+            ask: &mut ask,
             daemon: daemon_target(plan),
             versions: BTreeMap::from([("ck-subc", "2.0.0".to_string())]),
+            previous: BTreeMap::from([("ck-subc", "1.0.0".to_string())]),
+            failure: None,
             installed: Vec::new(),
         };
         let _ = super::super::execute_upgrade(plan, &mut reporting);
         let installed = reporting.installed;
-        (events, installed)
+        Ran {
+            events,
+            installed,
+            asked,
+        }
+    }
+
+    fn run(plan: &UpgradePlan, fail: Option<&'static str>) -> (Vec<StageEvent>, Vec<String>) {
+        let ran = run_answering(plan, fail, Some(RollbackChoice::RollBack));
+        (ran.events, ran.installed)
     }
 
     #[test]
@@ -591,6 +661,57 @@ mod tests {
             ]
         );
         assert!(installed.is_empty());
+    }
+
+    /// The daemon's check after its restart fails. The person is asked,
+    /// with the reason exactly as the stage gave it, and the engine does
+    /// what they answer: ⏎ rolls back, esc keeps the new version, and no
+    /// answer at all keeps it too.
+    #[test]
+    fn a_failed_check_asks_the_person_and_the_engine_does_what_they_answer() {
+        let plan = plan_upgrade(&observed());
+        let question = RollbackQuestion {
+            component: "ck-subc".into(),
+            old: "1.0.0".into(),
+            new: "2.0.0".into(),
+            reason: "post-verification broke".into(),
+        };
+        let rollback = |events: &[StageEvent]| {
+            events
+                .iter()
+                .filter(|e| e.stage == "rollback")
+                .map(|e| e.status.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let ran = run_answering(
+            &plan,
+            Some("post-verification"),
+            Some(RollbackChoice::RollBack),
+        );
+        assert_eq!(ran.asked, std::slice::from_ref(&question));
+        assert_eq!(
+            question.sentence(),
+            "ck-subc 2.0.0 failed its check: post-verification broke."
+        );
+        assert_eq!(
+            rollback(&ran.events),
+            [
+                StageStatus::Started,
+                StageStatus::Ok("restored the previous binary".into())
+            ]
+        );
+        assert!(ran.installed.is_empty());
+
+        for answer in [Some(RollbackChoice::Keep), None] {
+            let ran = run_answering(&plan, Some("post-verification"), answer);
+            assert_eq!(ran.asked, std::slice::from_ref(&question), "{answer:?}");
+            assert!(
+                rollback(&ran.events).is_empty(),
+                "{answer:?} rolled back: {:?}",
+                ran.events
+            );
+        }
     }
 
     #[test]

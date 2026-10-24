@@ -6,18 +6,22 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ck_ui::app::{App, Request, Tab};
+use ck_ui::app::{App, Request, Tab, UPGRADE_RUNNING};
 use ck_ui::live::schedule::Showing;
 use ck_ui::live::{self, LiveOptions, NoService};
 use ck_ui::model::{Daemon, DaemonRunning, Panel, Serves, Status};
+use ck_ui::screens::overlays::choice_width;
 use ck_ui::screens::upgrade::{confirmation, wrap_verbatim, DAEMON_RESTART};
 use ck_ui::time::Timestamp;
 use ck_ui::upgrade::{
-    stage_label, Checked, PlanRow, Run, StageEvent, StageRef, StageState, StageStatus, Updates,
-    UpgradeCheck, UpgradeEvent, UpgradeOutcome, UpgradeService,
+    stage_label, Checked, PlanRow, Rollback, RollbackAnswer, RollbackChoice, RollbackQuestion, Run,
+    StageEvent, StageRef, StageState, StageStatus, Updates, UpgradeCheck, UpgradeEvent,
+    UpgradeOutcome, UpgradeService,
 };
 use ck_ui::{Snapshot, Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{buffer::Buffer, layout::Rect};
 
 fn press(app: &mut App, snap: &Snapshot, code: KeyCode) -> bool {
@@ -323,13 +327,31 @@ fn an_ownership_refusal_says_updates_cant_be_checked_and_draws_no_table() {
 }
 
 /// A scripted setup engine: counts its checks, and runs by reporting the
-/// plan and the given events once the test opens its gate.
+/// plan and the given events once the test opens its gate. With a
+/// `question`, it then asks it and keeps the answer; answered "roll back",
+/// it reports a rollback stage that restored [`ROLLBACK_EVIDENCE`].
 struct Scripted {
     checks: AtomicUsize,
     plan: UpgradeCheck,
     events: Vec<UpgradeEvent>,
     outcome: UpgradeOutcome,
     gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    question: Option<RollbackQuestion>,
+    answers: Mutex<Vec<Option<RollbackChoice>>>,
+}
+
+impl Scripted {
+    fn new(plan: UpgradeCheck, events: Vec<UpgradeEvent>, outcome: UpgradeOutcome) -> Scripted {
+        Scripted {
+            checks: AtomicUsize::new(0),
+            plan,
+            events,
+            outcome,
+            gate: Mutex::new(None),
+            question: None,
+            answers: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl UpgradeService for Scripted {
@@ -338,13 +360,29 @@ impl UpgradeService for Scripted {
         Ok(self.plan.clone())
     }
 
-    fn run(&self, report: &mut dyn FnMut(UpgradeEvent)) -> UpgradeOutcome {
+    fn run(
+        &self,
+        report: &mut dyn FnMut(UpgradeEvent),
+        ask: &mut dyn FnMut(RollbackQuestion) -> Option<RollbackChoice>,
+    ) -> UpgradeOutcome {
         if let Some(gate) = self.gate.lock().unwrap().take() {
             let _ = gate.recv();
         }
         report(UpgradeEvent::Planned(self.plan.clone()));
         for event in &self.events {
             report(event.clone());
+        }
+        if let Some(question) = &self.question {
+            let answer = ask(question.clone());
+            self.answers.lock().unwrap().push(answer);
+            if answer == Some(RollbackChoice::RollBack) {
+                report(stage("ck-subc", "rollback", StageStatus::Started));
+                report(stage(
+                    "ck-subc",
+                    "rollback",
+                    StageStatus::Ok(ROLLBACK_EVIDENCE.into()),
+                ));
+            }
         }
         self.outcome.clone()
     }
@@ -395,13 +433,11 @@ fn updates_showing() -> Showing {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_check_runs_once_per_session_when_updates_first_shows() {
-    let service = Arc::new(Scripted {
-        checks: AtomicUsize::new(0),
-        plan: daemon_plan(),
-        events: Vec::new(),
-        outcome: UpgradeOutcome::default(),
-        gate: Mutex::new(None),
-    });
+    let service = Arc::new(Scripted::new(
+        daemon_plan(),
+        Vec::new(),
+        UpgradeOutcome::default(),
+    ));
     let mut live = start(Arc::clone(&service));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
@@ -432,28 +468,29 @@ async fn every_planned_stage_is_pending_before_the_run_and_a_failure_reads_verba
     let reason = "ck-subc: new process has stale version 0.36.17 (expected 0.36.18)";
     let (open, gate) = std::sync::mpsc::channel();
     let service = Arc::new(Scripted {
-        checks: AtomicUsize::new(0),
-        plan: daemon_plan(),
-        events: vec![
-            stage("ck-subc", "download-and-verify", StageStatus::Started),
-            stage(
-                "ck-subc",
-                "download-and-verify",
-                StageStatus::Ok("archive verified".into()),
-            ),
-            stage("ck-subc", "rollback-copy", StageStatus::Started),
-            stage(
-                "ck-subc",
-                "rollback-copy",
-                StageStatus::Failed(reason.into()),
-            ),
-        ],
-        outcome: UpgradeOutcome {
-            installed: Vec::new(),
-            error: Some(format!("refusal: ck-subc rollback-copy failed: {reason}")),
-            warnings: Vec::new(),
-        },
         gate: Mutex::new(Some(gate)),
+        ..Scripted::new(
+            daemon_plan(),
+            vec![
+                stage("ck-subc", "download-and-verify", StageStatus::Started),
+                stage(
+                    "ck-subc",
+                    "download-and-verify",
+                    StageStatus::Ok("archive verified".into()),
+                ),
+                stage("ck-subc", "rollback-copy", StageStatus::Started),
+                stage(
+                    "ck-subc",
+                    "rollback-copy",
+                    StageStatus::Failed(reason.into()),
+                ),
+            ],
+            UpgradeOutcome {
+                installed: Vec::new(),
+                error: Some(format!("refusal: ck-subc rollback-copy failed: {reason}")),
+                warnings: Vec::new(),
+            },
+        )
     });
     let mut live = start(Arc::clone(&service));
     live.requests
@@ -662,5 +699,374 @@ fn the_section_draws_at_every_size_and_says_how_many_stages_are_hidden() {
             text.contains(&stage_label(&plan.stages[0].target, &plan.stages[0].stage)),
             "{w}x{h} lost the running stage:\n{text}"
         );
+    }
+}
+
+/// What the scripted rollback stage reports it restored.
+const ROLLBACK_EVIDENCE: &str =
+    "restored ~/.local/share/cortexkit/bin/ck-subc from ~/.local/share/cortexkit/bin/.ck-subc.rollback-1";
+
+/// Why the daemon's check after its restart failed, as the engine words it.
+const STALE: &str = "ck-subc: new process has stale version 0.36.17 (expected 0.36.18)";
+
+/// A run of [`daemon_plan`] whose daemon passes every stage up to its check
+/// after the restart, fails that check with [`STALE`], and asks whether to
+/// roll back.
+fn failing_check() -> Scripted {
+    let mut events = Vec::new();
+    for s in daemon_plan()
+        .stages
+        .iter()
+        .filter(|s| s.target == "ck-subc")
+    {
+        events.push(stage(&s.target, &s.stage, StageStatus::Started));
+        events.push(stage(
+            &s.target,
+            &s.stage,
+            if s.stage == "post-verification" {
+                StageStatus::Failed(STALE.into())
+            } else {
+                StageStatus::Ok("done".into())
+            },
+        ));
+    }
+    Scripted {
+        question: Some(RollbackQuestion {
+            component: "ck-subc".into(),
+            old: "0.36.17".into(),
+            new: "0.36.18".into(),
+            reason: STALE.into(),
+        }),
+        ..Scripted::new(
+            daemon_plan(),
+            events,
+            UpgradeOutcome {
+                installed: Vec::new(),
+                error: Some(format!(
+                    "refusal: ck-subc post-verification failed: {STALE}"
+                )),
+                warnings: Vec::new(),
+            },
+        )
+    }
+}
+
+/// Starts a live session on Settings → Updates and confirms the upgrade.
+async fn confirmed(service: &Arc<Scripted>) -> live::Live {
+    let mut live = start(Arc::clone(service));
+    live.requests
+        .send(Request::Show(updates_showing()))
+        .unwrap();
+    until(&mut live.snapshots, |s| s.upgrade.check.is_some()).await;
+    live.requests.send(Request::Upgrade).unwrap();
+    live
+}
+
+fn updates_app() -> App {
+    let mut app = App::new(Theme::test());
+    app.tab = Tab::Settings;
+    app.settings.section = 2;
+    app
+}
+
+/// `snap` with the daemon running and the fixture's modules, so the
+/// Updates section draws instead of the daemon-down screen.
+fn daemon_up(snap: &Snapshot) -> Snapshot {
+    let mut shown = snap.clone();
+    shown.daemon = Panel::new(
+        Snapshot::fixture_now(),
+        Daemon::Running(DaemonRunning {
+            version: "0.36.17".into(),
+            started_at: None,
+            clients: None,
+        }),
+    );
+    shown.modules = Snapshot::fixture().modules;
+    shown
+}
+
+fn send_requests(app: &mut App, live: &live::Live) {
+    for request in app.requests.drain(..) {
+        live.requests.send(request).unwrap();
+    }
+}
+
+/// The daemon fails its check after the restart. The wizard asks the
+/// question with the reason as the engine gave it, and the run waits for
+/// the person however long they take. ⏎ rolls back and esc keeps the new
+/// version, and the section says which happened, with the rollback's own
+/// account shown as it was given.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_check_asks_whether_to_roll_back_and_waits_for_the_person() {
+    for (key, choice) in [
+        (KeyCode::Enter, RollbackChoice::RollBack),
+        (KeyCode::Esc, RollbackChoice::Keep),
+    ] {
+        let service = Arc::new(failing_check());
+        let mut live = confirmed(&service).await;
+        let snap = until(&mut live.snapshots, |s| s.upgrade.question().is_some()).await;
+        let mut app = updates_app();
+        let text = screen(&render(&app, &daemon_up(&snap)));
+        let question = service.question.clone().unwrap();
+        assert_eq!(
+            question.sentence(),
+            format!("ck-subc 0.36.18 failed its check: {STALE}.")
+        );
+        for line in wrap_verbatim(&question.sentence(), choice_width(120)) {
+            assert!(text.contains(line.trim_end()), "{line:?} missing:\n{text}");
+        }
+        assert!(text.contains("⏎  Roll back to 0.36.17"), "{text}");
+        assert!(text.contains("esc  Keep 0.36.18"), "{text}");
+
+        // Nobody has answered, so the run is still waiting, with no time
+        // limit on the person.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            service.answers.lock().unwrap().is_empty(),
+            "the run was answered without the person: {:?}",
+            service.answers.lock().unwrap()
+        );
+        assert!(live.snapshots.borrow().upgrade.running());
+
+        assert!(press(&mut app, &snap, key));
+        assert_eq!(app.requests, vec![Request::Rollback(choice)]);
+        send_requests(&mut app, &live);
+        let snap = until(&mut live.snapshots, |s| {
+            s.upgrade.run.as_ref().is_some_and(Run::finished)
+        })
+        .await;
+        assert_eq!(*service.answers.lock().unwrap(), vec![Some(choice)]);
+        let run = snap.upgrade.run.clone().unwrap();
+        let text = screen(&render(&app, &daemon_up(&snap)));
+        assert!(!text.contains("failed its check"), "{text}");
+        match choice {
+            RollbackChoice::RollBack => {
+                assert_eq!(run.rollback.unwrap().answer, Some(RollbackAnswer::RollBack));
+                assert!(text.contains("✓ ck-subc rolling back"), "{text}");
+                assert!(text.contains("ck-subc: rolled back to 0.36.17."), "{text}");
+                for line in wrap_verbatim(ROLLBACK_EVIDENCE, 92 - 2) {
+                    assert!(text.contains(line.trim_end()), "{line:?} missing:\n{text}");
+                }
+            }
+            RollbackChoice::Keep => {
+                assert_eq!(run.rollback.unwrap().answer, Some(RollbackAnswer::Keep));
+                assert!(text.contains("ck-subc: kept 0.36.18."), "{text}");
+                assert!(!text.contains("rolling back"), "{text}");
+            }
+        }
+    }
+}
+
+/// While the run goes, the keys that would quit or leave the wizard are
+/// refused with a reason, and the run finishes. Once it has, `q` quits.
+#[tokio::test(flavor = "multi_thread")]
+async fn q_and_ctrl_c_mid_run_are_refused_and_the_engine_finishes() {
+    let (open, gate) = std::sync::mpsc::channel();
+    let service = Arc::new(Scripted {
+        gate: Mutex::new(Some(gate)),
+        ..Scripted::new(
+            daemon_plan(),
+            Vec::new(),
+            UpgradeOutcome {
+                installed: vec!["ck-subc 0.36.18".into(), "ck 0.20.110".into()],
+                error: None,
+                warnings: Vec::new(),
+            },
+        )
+    });
+    let mut live = confirmed(&service).await;
+    let snap = until(&mut live.snapshots, |s| s.upgrade.running()).await;
+    let mut app = updates_app();
+    let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+    for key in [
+        KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        ctrl('c'),
+        KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+        ctrl('k'),
+        KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char('7'), KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+    ] {
+        app.refused = None;
+        assert!(app.handle_key(key, &snap), "{key:?} drew nothing");
+        assert!(!app.quit, "{key:?} quit mid-run");
+        assert_eq!(app.refused, Some(UPGRADE_RUNNING), "{key:?}");
+        assert_eq!(
+            (app.tab, app.settings.section),
+            (Tab::Settings, 2),
+            "{key:?}"
+        );
+        assert!(app.overlay.is_none(), "{key:?} opened {:?}", app.overlay);
+        assert!(app.requests.is_empty(), "{key:?} sent {:?}", app.requests);
+    }
+    let rows = render(&app, &daemon_up(&snap));
+    assert!(rows[35].contains(UPGRADE_RUNNING), "{}", rows[35]);
+
+    open.send(()).unwrap();
+    let snap = until(&mut live.snapshots, |s| {
+        s.upgrade.run.as_ref().is_some_and(Run::finished)
+    })
+    .await;
+    assert!(!app.quit);
+    assert!(press(&mut app, &daemon_up(&snap), KeyCode::Char('q')));
+    assert!(app.quit, "q quits once the run has finished");
+}
+
+/// The daemon is down when the question opens (the run restarted it). The
+/// daemon-down screen takes no keys, so ⏎ answers the question and starts
+/// no daemon.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_the_daemon_down_enter_answers_the_question_and_starts_no_daemon() {
+    let service = Arc::new(failing_check());
+    let mut live = confirmed(&service).await;
+    let snap = until(&mut live.snapshots, |s| s.upgrade.question().is_some()).await;
+    let mut down = snap.clone();
+    down.daemon = Snapshot::fixture_daemon_down().daemon;
+    assert!(matches!(down.daemon.data, Daemon::Down(_)));
+    let mut app = updates_app();
+    let text = screen(&render(&app, &down));
+    assert!(text.contains("⏎  Roll back to 0.36.17"), "{text}");
+    assert!(press(&mut app, &down, KeyCode::Enter));
+    assert_eq!(
+        app.requests,
+        vec![Request::Rollback(RollbackChoice::RollBack)],
+        "⏎ must answer the question, not start the daemon"
+    );
+    send_requests(&mut app, &live);
+    until(&mut live.snapshots, |s| {
+        s.upgrade.run.as_ref().is_some_and(Run::finished)
+    })
+    .await;
+    assert_eq!(
+        *service.answers.lock().unwrap(),
+        vec![Some(RollbackChoice::RollBack)]
+    );
+}
+
+/// The app goes away with the question open: the answer's channel is
+/// dropped, and the run keeps the new version and says nobody answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_answer_channel_keeps_the_new_version() {
+    let service = Arc::new(failing_check());
+    let live = confirmed(&service).await;
+    let live::Live {
+        mut snapshots,
+        requests,
+        ..
+    } = live;
+    until(&mut snapshots, |s| s.upgrade.question().is_some()).await;
+    drop(requests);
+    let snap = until(&mut snapshots, |s| {
+        s.upgrade.run.as_ref().is_some_and(Run::finished)
+    })
+    .await;
+    assert_eq!(*service.answers.lock().unwrap(), vec![None]);
+    let run = snap.upgrade.run.clone().unwrap();
+    assert_eq!(run.rollback.unwrap().answer, Some(RollbackAnswer::NoAnswer));
+    let text = screen(&render(&updates_app(), &daemon_up(&snap)));
+    assert!(text.contains("no answer; kept 0.36.18"), "{text}");
+    assert!(!text.contains("rolling back"), "{text}");
+}
+
+/// The column where `word` starts on row `y` of a drawn frame, matched cell
+/// by cell, so wide characters elsewhere on the row don't shift it.
+fn cell_of(app: &App, snap: &Snapshot, y: u16, word: &str) -> Option<u16> {
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 36));
+    app.render(&mut buffer, snap, Snapshot::fixture_now());
+    let cells: Vec<String> = word.chars().map(String::from).collect();
+    let w = buffer.area.width;
+    (0..w).find(|&x| {
+        cells.iter().enumerate().all(|(i, ch)| {
+            let cx = x + i as u16;
+            cx < w && buffer[(cx, y)].symbol() == ch
+        })
+    })
+}
+
+/// While a run goes, the mouse can't leave the wizard either: a click on
+/// another tab, on the footer, or on the question's buttons changes
+/// nothing, sends nothing and asks for no redraw, whether or not the
+/// rollback question is open.
+#[test]
+fn clicks_change_nothing_while_an_upgrade_runs() {
+    let plan = daemon_plan();
+    let mut going = Run::new(Snapshot::fixture_now().add_secs(-5.0), &plan.stages);
+    going.record(stage(
+        "ck-subc",
+        "download-and-verify",
+        StageStatus::Started,
+    ));
+    let question = RollbackQuestion {
+        component: "ck-subc".into(),
+        old: "0.36.17".into(),
+        new: "0.36.18".into(),
+        reason: STALE.into(),
+    };
+    for open in [false, true] {
+        let mut run = going.clone();
+        if open {
+            run.rollback = Some(Rollback {
+                question: question.clone(),
+                answer: None,
+            });
+        }
+        let mut updates = checked(Ok(plan.clone()));
+        updates.run = Some(run);
+        let (mut app, snap) = updates_session(updates);
+        assert!(snap.upgrade.running());
+        assert_eq!(snap.upgrade.question().is_some(), open);
+        let before = render(&app, &snap);
+        let footer = before.len() as u16 - 1;
+
+        let mut targets = Vec::new();
+        for tab in ["Home", "Modules", "Activity", "Devices"] {
+            let x = cell_of(&app, &snap, 0, tab)
+                .unwrap_or_else(|| panic!("no {tab} tab in the bar: {}", before[0]));
+            targets.push((tab, x, 0));
+        }
+        let x = cell_of(&app, &snap, footer, "Upgrading")
+            .unwrap_or_else(|| panic!("no footer text: {}", before[footer as usize]));
+        targets.push(("the footer", x, footer));
+        if open {
+            let y = (0..footer)
+                .find(|&y| cell_of(&app, &snap, y, "Roll back to").is_some())
+                .expect("the question's buttons are drawn");
+            for button in ["Roll back to", "Keep 0.36.18"] {
+                let x = cell_of(&app, &snap, y, button).expect(button);
+                targets.push((button, x, y));
+            }
+        }
+
+        for (what, x, y) in targets {
+            let click = Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(
+                !app.handle_event(&click, &snap, (120, 36)),
+                "a click on {what} at ({x}, {y}) asked for a redraw (question open: {open})"
+            );
+            assert_eq!(
+                (app.tab, app.settings.section),
+                (Tab::Settings, 2),
+                "a click on {what} left Settings → Updates (question open: {open})"
+            );
+            assert!(
+                app.requests.is_empty(),
+                "a click on {what} sent {:?}",
+                app.requests
+            );
+            assert!(app.overlay.is_none(), "a click on {what} opened an overlay");
+            assert_eq!(snap.upgrade.question().is_some(), open);
+            assert_eq!(
+                render(&app, &snap),
+                before,
+                "a click on {what} changed the frame (question open: {open})"
+            );
+        }
     }
 }

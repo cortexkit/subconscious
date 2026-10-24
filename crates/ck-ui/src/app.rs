@@ -85,6 +85,9 @@ pub enum Request {
     /// Run the upgrade Settings → Updates planned, after the person
     /// confirmed it.
     Upgrade,
+    /// The person's answer to the rollback question the running upgrade is
+    /// waiting on.
+    Rollback(crate::upgrade::RollbackChoice),
 }
 
 /// A question waiting for an answer before an action is sent.
@@ -156,6 +159,9 @@ pub struct App {
     pub requests: Vec<Request>,
     /// The upgrade confirmation is open over Settings → Updates.
     pub upgrade_confirm: bool,
+    /// Why the last key was refused while an upgrade runs, shown on the
+    /// bottom line until the run ends.
+    pub refused: Option<&'static str>,
 }
 
 impl App {
@@ -189,6 +195,7 @@ impl App {
             redact: false,
             requests: Vec::new(),
             upgrade_confirm: false,
+            refused: None,
         }
     }
 
@@ -338,6 +345,16 @@ impl App {
         }
         self.draw_quit_question(&mut c);
         screens::result_toast(&mut c, &v);
+        if snap.upgrade.running() {
+            if let Some(reason) = self.refused {
+                c.fill(0, c.h - 1, c.w, 1, ' ', crate::theme::St::NONE);
+                c.put(2, c.h - 1, reason, crate::theme::St::W);
+            }
+        }
+        if let Some(question) = snap.upgrade.question() {
+            screens::upgrade::rollback_question(&mut c, question);
+            return;
+        }
         if let Some(q) = &self.confirm {
             let title = match q.kind {
                 ActionKind::Restart => format!("Restart {}?", q.module),
@@ -396,6 +413,10 @@ impl App {
         }
         self.follow_roster(snap);
         self.settings.observe(&snap.settings);
+        if snap.upgrade.running() {
+            return self.upgrade_running_key(key, snap);
+        }
+        self.refused = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             self.request_quit();
@@ -859,6 +880,39 @@ impl App {
         true
     }
 
+    /// Keys while an upgrade runs. A run can't stop half way, and quitting
+    /// would leave nobody to answer its rollback question, so the wizard
+    /// owns the keyboard: ⏎ and esc answer that question when it is open,
+    /// the keys that would quit or leave the wizard are refused with a
+    /// reason on the bottom line, and every other key does nothing. That
+    /// holds on the daemon-down screen too, so ⏎ never starts a daemon the
+    /// upgrade is restarting.
+    fn upgrade_running_key(&mut self, key: KeyEvent, snap: &Snapshot) -> bool {
+        use crate::upgrade::RollbackChoice;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if snap.upgrade.question().is_some() && !ctrl {
+            let choice = match key.code {
+                KeyCode::Enter => Some(RollbackChoice::RollBack),
+                KeyCode::Esc => Some(RollbackChoice::Keep),
+                _ => None,
+            };
+            if let Some(choice) = choice {
+                self.requests.push(Request::Rollback(choice));
+                return true;
+            }
+        }
+        let leaves = match key.code {
+            KeyCode::Char('c' | 'k') if ctrl => true,
+            KeyCode::Char('q' | ':' | 'l') | KeyCode::Tab | KeyCode::BackTab => true,
+            KeyCode::Char(ch) => Tab::from_key(ch).is_some(),
+            _ => false,
+        };
+        if leaves {
+            self.refused = Some(UPGRADE_RUNNING);
+        }
+        leaves
+    }
+
     /// Keys for the log view. `None` lets the key fall through to the
     /// app-wide keys (tabs, palette, help, quit).
     fn log_key(&mut self, key: KeyEvent, snap: &Snapshot) -> Option<bool> {
@@ -1308,6 +1362,7 @@ impl App {
         self.follow_roster(snap);
         if self.overlay.is_some()
             || self.confirm.is_some()
+            || snap.upgrade.running()
             || matches!(snap.daemon.data, Daemon::Down(_))
         {
             return false;
@@ -1369,6 +1424,10 @@ impl App {
 /// the daemon is still down: long enough for the live layer, which looks for
 /// the daemon every two seconds, to reconnect to the one the run restarted.
 const UPGRADE_RECONNECT_GRACE_SECS: f64 = 10.0;
+
+/// The bottom line when a key that would quit or leave the wizard is
+/// pressed while an upgrade runs.
+pub const UPGRADE_RUNNING: &str = "An update is running; ck can quit when it finishes";
 
 /// Whether Settings → Updates keeps the screen while the daemon is down:
 /// its run is going (an upgrade restarts the daemon on purpose), or it ended

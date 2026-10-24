@@ -9,7 +9,10 @@ use super::View;
 use crate::draw::{frame_end, trunc, width, Canvas};
 use crate::model::{Daemon, Serves, Status};
 use crate::theme::{Bg, Fg, St};
-use crate::upgrade::{stage_label, PlanRow, Run, StageState, StageView, UpgradeCheck};
+use crate::upgrade::{
+    stage_label, PlanRow, RollbackAnswer, RollbackQuestion, Run, StageState, StageView,
+    UpgradeCheck,
+};
 
 /// The sentence that says what replacing the daemon does. It shows, and the
 /// confirmation names it, only when the plan replaces the daemon.
@@ -266,6 +269,20 @@ pub fn draw(c: &mut Canvas, v: &View, x: i32) {
     frame_end(c, &hints, status, St::D);
 }
 
+/// The question a running upgrade asks when a component it replaced fails:
+/// the failure as the engine gave it, "⏎ Roll back to <old>" (focused)
+/// and "esc Keep <new>".
+pub fn rollback_question(c: &mut Canvas, question: &RollbackQuestion) {
+    let lines = wrap_verbatim(&question.sentence(), super::overlays::choice_width(c.w));
+    super::overlays::choice(
+        c,
+        &format!("Roll back {}?", question.component),
+        &lines,
+        &format!("Roll back to {}", question.old),
+        &format!("Keep {}", question.new),
+    );
+}
+
 /// The lines after a run's stages: a failed stage's reason, then what the
 /// run installed and how many modules are healthy.
 fn outcome_lines<'a>(lines: &mut Vec<Line<'a>>, v: &View, run: &'a Run, w: usize) {
@@ -278,6 +295,7 @@ fn outcome_lines<'a>(lines: &mut Vec<Line<'a>>, v: &View, run: &'a Run, w: usize
             lines.push(Line::Text(format!("  {l}"), St::E));
         }
     }
+    rollback_lines(lines, run, w);
     let Some((at, outcome)) = &run.outcome else {
         return;
     };
@@ -321,6 +339,57 @@ fn outcome_lines<'a>(lines: &mut Vec<Line<'a>>, v: &View, run: &'a Run, w: usize
     for warning in &outcome.warnings {
         for l in wrap_verbatim(warning, w) {
             lines.push(Line::Text(l, St::W));
+        }
+    }
+}
+
+/// What became of the run's rollback question once answered: rolled back,
+/// kept, or kept because nobody could answer. When a rollback stage ran,
+/// its own account (what it restored, or why it couldn't) follows, exactly
+/// as the engine gave it.
+fn rollback_lines(lines: &mut Vec<Line>, run: &Run, w: usize) {
+    let Some(rollback) = &run.rollback else {
+        return;
+    };
+    let Some(answer) = rollback.answer else {
+        return;
+    };
+    let q = &rollback.question;
+    let stage = run
+        .stages
+        .iter()
+        .rev()
+        .find(|s| s.stage == "rollback" && s.target == q.component)
+        .map(|s| &s.state);
+    let (said, st) = match (answer, stage) {
+        (RollbackAnswer::RollBack, Some(StageState::Done(_))) => {
+            (format!("{}: rolled back to {}.", q.component, q.old), St::B)
+        }
+        (RollbackAnswer::RollBack, Some(StageState::Failed(_))) => (
+            format!("{}: couldn't roll back to {}.", q.component, q.old),
+            St::E,
+        ),
+        (RollbackAnswer::RollBack, _) => (
+            format!("{}: rolling back to {}…", q.component, q.old),
+            St::D,
+        ),
+        (RollbackAnswer::Keep, _) => (format!("{}: kept {}.", q.component, q.new), St::B),
+        (RollbackAnswer::NoAnswer, _) => (
+            format!("{}: no answer; kept {}.", q.component, q.new),
+            St::W,
+        ),
+    };
+    for l in wrap_verbatim(&said, w) {
+        lines.push(Line::Text(l, st));
+    }
+    let evidence = match stage {
+        Some(StageState::Done(detail)) => Some((detail, St::D)),
+        Some(StageState::Failed(reason)) => Some((reason, St::E)),
+        _ => None,
+    };
+    if let Some((text, st)) = evidence {
+        for l in wrap_verbatim(text, w.saturating_sub(2)) {
+            lines.push(Line::Text(format!("  {l}"), st));
         }
     }
 }

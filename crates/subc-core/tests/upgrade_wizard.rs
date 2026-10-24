@@ -116,7 +116,9 @@ fn the_wizard_refuses_with_the_text_ck_upgrade_check_prints() {
 
         // Running refuses the same way and changes nothing.
         let mut events = Vec::new();
-        let outcome = service.run(&mut |event| events.push(event));
+        let outcome = service.run(&mut |event| events.push(event), &mut |question| {
+            panic!("a refused upgrade asks no rollback question: {question:?}")
+        });
         assert_eq!(events, vec![UpgradeEvent::Planned(check)]);
         assert_eq!(outcome.error.as_deref(), Some(refusal.as_str()));
         assert!(outcome.installed.is_empty());

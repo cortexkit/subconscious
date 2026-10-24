@@ -239,10 +239,25 @@ pub fn help(c: &mut Canvas, serves: Serves, visible: TabSet) {
 /// A question asked once before an action that is hard to undo: what will
 /// happen, then the key that does it and the key that doesn't.
 pub fn confirm(c: &mut Canvas, title: &str, body: &[String], yes: &str) {
+    let inner = choice_width(c.w);
+    let lines: Vec<String> = body.iter().flat_map(|l| wrap(l, inner)).collect();
+    choice(c, title, &lines, yes, "Cancel");
+}
+
+/// The columns a [`choice`] box gives each body line in a window of `w`
+/// columns.
+pub fn choice_width(w: i32) -> usize {
+    (64.min(w - 4) - 8).max(0) as usize
+}
+
+/// A box over the dimmed screen: `title`, the body `lines` as given (each
+/// at most [`choice_width`] columns), then "⏎ <yes>", focused, and
+/// "esc <no>". Lines that don't fit the window are left out from the
+/// bottom.
+pub fn choice(c: &mut Canvas, title: &str, lines: &[String], yes: &str, no: &str) {
     c.dim_all();
     let wd = 64.min(c.w - 4);
-    let inner = (wd - 8).max(0) as usize;
-    let lines: Vec<String> = body.iter().flat_map(|l| wrap(l, inner)).collect();
+    let lines = &lines[..lines.len().min((c.h - 9).max(1) as usize)];
     let hd = lines.len() as i32 + 7;
     let x = ((c.w - wd) / 2).max(0);
     let y = ((c.h - hd) / 2).max(1);
@@ -253,7 +268,7 @@ pub fn confirm(c: &mut Canvas, title: &str, body: &[String], yes: &str) {
     let by = y + hd - 3;
     let yes = format!(" ⏎  {yes} ");
     let end = c.put(x + 4, by, &yes, St::fg(Fg::OnAcc).on(Bg::Acc).bold());
-    c.put(end + 2, by, " esc  Cancel ", St::bg(Bg::Key));
+    c.put(end + 2, by, &format!(" esc  {no} "), St::bg(Bg::Key));
 }
 
 /// Splits `text` into lines of at most `n` columns at spaces; a word longer

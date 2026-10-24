@@ -3,6 +3,7 @@
 ## 0.1.19
 
 - Run Unix launch-nonce descriptor-sensitive tests in separate processes so parallel tests opening files, sockets or pidfds cannot change their descriptor-number assumptions. Production handoff behavior is unchanged.
+- Check cross-process resource usage against a child's retained, touched private memory rather than assuming a sleeping executable uses less memory than the test process. Require the caller's usage to stay below the child's lower bound, so a regression that reads the caller's usage for the child fails the test.
 
 ## 0.1.18
 

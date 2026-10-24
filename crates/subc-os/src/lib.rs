@@ -438,7 +438,8 @@ impl Process {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use std::{
-        process::{Child, Command},
+        io::Read,
+        process::{Child, Command, Stdio},
         time::{Duration, Instant},
     };
 
@@ -627,20 +628,77 @@ mod tests {
 
     #[test]
     fn a_child_reads_its_own_usage_not_ours() {
-        let mut child = spawn_sleep();
-        let process = Process::open(child.id()).unwrap().unwrap();
-        wait_for_executable(&process, sleep_identity());
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        // An unrelated executable's RSS need not be smaller than ours. Give
+        // the child a known amount of touched private memory instead, with a
+        // margin above the caller's footprint even while other tests run.
         let ours = resource_usage(std::process::id()).unwrap();
-        let usage = resource_usage(child.id()).expect("live child is readable");
-        assert!(usage.memory_bytes > 0);
-        assert!(
-            usage.memory_bytes < ours.memory_bytes,
-            "a sleeping child ({} bytes) should be smaller than the test binary ({} bytes)",
-            usage.memory_bytes,
-            ours.memory_bytes
+        let bytes = usize::try_from(ours.memory_bytes)
+            .unwrap()
+            .checked_add(64 * 1024 * 1024)
+            .unwrap();
+        let scratch = cortexkit_test_support::ScratchDir::new("subc-os-resource-usage");
+        let ready = scratch.join("ready");
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "tests::resource_usage_child",
+                    "--exact",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("SUBC_OS_TEST_RESOURCE_BYTES", bytes.to_string())
+                .env("SUBC_OS_TEST_RESOURCE_READY", &ready)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
         );
-        child.kill().unwrap();
-        child.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(child.0.try_wait().unwrap().is_none(), "memory child exited");
+            assert!(Instant::now() < deadline, "memory child never became ready");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let ours = resource_usage(std::process::id()).unwrap();
+        let usage = resource_usage(child.0.id()).expect("live child is readable");
+        // The caller cannot meet the child's lower bound. Reading our own
+        // usage for both pids must therefore fail, not satisfy the test.
+        assert!(
+            ours.memory_bytes < bytes as u64,
+            "caller uses {} bytes, overlapping the child's {bytes} touched bytes",
+            ours.memory_bytes,
+        );
+        assert!(
+            usage.memory_bytes >= bytes as u64,
+            "child uses {} bytes, fewer than its {bytes} touched bytes (caller uses {})",
+            usage.memory_bytes,
+            ours.memory_bytes,
+        );
+    }
+
+    #[test]
+    #[ignore = "re-exec fixture retaining touched private memory until its parent closes stdin"]
+    fn resource_usage_child() {
+        let bytes: usize = std::env::var("SUBC_OS_TEST_RESOURCE_BYTES")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let ready = std::env::var_os("SUBC_OS_TEST_RESOURCE_READY").unwrap();
+        let pages = vec![0xa5u8; bytes];
+        std::hint::black_box(&pages);
+        std::fs::write(ready, b"ready").unwrap();
+        let _ = std::io::stdin().read(&mut [0]);
+        std::hint::black_box(&pages);
     }
 
     #[test]

@@ -71,15 +71,31 @@ mod unix_tests {
     };
     use super::NONCE;
 
-    // These tests open, close and duplicate descriptors by number, and a
-    // number one test frees can be reused by another at once. They take this
-    // lock so no two of them run together.
-    static RAW_FD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Descriptor numbers belong to the process, not the test thread. A lock
+    // here cannot exclude unrelated tests opening files, sockets or pidfds.
+    // Run each descriptor-sensitive test alone in a fresh process instead.
+    fn in_isolated_process() -> bool {
+        const CASE_ENV: &str = "SUBC_OS_TEST_ISOLATED_FD_CASE";
+        let thread = std::thread::current();
+        let name = thread.name().expect("libtest names each test thread");
+        if std::env::var(CASE_ENV).as_deref() == Ok(name) {
+            return true;
+        }
 
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
-        RAW_FD_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([name, "--exact", "--nocapture", "--test-threads=1"])
+            .env(CASE_ENV, name)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated test {name} failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        false
     }
 
     fn fd_is_open(fd: RawFd) -> bool {
@@ -133,7 +149,9 @@ mod unix_tests {
 
     #[test]
     fn two_readers_share_one_descriptor_read() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         let (read_end, inode) = sealed_pipe(NONCE.as_bytes());
         let fd = read_end.into_raw_fd();
         let cell = Arc::new(LaunchNonceCell::new());
@@ -206,7 +224,9 @@ mod unix_tests {
 
     #[test]
     fn a_closed_descriptor_is_not_open_and_never_falls_back() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         // A number far above anything this test binary opens.
         let fd: RawFd = 900;
         assert!(!fd_is_open(fd));
@@ -219,7 +239,9 @@ mod unix_tests {
 
     #[test]
     fn a_descriptor_that_is_not_a_pipe_is_left_open() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         // Held as a raw number until the checks pass: had the accessor closed
         // it, dropping an owner would close it twice and abort the test binary
         // instead of failing this test by name.
@@ -239,7 +261,9 @@ mod unix_tests {
 
     #[test]
     fn a_different_pipe_at_the_number_is_left_unread() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         let (_ours, expected) = sealed_pipe(NONCE.as_bytes());
         let (theirs, found) = sealed_pipe(b"someone else's");
         assert_ne!(expected, found, "pipes need distinct inodes for this test");
@@ -267,7 +291,9 @@ mod unix_tests {
 
     #[test]
     fn an_empty_pipe_is_its_own_error_and_is_left_open() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         let (empty, inode) = sealed_pipe(b"");
         // Raw until checked, for the reason given in the non-pipe test.
         let fd = empty.into_raw_fd();
@@ -283,7 +309,9 @@ mod unix_tests {
 
     #[test]
     fn the_named_pipe_is_read_and_closed() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         let (ours, inode) = sealed_pipe(NONCE.as_bytes());
         let fd = ours.into_raw_fd();
         let got = LaunchNonceCell::new()
@@ -296,7 +324,9 @@ mod unix_tests {
 
     #[test]
     fn malformed_values_are_refused() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         for value in ["", "3", "x:1", "-1:5", "3:", "3:x", ":5"] {
             let got = LaunchNonceCell::new().get(naming(value.to_string()));
             assert!(
@@ -339,7 +369,9 @@ mod unix_tests {
 
     #[test]
     fn the_pre_exec_step_does_not_allocate() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         // Run the step in this process onto a free high number, then on the
         // already-in-place path and on the error path.
         let moved = LaunchNonceHandoff::new(NONCE).unwrap().with_target(250);
@@ -385,7 +417,9 @@ mod unix_tests {
 
     #[test]
     fn a_new_handoff_is_close_on_exec_in_the_parent() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         let handoff = LaunchNonceHandoff::new(NONCE).unwrap();
         // SAFETY: F_GETFD reads flags.
         #[allow(unsafe_code)]
@@ -544,7 +578,9 @@ mod unix_tests {
 
     #[test]
     fn a_spawned_child_reads_the_nonce_from_descriptor_3_and_leaves_the_environment_alone() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         let scratch = Scratch::new("fd-child");
         let out = scratch.0.join("report");
         let mut command = probe_command(&out, "module");
@@ -561,7 +597,9 @@ mod unix_tests {
 
     #[test]
     fn handoff_survives_each_closed_standard_descriptor() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         let scratch = Scratch::new("closed-stdio");
         for fd in 0..=2 {
             let out = scratch.0.join(format!("report-{fd}"));
@@ -576,7 +614,9 @@ mod unix_tests {
 
     #[test]
     fn a_spawned_child_without_a_descriptor_reads_the_environment_copy() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         let scratch = Scratch::new("env-child");
         let out = scratch.0.join("report");
         let mut command = probe_command(&out, "module");
@@ -589,7 +629,9 @@ mod unix_tests {
 
     #[test]
     fn a_grandchild_spawned_after_the_first_read_gets_no_descriptor_and_refuses_by_name() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         let scratch = Scratch::new("grandchild");
         let out = scratch.0.join("report");
         let mut command = probe_command(&out, "module-with-grandchild");
@@ -611,12 +653,15 @@ mod unix_tests {
 
     #[test]
     fn the_handoff_installed_after_an_earlier_step_survives_a_colliding_descriptor_3() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         let scratch = Scratch::new("collision");
         let out = scratch.0.join("report");
         let marker_path = scratch.0.join("marker");
         let marker = File::create(&marker_path).unwrap();
         let marker_fd = marker.as_raw_fd();
+        assert_eq!(marker_fd, 3, "the earlier step must capture descriptor 3");
         let mut command = probe_command(&out, "cat-fd:3");
         // Stands in for the Linux cgroup placement: an earlier step that
         // writes through a descriptor it captured, which here has number 3.
@@ -645,7 +690,9 @@ mod unix_tests {
 
     #[test]
     fn a_read_end_already_at_the_target_number_still_reaches_the_child() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         let scratch = Scratch::new("in-place");
         let out = scratch.0.join("report");
         let handoff = LaunchNonceHandoff::new(NONCE).unwrap();
@@ -660,7 +707,9 @@ mod unix_tests {
 
     #[test]
     fn the_accessor_leaves_this_process_environment_alone() {
-        let _serial = serial();
+        if !in_isolated_process() {
+            return;
+        }
         let before: Vec<_> = std::env::vars_os().collect();
         let (ours, inode) = sealed_pipe(NONCE.as_bytes());
         let fd = ours.into_raw_fd();

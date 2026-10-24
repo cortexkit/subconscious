@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.19
+
+- Run Unix launch-nonce descriptor-sensitive tests in separate processes so parallel tests opening files, sockets or pidfds cannot change their descriptor-number assumptions. Production handoff behavior is unchanged.
+
 ## 0.1.18
 
 - Add the `host` module: total and available memory (`host::memory`), the 1, 5 and 15 minute load averages (`host::load_average`, `None` on Windows) and the total and free space of the filesystem holding a path (`host::disk_space`), for macOS, Linux and Windows. Each returns `None` when the value can't be read, never zeros.

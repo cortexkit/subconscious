@@ -4456,6 +4456,7 @@ pub(crate) fn validate_spec(spec: &ModuleSpec) -> Result<(), SuperviseError> {
 
 #[derive(Debug, Default)]
 struct HealthProbeRuntime {
+    spawn_generation: Option<u64>,
     configured_health: Option<HealthConfig>,
     registered_connection: Option<crate::ConnectionId>,
     advertised: bool,
@@ -4478,6 +4479,18 @@ impl HealthProbeRuntime {
         registry: &Registry,
         snapshot: &SharedSnapshot,
     ) {
+        let generation = lock_snapshot(snapshot)
+            .ok()
+            .map(|state| state.spawn_generation);
+        if self.spawn_generation != generation {
+            // A replacement cannot reuse a deadline that is already due for its
+            // predecessor. HTTP children get a full cadence to start; wire
+            // children still wait for their own health-advertising HELLO.
+            *self = Self {
+                spawn_generation: generation,
+                ..Self::default()
+            };
+        }
         if self.configured_health.as_ref() != Some(&runtime.health) {
             self.configured_health = Some(runtime.health.clone());
             self.next_probe_at = None;
@@ -6208,6 +6221,177 @@ mod tests {
         .expect("sustained HTTP 503 responses must trigger the health restart policy");
         module.drain().await.unwrap();
         server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_replacement_recovers_after_one_restart() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = cortexkit_test_support::ScratchDir::new("http-replacement-recovers");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/healthz", listener.local_addr().unwrap());
+        let mut configured = http_fixture(&dir, &url, 2);
+        configured.restart.max_restarts = 2;
+        let module =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .supervise_configured_with_health(
+                    configured.module_spec(),
+                    true,
+                    configured.health,
+                    configured.drain_timeout_ms,
+                    configured.restart,
+                )
+                .unwrap();
+        let first_generation = module.status().unwrap().spawn_generation;
+        let observed = module.clone();
+        let (healthy_tx, mut healthy_rx) = mpsc::channel(8);
+        let server = tokio::spawn(async move {
+            let mut generation = first_generation;
+            let mut probes = 0;
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                let current = observed.status().unwrap().spawn_generation;
+                if current != generation {
+                    generation = current;
+                    probes = 0;
+                }
+                probes += 1;
+                // The original process never recovers. Each replacement has one
+                // transient miss, then answers successfully for its remaining life.
+                let healthy = generation != first_generation && probes > 1;
+                let code = if healthy { 200 } else { 503 };
+                let response = format!(
+                    "HTTP/1.1 {code} scratch\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                if healthy {
+                    healthy_tx.send(()).await.unwrap();
+                }
+            }
+        });
+        timeout(Duration::from_secs(5), async {
+            let mut healthy_probes = 0;
+            loop {
+                if module.state().unwrap() == ModuleState::Failed {
+                    break;
+                }
+                while healthy_rx.try_recv().is_ok() {
+                    healthy_probes += 1;
+                }
+                if healthy_probes >= 3
+                    && module.status().unwrap().health.status == SupervisorHealthStatus::Ok
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the replacement must settle healthy without exhausting its restart budget");
+        let status = module.status().unwrap();
+        module.drain().await.unwrap();
+        server.abort();
+        assert_eq!(status.state, ModuleState::Running);
+        assert_eq!(status.health.status, SupervisorHealthStatus::Ok);
+        assert_eq!(status.health.consecutive_failures, 0);
+        assert_eq!(status.lifetime_restarts, 1);
+        assert_eq!(status.restart_count, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_health_sustained_failure_exhausts_restart_budget() {
+        use std::collections::BTreeMap;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = cortexkit_test_support::ScratchDir::new("http-health-budget");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/healthz", listener.local_addr().unwrap());
+        let mut configured = http_fixture(&dir, &url, 2);
+        configured.restart.max_restarts = 2;
+        let module =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .supervise_configured_with_health(
+                    configured.module_spec(),
+                    true,
+                    configured.health,
+                    configured.drain_timeout_ms,
+                    configured.restart,
+                )
+                .unwrap();
+        let observed = module.clone();
+        let probes = Arc::new(Mutex::new(BTreeMap::<u64, u32>::new()));
+        let served = probes.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                *served
+                    .lock()
+                    .unwrap()
+                    .entry(observed.status().unwrap().spawn_generation)
+                    .or_default() += 1;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        timeout(Duration::from_secs(5), async {
+            while module.state().unwrap() != ModuleState::Failed {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("sustained failures must still exhaust the health restart budget");
+        let status = module.status().unwrap();
+        server.abort();
+        assert_eq!(status.restart_count, 2);
+        assert_eq!(status.lifetime_restarts, 2);
+        assert!(!status.process_alive);
+        assert_eq!(
+            probes.lock().unwrap().values().copied().collect::<Vec<_>>(),
+            vec![2, 2, 2]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_clears_the_previous_process_health() {
+        let dir = cortexkit_test_support::ScratchDir::new("spawn-fresh-health");
+        let mut configured = http_fixture(&dir, "http://127.0.0.1:1/healthz", 2);
+        configured.health.cadence = Duration::from_secs(3600);
+        let module =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                .supervise_configured_with_health(
+                    configured.module_spec(),
+                    false,
+                    configured.health,
+                    configured.drain_timeout_ms,
+                    configured.restart,
+                )
+                .unwrap();
+        update_snapshot(&module.inner.snapshot, Some(module.module_id()), |state| {
+            state.health.status = SupervisorHealthStatus::Unresponsive;
+            state.health.consecutive_failures = 3;
+            state.health.detail = Some("old process refused connections".into());
+            state.health.metrics = Some(serde_json::json!({"old": true}));
+            state.health.last_probe_ms = Some(123);
+            state.health.last_action = Some("restart".into());
+            state.health.last_action_ms = Some(124);
+        })
+        .unwrap();
+        module.set_enabled(true).await.unwrap();
+        let health = module.status().unwrap().health;
+        module.drain().await.unwrap();
+        assert_eq!(health.consecutive_failures, 0);
+        assert_eq!(health.status, SupervisorHealthStatus::Unknown);
+        assert_eq!(health.detail, None);
+        assert_eq!(health.metrics, None);
+        assert_eq!(health.last_probe_ms, None);
+        assert_eq!(health.last_action.as_deref(), Some("restart"));
+        assert_eq!(health.last_action_ms, Some(124));
     }
 
     #[cfg(unix)]
@@ -11199,6 +11383,13 @@ fn set_running(
     state.enabled = true;
     state.process_alive = true;
     state.pid = child.id();
+    // Probe samples belong to one process. Keep module-level escalation and
+    // late-answer history, but never charge a new child for its predecessor's misses.
+    state.health.status = SupervisorHealthStatus::Unknown;
+    state.health.consecutive_failures = 0;
+    state.health.detail = None;
+    state.health.metrics = None;
+    state.health.last_probe_ms = None;
     #[cfg(windows)]
     {
         state.pipe_consumed = child
@@ -13932,6 +14123,75 @@ mod health_event_tests {
         assert_eq!(rearmed.next_probe_at, Some(hello_tick + delay));
         tokio::time::advance(delay).await;
         actor.probe().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn http_probe_waits_a_full_cadence_for_each_spawn() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let mut actor = Actor::start(ModuleProtocol::None, Duration::from_secs(30)).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        actor.health.http = Some(format!("http://{}/healthz", listener.local_addr().unwrap()));
+        let (started_tx, mut started_rx) = mpsc::channel(8);
+        let peer = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                started_tx.send(Instant::now()).await.unwrap();
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        actor
+            .module
+            .update_configuration(actor.spec.clone(), actor.health.clone(), None)
+            .await
+            .unwrap();
+        let first_tick = Instant::now();
+        let first = actor
+            .wait_for_select(|checkpoint| checkpoint.next_probe_at.is_some())
+            .await;
+        assert!(first.next_probe_at.unwrap() >= first_tick + actor.health.cadence);
+        assert!(started_rx.try_recv().is_err());
+
+        // Restart just before the old deadline: reusing it would give the new
+        // process only one second to start, rather than a full cadence.
+        tokio::time::advance(
+            first.next_probe_at.unwrap() - Instant::now() - Duration::from_secs(1),
+        )
+        .await;
+        actor.module.restart(Some(0)).await.unwrap();
+        let spawn_tick = Instant::now();
+        let replacement = actor
+            .wait_for_select(|checkpoint| checkpoint.generation > first.generation)
+            .await;
+        let deadline = replacement.next_probe_at.unwrap();
+        assert!(
+            deadline >= spawn_tick + actor.health.cadence,
+            "a replacement must not inherit its predecessor's probe deadline"
+        );
+        tokio::time::advance(actor.health.cadence - Duration::from_nanos(1)).await;
+        assert!(
+            started_rx.try_recv().is_err(),
+            "no HTTP probe during startup grace"
+        );
+        tokio::time::advance(deadline - Instant::now()).await;
+        let landed = wait_for("first replacement HTTP probe", || {
+            started_rx.try_recv().ok()
+        })
+        .await;
+        assert!(landed >= spawn_tick + actor.health.cadence);
+        wait_for("healthy replacement", || {
+            (actor.module.status().unwrap().health.status == SupervisorHealthStatus::Ok)
+                .then_some(())
+        })
+        .await;
+        peer.abort();
     }
 
     #[tokio::test(start_paused = true)]

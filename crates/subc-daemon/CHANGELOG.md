@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.2
+
+- Reset process-local health samples and consecutive failures on every accepted spawn, including restarts, starts after failure, and promoted swap candidates. HTTP-only children now get a fresh full probe cadence (plus the existing jitter) to start instead of inheriting an overdue probe from their predecessor. Wire children still wait for HELLO. Health-triggered restarts keep spending the same restart budget; sustained failures still end in `failed`. Escalation history and restart ledgers remain available across replacements.
+
 ## 0.37.1
 
 - The `route.open refused` log line now names who asked, so a refusal can be attributed without matching connection ids, which restart with the daemon and belong to different modules before and after a restart. It gains `principal=` (the attested principal as on the `route.open accepted` line: `direct`, `reserved:<module>`, or `unattested` when a consumer identity's launch nonce did not verify; the claimed module id is never printed as a principal), `scope=` (`none`; the admitted stamp's label as on the accepted line once scope admission issued one; before that `requested/"<owner>"/"<ref>"@<epoch>`), and `harness=` (quoted). Every caller-chosen string is escaped and cut to 64 characters, so a refusal cannot forge a log line. Bodies, bind proofs and scope attributes are never logged. The launch nonce is now checked once at the start of a `route.open` instead of just before principal enforcement; which check refuses an open, and with which code, is unchanged.

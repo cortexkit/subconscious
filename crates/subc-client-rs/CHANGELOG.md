@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.4
+
+- Treat a daemon reset after a validated HELLO_ACK as a connection end even if the module's `on_hello_ack` callback is still pending. Serving returns `Ok` and calls `on_connection_end(Reset)` once, instead of sometimes returning a raw frame I/O error. Disconnects before a valid HELLO_ACK remain registration errors. Reader and writer paths now share the reset/abort/broken-pipe classifier; a late flush disconnect after EOF, GOODBYE or a module stop still preserves the first connection-end reason. Frame I/O errors no longer repeat the `frame I/O error:` prefix. No API change.
+
 ## 0.32.3
 
 - A module that ends its own daemon connection now closes it in order, so the daemon reads the module's GOODBYE and then a clean EOF instead of a connection reset. Before, the module dropped its socket while frames the daemon had sent after the stop were still unread, and closing a TCP socket with unread data makes the OS send a reset. On Windows the daemon's read then failed with `ConnectionReset` (10054) before it saw GOODBYE; Linux passed only by timing. After the last frame is flushed, serving now shuts down the socket's sending side and keeps reading and discarding until the daemon closes, bounded by the existing writer drain budget, so a daemon that never closes cannot hold a stop past that budget. This applies to a `ModuleStopHandle` stop (during or after the handshake), an internal close and a module-side error. When the daemon ended the connection (EOF, GOODBYE or a reset), nothing is drained. A test stand-in daemon that keeps its end open after the module closes now holds `serve` until the drain budget; close the stand-in's end, as a real daemon does, to end it at once. No API change.

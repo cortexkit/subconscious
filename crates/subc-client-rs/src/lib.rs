@@ -2145,20 +2145,29 @@ where
     let mut writer = tokio::spawn(drain_writer(write_half, rx));
     let handler = Arc::new(handler);
 
+    let mut hello_ack = None;
     let handshake = async {
         send_hello(&tx, manifest).await?;
-        let ack = expect_hello_ack(&mut read_half).await?;
-        handler.on_hello_ack(&ack).await;
-        Ok::<_, SubcModuleError>(ack)
+        // A validated ACK means the daemon accepted the module, even while the
+        // module's callback is pending. Keep that boundary when the writer wins.
+        hello_ack = Some(expect_hello_ack(&mut read_half).await?);
+        handler
+            .on_hello_ack(hello_ack.as_ref().expect("validated HELLO_ACK"))
+            .await;
+        Ok::<_, SubcModuleError>(())
     };
-    let ack = tokio::select! {
+    let mut writer_result = None;
+    let handshake_result = tokio::select! {
         biased;
         () = options.stop_handle.token.cancelled() => None,
-        ack = handshake => Some(ack),
-        result = &mut writer => return Err(writer_ended(result)),
+        result = handshake => Some(result),
+        result = &mut writer => {
+            writer_result = Some(result);
+            Some(Ok(()))
+        }
     };
-    let ack = match ack {
-        Some(Ok(ack)) => ack,
+    match handshake_result {
+        Some(Ok(())) => {}
         other => {
             let result = match other {
                 None => {
@@ -2186,12 +2195,25 @@ where
             let _ = finish_writer_and_drain(writer, &mut read_half, deadline).await;
             return Err(result);
         }
+    }
+    let ack = match hello_ack {
+        Some(ack) => ack,
+        None => {
+            return Err(writer_ended(
+                writer_result.expect("writer ended before HELLO_ACK"),
+            ))
+        }
     };
+    // The callback can be cancelled by a writer failure, but a failure after
+    // acceptance belongs to the serving lifecycle, including its teardown hook.
+    let writer_end = writer_result.map(writer_connection_end);
 
     let Some(connection_token) = checked_increment(&NEXT_MODULE_CONNECTION_TOKEN) else {
         drop(tx);
         let deadline = Instant::now() + options.writer_drain_timeout;
-        let _ = finish_writer_and_drain(writer, &mut read_half, deadline).await;
+        if writer_end.is_none() {
+            let _ = finish_writer_and_drain(writer, &mut read_half, deadline).await;
+        }
         return Err(SubcModuleError::ConnectionTokenExhausted);
     };
     let close_token = CancellationToken::new();
@@ -2209,6 +2231,7 @@ where
         handle.clone(),
         writer,
         options,
+        writer_end,
     );
     Ok(Some((handle, serve_future)))
 }
@@ -2234,6 +2257,7 @@ where
         handle,
         writer,
         ServeOptions::default(),
+        None,
     )
 }
 
@@ -2244,6 +2268,7 @@ fn connection_serve_future_with_options<R, H>(
     handle: ModuleHandle,
     mut writer: tokio::task::JoinHandle<Result<(), WriterFailure>>,
     options: ServeOptions,
+    writer_end: Option<Result<ConnectionEnd, SubcModuleError>>,
 ) -> ModuleServeFuture
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -2259,13 +2284,17 @@ where
         // reconnect task or in-flight reconnect gate; a supervisor that needs
         // recovery starts a fresh serve_with_handle invocation.
         let dispatcher = RequestDispatcher::with_pools(serve_handle.dispatch_pools());
-        let mut writer_finished = false;
-        let mut loop_result = tokio::select! {
-            biased;
-            result = module_loop(&mut read_half, &tx, Arc::clone(&handler), serve_handle.clone(), &dispatcher, &options.stop_handle) => result,
-            result = &mut writer => {
-                writer_finished = true;
-                writer_connection_end(result)
+        let mut writer_finished = writer_end.is_some();
+        let mut loop_result = if let Some(end) = writer_end {
+            end
+        } else {
+            tokio::select! {
+                biased;
+                result = module_loop(&mut read_half, &tx, Arc::clone(&handler), serve_handle.clone(), &dispatcher, &options.stop_handle) => result,
+                result = &mut writer => {
+                    writer_finished = true;
+                    writer_connection_end(result)
+                }
             }
         };
         // A failed terminal enqueue can win the select just before the writer
@@ -2414,12 +2443,7 @@ where
             Ok(None) => return Ok(ConnectionEnd::Eof),
             // A killed daemon can close with FIN on Unix and RST on Windows.
             // Both end serving and run the same connection-end teardown hook.
-            Err(FrameIoError::Io(error))
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
-                ) =>
-            {
+            Err(FrameIoError::Io(error)) if is_disconnect(&error) => {
                 return Ok(ConnectionEnd::Reset);
             }
             Err(err) => return Err(SubcModuleError::FrameIo(err)),
@@ -3406,7 +3430,7 @@ impl fmt::Display for SubcModuleError {
                 "failed to authenticate to subc endpoint {endpoint} from '{}': {source}",
                 path.display()
             ),
-            Self::FrameIo(err) => write!(f, "frame I/O error: {err}"),
+            Self::FrameIo(err) => fmt::Display::fmt(err, f),
             Self::FrameBuild(err) => write!(f, "frame build error: {err}"),
             Self::Json(err) => write!(f, "JSON error: {err}"),
             Self::WriterClosed => write!(f, "module writer task closed"),

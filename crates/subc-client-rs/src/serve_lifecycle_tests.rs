@@ -65,6 +65,7 @@ where
         handle.clone(),
         tokio::spawn(drain_writer(writer, rx)),
         options,
+        None,
     );
     (handle, tokio::spawn(future))
 }
@@ -620,10 +621,11 @@ async fn idle_eof_is_ok() {
 }
 
 #[tokio::test]
-async fn read_reset_and_abort_end_the_connection_as_reset() {
+async fn read_disconnects_end_the_connection_as_reset() {
     for kind in [
         io::ErrorKind::ConnectionReset,
         io::ErrorKind::ConnectionAborted,
+        io::ErrorKind::BrokenPipe,
     ] {
         let recorder = EndRecorder::default();
         let (handle, serve) = start(
@@ -755,6 +757,204 @@ async fn disconnect_before_hello_ack_remains_an_error_without_an_end_hook() {
         );
         assert!(recorder.0.lock().unwrap().is_empty());
     }
+}
+
+#[test]
+fn disconnect_classifier_covers_reset_abort_and_broken_pipe_only() {
+    for (kind, expected) in [
+        (io::ErrorKind::ConnectionReset, true),
+        (io::ErrorKind::ConnectionAborted, true),
+        (io::ErrorKind::BrokenPipe, true),
+        (io::ErrorKind::ConnectionRefused, false),
+        (io::ErrorKind::NotConnected, false),
+        (io::ErrorKind::TimedOut, false),
+        (io::ErrorKind::WouldBlock, false),
+        (io::ErrorKind::Interrupted, false),
+        (io::ErrorKind::UnexpectedEof, false),
+        (io::ErrorKind::InvalidData, false),
+        (io::ErrorKind::PermissionDenied, false),
+        (io::ErrorKind::Other, false),
+    ] {
+        assert_eq!(is_disconnect(&io::Error::from(kind)), expected, "{kind:?}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_disconnect_codes_use_the_same_classifier() {
+    for code in [10054, 10053, 109, 232] {
+        let error = io::Error::from_raw_os_error(code);
+        assert!(is_disconnect(&error), "{error:?}");
+    }
+}
+
+#[test]
+fn frame_io_display_has_one_context_prefix_and_preserves_its_source() {
+    let error = SubcModuleError::FrameIo(FrameIoError::Io(io::Error::new(
+        io::ErrorKind::ConnectionReset,
+        "daemon reset",
+    )));
+    assert_eq!(error.to_string(), "frame I/O error: daemon reset");
+    let source = error.source().unwrap();
+    assert!(source.is::<FrameIoError>());
+    assert!(source.source().unwrap().is::<io::Error>());
+}
+
+struct PendingAck {
+    entered: Arc<Notify>,
+    recorder: EndRecorder,
+}
+
+#[async_trait]
+impl ModuleHandler for PendingAck {
+    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        HandlerOutcome::Response(body)
+    }
+
+    async fn on_hello_ack(&self, _ack: &ModuleHelloAckBody) {
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+
+    async fn on_connection_end(&self, end: ConnectionEnd) {
+        self.recorder.on_connection_end(end).await;
+    }
+}
+
+// TCP flush normally completes before the ACK callback can run. Hold HELLO's
+// flush open until the daemon has reset, then make a real socket write expose
+// the reset. Only scheduling is controlled; the error comes from the OS.
+struct AckRaceStream {
+    stream: TcpStream,
+    reset: tokio::sync::oneshot::Receiver<()>,
+    reset_seen: bool,
+    write_error: Arc<Mutex<Option<io::ErrorKind>>>,
+}
+
+impl AsyncRead for AckRaceStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for AckRaceStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if !self.reset_seen {
+            std::task::ready!(Pin::new(&mut self.reset).poll(cx))
+                .expect("daemon must close before releasing the writer");
+            self.reset_seen = true;
+        }
+        // A write may beat delivery of the RST. Retry without blocking the
+        // executor until the socket exposes the daemon's abortive close.
+        for _ in 0..16 {
+            if let Err(error) =
+                std::task::ready!(Pin::new(&mut self.stream).poll_write(cx, b"probe"))
+            {
+                *self.write_error.lock().unwrap() = Some(error.kind());
+                return Poll::Ready(Err(error));
+            }
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn zero_linger_reset_during_ack_callback_ends_once_as_reset() {
+    timeout(Duration::from_secs(5), async {
+        for _ in 0..8 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut daemon, _) = listener.accept().await.unwrap();
+            let (reset_tx, reset) = tokio::sync::oneshot::channel();
+            let entered = Arc::new(Notify::new());
+            let recorder = EndRecorder::default();
+            let write_error = Arc::new(Mutex::new(None));
+            let registration = tokio::spawn(register_connection(
+                AckRaceStream {
+                    stream,
+                    reset,
+                    reset_seen: false,
+                    write_error: Arc::clone(&write_error),
+                },
+                ModuleManifest::builder("test", "0.1.0").build(),
+                PendingAck {
+                    entered: Arc::clone(&entered),
+                    recorder: recorder.clone(),
+                },
+                ServeOptions::default(),
+            ));
+            assert_eq!(
+                read_frame(&mut daemon).await.unwrap().unwrap().header.ty,
+                FrameType::Hello
+            );
+            let ack_frame = Frame::build(
+                FrameType::HelloAck,
+                control_flags(),
+                0,
+                0,
+                HELLO_CORR,
+                serde_json::to_vec(&ack()).unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut daemon, &ack_frame).await.unwrap();
+            entered.notified().await;
+            socket2::SockRef::from(&daemon)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+            drop(daemon);
+            reset_tx.send(()).unwrap();
+            let (handle, serve) = registration.await.unwrap().unwrap().unwrap();
+            assert!(matches!(
+                *write_error.lock().unwrap(),
+                Some(
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                )
+            ));
+            serve.await.unwrap();
+            assert!(handle.is_closed());
+            assert_eq!(*recorder.0.lock().unwrap(), [ConnectionEnd::Reset]);
+        }
+    })
+    .await
+    .expect("reset must cancel the pending ACK callback and end serving");
+}
+
+#[tokio::test]
+async fn late_flush_reset_after_goodbye_preserves_goodbye_and_one_end_hook() {
+    let goodbye = Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 0, Vec::new()).unwrap();
+    let mut bytes = Vec::new();
+    write_frame(&mut bytes, &goodbye).await.unwrap();
+    let recorder = EndRecorder::default();
+    let (handle, serve) = start(
+        std::io::Cursor::new(bytes),
+        FlushError(io::ErrorKind::ConnectionReset),
+        recorder.clone(),
+        ServeOptions::default(),
+    );
+    serve.await.unwrap().unwrap();
+    assert!(handle.is_closed());
+    assert_eq!(*recorder.0.lock().unwrap(), [ConnectionEnd::Goodbye]);
 }
 
 #[tokio::test]

@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 /// Context supplied to an injected dial factory for one candidate attempt.
 public struct FedDialAttemptContext: Sendable {
@@ -105,6 +106,11 @@ public actor SubcFedClient {
     private var activeSession: FedDialedSession?
     private var establishingSession: FedDialedSession?
     private var receiveTask: Task<Void, Never>?
+    private var timerTask: Task<Void, Never>?
+    private var sessionLossLogger: @Sendable (String) -> Void = { cause in
+        Logger(subsystem: "io.cortexkit.subcfed", category: "session")
+            .error("Session lost: \(cause, privacy: .public)")
+    }
     private var pendingCalls: [UInt64: PendingCall] = [:]
     private var subscriptions: [UInt64: SubscriptionRecord] = [:]
     private var subscriptionGeneration = UUID()
@@ -201,6 +207,7 @@ public actor SubcFedClient {
         subscriptionWriter?.cancel()
         reconnectTask?.cancel()
         receiveTask?.cancel()
+        timerTask?.cancel()
     }
 
     public var state: FedConnectionState { connectionState }
@@ -599,7 +606,7 @@ public actor SubcFedClient {
                 }
             } catch {
                 guard generation == subscriptionGeneration, isCurrentSession(session) else { return }
-                await handleSessionLoss(error)
+                await handleSessionLoss(error, context: "subscription write")
                 return
             }
         }
@@ -902,6 +909,7 @@ public actor SubcFedClient {
                 peerAdvertisedFeatures = await dialed.engine.peerAdvertisedFeatures
                 peerMachineID = await dialed.engine.peerMachineID
                 startReceiveLoop(session: dialed)
+                startTimerLoop(session: dialed)
                 planner.resetBackoff()
                 publish(.ready(sessionID: await dialed.engine.sessionID))
                 activatePendingProfileIfNeeded()
@@ -980,6 +988,34 @@ public actor SubcFedClient {
 
     // MARK: - Receive / calls
 
+    private func startTimerLoop(session: FedDialedSession) {
+        timerTask?.cancel()
+        let clock = self.clock
+        timerTask = Task { [weak self] in
+            do {
+                try Task.checkCancellation()
+                await session.engine.setTimerDeadlineChanged { [weak self] in
+                    Task { await self?.restartTimerLoopIfCurrent(session: session) }
+                }
+                while !Task.isCancelled, let deadline = await session.engine.nextTimerDeadline() {
+                    try await clock.sleep(untilNanoseconds: deadline)
+                    try Task.checkCancellation()
+                    guard await self?.isCurrentSession(session) == true else { return }
+                    _ = try await session.engine.pollTimers()
+                }
+            } catch {
+                let cause = await session.engine.timerFailureCause
+                guard !Task.isCancelled, let self, await self.isCurrentSession(session) else { return }
+                await self.handleSessionLoss(error, context: cause ?? "session timer")
+            }
+        }
+    }
+
+    private func restartTimerLoopIfCurrent(session: FedDialedSession) {
+        guard isCurrentSession(session) else { return }
+        startTimerLoop(session: session)
+    }
+
     private func startReceiveLoop(session: FedDialedSession) {
         receiveTask?.cancel()
         receiveTask = Task { [weak self] in
@@ -993,8 +1029,9 @@ public actor SubcFedClient {
                     let frames = try await session.engine.processInboundBytes(chunk)
                     try await self.handleInboundFrames(frames, session: session, receivedAtNs: receivedAtNs)
                 } catch {
+                    let cause = await session.engine.timerFailureCause
                     guard await self.isCurrentSession(session) else { return }
-                    await self.handleSessionLoss(error)
+                    await self.handleSessionLoss(error, context: cause ?? "receive")
                     return
                 }
             }
@@ -1097,7 +1134,25 @@ public actor SubcFedClient {
         }
     }
 
-    private func handleSessionLoss(_ error: Error) async {
+    func setSessionLossLogger(_ logger: @escaping @Sendable (String) -> Void) {
+        sessionLossLogger = logger
+    }
+
+    private func handleSessionLoss(_ error: Error, context: String = "receive") async {
+        // Error descriptions can contain peer addresses or payloads. Keep the
+        // original error's type and case, not its associated values, in the log.
+        var kind = Mirror(reflecting: error).children.first?.label
+        if let failure = error as? FedFailure {
+            switch failure {
+            case .disconnected: kind = "disconnected"
+            case .suspended: kind = "suspended"
+            case .cancelled: kind = "cancelled"
+            default: break
+            }
+        }
+        var rawCause = String(reflecting: type(of: error)) + (kind.map { "." + $0 } ?? "")
+        if let urlError = error as? URLError { rawCause = "URLError(code: \(urlError.code.rawValue))" }
+        sessionLossLogger("\(context): \(rawCause)")
         if error is FedStateStoreClosed {
             // Store closure is a local lifetime boundary, not a retryable network
             // loss. Preserve the typed error for calls already awaiting replies.
@@ -1280,6 +1335,8 @@ public actor SubcFedClient {
         establishingSession = nil
         receiveTask?.cancel()
         receiveTask = nil
+        timerTask?.cancel()
+        timerTask = nil
         subscriptionWriter?.cancel()
         subscriptionWriter = nil
         subscriptionOutbox.removeAll()

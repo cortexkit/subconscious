@@ -127,7 +127,7 @@ extension FedShareTests {
 }
 
 actor ShareTestServer: FedSessionByteTransport {
-    enum Mode { case normal, closeBeforeReady, closeAfterCall, noFeature, byeBeforeReady(String), byeAfterCall(String) }
+    enum Mode { case normal, pending, closeBeforeReady, closeAfterCall, noFeature, byeBeforeReady(String), byeAfterCall(String) }
     let mode: Mode
     let epoch: String
     let ledger: FedShareLedger?
@@ -146,6 +146,8 @@ actor ShareTestServer: FedSessionByteTransport {
     var couldTakeLedgerLock = false
     var closed = false
     var responseQueued = false
+    var readers: [CheckedContinuation<Data, Error>] = []
+    var receivedCount = 0
 
     init(mode: Mode = .normal, epoch: String = "computer-epoch", ledger: FedShareLedger? = nil,
          advanceAfterResult: (@Sendable () -> Void)? = nil, resultBody: Data = Data(), rawResult: Data? = nil) {
@@ -178,6 +180,7 @@ actor ShareTestServer: FedSessionByteTransport {
                 allCallsDurablyMarked = allCallsDurablyMarked && saved?.mark?.requestDigest == Data(SHA256.hash(data: bytes)) && (saved?.claim ?? 0) > 0
             }
             switch mode {
+            case .pending: break
             case .closeAfterCall: queue.append(Data())
             case .byeAfterCall(let code): try enqueue(FedFrame(type: "bye", fields: ["code": .string(code)]))
             default:
@@ -185,14 +188,24 @@ actor ShareTestServer: FedSessionByteTransport {
                 else { try enqueue(FedFrame(type: "share_result", fields: ["share_id": frame.header["share_id"]!, "k": .string("response")], body: resultBody)) }
                 responseQueued = true
             }
+        case "keepalive": break
         case "bye": lastBye = frame.byeCode
         default: XCTFail("unexpected share client frame")
         }
     }
 
-    func enqueue(_ frame: FedFrame) throws { queue.append(try FedFrameCodec.encode(frame, negotiatedFeatures: ["share-v1"])) }
+    func enqueue(_ frame: FedFrame) throws {
+        let bytes = try FedFrameCodec.encode(frame, negotiatedFeatures: ["share-v1"])
+        if !readers.isEmpty { readers.removeFirst().resume(returning: bytes) }
+        else { queue.append(bytes) }
+    }
 
     func receive() async throws -> Data {
+        receivedCount += 1
+        if closed { throw FedFailure.disconnected }
+        if queue.isEmpty, case .pending = mode {
+            return try await withCheckedThrowingContinuation { readers.append($0) }
+        }
         guard !queue.isEmpty else { throw FedFailure.disconnected }
         let bytes = queue.removeFirst()
         if responseQueued && queue.isEmpty {
@@ -200,5 +213,9 @@ actor ShareTestServer: FedSessionByteTransport {
         }
         return bytes
     }
-    func close() { closed = true }
+    func close() {
+        closed = true
+        for reader in readers { reader.resume(throwing: FedFailure.disconnected) }
+        readers.removeAll()
+    }
 }

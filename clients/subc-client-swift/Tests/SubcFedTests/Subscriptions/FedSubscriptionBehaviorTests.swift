@@ -5,7 +5,7 @@ import XCTest
 private let watchFeatures: Set<String> = ["mgmt-v1", "subscribe-v1"]
 
 /// Every wait is driven by a wire event or an explicit gate, never a wall-clock delay.
-private actor SubscriptionTestTransport: FedSessionByteTransport {
+actor SubscriptionTestTransport: FedSessionByteTransport {
     let features: Set<String>
     let cap: UInt64
     private var inbound: [Data] = []
@@ -64,6 +64,12 @@ private actor SubscriptionTestTransport: FedSessionByteTransport {
         return await withCheckedContinuation { observers.append((type, count, $0)) }
     }
     func count(_ type: String) -> Int { sent.filter { $0.typeName == type }.count }
+    var pendingReaderCount: Int { readers.count }
+    func failInbound(_ error: any Error) {
+        let pending = readers
+        readers.removeAll()
+        for reader in pending { reader.resume(throwing: error) }
+    }
     func gateSubscribe() { holdSubscribe = true }
     func gateCatalog() { holdCatalog = true }
     func gateUnsubscribe() { holdUnsubscribe = true }
@@ -81,7 +87,7 @@ private actor SubscriptionTestTransport: FedSessionByteTransport {
     }
 }
 
-private struct SubscriptionHarness {
+struct SubscriptionHarness {
     let client: SubcFedClient
     let transport: SubscriptionTestTransport
     let engine: FedSessionEngine

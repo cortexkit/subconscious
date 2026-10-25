@@ -104,17 +104,17 @@ public struct FedShareClient: Sendable {
         guard let transport else {
             return FedShareSessionReport(calls: try requests.map { try unattempted($0, code: nil) }, byeCode: nil)
         }
-        let connection = FedShareConnection(transport: transport, maximumBodyBytes: UInt32(policy.maxBodyBytes))
+        let connection = FedShareConnection(transport: transport, maximumBodyBytes: UInt32(policy.maxBodyBytes), clock: clock)
         return try await withTaskCancellationHandler {
             do {
                 let report = try await exchange(requests, computer: computer, ownKey: ownKey, connection: connection)
-                await transport.close()
+                await connection.close()
                 return report
             } catch {
-                await transport.close()
+                await connection.close()
                 throw error
             }
-        } onCancel: { Task { await transport.close() } }
+        } onCancel: { Task { await connection.close() } }
     }
 
     private func unattempted(_ request: FedShareRequest, code: String?, bindingChanged: Bool = false) throws -> FedShareCallResult {
@@ -151,6 +151,7 @@ public struct FedShareClient: Sendable {
                     throw ShareClose(code: nil)
                 }
                 guard try await connection.next().typeName == "share_ready" else { throw FedShareError.invalidFrame }
+                await connection.startTimers(localIntervalMs: policy.keepaliveIntervalMs, peerIntervalMs: parsed.keepaliveIntervalMs)
                 return (parsed.ledgerEpoch, UInt32(min(parsed.maxBodyBytes, policy.maxBodyBytes)), clock.nowNanoseconds())
             }
         } catch {
@@ -238,14 +239,68 @@ private func shareCloseCode(_ error: any Error) -> String? {
 
 private actor FedShareConnection {
     let transport: any FedSessionByteTransport
+    let clock: any FedMonotonicClock
     var decoder: FedFrameStreamDecoder
     var buffered: [FedFrame] = []
+    private var keepalive: FedKeepaliveController?
+    private var timerTask: Task<Void, Never>?
+    private var failure: (any Error)?
+    private var writing = false
+    private var writeWaiters: [CheckedContinuation<Void, Error>] = []
 
-    init(transport: any FedSessionByteTransport, maximumBodyBytes: UInt32) {
+    init(transport: any FedSessionByteTransport, maximumBodyBytes: UInt32, clock: any FedMonotonicClock) {
         self.transport = transport
+        self.clock = clock
         decoder = FedFrameStreamDecoder(negotiatedMaximumBodyLength: maximumBodyBytes, negotiationComplete: true,
                                          negotiatedFeatures: [FedShareCodec.feature])
         decoder.allowedFrameTypes = ["hello", "share_ready", "share_result", "keepalive", "bye"]
+    }
+
+    func startTimers(localIntervalMs: UInt64, peerIntervalMs: UInt64) {
+        guard failure == nil else { return }
+        keepalive = FedKeepaliveController(localIntervalMs: localIntervalMs, peerIntervalMs: peerIntervalMs,
+                                           effectsEnabled: false, nowNanoseconds: clock.nowNanoseconds())
+        timerTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                while let deadline = await self.nextTimerDeadline(), !Task.isCancelled {
+                    try await self.clock.sleep(untilNanoseconds: deadline)
+                    try Task.checkCancellation()
+                    try await self.pollTimers()
+                }
+            } catch {
+                if !Task.isCancelled { await self.close(error) }
+            }
+        }
+    }
+
+    private func nextTimerDeadline() -> UInt64? {
+        guard failure == nil, let keepalive else { return nil }
+        var deadline = min(keepalive.nextKeepaliveDeadline(), keepalive.nextStalenessDeadline())
+        if let started = keepalive.assemblyStartedNanoseconds {
+            deadline = min(deadline, started &+ FedKeepaliveController.assemblyBudgetNanoseconds)
+        }
+        return deadline
+    }
+
+    private func pollTimers() async throws {
+        guard failure == nil, let keepalive else { return }
+        let now = clock.nowNanoseconds()
+        if keepalive.assemblyTimedOut(at: now) { throw FedShareError.invalidFrame }
+        if keepalive.isStale(at: now) { throw FedFailure.disconnected }
+        if keepalive.needsKeepalive(at: now) {
+            try await send(keepalive.makeKeepalive(confirmedWatermark: nil), maximum: UInt32.max)
+        }
+    }
+
+    func close(_ error: any Error = FedFailure.disconnected) async {
+        guard failure == nil else { return }
+        failure = error
+        timerTask?.cancel()
+        timerTask = nil
+        for waiter in writeWaiters { waiter.resume(throwing: error) }
+        writeWaiters.removeAll()
+        await transport.close()
     }
 
     func send(_ frame: FedFrame, maximum: UInt32, negotiating: Bool = false) async throws {
@@ -255,12 +310,25 @@ private actor FedShareConnection {
 
     func sendBytes(_ bytes: Data) async throws {
         try Task.checkCancellation()
+        if let failure { throw failure }
+        // The timer and the exchange share one frame writer; a transport send
+        // may suspend and must not interleave with a keepalive's bytes.
+        if writing { try await withCheckedThrowingContinuation { writeWaiters.append($0) } }
+        else { writing = true }
+        defer {
+            if !writeWaiters.isEmpty { writeWaiters.removeFirst().resume() }
+            else { writing = false }
+        }
+        if let failure { throw failure }
+        try Task.checkCancellation()
         try await transport.send(bytes)
+        keepalive?.noteOutboundFrame(at: clock.nowNanoseconds())
     }
 
     func next() async throws -> FedFrame {
         while true {
             try Task.checkCancellation()
+            if let failure { throw failure }
             if !buffered.isEmpty {
                 let frame = buffered.removeFirst()
                 if frame.typeName == "bye" { throw ShareClose(code: frame.byeCode) }
@@ -268,8 +336,12 @@ private actor FedShareConnection {
                 return frame
             }
             let bytes = try await transport.receive()
+            if let failure { throw failure }
             guard !bytes.isEmpty else { throw ShareClose(code: nil) }
-            buffered += try decoder.append(bytes)
+            keepalive?.noteAssemblyProgress(at: clock.nowNanoseconds())
+            let frames = try decoder.append(bytes)
+            if !frames.isEmpty { keepalive?.noteInboundFrame(at: clock.nowNanoseconds()) }
+            buffered += frames
         }
     }
 }

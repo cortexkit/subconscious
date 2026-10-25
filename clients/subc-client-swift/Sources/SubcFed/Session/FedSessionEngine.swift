@@ -212,7 +212,10 @@ public actor FedSessionEngine {
     private var admittedEffectSequences: Set<UInt64> = []
     private var openPureQuerySequences: Set<UInt64> = []
     private var receiveTask: Task<Void, Never>?
-    private var timerTask: Task<Void, Never>?
+    /// Closing the transport can wake the reader before the timer task catches
+    /// its error, so both paths need the original timeout reason for logging.
+    private(set) var timerFailureCause: String?
+    private var timerDeadlineChanged: (@Sendable () -> Void)?
     /// In-flight origin-side reconciliation for this reconnect, if any. Present
     /// between sending the effect_status queries and collecting every answer.
     private var reconciliation: FedPendingReconciliation?
@@ -836,6 +839,7 @@ public actor FedSessionEngine {
             drainStartedAt: now,
             admittedEffectSequences: admittedEffectSequences
         )
+        timerDeadlineChanged?()
         await admission?.cancelAllQueued(with: .disconnected)
     }
 
@@ -843,6 +847,7 @@ public actor FedSessionEngine {
         if var activeDrain = drain {
             activeDrain.noteEffectSettled(seq)
             drain = activeDrain
+            if activeDrain.shouldClose(at: deps.clock.nowNanoseconds()) { timerDeadlineChanged?() }
         }
         admittedEffectSequences.remove(seq)
     }
@@ -857,6 +862,7 @@ public actor FedSessionEngine {
     public func disconnect(reason: FedFailure = .disconnected) async {
         guard !cancelledActivities else { return }
         cancelledActivities = true
+        timerDeadlineChanged = nil
         lastFailure = reason
         phase = .closed
         for waiter in writeWaiters { waiter.resume(throwing: reason) }
@@ -870,9 +876,7 @@ public actor FedSessionEngine {
             drain = activeDrain
         }
         receiveTask?.cancel()
-        timerTask?.cancel()
         receiveTask = nil
-        timerTask = nil
         for task in listBusyRetryTasks {
             task.cancel()
         }
@@ -902,6 +906,32 @@ public actor FedSessionEngine {
         await disconnect(reason: .suspended)
     }
 
+    /// Drain completion can bring a deadline forward. Idle traffic only moves
+    /// deadlines later, so the driver may recheck those on its existing wake.
+    func setTimerDeadlineChanged(_ callback: @escaping @Sendable () -> Void) {
+        guard !cancelledActivities else { return }
+        timerDeadlineChanged = callback
+    }
+
+    /// Absolute deadline for the client-owned timer driver. Traffic can postpone
+    /// idle deadlines; a wake at the previous deadline simply rechecks them.
+    func nextTimerDeadline() -> UInt64? {
+        guard !cancelledActivities, let keepalive, phase == .ready || phase == .draining else {
+            return nil
+        }
+        var deadline = min(keepalive.nextKeepaliveDeadline(), keepalive.nextStalenessDeadline())
+        if let started = keepalive.assemblyStartedNanoseconds {
+            deadline = min(deadline, started &+ FedKeepaliveController.assemblyBudgetNanoseconds)
+        }
+        if phase == .draining, let drain {
+            let close = drain.shouldClose(at: deps.clock.nowNanoseconds())
+                ? deps.clock.nowNanoseconds()
+                : drain.drainStartedAt &+ FedRekeyDrainPolicy.maximumDrainNanoseconds
+            deadline = min(deadline, close)
+        }
+        return deadline
+    }
+
     /// Tick keepalive and staleness using the injected clock.
     public func pollTimers() async throws -> FedFrame? {
         guard !cancelledActivities, let keepalive, phase == .ready || phase == .draining else {
@@ -909,10 +939,12 @@ public actor FedSessionEngine {
         }
         let now = deps.clock.nowNanoseconds()
         if keepalive.assemblyTimedOut(at: now) {
+            timerFailureCause = "assembly timeout"
             await disconnect(reason: .protocolViolation(byeCode: "fed_bad_frame"))
             throw FedFailure.protocolViolation(byeCode: "fed_bad_frame")
         }
         if keepalive.isStale(at: now) {
+            timerFailureCause = "stale timeout"
             await disconnect(reason: .disconnected)
             throw FedFailure.disconnected
         }

@@ -31,6 +31,10 @@ pub enum ScriptedControlAction {
 
 impl ScriptedDaemon {
     pub async fn start(name: &str, steps: Vec<ScriptedControlStep>) -> Self {
+        Self::start_sessions(name, vec![steps]).await
+    }
+
+    pub async fn start_sessions(name: &str, sessions: Vec<Vec<ScriptedControlStep>>) -> Self {
         let temp_dir = ScratchDir::new(name);
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -55,61 +59,64 @@ impl ScriptedDaemon {
         write_atomic(&connection_file_path, &connection).expect("scripted connection file");
 
         let task = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("ck connects");
-            authenticate_server(
-                &mut stream,
-                &connection.key,
-                &connection.daemon_id,
-                &connection.daemon_ver,
-                Duration::from_secs(2),
-            )
-            .await
-            .expect("ck authenticates");
+            for steps in sessions {
+                let (mut stream, _) = listener.accept().await.expect("ck connects");
+                authenticate_server(
+                    &mut stream,
+                    &connection.key,
+                    &connection.daemon_id,
+                    &connection.daemon_ver,
+                    Duration::from_secs(2),
+                )
+                .await
+                .expect("ck authenticates");
 
-            for step in steps {
-                let request_frame = read_frame(&mut stream)
-                    .await
-                    .expect("scripted request frame is valid")
-                    .expect("ck keeps scripted connection open");
-                assert_eq!(request_frame.header.channel, 0);
-                assert_eq!(request_frame.header.ty, FrameType::Request);
-                let request: ClientControlRequest = serde_json::from_slice(&request_frame.body)
-                    .expect("scripted request body decodes");
-                assert_eq!(request, step.expected);
+                for step in steps {
+                    let request_frame = read_frame(&mut stream)
+                        .await
+                        .expect("scripted request frame is valid")
+                        .expect("ck keeps scripted connection open");
+                    assert_eq!(request_frame.header.channel, 0);
+                    assert_eq!(request_frame.header.ty, FrameType::Request);
+                    let request: ClientControlRequest = serde_json::from_slice(&request_frame.body)
+                        .expect("scripted request body decodes");
+                    assert_eq!(request, step.expected);
 
-                match step.action {
-                    ScriptedControlAction::Reply(response) => {
-                        let response = Frame::build_with_version(
-                            request_frame.header.ver,
-                            FrameType::Response,
-                            request_frame.header.flags,
-                            0,
-                            0,
-                            request_frame.header.corr,
-                            serde_json::to_vec(&response).expect("scripted response serializes"),
-                        )
-                        .expect("scripted response frame builds");
-                        write_frame(&mut stream, &response)
-                            .await
-                            .expect("scripted response writes");
-                        stream.flush().await.expect("scripted response flushes");
-                    }
-                    ScriptedControlAction::NeverReply => pending::<()>().await,
-                    ScriptedControlAction::Error(error) => {
-                        let response = Frame::build_with_version(
-                            request_frame.header.ver,
-                            FrameType::Error,
-                            request_frame.header.flags,
-                            0,
-                            0,
-                            request_frame.header.corr,
-                            serde_json::to_vec(&error).expect("scripted error serializes"),
-                        )
-                        .expect("scripted error frame builds");
-                        write_frame(&mut stream, &response)
-                            .await
-                            .expect("scripted error writes");
-                        stream.flush().await.expect("scripted error flushes");
+                    match step.action {
+                        ScriptedControlAction::Reply(response) => {
+                            let response = Frame::build_with_version(
+                                request_frame.header.ver,
+                                FrameType::Response,
+                                request_frame.header.flags,
+                                0,
+                                0,
+                                request_frame.header.corr,
+                                serde_json::to_vec(&response)
+                                    .expect("scripted response serializes"),
+                            )
+                            .expect("scripted response frame builds");
+                            write_frame(&mut stream, &response)
+                                .await
+                                .expect("scripted response writes");
+                            stream.flush().await.expect("scripted response flushes");
+                        }
+                        ScriptedControlAction::NeverReply => pending::<()>().await,
+                        ScriptedControlAction::Error(error) => {
+                            let response = Frame::build_with_version(
+                                request_frame.header.ver,
+                                FrameType::Error,
+                                request_frame.header.flags,
+                                0,
+                                0,
+                                request_frame.header.corr,
+                                serde_json::to_vec(&error).expect("scripted error serializes"),
+                            )
+                            .expect("scripted error frame builds");
+                            write_frame(&mut stream, &response)
+                                .await
+                                .expect("scripted error writes");
+                            stream.flush().await.expect("scripted error flushes");
+                        }
                     }
                 }
             }

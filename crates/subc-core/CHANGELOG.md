@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.20.137
+
+- `ckni --json` versions built-in object outputs with a `schema` string and
+  wraps arrays in `{schema, entries}`. Activity and module-log followers emit
+  one versioned object per line. Commands without JSON, including help and
+  version, fail with a usage error before doing any work. Machine probes,
+  `module restart` (including `--swap`), `module stop`, `module start` and
+  external command faces retain their existing bytes. `docs/ck-json.md`
+  describes the schemas and plain-output coverage.
+- Piped `ck --json` output is unchanged, including when run on a terminal.
+
 ## 0.20.136
 
 - `ckni` prints dedicated plain tables for the health overview, the module list

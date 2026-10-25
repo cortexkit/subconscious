@@ -3,7 +3,7 @@ use std::{ffi::OsString, io::Write, path::Path};
 use subc_client_rs::{ConsumerOptions, SubcConsumer};
 use subc_control::{ActivityEntry, ActivityQueryRequest};
 
-use super::{discover_connection_file, print_table, CkError, Command};
+use super::{discover_connection_file, print_table, CkError, Command, JsonOutput};
 
 pub(super) const HELP: &str = "ck activity — consequential agent and module events
 
@@ -116,7 +116,7 @@ pub(super) fn parse(tail: &[OsString]) -> Result<Command, CkError> {
 pub(super) async fn run(
     options: &Options,
     subc: Option<&Path>,
-    json: bool,
+    json: JsonOutput,
     ckni: bool,
     verbose: bool,
 ) -> Result<(), CkError> {
@@ -135,7 +135,7 @@ pub(super) async fn run(
 async fn display(
     consumer: &SubcConsumer,
     options: &Options,
-    json: bool,
+    json: JsonOutput,
     ckni: bool,
     verbose: bool,
 ) -> Result<(), CkError> {
@@ -146,16 +146,13 @@ async fn display(
             code: error.code().map(str::to_string),
             message: format!("activity query failed: {error}"),
         })?;
-    if json && !options.follow {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::to_value(&reply.entries)?)?
-        );
+    if json.enabled && !options.follow {
+        json.print(&serde_json::to_value(&reply.entries)?)?;
         return Ok(());
     }
-    if json {
+    if json.enabled {
         for entry in &reply.entries {
-            print_stream_json(entry)?;
+            print_stream_json(entry, json)?;
         }
     } else if ckni {
         print_table(
@@ -204,7 +201,7 @@ async fn display(
                     .ok_or_else(|| CkError::Message("activity feed ended; rerun ck activity to query retained history".into()))?;
                 // Subscription bodies have no filters; retain query semantics locally.
                 if matches(&options.query, &entry) {
-                    if json { print_stream_json(&entry)?; }
+                    if json.enabled { print_stream_json(&entry, json)?; }
                     else if ckni {
                         print_table(&super::ckni::activity_headers(verbose), vec![plain_row(&entry, verbose)]);
                     }
@@ -312,8 +309,13 @@ fn timestamp(at_ms: u64) -> String {
     )
 }
 
-fn print_stream_json(entry: &ActivityEntry) -> Result<(), CkError> {
-    println!("{}", serde_json::to_string(entry)?);
+fn print_stream_json(entry: &ActivityEntry, json: JsonOutput) -> Result<(), CkError> {
+    let line = if json.is_versioned() {
+        json.stream_line(&serde_json::to_value(entry)?)?
+    } else {
+        serde_json::to_string(entry)?
+    };
+    println!("{line}");
     Ok(())
 }
 

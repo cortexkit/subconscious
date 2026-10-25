@@ -110,7 +110,24 @@ impl Fixture {
     }
 
     fn ck_command(&self) -> Command {
-        let mut command = dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck-under-test")));
+        self.face_command(false)
+    }
+
+    fn face_command(&self, ckni: bool) -> Command {
+        let binary = ckdev_binary(env!("CARGO_BIN_EXE_ck-under-test"));
+        let program = if ckni {
+            let link = self
+                .root
+                .join(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&binary, &link).unwrap();
+            #[cfg(not(unix))]
+            fs::copy(&binary, &link).unwrap();
+            link
+        } else {
+            binary
+        };
+        let mut command = dev_command(program);
         common::kit::isolate_client(&mut command, &self.root.join("client"));
         command
             .arg("--subc")
@@ -121,6 +138,9 @@ impl Fixture {
             .env_remove("SUBC_MODULE_ID")
             .env_remove("SUBC_LAUNCH_NONCE")
             .env_remove("CK_TEST_ACTIVITY_HANDOFF");
+        if ckni {
+            common::kit::isolate_client_fully(&mut command, &self.root.join("client"));
+        }
         command
     }
 
@@ -352,14 +372,29 @@ async fn record(handle: &subc_client_rs::ModuleHandle, kind: &str, summary: &str
         .seq
 }
 
-async fn follow_handoff(json_output: bool, empty_page: bool) {
+async fn follow_handoff(json_output: bool, empty_page: bool, ckni: bool) {
     let mut fixture = Fixture::new();
     fixture.seed(&[entry(1), entry(2)]);
     fixture.boot().await;
+    if ckni {
+        let describe = fixture.ck(&["daemon"]);
+        success(&describe);
+        let describe = String::from_utf8(describe.stdout).unwrap();
+        let pid = describe
+            .lines()
+            .next()
+            .unwrap()
+            .split(" · ")
+            .find_map(|part| part.strip_prefix("pid "))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert_eq!(pid, fixture.child.as_ref().unwrap().id());
+    }
     let (worker, worker_task) = reporter(&fixture.connection(), "worker").await;
     let (other, other_task) = reporter(&fixture.connection(), "other").await;
     let handoff = fixture.root.join("handoff");
-    let mut command = tokio::process::Command::from(fixture.ck_command());
+    let mut command = tokio::process::Command::from(fixture.face_command(ckni));
     command
         .args([
             "activity",
@@ -441,10 +476,20 @@ async fn follow_handoff(json_output: bool, empty_page: bool) {
     worker_task.abort();
     other_task.abort();
     if json_output {
+        if !ckni && !empty_page {
+            assert!(output[0].starts_with("{\"seq\":2,\"at_ms\":1704067200000,\"daemon_incarnation\":\"retained\",\"module\":\"worker\""), "piped ck keeps its serialized field order: {}", output[0]);
+        }
         let entries = output
             .iter()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
+        for entry in &entries {
+            if ckni {
+                assert_eq!(entry["schema"], "ck.activity/v1");
+            } else {
+                assert!(entry.get("schema").is_none());
+            }
+        }
         let expected = if empty_page {
             vec![gap_first, gap_last, live]
         } else {
@@ -490,12 +535,17 @@ async fn follow_handoff(json_output: bool, empty_page: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activity_json_follow_replays_handoff_once_and_filters_live_entries() {
-    follow_handoff(true, false).await;
+    follow_handoff(true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn activity_table_follow_uses_head_even_when_query_is_empty() {
-    follow_handoff(false, true).await;
+    follow_handoff(false, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ckni_json_follow_versions_initial_handoff_and_live_entries_one_per_line() {
+    follow_handoff(true, false, true).await;
 }
 
 #[test]

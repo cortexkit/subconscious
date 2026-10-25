@@ -11,6 +11,7 @@ use subc_core::setup::text::{human_blocking_outcome, upgrade_current_summary};
 #[path = "activity/mod.rs"]
 mod activity;
 mod ckni;
+use ckni::JsonOutput;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -511,6 +512,8 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         return Err(CkError::Usage(CKNI_NEEDS_A_COMMAND.to_string()));
     }
 
+    let json_output = JsonOutput::for_command(&args.command, args.json, ckni)?;
+
     if matches!(&args.command, Command::BuildShape) {
         println!("{CK_BUILD_SHAPE}");
         return Ok(());
@@ -559,20 +562,26 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         .await;
     }
     if matches!(&args.command, Command::DaemonTriage) {
-        return daemon_triage(args.subc.as_deref(), args.json);
+        return daemon_triage(args.subc.as_deref(), json_output);
     }
     // Both machine verbs work without a daemon: the stored id is a file, and
     // adopting one is refused while a daemon IS reachable.
     if matches!(&args.command, Command::MachineShow) {
-        return machine_show(args.subc.as_deref(), args.json).await;
+        return machine_show(args.subc.as_deref(), json_output).await;
     }
     if let Command::MachineAdopt { id, force } = &args.command {
-        return machine_adopt(args.subc.as_deref(), id, *force, args.json).await;
+        return machine_adopt(args.subc.as_deref(), id, *force, json_output).await;
     }
     if let Command::Activity(options) = &args.command {
-        return activity::run(options, args.subc.as_deref(), args.json, ckni, args.verbose)
-            .await
-            .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()));
+        return activity::run(
+            options,
+            args.subc.as_deref(),
+            json_output,
+            ckni,
+            args.verbose,
+        )
+        .await
+        .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()));
     }
 
     let resolved = discover_connection_file(args.subc.as_deref())
@@ -596,55 +605,57 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     let result = match args.command {
         Command::Dashboard => unreachable!("handled before connecting"),
         Command::Module(ModuleCommand::List) => {
-            module_list(&mut client, args.json, args.verbose, args.subc.as_deref()).await
+            module_list(&mut client, json_output, args.verbose, args.subc.as_deref()).await
         }
         Command::Module(ModuleCommand::Status { module_id }) => {
-            module_status(&mut client, &module_id, args.json, args.verbose).await
+            module_status(&mut client, &module_id, json_output, args.verbose).await
         }
         Command::Module(ModuleCommand::Logs { module_id, options }) => {
-            module_logs(&mut client, module_id.as_deref(), &options, args.json).await
+            module_logs(&mut client, module_id.as_deref(), &options, json_output).await
         }
         Command::Module(ModuleCommand::StderrTail {
             module_id,
             max_lines,
-        }) => module_stderr_tail(&mut client, &module_id, max_lines, args.json).await,
+        }) => module_stderr_tail(&mut client, &module_id, max_lines, json_output).await,
         Command::Module(ModuleCommand::Terminals { module_id }) => {
-            module_terminals(&mut client, &module_id, args.json, args.verbose).await
+            module_terminals(&mut client, &module_id, json_output, args.verbose).await
         }
         Command::Module(ModuleCommand::Restart {
             module_id,
             drain_timeout_ms,
-        }) => module_restart(&mut client, &module_id, drain_timeout_ms, args.json).await,
+        }) => module_restart(&mut client, &module_id, drain_timeout_ms, json_output).await,
         Command::Module(ModuleCommand::Swap {
             module_id,
             ready_timeout_ms,
-        }) => module_swap(&mut client, &module_id, ready_timeout_ms, args.json).await,
+        }) => module_swap(&mut client, &module_id, ready_timeout_ms, json_output).await,
         Command::Module(ModuleCommand::Rescan { preview }) => {
-            module_rescan(&mut client, args.json, preview).await
+            module_rescan(&mut client, json_output, preview).await
         }
         Command::Module(ModuleCommand::ReleaseReserved { module_id }) => {
-            module_release_reserved(&mut client, &module_id, args.json).await
+            module_release_reserved(&mut client, &module_id, json_output).await
         }
         Command::Module(ModuleCommand::Stop { module_id }) => {
-            module_set_enabled(&mut client, &module_id, false, args.json).await
+            module_set_enabled(&mut client, &module_id, false, json_output).await
         }
         Command::Module(ModuleCommand::Start { module_id }) => {
-            module_set_enabled(&mut client, &module_id, true, args.json).await
+            module_set_enabled(&mut client, &module_id, true, json_output).await
         }
         Command::Routes { module_id } => {
-            supervisor_routes(&mut client, module_id.as_deref(), args.json).await
+            supervisor_routes(&mut client, module_id.as_deref(), json_output).await
         }
         Command::Catalog { module_id } => {
-            catalog_report(&mut client, module_id.as_deref(), args.json).await
+            catalog_report(&mut client, module_id.as_deref(), json_output).await
         }
         Command::Provenance { module_id } => {
-            provenance(&mut client, &module_id, args.json, args.verbose).await
+            provenance(&mut client, &module_id, json_output, args.verbose).await
         }
-        Command::Health => health(&mut client, args.json, args.verbose, args.subc.as_deref()).await,
+        Command::Health => {
+            health(&mut client, json_output, args.verbose, args.subc.as_deref()).await
+        }
         Command::HealthDetail { module_id } => {
-            health_detail(&mut client, &module_id, args.json, args.verbose).await
+            health_detail(&mut client, &module_id, json_output, args.verbose).await
         }
-        Command::Daemon => daemon(&mut client, args.json, args.verbose).await,
+        Command::Daemon => daemon(&mut client, json_output, args.verbose).await,
         Command::DaemonTriage | Command::MachineShow | Command::MachineAdopt { .. } => {
             unreachable!("handled before connecting")
         }
@@ -656,7 +667,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             quota(
                 &mut client,
                 provider_id.as_deref(),
-                args.json,
+                json_output,
                 verbose,
                 redact,
                 args.subc.as_deref(),
@@ -1799,13 +1810,13 @@ async fn module_drain_response_timeout(
 
 async fn module_list(
     client: &mut CkClient,
-    json_output: bool,
+    json_output: JsonOutput,
     verbose: bool,
     subc: Option<&Path>,
 ) -> Result<(), CkError> {
     let value = supervisor_list(client).await?;
-    if json_output {
-        print_json(&value)?;
+    if json_output.enabled {
+        json_output.print(&value)?;
     } else {
         let modules = modules_array(&value);
         if modules.is_empty() {
@@ -1860,7 +1871,7 @@ async fn module_logs(
     client: &mut CkClient,
     module_id: Option<&str>,
     options: &ModuleLogsOptions,
-    json_output: bool,
+    json_output: JsonOutput,
 ) -> Result<(), CkError> {
     let roster = supervisor_list(client).await?;
     let modules = modules_array(&roster);
@@ -1868,6 +1879,11 @@ async fn module_logs(
         return module_log_census(modules, json_output);
     };
     if find_module(&roster, module_id).is_none() {
+        if json_output.is_versioned() {
+            return Err(CkError::rejected(format!(
+                "module_id '{module_id}' is not supervised"
+            )));
+        }
         println!("no module named '{}'. Run ck module list.", module_id);
         return Ok(());
     }
@@ -1875,7 +1891,7 @@ async fn module_logs(
     let sources = discover_log_sources(module_id, true)?;
     let (mut entries, counts) = collect_log_entries(module_id, &sources, options)?;
     sort_log_entries(&mut entries);
-    if entries.is_empty() && counts.total == 0 {
+    if entries.is_empty() && counts.total == 0 && !json_output.is_versioned() {
         println!("no log yet for {module_id}");
         return Ok(());
     }
@@ -1907,7 +1923,7 @@ fn sort_log_entries(entries: &mut [LogEntry]) {
     });
 }
 
-fn module_log_census(modules: &[Value], json_output: bool) -> Result<(), CkError> {
+fn module_log_census(modules: &[Value], json_output: JsonOutput) -> Result<(), CkError> {
     let mut rows = Vec::new();
     for module in modules {
         let Some(module_id) = module.get("module_id").and_then(Value::as_str) else {
@@ -1928,8 +1944,8 @@ fn module_log_census(modules: &[Value], json_output: bool) -> Result<(), CkError
             }));
         }
     }
-    if json_output {
-        print_json(&json!({ "files": rows }))?;
+    if json_output.enabled {
+        json_output.print(&json!({ "files": rows }))?;
     } else {
         let table_rows = rows
             .iter()
@@ -2414,10 +2430,16 @@ fn log_level_rank(level: ParsedLevel) -> u8 {
     }
 }
 
-fn print_log_entries(entries: &[LogEntry], json_output: bool) -> Result<(), CkError> {
-    if json_output {
+fn print_log_entries(entries: &[LogEntry], json_output: JsonOutput) -> Result<(), CkError> {
+    if json_output.enabled {
+        if json_output.is_stream() {
+            for entry in entries {
+                println!("{}", json_output.stream_line(&log_entry_json(entry))?);
+            }
+            return Ok(());
+        }
         let lines = entries.iter().map(log_entry_json).collect::<Vec<_>>();
-        return print_json(&json!({ "lines": lines }));
+        return json_output.print(&json!({ "lines": lines }));
     }
     let color = ansi_color_enabled();
     for entry in entries {
@@ -2498,7 +2520,7 @@ async fn follow_module_logs(
     module_id: &str,
     options: &ModuleLogsOptions,
     initial_sources: Vec<LogSource>,
-    json_output: bool,
+    json_output: JsonOutput,
 ) -> Result<(), CkError> {
     let (dirs, _) = LogDirs::for_module(module_id);
     let mut follower = LogFollower::start(module_id, dirs, &initial_sources)?;
@@ -2717,7 +2739,7 @@ fn print_follow_text(
     options: &ModuleLogsOptions,
     source: &LogSource,
     text: &str,
-    json_output: bool,
+    json_output: JsonOutput,
 ) -> Result<(), CkError> {
     let mut entries = Vec::new();
     let mut counts = LogFilterCounts::default();
@@ -2737,12 +2759,12 @@ fn print_follow_text(
 async fn module_status(
     client: &mut CkClient,
     module_id: &str,
-    json_output: bool,
+    json_output: JsonOutput,
     verbose: bool,
 ) -> Result<(), CkError> {
     let list = supervisor_list(client).await?;
     let Some(module) = find_module(&list, module_id).cloned() else {
-        return if json_output {
+        return if json_output.enabled {
             Err(CkError::rejected(format!(
                 "module_id '{module_id}' is not supervised"
             )))
@@ -2769,8 +2791,8 @@ async fn module_status(
         .into_iter()
         .find(|entry| entry.module_id == module_id);
 
-    if json_output {
-        print_json(&json!({
+    if json_output.enabled {
+        json_output.print(&json!({
             "module": module,
             "health": health_entry,
             "catalog": catalog_entry,
@@ -3006,7 +3028,7 @@ async fn module_stderr_tail(
     client: &mut CkClient,
     module_id: &str,
     max_lines: Option<u32>,
-    json_output: bool,
+    json_output: JsonOutput,
 ) -> Result<(), CkError> {
     let response = client
         .rpc_value(ClientControlRequest::SupervisorStderrTail {
@@ -3016,8 +3038,8 @@ async fn module_stderr_tail(
         })
         .await?;
 
-    if json_output {
-        print_json(&response)?;
+    if json_output.enabled {
+        json_output.print(&response)?;
         return Ok(());
     }
 
@@ -3136,7 +3158,7 @@ fn stderr_truncation_hint(response: &Value) -> Option<String> {
 async fn module_terminals(
     client: &mut CkClient,
     module_id: &str,
-    json_output: bool,
+    json_output: JsonOutput,
     verbose: bool,
 ) -> Result<(), CkError> {
     let response = client
@@ -3145,8 +3167,8 @@ async fn module_terminals(
         })
         .await?;
 
-    if json_output {
-        print_json(&response)?;
+    if json_output.enabled {
+        json_output.print(&response)?;
         return Ok(());
     }
 
@@ -3213,7 +3235,7 @@ async fn module_restart(
     client: &mut CkClient,
     module_id: &str,
     drain_timeout_ms: Option<u64>,
-    json_output: bool,
+    json_output: JsonOutput,
 ) -> Result<(), CkError> {
     let ack = client
         .mutating_rpc_value(
@@ -3227,7 +3249,7 @@ async fn module_restart(
         )
         .await?;
     print_ack_with_state(client, module_id, ack, "restart", json_output).await?;
-    if !json_output {
+    if !json_output.enabled {
         // The ack means INITIATED, not completed: the daemon drains and respawns
         // asynchronously precisely so a caller whose own tool lane rides this
         // module can settle instead of deadlocking the drain. The state column
@@ -3241,7 +3263,7 @@ async fn module_swap(
     client: &mut CkClient,
     module_id: &str,
     ready_timeout_ms: Option<u64>,
-    json_output: bool,
+    json_output: JsonOutput,
 ) -> Result<(), CkError> {
     // The daemon answers when the swap has cut over or failed, which can take
     // as long as the replacement's readiness budget, so the wait is sized
@@ -3262,7 +3284,7 @@ async fn module_swap(
         )
         .await?;
     print_ack_with_state(client, module_id, ack, "swap", json_output).await?;
-    if !json_output {
+    if !json_output.enabled {
         // The reply means CUT OVER: new routes land on the replacement. The old
         // process drains after the reply, so its routes close over the next
         // drain budget.
@@ -3275,7 +3297,7 @@ async fn module_swap(
 
 async fn module_rescan(
     client: &mut CkClient,
-    json_output: bool,
+    json_output: JsonOutput,
     preview: bool,
 ) -> Result<(), CkError> {
     let request = ClientControlRequest::SupervisorRescan { preview };
@@ -3321,8 +3343,8 @@ async fn module_rescan(
         ));
     }
 
-    if json_output {
-        print_json(&result)?;
+    if json_output.enabled {
+        json_output.print(&result)?;
     } else {
         print_rescan_table(&result);
     }
@@ -3332,7 +3354,7 @@ async fn module_rescan(
 async fn module_release_reserved(
     client: &mut CkClient,
     module_id: &str,
-    json_output: bool,
+    json_output: JsonOutput,
 ) -> Result<(), CkError> {
     let ack = client
         .mutating_rpc_value(
@@ -3351,7 +3373,7 @@ async fn module_set_enabled(
     client: &mut CkClient,
     module_id: &str,
     enabled: bool,
-    json_output: bool,
+    json_output: JsonOutput,
 ) -> Result<(), CkError> {
     let verb = if enabled { "start" } else { "stop" };
     let response_timeout = module_drain_response_timeout(client, module_id).await?;
@@ -3384,7 +3406,7 @@ async fn module_set_enabled(
 async fn catalog_report(
     client: &mut CkClient,
     module_id: Option<&str>,
-    json_output: bool,
+    json_output: JsonOutput,
 ) -> Result<(), CkError> {
     let entries = client.catalog_list().await?;
     let selected: Vec<_> = match module_id {
@@ -3395,11 +3417,11 @@ async fn catalog_report(
         None => entries.iter().collect(),
     };
 
-    if json_output {
+    if json_output.enabled {
         let value = serde_json::to_value(&selected).map_err(|error| {
             CkError::Message(format!("could not render catalog as JSON: {error}"))
         })?;
-        print_json(&value)?;
+        json_output.print(&value)?;
     } else if selected.is_empty() {
         match module_id {
             Some(wanted) => println!("{wanted} is not registered"),
@@ -3454,15 +3476,15 @@ fn catalog_readiness_text(entry: &CatalogEntry) -> String {
 async fn supervisor_routes(
     client: &mut CkClient,
     module_id: Option<&str>,
-    json_output: bool,
+    json_output: JsonOutput,
 ) -> Result<(), CkError> {
     let response = client
         .rpc_value(ClientControlRequest::SupervisorRoutes {
             module_id: module_id.map(str::to_owned),
         })
         .await?;
-    if json_output {
-        print_json(&response)?;
+    if json_output.enabled {
+        json_output.print(&response)?;
         return Ok(());
     }
 
@@ -3527,7 +3549,7 @@ async fn supervisor_routes(
 async fn provenance(
     client: &mut CkClient,
     module_id: &str,
-    json_output: bool,
+    json_output: JsonOutput,
     verbose: bool,
 ) -> Result<(), CkError> {
     let response = client
@@ -3535,8 +3557,8 @@ async fn provenance(
             module_id: Some(module_id.to_string()),
         })
         .await?;
-    if json_output {
-        print_json(&response)?;
+    if json_output.enabled {
+        json_output.print(&response)?;
         return Ok(());
     }
 
@@ -3712,7 +3734,7 @@ async fn print_ack_with_state(
     module_id: &str,
     ack: Value,
     verb: &str,
-    json_output: bool,
+    json_output: JsonOutput,
 ) -> Result<(), CkError> {
     let list = supervisor_list(client).await?;
     let module = find_module(&list, module_id).cloned();
@@ -3726,7 +3748,7 @@ async fn print_ack_with_state(
         .and_then(Value::as_bool)
         .ok_or_else(|| CkError::Message(format!("unexpected {verb} ack: {ack}")))?;
 
-    if json_output {
+    if json_output.enabled {
         let mut output = ack;
         if let Some(object) = output.as_object_mut() {
             object.insert("state".to_string(), Value::String(state.to_string()));
@@ -3739,7 +3761,7 @@ async fn print_ack_with_state(
                 module.unwrap_or_else(|| Value::Object(Default::default())),
             );
         }
-        print_json(&output)?;
+        json_output.print(&output)?;
     } else {
         print_table(
             &["module", "applied", "state"],
@@ -3775,13 +3797,13 @@ fn enabled_drift_notice(verb: &str, module: &Value) -> Option<&'static str> {
 
 async fn health(
     client: &mut CkClient,
-    json_output: bool,
+    json_output: JsonOutput,
     verbose: bool,
     subc: Option<&Path>,
 ) -> Result<(), CkError> {
     let value = supervisor_health(client).await?;
-    if json_output {
-        print_json(&value)?;
+    if json_output.enabled {
+        json_output.print(&value)?;
     } else {
         print_health_table(modules_array(&value), verbose, subc);
     }
@@ -3791,10 +3813,10 @@ async fn health(
 async fn health_detail(
     client: &mut CkClient,
     module_id: &str,
-    json_output: bool,
+    json_output: JsonOutput,
     verbose: bool,
 ) -> Result<(), CkError> {
-    if !json_output {
+    if !json_output.enabled {
         let modules = supervisor_list(client).await?;
         if find_module(&modules, module_id).is_none() {
             return Err(CkError::rejected(format!(
@@ -3808,8 +3830,8 @@ async fn health_detail(
             module_id: module_id.to_string(),
         })
         .await?;
-    if json_output {
-        print_json(&value)?;
+    if json_output.enabled {
+        json_output.print(&value)?;
         return Ok(());
     }
     let status = value
@@ -3950,7 +3972,7 @@ fn metrics_have_non_headline_entries(metrics: &Value) -> bool {
     }
 }
 
-fn daemon_triage(override_path: Option<&Path>, json_output: bool) -> Result<(), CkError> {
+fn daemon_triage(override_path: Option<&Path>, json_output: JsonOutput) -> Result<(), CkError> {
     let env_named = env::var_os("SUBC_CONNECTION_FILE").filter(|value| !value.is_empty());
     let candidates = connection_file::discovery_candidates(override_path, env_named.as_deref());
     let run_dir = candidates
@@ -3960,8 +3982,8 @@ fn daemon_triage(override_path: Option<&Path>, json_output: bool) -> Result<(), 
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
     let report = collect_daemon_triage(&candidates, &run_dir);
-    if json_output {
-        print_json(&report.json)
+    if json_output.enabled {
+        json_output.print(&report.json)
     } else {
         print_daemon_triage(&report);
         Ok(())
@@ -4571,14 +4593,18 @@ fn piped_describe(mut describe: Value) -> Value {
     describe
 }
 
-async fn daemon(client: &mut CkClient, json_output: bool, verbose: bool) -> Result<(), CkError> {
+async fn daemon(
+    client: &mut CkClient,
+    json_output: JsonOutput,
+    verbose: bool,
+) -> Result<(), CkError> {
     let describe = piped_describe(
         client
             .rpc_value(ClientControlRequest::ServerDescribe {})
             .await?,
     );
-    if json_output {
-        print_json(&describe)?;
+    if json_output.enabled {
+        json_output.print(&describe)?;
         return Ok(());
     }
 
@@ -4645,7 +4671,7 @@ fn machine_id_path_or_error() -> Result<PathBuf, CkError> {
     machine_id::default_machine_id_path().map_err(|error| CkError::Message(error.to_string()))
 }
 
-async fn machine_show(subc: Option<&Path>, json_output: bool) -> Result<(), CkError> {
+async fn machine_show(subc: Option<&Path>, json_output: JsonOutput) -> Result<(), CkError> {
     let path = machine_id_path_or_error()?;
     let stored = machine_id::read(&path);
     let daemon = probe_running_daemon(subc).await;
@@ -4659,7 +4685,7 @@ async fn machine_show(subc: Option<&Path>, json_output: bool) -> Result<(), CkEr
         _ => false,
     };
 
-    if json_output {
+    if json_output.enabled {
         let file = match &stored {
             Ok(id) => json!({
                 "path": path.display().to_string(),
@@ -4679,7 +4705,7 @@ async fn machine_show(subc: Option<&Path>, json_output: bool) -> Result<(), CkEr
                 "machine_id": machine_id,
             }),
         };
-        return print_json(&json!({ "file": file, "daemon": daemon, "differ": differ }));
+        return json_output.print(&json!({ "file": file, "daemon": daemon, "differ": differ }));
     }
 
     match &stored {
@@ -4715,7 +4741,7 @@ async fn machine_adopt(
     subc: Option<&Path>,
     id: &str,
     force: bool,
-    json_output: bool,
+    json_output: JsonOutput,
 ) -> Result<(), CkError> {
     let id = machine_id::MachineId::parse(id)
         .map_err(|error| CkError::Usage(format!("'{id}' is not a machine id: {error}")))?;
@@ -4733,12 +4759,12 @@ async fn machine_adopt(
     let previous = machine_id::read(&path);
     machine_id::write(&path, &id).map_err(|error| CkError::Message(error.to_string()))?;
 
-    if json_output {
+    if json_output.enabled {
         let (daemon_running, daemon_serves) = match &daemon {
             RunningDaemon::NotRunning => (false, None),
             RunningDaemon::Running { machine_id, .. } => (true, machine_id.clone()),
         };
-        return print_json(&json!({
+        return json_output.print(&json!({
             "path": path.display().to_string(),
             "machine_id": id.as_str(),
             "previous": previous.as_ref().ok().and_then(|id| id.as_ref()).map(|id| id.as_str()),
@@ -4878,7 +4904,7 @@ async fn supervisor_health(client: &mut CkClient) -> Result<Value, CkError> {
 async fn quota(
     client: &mut CkClient,
     provider_filter: Option<&str>,
-    json_output: bool,
+    json_output: JsonOutput,
     verbose: bool,
     redact: bool,
     subc: Option<&Path>,
@@ -4904,7 +4930,7 @@ async fn quota(
                 "unknown provider '{filter}'; valid ids: {}",
                 ids.join(", ")
             ));
-            if json_output {
+            if json_output.enabled {
                 return Err(error);
             }
             let command = if verbose {
@@ -4919,8 +4945,8 @@ async fn quota(
         }
     }
 
-    if json_output {
-        print_json(&body)?;
+    if json_output.enabled {
+        json_output.print(&body)?;
     } else {
         print_quota_table(&providers, provider_filter, verbose, redact, subc);
         let project_root = env::current_dir()
@@ -8241,8 +8267,8 @@ fn decode_error_body(body: &[u8]) -> String {
     }
 }
 
-fn decorate_error(error: CkError, json_output: bool, subc: Option<&Path>) -> CkError {
-    if json_output {
+fn decorate_error(error: CkError, json: bool, subc: Option<&Path>) -> CkError {
+    if json {
         return error;
     }
     let footer = match &error {
@@ -8761,19 +8787,21 @@ mod tests {
                     ClientControlRequest::SupervisorRestart {
                         module_id,
                         drain_timeout_ms,
-                    } => module_restart(&mut client, &module_id, drain_timeout_ms, true).await,
+                    } => {
+                        module_restart(&mut client, &module_id, drain_timeout_ms, true.into()).await
+                    }
                     ClientControlRequest::SupervisorSwap {
                         module_id,
                         ready_timeout_ms,
-                    } => module_swap(&mut client, &module_id, ready_timeout_ms, true).await,
+                    } => module_swap(&mut client, &module_id, ready_timeout_ms, true.into()).await,
                     ClientControlRequest::SupervisorRescan { preview } => {
-                        module_rescan(&mut client, true, preview).await
+                        module_rescan(&mut client, true.into(), preview).await
                     }
                     ClientControlRequest::SupervisorReleaseReserved { module_id } => {
-                        module_release_reserved(&mut client, &module_id, true).await
+                        module_release_reserved(&mut client, &module_id, true.into()).await
                     }
                     ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
-                        module_set_enabled(&mut client, &module_id, enabled, true).await
+                        module_set_enabled(&mut client, &module_id, enabled, true.into()).await
                     }
                     ClientControlRequest::SupervisorList {} => {
                         supervisor_list(&mut client).await.map(|_| ())

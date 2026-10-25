@@ -1,4 +1,7 @@
-//! Plain output for the three built-in views that differ from piped `ck`.
+//! Script-facing output for built-in commands.
+
+mod json;
+pub(super) use json::JsonOutput;
 
 use serde_json::Value;
 use subc_control::ClientControlRequest;

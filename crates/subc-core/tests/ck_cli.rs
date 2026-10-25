@@ -257,7 +257,7 @@ fn ckni_external_face_passes_ansi_own_json_stderr_and_exit_seven_unchanged() {
         let output = command
             .env("XDG_DATA_HOME", data.path())
             .env("LOCALAPPDATA", data.path())
-            .args(["example-face", "--json"])
+            .args(["--json", "example-face", "--json"])
             .output()
             .unwrap();
         assert_exit(&output, 7);
@@ -359,9 +359,13 @@ fn ckni_three_tables_are_selected_through_the_link_and_other_text_is_unchanged()
 }
 
 #[test]
-fn ckni_json_wins_over_each_plain_table_and_matches_piped_ck() {
+fn ckni_json_wins_over_each_plain_table_and_versions_the_piped_ck_payload() {
     let kit = common::kit::Kit::boot("ckni-json-tables", &[]);
-    for args in [&["health"][..], &["module", "list"], &["activity"]] {
+    for (args, schema) in [
+        (&["health"][..], "ck.health/v1"),
+        (&["module", "list"][..], "ck.module.list/v1"),
+        (&["activity"][..], "ck.activity/v1"),
+    ] {
         let (_link, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
         common::kit::isolate_client_fully(&mut command, &kit.client_root());
         let output = command
@@ -378,8 +382,319 @@ fn ckni_json_wins_over_each_plain_table_and_matches_piped_ck() {
         assert_exit(&output, 0);
         assert!(ck.stderr.is_empty(), "{}", text(&ck.stderr));
         assert_eq!(output.stderr, ck.stderr, "--json {}", args.join(" "));
-        assert_eq!(output.stdout, ck.stdout, "--json {}", args.join(" "));
-        serde_json::from_slice::<Value>(&output.stdout).expect("ckni --json prints JSON");
+        let mut versioned: Value =
+            serde_json::from_slice(&output.stdout).expect("ckni --json prints JSON");
+        assert_eq!(
+            versioned.as_object_mut().unwrap().remove("schema"),
+            Some(json!(schema))
+        );
+        let legacy: Value = serde_json::from_slice(&ck.stdout).unwrap();
+        if args == ["activity"] {
+            assert_eq!(versioned, json!({"entries": legacy}));
+        } else {
+            assert_eq!(versioned, legacy);
+        }
+    }
+}
+
+#[test]
+fn ckni_json_rejects_prose_help_and_version_before_discovery() {
+    for (args, name) in [
+        (vec!["setup", "--dry-run"], "setup"),
+        (vec!["upgrade", "--check"], "upgrade"),
+        (vec!["daemon", "lint"], "daemon lint"),
+        (vec!["--help"], "help"),
+        (vec!["module", "--help"], "help"),
+        (vec!["--version"], "version"),
+        (vec![], "help"),
+    ] {
+        let (_link, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+        let output = command.arg("--json").args(&args).output().unwrap();
+        assert_exit(&output, 2);
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert_eq!(
+            text(&output.stderr),
+            format!("ckni: usage: {name} has no JSON form\nRun ckni --help for the commands.\n")
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ckni_json_exemptions_keep_probes_and_action_acks_byte_identical() {
+    for flag in ["--ck-build-shape", "--ck-cli-face-reserved-names"] {
+        let (_link, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+        let ckni = command.args(["--json", flag]).output().unwrap();
+        let ck = ck_command().args(["--json", flag]).output().unwrap();
+        assert_exit(&ckni, 0);
+        assert_exit(&ck, 0);
+        assert_eq!(ckni.stdout, ck.stdout);
+        assert_eq!(ckni.stderr, ck.stderr);
+    }
+    for args in [
+        vec!["restart", "alpha"],
+        vec!["restart", "alpha", "--swap"],
+        vec!["stop", "alpha"],
+        vec!["start", "alpha"],
+    ] {
+        let steps = || {
+            let reply = |expected, response| ScriptedControlStep {
+                expected,
+                action: ScriptedControlAction::Reply(Box::new(response)),
+            };
+            let list = || {
+                reply(
+                    ClientControlRequest::SupervisorList {},
+                    ClientControlResponse::SupervisorList {
+                        generation: 1,
+                        modules: vec![SupervisorEntry::new(
+                            "alpha",
+                            "starting",
+                            true,
+                            false,
+                            SupervisorHealthStatus::Unknown,
+                        )],
+                    },
+                )
+            };
+            let request = match args.as_slice() {
+                ["restart", "alpha"] => ClientControlRequest::SupervisorRestart {
+                    module_id: "alpha".into(),
+                    drain_timeout_ms: None,
+                },
+                ["restart", "alpha", "--swap"] => ClientControlRequest::SupervisorSwap {
+                    module_id: "alpha".into(),
+                    ready_timeout_ms: None,
+                },
+                _ => ClientControlRequest::SupervisorSetEnabled {
+                    module_id: "alpha".into(),
+                    enabled: args[0] == "start",
+                },
+            };
+            let mut steps = vec![];
+            if args[0] != "restart" {
+                steps.push(list());
+            }
+            steps.push(reply(
+                request,
+                ClientControlResponse::SupervisorAck {
+                    module_id: "alpha".into(),
+                    applied: true,
+                },
+            ));
+            steps.push(list());
+            steps
+        };
+        let daemon = ScriptedDaemon::start_sessions("ckni-ack-json", vec![steps(), steps()]).await;
+        let (_link, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+        let ckni = command
+            .arg("--subc")
+            .arg(&daemon.connection_file_path)
+            .args(["--json", "module"])
+            .args(&args)
+            .output()
+            .unwrap();
+        let ck = ck_command()
+            .arg("--subc")
+            .arg(&daemon.connection_file_path)
+            .args(["--json", "module"])
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_exit(&ckni, 0);
+        assert_exit(&ck, 0);
+        assert_eq!(ckni.stdout, ck.stdout, "{args:?}");
+        assert_eq!(ckni.stderr, ck.stderr, "{args:?}");
+        let body: Value = serde_json::from_slice(&ckni.stdout).unwrap();
+        assert_eq!(body["applied"], true);
+        assert!(body.get("schema").is_none());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ck_json_terminal_health_list_and_restart_are_exactly_piped_without_progress() {
+    for args in [
+        vec!["health"],
+        vec!["module", "list"],
+        vec!["module", "restart", "alpha"],
+    ] {
+        let steps = || {
+            let reply = |expected, response| ScriptedControlStep {
+                expected,
+                action: ScriptedControlAction::Reply(Box::new(response)),
+            };
+            let list = || ClientControlResponse::SupervisorList {
+                generation: 1,
+                modules: vec![SupervisorEntry::new(
+                    "alpha",
+                    "starting",
+                    true,
+                    false,
+                    SupervisorHealthStatus::Unknown,
+                )],
+            };
+            match args.as_slice() {
+                ["health"] => vec![reply(
+                    ClientControlRequest::SupervisorHealth {},
+                    ClientControlResponse::SupervisorHealth {
+                        generation: 1,
+                        modules: vec![],
+                    },
+                )],
+                ["module", "list"] => vec![reply(ClientControlRequest::SupervisorList {}, list())],
+                _ => vec![
+                    reply(
+                        ClientControlRequest::SupervisorRestart {
+                            module_id: "alpha".into(),
+                            drain_timeout_ms: None,
+                        },
+                        ClientControlResponse::SupervisorAck {
+                            module_id: "alpha".into(),
+                            applied: true,
+                        },
+                    ),
+                    reply(ClientControlRequest::SupervisorList {}, list()),
+                ],
+            }
+        };
+        let daemon = ScriptedDaemon::start_sessions("ck-json-pty", vec![steps(), steps()]).await;
+        let mut command = ck_command();
+        command
+            .env_remove("NO_COLOR")
+            .arg("--subc")
+            .arg(&daemon.connection_file_path)
+            .arg("--json")
+            .args(&args);
+        let piped = command.output().unwrap();
+        let terminal = upgrade_terminal_output(&command);
+        assert_exit(&piped, 0);
+        assert_exit(&terminal, 0);
+        assert!(piped.stderr.is_empty());
+        assert_eq!(terminal.stdout, piped.stdout, "{args:?}");
+        assert_eq!(terminal.stderr, piped.stderr, "{args:?}");
+        assert!(!terminal.stdout.contains(&0x1b));
+        let body: Value = serde_json::from_slice(&terminal.stdout).unwrap();
+        assert!(
+            body.get("schema").is_none(),
+            "ck keeps its existing JSON shape"
+        );
+        if args.contains(&"restart") {
+            assert_eq!(body["applied"], true);
+            assert_eq!(
+                body["state"], "starting",
+                "returns at the ack, not at healthy"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ckni_json_log_follow_versions_each_initial_and_appended_line() {
+    use std::io::Write;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let data = TempDir::new("ckni-log-json");
+    let logs = data.join("cortexkit/alpha/logs");
+    fs::create_dir_all(&logs).unwrap();
+    let path = logs.join("alpha.2026-01-01.log");
+    fs::write(&path, "2026-01-01T00:00:00.000Z INFO  alpha: initial\n").unwrap();
+    let daemon = ScriptedDaemon::start(
+        "ckni-log-json",
+        vec![ScriptedControlStep {
+            expected: ClientControlRequest::SupervisorList {},
+            action: ScriptedControlAction::Reply(Box::new(ClientControlResponse::SupervisorList {
+                generation: 1,
+                modules: vec![scripted_supervisor_entry("alpha", None)],
+            })),
+        }],
+    )
+    .await;
+    let (_link, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+    command
+        .env("XDG_DATA_HOME", data.path())
+        .arg("--subc")
+        .arg(&daemon.connection_file_path)
+        .args(["--json", "module", "logs", "alpha", "-f"]);
+    let mut command = tokio::process::Command::from(command);
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let initial = timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let initial: Value = serde_json::from_str(&initial).expect("one complete object per line");
+    assert_eq!(initial["schema"], "ck.module.logs/v1");
+    assert!(initial["line"].as_str().unwrap().ends_with("initial"));
+    assert!(initial.get("lines").is_none());
+    // The follower snapshots the file end after the initial output. Let that
+    // snapshot complete before appending the line whose delivery is asserted.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    writeln!(
+        fs::OpenOptions::new().append(true).open(&path).unwrap(),
+        "2026-01-01T00:00:01.000Z INFO  alpha: appended"
+    )
+    .unwrap();
+    let appended = timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let appended: Value = serde_json::from_str(&appended).unwrap();
+    assert_eq!(appended["schema"], "ck.module.logs/v1");
+    assert!(appended["line"].as_str().unwrap().ends_with("appended"));
+    child.kill().await.unwrap();
+    let output = child.wait_with_output().await.unwrap();
+    assert_eq!(text(&output.stderr), "showing 1 of 1 lines\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ckni_json_empty_logs_are_arrays_and_unknown_modules_are_refused() {
+    for known in [true, false] {
+        let data = TempDir::new("ckni-empty-log-json");
+        let daemon = ScriptedDaemon::start(
+            "ckni-empty-log-json",
+            vec![ScriptedControlStep {
+                expected: ClientControlRequest::SupervisorList {},
+                action: ScriptedControlAction::Reply(Box::new(
+                    ClientControlResponse::SupervisorList {
+                        generation: 1,
+                        modules: if known {
+                            vec![scripted_supervisor_entry("alpha", None)]
+                        } else {
+                            vec![]
+                        },
+                    },
+                )),
+            }],
+        )
+        .await;
+        let (_link, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+        let output = command
+            .env("XDG_DATA_HOME", data.path())
+            .arg("--subc")
+            .arg(&daemon.connection_file_path)
+            .args(["--json", "module", "logs", "alpha"])
+            .output()
+            .unwrap();
+        if known {
+            assert_exit(&output, 0);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+                json!({"schema":"ck.module.logs/v1","lines":[]})
+            );
+            assert_eq!(text(&output.stderr), "showing 0 of 0 lines\n");
+        } else {
+            assert_exit(&output, 1);
+            assert!(output.stdout.is_empty());
+            assert!(text(&output.stderr)
+                .starts_with("ckni: failed: module_id 'alpha' is not supervised\n"));
+        }
     }
 }
 

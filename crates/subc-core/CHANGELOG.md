@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.20.134
+
+- `ck` started under the name `ckni` runs as ckni. The name is the last
+  part of argv[0]: exactly `ckni` on Unix, and on Windows `ckni` with or
+  without `.exe`, in any case. With no command ckni is a usage error (exit
+  2) instead of the dashboard or the terminal app, and `ckni setup` fails
+  with a usage error where `ck setup` would ask "Continue? [y/N]". `ck
+  upgrade` never asks, so `ckni upgrade` behaves as it does.
+- `ck setup` puts `ckni` beside the `ck` the installer manifest owns: a
+  relative symlink on Unix, a `ckni.exe` copy on Windows. It is recorded
+  under the existing `managed-link` kind, which uninstall already removes;
+  a copy's row carries its `sha256`. The plan lists it ("would link ckni to
+  ck at …" / "would copy ck to ckni at …"), and setup touches nothing else
+  for it. A `ckni` the manifest doesn't list is refused with the
+  unowned-binary refusal, and nothing changes.
+- The engine's `ck` replacement step (`ck upgrade` and Settings → Updates),
+  and a rollback of `ck`, bring `ckni` in line with the new `ck`: on
+  Windows the copy is rewritten and its digest recorded. `ck upgrade` and
+  the update wizard refuse up front when an unowned `ckni` sits beside the
+  managed `ck`, listing it with the other unowned binaries.
+- Under a `ckni.exe` copy, setup and upgrade act on the `ck.exe` beside it.
+- Uninstall removes a `ckni` symlink only while it is still a symlink
+  pointing where setup pointed it, even when `ck` is already gone. A regular
+  file, or a link pointing elsewhere, is kept and reported as a modified
+  managed destination, as a changed copy already was.
+
 ## 0.20.133
 
 - The terminal app's update wizard asks the person whether to roll back a

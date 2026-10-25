@@ -1,5 +1,6 @@
 use super::{
     bus_monitoring::BusMonitoring,
+    ckni::CkniState,
     conversion::{explicit_conversion_requires_confirmation, selected_components},
     model::{
         Component, ComponentState, ConfigurationState, CoreVersion, DetectionOutcome, PlanOutcome,
@@ -114,6 +115,17 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
             }
         }
     }
+    // A `ckni` setup didn't install is refused like any other binary it
+    // didn't install: the operator moves it aside, and setup links its own.
+    if let Some(ckni) = observed
+        .ckni
+        .as_ref()
+        .filter(|ckni| ckni.state == CkniState::Unowned)
+    {
+        plan.outcomes.push(PlanOutcome::Refusal {
+            reason: super::text::unowned_binary_refusal(&ckni.link),
+        });
+    }
     if !plan.is_authorized() {
         return plan;
     }
@@ -121,6 +133,16 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
     if let Some(path) = &observed.running_ck_adoption {
         plan.operations
             .push(SetupOperation::AdoptRunningCk { path: path.clone() });
+    }
+    if let Some(ckni) = observed
+        .ckni
+        .as_ref()
+        .filter(|ckni| matches!(ckni.state, CkniState::Missing | CkniState::Stale))
+    {
+        plan.operations.push(SetupOperation::LinkCkni {
+            ck: ckni.ck.clone(),
+            link: ckni.link.clone(),
+        });
     }
 
     record_detection_outcomes(observed, &mut plan);
@@ -730,6 +752,7 @@ fn plan_upgrade_target(plan: &mut UpgradePlan, target: UpgradeTarget, observed: 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::Path;
 
     use super::super::{
         components::upgrade_roster,
@@ -780,6 +803,7 @@ mod tests {
             runtime: RuntimeState::Missing,
             configuration: ConfigurationState::Additive,
             running_ck_adoption: None,
+            ckni: None,
             mc_detection: None,
             detections: BTreeMap::new(),
             restart_required: Vec::new(),
@@ -817,6 +841,63 @@ mod tests {
             }],
         );
         observed
+    }
+
+    fn with_ckni(state: super::super::ckni::CkniState) -> SetupObserved {
+        let mut observed = installed_core_setup(Some("0.20.83"));
+        observed.ckni = Some(super::super::ckni::CkniObservation {
+            ck: "/managed/cmd/ck".into(),
+            link: "/managed/cmd/ckni".into(),
+            state,
+        });
+        observed
+    }
+
+    fn ckni_operations(plan: &SetupPlan) -> Vec<&SetupOperation> {
+        plan.operations
+            .iter()
+            .filter(|operation| matches!(operation, SetupOperation::LinkCkni { .. }))
+            .collect()
+    }
+
+    #[test]
+    fn setup_links_a_missing_or_stale_ckni_and_leaves_a_current_one() {
+        use super::super::ckni::CkniState;
+        let request = SetupRequest::install(vec![]);
+        for state in [CkniState::Missing, CkniState::Stale] {
+            let plan = plan_setup(&with_ckni(state), &request);
+            assert!(plan.is_authorized(), "{}", plan.render());
+            assert_eq!(
+                ckni_operations(&plan),
+                [&SetupOperation::LinkCkni {
+                    ck: "/managed/cmd/ck".into(),
+                    link: "/managed/cmd/ckni".into(),
+                }],
+                "{state:?}"
+            );
+            assert!(plan.mutation_count() >= 1);
+        }
+        let plan = plan_setup(&with_ckni(CkniState::Current), &request);
+        assert!(ckni_operations(&plan).is_empty(), "{}", plan.render());
+        let plan = plan_setup(&installed_core_setup(Some("0.20.83")), &request);
+        assert!(ckni_operations(&plan).is_empty(), "{}", plan.render());
+    }
+
+    #[test]
+    fn setup_refuses_a_ckni_it_did_not_install_before_any_mutation() {
+        let observed = with_ckni(super::super::ckni::CkniState::Unowned);
+        let plan = plan_setup(&observed, &SetupRequest::install(vec![]));
+        assert!(!plan.is_authorized());
+        assert_eq!(plan.mutation_count(), 0);
+        assert_eq!(
+            plan.blocking_outcome(),
+            Some(&PlanOutcome::Refusal {
+                reason: super::super::text::unowned_binary_refusal(Path::new("/managed/cmd/ckni")),
+            })
+        );
+        let mut executor = RecordingExecutor::default();
+        execute_setup(&plan, ExecutionMode::Apply, &mut executor).unwrap();
+        assert!(executor.applied.is_empty());
     }
 
     #[test]

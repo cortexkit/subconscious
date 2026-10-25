@@ -319,6 +319,11 @@ pub struct SetupObserved {
     /// The bootstrap installer owns the running `ck` placement but setup has
     /// not yet recorded its managed-binary identity.
     pub running_ck_adoption: Option<std::path::PathBuf>,
+    /// The `ckni` path beside the running `ck` and what is there, when that
+    /// `ck` is one the installer manifest owns or setup is about to adopt.
+    /// `None` for any other `ck` (a build folder, a package manager), which
+    /// setup never puts `ckni` beside.
+    pub ckni: Option<super::ckni::CkniObservation>,
     /// Retains the MC database probe result so the planner can distinguish an
     /// absent installation from a state that is unsafe for automatic conversion.
     pub mc_detection: Option<McDetection>,
@@ -371,6 +376,7 @@ impl SetupObserved {
             runtime: RuntimeState::Missing,
             configuration: ConfigurationState::Additive,
             running_ck_adoption: None,
+            ckni: None,
             mc_detection: Some(mc_detection),
             detections,
             restart_required: Vec::new(),
@@ -578,6 +584,12 @@ pub enum SetupOperation {
     AdoptRunningCk {
         path: std::path::PathBuf,
     },
+    /// Put `ckni` at `link` beside the managed `ck`, or bring an existing
+    /// one setup installed back in line with it.
+    LinkCkni {
+        ck: std::path::PathBuf,
+        link: std::path::PathBuf,
+    },
     RescanComponent {
         component: Component,
     },
@@ -617,6 +629,7 @@ impl SetupOperation {
                 | Self::ConfigureComponent { .. }
                 | Self::BootstrapClaustrum { .. }
                 | Self::AdoptRunningCk { .. }
+                | Self::LinkCkni { .. }
                 | Self::RescanComponent { .. }
                 | Self::EnableComponent { .. }
                 | Self::RestartRuntime { .. }
@@ -643,6 +656,7 @@ impl SetupOperation {
             | Self::OfferConversion { .. }
             | Self::ConfirmConversion { .. }
             | Self::AdoptRunningCk { .. }
+            | Self::LinkCkni { .. }
             | Self::RestartRuntime { .. }
             | Self::RegisterRuntime
             | Self::UpdateRuntimeDefinition { .. }
@@ -693,6 +707,14 @@ impl fmt::Display for SetupOperation {
             }
             Self::AdoptRunningCk { path } => {
                 write!(formatter, "adopt running ck binary at {}", path.display())
+            }
+            Self::LinkCkni { link, .. } => {
+                write!(
+                    formatter,
+                    "{} at {}",
+                    super::ckni::Mechanism::CURRENT.plan_verb(),
+                    link.display()
+                )
             }
             Self::RescanComponent { component } => {
                 write!(formatter, "rescan {component} module entry")

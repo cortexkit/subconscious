@@ -91,6 +91,22 @@ pub fn upgrade_ownership_outcomes(
 ) -> Result<Vec<super::PlanOutcome>, String> {
     let inventory = load_current_inventory()?;
     let binary_home = load_current_inventory_root()?.join("bin");
+    Ok(ownership_outcomes(
+        executable,
+        discovered,
+        &inventory,
+        &binary_home,
+    ))
+}
+
+/// [`upgrade_ownership_outcomes`] over an inventory and bin folder already
+/// located.
+fn ownership_outcomes(
+    executable: &Path,
+    discovered: &[ManagedUpgradeTarget],
+    inventory: &Inventory,
+    binary_home: &Path,
+) -> Vec<super::PlanOutcome> {
     let mut outcomes = Vec::new();
     if let super::PlatformObservation::Supported(target) = super::PlatformObservation::current() {
         let mut unowned = Vec::new();
@@ -100,9 +116,23 @@ pub fn upgrade_ownership_outcomes(
             .chain(std::iter::once(&["ck"][..]))
         {
             for (_, path) in
-                super::components::unowned_binary_paths(binaries, &binary_home, &inventory)
+                super::components::unowned_binary_paths(binaries, binary_home, inventory)
             {
                 unowned.push(path);
+            }
+        }
+        // A `ckni` that `ck setup` did not install, sitting beside the
+        // managed `ck`, is refused with the other unowned binaries before
+        // anything changes. The replacement step leaves such a `ckni` alone
+        // if one appears during the run.
+        if let Some(ck) = discovered
+            .iter()
+            .find(|item| item.target.is_self_replacing())
+        {
+            let ckni =
+                super::ckni::observe(&ck.destination, inventory, super::ckni::Mechanism::CURRENT);
+            if ckni.state == super::ckni::CkniState::Unowned {
+                unowned.push(ckni.link);
             }
         }
         if !discovered.is_empty()
@@ -123,7 +153,7 @@ pub fn upgrade_ownership_outcomes(
             });
         }
     }
-    Ok(outcomes)
+    outcomes
 }
 
 /// Reads only inventory evidence for the dashboard. It avoids probing binaries:
@@ -1166,6 +1196,17 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             .remove(target.label())
             .flatten();
         self.record_replacement_digest(target, &destination, previous_archive.as_deref())?;
+        // Restoring `ck` changes its bytes as much as replacing it did, so a
+        // Windows `ckni.exe` copy is rewritten to the restored `ck` too.
+        let ckni_note = if target.is_self_replacing() {
+            super::ckni::refresh_after_ck_replacement(
+                &destination,
+                &mut self.inventory,
+                super::ckni::Mechanism::CURRENT,
+            )?
+        } else {
+            String::new()
+        };
         fs::remove_file(&rollback).map_err(|error| {
             format!(
                 "restored {} but could not remove rollback copy {}: {error}",
@@ -1183,7 +1224,7 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             })
             .unwrap_or_default();
         Ok(format!(
-            "accepted; restored prior binary at inode={}{aside_note}",
+            "accepted; restored prior binary at inode={}{aside_note}{ckni_note}",
             destination_inode(&destination)?
         ))
     }
@@ -1303,7 +1344,7 @@ fn process_id() -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use serde_json::Map;
     #[cfg(unix)]
     use serde_json::Value;
@@ -1617,7 +1658,7 @@ mod tests {
     /// inventory kept outside the binary's directory so tests can compare that
     /// directory's whole listing. Builds on every platform: the destination
     /// need not be executable until something runs it.
-    fn managed_backend(
+    pub(in crate::setup) fn managed_backend(
         root: &Path,
         target: UpgradeTarget,
         destination: &Path,
@@ -1660,7 +1701,7 @@ mod tests {
 
     /// Hands the backend a verified candidate with `bytes`, in its own
     /// workspace outside the binary's directory, as `download_and_verify` would.
-    fn stage_candidate(
+    pub(in crate::setup) fn stage_candidate(
         backend: &mut SystemUpgradeBackend,
         root: &Path,
         target: UpgradeTarget,
@@ -1683,6 +1724,44 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    #[test]
+    fn upgrade_refuses_a_ckni_beside_ck_that_setup_did_not_install() {
+        use crate::setup::ckni::{link_path, CKNI_KIND};
+        let root = ScratchDir::new("upgrade-ckni-unowned");
+        let bin = root.join("bin");
+        let cmd = root.join("cmd");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(&cmd).unwrap();
+        let ck = cmd.join(if cfg!(windows) { "ck.exe" } else { "ck" });
+        fs::write(&ck, "ck").unwrap();
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
+        inventory.record("managed-binary", &ck, Map::new());
+        let discovered = [ManagedUpgradeTarget {
+            target: upgrade_target("ck"),
+            destination: ck.clone(),
+            installed_version: "0.1.0".into(),
+            installed_archive_sha256: None,
+        }];
+        let outcomes =
+            |inventory: &Inventory| ownership_outcomes(&ck, &discovered, inventory, &bin);
+        assert!(outcomes(&inventory).is_empty());
+
+        let ckni = link_path(&ck);
+        fs::write(&ckni, "someone else's ckni").unwrap();
+        assert_eq!(
+            outcomes(&inventory),
+            [crate::setup::PlanOutcome::Refusal {
+                reason: crate::setup::text::upgrade_unowned_binaries_refusal(std::slice::from_ref(
+                    &ckni
+                )),
+            }]
+        );
+
+        inventory.record(CKNI_KIND, &ckni, Map::new());
+        assert!(outcomes(&inventory).is_empty());
     }
 
     #[test]

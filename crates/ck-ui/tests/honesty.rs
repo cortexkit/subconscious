@@ -634,12 +634,17 @@ fn the_live_app_advertises_only_what_it_serves() {
     app.overlay = Some(Overlay::Help);
     let buf = render(&app, &s, 120, 36);
     let page: String = (0..36).map(|y| row(&buf, y) + "\n").collect();
-    for gone in ["restart, no downtime", "space", "double-click", "ckni"] {
+    for gone in ["restart, no downtime", "space", "double-click"] {
         assert!(
             !page.contains(gone),
             "the live keys page offers {gone:?}:\n{page}"
         );
     }
+    // ckni ships beside ck, so the keys page points scripts and agents at it.
+    assert!(
+        page.contains("ckni runs any command without this app"),
+        "the live keys page leaves out ckni:\n{page}"
+    );
 
     // Each listed key does something.
     let served =

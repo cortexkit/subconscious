@@ -1014,7 +1014,9 @@ impl Serves {
         list_filter: TabSet::of(&[Tab::Activity, Tab::Agents, Tab::Settings]),
         multi_select: false,
         double_click: false,
-        ckni: false,
+        // `ckni` is the same binary under another name; setup and upgrade
+        // put it beside `ck`.
+        ckni: true,
         approvals: false,
         all_metrics: true,
         usage_detail: false,

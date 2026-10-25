@@ -66,6 +66,12 @@ fn remove_owned_path(
     if !inventory.owns_path(kind, path) {
         return Ok(());
     }
+    if let Some(targets) = inventory
+        .entry_for_path(kind, path)
+        .and_then(super::ckni::recorded_symlink_targets)
+    {
+        return remove_owned_symlink(kind, path, &targets, inventory, report);
+    }
     if path.exists() {
         if let Some(expected) = inventory
             .entry_for_path(kind, path)
@@ -105,6 +111,54 @@ fn remove_owned_path(
             )
         })?;
         report.removed.push(path.to_path_buf());
+    }
+    inventory.remove_owned_path(kind, path);
+    Ok(())
+}
+
+/// Removes a symlink setup recorded, judging the link itself rather than
+/// the file it points at: a row for a symlink carries no digest, so the
+/// link's own target is the only evidence it is still setup's. A link that
+/// still points where setup pointed it is removed even when that target is
+/// already gone. Anything else at the path (a regular file, or a link
+/// pointing elsewhere) was put there by someone else and is kept, reported
+/// the way a modified copy is.
+fn remove_owned_symlink(
+    kind: &str,
+    path: &Path,
+    targets: &[PathBuf],
+    inventory: &mut Inventory,
+    report: &mut UninstallReport,
+) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "could not inspect inventory-owned {}: {error}",
+                path.display()
+            ))
+        }
+        Ok(metadata) => {
+            let ours = if !metadata.file_type().is_symlink() {
+                false
+            } else {
+                fs::read_link(path).is_ok_and(|target| targets.contains(&target))
+            };
+            if !ours {
+                report.retained.push(format!(
+                    "modified managed destination retained: {}",
+                    path.display()
+                ));
+                return Ok(());
+            }
+            fs::remove_file(path).map_err(|error| {
+                format!(
+                    "could not remove inventory-owned {}: {error}",
+                    path.display()
+                )
+            })?;
+            report.removed.push(path.to_path_buf());
+        }
     }
     inventory.remove_owned_path(kind, path);
     Ok(())
@@ -303,5 +357,111 @@ mod tests {
             .retained
             .iter()
             .any(|line| line.contains("modified managed destination retained")));
+    }
+
+    /// A `ck` and a `ckni` symlink row as setup records them, with whatever
+    /// `place` puts at the `ckni` path.
+    #[cfg(unix)]
+    fn uninstall_ckni(
+        name: &str,
+        place: impl FnOnce(&Path, &Path),
+    ) -> (ScratchDir, PathBuf, UninstallReport, Inventory) {
+        use super::super::ckni::CKNI_KIND;
+        let root = fixture_dir(name);
+        let ck = root.join("ck");
+        let ckni = root.join("ckni");
+        place(&ck, &ckni);
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
+        let mut fields = Map::new();
+        fields.insert(
+            "mechanism".into(),
+            serde_json::Value::String("symlink".into()),
+        );
+        fields.insert(
+            "links_to".into(),
+            serde_json::Value::String(ck.to_string_lossy().into_owned()),
+        );
+        inventory.record(CKNI_KIND, &ckni, fields);
+        let runtime_paths = RuntimePaths {
+            definition: root.join("unit"),
+            daemon: root.join("ck-subc"),
+        };
+        let report = uninstall(
+            RuntimePlatform::Linux,
+            &runtime_paths,
+            None,
+            &mut SuccessfulRunner,
+            &mut inventory,
+            &root.join("subc.jsonc"),
+            &[],
+        )
+        .expect("uninstall");
+        (root, ckni, report, inventory)
+    }
+
+    #[cfg(unix)]
+    fn retained(report: &UninstallReport, path: &Path) -> bool {
+        report.retained.contains(&format!(
+            "modified managed destination retained: {}",
+            path.display()
+        ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_keeps_a_regular_file_that_replaced_the_ckni_link() {
+        let (_root, ckni, report, inventory) =
+            uninstall_ckni("ckni-replaced-by-file", |ck, ckni| {
+                fs::write(ck, "ck").unwrap();
+                fs::write(ckni, "someone's own ckni").unwrap();
+            });
+        assert_eq!(fs::read_to_string(&ckni).unwrap(), "someone's own ckni");
+        assert!(retained(&report, &ckni), "{report:?}");
+        assert!(!report.removed.contains(&ckni));
+        assert!(inventory.owns_path(super::super::ckni::CKNI_KIND, &ckni));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_keeps_a_ckni_link_that_points_somewhere_else() {
+        let (root, ckni, report, _) = uninstall_ckni("ckni-points-elsewhere", |ck, ckni| {
+            fs::write(ck, "ck").unwrap();
+            let elsewhere = ck.with_file_name("elsewhere");
+            fs::write(&elsewhere, "another program").unwrap();
+            std::os::unix::fs::symlink(&elsewhere, ckni).unwrap();
+        });
+        assert_eq!(fs::read_link(&ckni).unwrap(), root.join("elsewhere"));
+        assert!(retained(&report, &ckni), "{report:?}");
+        assert!(!report.removed.contains(&ckni));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_removes_a_dangling_ckni_link_that_still_points_at_ck() {
+        // ck is already gone, so the link dangles; it is still setup's link.
+        let (_root, ckni, report, inventory) = uninstall_ckni("ckni-dangling", |_ck, ckni| {
+            std::os::unix::fs::symlink("ck", ckni).unwrap();
+        });
+        assert!(
+            fs::symlink_metadata(&ckni).is_err(),
+            "the dangling link remains"
+        );
+        assert_eq!(report.removed, std::slice::from_ref(&ckni));
+        assert!(!retained(&report, &ckni));
+        assert!(!inventory.owns_path(super::super::ckni::CKNI_KIND, &ckni));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_removes_a_ckni_link_to_ck_and_leaves_ck_for_its_own_row() {
+        let (root, ckni, report, _) = uninstall_ckni("ckni-live", |ck, ckni| {
+            fs::write(ck, "ck").unwrap();
+            std::os::unix::fs::symlink(ck, ckni).unwrap();
+        });
+        assert!(fs::symlink_metadata(&ckni).is_err());
+        assert_eq!(report.removed, std::slice::from_ref(&ckni));
+        // Nothing owns ck in this fixture, so it stays.
+        assert!(root.join("ck").exists());
     }
 }

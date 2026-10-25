@@ -714,6 +714,87 @@ mod tests {
         }
     }
 
+    /// The engine's ck replacement step, reached through the wizard's
+    /// backend, brings the `ckni` setup installed in line with the new `ck`:
+    /// on Unix by putting the symlink in place, on Windows by rewriting the
+    /// `ckni.exe` copy and its recorded digest.
+    #[test]
+    fn replacing_ck_through_the_wizard_brings_ckni_in_line() {
+        use crate::setup::ckni::{link_path, CKNI_KIND};
+        use crate::setup::inventory::Inventory;
+        use crate::setup::upgrade::tests::{managed_backend, stage_candidate};
+        use std::fs;
+
+        let root = cortexkit_test_support::ScratchDir::new("wizard-ckni");
+        let cmd = root.join("cmd");
+        fs::create_dir(&cmd).unwrap();
+        let ck = cmd.join(if cfg!(windows) { "ck.exe" } else { "ck" });
+        let ckni = link_path(&ck);
+        fs::write(&ck, b"old ck").unwrap();
+        // The copy setup made of the old ck, on record as setup's own.
+        fs::write(&ckni, b"old ck").unwrap();
+        let manifest = root.join("installer-manifest.json");
+        let mut inventory = Inventory::load(&manifest, "linux-x64").unwrap();
+        inventory.record(CKNI_KIND, &ckni, serde_json::Map::new());
+        inventory.save().unwrap();
+
+        let target = upgrade_roster([Component::Core])
+            .into_iter()
+            .find(|target| target.is_self_replacing())
+            .expect("ck is in Core's roster");
+        let mut backend = managed_backend(&root, target, &ck);
+        stage_candidate(&mut backend, &root, target, b"new ck");
+
+        let mut events = Vec::new();
+        let mut report = |event| {
+            if let UpgradeEvent::Stage(event) = event {
+                events.push(event);
+            }
+        };
+        let mut ask = |_: RollbackQuestion| -> Option<RollbackChoice> { None };
+        let mut reporting = Reporting {
+            inner: backend,
+            report: &mut report,
+            ask: &mut ask,
+            daemon: None,
+            versions: BTreeMap::new(),
+            previous: BTreeMap::new(),
+            failure: None,
+            installed: Vec::new(),
+        };
+        let detail = reporting
+            .replace_destination(target)
+            .expect("ck is replaced");
+
+        assert_eq!(fs::read(&ck).unwrap(), b"new ck");
+        assert_eq!(fs::read(&ckni).unwrap(), b"new ck", "{detail}");
+        let saved = Inventory::load(&manifest, "linux-x64").unwrap();
+        let row = saved
+            .entry_for_path(CKNI_KIND, &ckni)
+            .expect("ckni stays on record");
+        if cfg!(windows) {
+            assert!(detail.contains("copied ck to"), "{detail}");
+            assert_eq!(row["mechanism"], "copy");
+            assert_eq!(
+                row["sha256"],
+                crate::setup::components::digest_file(&ck).unwrap().as_str()
+            );
+        } else {
+            assert!(detail.contains("linked"), "{detail}");
+            assert!(fs::symlink_metadata(&ckni)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(row["mechanism"], "symlink");
+            assert!(row.get("sha256").is_none(), "{row}");
+        }
+        drop(reporting);
+        assert!(matches!(
+            events.last().map(|event| &event.status),
+            Some(StageStatus::Ok(ok)) if *ok == detail
+        ));
+    }
+
     #[test]
     fn rows_say_what_each_replacement_restarts_and_which_is_the_daemon() {
         let observed = observed();

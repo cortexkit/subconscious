@@ -104,6 +104,21 @@ pub(crate) fn replace_verified_candidate(
                 )
             })?;
     }
+    // `ckni` runs `ck`'s bytes under another name. On Windows it is a copy,
+    // so every upgrade that replaces `ck` (`ck upgrade` and the app's update
+    // wizard) rewrites it here. A rollback refreshes it in its own path, and
+    // `ck setup` places or refreshes it through its separate link step.
+    let ckni_note = super::ckni::refresh_after_ck_replacement(
+        destination,
+        inventory,
+        super::ckni::Mechanism::CURRENT,
+    )
+    .map_err(|error| {
+        format!(
+            "refusal: self-update installed {} but could not bring ckni in line with it: {error}",
+            destination.display()
+        )
+    })?;
     inventory.save().map_err(|error| {
         format!(
             "refusal: self-update installed {} but could not save installer-manifest.json: {error}",
@@ -112,7 +127,9 @@ pub(crate) fn replace_verified_candidate(
     })?;
 
     Ok(SelfUpdateEvidence {
-        detail: format!("{replacement_detail}; installer-manifest.json SHA-256 reconciled"),
+        detail: format!(
+            "{replacement_detail}; installer-manifest.json SHA-256 reconciled{ckni_note}"
+        ),
     })
 }
 

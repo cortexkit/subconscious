@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.8
+
+- The live app serves `ckni`: the keys page shows its "Scripts and agents"
+  paragraph, now that setup and upgrade put `ckni` beside `ck`.
+
 ## 0.2.7
 
 - When an upgrade run from Settings → Updates fails after replacing a

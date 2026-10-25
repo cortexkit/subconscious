@@ -9,6 +9,7 @@ use serde_json::{Map, Value};
 
 use super::{
     bus_monitoring::{self, BusMonitoring},
+    ckni,
     components::{self, ReleaseArtifactSource},
     config,
     conversion::selected_components,
@@ -269,6 +270,7 @@ impl SetupBackend {
         )?;
         observed.configuration = configuration;
         observed.running_ck_adoption = self.running_ck_adoption();
+        observed.ckni = self.ckni_observation(observed.running_ck_adoption.is_some());
         if !request.uninstall {
             observed.bus_monitoring =
                 bus_monitoring::observe(&self.paths.config_path, &mut bus_monitoring::CkBusCommand);
@@ -358,6 +360,11 @@ impl SetupBackend {
                 SetupOperation::AdoptRunningCk { path } => steps.push(format!(
                     "would adopt {} as the managed ck binary",
                     components::display_home_path(path)
+                )),
+                SetupOperation::LinkCkni { link, .. } => steps.push(format!(
+                    "would {} at {}",
+                    ckni::Mechanism::CURRENT.plan_verb(),
+                    components::display_home_path(link)
                 )),
                 SetupOperation::EnableComponent { component } => steps.push(format!(
                     "would register {} with the daemon and check its health",
@@ -593,6 +600,14 @@ impl SetupBackend {
             .then(|| self.executable.clone())
             .filter(|path| path.is_file())
             .filter(|path| !self.inventory.owns_path("managed-binary", path))
+    }
+
+    /// The `ckni` beside the running `ck`, read only when that `ck` is one
+    /// the manifest owns or this run adopts; setup never puts `ckni` beside
+    /// a `ck` it doesn't manage.
+    fn ckni_observation(&self, adopting: bool) -> Option<ckni::CkniObservation> {
+        (adopting || ckni::ck_is_owned(&self.executable, &self.inventory))
+            .then(|| ckni::observe(&self.executable, &self.inventory, ckni::Mechanism::CURRENT))
     }
 
     fn adopt_running_ck(&mut self, path: &Path) -> Result<(), String> {
@@ -951,6 +966,17 @@ impl SetupExecutor for SetupBackend {
                 self.bootstrap_claustrum(key_path.as_deref())
             }
             SetupOperation::AdoptRunningCk { path } => self.adopt_running_ck(path),
+            SetupOperation::LinkCkni { ck, .. } => {
+                if let Some(detail) = ckni::install(
+                    ck,
+                    &mut self.inventory,
+                    ckni::Mechanism::CURRENT,
+                    super::text::unowned_binary_refusal,
+                )? {
+                    println!("  {detail}");
+                }
+                Ok(())
+            }
             SetupOperation::RescanComponent { .. } => self.run_ck(&["module", "rescan"]),
             SetupOperation::EnableComponent { component } => self.run_ck(&[
                 "module",

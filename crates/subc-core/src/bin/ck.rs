@@ -492,6 +492,13 @@ fn cleanup_replaced_windows_ck() -> Result<(), CkError> {
 
 async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     let args = parse_args(argv)?;
+    let ckni = invoked_as_ckni(&args.program);
+
+    // A bare `ck` opens the app in a terminal; ckni is for scripts and
+    // agents and never opens it, so it needs a command.
+    if ckni && matches!(&args.command, Command::Dashboard) {
+        return Err(CkError::Usage(CKNI_NEEDS_A_COMMAND.to_string()));
+    }
 
     if matches!(&args.command, Command::BuildShape) {
         println!("{CK_BUILD_SHAPE}");
@@ -523,7 +530,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         return fleet_lint_command(config.as_deref(), *verbose).await;
     }
     if let Command::Setup(request) = &args.command {
-        return setup_command(&running_executable()?, request);
+        return setup_command(&running_executable()?, request, ckni);
     }
     if let Command::Upgrade {
         check,
@@ -1157,16 +1164,62 @@ fn print_static_domains() {
 
 /// Lifecycle mutations identify the executable inode, not argv[0]: a shell
 /// invocation through PATH commonly supplies only the bare display name `ck`.
+/// Under a `ckni.exe` copy the running image is the copy, and setup and
+/// upgrade manage the `ck` beside it, so that is the executable they get.
 fn running_executable() -> Result<PathBuf, CkError> {
     let path = env::current_exe()
         .map_err(|error| CkError::Message(format!("could not identify the running ck: {error}")))?;
-    fs::canonicalize(&path).map_err(|error| {
-        CkError::Message(format!(
-            "could not canonicalize running ck {}: {error}",
-            path.display()
-        ))
-    })
+    fs::canonicalize(&path)
+        .map(ck_beside_ckni)
+        .map_err(|error| {
+            CkError::Message(format!(
+                "could not canonicalize running ck {}: {error}",
+                path.display()
+            ))
+        })
 }
+
+/// The `ck` beside `path` when `path` is a `ckni` copy and that `ck`
+/// exists; `path` otherwise. A symlinked `ckni` already canonicalizes to
+/// `ck`.
+fn ck_beside_ckni(path: PathBuf) -> PathBuf {
+    if !is_ckni_name(&path, cfg!(windows)) {
+        return path;
+    }
+    let ck = path.with_file_name(if cfg!(windows) { "ck.exe" } else { "ck" });
+    if ck.is_file() {
+        ck
+    } else {
+        path
+    }
+}
+
+/// `ck` started under the name `ckni` behaves as ckni: plain output for
+/// scripts and agents, and never a prompt or the terminal app.
+fn invoked_as_ckni(program: &Path) -> bool {
+    is_ckni_name(program, cfg!(windows))
+}
+
+/// Whether the last component of `program` is `ckni`. Windows file names
+/// ignore case and may arrive with or without `.exe`, so there the
+/// comparison drops a trailing `.exe` and ignores case. Unix names are
+/// exact, so a backup such as `ckni.old` stays a plain `ck`.
+fn is_ckni_name(program: &Path, windows: bool) -> bool {
+    let Some(name) = program.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    if !windows {
+        return name == "ckni";
+    }
+    let name = name.to_ascii_lowercase();
+    name.strip_suffix(".exe").unwrap_or(&name) == "ckni"
+}
+
+const CKNI_NEEDS_A_COMMAND: &str =
+    "ckni needs a command; it never opens the terminal app. Run ckni --help for the commands.";
+
+const CKNI_SETUP_WOULD_ASK: &str =
+    "ckni setup never asks before changing anything. Pass --yes to apply the plan, or --dry-run to see it.";
 
 fn executable_identity(argv0: &Path) -> (PathBuf, Option<PathBuf>) {
     let candidate = locate_executable(argv0).or_else(|| env::current_exe().ok());
@@ -7061,7 +7114,7 @@ async fn preview_rescan_restart_required_async() -> Result<Vec<String>, String> 
         .unwrap_or_default())
 }
 
-fn setup_command(program: &Path, request: &setup::SetupRequest) -> Result<(), CkError> {
+fn setup_command(program: &Path, request: &setup::SetupRequest, ckni: bool) -> Result<(), CkError> {
     let mut backend =
         setup::SetupBackend::current(program.to_path_buf()).map_err(CkError::Message)?;
     backend.set_rescan_preview(preview_rescan_restart_required);
@@ -7101,19 +7154,16 @@ fn setup_command(program: &Path, request: &setup::SetupRequest) -> Result<(), Ck
         print_verbose_setup_outcomes(&plan, request.verbose);
         return Ok(());
     }
-    if !confirm_setup_if_interactive(
-        request,
-        io::stdin().is_terminal(),
-        io::stdout().is_terminal(),
-        || {
-            backend.print_dry_run(&plan).map_err(CkError::Message)?;
-            backend
-                .print_proposed_diffs(&plan, request)
-                .map_err(CkError::Message)?;
-            confirm_setup(&mut io::stdin().lock(), &mut io::stdout().lock())
-                .map_err(|error| CkError::Message(format!("could not confirm setup: {error}")))
-        },
-    )? {
+    let (stdin_terminal, stdout_terminal) = (io::stdin().is_terminal(), io::stdout().is_terminal());
+    ckni_refuses_to_ask(ckni, request, stdin_terminal, stdout_terminal)?;
+    if !confirm_setup_if_interactive(request, stdin_terminal, stdout_terminal, || {
+        backend.print_dry_run(&plan).map_err(CkError::Message)?;
+        backend
+            .print_proposed_diffs(&plan, request)
+            .map_err(CkError::Message)?;
+        confirm_setup(&mut io::stdin().lock(), &mut io::stdout().lock())
+            .map_err(|error| CkError::Message(format!("could not confirm setup: {error}")))
+    })? {
         println!("Nothing was changed.");
         return Ok(());
     }
@@ -7133,11 +7183,35 @@ fn confirm_setup_if_interactive(
     stdout_terminal: bool,
     confirm: impl FnOnce() -> Result<bool, CkError>,
 ) -> Result<bool, CkError> {
-    if !request.yes && stdin_terminal && stdout_terminal {
+    if setup_would_ask(request, stdin_terminal, stdout_terminal) {
         confirm()
     } else {
         Ok(true)
     }
+}
+
+/// Setup asks before changing anything only when a person can answer: both
+/// ends are a terminal and `--yes` wasn't given.
+fn setup_would_ask(
+    request: &setup::SetupRequest,
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+) -> bool {
+    !request.yes && stdin_terminal && stdout_terminal
+}
+
+/// ckni never waits for input, so where `ck setup` would ask, `ckni setup`
+/// stops with a usage error that names the flag to pass instead.
+fn ckni_refuses_to_ask(
+    ckni: bool,
+    request: &setup::SetupRequest,
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+) -> Result<(), CkError> {
+    if ckni && setup_would_ask(request, stdin_terminal, stdout_terminal) {
+        return Err(CkError::Usage(CKNI_SETUP_WOULD_ASK.to_string()));
+    }
+    Ok(())
 }
 
 fn confirm_setup(input: &mut impl io::BufRead, output: &mut impl io::Write) -> io::Result<bool> {
@@ -11150,6 +11224,56 @@ mod tests {
             assert_eq!(accepted, expected, "answer {answer:?}");
             assert_eq!(output, b"Continue? [y/N] ");
         }
+    }
+
+    #[test]
+    fn ckni_is_chosen_by_the_last_name_in_argv0() {
+        for (program, windows, expected) in [
+            ("ckni", false, true),
+            ("/home/alex/.local/share/cortexkit/cmd/ckni", false, true),
+            ("ck", false, false),
+            ("ckni.exe", false, false),
+            ("CKNI", false, false),
+            ("ckni.old", false, false),
+            ("/opt/ckni/ck", false, false),
+            ("ckni", true, true),
+            ("ckni.exe", true, true),
+            ("CKNI.EXE", true, true),
+            ("Ckni", true, true),
+            (
+                "C:/Users/alex/AppData/Local/cortexkit/cmd/ckni.exe",
+                true,
+                true,
+            ),
+            ("ck.exe", true, false),
+            ("ckni.exe.old", true, false),
+            ("ckni2.exe", true, false),
+        ] {
+            assert_eq!(
+                is_ckni_name(Path::new(program), windows),
+                expected,
+                "{program} (windows: {windows})"
+            );
+        }
+    }
+
+    #[test]
+    fn ckni_setup_fails_with_usage_exactly_where_ck_setup_would_ask() {
+        let mut request = setup::SetupRequest::install(vec![]);
+        let refused = ckni_refuses_to_ask(true, &request, true, true).unwrap_err();
+        assert!(matches!(&refused, CkError::Usage(message) if message == CKNI_SETUP_WOULD_ASK));
+        assert_eq!(refused.exit_code(), 2);
+        // Where ck wouldn't ask, ckni goes ahead exactly as ck does.
+        for (stdin, stdout) in [(false, true), (true, false), (false, false)] {
+            assert!(!setup_would_ask(&request, stdin, stdout));
+            assert!(ckni_refuses_to_ask(true, &request, stdin, stdout).is_ok());
+        }
+        request.yes = true;
+        assert!(ckni_refuses_to_ask(true, &request, true, true).is_ok());
+        // ck itself still asks.
+        request.yes = false;
+        assert!(ckni_refuses_to_ask(false, &request, true, true).is_ok());
+        assert!(setup_would_ask(&request, true, true));
     }
 
     #[test]

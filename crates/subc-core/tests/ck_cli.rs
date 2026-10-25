@@ -154,6 +154,44 @@ fn bare_json_prints_the_one_top_help() {
     );
 }
 
+/// Runs Cargo's `ck-under-test` through a link named `ckni` in its own temp
+/// folder, the way setup places it beside `ck`: a symlink on Unix, a copy
+/// named `ckni.exe` on Windows.
+fn ckni_command(name: &str) -> (TempDir, Command) {
+    let dir = TempDir::new("ckni-link");
+    let target = cortexkit_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-under-test"));
+    let link = dir.join(name);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    #[cfg(not(unix))]
+    fs::copy(&target, &link).unwrap();
+    let mut command = Command::new(&link);
+    isolate_ck_command(&mut command);
+    (dir, command)
+}
+
+#[test]
+fn ckni_with_no_command_is_a_usage_error_not_the_dashboard() {
+    let name = if cfg!(windows) { "CKNI.exe" } else { "ckni" };
+    let (_dir, mut command) = ckni_command(name);
+    let output = command.output().unwrap();
+    assert_exit(&output, 2);
+    assert!(output.stdout.is_empty(), "stdout: {}", text(&output.stdout));
+    assert_eq!(
+        text(&output.stderr),
+        "ckni needs a command; it never opens the terminal app. Run ckni --help for the commands.\n"
+    );
+}
+
+#[test]
+fn ckni_through_a_link_runs_the_same_program() {
+    let (_dir, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+    let output = command.arg("--version").output().unwrap();
+    assert_exit(&output, 0);
+    let version = ck_command().arg("--version").output().unwrap();
+    assert_eq!(text(&output.stdout), text(&version.stdout));
+}
+
 #[test]
 fn hidden_cli_face_reserved_names_list_every_builtin_domain() {
     let output = ck_command()
@@ -1383,6 +1421,241 @@ fn setup_nothing_to_do_never_renders_outcome_no_op() {
     assert_eq!(
         text(&output.stdout),
         "CortexKit is set up: daemon running, aft · claustrum · insula ok.\nOptional modules not installed: mc, synapse — run `ck setup mc` or `ck setup synapse`.\n"
+    );
+}
+
+/// Places the test CLI in the fixture's `cmd` folder, where the bootstrap
+/// installer puts `ck`, and records it in the manifest as setup's own. It
+/// keeps its `ckdev-` name, so no test process runs under a production name;
+/// `ckni` is placed beside it all the same.
+fn place_managed_ck(fixture: &SetupFixture) -> PathBuf {
+    let cortexkit = fixture.data_home.join("cortexkit");
+    let cmd = cortexkit.join("cmd");
+    fs::create_dir_all(&cmd).unwrap();
+    let published = cortexkit_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-under-test"));
+    let placed = cmd.join(published.file_name().unwrap());
+    fs::copy(&published, &placed).unwrap();
+    // Setup identifies the running ck by its canonical path.
+    let ck = fs::canonicalize(&placed).unwrap();
+    let manifest_path = cortexkit.join("installer-manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["mutations"].as_array_mut().unwrap().push(json!({
+        "kind": "managed-binary",
+        "path": ck,
+        "component": "core",
+    }));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    ck
+}
+
+fn manifest_rows(fixture: &SetupFixture, kind: &str) -> Vec<Value> {
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(fixture.data_home.join("cortexkit/installer-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    manifest["mutations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["kind"] == kind)
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn setup_puts_ckni_beside_the_managed_ck_and_then_has_nothing_to_do() {
+    let fixture = SetupFixture::installed("ck-setup-ckni");
+    #[cfg(unix)]
+    set_setup_managed_modes(&fixture);
+    let ck = place_managed_ck(&fixture);
+    let ckni = ck.with_file_name(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+    let index = serve_signed_index(|base| setup_index(base, None));
+    let run = |args: &[&str]| {
+        fixture
+            .command_from(Command::new(&ck), &index, args)
+            .output()
+            .unwrap()
+    };
+    let (verb, done) = if cfg!(windows) {
+        ("would copy ck to ckni at ", "  copied ck to ")
+    } else {
+        ("would link ckni to ck at ", "  linked ")
+    };
+
+    let preview = run(&["setup", "--dry-run"]);
+    assert_exit(&preview, 0);
+    assert!(
+        text(&preview.stdout).contains(verb),
+        "stdout: {}",
+        text(&preview.stdout)
+    );
+    assert!(
+        fs::symlink_metadata(&ckni).is_err(),
+        "a dry run placed ckni"
+    );
+
+    let applied = run(&["setup"]);
+    assert_exit(&applied, 0);
+    assert!(
+        text(&applied.stdout).contains(done),
+        "stdout: {}",
+        text(&applied.stdout)
+    );
+    assert_eq!(fs::read(&ckni).unwrap(), fs::read(&ck).unwrap());
+    let rows = manifest_rows(&fixture, "managed-link");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(Path::new(rows[0]["path"].as_str().unwrap()), ckni);
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            fs::read_link(&ckni).unwrap(),
+            Path::new(ck.file_name().unwrap())
+        );
+        assert_eq!(rows[0]["mechanism"], "symlink");
+    }
+    #[cfg(windows)]
+    {
+        assert!(fs::symlink_metadata(&ckni).unwrap().file_type().is_file());
+        assert_eq!(rows[0]["mechanism"], "copy");
+    }
+    // Setup touched nothing else in ck's folder.
+    let mut names = fs::read_dir(ck.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    let mut expected = vec![
+        ck.file_name().unwrap().to_string_lossy().into_owned(),
+        ckni.file_name().unwrap().to_string_lossy().into_owned(),
+    ];
+    expected.sort();
+    assert_eq!(names, expected);
+
+    let again = run(&["setup"]);
+    assert_exit(&again, 0);
+    assert_eq!(
+        text(&again.stdout),
+        "CortexKit is set up: daemon running, aft · claustrum · insula ok.\nOptional modules not installed: mc, synapse — run `ck setup mc` or `ck setup synapse`.\n"
+    );
+}
+
+/// Run from a byte copy named `ckni` (how Windows places it; on Unix a
+/// regular file named `ckni` also keeps that name when its path is
+/// canonicalized, unlike a symlink), setup acts on the `ck` beside the copy:
+/// the plan adopts `ck`, the installer's unowned placement, rather than the
+/// `ckni` it was started as. A setup that took the copy for `ck` would adopt
+/// the copy and leave `ck` unmanaged, and an upgrade would replace the copy
+/// instead.
+#[test]
+fn setup_run_from_a_ckni_copy_acts_on_the_ck_beside_it() {
+    let fixture = SetupFixture::installed("ck-setup-from-ckni-copy");
+    #[cfg(unix)]
+    set_setup_managed_modes(&fixture);
+    let cortexkit = fixture.data_home.join("cortexkit");
+    let cmd = cortexkit.join("cmd");
+    fs::create_dir_all(&cmd).unwrap();
+    let published = cortexkit_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-under-test"));
+    let (ck_name, ckni_name) = if cfg!(windows) {
+        ("ck.exe", "ckni.exe")
+    } else {
+        ("ck", "ckni")
+    };
+    // `ck` is a placement the installer made and setup has not adopted yet.
+    // Nothing executes it in a dry run; only the `ckni` copy runs.
+    fs::copy(&published, cmd.join(ck_name)).unwrap();
+    fs::copy(&published, cmd.join(ckni_name)).unwrap();
+    let ck = fs::canonicalize(cmd.join(ck_name)).unwrap();
+    let ckni = fs::canonicalize(cmd.join(ckni_name)).unwrap();
+    // The copy is on record as setup's own, so it is not refused as unowned.
+    let manifest_path = cortexkit.join("installer-manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["mutations"].as_array_mut().unwrap().push(json!({
+        "kind": "managed-link",
+        "path": ckni,
+        "links_to": ck,
+        "mechanism": "copy",
+        "sha256": format!("{:x}", Sha256::digest(fs::read(&ckni).unwrap())),
+    }));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    let index = serve_signed_index(|base| setup_index(base, None));
+
+    let output = fixture
+        .command_from(Command::new(&ckni), &index, &["setup", "--dry-run"])
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    let adopted: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| {
+            line.split_once(". would adopt ")?
+                .1
+                .strip_suffix(" as the managed ck binary")
+        })
+        .collect();
+    assert_eq!(
+        adopted.len(),
+        1,
+        "the plan adopts exactly one ck:\n{stdout}"
+    );
+    assert_eq!(
+        Path::new(adopted[0]).file_name().unwrap(),
+        ck_name,
+        "setup run from the ckni copy adopted {} instead of {}:\n{stdout}",
+        adopted[0],
+        ck.display()
+    );
+    // The adopted path is that ck, not a ck elsewhere with the same name.
+    let relative = cmd.join(ck_name);
+    let relative = relative
+        .strip_prefix(&fixture.home)
+        .unwrap()
+        .display()
+        .to_string();
+    assert!(
+        adopted[0].ends_with(&relative),
+        "{} is not {relative}",
+        adopted[0]
+    );
+}
+
+#[test]
+fn setup_refuses_a_ckni_it_did_not_install_and_changes_nothing() {
+    let fixture = SetupFixture::installed("ck-setup-ckni-unowned");
+    #[cfg(unix)]
+    set_setup_managed_modes(&fixture);
+    let ck = place_managed_ck(&fixture);
+    let ckni = ck.with_file_name(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+    fs::write(&ckni, b"someone else's ckni").unwrap();
+    let manifest = fs::read(fixture.data_home.join("cortexkit/installer-manifest.json")).unwrap();
+    let index = serve_signed_index(|base| setup_index(base, None));
+
+    let output = fixture
+        .command_from(Command::new(&ck), &index, &["setup"])
+        .output()
+        .unwrap();
+    assert_exit(&output, 1);
+    let stdout = text(&output.stdout);
+    assert!(
+        stdout.starts_with("ck setup did not install ")
+            && stdout.ends_with(&format!(
+                "{}, so it won't replace it. Move it aside and run ck setup again. Nothing was changed.\n",
+                ckni.file_name().unwrap().to_string_lossy()
+            )),
+        "stdout: {stdout}"
+    );
+    assert_eq!(fs::read(&ckni).unwrap(), b"someone else's ckni");
+    assert_eq!(
+        fs::read(fixture.data_home.join("cortexkit/installer-manifest.json")).unwrap(),
+        manifest
     );
 }
 

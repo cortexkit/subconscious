@@ -29,7 +29,9 @@ actor FedSessionTimerSignal {
             try await sleep.value
         } catch {
             // A deadline change cancels only the sleep, not the driver's poll.
-            // Other clock failures still declare the session lost.
+            // A sleep error after the revision changed is treated as that wake;
+            // a clock that keeps failing throws again on the next sleep, with an
+            // unchanged revision, and then the session is declared lost.
             if stopped { throw CancellationError() }
             if observed == revision { throw error }
         }

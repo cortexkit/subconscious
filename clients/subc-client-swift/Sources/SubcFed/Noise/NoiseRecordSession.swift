@@ -42,8 +42,9 @@ public actor FedNoiseRecordSession {
     private let carrier: any FedNoiseMessageCarrier
     private let transport: FedNoiseTransport
     private var closed = false
-    // Actor isolation ends at each carrier await. Hold direction ownership across
-    // those awaits so records cannot overtake a nonce or split a logical frame.
+    // Actor-isolated methods can be reentered while a carrier await is suspended.
+    // Hold direction ownership across those awaits so records cannot overtake a
+    // nonce or split a logical frame.
     private var sending = false
     private var receiving = false
     private var sendWaiters: [CheckedContinuation<Void, Error>] = []

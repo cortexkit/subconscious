@@ -19,21 +19,20 @@ extension FedShareTests {
         let share = try request()
         let client = try client(ledger: ledger, server: server, clock: clock)
         let send = Task { try await client.send([share], to: computer) }
-        try await awaitShareEvent {
-            let count = await server.callCount
-            let readers = await server.readers.count
-            return count == 1 && readers == 1
-        }
+        try await server.waitForPendingCall()
         for second in stride(from: 5, through: 60, by: 5) {
             clock.advance(seconds: 5)
+            let next = UInt64((second / 15 + 1) * 15 + 1) * 1_000_000_000
+            // Wait for the timer driver to settle on its next sleep before
+            // delivering the peer's keepalive: inbound activity updates staleness
+            // without rescheduling a sleep that has already begun.
+            try await awaitShareEvent { clock.deadlines.contains(next) }
             try await server.enqueue(FedFrame(type: "keepalive"))
             try await awaitShareEvent {
                 let count = await server.receivedCount
                 let readers = await server.readers.count
                 return count == 3 + second / 5 && readers == 1
             }
-            let next = UInt64((second / 15 + 1) * 15 + 1) * 1_000_000_000
-            try await awaitShareEvent { clock.deadlines.contains(next) }
         }
         let keepalives = await server.sentTypes.filter { $0 == "keepalive" }.count
         XCTAssertGreaterThanOrEqual(keepalives, 3)
@@ -56,11 +55,7 @@ extension FedShareTests {
         let share = try request()
         let client = try client(ledger: ledger, server: server, clock: clock)
         let send = Task { try await client.send([share], to: computer) }
-        try await awaitShareEvent {
-            let count = await server.callCount
-            let readers = await server.readers.count
-            return count == 1 && readers == 1
-        }
+        try await server.waitForPendingCall()
         clock.advance(seconds: 45)
         try await awaitShareEvent { await server.closed }
         let report = try await send.value

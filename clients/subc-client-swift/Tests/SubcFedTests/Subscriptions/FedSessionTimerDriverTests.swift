@@ -96,7 +96,11 @@ private struct TimerHarness {
         let request = await transport.waitFor("subscribe")
         let id = try SubscriptionHarness.id(request)
         try await transport.push([SubscriptionHarness.frame("open", id: id)])
-        return (try await pending.value, id)
+        let watch = try await pending.value
+        // The reply can arrive before send completion records outbound idle.
+        // Finish the write before a test advances the clock past that send.
+        await client.waitForSubscriptionWriter()
+        return (watch, id)
     }
 
     func notice(_ iterator: inout FedSubscription.AsyncIterator, id: UInt64) async throws {
@@ -127,9 +131,12 @@ final class FedSessionTimerDriverTests: XCTestCase {
         var iterator = watch.makeAsyncIterator()
         for second in stride(from: 5, through: 30, by: 5) {
             h.clock.advance(seconds: 5)
-            try await h.notice(&iterator, id: id)
             let next = UInt64((second / 15 + 1) * 15 + 1) * 1_000_000_000
+            // Wait for the driver to settle on its next sleep before injecting
+            // the notice: receiving it updates staleness but does not reschedule
+            // a sleep that has already begun.
             try await eventually { h.clock.deadlines == [next] }
+            try await h.notice(&iterator, id: id)
             let count = await h.transport.count("keepalive")
             XCTAssertEqual(count, second / 15)
             let isReady = await ready(h.client)
@@ -193,9 +200,13 @@ final class FedSessionTimerDriverTests: XCTestCase {
         await h.client.setSessionLossLogger { log.append($0) }
         _ = try await h.engine.processInboundBytes(Data([0, 0]))
         h.clock.advance(seconds: 40)
+        // The old stale deadline wins until partial progress is processed. Let
+        // the driver sleep there first, then wake it to recompute after progress.
+        try await eventually { h.clock.deadlines == [46_000_000_000] }
         _ = try await h.engine.processInboundBytes(Data([0]))
+        h.clock.advance(seconds: 5)
         try await eventually { h.clock.deadlines == [56_000_000_000] }
-        h.clock.advance(seconds: 15)
+        h.clock.advance(seconds: 10)
         try await eventually { h.clock.deadlines == [61_000_000_000] }
         h.clock.advance(seconds: 5)
         try await eventually { log.messages.contains { $0.contains("assembly timeout") } }
@@ -222,11 +233,14 @@ final class FedSessionTimerDriverTests: XCTestCase {
         let (watch, id) = try await h.open()
         var iterator = watch.makeAsyncIterator()
         h.clock.advance(seconds: 44)
+        // Anchor the driver's sleep at the old stale deadline before the notice.
+        // Inbound traffic postpones staleness but does not reschedule that sleep.
+        try await eventually { h.clock.deadlines == [46_000_000_000] }
         try await h.notice(&iterator, id: id)
-        try await eventually { h.clock.deadlines == [60_000_000_000] }
         h.clock.advance(seconds: 1)
+        try await eventually { h.clock.deadlines == [60_000_000_000] }
         let isReady = await ready(h.client)
-        XCTAssertTrue(isReady, "a notice at 44s must protect the session at the old 45s deadline")
+        XCTAssertTrue(isReady, "a notice at clock 45s must protect the session at the old clock 46s deadline")
         h.clock.advance(seconds: 43)
         try await eventually { h.clock.deadlines == [90_000_000_000] }
         let stillReady = await ready(h.client)
@@ -257,13 +271,15 @@ final class FedSessionTimerDriverTests: XCTestCase {
         let h = TimerHarness(client: client, transport: secondTransport, engine: secondEngine, clock: clock)
         let (watch, id) = try await h.open()
         var iterator = watch.makeAsyncIterator()
+        // Anchor the replacement's first sleep before advancing its clock, so
+        // session startup cannot race the notice's later inbound timestamp.
+        try await eventually { clock.deadlines == [60_000_000_000] }
         clock.advance(seconds: 1)
         try await h.notice(&iterator, id: id)
         let isReady = await ready(client)
         XCTAssertTrue(isReady)
         let oldCount = await firstTransport.count("keepalive")
         XCTAssertEqual(oldCount, 0)
-        try await eventually { clock.deadlines == [60_000_000_000] }
         await client.disconnect()
         try await eventually { clock.cancellationCount >= 2 && clock.deadlines.isEmpty }
         clock.advance(seconds: 60)
@@ -279,9 +295,9 @@ final class FedSessionTimerDriverTests: XCTestCase {
         var iterator = watch.makeAsyncIterator()
         for second in stride(from: 5, through: 60, by: 5) {
             h.clock.advance(seconds: 5)
-            try await h.notice(&iterator, id: id)
             let next = UInt64((second / 15 + 1) * 15 + 1) * 1_000_000_000
             try await eventually { h.clock.deadlines == [next] }
+            try await h.notice(&iterator, id: id)
         }
         let written = await h.transport.count("keepalive")
         XCTAssertGreaterThanOrEqual(written, 3)

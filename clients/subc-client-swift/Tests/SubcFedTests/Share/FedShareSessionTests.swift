@@ -147,6 +147,7 @@ actor ShareTestServer: FedSessionByteTransport {
     var closed = false
     var responseQueued = false
     var readers: [CheckedContinuation<Data, Error>] = []
+    private var pendingCallWaiters: [CheckedContinuation<Void, Error>] = []
     var receivedCount = 0
 
     init(mode: Mode = .normal, epoch: String = "computer-epoch", ledger: FedShareLedger? = nil,
@@ -204,7 +205,12 @@ actor ShareTestServer: FedSessionByteTransport {
         receivedCount += 1
         if closed { throw FedFailure.disconnected }
         if queue.isEmpty, case .pending = mode {
-            return try await withCheckedThrowingContinuation { readers.append($0) }
+            return try await withCheckedThrowingContinuation {
+                readers.append($0)
+                let waiting = pendingCallWaiters
+                pendingCallWaiters.removeAll()
+                for waiter in waiting { waiter.resume() }
+            }
         }
         guard !queue.isEmpty else { throw FedFailure.disconnected }
         let bytes = queue.removeFirst()
@@ -213,9 +219,20 @@ actor ShareTestServer: FedSessionByteTransport {
         }
         return bytes
     }
+
+    /// Startup may perform disk I/O. Wait for the actual pending read rather
+    /// than exhausting a fixed number of executor yields while it completes.
+    func waitForPendingCall() async throws {
+        if closed { throw FedFailure.disconnected }
+        if callCount == 1, readers.count == 1 { return }
+        try await withCheckedThrowingContinuation { pendingCallWaiters.append($0) }
+    }
+
     func close() {
         closed = true
         for reader in readers { reader.resume(throwing: FedFailure.disconnected) }
         readers.removeAll()
+        for waiter in pendingCallWaiters { waiter.resume(throwing: FedFailure.disconnected) }
+        pendingCallWaiters.removeAll()
     }
 }

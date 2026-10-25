@@ -113,7 +113,13 @@ pub(super) fn parse(tail: &[OsString]) -> Result<Command, CkError> {
     Ok(Command::Activity(Options { query, follow }))
 }
 
-pub(super) async fn run(options: &Options, subc: Option<&Path>, json: bool) -> Result<(), CkError> {
+pub(super) async fn run(
+    options: &Options,
+    subc: Option<&Path>,
+    json: bool,
+    ckni: bool,
+    verbose: bool,
+) -> Result<(), CkError> {
     let resolved = discover_connection_file(subc)?;
     let consumer = SubcConsumer::connect(&resolved.path, ConsumerOptions::default())
         .await
@@ -121,16 +127,25 @@ pub(super) async fn run(options: &Options, subc: Option<&Path>, json: bool) -> R
             path: resolved.path,
             source: error.to_string(),
         })?;
-    let result = display(&consumer, options, json).await;
+    let result = display(&consumer, options, json, ckni, verbose).await;
     consumer.close().await;
     result
 }
 
-async fn display(consumer: &SubcConsumer, options: &Options, json: bool) -> Result<(), CkError> {
+async fn display(
+    consumer: &SubcConsumer,
+    options: &Options,
+    json: bool,
+    ckni: bool,
+    verbose: bool,
+) -> Result<(), CkError> {
     let reply = consumer
         .query_activity(options.query.clone())
         .await
-        .map_err(|error| CkError::Message(format!("activity query failed: {error}")))?;
+        .map_err(|error| CkError::Rejected {
+            code: error.code().map(str::to_string),
+            message: format!("activity query failed: {error}"),
+        })?;
     if json && !options.follow {
         println!(
             "{}",
@@ -142,6 +157,15 @@ async fn display(consumer: &SubcConsumer, options: &Options, json: bool) -> Resu
         for entry in &reply.entries {
             print_stream_json(entry)?;
         }
+    } else if ckni {
+        print_table(
+            &super::ckni::activity_headers(verbose),
+            reply
+                .entries
+                .iter()
+                .map(|entry| plain_row(entry, verbose))
+                .collect(),
+        );
     } else {
         print_table(
             &["time (UTC)", "module", "actor", "summary"],
@@ -161,7 +185,10 @@ async fn display(consumer: &SubcConsumer, options: &Options, json: bool) -> Resu
     let mut stream = consumer
         .subscribe_activity(Some(reply.head))
         .await
-        .map_err(|error| CkError::Message(format!("activity follow failed: {error}")))?;
+        .map_err(|error| CkError::Rejected {
+            code: error.code().map(str::to_string),
+            message: format!("activity follow failed: {error}"),
+        })?;
     loop {
         tokio::select! {
             signal = tokio::signal::ctrl_c() => {
@@ -170,11 +197,17 @@ async fn display(consumer: &SubcConsumer, options: &Options, json: bool) -> Resu
                 return Ok(());
             }
             next = stream.next() => {
-                let entry = next.map_err(|error| CkError::Message(format!("activity follow failed: {error}")))?
+                let entry = next.map_err(|error| CkError::Rejected {
+                    code: error.code().map(str::to_string),
+                    message: format!("activity follow failed: {error}"),
+                })?
                     .ok_or_else(|| CkError::Message("activity feed ended; rerun ck activity to query retained history".into()))?;
                 // Subscription bodies have no filters; retain query semantics locally.
                 if matches(&options.query, &entry) {
                     if json { print_stream_json(&entry)?; }
+                    else if ckni {
+                        print_table(&super::ckni::activity_headers(verbose), vec![plain_row(&entry, verbose)]);
+                    }
                     else { println!("{}", row(&entry).join("  ")); }
                     flush()?;
                 }
@@ -219,9 +252,41 @@ fn row(entry: &ActivityEntry) -> Vec<String> {
     ]
 }
 
+fn plain_row(entry: &ActivityEntry, verbose: bool) -> Vec<String> {
+    let actor = entry
+        .actor
+        .agent_id
+        .as_deref()
+        .unwrap_or_else(|| match &entry.actor.principal {
+            subc_protocol::Principal::Reserved { module_id } => module_id,
+            subc_protocol::Principal::Direct => "direct",
+            subc_protocol::Principal::Unverified => "unverified",
+        });
+    let mut row = vec![
+        timestamp(entry.at_ms),
+        super::ckni::cell(
+            entry
+                .subject
+                .as_ref()
+                .map(|subject| subject.id.as_str())
+                .unwrap_or(""),
+        ),
+        super::ckni::cell(&entry.summary),
+        super::ckni::cell(actor),
+    ];
+    if verbose {
+        row.extend([
+            super::ckni::cell(&entry.kind),
+            entry.seq.to_string(),
+            super::ckni::json_cell(&serde_json::to_value(&entry.details).unwrap_or_default()),
+        ]);
+    }
+    row
+}
+
 // Keep Unicode text readable, but never let ledger text inject terminal controls
 // or split a table row. JSON serialization separately escapes control characters.
-fn cell(text: &str) -> String {
+pub(super) fn cell(text: &str) -> String {
     text.chars()
         .flat_map(|ch| {
             if ch.is_control() {
@@ -303,5 +368,40 @@ mod tests {
             let changed = serde_json::from_value(value).unwrap();
             assert!(!matches(&changed, &entry), "live filter ignored: {field}");
         }
+    }
+    #[test]
+    fn ckni_activity_names_subject_and_actor_and_keeps_details_verbose_only() {
+        let mut entry: ActivityEntry = serde_json::from_value(serde_json::json!({
+            "daemon_incarnation":"test-incarnation", "seq":7, "at_ms":1001,
+            "module":"subc", "kind":"subc.module_restarted", "summary":"module restarted",
+            "actor":{"principal":{"kind":"direct"}},
+            "subject":{"type":"module", "id":"alpha"}, "details":{"drain_ms":1500},
+        }))
+        .unwrap();
+        assert_eq!(
+            plain_row(&entry, false),
+            [
+                "1970-01-01 00:00:01.001",
+                "alpha",
+                "module restarted",
+                "direct"
+            ]
+        );
+        let verbose = plain_row(&entry, true);
+        assert_eq!(
+            &verbose[4..],
+            ["subc.module_restarted", "7", "{\"drain_ms\":1500}"]
+        );
+        entry.subject = None;
+        entry.actor.principal = subc_protocol::Principal::Reserved {
+            module_id: "recorder".into(),
+        };
+        assert_eq!(plain_row(&entry, false)[1], "-");
+        assert_eq!(plain_row(&entry, false)[3], "recorder");
+        entry.actor.agent_id = Some("agent-1".into());
+        assert_eq!(plain_row(&entry, false)[3], "agent-1");
+        let long = "event".repeat(500);
+        entry.summary = long.clone();
+        assert_eq!(plain_row(&entry, false)[2], long);
     }
 }

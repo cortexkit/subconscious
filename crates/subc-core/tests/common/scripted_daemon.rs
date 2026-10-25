@@ -25,6 +25,7 @@ pub struct ScriptedControlStep {
 
 pub enum ScriptedControlAction {
     Reply(Box<ClientControlResponse>),
+    Error(subc_protocol::ErrorBody),
     NeverReply,
 }
 
@@ -94,6 +95,22 @@ impl ScriptedDaemon {
                         stream.flush().await.expect("scripted response flushes");
                     }
                     ScriptedControlAction::NeverReply => pending::<()>().await,
+                    ScriptedControlAction::Error(error) => {
+                        let response = Frame::build_with_version(
+                            request_frame.header.ver,
+                            FrameType::Error,
+                            request_frame.header.flags,
+                            0,
+                            0,
+                            request_frame.header.corr,
+                            serde_json::to_vec(&error).expect("scripted error serializes"),
+                        )
+                        .expect("scripted error frame builds");
+                        write_frame(&mut stream, &response)
+                            .await
+                            .expect("scripted error writes");
+                        stream.flush().await.expect("scripted error flushes");
+                    }
                 }
             }
         });

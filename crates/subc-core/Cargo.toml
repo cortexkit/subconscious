@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.20.135"
+version = "0.20.136"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -38,6 +38,11 @@ required-features = ["test-support"]
 [[bin]]
 name = "mode-umask-helper"
 path = "tests/fixtures/mode-umask-helper.rs"
+required-features = ["test-support"]
+
+[[bin]]
+name = "external-face-fixture"
+path = "tests/fixtures/external-face.rs"
 required-features = ["test-support"]
 
 # Other workspace tests rebuild fake-aft-stub without test-support. A separate

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.20.136
+
+- `ckni` prints dedicated plain tables for the health overview, the module list
+  and activity, with the DETAILS columns shown only under `--verbose`.
+  `--json` still prints JSON. Other built-ins print what piped `ck` prints, and
+  `ckni` refuses the terminal app. External `ck-<domain>` commands keep their
+  own output bytes and exit status.
+- Formatted `ckni` errors carry a stable code and next step on stderr,
+  including the original code from a decoded refusal. Piped `ck` error text
+  stays unchanged.
+
 ## 0.20.135
 
 - `ck setup` no longer refuses the binary it has just installed because that

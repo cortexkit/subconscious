@@ -179,7 +179,7 @@ fn ckni_with_no_command_is_a_usage_error_not_the_dashboard() {
     assert!(output.stdout.is_empty(), "stdout: {}", text(&output.stdout));
     assert_eq!(
         text(&output.stderr),
-        "ckni needs a command; it never opens the terminal app. Run ckni --help for the commands.\n"
+        "ckni: usage: ckni needs a command; it never opens the terminal app. Run ckni --help for the commands.\nRun ckni --help for the commands.\n"
     );
 }
 
@@ -190,6 +190,197 @@ fn ckni_through_a_link_runs_the_same_program() {
     assert_exit(&output, 0);
     let version = ck_command().arg("--version").output().unwrap();
     assert_eq!(text(&output.stdout), text(&version.stdout));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ckni_decoded_refusal_keeps_its_code_and_ck_keeps_its_stderr() {
+    use common::scripted_daemon::{ScriptedControlAction, ScriptedControlStep, ScriptedDaemon};
+    for ckni in [false, true] {
+        let daemon = ScriptedDaemon::start(
+            "ckni-refusal",
+            vec![ScriptedControlStep {
+                expected: ClientControlRequest::SupervisorHealth {},
+                action: ScriptedControlAction::Error(subc_protocol::ErrorBody {
+                    code: "fed_not_authorized".into(),
+                    message: "access denied".into(),
+                    detail: None,
+                }),
+            }],
+        )
+        .await;
+        let (_link, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+        if !ckni {
+            command = ck_command();
+        }
+        let output = command
+            .arg("--subc")
+            .arg(&daemon.connection_file_path)
+            .arg("health")
+            .output()
+            .unwrap();
+        assert_exit(&output, 1);
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            text(&output.stderr),
+            if ckni {
+                "ckni: fed_not_authorized: access denied\nCheck the refusal above before retrying the command.\n"
+            } else {
+                "fed_not_authorized — access denied\n"
+            }
+        );
+    }
+}
+
+#[test]
+fn ckni_parse_errors_are_formatted_even_before_dispatch() {
+    let (_link, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+    let output = command.arg("--not-a-flag").output().unwrap();
+    assert_exit(&output, 2);
+    assert!(output.stdout.is_empty());
+    assert_eq!(text(&output.stderr), "ckni: usage: unknown flag '--not-a-flag'. Run ck --help.\nRun ckni --help for the commands.\n");
+}
+
+#[test]
+fn ckni_external_face_passes_ansi_own_json_stderr_and_exit_seven_unchanged() {
+    let data = TempDir::new("ckni-external-face");
+    let bin = data.join("cortexkit/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let fixture = cortexkit_test_support::ckdev_binary(env!("CARGO_BIN_EXE_external-face-fixture"));
+    fs::copy(fixture, bin.join(platform_binary("ck-example-face"))).unwrap();
+    for ckni in [false, true] {
+        let (_link, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+        if !ckni {
+            command = ck_command();
+        }
+        // ck finds external commands in the CortexKit bin folder under the
+        // data home: XDG_DATA_HOME on Unix, LOCALAPPDATA on Windows.
+        let output = command
+            .env("XDG_DATA_HOME", data.path())
+            .env("LOCALAPPDATA", data.path())
+            .args(["example-face", "--json"])
+            .output()
+            .unwrap();
+        assert_exit(&output, 7);
+        assert_eq!(
+            output.stdout,
+            b"\x1b[31mface\x1b[0m\n{\"schema\":\"face/v9\",\"ok\":true}\n"
+        );
+        assert_eq!(output.stderr, b"face error\n");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ckni_quota_on_a_terminal_matches_piped_ck_without_color() {
+    let kit = common::kit::Kit::boot(
+        "ckni-quota-pty",
+        &[(
+            "insula",
+            json!({
+                "program": env!("CARGO_BIN_EXE_fake-aft-stub"),
+                "env": {
+                    "FAKE_AFT_MODULE_ID": "insula", "FAKE_AFT_ROLE": "management_surface",
+                    "FAKE_AFT_USAGE_GET_FIXTURE": json!([{
+                        "provider":"claude", "account":"acct-ops",
+                        "usage":{"primary":{"usedPercent":25.0,"windowMinutes":300,"resetsAt":"2020-01-01T05:00:00Z"}}
+                    }]).to_string(),
+                }
+            }),
+        )],
+    );
+    kit.wait_json(
+        "quota module live",
+        &["--json", "module", "status", "insula"],
+        |status| status["module"]["live"] == true,
+    );
+    let piped = kit.ck(&["quota"]);
+    assert_exit(&piped, 0);
+    assert!(piped.stderr.is_empty());
+    assert!(
+        text(&piped.stdout).contains("25%"),
+        "{}",
+        text(&piped.stdout)
+    );
+    let (_link, mut command) = ckni_command("ckni");
+    common::kit::isolate_client_fully(&mut command, &kit.client_root());
+    command
+        .env_remove("NO_COLOR")
+        .arg("--subc")
+        .arg(kit.connection())
+        .arg("quota");
+    let terminal = upgrade_terminal_output(&command);
+    assert_exit(&terminal, 0);
+    assert_eq!(terminal.stdout, piped.stdout);
+    assert_eq!(terminal.stderr, piped.stderr);
+}
+
+#[test]
+fn ckni_three_tables_are_selected_through_the_link_and_other_text_is_unchanged() {
+    let kit = common::kit::Kit::boot("ckni-tables", &[]);
+    for (args, header) in [
+        (vec!["health"], "MODULE  HEALTH  SUMMARY"),
+        (
+            vec!["module", "list"],
+            "MODULE  STATUS  HEALTH  PID  UP (s)  RESTARTS  BUILD  PENDING",
+        ),
+        (vec!["activity"], "TIME (UTC)  SUBJECT  EVENT  BY"),
+    ] {
+        let (_link, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+        common::kit::isolate_client(&mut command, &kit.client_root());
+        let output = command
+            .arg("--subc")
+            .arg(kit.connection())
+            .args(args)
+            .output()
+            .unwrap();
+        assert_exit(&output, 0);
+        assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+        assert_eq!(text(&output.stdout).trim_end(), header);
+    }
+    for args in [
+        vec!["module", "logs"],
+        vec!["routes"],
+        vec!["catalog"],
+        vec!["module", "rescan", "--dry-run"],
+    ] {
+        let (_link, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+        common::kit::isolate_client(&mut command, &kit.client_root());
+        let output = command
+            .arg("--subc")
+            .arg(kit.connection())
+            .args(&args)
+            .output()
+            .unwrap();
+        let ck = kit.ck(&args);
+        assert_exit(&output, 0);
+        assert_eq!(output.stdout, ck.stdout, "{}", args.join(" "));
+        assert_eq!(output.stderr, ck.stderr);
+    }
+}
+
+#[test]
+fn ckni_json_wins_over_each_plain_table_and_matches_piped_ck() {
+    let kit = common::kit::Kit::boot("ckni-json-tables", &[]);
+    for args in [&["health"][..], &["module", "list"], &["activity"]] {
+        let (_link, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+        common::kit::isolate_client_fully(&mut command, &kit.client_root());
+        let output = command
+            .arg("--subc")
+            .arg(kit.connection())
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap();
+        let mut ck_args = vec!["--json"];
+        ck_args.extend_from_slice(args);
+        let ck = kit.ck(&ck_args);
+        assert_exit(&ck, 0);
+        assert_exit(&output, 0);
+        assert!(ck.stderr.is_empty(), "{}", text(&ck.stderr));
+        assert_eq!(output.stderr, ck.stderr, "--json {}", args.join(" "));
+        assert_eq!(output.stdout, ck.stdout, "--json {}", args.join(" "));
+        serde_json::from_slice::<Value>(&output.stdout).expect("ckni --json prints JSON");
+    }
 }
 
 #[test]

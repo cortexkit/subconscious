@@ -10,6 +10,7 @@ use subc_core::setup::text::{human_blocking_outcome, upgrade_current_summary};
 
 #[path = "activity/mod.rs"]
 mod activity;
+mod ckni;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -448,8 +449,18 @@ fn record_test_probe(path: &Path) {
 
 #[tokio::main]
 async fn main() {
-    match run(env::args_os()).await {
+    let argv = env::args_os().collect::<Vec<_>>();
+    let ckni = argv
+        .first()
+        .is_some_and(|name| invoked_as_ckni(Path::new(name)));
+    match run(argv).await {
         Ok(()) => process::exit(successful_command_exit(cleanup_replaced_windows_ck())),
+        Err(err) if ckni => {
+            if let Some(text) = ckni::error_text(&err) {
+                eprintln!("{text}");
+            }
+            process::exit(ckni::exit_code(&err));
+        }
         Err(
             CkError::FleetLintExit { exit_code }
             | CkError::TriageExit { exit_code }
@@ -559,7 +570,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         return machine_adopt(args.subc.as_deref(), id, *force, args.json).await;
     }
     if let Command::Activity(options) = &args.command {
-        return activity::run(options, args.subc.as_deref(), args.json)
+        return activity::run(options, args.subc.as_deref(), args.json, ckni, args.verbose)
             .await
             .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()));
     }
@@ -569,6 +580,18 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     let mut client = CkClient::connect(resolved)
         .await
         .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))?;
+
+    if ckni && !args.json {
+        let table = match ckni::plain_output(&args.command) {
+            ckni::PlainOutput::Table(table) => Some(table),
+            ckni::PlainOutput::PipedText | ckni::PlainOutput::Exempt => None,
+        };
+        if let Some(table) = table {
+            return ckni::run_table(table, &mut client, args.verbose)
+                .await
+                .map_err(|error| decorate_error(error, false, args.subc.as_deref()));
+        }
+    }
 
     let result = match args.command {
         Command::Dashboard => unreachable!("handled before connecting"),
@@ -1581,7 +1604,7 @@ impl CkClient {
             .await?;
         match frame.header.ty {
             FrameType::Response => Ok(serde_json::from_slice(&frame.body)?),
-            FrameType::Error => Err(CkError::Rejected(decode_error_body(&frame.body))),
+            FrameType::Error => Err(CkError::rejected_frame(&frame.body)),
             ty => Err(CkError::Message(format!(
                 "unexpected control response frame {ty:?}"
             ))),
@@ -1732,7 +1755,7 @@ impl CkClient {
             }
             return match reply.header.ty {
                 FrameType::Response => Ok(serde_json::from_slice(&reply.body)?),
-                FrameType::Error => Err(CkError::Rejected(decode_error_body(&reply.body))),
+                FrameType::Error => Err(CkError::rejected_frame(&reply.body)),
                 ty => Err(CkError::Message(format!(
                     "unexpected route response frame {ty:?}"
                 ))),
@@ -2720,11 +2743,11 @@ async fn module_status(
     let list = supervisor_list(client).await?;
     let Some(module) = find_module(&list, module_id).cloned() else {
         return if json_output {
-            Err(CkError::Rejected(format!(
+            Err(CkError::rejected(format!(
                 "module_id '{module_id}' is not supervised"
             )))
         } else {
-            Err(CkError::Rejected(format!(
+            Err(CkError::rejected(format!(
                 "no module named '{module_id}'. Run ck module list."
             )))
         };
@@ -3774,7 +3797,7 @@ async fn health_detail(
     if !json_output {
         let modules = supervisor_list(client).await?;
         if find_module(&modules, module_id).is_none() {
-            return Err(CkError::Rejected(format!(
+            return Err(CkError::rejected(format!(
                 "no module named '{module_id}'. Run ck module list."
             )));
         }
@@ -4877,7 +4900,7 @@ async fn quota(
     if let Some(filter) = provider_filter {
         if !providers.iter().any(|p| provider_id(p) == filter) {
             let ids = provider_ids_sorted(&providers);
-            let error = CkError::Rejected(format!(
+            let error = CkError::rejected(format!(
                 "unknown provider '{filter}'; valid ids: {}",
                 ids.join(", ")
             ));
@@ -5012,7 +5035,9 @@ async fn fetch_subscription_value(
 /// decoded as `code — message`; only the code is kept so the line stays short.
 fn subscription_value_error(error: &CkError) -> String {
     match error {
-        CkError::Rejected(message) => message.split(" — ").next().unwrap_or(message).to_string(),
+        CkError::Rejected { message, .. } => {
+            message.split(" — ").next().unwrap_or(message).to_string()
+        }
         CkError::ResponseTimeout { .. } => "timed out".to_string(),
         _ => "request failed".to_string(),
     }
@@ -5165,7 +5190,7 @@ async fn ensure_quota_module_registered(client: &mut CkClient) -> Result<(), CkE
     if catalog.iter().any(|entry| entry.module_id == USAGE_MODULE) {
         return Ok(());
     }
-    Err(CkError::Rejected(format!(
+    Err(CkError::rejected(format!(
         "module '{}' is not registered — is it enabled in subc.jsonc?",
         USAGE_MODULE
     )))
@@ -5879,7 +5904,14 @@ fn format_quota_progress_bar(used_percent: f64, color_enabled: bool) -> String {
 }
 
 fn ansi_color_enabled() -> bool {
-    io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none()
+    let ckni = env::args_os()
+        .next()
+        .is_some_and(|name| invoked_as_ckni(Path::new(&name)));
+    ckni::color_enabled(
+        ckni,
+        io::stdout().is_terminal(),
+        env::var_os("NO_COLOR").is_some(),
+    )
 }
 
 fn dim_text(text: &str, color_enabled: bool) -> String {
@@ -7349,9 +7381,9 @@ async fn upgrade_command(
         .or_else(|| connection.as_ref().map(|found| found.path.clone()));
     let discovered =
         setup::discover_current_upgrade_targets(executable, None::<&setup::DaemonCatalogBuild>)
-            .map_err(CkError::Rejected)?;
+            .map_err(CkError::rejected)?;
     let ownership_outcomes =
-        setup::upgrade_ownership_outcomes(executable, &discovered).map_err(CkError::Rejected)?;
+        setup::upgrade_ownership_outcomes(executable, &discovered).map_err(CkError::rejected)?;
     if let Some(refusal) = setup::text::upgrade_ownership_refusal(&ownership_outcomes) {
         println!("{refusal}");
         return Err(CkError::RenderedExit { exit_code: 1 });
@@ -7476,7 +7508,7 @@ async fn upgrade_command(
         index,
         setup::UpgradeOutput::Terminal,
     )
-    .map_err(CkError::Rejected)?;
+    .map_err(CkError::rejected)?;
     backend.set_supervised_modules(observed.supervised_modules.clone());
     for &target in &observed.roster {
         if let setup::UpgradeState::UpdateAvailable { from, to, .. } = observed.target_state(target)
@@ -7499,7 +7531,7 @@ async fn upgrade_command(
         }
         Err(failure) => {
             setup::render_execution_report(&failure.report);
-            Err(CkError::Rejected(failure.to_string()))
+            Err(CkError::rejected(failure.to_string()))
         }
     }
 }
@@ -7808,6 +7840,11 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                 subc = Some(PathBuf::from(take_value(&mut iter, "--subc")?));
             } else if arg == OsStr::new("--json") {
                 json = true;
+            } else if arg == OsStr::new("--verbose")
+                && domain == "activity"
+                && invoked_as_ckni(&program)
+            {
+                verbose = true;
             } else {
                 positionals.push(arg);
             }
@@ -8213,12 +8250,12 @@ fn decorate_error(error: CkError, json_output: bool, subc: Option<&Path>) -> CkE
             "Check the connection file path above, then run `ck daemon --subc <connection-file>`"
                 .to_string(),
         ),
-        CkError::Rejected(message)
+        CkError::Rejected { message, .. }
             if message.contains("module_id '") && message.contains("not supervised") =>
         {
             Some(next_step("ck module list", "to see valid module ids", subc))
         }
-        CkError::Rejected(message) if message.contains("unknown provider '") => {
+        CkError::Rejected { message, .. } if message.contains("unknown provider '") => {
             Some(next_step("ck quota", "to list connected providers", subc))
         }
         _ => None,
@@ -8242,7 +8279,10 @@ enum CkError {
         path: PathBuf,
         source: String,
     },
-    Rejected(String),
+    Rejected {
+        message: String,
+        code: Option<String>,
+    },
     ModuleNotCommand {
         command: String,
         module_id: String,
@@ -8286,11 +8326,27 @@ impl From<DiscoveryError> for CkError {
 }
 
 impl CkError {
+    fn rejected(message: String) -> Self {
+        Self::Rejected {
+            message,
+            code: None,
+        }
+    }
+
+    fn rejected_frame(body: &[u8]) -> Self {
+        Self::Rejected {
+            message: decode_error_body(body),
+            code: serde_json::from_slice::<subc_protocol::ErrorBody>(body)
+                .ok()
+                .map(|error| error.code),
+        }
+    }
+
     fn exit_code(&self) -> i32 {
         match self {
             Self::Usage(_) | Self::Discovery { .. } => 2,
             Self::Connection { .. } => 3,
-            Self::Rejected(_)
+            Self::Rejected { .. }
             | Self::Message(_)
             | Self::ResponseTimeout { .. }
             | Self::Json(_)
@@ -8325,7 +8381,7 @@ impl fmt::Display for CkError {
                     path.display()
                 )
             }
-            Self::Rejected(message) => write!(f, "{message}"),
+            Self::Rejected { message, .. } => write!(f, "{message}"),
             Self::ModuleNotCommand { command, module_id } => write!(
                 f,
                 "'{command}' is a module, not a command. Try: ck module status {module_id}"
@@ -8530,7 +8586,7 @@ mod tests {
                 }
                 body = body.with_detail(Value::Object(detail));
             }
-            CkError::Rejected(decode_error_body(&serde_json::to_vec(&body).unwrap()))
+            CkError::rejected_frame(&serde_json::to_vec(&body).unwrap())
         }
 
         #[test]
@@ -8936,7 +8992,7 @@ mod tests {
                 .await;
                 let error = task.await.unwrap().unwrap_err();
                 awake.abort();
-                assert!(matches!(error, CkError::Rejected(_)));
+                assert!(matches!(error, CkError::Rejected { .. }));
                 assert_eq!(
                     error.to_string(),
                     operator_error_with_retry(code, Some(reason), retry_after_ms).to_string()
@@ -11020,7 +11076,7 @@ mod tests {
     #[test]
     fn subscription_value_error_keeps_only_the_module_error_code() {
         assert_eq!(
-            subscription_value_error(&CkError::Rejected(
+            subscription_value_error(&CkError::rejected(
                 "invalid_range — from_ms 5 must be non-negative and earlier than to_ms 1".into()
             )),
             "invalid_range"
@@ -11093,14 +11149,14 @@ mod tests {
     #[test]
     fn error_footers_are_scoped_and_absent_for_json() {
         let unknown_module = decorate_error(
-            CkError::Rejected("module_id 'm' is not supervised".to_string()),
+            CkError::rejected("module_id 'm' is not supervised".to_string()),
             false,
             None,
         );
         assert!(unknown_module.to_string().contains("ck module list"));
 
         let unknown_provider = decorate_error(
-            CkError::Rejected("unknown provider 'p'".to_string()),
+            CkError::rejected("unknown provider 'p'".to_string()),
             true,
             None,
         );

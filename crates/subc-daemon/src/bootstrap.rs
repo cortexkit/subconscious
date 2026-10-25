@@ -989,6 +989,7 @@ async fn serve_bound_daemon(
             health.clone(),
             configured.drain_timeout_ms,
             configured.restart,
+            configured.register_timeout,
         ) {
             Ok(registered) => registered,
             Err(err) => {
@@ -1997,6 +1998,7 @@ mod tests {
             overlap: Default::default(),
             health: HealthConfig::default(),
             drain_timeout_ms: None,
+            register_timeout: crate::supervise::DEFAULT_REGISTER_TIMEOUT,
             route_bind_relay_timeout_ms: None,
             restart: RestartPolicy::default(),
         };

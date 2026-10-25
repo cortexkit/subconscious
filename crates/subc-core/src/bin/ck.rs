@@ -2791,11 +2791,33 @@ async fn module_status(
         .into_iter()
         .find(|entry| entry.module_id == module_id);
 
+    // Terminal history retains the supervisor's cause, which a signal or exit
+    // code alone cannot explain. Match the roster's exit so a concurrent exit
+    // does not attach a newer process's reason to this status snapshot.
+    let last_exit_reason = if let Some(at_ms) = module.get("last_exit_ms").and_then(Value::as_u64) {
+        let terminals = client
+            .rpc_value(ClientControlRequest::SupervisorTerminals {
+                module_id: module_id.to_string(),
+            })
+            .await?;
+        terminals
+            .get("entries")
+            .and_then(Value::as_array)
+            .and_then(|entries| entries.last())
+            .filter(|entry| entry.get("at_ms").and_then(Value::as_u64) == Some(at_ms))
+            .and_then(|entry| entry.get("disposition_detail"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    } else {
+        None
+    };
+
     if json_output.enabled {
         json_output.print(&json!({
             "module": module,
             "health": health_entry,
             "catalog": catalog_entry,
+            "last_exit_reason": last_exit_reason,
         }))?;
     } else {
         let provenance = client
@@ -2814,6 +2836,9 @@ async fn module_status(
             observed,
             verbose,
         );
+        if let Some(reason) = last_exit_reason {
+            println!("  last exit reason: {}", terminal_safe_string(&reason));
+        }
         if let Some(entry) = catalog_entry.as_ref().filter(|entry| !entry.ready) {
             println!("  routing: {}", catalog_readiness_text(entry));
         }

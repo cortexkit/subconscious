@@ -292,6 +292,9 @@ pub struct ConfiguredModule {
     /// Effective drain budget (ms) for this module's teardown, already resolved
     /// against the daemon-wide default at parse time. `None` = built-in default.
     pub drain_timeout_ms: Option<u64>,
+    /// First-HELLO budget for ordinary spawns. Resolved when supervision starts,
+    /// like the restart policy; reload and swap use their own readiness budgets.
+    pub register_timeout: Duration,
     /// Effective route.bind relay budget (ms) for this module, already resolved
     /// against the daemon-wide default at parse time. `None` = built-in default
     /// (12s). A `0` is refused at parse time at both layers — see
@@ -453,6 +456,8 @@ struct RawModuleConfig {
     health: Option<RawHealthConfig>,
     #[serde(default)]
     drain_timeout_ms: Option<u64>,
+    #[serde(default)]
+    register_timeout_s: Option<u64>,
     #[serde(default)]
     route_bind_relay_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -878,6 +883,17 @@ fn parse_doc_with_activity(
                 });
             }
             let restart = parse_restart_config(module.restart, path, &module_id)?;
+            let register_timeout_s = module
+                .register_timeout_s
+                .unwrap_or(crate::supervise::DEFAULT_REGISTER_TIMEOUT.as_secs());
+            if !(10..=3600).contains(&register_timeout_s) {
+                return Err(DaemonConfigError::InvalidValue {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "module '{module_id}' register_timeout_s must be an integer from 10 to 3600"
+                    ),
+                });
+            }
             let log = module
                 .log
                 .map(|log| parse_logging_config(log, path, &format!("module '{module_id}' log")))
@@ -898,6 +914,7 @@ fn parse_doc_with_activity(
                 // Per-module wins; the daemon-wide value is the fallback. `0` is
                 // legitimate ("never wait"), so this is `.or`, not `filter+or`.
                 drain_timeout_ms: module.drain_timeout_ms.or(default_drain_timeout_ms),
+                register_timeout: Duration::from_secs(register_timeout_s),
                 // Same shape as drain: an explicit per-module value wins over
                 // the daemon-wide default. A `0` here is rejected above
                 // (see "off is not a budget"), so `None` means "use the
@@ -2238,6 +2255,30 @@ mod tests {
             config.modules[0].restart.max_backoff,
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn register_timeout_config_accepts_bounds_and_rejects_outside_them() {
+        let path = Path::new("subc.jsonc");
+        for seconds in [10, 3600] {
+            let doc = format!(
+                r#"{{"version":1,"modules":{{"m":{{"program":"m","register_timeout_s":{seconds}}}}}}}"#
+            );
+            let config = parse_doc(&doc, path).unwrap();
+            assert_eq!(
+                config.modules[0].register_timeout,
+                Duration::from_secs(seconds)
+            );
+        }
+        for value in ["9", "3601"] {
+            let doc = format!(
+                r#"{{"version":1,"modules":{{"m":{{"program":"m","register_timeout_s":{value}}}}}}}"#
+            );
+            let error = parse_doc(&doc, path).unwrap_err().to_string();
+            assert!(error.contains("register_timeout_s"), "{value}: {error}");
+        }
+        let config = parse_doc(r#"{"version":1,"modules":{"m":{"program":"m"}}}"#, path).unwrap();
+        assert_eq!(config.modules[0].register_timeout, Duration::from_secs(120));
     }
 
     #[test]

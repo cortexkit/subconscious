@@ -6384,6 +6384,7 @@ impl ControlHandler {
                     configured_module.health.clone(),
                     configured_module.drain_timeout_ms,
                     configured_module.restart,
+                    configured_module.register_timeout,
                     Some(requester.clone()),
                 )
                 .map_err(|err| {

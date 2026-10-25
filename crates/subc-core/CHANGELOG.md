@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.138
+
+- The daemon now recovers supervised subc children that never send HELLO; a real-daemon regression test covers killing, respawning, terminal reason and the warning log with isolated XDG directories. `ck module status` shows the last exit's supervisor reason in plain output and `last_exit_reason` in JSON by reading the supervisor's terminal history.
+
 ## 0.20.137
 
 - `ckni --json` versions built-in object outputs with a `schema` string and

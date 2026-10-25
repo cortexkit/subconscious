@@ -111,6 +111,7 @@ waiting for impossible room.
 | Daemon shutdown, per module | 25 s cap | `CHILD_SHUTDOWN_CAP`, child_roster.rs:265 |
 | Restart budget | 3 in 10 min | `DEFAULT_MAX_RESTARTS`, `DEFAULT_RESTART_WINDOW`, supervise.rs:62-68 |
 | Restart backoff | 100 ms to 30 s | `DEFAULT_BACKOFF`, `DEFAULT_MAX_BACKOFF`, supervise.rs:63-64 |
+| First HELLO, ordinary supervised subc spawn | 120 s default; per-module `register_timeout_s` from 10 to 3600 s | `DEFAULT_REGISTER_TIMEOUT`, supervise.rs |
 | Health probe deadline | 5 s | `DEFAULT_HEALTH_DEADLINE`, supervise.rs:530 |
 | Health failures before a module is faulted | 3 | `DEFAULT_HEALTH_FAILURE_THRESHOLD`, supervise.rs:531 |
 | Swap candidate ready timeout | 100 s | `DEFAULT_SWAP_READY_TIMEOUT`, supervise.rs:407 |

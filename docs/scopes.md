@@ -785,6 +785,7 @@ Which live routes a record change drains:
 | a module removed from a carrier's `targets` | that carrier's routes to that module | `scope_carrier_removed` |
 | `delegates` true to false | every route under it | `scope_delegation_changed` |
 | `agent_id` changed | every route under it | `scope_delegation_changed` |
+| `on_behalf_of_agent` added, changed or removed | every route under it | `scope_delegation_changed` |
 | `flow_id` changed | every route under it | `scope_delegation_changed` |
 | `run_id` changed (including added or removed) | every route under it | `scope_delegation_changed` |
 | `parent_state` becomes `ended` | every route under it | `scope_parent_ended` |

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.20.139
+
+- Terminal module restart, stop and start show live phases and an observed result.
+  Ctrl-C stops watching without cancelling the daemon's action. `--no-wait`
+  retains acknowledgement-only output; `--wait` also follows silently under
+  piped `ck` and `ckni`, adding a plain summary and reporting unhealthy outcomes
+  with exit code 1. `--wait --json` is a usage error.
+- Accept `--drain-timeout-ms` as an alias for restart's `--drain-ms` and carry
+  the override through the shared lifecycle follower.
+
 ## 0.20.138
 
 - The daemon now recovers supervised subc children that never send HELLO; a real-daemon regression test covers killing, respawning, terminal reason and the warning log with isolated XDG directories. `ck module status` shows the last exit's supervisor reason in plain output and `last_exit_reason` in JSON by reading the supervisor's terminal history.

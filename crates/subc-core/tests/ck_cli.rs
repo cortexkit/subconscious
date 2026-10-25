@@ -37,6 +37,8 @@ use common::{
     start_test_daemon_with_process_liveness_and_supervisor, TestDaemon,
 };
 
+mod inline_actions;
+
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 

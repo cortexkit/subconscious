@@ -26,8 +26,7 @@ use super::map;
 use super::pairing::{self, CallFailure, WatchStream};
 use super::schedule::{self, Gate, Source, Sources};
 use super::{
-    action_progress, assemble, every, modules, Connection, DaemonService, HostFacts, LiveOptions,
-    LiveProcess, State,
+    assemble, every, modules, Connection, DaemonService, HostFacts, LiveOptions, LiveProcess, State,
 };
 use crate::app::Request;
 use crate::model::{
@@ -40,10 +39,6 @@ use crate::time::Timestamp;
 /// The longest any one daemon or module request may take before its source
 /// counts it as failed and tries again on its next turn.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long an action is watched for its outcome before ck reports that it
-/// never saw one.
-const ACTION_WATCH: Duration = Duration::from_secs(120);
 
 /// How many stderr lines the log view asks for.
 const LOG_LINES: u32 = 1000;
@@ -1768,8 +1763,6 @@ async fn start_daemon(shared: Arc<Shared>) {
     shared.update(|s| s.down_note = Some(note));
 }
 
-/// Sends one lifecycle request and follows it until the daemon shows its
-/// outcome, updating the module's phase as spawn events and health arrive.
 async fn run_action(
     shared: Arc<Shared>,
     kind: ActionKind,
@@ -1777,32 +1770,6 @@ async fn run_action(
     progress_notes: Option<String>,
 ) -> super::apply::RestartResult {
     let started = now();
-    let finish = |ok: bool, text: String, state: &str| {
-        shared.update(|s| {
-            s.actions.remove(&module);
-            if ok && state == "healthy" {
-                s.pending_restarts.remove(&module);
-            }
-            s.last_result = Some(ActionResult {
-                at: now(),
-                text: text.clone(),
-                ok,
-            });
-        });
-        super::apply::RestartResult {
-            healthy: ok && state == "healthy",
-            state: state.into(),
-            detail: text,
-        }
-    };
-    let Some(conn) = shared.conn() else {
-        return finish(
-            false,
-            format!("{module}: the daemon isn't connected"),
-            "disconnected",
-        );
-    };
-    let before = shared.read(|s| s.processes.get(&module).copied());
     shared.update(|s| {
         s.actions.insert(
             module.clone(),
@@ -1813,87 +1780,99 @@ async fn run_action(
             },
         );
     });
-    let reply = match kind {
-        ActionKind::Restart => conn.consumer.supervisor_restart(module.clone(), None).await,
-        ActionKind::Stop => {
-            conn.consumer
-                .supervisor_set_enabled(module.clone(), false)
-                .await
-        }
-        ActionKind::Start => {
-            conn.consumer
-                .supervisor_set_enabled(module.clone(), true)
-                .await
-        }
+    let result = super::actions::run_action(
+        &AppAction(Arc::clone(&shared)),
+        kind,
+        &module,
+        None,
+        false,
+        |phase, _line| {
+            shared.update(|s| {
+                if let Some(a) = s.actions.get_mut(&module) {
+                    a.phase = phase;
+                    if let Some(notes) = &progress_notes {
+                        s.last_result = Some(ActionResult {
+                            at: now(),
+                            text: super::apply::progress_line(&module, a, notes),
+                            ok: true,
+                        });
+                    }
+                }
+            })
+        },
+    )
+    .await;
+    let (ok, state, text, new_process) = match result {
+        Ok(outcome) => (
+            outcome.ok,
+            outcome.state,
+            outcome.detail,
+            outcome.new_process,
+        ),
+        Err(why) => (
+            false,
+            "refused".into(),
+            format!("{module}: {} refused: {why}", kind.verb()),
+            false,
+        ),
     };
-    match reply {
-        Err(e) => {
-            let why = match &e {
-                CallError::Module(body) if !body.message.is_empty() => {
-                    format!("{} ({})", body.code, body.message)
-                }
-                _ => control_error(&e),
-            };
-            return finish(
-                false,
-                format!("{module}: {} refused: {why}", kind.verb()),
-                "refused",
-            );
-        }
-        Ok(ack) if !ack.applied => {
-            let text = match kind {
-                ActionKind::Stop => format!("{module} was already stopped"),
-                ActionKind::Start => format!("{module} was already running"),
-                ActionKind::Restart => format!("{module}: the daemon didn't restart it"),
-            };
-            return finish(true, text, "not restarted");
-        }
-        Ok(_) => {}
-    }
-    let deadline = tokio::time::Instant::now() + ACTION_WATCH;
-    loop {
-        tokio::time::sleep(Duration::from_millis(250)).await;
-        let (phase, done) =
-            shared.read(|s| action_progress(s, kind, &module, before, started, now()));
-        if let Some((ok, text)) = done {
-            let state = if ok {
-                if text.ends_with("health unknown") {
-                    "health unknown"
-                } else {
-                    "healthy"
-                }
-            } else {
-                shared.read(|s| match s.health_of(&module).map(|h| h.status) {
-                    Some(subc_control::SupervisorHealthStatus::Degraded) => "degraded",
-                    Some(subc_control::SupervisorHealthStatus::Failing) => "failing",
-                    _ => "unresponsive",
-                })
-            };
-            return finish(ok, text, state);
-        }
-        shared.update(|s| {
-            if let Some(a) = s.actions.get_mut(&module) {
-                a.phase = phase;
-                if let Some(notes) = &progress_notes {
-                    s.last_result = Some(ActionResult {
-                        at: now(),
-                        text: super::apply::progress_line(&module, a, notes),
-                        ok: true,
-                    });
-                }
-            }
+    shared.update(|s| {
+        s.actions.remove(&module);
+        clear_pending_restart(s, &module, ok && state == "healthy", new_process);
+        s.last_result = Some(ActionResult {
+            at: now(),
+            text: text.clone(),
+            ok,
         });
-        if tokio::time::Instant::now() >= deadline {
-            return finish(
-                false,
-                format!(
-                    "{module}: no outcome seen within {} s of the {}",
-                    ACTION_WATCH.as_secs(),
-                    kind.verb()
-                ),
-                "follow deadline",
-            );
-        }
+    });
+    super::apply::RestartResult {
+        healthy: ok && state == "healthy",
+        state,
+        detail: text,
+    }
+}
+
+fn clear_pending_restart(s: &mut State, module: &str, healthy: bool, new_process: bool) {
+    // Existing-process health cannot prove that staged changes were loaded.
+    if healthy && new_process {
+        s.pending_restarts.remove(module);
+    }
+}
+
+struct AppAction(Arc<Shared>);
+
+impl super::actions::ActionSource for AppAction {
+    type Error = String;
+    fn read(&self) -> BoxFuture<'_, Result<super::actions::Reading, String>> {
+        Box::pin(async {
+            Ok(super::actions::Reading {
+                state: self.0.read(Clone::clone),
+                busy: None,
+                busy_declared: false,
+                budget_ms: 30_000,
+            })
+        })
+    }
+    fn send(
+        &self,
+        kind: ActionKind,
+        module: &str,
+        drain_timeout_ms: Option<u64>,
+    ) -> BoxFuture<'_, Result<bool, String>> {
+        let module = module.to_string();
+        Box::pin(async move {
+            let conn = self.0.conn().ok_or("the daemon isn't connected")?;
+            let result = match kind {
+                ActionKind::Restart => {
+                    conn.consumer
+                        .supervisor_restart(module, drain_timeout_ms)
+                        .await
+                }
+                ActionKind::Stop => conn.consumer.supervisor_set_enabled(module, false).await,
+                ActionKind::Start => conn.consumer.supervisor_set_enabled(module, true).await,
+            };
+            result.map(|ack| ack.applied).map_err(|e| control_error(&e))
+        })
     }
 }
 
@@ -1907,6 +1886,18 @@ mod tests {
     use crate::live::schedule::Showing;
     use crate::live::NoService;
     use crate::model::Tab;
+
+    #[test]
+    fn pending_restart_marker_requires_a_new_healthy_process() {
+        let mut state = State::empty("This computer");
+        state.pending_restarts.insert("broca".into());
+        clear_pending_restart(&mut state, "broca", true, false);
+        assert!(state.pending_restarts.contains("broca"));
+        clear_pending_restart(&mut state, "broca", false, true);
+        assert!(state.pending_restarts.contains("broca"));
+        clear_pending_restart(&mut state, "broca", true, true);
+        assert!(!state.pending_restarts.contains("broca"));
+    }
 
     #[tokio::test]
     async fn what_the_app_shows_decides_the_sources_wanted() {

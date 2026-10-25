@@ -12,6 +12,7 @@
 //! When the connection fails or drops, the snapshot switches to the
 //! daemon-down screen and the layer tries again every two seconds.
 
+pub mod actions;
 pub mod activity;
 pub mod apply;
 pub mod map;
@@ -1333,10 +1334,10 @@ pub fn action_progress(
     started: Timestamp,
     now: Timestamp,
 ) -> (ActionPhase, Option<(bool, String)>) {
-    let exited = s.exits.get(module).is_some_and(|t| *t >= started);
     let current = s.processes.get(module).copied();
-    let fresh =
-        current.filter(|p| p.spawned_at >= started && before.is_none_or(|b| b.pid != p.pid));
+    let exited = s.exits.get(module).is_some_and(|t| *t >= started)
+        || (before.is_some() && current != before);
+    let fresh = fresh_action_process(current, before, started);
     let roster_state = s
         .roster
         .value
@@ -1434,6 +1435,14 @@ pub fn action_progress(
             }
         }
     }
+}
+
+fn fresh_action_process(
+    current: Option<LiveProcess>,
+    before: Option<LiveProcess>,
+    started: Timestamp,
+) -> Option<LiveProcess> {
+    current.filter(|p| p.spawned_at >= started && before != Some(*p))
 }
 
 /// How long a started or restarted module with no health check runs before

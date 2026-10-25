@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.9
+
+- Share lifecycle sending and following between the terminal app and inline
+  commands, including restart drain overrides, observed health outcomes and
+  process-bound busy-gauge summaries.
+
 ## 0.2.8
 
 - The live app serves `ckni`: the keys page shows its "Scripts and agents"

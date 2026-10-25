@@ -11,6 +11,7 @@ use subc_core::setup::text::{human_blocking_outcome, upgrade_current_summary};
 #[path = "activity/mod.rs"]
 mod activity;
 mod ckni;
+mod inline_actions;
 use ckni::JsonOutput;
 
 use std::{
@@ -410,7 +411,7 @@ const MODULE_HELP: &str = "ck module — inspect and control supervised modules\
     --tag <tag>             show one canonical tag
     --level <level>         show this level and more severe levels
     --lane <source>         select module, stderr, daemon, or a harness lane
-  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n    --swap                  blue/green: start the replacement beside the running process,\n                            cut over when it is ready, then drain the old one (needs\n                            overlap: \"safe\" in the module's config)\n    --ready-ms <n>          with --swap: how long the replacement may take to be ready\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it\n  ck module release <id>    forget a removed module's reserved id so another module may use it\n\nexit codes:\n  1  operation refused or failed (including read-only timeout)\n  4  mutating operation timed out; outcome unknown, verify before retrying";
+  ck module stderr <id>     retained stderr for a module (-n <count> to limit)\n  ck module terminals <id>  retained terminal exits for a module\n  ck module restart <id>    drain-restart a module\n    --now                   restart without waiting for in-flight requests\n    --drain-ms <n>          wait up to <n> ms for in-flight requests (this restart only)\n    --drain-timeout-ms <n>  same as --drain-ms\n    --wait                  follow to healthy or stopped, even when piped\n    --no-wait               return at the acknowledgement\n    --swap                  blue/green: start the replacement beside the running process,\n                            cut over when it is ready, then drain the old one (needs\n                            overlap: \"safe\" in the module's config)\n    --ready-ms <n>          with --swap: how long the replacement may take to be ready\n  ck module stop <id>       disable and stop a module (persists until start)\n  ck module start <id>      enable and spawn a module\n  ck module rescan          re-read subc.jsonc and reconcile the module set\n  ck module rescan --dry-run  show what a rescan would change, without changing it\n  ck module release <id>    forget a removed module's reserved id so another module may use it\n\nexit codes:\n  1  operation refused or failed (including read-only timeout)\n  4  mutating operation timed out; outcome unknown, verify before retrying";
 
 const CATALOG_HELP: &str = "ck catalog — what is registered with the daemon right now\n\nusage: ck [--json] catalog [<module-id>]\n\n  ck catalog         every module registered on the wire\n  ck catalog <id>    one module, exit 1 if it is not registered\n\nThis is the REGISTRY, not the supervisor roster: a module that connected and\nregistered itself appears here even though the daemon did not spawn it, so\n'ck module list' will not show it. Harnesses waiting for a module to come up\nshould poll this.";
 
@@ -504,6 +505,9 @@ fn cleanup_replaced_windows_ck() -> Result<(), CkError> {
 
 async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     let args = parse_args(argv)?;
+    if args.json && args.wait == Some(true) {
+        return Err(CkError::Usage("--wait cannot be used with --json".into()));
+    }
     let ckni = invoked_as_ckni(&args.program);
 
     // A bare `ck` opens the app in a terminal; ckni is for scripts and
@@ -589,6 +593,27 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     let mut client = CkClient::connect(resolved)
         .await
         .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))?;
+
+    let inline = !ckni && !args.json && io::stdout().is_terminal();
+    if !args.json && args.wait.unwrap_or(inline) {
+        use ck_ui::model::ActionKind;
+        let action = match &args.command {
+            Command::Module(ModuleCommand::Restart {
+                module_id,
+                drain_timeout_ms,
+            }) => Some((ActionKind::Restart, module_id, *drain_timeout_ms)),
+            Command::Module(ModuleCommand::Stop { module_id }) => {
+                Some((ActionKind::Stop, module_id, None))
+            }
+            Command::Module(ModuleCommand::Start { module_id }) => {
+                Some((ActionKind::Start, module_id, None))
+            }
+            _ => None,
+        };
+        if let Some((kind, module, drain)) = action {
+            return inline_actions::run(&mut client, kind, module, drain, inline).await;
+        }
+    }
 
     if ckni && !args.json {
         let table = match ckni::plain_output(&args.command) {
@@ -1423,6 +1448,7 @@ struct CkArgs {
     subc: Option<PathBuf>,
     json: bool,
     verbose: bool,
+    wait: Option<bool>,
     command: Command,
 }
 
@@ -2860,7 +2886,7 @@ fn parse_drain_override(tail: &[std::ffi::OsString]) -> Result<Option<u64>, CkEr
     let mut drain_ms: Option<u64> = None;
     let mut iter = tail.iter();
     while let Some(token) = iter.next() {
-        if token == "--drain-ms" {
+        if token == "--drain-ms" || token == "--drain-timeout-ms" {
             let value = iter.next().ok_or_else(|| {
                 CkError::Usage(format!(
                     "--drain-ms needs a millisecond count\n\n{MODULE_HELP}"
@@ -2926,7 +2952,10 @@ fn parse_swap_request(tail: &[OsString]) -> Result<Option<Option<u64>>, CkError>
             None => Ok(None),
         };
     }
-    if tail.iter().any(|t| t == "--now" || t == "--drain-ms") {
+    if tail
+        .iter()
+        .any(|t| t == "--now" || t == "--drain-ms" || t == "--drain-timeout-ms")
+    {
         return Err(CkError::Usage(format!(
             "--swap drains the old process only after the new one is serving, on the module's configured budget; --now and --drain-ms do not apply\n\n{MODULE_HELP}"
         )));
@@ -7781,6 +7810,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
     let mut subc = None;
     let mut json = false;
     let mut verbose = false;
+    let mut wait = None;
 
     // Dispatcher-local flags are only parsed BEFORE the domain; everything from
     // the first positional on is the command tail (an unknown domain forwards it
@@ -7793,6 +7823,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                     subc,
                     json,
                     verbose,
+                    wait,
                     command: if json {
                         Command::Help(top_help())
                     } else {
@@ -7804,6 +7835,9 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                 subc = Some(PathBuf::from(take_value(&mut args, "--subc")?));
             }
             Some(arg) if arg == OsStr::new("--json") => json = true,
+            Some(arg) if arg == OsStr::new("--wait") || arg == OsStr::new("--no-wait") => {
+                inline_actions::set_wait(&mut wait, arg == OsStr::new("--wait"))?;
+            }
             Some(arg) if arg == OsStr::new("--verbose") => verbose = true,
             Some(arg) if arg == OsStr::new("-h") || arg == OsStr::new("--help") => {
                 return Ok(CkArgs {
@@ -7811,6 +7845,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                     subc,
                     json,
                     verbose,
+                    wait,
                     command: Command::Help(top_help()),
                 })
             }
@@ -7820,6 +7855,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                     subc,
                     json,
                     verbose,
+                    wait,
                     command: Command::Help(format!("ck {}", env!("CARGO_PKG_VERSION"))),
                 })
             }
@@ -7829,6 +7865,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                     subc,
                     json,
                     verbose,
+                    wait,
                     command: Command::BuildShape,
                 })
             }
@@ -7840,6 +7877,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                     subc,
                     json,
                     verbose,
+                    wait,
                     command: Command::CliFaceReservedNames,
                 })
             }
@@ -7891,6 +7929,10 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
                 subc = Some(PathBuf::from(take_value(&mut iter, "--subc")?));
             } else if arg == OsStr::new("--json") {
                 json = true;
+            } else if domain == "module"
+                && (arg == OsStr::new("--wait") || arg == OsStr::new("--no-wait"))
+            {
+                inline_actions::set_wait(&mut wait, arg == OsStr::new("--wait"))?;
             } else if arg == OsStr::new("--verbose")
                 && domain == "activity"
                 && invoked_as_ckni(&program)
@@ -7906,11 +7948,26 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<CkArgs, CkErro
     };
 
     let command = parse_command(&domain, &tail)?;
+    if wait.is_some()
+        && !matches!(
+            command,
+            Command::Module(
+                ModuleCommand::Restart { .. }
+                    | ModuleCommand::Stop { .. }
+                    | ModuleCommand::Start { .. }
+            )
+        )
+    {
+        return Err(CkError::Usage(
+            "--wait and --no-wait apply only to module restart, stop and start".into(),
+        ));
+    }
     Ok(CkArgs {
         program,
         subc,
         json,
         verbose,
+        wait,
         command,
     })
 }

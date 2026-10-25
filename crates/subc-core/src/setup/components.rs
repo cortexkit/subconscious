@@ -553,7 +553,9 @@ pub(super) fn unowned_binary_paths<'a>(
 }
 
 pub(super) fn observed_binary_version(path: &Path) -> Option<String> {
-    let output = run_probe_tolerating_text_busy(path, "--version").ok()?;
+    // The caller found this path and nothing here has verified what is at it,
+    // so it gets the bound an unowned binary gets.
+    let output = run_probe_tolerating_text_busy(path, "--version", ProbeSubject::Unowned).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -846,7 +848,7 @@ pub enum Acceptance {
 /// carries the wrong binary from becoming a supervised module, and pays the
 /// first-exec toll on the destination inode before the daemon spawns it.
 fn verify_acceptance(path: &Path, acceptance: &Acceptance) -> Result<(), String> {
-    let output = run_probe_tolerating_text_busy(path, "--version")
+    let output = run_probe_tolerating_text_busy(path, "--version", ProbeSubject::PlacedBySetup)
         .map_err(|error| format!("could not run {} --version: {error}", path.display()))?;
     if !output.status.success() {
         return Err(format!(
@@ -865,19 +867,55 @@ fn verify_acceptance(path: &Path, acceptance: &Acceptance) -> Result<(), String>
     })
 }
 
-/// Executes an offline binary probe, retrying briefly on ETXTBSY. On Linux a
-/// `fork` in another thread of this process inherits every open descriptor,
-/// including the write end of a binary that a sibling thread is still
-/// finishing; until that child execs (which closes it), the kernel refuses
-/// to execute the file as "text busy". The window is microseconds but the
-/// error is real, and the fix belongs here rather than in a test because
+/// An executable setup found and does not own may not implement `--version`,
+/// or may hang, so its probe is bounded tightly: planning must never stall on
+/// a foreign program.
+const UNOWNED_PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The probe of a binary this run placed from a release archive whose SHA-256
+/// it verified. For setup's acceptance check this is the file's first run, and
+/// a first run can be delayed by the system's security checks, or by antivirus
+/// software scanning a new executable, before the program starts. A slow start
+/// gets up to this long; a placed binary that still hasn't answered by then is
+/// refused like any other probe that times out.
+const PLACED_PROBE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Which binary a probe is about to run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProbeSubject {
+    /// A binary this process was handed and verified itself, such as the
+    /// release asset it just installed or upgraded.
+    PlacedBySetup,
+    /// A binary found on disk whose bytes nothing in this run has checked,
+    /// including one an earlier setup or upgrade placed: the short bound keeps
+    /// a program that hangs from stalling planning.
+    Unowned,
+}
+
+impl ProbeSubject {
+    fn bound(self) -> std::time::Duration {
+        match self {
+            ProbeSubject::PlacedBySetup => PLACED_PROBE_BOUND,
+            ProbeSubject::Unowned => UNOWNED_PROBE_BOUND,
+        }
+    }
+}
+
+/// Executes an offline binary probe of `subject`, retrying briefly on ETXTBSY.
+/// On Linux a `fork` in another thread of this process inherits every open
+/// descriptor, including the write end of a binary that a sibling thread is
+/// still finishing; until that child execs (which closes it), the kernel
+/// refuses to execute the file as "text busy". The window is microseconds but
+/// the error is real, and the fix belongs here rather than in a test because
 /// the same race exists for any multi-threaded caller of this probe helper.
 pub(super) fn run_probe_tolerating_text_busy(
     path: &Path,
     argument: &str,
+    subject: ProbeSubject,
 ) -> std::io::Result<std::process::Output> {
-    // An unowned executable may not implement --version, or may hang. Bound
-    // both execution and output collection before trusting it during planning.
+    let bound = subject.bound();
+    // Bound both execution and output collection before accepting or trusting
+    // a probe's result.
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -885,17 +923,14 @@ pub(super) fn run_probe_tolerating_text_busy(
                     .enable_all()
                     .build()?
                     .block_on(async {
-                        tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
-                            probe_output(path, argument),
-                        )
-                        .await
-                        .map_err(|_| {
-                            std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                format!("{argument} timed out"),
-                            )
-                        })?
+                        tokio::time::timeout(bound, probe_output(path, argument))
+                            .await
+                            .map_err(|_| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    format!("{argument} timed out"),
+                                )
+                            })?
                     })
             })
             .join()
@@ -1045,6 +1080,52 @@ mod tests {
                 .unwrap_or("");
             check_reported(reported, acceptance)
                 .map_err(|reason| format!("fake binary at {} {reason}", destination.display()))
+        }
+    }
+
+    /// A source whose placed binary is a shell script that sleeps on its first
+    /// run only, standing in for a system that checks a new program before it
+    /// starts: the first run is slow, and every later run is immediate.
+    #[cfg(unix)]
+    struct SlowFirstRunSource {
+        ledger: PathBuf,
+        first_run_delay: std::time::Duration,
+    }
+
+    #[cfg(unix)]
+    impl ArtifactSource for SlowFirstRunSource {
+        fn install(
+            &mut self,
+            _component: Component,
+            _binary: &str,
+            destination: &Path,
+        ) -> Result<PlacementDigests, String> {
+            let milliseconds = self.first_run_delay.as_millis();
+            let script = format!(
+                "#!/bin/sh\n\
+                 if [ ! -e \"{ledger}\" ]; then\n\
+                 \t: > \"{ledger}\"\n\
+                 \tsleep {seconds}.{fraction:03}\n\
+                 fi\n\
+                 echo {name} 1.2.3\n",
+                ledger = self.ledger.display(),
+                seconds = milliseconds / 1000,
+                fraction = milliseconds % 1000,
+                name = destination
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            );
+            crate::setup::test_exec::write_executable(destination, script.as_bytes());
+            fake_placement_digests(destination)
+        }
+
+        fn acceptance(
+            &mut self,
+            _component: Component,
+            _binary: &str,
+        ) -> Result<Acceptance, String> {
+            Ok(Acceptance::Reports("1.2.3".to_string()))
         }
     }
 
@@ -1694,6 +1775,56 @@ mod tests {
         let start = std::time::Instant::now();
         assert_eq!(observed_binary_version(&binary), None);
         assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    /// The first `--version` of a freshly placed binary is one half of its
+    /// acceptance: setup runs it directly after writing it, and nothing has run
+    /// that file before. When that first run is slow, the short bound meant for
+    /// a foreign program must not refuse setup's own fresh placement.
+    #[cfg(unix)]
+    #[test]
+    fn acceptance_probe_outlasts_a_slow_first_run_of_a_placed_binary() {
+        let root = fixture_dir("setup-slow-first-run-acceptance");
+        let binary_home = root.join("bin");
+        fs::create_dir_all(&binary_home).expect("binary home");
+        let mut inventory =
+            Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
+        let mut source = SlowFirstRunSource {
+            ledger: root.join("first-run-ledger"),
+            first_run_delay: std::time::Duration::from_millis(2_500),
+        };
+
+        install_component(Component::Core, &binary_home, &mut inventory, &mut source)
+            .expect("a placed binary's slow first run must not refuse its acceptance");
+        assert!(is_installed(Component::Core, &binary_home, &inventory));
+
+        // The same component installed again is a no-op: the ownership rows
+        // are what setup placed, read back unchanged.
+        install_component(Component::Core, &binary_home, &mut inventory, &mut source)
+            .expect("repeat install after a slow first run");
+        assert_eq!(
+            inventory.paths_for_kind("managed-binary").len(),
+            component_binaries(Component::Core).len()
+        );
+    }
+
+    /// The short bound is for binaries setup does not own. A foreign program
+    /// at a managed destination that hangs on `--version` must still be
+    /// refused quickly; the longer bound for setup's own fresh placements
+    /// must not leak into it.
+    #[cfg(unix)]
+    #[test]
+    fn unowned_binary_that_hangs_on_version_is_refused_within_the_short_bound() {
+        let root = fixture_dir("setup-unowned-hang");
+        let hang = root.join("hang");
+        crate::setup::test_exec::write_executable(&hang, b"#!/bin/sh\nexec sleep 60\n");
+        let start = std::time::Instant::now();
+        assert_eq!(observed_binary_version(&hang), None);
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "an unowned binary that hangs must be refused within the short bound, waited {elapsed:?}"
+        );
     }
 
     #[test]

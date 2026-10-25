@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.20.135
+
+- `ck setup` no longer refuses the binary it has just installed because that
+  binary's first `--version` took longer than two seconds. A first run can be
+  delayed by the system's security checks, or by antivirus software scanning a
+  new executable. A binary this run placed from a release archive whose
+  SHA-256 it verified now gets up to 30 seconds, and so does `ck upgrade`'s
+  read of the build identity of the core it just replaced. A binary found on
+  disk that this run didn't place keeps the two-second bound, so one that
+  hangs on `--version` is still refused quickly and planning never stalls on
+  it.
+
 ## 0.20.134
 
 - `ck` started under the name `ckni` runs as ckni. The name is the last

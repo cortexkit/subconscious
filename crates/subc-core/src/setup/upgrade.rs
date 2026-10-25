@@ -719,8 +719,14 @@ impl SystemUpgradeBackend {
 
     fn daemon_build(&self, target: UpgradeTarget) -> Result<CoreBuildInfo, String> {
         let destination = &self.target(target)?.destination;
-        let output = super::components::run_probe_tolerating_text_busy(destination, "--build-info")
-            .map_err(|error| format!("could not read managed ck-subc build identity: {error}"))?;
+        // This run replaced the daemon at `destination`, so its build-identity
+        // probe uses the bound for a binary setup placed.
+        let output = super::components::run_probe_tolerating_text_busy(
+            destination,
+            "--build-info",
+            super::components::ProbeSubject::PlacedBySetup,
+        )
+        .map_err(|error| format!("could not read managed ck-subc build identity: {error}"))?;
         if !output.status.success() {
             return Err("refusal: managed ck-subc does not report offline build identity; cannot verify the running core release".to_string());
         }
@@ -1519,6 +1525,32 @@ pub(super) mod tests {
     #[cfg(unix)]
     fn core_build(sha: Option<&str>, lock: Option<&str>) -> Value {
         serde_json::json!({"core_version": "0.20.83", "build_git_sha": sha, "build_lock_digest": lock})
+    }
+
+    /// The build-identity read of a daemon this run replaced uses the bound for
+    /// a binary setup placed. In this test the read is the script's first
+    /// invocation, which sleeps past the short bound; the longer bound lets the
+    /// simulated delay complete.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_build_outlasts_a_slow_first_run_of_the_replaced_daemon() {
+        let root = fixture_dir("daemon-build-slow-first-run");
+        let build = core_build(Some(&"a".repeat(40)), Some(&"1".repeat(64)));
+        let backend = daemon_build_backend(root.path(), build.clone(), build.clone());
+        let ledger = root.path().join("first-run-ledger");
+        write_executable(
+            &root.path().join("ck-subc"),
+            format!(
+                "#!/bin/sh\nif [ ! -e \"{ledger}\" ]; then\n  : > \"{ledger}\"\n  sleep 2.5\nfi\nif [ \"$1\" = --build-info ]; then\n  echo '{build}'\nelse\n  echo 'ck-subc 0.20.83'\nfi\n",
+                ledger = ledger.display()
+            )
+            .as_bytes(),
+        );
+        let info = backend
+            .daemon_build(upgrade_target("ck-subc"))
+            .expect("a slow first run of the replaced daemon must not refuse its build read");
+        assert_eq!(info.core_version, "0.20.83");
+        assert!(ledger.exists(), "the slow first run happened");
     }
 
     #[cfg(unix)]

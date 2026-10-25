@@ -122,7 +122,9 @@ pub struct Registry {
 struct RegistryInner {
     /// Only subscribed module ids have a sender. Changes coalesce, and writers
     /// never wait for a supervisor to receive them.
-    module_changes: HashMap<String, watch::Sender<()>>,
+    // The value counts accepted active registrations. Keep that evidence even
+    // when register and disconnect coalesce before a supervisor receives them.
+    module_changes: HashMap<String, watch::Sender<u64>>,
     modules: HashMap<String, ModuleRegistration>,
     /// Swap candidates by module id: registered, never routable, never listed.
     candidates: HashMap<String, ModuleRegistration>,
@@ -159,7 +161,7 @@ impl Registry {
     pub(crate) fn subscribe_module_changes(
         &self,
         module_id: &str,
-    ) -> Result<watch::Receiver<()>, RegistryError> {
+    ) -> Result<watch::Receiver<u64>, RegistryError> {
         let mut inner = self.lock_inner()?;
         // Retired supervisors must not leave an ever-growing set of ids.
         inner
@@ -168,7 +170,7 @@ impl Registry {
         Ok(inner
             .module_changes
             .entry(module_id.to_string())
-            .or_insert_with(|| watch::channel(()).0)
+            .or_insert_with(|| watch::channel(0).0)
             .subscribe())
     }
 
@@ -278,7 +280,9 @@ impl Registry {
         } else {
             inner.unpublished.insert(connection_id);
         }
-        inner.notify_module_changed(&registration.manifest.module_id);
+        if let Some(sender) = inner.module_changes.get(&registration.manifest.module_id) {
+            sender.send_modify(|accepted| *accepted = accepted.wrapping_add(1));
+        }
         Ok(registration)
     }
 
@@ -743,7 +747,7 @@ enum SlotKind {
 impl RegistryInner {
     fn notify_module_changed(&self, module_id: &str) {
         if let Some(sender) = self.module_changes.get(module_id) {
-            sender.send_replace(());
+            sender.send_modify(|_| {});
         }
     }
 
@@ -880,7 +884,7 @@ mod change_notification_tests {
             .build()
     }
 
-    fn changed(receiver: &mut watch::Receiver<()>) {
+    fn changed(receiver: &mut watch::Receiver<u64>) {
         assert!(
             receiver.has_changed().unwrap(),
             "registry write must notify"

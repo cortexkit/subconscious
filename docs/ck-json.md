@@ -118,7 +118,9 @@ printed.
 ### `ck.module.status/v1`
 
 `module status <module>`: `{schema, module:Module, health:Health|null,
-catalog:catalog_entry|null}`. A module missing from the supervisor is refused.
+catalog:catalog_entry|null, last_exit_reason:string|null}`. The exit reason is
+the latest matching terminal record's disposition detail, when available. A
+module missing from the supervisor is refused.
 The catalog record describes wire registration/readiness and may be absent
 even when a process is running.
 

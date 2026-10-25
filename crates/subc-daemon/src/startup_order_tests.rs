@@ -20,6 +20,7 @@ fn configured(module_id: &str, program: PathBuf, enabled: bool) -> ConfiguredMod
         overlap: Default::default(),
         health: HealthConfig::default(),
         drain_timeout_ms: Some(123),
+        register_timeout: crate::supervise::DEFAULT_REGISTER_TIMEOUT,
         route_bind_relay_timeout_ms: None,
         restart: RestartPolicy::new(7, Duration::from_millis(321)),
     }

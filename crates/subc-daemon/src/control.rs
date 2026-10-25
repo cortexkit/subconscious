@@ -1471,7 +1471,7 @@ impl ControlHandler {
                 continue;
             };
             let mut closed_routes = Vec::new();
-            let mut module_goodbyes = Vec::new();
+            let mut goodbyes = Vec::new();
             for route in routes {
                 let Principal::Reserved {
                     module_id: opening_module_id,
@@ -1498,8 +1498,9 @@ impl ControlHandler {
                             capability,
                             "force-closing route because an attested capability deny edge now matches"
                         );
+                        goodbyes.push(module_goodbye);
+                        goodbyes.push(route.goodbye_target.clone());
                         closed_routes.push(route);
-                        module_goodbyes.push(module_goodbye);
                     }
                     Ok(RouteRelease::Stale | RouteRelease::Absent) => {}
                     Err(err) => warn!(
@@ -1528,7 +1529,9 @@ impl ControlHandler {
                     terminal: Some(false),
                 },
             );
-            self.emit_route_goodbyes(module_goodbyes);
+            // route.closed records the reason; the route GOODBYE ends the
+            // client's handle and settles any calls still pending on it.
+            self.emit_route_goodbyes(goodbyes);
         }
     }
 
@@ -6384,6 +6387,7 @@ impl ControlHandler {
                     configured_module.health.clone(),
                     configured_module.drain_timeout_ms,
                     configured_module.restart,
+                    configured_module.register_timeout,
                     Some(requester.clone()),
                 )
                 .map_err(|err| {
@@ -14943,7 +14947,7 @@ mod tests {
         (client_rx, bind_request)
     }
 
-    fn assert_capability_denied_push(frame: Frame, target_module_id: &str) {
+    fn assert_capability_denied_push(frame: Frame, target_module_id: &str) -> u16 {
         assert_eq!(frame.header.ty, FrameType::Push);
         assert_eq!(frame.header.channel, 0);
         let push = serde_json::from_slice::<ClientControlPush>(&frame.body)
@@ -14952,6 +14956,7 @@ mod tests {
             panic!("expected route.closed");
         };
         assert_eq!(channels.len(), 1, "exactly one violating route closed");
+        let closed_channel = channels[0];
         let channels = channels.clone();
         assert_eq!(
             push,
@@ -14965,6 +14970,7 @@ mod tests {
                 terminal: Some(false),
             }
         );
+        closed_channel
     }
 
     #[tokio::test]
@@ -15075,13 +15081,22 @@ mod tests {
         )
         .await;
 
-        assert_capability_denied_push(
+        let closed_channel = assert_capability_denied_push(
             client_rx
                 .try_recv()
                 .expect("HELLO deny addition must emit route.closed")
                 .frame,
             "target",
         );
+        let goodbye = client_rx
+            .try_recv()
+            .expect("HELLO deny addition must send the client a route GOODBYE")
+            .frame;
+        assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+        assert_eq!(goodbye.header.channel, closed_channel);
+        assert_ne!(goodbye.header.channel, 0);
+        assert_ne!(goodbye.header.epoch, 0);
+        assert!(client_rx.try_recv().is_err());
         assert_eq!(forwarding.active_binding_count().unwrap(), 0);
         assert!(matches!(
             target_rx.try_recv(),
@@ -15149,13 +15164,22 @@ mod tests {
             serde_json::from_slice::<ModuleControlResponseToModule>(&replies[0].body),
             Ok(ModuleControlResponseToModule::CatalogUpdate {})
         ));
-        assert_capability_denied_push(
+        let closed_channel = assert_capability_denied_push(
             client_rx
                 .try_recv()
                 .expect("claim addition must emit route.closed")
                 .frame,
             "target",
         );
+        let goodbye = client_rx
+            .try_recv()
+            .expect("claim addition must send the client a route GOODBYE")
+            .frame;
+        assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+        assert_eq!(goodbye.header.channel, closed_channel);
+        assert_ne!(goodbye.header.channel, 0);
+        assert_ne!(goodbye.header.epoch, 0);
+        assert!(client_rx.try_recv().is_err());
         assert_eq!(forwarding.active_binding_count().unwrap(), 0);
         assert!(matches!(
             target_rx.try_recv(),
@@ -15226,7 +15250,7 @@ mod tests {
         );
         assert!(
             client_rx.try_recv().is_err(),
-            "claim removal must not emit route.closed capability_denied"
+            "claim removal must not emit route.closed or a client route GOODBYE"
         );
         assert!(
             target_rx.try_recv().is_err(),

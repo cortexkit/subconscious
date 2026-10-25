@@ -1,8 +1,9 @@
 # Daemon timeout configuration and pre-auth limits
 
-`$XDG_CONFIG_HOME/cortexkit/subc.jsonc` has two timeout keys that are
-deliberately configurable. Both may appear at the daemon root as defaults or
-inside an individual module. Resolution happens while the file is parsed:
+`$XDG_CONFIG_HOME/cortexkit/subc.jsonc` supports drain and relay timeout keys
+at the daemon root as defaults or inside an individual module. The separate
+first-registration timeout is per-module only. Drain and relay resolution
+happens while the file is parsed:
 per-module value wins, then the daemon-wide value, then the built-in default.
 An explicit `0` is a value, not an absent setting.
 
@@ -15,7 +16,8 @@ An explicit `0` is a value, not an absent setting.
     "fast-worker": {
       "program": "/usr/local/bin/fast-worker",
       "drain_timeout_ms": 0,
-      "route_bind_relay_timeout_ms": 5000
+      "route_bind_relay_timeout_ms": 5000,
+      "register_timeout_s": 120
     }
   }
 }
@@ -38,6 +40,30 @@ route_bind_relay_timeout_ms must be greater than 0 (a zero budget fails every bi
 
 At module scope, the error also names the offending module id. At either
 scope, it names the key and the `enabled: false` remedy.
+
+## First registration after spawn
+
+`modules.<id>.register_timeout_s` bounds the wait for the first accepted HELLO
+of an ordinary supervised `protocol: "subc"` child. It is a per-module integer
+from **10 to 3600 seconds**, default **120 seconds**, measured from spawn using
+the supervisor's monotonic clock. It is read when supervision starts (daemon
+start or rescan adding the module), like the restart policy. Editing it for an
+already-supervised module takes effect on the next daemon start.
+
+The deadline applies on boot, start/enable, plain restart, crash respawn, and
+slow failed-module retry. On expiry the daemon logs a WARN with module id, pid,
+and wait, stops and reaps the child (Unix process-group TERM then KILL after
+the existing grace; Windows Job Object termination), and records a crash with
+`registration_timeout` in the terminal record's `disposition_detail`. This
+reason is retained in the terminal journal and the history shown by
+`ck module status` / `ck module terminals`. The normal restart budget and slow
+retry apply, even if the child handles TERM by exiting zero.
+
+An accepted HELLO cancels the deadline permanently for that process; a later
+disconnect does not re-arm it. Exit, stop, disable, removal and daemon shutdown
+also end the wait. `protocol: "none"` children have no registration deadline.
+Reload retains its 1-second registration wait, and swap retains its separate
+100-second default readiness wait. `route.open` during warm-up is unchanged.
 
 ## The crash-restart budget is a rate
 

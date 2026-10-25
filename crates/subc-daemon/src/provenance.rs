@@ -406,28 +406,41 @@ mod tests {
         ScratchDir::new(label)
     }
 
-    /// A live child running a copy of `sleep` that the test owns, returned
-    /// once its exe link names that copy.
+    /// A live child running a test-owned shell, returned after a readiness byte.
     ///
     /// A child owns the copy's writable descriptor so other test threads cannot
-    /// inherit it while forking. The probe waits for the child's exe link to
-    /// change because `spawn()` can return before the exec completes.
+    /// inherit it while forking. An exe link alone does not confirm userspace
+    /// startup: Ubuntu's rust-coreutils `sleep` can still be checking its own
+    /// executable name and exit if rename-over has appended ` (deleted)`.
+    /// The shell emits its readiness byte after startup, then blocks in a
+    /// builtin read so it keeps running the copied image without another exec.
     #[cfg(target_os = "linux")]
-    async fn spawn_owned_sleep(dir: &Path) -> (tokio::process::Child, PathBuf) {
-        let executable = dir.join("sleep");
+    async fn spawn_owned_waiter(dir: &Path) -> (tokio::process::Child, PathBuf) {
+        use tokio::io::AsyncReadExt;
+
+        let executable = dir.join("sh");
         assert!(std::process::Command::new("cp")
-            .args([std::ffi::OsStr::new("/bin/sleep"), executable.as_os_str()])
+            .args([std::ffi::OsStr::new("/bin/sh"), executable.as_os_str()])
             .status()
-            .expect("copy sleep fixture")
+            .expect("copy shell fixture")
             .success());
-        let child = Command::new(&executable).arg("60").spawn().unwrap();
-        let pid = child.id().unwrap();
-        let canonical = fs::canonicalize(&executable).unwrap();
-        for _ in 0..200 {
-            if fs::read_link(format!("/proc/{pid}/exe")).ok().as_deref() == Some(&*canonical) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let mut child = Command::new(&executable)
+            .args(["-c", "printf R; read -r line"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut ready = [0];
+        let readiness = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            child.stdout.as_mut().unwrap().read_exact(&mut ready),
+        )
+        .await;
+        if !matches!(readiness, Ok(Ok(1))) || ready != *b"R" {
+            let _ = child.start_kill();
+            child.wait().await.unwrap();
+            panic!("shell fixture did not signal readiness: {readiness:?}, byte: {ready:?}");
         }
         (child, executable)
     }
@@ -574,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn live_spawned_process_with_matching_start_time_still_matches() {
         let dir = temp_dir("live-child");
-        let (mut child, executable) = spawn_owned_sleep(&dir).await;
+        let (mut child, executable) = spawn_owned_waiter(&dir).await;
         let pid = child.id().unwrap();
         let start_time = process_start_time(pid).unwrap();
         let agreement = ExecutableIdentityProbe::default()
@@ -606,7 +619,7 @@ mod tests {
             b"a different image at the path the probe was told about",
         )
         .unwrap();
-        let (mut child, _executable) = spawn_owned_sleep(&dir).await;
+        let (mut child, _executable) = spawn_owned_waiter(&dir).await;
         let pid = child.id().unwrap();
         let start_time = process_start_time(pid).unwrap();
         let agreement = ExecutableIdentityProbe::default()
@@ -631,7 +644,7 @@ mod tests {
     #[tokio::test]
     async fn a_binary_replaced_under_a_live_process_is_a_mismatch() {
         let dir = temp_dir("replaced");
-        let (mut child, executable) = spawn_owned_sleep(&dir).await;
+        let (mut child, executable) = spawn_owned_waiter(&dir).await;
         let pid = child.id().unwrap();
         let start_time = process_start_time(pid).unwrap();
         let replacement = dir.join("sleep.new");

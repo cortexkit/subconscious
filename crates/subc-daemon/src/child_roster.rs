@@ -496,7 +496,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 #[cfg(unix)]
-pub(crate) use unix_shutdown::end_children_for_daemon_shutdown;
+pub(crate) use unix_shutdown::{end_children_for_daemon_shutdown, TERM_TO_KILL};
 
 #[cfg(unix)]
 mod unix_shutdown {
@@ -530,7 +530,7 @@ mod unix_shutdown {
     /// For a subc module still running at its deadline: the time between the
     /// SIGTERM sent then and the SIGKILL. Long enough for a handler to write a
     /// last line and exit.
-    const TERM_TO_KILL: Duration = Duration::from_millis(500);
+    pub(crate) const TERM_TO_KILL: Duration = Duration::from_millis(500);
     /// After a SIGKILL, how long to wait for the supervisor tasks to reap.
     /// SIGKILL cannot be ignored, so this only covers scheduling; it bounds the
     /// wait even if a reap never lands.

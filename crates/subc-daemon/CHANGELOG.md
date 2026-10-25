@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.37.8
+
+- Bound ordinary supervised subc children to a first HELLO within 120 seconds of spawn, with per-module `register_timeout_s` from 10 to 3600 seconds. Expiry stops and reaps the child and records `registration_timeout` in terminal disposition detail as a crash, using the normal restart budget and slow retry. HELLO, child exit, operator stop/disable/removal and daemon shutdown cancel the wait. Non-wire children and the separate reload/swap deadlines are unchanged.
+- Unix registration timeouts retain the unreaped process-group leader through the full TERM grace and group KILL, then reap it. Group ids come only from the recorded spawn pid, must exceed 1, and are rejected after reaping so pid reuse cannot target an unrelated group. Windows Job Object and Linux cgroup termination are unchanged.
+- Send the client a per-route GOODBYE after `route.closed` when a newly added attested capability deny edge or target capability claim closes an existing route. This ends the client's route handle and settles accepted in-flight calls as outcome unknown instead of leaving them pending until their deadlines. Claim removal still leaves routes open.
+
 ## 0.37.7
 
 - Keep health-probe and slow-retry uptime-reset deadlines absolute until their timer is polled, so a delayed executor poll does not postpone recovery. Paused-clock supervision tests now wait for the running process's current select and advance from its recorded uptime origin rather than treating `Running` as a timer-readiness barrier. The readiness timeout is unchanged.

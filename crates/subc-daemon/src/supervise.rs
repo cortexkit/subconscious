@@ -90,6 +90,7 @@ const DEFAULT_RESTART_WINDOW: Duration = Duration::from_secs(600);
 /// `supervisor.restart{drain_timeout_ms}` (0 = cut now, for wedge bounces
 /// where a stuck request will never settle).
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const DEFAULT_REGISTER_TIMEOUT: Duration = Duration::from_secs(120);
 const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
 /// How long a drain waits after one busy-gauge probe completes before it asks
@@ -322,7 +323,8 @@ struct SupervisedChild {
     /// reports the trampoline's image as the module's.
     #[cfg(target_os = "macos")]
     report_ready: Arc<OnceLock<()>>,
-    /// Refusal before the module image was accepted, retained for terminal records.
+    /// Supervisor failure detail retained for the terminal record, including
+    /// image refusals and first-HELLO timeouts after a successful spawn.
     spawn_failure: Option<String>,
     /// The protocol this process was launched with. A reload can store a new
     /// launch spec with a different protocol, but that takes effect only at the
@@ -367,6 +369,10 @@ struct SupervisedChild {
     /// Conservative monotonic bound sampled before `command.spawn()`, not when
     /// identity recording finishes or the spawn generation is published.
     spawned_at: Instant,
+    /// Ordinary spawns must send their first HELLO within this budget. Once
+    /// accepted, a later disconnect must not restart the registration clock.
+    registration_deadline: Option<Instant>,
+    registration_watch: Option<RegistrationWatch>,
     spawned_at_ms: u64,
     spawned_from: PathBuf,
     launch_spec_digest: LaunchSpecDigest,
@@ -380,6 +386,12 @@ struct SupervisedChild {
 }
 
 impl SupervisedChild {
+    fn registered_since_spawn(&self) -> bool {
+        self.registration_watch
+            .as_ref()
+            .is_some_and(|watch| *watch.changes.borrow() != watch.baseline)
+    }
+
     fn id(&self) -> Option<u32> {
         Some(self.pid)
     }
@@ -1924,6 +1936,7 @@ type ReloadReply = oneshot::Sender<Result<(), SuperviseError>>;
 
 #[derive(Debug, Clone)]
 struct SupervisorRuntimeConfig {
+    registry: Arc<Registry>,
     /// Retained across an operation's deferred backoff, until its child starts.
     recovery_is_daemon: bool,
     start_requester: Option<Principal>,
@@ -1934,6 +1947,7 @@ struct SupervisorRuntimeConfig {
     /// A reload acknowledges completion only after its replacement registers.
     deferred_reload_reply: Arc<Mutex<Option<ReloadReply>>>,
     restart_policy: RestartPolicy,
+    register_timeout: Duration,
     /// This module's RESOLVED drain budget: per-module config when present,
     /// else `default_drain_timeout`.
     drain_timeout: Duration,
@@ -3114,6 +3128,7 @@ impl Supervisor {
         let runtime = self.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
+        let registration_watch = watch_registration(&self.registry, &spec);
         let spawned = spawn_child(
             &spec,
             runtime.connection_file_path.as_deref(),
@@ -3126,7 +3141,7 @@ impl Supervisor {
         );
         #[cfg(test)]
         self.test_after_first_spawn.run(&spec.module_id);
-        let child = match spawned {
+        let mut child = match spawned {
             Ok(child) => child,
             Err(err) => {
                 // Unlike the configured paths, a failed `spawn` leaves nothing
@@ -3135,7 +3150,8 @@ impl Supervisor {
                 return Err(err);
             }
         };
-        self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
+        arm_registration_deadline(&mut child, runtime.register_timeout, registration_watch);
+        self.mark_first_process_running(&spec, &runtime, &snapshot, &mut child)?;
         if let Some(spawn) = activity_spawn {
             spawn.complete(&snapshot);
         }
@@ -3177,7 +3193,7 @@ impl Supervisor {
         spec: &ModuleSpec,
         runtime: &SupervisorRuntimeConfig,
         snapshot: &SharedSnapshot,
-        child: &SupervisedChild,
+        child: &mut SupervisedChild,
     ) -> Result<(), SuperviseError> {
         if let Err(err) = set_running(snapshot, child, &spec.module_id, &runtime.spawn_events) {
             self.abandon_unrostered(&spec.module_id);
@@ -3204,6 +3220,7 @@ impl Supervisor {
             self.health.clone(),
             None,
             self.restart_policy,
+            DEFAULT_REGISTER_TIMEOUT,
             None,
         )
     }
@@ -3227,10 +3244,12 @@ impl Supervisor {
             health,
             drain_timeout_ms,
             restart_policy,
+            DEFAULT_REGISTER_TIMEOUT,
             None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn supervise_configured_requested(
         &self,
         spec: ModuleSpec,
@@ -3238,6 +3257,7 @@ impl Supervisor {
         health: HealthConfig,
         drain_timeout_ms: Option<u64>,
         restart_policy: RestartPolicy,
+        register_timeout: Duration,
         requester: Option<Principal>,
     ) -> Result<SupervisedModule, SuperviseError> {
         let registered = self.register_configured_with_health(
@@ -3246,6 +3266,7 @@ impl Supervisor {
             health,
             drain_timeout_ms,
             restart_policy,
+            register_timeout,
         )?;
         let daemon_initiated = requester.is_none();
         self.start_registered_configured(registered, requester, daemon_initiated)
@@ -3262,6 +3283,7 @@ impl Supervisor {
         health: HealthConfig,
         drain_timeout_ms: Option<u64>,
         restart_policy: RestartPolicy,
+        register_timeout: Duration,
     ) -> Result<RegisteredConfiguredModule, SuperviseError> {
         validate_spec(&spec)?;
         self.establish_identity(&spec);
@@ -3269,6 +3291,7 @@ impl Supervisor {
         let mut runtime = self.runtime_config();
         runtime.health = health;
         runtime.restart_policy = restart_policy;
+        runtime.register_timeout = register_timeout;
         if let Some(ms) = drain_timeout_ms {
             runtime.drain_timeout = Duration::from_millis(ms);
             *runtime
@@ -3325,6 +3348,7 @@ impl Supervisor {
         };
         let child = if should_spawn {
             let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
+            let registration_watch = watch_registration(&self.registry, &spec);
             let spawned = spawn_child(
                 &spec,
                 runtime.connection_file_path.as_deref(),
@@ -3338,8 +3362,13 @@ impl Supervisor {
             #[cfg(test)]
             self.test_after_first_spawn.run(&spec.module_id);
             match spawned {
-                Ok(child) => {
-                    self.mark_first_process_running(&spec, &runtime, snapshot, &child)?;
+                Ok(mut child) => {
+                    arm_registration_deadline(
+                        &mut child,
+                        runtime.register_timeout,
+                        registration_watch,
+                    );
+                    self.mark_first_process_running(&spec, &runtime, snapshot, &mut child)?;
                     if let Some(spawn) = activity_spawn {
                         spawn.complete(snapshot);
                     }
@@ -3380,6 +3409,7 @@ impl Supervisor {
     fn runtime_config(&self) -> SupervisorRuntimeConfig {
         let effective_drain_timeout = Arc::new(Mutex::new(self.drain_timeout));
         SupervisorRuntimeConfig {
+            registry: self.registry.clone(),
             recovery_is_daemon: true,
             start_requester: None,
             pending_activity_restart: false,
@@ -3387,6 +3417,7 @@ impl Supervisor {
             scheduled_respawn: Arc::default(),
             deferred_reload_reply: Arc::default(),
             restart_policy: self.restart_policy,
+            register_timeout: DEFAULT_REGISTER_TIMEOUT,
             drain_timeout: self.drain_timeout,
             // Shared with this module's roster copy: daemon shutdown waits on
             // each child for the module's own drain budget, as resolved now.
@@ -6844,6 +6875,11 @@ async fn supervise_loop(
                 lock_snapshot(&snapshot).unwrap().actor_turns += 1;
             }
             health_probe.refresh_registration(&spec, &runtime, &registry, &snapshot);
+            let active = child.as_mut().expect("child checked above");
+            if runtime.child_roster.is_closed() || active.registered_since_spawn() {
+                active.registration_deadline = None;
+            }
+            let registration_deadline = active.registration_deadline;
             let no_checks = runtime.health.http.is_none()
                 && (running_protocol(&spec, &snapshot) == ModuleProtocol::None
                     || (health_probe.registered_connection.is_some() && !health_probe.advertised));
@@ -6855,6 +6891,10 @@ async fn supervise_loop(
             let wake_at = match (health_probe.wake_at(), uptime_reset) {
                 (probe, Some(reset)) => Some(probe.map_or(reset, |probe| probe.min(reset))),
                 (probe, None) => probe,
+            };
+            let wake_at = match (wake_at, registration_deadline) {
+                (Some(wake), Some(register)) => Some(wake.min(register)),
+                (wake, register) => wake.or(register),
             };
             #[cfg(test)]
             let wake_after = wake_at.map(|at| at.saturating_duration_since(Instant::now()));
@@ -6997,6 +7037,30 @@ async fn supervise_loop(
                 _ = &mut probe_sleep => {
                     #[cfg(test)]
                     { lock_snapshot(&snapshot).unwrap().actor_select = None; }
+                    if registration_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        // Recheck after the wake: HELLO, exit or shutdown may
+                        // have become ready in the same executor tick.
+                        active_child.registration_deadline = None;
+                        if !runtime.child_roster.is_closed()
+                            && !active_child.registered_since_spawn()
+                            && active_child.child.try_wait().is_ok_and(|status| status.is_none())
+                        {
+                            warn!(module_id = %spec.module_id, pid = active_child.pid,
+                                wait_secs = runtime.register_timeout.as_secs(),
+                                "supervised module registration_timeout: first HELLO deadline expired; stopping child");
+                            active_child.spawn_failure = Some("registration_timeout".into());
+                            if let Err(error) = stop_unregistered_child(active_child).await {
+                                error!(module_id = %spec.module_id, %error, "failed to stop unregistered child");
+                                fail_after_wait_error(&spec.module_id, &snapshot, &runtime.terminal_ring,
+                                    &runtime.spawn_events, format!("registration_timeout: {error}"),
+                                    &runtime.failure_context(true));
+                                child = None;
+                            }
+                            // The ordinary exit handler records the child's exit,
+                            // spends crash budget, and schedules recovery.
+                            continue;
+                        }
+                    }
                     if health_probe.due() {
                         run_health_probe_cycle(
                             &spec,
@@ -7771,6 +7835,10 @@ async fn finish_reload_child(
 
     match wait_outcome {
         RegistrationWaitOutcome::Registered => {
+            child
+                .as_mut()
+                .expect("registered reload child")
+                .registration_deadline = None;
             debug!(module_id = %spec.module_id, "supervised module reloaded and registered");
             Ok(())
         }
@@ -7979,11 +8047,12 @@ async fn on_child_exit(
         )
         .await;
     }
-    // Every stop the supervisor itself asks for (operator stop, disable,
+    // Deliberate stops the supervisor asks for (operator stop, disable,
     // restart, reload, swap, a health restart, a drain that runs out of budget)
     // takes the child out of the supervise loop and reaps it in
     // `drain_child_to_state`, and daemon shutdown is handled above. So an exit
-    // that reaches this point was not requested by the daemon.
+    // that reaches this point is either unrequested or a first-HELLO timeout,
+    // which is deliberately classified as a crash even after a clean TERM exit.
     //
     // For a subc-wire module a clean exit is still a stop: those modules are
     // written to re-raise SIGTERM, so a stray outside signal already reads as a
@@ -9117,6 +9186,8 @@ fn spawn_child_in_slot(
         stderr_pump,
         stderr_ring: Arc::clone(ring),
         spawned_at,
+        registration_deadline: None,
+        registration_watch: None,
         spawned_at_ms,
         spawned_from,
         launch_spec_digest: LaunchSpecDigest::from_spec(spec),
@@ -9841,6 +9912,7 @@ fn spawn_and_mark_running(
     snapshot: &SharedSnapshot,
 ) -> Result<SupervisedChild, SuperviseError> {
     let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
+    let registration_watch = watch_registration(&runtime.registry, spec);
     let child = spawn_child(
         spec,
         runtime.connection_file_path.as_deref(),
@@ -9851,11 +9923,85 @@ fn spawn_and_mark_running(
         #[cfg(target_os = "linux")]
         runtime.cgroup_placement.as_ref(),
     )?;
+    let mut child = child;
+    arm_registration_deadline(&mut child, runtime.register_timeout, registration_watch);
     set_running(snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
     if let Some(spawn) = activity_spawn {
         spawn.complete(snapshot);
     }
     Ok(child)
+}
+
+struct RegistrationWatch {
+    changes: watch::Receiver<u64>,
+    baseline: u64,
+}
+
+// Capture before spawning: a fast child's accepted HELLO can disappear from the
+// active registry before the monitor first runs. A pre-existing registration
+// must not satisfy a new process's deadline either.
+fn watch_registration(registry: &Registry, spec: &ModuleSpec) -> Option<RegistrationWatch> {
+    if spec.protocol != ModuleProtocol::Subc {
+        return None;
+    }
+    let changes = registry.subscribe_module_changes(&spec.module_id).ok()?;
+    let baseline = *changes.borrow();
+    Some(RegistrationWatch { changes, baseline })
+}
+
+fn arm_registration_deadline(
+    child: &mut SupervisedChild,
+    budget: Duration,
+    registration_watch: Option<RegistrationWatch>,
+) {
+    child.registration_deadline =
+        (child.protocol == ModuleProtocol::Subc).then_some(child.spawned_at + budget);
+    child.registration_watch = registration_watch;
+}
+
+async fn stop_unregistered_child(child: &mut SupervisedChild) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        // Children lead their own process groups. Signal the whole group so a
+        // helper stuck before HELLO cannot survive its supervised parent.
+        let group = unreaped_registration_group(child)?;
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::TERM);
+        // Process-group safety rule: only signal a group while its leader is
+        // our unreaped child. Even a zombie leader reserves its pid/group id;
+        // reaping it before KILL would let that id name an unrelated group.
+        // Sleep without waiting so TERM-ignoring helpers get the full grace.
+        sleep(crate::child_roster::TERM_TO_KILL).await;
+        let group = unreaped_registration_group(child)?;
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
+    // Windows terminates the containing Job Object as well as the direct
+    // child. Linux also kills the child's cgroup when placement is enabled.
+    child.start_kill()?;
+    child.wait().await?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unreaped_registration_group(child: &SupervisedChild) -> io::Result<rustix::process::Pid> {
+    // The group id comes only from the pid recorded at spawn, when the child
+    // created its own group. Never admit init's group or a negative group id.
+    let group = i32::try_from(child.pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .and_then(rustix::process::Pid::from_raw)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid supervised process group",
+            )
+        })?;
+    if child.child.id() != Some(child.pid) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing process-group signal after supervised child was reaped",
+        ));
+    }
+    Ok(group)
 }
 
 enum RegistrationWaitOutcome {
@@ -10845,8 +10991,9 @@ async fn wait_for_slot_registration(
 }
 
 fn registration_failure_exit_report(mut exit_report: ExitReport) -> ExitReport {
-    // A replacement process that exits before HELLO did not provide service, even
-    // if it used status 0. Count it against the restart cap as a new-binary failure.
+    // A process stopped for missing its first HELLO did not provide service,
+    // even if its TERM handler exits zero. Reload also uses this classification
+    // when a replacement exits before registering.
     if exit_report.kind != ExitKind::DeliberateSeverance {
         exit_report.kind = ExitKind::Crash;
     }
@@ -11680,7 +11827,11 @@ fn classify_reaped_child_exit(
         state.reaped_pid = Some(child.pid);
         state.spawn_failure = child.spawn_failure.clone();
     });
-    apply_deliberate_severance_marker(snapshot, child.process_identity(), classify_exit(status))
+    if child.spawn_failure.as_deref() == Some("registration_timeout") {
+        registration_failure_exit_report(classify_exit(status))
+    } else {
+        apply_deliberate_severance_marker(snapshot, child.process_identity(), classify_exit(status))
+    }
 }
 
 fn fail_snapshot(
@@ -13813,6 +13964,7 @@ mod restart_ordering_tests {
                 HealthConfig::default(),
                 None,
                 RestartPolicy::new(3, Duration::ZERO),
+                DEFAULT_REGISTER_TIMEOUT,
             )
             .unwrap();
         let module = registered.module.clone();
@@ -13926,6 +14078,7 @@ mod restart_ordering_tests {
                 HealthConfig::default(),
                 None,
                 RestartPolicy::default(),
+                DEFAULT_REGISTER_TIMEOUT,
             )
             .unwrap();
         let RegisteredConfiguredModule {
@@ -13991,6 +14144,7 @@ mod health_event_tests {
         spec: ModuleSpec,
         health: HealthConfig,
         rx: mpsc::Receiver<crate::router::OutboundFrame>,
+        roster: ChildRoster,
         _home: ScratchDir,
     }
 
@@ -14015,6 +14169,21 @@ mod health_event_tests {
 
     impl Actor {
         async fn start(protocol: ModuleProtocol, cadence: Duration) -> Self {
+            Self::start_with_policy(
+                protocol,
+                cadence,
+                DEFAULT_REGISTER_TIMEOUT,
+                RestartPolicy::new(3, Duration::ZERO),
+            )
+            .await
+        }
+
+        async fn start_with_policy(
+            protocol: ModuleProtocol,
+            cadence: Duration,
+            register_timeout: Duration,
+            policy: RestartPolicy,
+        ) -> Self {
             let home = ScratchDir::new("health-events");
             let registry = Arc::new(Registry::default());
             let forwarding = Arc::new(ForwardingTable::default());
@@ -14023,10 +14192,9 @@ mod health_event_tests {
                 deadline: Duration::from_secs(3600),
                 ..HealthConfig::default()
             };
-            let supervisor =
-                Supervisor::new_for_test(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
-                    .with_forwarding(forwarding.clone())
-                    .with_health_config(health.clone());
+            let supervisor = Supervisor::new_for_test(registry.clone(), policy)
+                .with_forwarding(forwarding.clone())
+                .with_health_config(health.clone());
             let spec = ModuleSpec {
                 module_id: "event-health-child".into(),
                 // `/bin/sleep` itself, not `/bin/sh -c "exec sleep"`: on macOS
@@ -14049,7 +14217,17 @@ mod health_event_tests {
                 protocol,
                 overlap: Default::default(),
             };
-            let module = supervisor.spawn(spec.clone()).unwrap();
+            let module = supervisor
+                .supervise_configured_requested(
+                    spec.clone(),
+                    true,
+                    health.clone(),
+                    Some(0),
+                    policy,
+                    register_timeout,
+                    None,
+                )
+                .unwrap();
             let (_, rx) = mpsc::channel(8);
             let actor = Self {
                 module,
@@ -14058,12 +14236,26 @@ mod health_event_tests {
                 spec,
                 health,
                 rx,
+                roster: supervisor.child_roster.clone(),
                 _home: home,
             };
             actor
                 .wait_for_select(|checkpoint| checkpoint.generation > 0)
                 .await;
             actor
+        }
+
+        async fn expire_registration_wait(&self, remaining: Duration) {
+            tokio::time::advance(remaining).await;
+            wait_for("registration timeout TERM grace", || {
+                lock_snapshot(&self.module.inner.snapshot)
+                    .unwrap()
+                    .actor_select
+                    .is_none()
+                    .then_some(())
+            })
+            .await;
+            tokio::time::advance(crate::child_roster::TERM_TO_KILL).await;
         }
 
         fn turns(&self) -> u64 {
@@ -14153,6 +14345,335 @@ mod health_event_tests {
                 )
                 .unwrap();
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registration_timeout_kills_at_120_seconds_and_respawns() {
+        let actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        let initial = actor.module.status().unwrap();
+        tokio::time::advance(Duration::from_secs(119)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(actor.module.status().unwrap().pid, initial.pid);
+        assert!(actor.module.terminal_history().entries.is_empty());
+        actor.expire_registration_wait(Duration::from_secs(1)).await;
+        actor
+            .wait_for_select(|at| at.generation > initial.spawn_generation)
+            .await;
+        let status = actor.module.status().unwrap();
+        assert_ne!(status.pid, initial.pid);
+        assert!(!cortexkit_test_support::process_alive(
+            initial.pid.unwrap() as i32
+        ));
+        assert_eq!(status.restart_count, 1);
+        assert_eq!(status.last_exit.unwrap().kind, ExitKind::Crash);
+        let entries = actor.module.terminal_history().entries;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].disposition_detail.as_deref(),
+            Some("registration_timeout")
+        );
+        actor.module.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registration_timeout_is_cancelled_by_hello_at_119_seconds() {
+        let mut actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        let pid = actor.module.status().unwrap().pid;
+        tokio::time::advance(Duration::from_secs(119)).await;
+        actor.hello(1, false);
+        let registered = actor
+            .wait_for_select(|at| at.registered_connection.is_some())
+            .await;
+        assert_eq!(
+            registered.wake_after, None,
+            "HELLO must cancel the deadline"
+        );
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(actor.module.status().unwrap().pid, pid);
+        assert!(actor.module.terminal_history().entries.is_empty());
+        // A disconnect after the first HELLO must not re-arm a startup timer.
+        actor
+            .registry
+            .deregister_connection(ConnectionId::new(1))
+            .unwrap();
+        actor
+            .wait_for_select(|at| at.registered_connection.is_none())
+            .await;
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(actor.module.status().unwrap().pid, pid);
+        assert!(actor.module.terminal_history().entries.is_empty());
+        actor.module.stop().await.unwrap();
+
+        let mut transient = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        let pid = transient.module.status().unwrap().pid;
+        tokio::time::advance(Duration::from_secs(119)).await;
+        let turns = transient.turns();
+        // Both writes happen before the supervisor can refresh the registry.
+        // An accepted HELLO must remain evidence after its connection is gone.
+        transient.hello(1, false);
+        transient
+            .registry
+            .deregister_connection(ConnectionId::new(1))
+            .unwrap();
+        let parked = transient.wait_for_select(|at| at.turn > turns).await;
+        assert_eq!(
+            parked.wake_after, None,
+            "transient HELLO must cancel the deadline"
+        );
+        tokio::time::advance(Duration::from_secs(300)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(transient.module.status().unwrap().pid, pid);
+        assert!(transient.module.terminal_history().entries.is_empty());
+        transient.module.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registration_timeouts_exhaust_budget_and_schedule_slow_retry() {
+        let actor = Actor::start_with_policy(
+            ModuleProtocol::Subc,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            RestartPolicy::new(1, Duration::ZERO),
+        )
+        .await;
+        let generation = actor.module.status().unwrap().spawn_generation;
+        actor
+            .expire_registration_wait(Duration::from_secs(10))
+            .await;
+        actor.wait_for_select(|at| at.generation > generation).await;
+        actor
+            .expire_registration_wait(Duration::from_secs(10))
+            .await;
+        let retry = wait_for("failed retry schedule", || {
+            let state = lock_snapshot(&actor.module.inner.snapshot).unwrap();
+            (state.state == ModuleState::Failed)
+                .then_some(state.failed_retry.pending)
+                .flatten()
+        })
+        .await;
+        assert_eq!(retry.delay, Duration::from_secs(600));
+        assert_eq!(retry.attempt, 1);
+        let entries = actor.module.terminal_history().entries;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].disposition, TerminalDisposition::Failed);
+        assert!(entries[1]
+            .disposition_detail
+            .as_deref()
+            .unwrap()
+            .contains("registration_timeout"));
+        tokio::time::advance(Duration::from_secs(599)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(actor.module.state().unwrap(), ModuleState::Failed);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        actor
+            .wait_for_select(|at| at.generation > generation + 1)
+            .await;
+        // The slow retry is another ordinary spawn, with its own HELLO budget.
+        actor
+            .expire_registration_wait(Duration::from_secs(10))
+            .await;
+        wait_for("slow retry registration timeout", || {
+            (actor.module.terminal_history().entries.len() == 3).then_some(())
+        })
+        .await;
+        actor.module.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registration_timeout_honours_ten_second_override() {
+        let actor = Actor::start_with_policy(
+            ModuleProtocol::Subc,
+            Duration::from_secs(30),
+            Duration::from_secs(10),
+            RestartPolicy::new(3, Duration::ZERO),
+        )
+        .await;
+        let generation = actor.module.status().unwrap().spawn_generation;
+        tokio::time::advance(Duration::from_secs(9)).await;
+        tokio::task::yield_now().await;
+        assert!(actor.module.terminal_history().entries.is_empty());
+        actor.expire_registration_wait(Duration::from_secs(1)).await;
+        actor.wait_for_select(|at| at.generation > generation).await;
+        assert_eq!(actor.module.terminal_history().entries.len(), 1);
+        actor.module.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn registration_timeout_kills_term_ignoring_helper_before_reaping_leader() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+
+        struct Helper(std::process::Child);
+        impl Drop for Helper {
+            fn drop(&mut self) {
+                // This handle still owns the helper until wait returns. Never
+                // clean up its old process group after the leader is reaped.
+                if matches!(self.0.try_wait(), Ok(None)) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+        }
+
+        let home = ScratchDir::new("registration-timeout-helper");
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        );
+        let spec = ModuleSpec {
+            module_id: "registration-timeout-group".into(),
+            program: "/bin/sleep".into(),
+            args: vec!["120".into()],
+            env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                .into_iter()
+                .map(|key| (key.into(), home.path().display().to_string()))
+                .collect(),
+            reserved: false,
+            reserved_prefixes: vec![],
+            protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
+        };
+        let module = supervisor
+            .supervise_configured_requested(
+                spec,
+                true,
+                HealthConfig::default(),
+                None,
+                RestartPolicy::new(0, Duration::ZERO),
+                Duration::from_secs(10),
+                None,
+            )
+            .unwrap();
+        let leader = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = module.status().unwrap().pid {
+                    break pid;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("supervised group leader must be reported before the deadline");
+        assert!(leader > 1);
+        let ready = home.join("helper.ready");
+        // Own the helper separately so even a broken group kill can be cleaned
+        // up by its own unreaped child handle, without signalling a stale pgid.
+        let mut helper = Helper(
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "trap '' TERM; : > \"$1\"; exec /bin/sleep 120",
+                    "helper",
+                ])
+                .arg(&ready)
+                .process_group(i32::try_from(leader).unwrap())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        timeout(Duration::from_secs(5), async {
+            while !ready.exists() {
+                assert!(helper.0.try_wait().unwrap().is_none());
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("helper must install TERM ignore before the registration deadline");
+        let helper_pid =
+            rustix::process::Pid::from_raw(i32::try_from(helper.0.id()).unwrap()).unwrap();
+        rustix::process::kill_process(helper_pid, rustix::process::Signal::TERM).unwrap();
+        sleep(Duration::from_millis(20)).await;
+        assert!(
+            helper.0.try_wait().unwrap().is_none(),
+            "helper must ignore TERM"
+        );
+
+        timeout(Duration::from_secs(20), async {
+            while module.state().unwrap() != ModuleState::Failed {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("registration timeout must stop and reap the group leader");
+        let helper_exit = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(status) = helper.0.try_wait().unwrap() {
+                    break status;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("TERM-ignoring helper survived the registration timeout's group KILL");
+        assert_eq!(helper_exit.signal(), Some(9));
+        assert!(!cortexkit_test_support::process_alive(
+            i32::try_from(leader).unwrap()
+        ));
+        assert_eq!(
+            module.status().unwrap().last_exit.unwrap().kind,
+            ExitKind::Crash
+        );
+        assert!(module.terminal_history().entries[0]
+            .disposition_detail
+            .as_deref()
+            .unwrap()
+            .contains("registration_timeout"));
+        module.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registration_timeout_does_not_count_an_earlier_exit() {
+        let actor = Actor::start_with_policy(
+            ModuleProtocol::Subc,
+            Duration::from_secs(30),
+            DEFAULT_REGISTER_TIMEOUT,
+            RestartPolicy::new(0, Duration::ZERO),
+        )
+        .await;
+        let pid = actor.module.status().unwrap().pid.unwrap();
+        rustix::process::kill_process(
+            rustix::process::Pid::from_raw(pid as i32).unwrap(),
+            rustix::process::Signal::TERM,
+        )
+        .unwrap();
+        wait_for("early exit", || {
+            (actor.module.state().unwrap() == ModuleState::Failed).then_some(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(121)).await;
+        tokio::task::yield_now().await;
+        let entries = actor.module.terminal_history().entries;
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0]
+            .disposition_detail
+            .as_deref()
+            .unwrap()
+            .contains("registration_timeout"));
+        assert_eq!(actor.module.status().unwrap().lifetime_restarts, 0);
+        actor.module.stop().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registration_timeout_is_cancelled_by_daemon_shutdown() {
+        let actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        let pid = actor.module.status().unwrap().pid;
+        tokio::time::advance(Duration::from_secs(119)).await;
+        actor.roster.close();
+        let turns = actor.turns();
+        tokio::time::advance(Duration::from_secs(300)).await;
+        let parked = actor.wait_for_select(|at| at.turn > turns).await;
+        assert_eq!(parked.wake_after, None);
+        assert_eq!(actor.module.status().unwrap().pid, pid);
+        assert!(actor.module.terminal_history().entries.is_empty());
+        actor.module.stop().await.unwrap();
+        let status = actor.module.status().unwrap();
+        assert_eq!(status.restart_count, 0);
+        assert_eq!(
+            actor.module.terminal_history().entries[0].disposition,
+            TerminalDisposition::DaemonShutdown
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -14335,7 +14856,7 @@ mod health_event_tests {
                     && checkpoint.next_probe_at.is_none()
             })
             .await;
-        assert_eq!(parked.wake_after, None);
+        assert_eq!(parked.wake_after, Some(DEFAULT_REGISTER_TIMEOUT));
         actor.rx.close();
         // Drain the stop notice the restart queued for the old process's connection,
         // so it isn't mistaken for traffic to the replacement.
@@ -15925,6 +16446,8 @@ mod cgroup_placement_tests {
             stderr_pump: None,
             stderr_ring: Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default()))),
             spawned_at: tokio::time::Instant::now(),
+            registration_deadline: None,
+            registration_watch: None,
             spawned_at_ms: 0,
             spawned_from: PathBuf::from("true"),
             launch_spec_digest: LaunchSpecDigest([0; 32]),

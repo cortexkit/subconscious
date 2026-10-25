@@ -669,6 +669,7 @@ async fn operator_configured_start_failure_does_not_schedule_recovery() {
             HealthConfig::default(),
             None,
             RestartPolicy::default(),
+            DEFAULT_REGISTER_TIMEOUT,
             Some(Principal::Direct),
         )
         .unwrap();

@@ -26,4 +26,10 @@ public struct FedNoiseSessionByteTransport: FedSessionByteTransport {
     public func close() async {
         await session.close()
     }
+
+    var nonceSummary: String {
+        get async {
+            await "nextSendNonce=\(session.nextSendNonce) nextReceiveNonce=\(session.nextReceiveNonce)"
+        }
+    }
 }

@@ -216,6 +216,7 @@ public actor FedSessionEngine {
     /// its error, so both paths need the original timeout reason for logging.
     private(set) var timerFailureCause: String?
     private var timerDeadlineChanged: (@Sendable () -> Void)?
+    private var pollingTimers = false
     /// In-flight origin-side reconciliation for this reconnect, if any. Present
     /// between sending the effect_status queries and collecting every answer.
     private var reconciliation: FedPendingReconciliation?
@@ -881,6 +882,9 @@ public actor FedSessionEngine {
             task.cancel()
         }
         listBusyRetryTasks.removeAll()
+        // Close I/O before durable cleanup can suspend. Cancellation does not
+        // interrupt a carrier read, and a lost session must not send a goodbye.
+        await deps.transport.close()
         // Peer-scoped admission: tear down session permits without dropping
         // ledgered recovery ownership. Full shutdown only if we own the controller.
         if ownsAdmission {
@@ -892,14 +896,6 @@ public actor FedSessionEngine {
         if deps.sharedEffectLog == nil {
             await effectLog?.shutdown()
         }
-        if helloGate.isComplete {
-            let bye = FedFrame(
-                type: FedFrameType.bye.rawValue,
-                fields: ["code": .string("fed_goodbye")]
-            )
-            try? await sendFrame(bye)
-        }
-        await deps.transport.close()
     }
 
     public func suspend() async {
@@ -934,6 +930,9 @@ public actor FedSessionEngine {
 
     /// Tick keepalive and staleness using the injected clock.
     public func pollTimers() async throws -> FedFrame? {
+        guard !pollingTimers else { return nil }
+        pollingTimers = true
+        defer { pollingTimers = false }
         guard !cancelledActivities, let keepalive, phase == .ready || phase == .draining else {
             return nil
         }

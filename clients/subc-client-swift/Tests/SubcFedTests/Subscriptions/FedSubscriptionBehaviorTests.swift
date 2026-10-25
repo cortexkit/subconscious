@@ -18,10 +18,16 @@ actor SubscriptionTestTransport: FedSessionByteTransport {
     private var autoOpenAfterFirst = false
     private var holdCatalog = false
     private var holdUnsubscribe = false
+    private var holdKeepalive = false
+    private(set) var cancelledHeldSend = false
+    private(set) var closeCalls = 0
+    private(set) var callsAfterClose = 0
+    private(set) var receiveCalls = 0
 
     init(features: Set<String>, cap: UInt64) { self.features = features; self.cap = cap }
 
     func send(_ bytes: Data) async throws {
+        if closed { callsAfterClose += 1; throw FedFailure.disconnected }
         let frame = try FedFrameCodec.decode(bytes, negotiationComplete: true, negotiatedFeatures: features)
         sent.append(frame)
         let ready = observers.filter { type, count, _ in sent.filter { $0.typeName == type }.count >= count }
@@ -42,11 +48,16 @@ actor SubscriptionTestTransport: FedSessionByteTransport {
             if holdSubscribe { await withCheckedContinuation { held = $0 } }
         } else if frame.typeName == "unsubscribe", holdUnsubscribe {
             await withCheckedContinuation { held = $0 }
+        } else if frame.typeName == "keepalive", holdKeepalive {
+            await withCheckedContinuation { held = $0 }
+            cancelledHeldSend = Task.isCancelled
         }
     }
 
     static let catalog = #"{"modules":[{"module_id":"prefrontal-core","management":{"operations":[{"name":"agent.watch","kind":"query","delivery":"watch"},{"name":"read","kind":"query"},{"name":"future","kind":"query","delivery":"future"},{"name":"bad","kind":"query","delivery":17},{"name":"mutate.watch","kind":"mutate","delivery":"watch"}]}}]}"#
     func receive() async throws -> Data {
+        receiveCalls += 1
+        if closed { callsAfterClose += 1; throw FedFailure.disconnected }
         if !inbound.isEmpty { return inbound.removeFirst() }
         if closed { throw FedFailure.disconnected }
         return try await withCheckedThrowingContinuation { readers.append($0) }
@@ -73,13 +84,15 @@ actor SubscriptionTestTransport: FedSessionByteTransport {
     func gateSubscribe() { holdSubscribe = true }
     func gateCatalog() { holdCatalog = true }
     func gateUnsubscribe() { holdUnsubscribe = true }
+    func gateKeepalive() { holdKeepalive = true }
     func releaseCatalog() throws {
         holdCatalog = false
         try push([FedFrame(type: "catalog", fields: ["generation": .integer(1)], body: Data(Self.catalog.utf8))])
     }
     func openFollowingRequests(_ value: Bool = true) { autoOpenAfterFirst = value }
-    func release() { holdSubscribe = false; holdUnsubscribe = false; held?.resume(); held = nil }
+    func release() { holdSubscribe = false; holdUnsubscribe = false; holdKeepalive = false; held?.resume(); held = nil }
     func close() {
+        closeCalls += 1
         closed = true
         release()
         for reader in readers { reader.resume(throwing: FedFailure.disconnected) }

@@ -42,6 +42,12 @@ public actor FedNoiseRecordSession {
     private let carrier: any FedNoiseMessageCarrier
     private let transport: FedNoiseTransport
     private var closed = false
+    // Actor isolation ends at each carrier await. Hold direction ownership across
+    // those awaits so records cannot overtake a nonce or split a logical frame.
+    private var sending = false
+    private var receiving = false
+    private var sendWaiters: [CheckedContinuation<Void, Error>] = []
+    private var receiveWaiters: [CheckedContinuation<Void, Error>] = []
 
     init(
         transportMaterial: FedNoiseTransportMaterial,
@@ -72,10 +78,26 @@ public actor FedNoiseRecordSession {
     /// replacement session because the peer's frame assembler would reject it.
     public func sendTransportPayload(_ plaintext: Data) async throws {
         guard !closed else { throw FedNoiseError.transportClosed }
+        if sending {
+            try await withCheckedThrowingContinuation { sendWaiters.append($0) }
+        } else {
+            sending = true
+        }
+        defer {
+            if !sendWaiters.isEmpty { sendWaiters.removeFirst().resume() }
+            else { sending = false }
+        }
+        try Task.checkCancellation()
+        guard !closed else { throw FedNoiseError.transportClosed }
         let chunkCount = max(1, (plaintext.count + Self.maximumPlaintextPerRecord - 1)
             / Self.maximumPlaintextPerRecord)
 
         for chunkIndex in 0..<chunkCount {
+            if Task.isCancelled {
+                await close()
+                throw CancellationError()
+            }
+            guard !closed else { throw FedNoiseError.transportClosed }
             let lowerBound = chunkIndex * Self.maximumPlaintextPerRecord
             let upperBound = min(lowerBound + Self.maximumPlaintextPerRecord, plaintext.count)
             let chunk = plaintext.subdata(in: lowerBound..<upperBound)
@@ -88,6 +110,7 @@ public actor FedNoiseRecordSession {
             }
             do {
                 try await carrier.sendNoiseMessage(ciphertext)
+                guard !closed else { throw FedNoiseError.transportClosed }
             } catch {
                 await close()
                 throw error
@@ -106,8 +129,21 @@ public actor FedNoiseRecordSession {
     /// fed framing or application parsing.
     public func receiveTransportPayload() async throws -> Data {
         guard !closed else { throw FedNoiseError.transportClosed }
+        if receiving {
+            try await withCheckedThrowingContinuation { receiveWaiters.append($0) }
+        } else {
+            receiving = true
+        }
+        defer {
+            if !receiveWaiters.isEmpty { receiveWaiters.removeFirst().resume() }
+            else { receiving = false }
+        }
+        try Task.checkCancellation()
+        guard !closed else { throw FedNoiseError.transportClosed }
         do {
             let ciphertext = try await carrier.receiveNoiseMessage()
+            try Task.checkCancellation()
+            guard !closed else { throw FedNoiseError.transportClosed }
             let plaintext = try transport.decrypt(ciphertext)
             if transport.isClosed {
                 await close()
@@ -129,6 +165,10 @@ public actor FedNoiseRecordSession {
     public func close() async {
         guard !closed else { return }
         closed = true
+        for waiter in sendWaiters { waiter.resume(throwing: FedNoiseError.transportClosed) }
+        sendWaiters.removeAll()
+        for waiter in receiveWaiters { waiter.resume(throwing: FedNoiseError.transportClosed) }
+        receiveWaiters.removeAll()
         await carrier.close()
     }
 }

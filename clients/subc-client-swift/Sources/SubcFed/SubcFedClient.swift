@@ -106,7 +106,9 @@ public actor SubcFedClient {
     private var activeSession: FedDialedSession?
     private var establishingSession: FedDialedSession?
     private var receiveTask: Task<Void, Never>?
+    private var receiveSessionEngine: FedSessionEngine?
     private var timerTask: Task<Void, Never>?
+    private var timerSignal: FedSessionTimerSignal?
     private var sessionLossLogger: @Sendable (String) -> Void = { cause in
         Logger(subsystem: "io.cortexkit.subcfed", category: "session")
             .error("Session lost: \(cause, privacy: .public)")
@@ -606,7 +608,7 @@ public actor SubcFedClient {
                 }
             } catch {
                 guard generation == subscriptionGeneration, isCurrentSession(session) else { return }
-                await handleSessionLoss(error, context: "subscription write")
+                await handleSessionLoss(error, context: "subscription write", session: session)
                 return
             }
         }
@@ -885,33 +887,55 @@ public actor SubcFedClient {
             )
             do {
                 let dialed = try await dialFactory.dial(candidate: candidate, context: context)
+                // A cancelled dial can still return a carrier. Close it before
+                // establishment, which could otherwise wait forever for hello.
+                if isDialStale(generation) {
+                    await dialed.transport.close()
+                    await dialed.engine.disconnect(reason: .cancelled)
+                    throw FedFailure.cancelled
+                }
                 establishingSession = dialed
                 defer {
                     if establishingSession?.engine === dialed.engine { establishingSession = nil }
                 }
                 do {
                     try await dialed.engine.establish()
-                } catch let error as FedStateStoreClosed {
-                    await dialed.engine.disconnect()
+                } catch {
                     await dialed.transport.close()
+                    await dialed.engine.disconnect()
                     throw error
                 }
                 // Re-validate after the establish await: a concurrent disconnect or
                 // a newer dial generation must not be resurrected into a ready
                 // session. Tear the just-established session down and abort.
                 if isDialStale(generation) {
-                    await dialed.engine.disconnect(reason: .cancelled)
                     await dialed.transport.close()
+                    await dialed.engine.disconnect(reason: .cancelled)
                     throw FedFailure.cancelled
                 }
+                let features = await dialed.engine.negotiatedFeatures
+                let advertisedFeatures = await dialed.engine.peerAdvertisedFeatures
+                let machineID = await dialed.engine.peerMachineID
+                let sessionID = await dialed.engine.sessionID
+                // A second explicit connect can replace a ready session. Retire
+                // its carrier before publishing the replacement or starting loops.
+                if activeSession != nil {
+                    await tearDownSession(reason: .disconnected, preservingEstablishing: dialed.engine)
+                }
+                if isDialStale(generation) {
+                    await dialed.transport.close()
+                    await dialed.engine.disconnect(reason: .cancelled)
+                    throw FedFailure.cancelled
+                }
+                if establishingSession?.engine === dialed.engine { establishingSession = nil }
                 activeSession = dialed
-                negotiatedFeatures = await dialed.engine.negotiatedFeatures
-                peerAdvertisedFeatures = await dialed.engine.peerAdvertisedFeatures
-                peerMachineID = await dialed.engine.peerMachineID
+                negotiatedFeatures = features
+                peerAdvertisedFeatures = advertisedFeatures
+                peerMachineID = machineID
                 startReceiveLoop(session: dialed)
                 startTimerLoop(session: dialed)
                 planner.resetBackoff()
-                publish(.ready(sessionID: await dialed.engine.sessionID))
+                publish(.ready(sessionID: sessionID))
                 activatePendingProfileIfNeeded()
                 return
             } catch is CancellationError {
@@ -989,7 +1013,8 @@ public actor SubcFedClient {
     // MARK: - Receive / calls
 
     private func startTimerLoop(session: FedDialedSession) {
-        timerTask?.cancel()
+        let signal = FedSessionTimerSignal()
+        timerSignal = signal
         let clock = self.clock
         timerTask = Task { [weak self] in
             do {
@@ -997,45 +1022,81 @@ public actor SubcFedClient {
                 await session.engine.setTimerDeadlineChanged { [weak self] in
                     Task { await self?.restartTimerLoopIfCurrent(session: session) }
                 }
-                while !Task.isCancelled, let deadline = await session.engine.nextTimerDeadline() {
-                    try await clock.sleep(untilNanoseconds: deadline)
+                while !Task.isCancelled {
+                    let revision = await signal.currentRevision()
+                    guard let deadline = await session.engine.nextTimerDeadline() else { break }
+                    try await signal.wait(until: deadline, revision: revision, clock: clock)
                     try Task.checkCancellation()
-                    guard await self?.isCurrentSession(session) == true else { return }
+                    guard await self?.isCurrentSession(session) == true else { break }
                     _ = try await session.engine.pollTimers()
                 }
             } catch {
                 let cause = await session.engine.timerFailureCause
-                guard !Task.isCancelled, let self, await self.isCurrentSession(session) else { return }
-                await self.handleSessionLoss(error, context: cause ?? "session timer")
+                await self?.handleSessionLoss(error, context: cause ?? "session timer", session: session)
             }
+            await self?.sessionLoopEnded(session)
+            await signal.stop()
+            // Retirement normally closes first. Keep this defense-in-depth
+            // cleanup for a task whose client or session ownership disappears.
+            await session.transport.close()
+            await session.engine.disconnect()
         }
     }
 
-    private func restartTimerLoopIfCurrent(session: FedDialedSession) {
+    private func restartTimerLoopIfCurrent(session: FedDialedSession) async {
         guard isCurrentSession(session) else { return }
-        startTimerLoop(session: session)
+        await timerSignal?.wake()
     }
 
-    private func startReceiveLoop(session: FedDialedSession) {
-        receiveTask?.cancel()
+    func startReceiveLoop(session: FedDialedSession) {
+        guard isCurrentSession(session), receiveSessionEngine !== session.engine else { return }
+        receiveSessionEngine = session.engine
         receiveTask = Task { [weak self] in
-            guard let self else { return }
-            while !Task.isCancelled {
-                do {
+            do {
+                while !Task.isCancelled, await self?.isCurrentSession(session) == true {
                     let chunk = try await session.transport.receive()
+                    try Task.checkCancellation()
+                    guard let self, await self.isCurrentSession(session) else { break }
                     // Stamped as soon as the bytes arrive, before decoding, so a
                     // slow call's time splits into the network's share and ours.
                     let receivedAtNs = await self.clock.nowNanoseconds()
                     let frames = try await session.engine.processInboundBytes(chunk)
                     try await self.handleInboundFrames(frames, session: session, receivedAtNs: receivedAtNs)
-                } catch {
-                    let cause = await session.engine.timerFailureCause
-                    guard await self.isCurrentSession(session) else { return }
-                    await self.handleSessionLoss(error, context: cause ?? "receive")
-                    return
                 }
+            } catch {
+                let cause = await session.engine.timerFailureCause
+                await self?.handleSessionLoss(error, context: cause ?? "receive", session: session)
             }
+            await self?.sessionLoopEnded(session)
+            // Retirement normally closes first. Keep this defense-in-depth
+            // cleanup for a task whose client or session ownership disappears.
+            await session.transport.close()
+            await session.engine.disconnect()
         }
+    }
+
+    private func sessionLoopEnded(_ session: FedDialedSession) async {
+        guard isCurrentSession(session) else { return }
+        await handleSessionLoss(FedFailure.disconnected, context: "session loop ended", session: session)
+    }
+
+    /// Test seam: run only one loop so its cleanup cannot be supplied by the
+    /// other loop. The caller joins the returned task before checking closure.
+    func startIsolatedSessionLoopForTesting(session: FedDialedSession, receive: Bool) -> Task<Void, Never> {
+        precondition(activeSession == nil && receiveTask == nil && timerTask == nil)
+        activeSession = session
+        if receive {
+            startReceiveLoop(session: session)
+            return receiveTask!
+        }
+        startTimerLoop(session: session)
+        return timerTask!
+    }
+
+    /// Test seam: clear the active session without closing it, so the test can
+    /// verify that the loop's final cleanup closes the transport.
+    func abandonSessionForTesting() {
+        activeSession = nil
     }
 
     private func handleInboundFrames(
@@ -1138,7 +1199,13 @@ public actor SubcFedClient {
         sessionLossLogger = logger
     }
 
-    private func handleSessionLoss(_ error: Error, context: String = "receive") async {
+    private func handleSessionLoss(_ error: Error, context: String = "receive", session: FedDialedSession? = nil) async {
+        if let session, !isCurrentSession(session) {
+            await session.transport.close()
+            await session.engine.disconnect()
+            return
+        }
+        let lostSession = session ?? activeSession
         // Error descriptions can contain peer addresses or payloads. Keep the
         // original error's type and case, not its associated values, in the log.
         var kind = Mirror(reflecting: error).children.first?.label
@@ -1151,18 +1218,58 @@ public actor SubcFedClient {
             }
         }
         var rawCause = String(reflecting: type(of: error)) + (kind.map { "." + $0 } ?? "")
+        if let noise = error as? FedNoiseError {
+            // Explicit names stay payload-free even if an error later gains data.
+            let name: String
+            switch noise {
+            case .invalidKeyLength: name = "invalidKeyLength"
+            case .invalidMessage: name = "invalidMessage"
+            case .handshakeState: name = "handshakeState"
+            case .authenticationFailed: name = "authenticationFailed"
+            case .pinnedResponderKeyMismatch: name = "pinnedResponderKeyMismatch"
+            case .invalidHandshakePayload: name = "invalidHandshakePayload"
+            case .hardBackstop: name = "hardBackstop"
+            case .rekeyRequired: name = "rekeyRequired"
+            case .transportClosed: name = "transportClosed"
+            }
+            rawCause = "FedNoiseError." + name
+        }
+        if let body = error as? FedFramedBodyError {
+            let name: String
+            switch body {
+            case .shortBody: name = "shortBody"
+            case .emptyHead: name = "emptyHead"
+            case .headTooLarge: name = "headTooLarge"
+            case .headLongerThanBody: name = "headLongerThanBody"
+            case .invalidJSON: name = "invalidJSON"
+            case .headNotObject: name = "headNotObject"
+            }
+            rawCause = "FedFramedBodyError." + name
+        }
+        if let ladder = error as? FedDialLadderError {
+            switch ladder {
+            case .allRungsFailed: rawCause = "FedDialLadderError.allRungsFailed"
+            case .noRungs: rawCause = "FedDialLadderError.noRungs"
+            }
+        }
         if let urlError = error as? URLError { rawCause = "URLError(code: \(urlError.code.rawValue))" }
+        // Detach before awaiting closure: late errors from this session must not
+        // tear down a replacement that becomes ready during the await.
+        dialGeneration &+= 1
+        let generation = dialGeneration
+        let failure = (error as? FedFailure) ?? .disconnected
+        await tearDownSession(reason: failure, pendingError: error is FedStateStoreClosed ? error : nil)
+        if let transport = lostSession?.transport as? FedNoiseSessionByteTransport {
+            rawCause += " " + (await transport.nonceSummary)
+        }
         sessionLossLogger("\(context): \(rawCause)")
+        guard generation == dialGeneration, activeSession == nil else { return }
         if error is FedStateStoreClosed {
             // Store closure is a local lifetime boundary, not a retryable network
             // loss. Preserve the typed error for calls already awaiting replies.
-            await resolvePendingCall { _ in .failure(error) }
             await disconnect()
             return
         }
-        let failure = (error as? FedFailure) ?? .disconnected
-        await completePendingCalls(with: failure)
-        await tearDownSession(reason: failure)
         if explicitlyDisconnected {
             publish(.idle)
             return
@@ -1329,14 +1436,22 @@ public actor SubcFedClient {
         }
     }
 
-    private func tearDownSession(reason: FedFailure) async {
+    private func tearDownSession(
+        reason: FedFailure,
+        pendingError: Error? = nil,
+        preservingEstablishing: FedSessionEngine? = nil
+    ) async {
         let session = activeSession
+        let establishing = establishingSession?.engine === preservingEstablishing ? nil : establishingSession
         activeSession = nil
-        establishingSession = nil
+        if establishingSession?.engine !== preservingEstablishing { establishingSession = nil }
         receiveTask?.cancel()
         receiveTask = nil
+        receiveSessionEngine = nil
         timerTask?.cancel()
         timerTask = nil
+        let signal = timerSignal
+        timerSignal = nil
         subscriptionWriter?.cancel()
         subscriptionWriter = nil
         subscriptionOutbox.removeAll()
@@ -1349,14 +1464,23 @@ public actor SubcFedClient {
             record.storage.settle(.failure(lost))
         }
         subscriptions.removeAll()
-        await completePendingCalls(with: reason)
-        if let session {
-            await session.engine.disconnect(reason: reason)
-            await session.transport.close()
-        }
+        let pending = Array(pendingCalls.values)
+        pendingCalls.removeAll()
+        for call in pending { call.continuation.resume(throwing: pendingError ?? reason) }
         negotiatedFeatures = []
         peerAdvertisedFeatures = []
         peerMachineID = nil
+        // Closing the carrier first unblocks pending I/O even if engine/store
+        // cleanup suspends. Task cancellation alone cannot cancel a socket read.
+        await session?.transport.close()
+        if let establishing, establishing.engine !== session?.engine {
+            await establishing.transport.close()
+            await establishing.engine.disconnect(reason: reason)
+        }
+        await signal?.stop()
+        if let session {
+            await session.engine.disconnect(reason: reason)
+        }
     }
 
     private func cancelBackgroundWork() {

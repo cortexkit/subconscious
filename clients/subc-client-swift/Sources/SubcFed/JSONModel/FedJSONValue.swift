@@ -228,6 +228,13 @@ public indirect enum FedJSONValue: Sendable, Equatable, Codable {
     /// use FedJSONObject.init(jsonData:) when an object top level is required.
     public static func parse(_ data: Data) throws -> FedJSONValue {
         var parser = try FedStrictJSONParser(data: data)
+        return try parser.parse().fedValue()
+    }
+
+    // Catalogs need to isolate numeric errors to the module or operation that
+    // owns them without expanding the public, outbound fed JSON value domain.
+    static func parse(_ data: Data, allowUnrepresentableNumbers: Bool) throws -> FedParsedJSONValue {
+        var parser = try FedStrictJSONParser(data: data, allowUnrepresentableNumbers: allowUnrepresentableNumbers)
         return try parser.parse()
     }
 
@@ -467,18 +474,39 @@ private struct FedJSONWriter {
     }
 }
 
+/// A catalog-only parse tree keeps invalid fed numbers out of public JSON values.
+/// The marker retains no source text, so diagnostics cannot expose entry content.
+indirect enum FedParsedJSONValue {
+    case value(FedJSONValue)
+    case array([FedParsedJSONValue])
+    case object([String: FedParsedJSONValue])
+    case unrepresentableNumber(FedJSONError)
+
+    func fedValue() throws -> FedJSONValue {
+        switch self {
+        case .value(let value): return value
+        case .array(let values): return .array(try values.map { try $0.fedValue() })
+        case .object(let values):
+            return .object(FedJSONObject(try values.mapValues { try $0.fedValue() }))
+        case .unrepresentableNumber(let error): throw error
+        }
+    }
+}
+
 private struct FedStrictJSONParser {
     private let bytes: [UInt8]
+    private let allowUnrepresentableNumbers: Bool
     private var index = 0
 
-    init(data: Data) throws {
+    init(data: Data, allowUnrepresentableNumbers: Bool = false) throws {
         // Checking through String first makes malformed UTF-8 fail before the
         // parser can interpret any byte as syntax.
         guard String(data: data, encoding: .utf8) != nil else { throw FedJSONError.invalidUTF8 }
         bytes = Array(data)
+        self.allowUnrepresentableNumbers = allowUnrepresentableNumbers
     }
 
-    mutating func parse() throws -> FedJSONValue {
+    mutating func parse() throws -> FedParsedJSONValue {
         skipWhitespace()
         let value = try parseValue(depth: 1)
         skipWhitespace()
@@ -486,13 +514,13 @@ private struct FedStrictJSONParser {
         return value
     }
 
-    private mutating func parseValue(depth: Int) throws -> FedJSONValue {
+    private mutating func parseValue(depth: Int) throws -> FedParsedJSONValue {
         guard let byte = peek else { throw FedJSONError.invalidSyntax }
         switch byte {
-        case 0x6E: try consumeLiteral("null"); return .null
-        case 0x74: try consumeLiteral("true"); return .boolean(true)
-        case 0x66: try consumeLiteral("false"); return .boolean(false)
-        case 0x22: return .string(try parseString())
+        case 0x6E: try consumeLiteral("null"); return .value(.null)
+        case 0x74: try consumeLiteral("true"); return .value(.boolean(true))
+        case 0x66: try consumeLiteral("false"); return .value(.boolean(false))
+        case 0x22: return .value(.string(try parseString()))
         case 0x5B:
             guard depth <= FedJSONValue.maximumNestingDepth else {
                 throw FedJSONError.nestingTooDeep(maximum: FedJSONValue.maximumNestingDepth)
@@ -508,11 +536,11 @@ private struct FedStrictJSONParser {
         }
     }
 
-    private mutating func parseArray(depth: Int) throws -> [FedJSONValue] {
+    private mutating func parseArray(depth: Int) throws -> [FedParsedJSONValue] {
         try consume(0x5B)
         skipWhitespace()
         if consumeIfPresent(0x5D) { return [] }
-        var values: [FedJSONValue] = []
+        var values: [FedParsedJSONValue] = []
         while true {
             values.append(try parseValue(depth: depth + 1))
             skipWhitespace()
@@ -522,11 +550,11 @@ private struct FedStrictJSONParser {
         }
     }
 
-    private mutating func parseObject(depth: Int) throws -> FedJSONObject {
+    private mutating func parseObject(depth: Int) throws -> [String: FedParsedJSONValue] {
         try consume(0x7B)
         skipWhitespace()
-        var values: [String: FedJSONValue] = [:]
-        if consumeIfPresent(0x7D) { return FedJSONObject(values) }
+        var values: [String: FedParsedJSONValue] = [:]
+        if consumeIfPresent(0x7D) { return values }
         while true {
             guard peek == 0x22 else { throw FedJSONError.invalidSyntax }
             let key = try parseString()
@@ -536,7 +564,7 @@ private struct FedStrictJSONParser {
             skipWhitespace()
             values[key] = try parseValue(depth: depth + 1)
             skipWhitespace()
-            if consumeIfPresent(0x7D) { return FedJSONObject(values) }
+            if consumeIfPresent(0x7D) { return values }
             try consume(0x2C)
             skipWhitespace()
         }
@@ -616,7 +644,7 @@ private struct FedStrictJSONParser {
         return value
     }
 
-    private mutating func parseNumber() throws -> FedJSONValue {
+    private mutating func parseNumber() throws -> FedParsedJSONValue {
         let start = index
         if consumeIfPresent(0x2D) {}
         if consumeIfPresent(0x30) {
@@ -637,6 +665,15 @@ private struct FedStrictJSONParser {
             guard consumeDigits(minimum: 1) else { throw FedJSONError.invalidSyntax }
         }
         let token = String(decoding: bytes[start..<index], as: UTF8.self)
+        do {
+            return .value(try classifyNumber(token, hasFraction: hasFraction, hasExponent: hasExponent))
+        } catch let error as FedJSONError {
+            guard allowUnrepresentableNumbers else { throw error }
+            return .unrepresentableNumber(error)
+        }
+    }
+
+    private func classifyNumber(_ token: String, hasFraction: Bool, hasExponent: Bool) throws -> FedJSONValue {
         guard let value = Double(token), value.isFinite else { throw FedJSONError.nonFiniteNumber }
         if hasFraction || hasExponent {
             guard value.rounded() != value else { throw FedJSONError.integralNumber }

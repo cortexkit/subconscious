@@ -155,7 +155,7 @@ final class FedSessionEngineTests: XCTestCase {
         )
         XCTAssertEqual(good.modules.first?.operations.map(\.name), ["board.state", "ask.get"])
 
-        XCTAssertThrowsError(try FedCatalogCodec.parseRemote(
+        let ambiguous = try FedCatalogCodec.parseRemote(
             frame: remoteCatalogFrame(modulesJSON: """
             {"modules":[
               {"module_id":"dup","management":{"operations":[{"name":"a","kind":"query"}]}},
@@ -164,7 +164,8 @@ final class FedSessionEngineTests: XCTestCase {
             """),
             peerIncarnation: peerIncarnation,
             peerFeatures: ["mgmt-v1"]
-        ))
+        )
+        XCTAssertTrue(ambiguous.modules.isEmpty)
     }
 
     func testKeepaliveCadenceWatermarkGatingAndStaleness() throws {

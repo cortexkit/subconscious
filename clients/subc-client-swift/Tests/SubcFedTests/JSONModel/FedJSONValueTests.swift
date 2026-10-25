@@ -31,6 +31,22 @@ final class FedJSONValueTests: XCTestCase {
         XCTAssertThrowsError(try FedJSONValue(number: 1.0))
     }
 
+    func testStrictParserStillRejectsCatalogSchemaIntegerBounds() throws {
+        for (token, expected) in [
+            ("-9223372036854775808", FedJSONError.negativeInteger),
+            ("9223372036854775807", .unsafeInteger),
+            ("1e3", .integralNumber),
+            ("1.0", .integralNumber),
+            ("1e400", .nonFiniteNumber),
+        ] {
+            XCTAssertThrowsError(try FedJSONObject(jsonData: Data("{\"n\":\(token)}".utf8))) {
+                XCTAssertEqual($0 as? FedJSONError, expected)
+            }
+        }
+        XCTAssertEqual(try FedJSONValue.parse(Data("1.5".utf8)), .number(1.5))
+        XCTAssertEqual(try FedJSONValue.parse(Data("-1.5".utf8)), .number(-1.5))
+    }
+
     func testDepth128IsAcceptedAndDepth129IsRejected() throws {
         let accepted = nestedObjectJSON(containerCount: 128)
         XCTAssertNoThrow(try FedJSONObject(jsonData: accepted))

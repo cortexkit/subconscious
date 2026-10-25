@@ -612,23 +612,7 @@ public enum FedFrameCodec {
         }
         if type == FedFrameType.catalog.rawValue {
             do {
-                let catalog = try FedJSONObject(jsonData: body)
-                guard let modules = catalog["modules"],
-                      case .array(let values) = modules,
-                      values.count <= 64
-                else { throw FedFrameError.invalidCatalogShape }
-                for value in values {
-                    guard case .object(let module) = value else { throw FedFrameError.invalidCatalogShape }
-                    if let tools = module["tools"], case .array(let tools) = tools, tools.count > 256 {
-                        throw FedFrameError.invalidCatalogShape
-                    }
-                    if let management = module["management"], case .object(let management) = management,
-                       let operations = management["operations"], case .array(let operations) = operations,
-                       operations.count > 256
-                    {
-                        throw FedFrameError.invalidCatalogShape
-                    }
-                }
+                _ = try FedCatalogCodec.parseRemoteBody(body)
             } catch let error as FedFrameError {
                 throw error
             } catch let error as FedJSONError {

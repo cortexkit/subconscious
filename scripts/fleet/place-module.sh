@@ -70,7 +70,7 @@
 # Usage:
 #   place-module.sh --module <id> --staged <path> [--dest <path>] [--path-face <name>]
 #                   --marker <string> [--control <string>] [--old-control <string>]
-#                   --tool-defs <unchanged|changed|none> [--host-restart-window]
+#                   --tool-defs <unchanged|additive|changed|none> [--host-restart-window]
 #                   [--no-restart]
 #   place-module.sh --module <id> --rollback <stamp> [--dest <path>]
 #                   [--restore-store <path>] [--no-restart]
@@ -163,10 +163,18 @@ else
   if [ "$INSTALL" -eq 0 ]; then
     case "$TOOL_DEFS" in
       unchanged|none) ;;
+      additive)
+        # Core compares a registered head's tools by input-schema shape and
+        # never stores the tool-level description. So new optional properties
+        # and new tool-level description text are accepted by heads that are
+        # already running; they keep the old text until their next restart.
+        # Changed property descriptions, types or required lists, and removed
+        # properties, are not additive: those are --tool-defs changed.
+        echo "tool definitions: additive (new optional properties or tool-level description only); running heads keep their registered tools" ;;
       changed)
         [ "$HOST_RESTART_WINDOW" -eq 1 ] || { echo "REFUSED: --tool-defs changed: a tool definition change is placed only just before a host restart; pass --host-restart-window when that restart is booked" >&2; exit 2; } ;;
-      "") echo "REFUSED: --tool-defs is required: compare the build's tool descriptions and schemas against the RUNNING build and pass unchanged, changed or none (serves no tools)" >&2; exit 2 ;;
-      *) echo "REFUSED: --tool-defs must be unchanged, changed or none, not '$TOOL_DEFS'" >&2; exit 2 ;;
+      "") echo "REFUSED: --tool-defs is required: compare the build's tool descriptions and schemas against the RUNNING build and pass unchanged, additive, changed or none (serves no tools)" >&2; exit 2 ;;
+      *) echo "REFUSED: --tool-defs must be unchanged, additive, changed or none, not '$TOOL_DEFS'" >&2; exit 2 ;;
     esac
   fi
 fi

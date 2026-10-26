@@ -34,6 +34,21 @@ public enum DeviceApprovalVerifier {
 public struct DeviceApprovalActionKey: Sendable {
     public let dataRepresentation: Data
     public let p256PublicKeyHex: String
+
+    /// Restore a saved enclave reference without signing or reusing user authentication.
+    public init(dataRepresentation: Data) throws {
+        do {
+            let key = try SecureEnclaveP256Signer.restoreKey(dataRepresentation: dataRepresentation)
+            self.init(dataRepresentation: key.dataRepresentation, p256PublicKeyHex: key.x963PublicKeyHex)
+        } catch let error as DeviceApprovalError where error.code == .keyRestorationFailed {
+            throw DeviceApprovalError(code: error.code, field: "action_key")
+        }
+    }
+
+    package init(dataRepresentation: Data, p256PublicKeyHex: String) {
+        self.dataRepresentation = dataRepresentation
+        self.p256PublicKeyHex = p256PublicKeyHex
+    }
 }
 
 public enum DeviceApprovalActionSigner {
@@ -97,8 +112,8 @@ public enum DeviceApprovalActionSigner {
         try approvalHex(SecureEnclaveP256Signer.encodeSignature(transcript.utf8, sign: sign).raw)
     }
 
-    // This helper is internal; public callers can sign only through the enclave-backed overloads.
-    static func signForTesting(_ transcript: DeviceApprovalTranscript, key: P256.Signing.PrivateKey) throws -> String {
+    // Only the separate test-support target uses software keys outside this module's tests.
+    package static func signForTesting(_ transcript: DeviceApprovalTranscript, key: P256.Signing.PrivateKey) throws -> String {
         try checkRegistrationKey(transcript, publicKey: key.publicKey)
         return try approvalHex(SecureEnclaveP256Signer.signForTesting(transcript.utf8, key: key).raw)
     }
@@ -117,7 +132,7 @@ public struct DeviceApprovalCompanionSigner {
         try await sign(challenge.transcript)
     }
 
-    func sign(_ transcript: DeviceApprovalTranscript) async throws -> String {
+    package func sign(_ transcript: DeviceApprovalTranscript) async throws -> String {
         do {
             guard let bytes = try await keyStore.companionSigningPrivateKey() else {
                 throw DeviceApprovalError(code: .missingMember, field: "companion_key")

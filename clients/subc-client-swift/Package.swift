@@ -19,6 +19,7 @@ let package = Package(
     products: [
         .library(name: "SubcClient", targets: ["SubcClient"]),
         .library(name: "SubcFed", targets: ["SubcFed"]),
+        .library(name: "SubcFedTestSupport", targets: ["SubcFedTestSupport"]),
         // Shared alfonso-surface models (Ask/Board/Observe/Projects) with the
         // decode-tolerance discipline. Exported as a product so native apps
         // (iOS, GPUI) consume the models without forking them.
@@ -28,6 +29,7 @@ let package = Package(
     targets: [
         .target(name: "SubcClient"),
         .target(name: "SubcFed", resources: [.copy("Resources/bip39-english.txt")]),
+        .target(name: "SubcFedTestSupport", dependencies: ["SubcFed"]),
         .target(name: "SubcChatAskSupport"),
         .executableTarget(name: "SubcSwiftProbe", dependencies: ["SubcClient"]),
         .testTarget(
@@ -35,6 +37,7 @@ let package = Package(
             dependencies: ["SubcFed"],
             resources: [.copy("Fixtures/fed-pairing-v1")]
         ),
+        .testTarget(name: "SubcFedTestSupportTests", dependencies: ["SubcFedTestSupport", "SubcFed"]),
         .testTarget(
             name: "SubcClientTests",
             dependencies: ["SubcClient", "SubcChatAskSupport"],

@@ -20,6 +20,7 @@ public struct DeviceApprovalError: Error, Equatable, Sendable {
         public static let keyMismatch = Self(rawValue: "key_mismatch")
         public static let accountKeyMismatch = Self(rawValue: "account_key_mismatch")
         public static let signingFailed = Self(rawValue: "signing_failed")
+        public static let keyRestorationFailed = Self(rawValue: "key_restoration_failed")
     }
 
     public let code: Code

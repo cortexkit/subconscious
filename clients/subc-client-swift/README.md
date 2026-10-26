@@ -324,8 +324,15 @@ its public checked-challenge API is unchanged.
 key with `.privateKeyUsage` and `.userPresence`, accessible
 `WhenUnlockedThisDeviceOnly`. It returns `DeviceApprovalActionKey` containing
 `dataRepresentation` (an opaque enclave reference) and `p256PublicKeyHex` for
-registration. The **app** stores that reference in its own device-only Keychain
-and removes it on reset/unpair. The library never persists it. Unavailable Secure
+registration. The **app** must save `dataRepresentation` in its own device-only
+Keychain **before registering**, and remove it on reset/unpair. On relaunch, load
+the saved data with `try DeviceApprovalActionKey(dataRepresentation: savedData)`,
+then repeat registration with the **same key**: request a fresh registration
+challenge using `DeviceApprovalRequests.registrationChallenge(for: restoredKey)`
+and submit both proofs again. Do not generate a replacement key just because the
+previous registration's reply was lost. When the Secure Enclave is available,
+a corrupt reference that cannot be restored throws `DeviceApprovalError` with
+code `key_restoration_failed` and field `action_key`. The library never persists the reference. Unavailable Secure
 Enclave hardware, including the simulator, refuses with
 `secure_enclave_unavailable`; production never substitutes a software key.
 
@@ -352,6 +359,26 @@ P-256 verifier rejects wrong-length/DER signatures, out-of-range scalars and
 high-S twins instead of normalizing received signatures. All new refusals are
 `DeviceApprovalError` with an extensible `Code` string struct and a `field`;
 no cases were added to existing public enums.
+
+### Software signing in tests only
+
+Add the separate `SubcFedTestSupport` library product to your **test target only**.
+Nothing enforces that: it is an ordinary public product, so keep it out of app
+targets by convention and review. `SubcFed` itself has no public software-key path.
+Use ordinary
+`import SubcFed` and `import SubcFedTestSupport`; no `@testable`
+import is required. `SoftwareDeviceApprovalSigner()` creates a software P-256
+key on the simulator or host. `init(rawRepresentation:)` accepts a deterministic
+test key. Its `actionKey` can be passed to
+`DeviceApprovalRequests.registrationChallenge(for:)` to build registration
+challenges, and
+`try await signer.sign(decision, companionKeyStore: store)` builds signed decision
+requests through the same request builder and low-S encoder as production.
+The companion key store is required only for registration and possession proofs.
+The action key's data is software-key material for tests, **not** an enclave
+reference; do not pass it to the production restore/sign APIs. Never link
+`SubcFedTestSupport` into an app product. Its cross-target hooks use Swift 5.9
+`package` access, not public software-key overloads or SPI on `SubcFed`.
 
 ### Signed approval control notices and opt-in
 

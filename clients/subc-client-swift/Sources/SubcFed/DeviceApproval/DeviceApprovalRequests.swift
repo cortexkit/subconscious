@@ -203,9 +203,9 @@ public enum DeviceApprovalRequests {
         })
     }
 
-    // Internal injection preserves the production body construction while tests supply
-    // deterministic published signatures instead of prompting for user presence.
-    static func sign(_ decision: DeviceApprovalDecision,
+    // Package-only injection lets test support use the production body construction
+    // without adding a software-key path to the public SubcFed API.
+    package static func sign(_ decision: DeviceApprovalDecision,
                      actionSign: (DeviceApprovalTranscript) throws -> String,
                      companionSign: (DeviceApprovalTranscript) async throws -> String) async throws -> DeviceApprovalDecisionRequest {
         let members: [(String, String)]

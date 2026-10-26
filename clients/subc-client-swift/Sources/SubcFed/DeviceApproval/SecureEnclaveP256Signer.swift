@@ -80,6 +80,19 @@ public enum SecureEnclaveP256Signer {
         } catch { throw DeviceApprovalError(code: .signingFailed, field: "key_data") }
     }
 
+    static func restoreKey(dataRepresentation: Data) throws -> SecureEnclaveP256Key {
+        try requireEnclave()
+        let context = LAContext()
+        context.touchIDAuthenticationAllowableReuseDuration = 0
+        defer { context.invalidate() }
+        do {
+            let key = try SecureEnclave.P256.Signing.PrivateKey(
+                dataRepresentation: dataRepresentation, authenticationContext: context)
+            return SecureEnclaveP256Key(dataRepresentation: key.dataRepresentation,
+                x963PublicKeyHex: approvalHex(key.publicKey.x963Representation))
+        } catch { throw DeviceApprovalError(code: .keyRestorationFailed, field: "key_data") }
+    }
+
     /// Supply fixed app text as reason, never server-provided text. Both encodings share one signature.
     public static func sign(_ bytes: Data, keyData: Data, reason: String) throws -> SecureEnclaveP256Signature {
         try sign(bytes, keyData: keyData, reason: reason, checkingPublicKey: { _ in })

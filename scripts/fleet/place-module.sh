@@ -70,6 +70,7 @@
 # Usage:
 #   place-module.sh --module <id> --staged <path> [--dest <path>] [--path-face <name>]
 #                   --marker <string> [--control <string>] [--old-control <string>]
+#                   --tool-defs <unchanged|changed|none> [--host-restart-window]
 #                   [--no-restart]
 #   place-module.sh --module <id> --rollback <stamp> [--dest <path>]
 #                   [--restore-store <path>] [--no-restart]
@@ -86,7 +87,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; ALLOW_UNSTAMPED=0; INSTALL=0; ROLLBACK=""; RESTORE_STORE=""
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; ALLOW_UNSTAMPED=0; INSTALL=0; ROLLBACK=""; RESTORE_STORE=""; TOOL_DEFS=""; HOST_RESTART_WINDOW=0
 
 while (($# > 0)); do
   case "$1" in
@@ -136,6 +137,16 @@ while (($# > 0)); do
     # and the marker must read in it. It never restarts: the module starts when
     # its subc.jsonc entry exists and a rescan or daemon cut picks it up.
     --install) INSTALL=1; RESTART=0; shift ;;
+    # Agent hosts register each head's tool definitions (descriptions and argument
+    # schemas) when the head starts, and core refuses a call whose provider's
+    # definitions changed since then (`provider_snapshot_reregister_required`)
+    # until the hosts restart. So a build that changes a definition must be placed
+    # just before a host restart, never on its own. Nothing in this script can read
+    # a build's definitions, so the operator states the answer explicitly, compared
+    # against the RUNNING build rather than the card it replaces: `none` for a
+    # module that serves no tools.
+    --tool-defs) TOOL_DEFS="$2"; shift 2 ;;
+    --host-restart-window) HOST_RESTART_WINDOW=1; shift ;;
     *) echo "REFUSED: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -149,6 +160,15 @@ else
   [ -n "$STAGED" ] || { echo "REFUSED: --staged is required" >&2; exit 2; }
   [ -n "$MARKER" ] || { echo "REFUSED: --marker is required (a discriminator that separates this build from the running one); pass --marker none for a change that adds no literal" >&2; exit 2; }
   [ -z "$RESTORE_STORE" ] || { echo "REFUSED: --restore-store requires --rollback" >&2; exit 2; }
+  if [ "$INSTALL" -eq 0 ]; then
+    case "$TOOL_DEFS" in
+      unchanged|none) ;;
+      changed)
+        [ "$HOST_RESTART_WINDOW" -eq 1 ] || { echo "REFUSED: --tool-defs changed: a tool definition change is placed only just before a host restart; pass --host-restart-window when that restart is booked" >&2; exit 2; } ;;
+      "") echo "REFUSED: --tool-defs is required: compare the build's tool descriptions and schemas against the RUNNING build and pass unchanged, changed or none (serves no tools)" >&2; exit 2 ;;
+      *) echo "REFUSED: --tool-defs must be unchanged, changed or none, not '$TOOL_DEFS'" >&2; exit 2 ;;
+    esac
+  fi
 fi
 
 # `--marker none` IS FOR A CHANGE THAT ADDS NO STRING, and it is honest rather

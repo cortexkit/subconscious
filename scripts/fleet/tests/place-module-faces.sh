@@ -90,7 +90,7 @@ run_script() {
   XDG_DATA_HOME="$CASE_DIR/data" \
   PATH="$STUBS:$PATH" \
     bash "$PLACE_SCRIPT" --module demo --staged "$STAGED" --dest "$DEST" \
-      --marker "$marker" --control "$CONTROL" --no-restart "$@"
+      --marker "$marker" --control "$CONTROL" --tool-defs none --no-restart "$@"
 }
 
 run_place() {

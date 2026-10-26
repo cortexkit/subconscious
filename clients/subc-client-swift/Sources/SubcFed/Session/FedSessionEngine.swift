@@ -580,7 +580,7 @@ public actor FedSessionEngine {
         provenance: FedDispatchProvenance = .afterDispatchOrUnknown
     ) async throws -> Data {
         if isMutation, let effectLog {
-            if let applied = try await effectLog.applyTerminalFrame(
+            if let settled = try await effectLog.settleTerminalFrame(
                 effect: effect,
                 kind: kind,
                 body: body,
@@ -595,7 +595,15 @@ public actor FedSessionEngine {
                 }
                 // Durable settle releases the ledgered permit.
                 await admission?.release(permit)
-                return applied.body
+                // Only now, with the row settled and the permit released, is
+                // the caller answered, judged by the settled row rather than
+                // the frame. A refusal (recorded error or not_sent) throws the
+                // module's error as a pure query's does; an ambiguous settlement
+                // throws indeterminateMutation because the call may have
+                // arrived. The message and detail come from the frame because
+                // a not_sent row keeps no body; no host-refusal hint is carried
+                // on this path.
+                return try settled.callerResult(message: errorMessage, detail: errorDetail)
             }
             // Non-settling advisory: retain ledgered permit for recovery.
             await admission?.retainLedgeredForRecovery(permit)

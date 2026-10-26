@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Mutating calls now throw module refusals like queries do. A module that refuses a mutating `callManagement` call (for example an upload chunk refused with `offset_gap`) previously returned its error envelope (`{"code":…,"message":…,"detail":…}`) as a successful body; it now throws `FedFailure.moduleError` with the module's code, message and detail, after the refusal has settled durably. What the caller receives follows the settled send-log row: a recorded outcome of kind `error` throws `moduleError`; a `not_sent` settlement by a fed control code (for example `fed_busy`), which proves the call never reached the module, also throws `moduleError` with that code; an `ambiguous` settlement (for example `fed_seq_fenced`), where the module may already have received the call, throws `FedFailure.indeterminateMutation` so it is never mistaken for a refusal that is safe to resend. Each of these used to return the error body as success. Any other recorded outcome still returns its body. Settlement, the send-log row and permit release are unchanged, and the mutating path still carries no host-refusal hint. No public signatures or enum cases change.
+
 - Keep the rendezvous session and contiguous cursor alive when approval handling is not configured: discard notice presentation without persisting or acknowledging it, count unhandled deliveries, and log once per session so a later configured session can replay them.
 
 - Refuse rendezvous control-session `seq` and `server_seq` values above 2^53 - 1 (9007199254740991), uniformly for ordinary frames and device-approval notices/acks. Other decimal-string fields keep their existing validation.

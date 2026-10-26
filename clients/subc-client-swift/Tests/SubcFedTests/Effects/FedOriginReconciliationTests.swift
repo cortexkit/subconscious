@@ -84,6 +84,53 @@ class FedOriginReconciliationTests: XCTestCase {
         XCTAssertTrue(unsettled.isEmpty)
     }
 
+    /// A refusal adopted from the peer during reconciliation must read as the
+    /// module's refusal, the same as one settled from a live terminal frame.
+    /// The reconciled row keeps the error body and kind but no code, so the
+    /// code, message and detail all come from the stored body.
+    func testReconciledModuleRefusalReadsAsModuleError() async throws {
+        let store = try Self.storeUnderTest.scratchStore(for: self)
+        _ = try await store.open(localPublicKey: localKey)
+        let seeded = try await seedUnsettledMutation(in: store, epoch: liveEpoch)
+
+        let transport = FedLoopbackByteTransport()
+        let engine = try makeEngine(transport: transport, store: store)
+        try await establishReady(engine: engine, transport: transport, modulesJSON: mutateCatalog)
+
+        let refusal = Data(#"{"code":"offset_gap","message":"chunk does not start at the upload's end","detail":{"expected_offset":4096}}"#.utf8)
+        try await deliver(engine, statusResultFrame(
+            effect: seeded,
+            status: "recorded",
+            ledgerComplete: true,
+            ledgerEpoch: liveEpoch,
+            kind: "error",
+            body: refusal
+        ))
+
+        // Settlement is unchanged: the refusal is recorded durably.
+        let stored = try await row(for: seeded, in: store)
+        XCTAssertEqual(stored?.disposition, .recorded)
+        XCTAssertEqual(stored?.terminalKind, "error")
+        XCTAssertEqual(stored?.terminalBody, refusal)
+        let unsettled = try await store.unsettledEffects(forResponderPublicKey: responderKey)
+        XCTAssertTrue(unsettled.isEmpty)
+
+        guard let record = stored, let outcome = FedSettledMutationOutcome(record: record) else {
+            return XCTFail("the reconciled row must be settled")
+        }
+        XCTAssertThrowsError(try outcome.callerResult()) { error in
+            XCTAssertEqual(
+                error as? FedFailure,
+                .moduleError(
+                    code: "offset_gap",
+                    message: "chunk does not start at the upload's end",
+                    hostRefusal: nil,
+                    detail: .object(FedJSONObject(["expected_offset": .integer(4_096)]))
+                )
+            )
+        }
+    }
+
     // MARK: - 3. not_found + complete + three-way epoch agreement → not_sent
 
     func testNotFoundCompleteWithThreeWayEpochAgreementSettlesNotSent() async throws {

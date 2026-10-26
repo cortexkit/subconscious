@@ -305,6 +305,177 @@ final class FedAuditHardeningTests: XCTestCase {
         XCTAssertEqual(unsettled.count, 1)
     }
 
+    /// A module that refuses a MUTATING call must reach the caller as a module
+    /// error, exactly as a refused pure query does, and only after the refusal
+    /// has settled durably. Returning the error envelope as the call's body let
+    /// a caller that never looked for a top-level `code` (an upload refused
+    /// with `offset_gap`, for one) carry on as though the chunk had landed.
+    func testModuleRefusalOfMutationThrowsModuleErrorWithDetailAfterSettling() async throws {
+        let detail = FedJSONValue.object(FedJSONObject(["expected_offset": .integer(4_096)]))
+        try await assertRefusedMutationThrowsAfterSettling(
+            body: #"{"code":"offset_gap","message":"chunk does not start at the upload's end","detail":{"expected_offset":4096}}"#,
+            expected: .moduleError(
+                code: "offset_gap",
+                message: "chunk does not start at the upload's end",
+                hostRefusal: nil,
+                detail: detail
+            )
+        )
+    }
+
+    func testModuleRefusalOfMutationWithoutDetailThrowsModuleError() async throws {
+        try await assertRefusedMutationThrowsAfterSettling(
+            body: #"{"code":"upload_closed","message":"upload already finished"}"#,
+            expected: .moduleError(
+                code: "upload_closed",
+                message: "upload already finished",
+                hostRefusal: nil,
+                detail: nil
+            )
+        )
+    }
+
+    /// An ambiguous settlement (here `fed_seq_fenced`) means the module may
+    /// already have received the call. It must not reach the caller as a
+    /// module error, which an app reads as "never arrived, safe to resend",
+    /// so it throws `indeterminateMutation` after settling like any other.
+    func testAmbiguousSettlementOfMutationThrowsIndeterminateAfterSettling() async throws {
+        try await assertRefusedMutationThrowsAfterSettling(
+            body: #"{"code":"fed_seq_fenced","message":"sequence fenced"}"#,
+            expected: .indeterminateMutation,
+            disposition: .ambiguous
+        )
+    }
+
+    /// A not_sent settlement (here `fed_busy`) proves the call never reached
+    /// the module, so it is reported as the module error carrying that code.
+    func testNotSentSettlementOfMutationThrowsModuleError() async throws {
+        try await assertRefusedMutationThrowsAfterSettling(
+            body: #"{"code":"fed_busy","message":"peer is busy"}"#,
+            expected: .moduleError(
+                code: "fed_busy",
+                message: "peer is busy",
+                hostRefusal: nil,
+                detail: nil
+            ),
+            disposition: .notSent
+        )
+    }
+
+    /// A successful mutation still returns its body: the refusal check must
+    /// not catch recorded responses.
+    func testRecordedMutationResponseStillReturnsItsBody() async throws {
+        let (engine, admission, store) = try await makeMutatingEngine()
+        let admitted = try await engine.admitManagementCall(
+            moduleID: "prefrontal-core",
+            method: "board.post",
+            params: FedJSONObject(["t": .string("x")]),
+            policy: try FedAdmissionPolicySnapshot()
+        )
+        let body = Data(#"{"ok":true}"#.utf8)
+        let returned = try await engine.handleInboundTerminal(
+            effect: admitted.effect,
+            kind: "response",
+            body: body,
+            bodyOmitted: false,
+            errorCode: nil,
+            isMutation: true,
+            permit: admitted.permit
+        )
+        XCTAssertEqual(returned, body)
+        let inFlight = await admission.inFlightCount
+        XCTAssertEqual(inFlight, 0)
+        let unsettled = try await store.unsettledEffects(forResponderPublicKey: responder)
+        XCTAssertTrue(unsettled.isEmpty)
+    }
+
+    private func assertRefusedMutationThrowsAfterSettling(
+        body bodyText: String,
+        expected: FedFailure,
+        disposition: FedEffectDisposition = .recorded,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let (engine, admission, store) = try await makeMutatingEngine()
+        let admitted = try await engine.admitManagementCall(
+            moduleID: "prefrontal-core",
+            method: "board.post",
+            params: FedJSONObject(["t": .string("x")]),
+            policy: try FedAdmissionPolicySnapshot()
+        )
+        // Read through the same accessors SubcFedClient.handleInboundFrames uses.
+        let frame = FedFrame(
+            type: "call_frame",
+            fields: ["k": .string("error"), "last": .bool(true)],
+            body: Data(bodyText.utf8)
+        )
+        do {
+            let returned = try await engine.handleInboundTerminal(
+                effect: admitted.effect,
+                kind: frame.terminalKind ?? "error",
+                body: frame.body,
+                bodyOmitted: frame.body.isEmpty,
+                errorCode: frame.terminalCode,
+                errorMessage: frame.terminalMessage,
+                hostRefusal: frame.terminalHostRefusal,
+                errorDetail: frame.terminalDetail,
+                isMutation: true,
+                permit: admitted.permit
+            )
+            XCTFail("a refused mutation returned a body: \(String(decoding: returned, as: UTF8.self))", file: file, line: line)
+        } catch let error as FedFailure {
+            XCTAssertEqual(error, expected, file: file, line: line)
+        }
+
+        // Settlement is unchanged: the outcome is committed durably (a recorded
+        // one with its kind and body) and the ledgered permit is released, not
+        // retained for recovery. A not_sent or ambiguous row is pruned in the
+        // write that settles it, so the commit is read from the recorder.
+        let committed = await store.committedTerminal(for: admitted.effect)
+        XCTAssertEqual(committed?.disposition, disposition, file: file, line: line)
+        XCTAssertEqual(committed?.body, disposition == .recorded ? frame.body : nil, file: file, line: line)
+        if disposition == .recorded {
+            XCTAssertEqual(committed?.kind, "error", file: file, line: line)
+            let destination = try await store.destination(forResponderPublicKey: responder)
+            let row = destination?.unresolvedEffects.first { $0.effect == admitted.effect }
+            XCTAssertEqual(row?.terminalCode, frame.terminalCode, file: file, line: line)
+        }
+        let unsettled = try await store.unsettledEffects(forResponderPublicKey: responder)
+        XCTAssertTrue(unsettled.isEmpty, file: file, line: line)
+        let inFlight = await admission.inFlightCount
+        let retained = await admission.retainedLedgeredCount
+        XCTAssertEqual(inFlight, 0, file: file, line: line)
+        XCTAssertEqual(retained, 0, file: file, line: line)
+    }
+
+    private func makeMutatingEngine() async throws -> (
+        FedSessionEngine, FedAdmissionController, FedTerminalCommitRecorder
+    ) {
+        let store = FedTerminalCommitRecorder(wrapping: FedMemoryStateStore())
+        _ = try await store.open(localPublicKey: localKey)
+        let clock = FedFakeClock()
+        let admission = FedAdmissionController(
+            responderStaticPublicKey: responder,
+            configuration: .init(policy: try FedAdmissionPolicySnapshot(), peerMaxInFlight: 2),
+            clock: clock
+        )
+        let effectLog = FedOriginEffectLog(store: store, responderStaticPublicKey: responder)
+        let transport = FedLoopbackByteTransport()
+        let engine = FedSessionEngine(deps: .init(
+            transport: transport,
+            store: store,
+            clock: clock,
+            localPublicKey: localKey,
+            responderStaticPublicKey: responder,
+            helloPolicy: try FedHelloPolicy(),
+            connectionAttemptID: String(repeating: "a", count: 32),
+            sharedAdmission: admission,
+            sharedEffectLog: effectLog
+        ))
+        try await establishReady(engine: engine, transport: transport, modulesJSON: mutateCatalog)
+        return (engine, admission, store)
+    }
+
     /// A module answering a pure query with an error must reach the caller as a
     /// module error carrying the module's own code — not as a lost session.
     ///

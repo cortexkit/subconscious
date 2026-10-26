@@ -317,6 +317,30 @@ public actor FedOriginEffectLog {
         errorCode: String?,
         provenance: FedDispatchProvenance = .afterDispatchOrUnknown
     ) async throws -> (disposition: FedEffectDisposition, body: Data)? {
+        guard let settled = try await settleTerminalFrame(
+            effect: effect,
+            kind: kind,
+            body: body,
+            bodyOmitted: bodyOmitted,
+            errorCode: errorCode,
+            provenance: provenance
+        ) else {
+            return nil
+        }
+        return (settled.disposition, body)
+    }
+
+    /// Settles a terminal frame exactly as ``applyTerminalFrame`` does and
+    /// returns the outcome as the durable log now holds it, so the caller is
+    /// answered from the settled row rather than from the inbound frame.
+    func settleTerminalFrame(
+        effect: FedEffectID,
+        kind: String,
+        body: Data,
+        bodyOmitted: Bool,
+        errorCode: String?,
+        provenance: FedDispatchProvenance = .afterDispatchOrUnknown
+    ) async throws -> FedSettledMutationOutcome? {
         let classification = Self.classifyTerminalFrame(
             kind: kind,
             body: body,
@@ -334,7 +358,15 @@ public actor FedOriginEffectLog {
             kind: kind,
             code: errorCode
         )
-        return (disposition, body)
+        // The same fields the stores keep: body and kind only for a recorded
+        // outcome, the code always.
+        let recorded = disposition == .recorded
+        return FedSettledMutationOutcome(
+            disposition: disposition,
+            kind: recorded ? kind : nil,
+            code: errorCode,
+            body: recorded ? body : nil
+        )
     }
 
     /// Session loss for a ledgered mutation: fail the caller-facing wait, but
@@ -587,6 +619,90 @@ public actor FedOriginEffectLog {
         guard !laneWaiters.isEmpty else { return }
         let next = laneWaiters.removeFirst()
         next.resume()
+    }
+}
+
+/// A settled mutation's outcome as the durable send-log holds it, and what a
+/// caller receives for it.
+///
+/// A module refusal settles a mutation like any recorded outcome, but it is
+/// still a refusal: handing its error envelope back as a successful body lets a
+/// caller that does not look for a top-level `code` treat the refusal as
+/// success. Pure queries already throw the refusal; ``callerResult(message:detail:)``
+/// makes every settled mutation throw too (a refusal, or an indeterminate
+/// outcome when the settlement is ambiguous), whether the outcome was settled
+/// from a live terminal frame or adopted from a peer during reconciliation.
+struct FedSettledMutationOutcome: Sendable, Equatable {
+    let disposition: FedEffectDisposition
+    /// Kept only for a recorded outcome, as the stores keep it.
+    let kind: String?
+    let code: String?
+    /// Kept only for a recorded outcome, as the stores keep it.
+    let body: Data?
+
+    init(disposition: FedEffectDisposition, kind: String?, code: String?, body: Data?) {
+        self.disposition = disposition
+        self.kind = kind
+        self.code = code
+        self.body = body
+    }
+
+    /// The outcome held by a settled send-log row; nil while it is unsettled.
+    init?(record: FedUnresolvedEffectRecord) {
+        guard record.isSettled else { return nil }
+        self.init(
+            disposition: record.disposition,
+            kind: record.terminalKind,
+            code: record.terminalCode,
+            body: record.terminalBody
+        )
+    }
+
+    /// Whether the settled outcome is an error rather than a result: a
+    /// recorded outcome of kind `error`, or a not_sent or ambiguous settlement.
+    /// Those two keep no kind or body, and only an error frame or a
+    /// reconciliation miss ever settles a row that way, so they are always
+    /// errors. ``callerResult(message:detail:)`` decides which failure each is.
+    var isError: Bool {
+        disposition != .recorded || kind == "error"
+    }
+
+    /// What the caller receives for the settled outcome:
+    ///
+    /// - recorded with kind `error`: the module's refusal, thrown as
+    ///   `FedFailure.moduleError`.
+    /// - not_sent: `FedFailure.moduleError` with the settling code. not_sent
+    ///   proves the call never reached the module, which is what `moduleError`
+    ///   tells a caller (safe to edit or resend).
+    /// - ambiguous: `FedFailure.indeterminateMutation`. The module may already
+    ///   have received the call, so reporting it as a refusal would invite a
+    ///   resend that could apply the effect twice.
+    /// - recorded with any other kind: the stored body.
+    ///
+    /// For `moduleError`, a message or detail passed in (read from the terminal
+    /// frame) is preferred; otherwise both are read from the stored error body.
+    /// A reconciled refusal is stored without a code, so the code is read from
+    /// the body too. The host-refusal hint is never carried here: it is
+    /// informational and only pure queries report it.
+    func callerResult(message: String? = nil, detail: FedJSONValue? = nil) throws -> Data {
+        switch disposition {
+        case .recorded where kind != "error":
+            return body ?? Data()
+        case .ambiguous, .unknown:
+            // An unsettled row never reaches here (both initializers require a
+            // settled disposition); it would mean the same as ambiguous.
+            throw FedFailure.indeterminateMutation
+        case .recorded, .notSent:
+            let stored = body.map {
+                FedFrame(type: FedFrameType.callFrame.rawValue, fields: [:], body: $0)
+            }
+            throw FedFailure.moduleError(
+                code: code ?? stored?.terminalCode ?? "unspecified",
+                message: message ?? stored?.terminalMessage,
+                hostRefusal: nil,
+                detail: detail ?? stored?.terminalDetail
+            )
+        }
     }
 }
 

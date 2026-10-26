@@ -7075,7 +7075,9 @@ mod tests {
             let err = reply.await.unwrap_err();
             assert_eq!(err.close_reason(), Some(&RouteEndReason::ConnectionLost));
             if written {
-                assert!(matches!(err, CallError::OutcomeUnknown(_)));
+                // `outcome_cause` answers only for `OutcomeUnknown`, so this also
+                // checks the variant without adding a spelling the
+                // outcome_unknown_inventory test would have to count.
                 assert_eq!(err.outcome_cause(), Some(OutcomeUnknownCause::WriterClosed));
                 assert!(!writer.bytes().is_empty());
             } else {

@@ -100,12 +100,16 @@ Fields:
     `agent_id`.
   - `flow_id` (optional string): this scope belongs to the named flow (section 2's
     flow identity subsection).
+  - `flow_version` (optional unsigned integer), `flow_code_hash` (optional string),
+    `flow_install_id` (optional string): the approved installed flow identity,
+    present together and only with `flow_id` (see below).
   - `run_id` (optional string): this `ephemeral` scope belongs to one agent run (section 2's
     agent-run identity subsection).
 
-**Authority gate.** `agent_id`, `on_behalf_of_agent`, `delegates`, `flow_id` and `run_id` may be set only by an owner listed
-in the daemon config key `scope_authority_owners` (today `["prefrontal-core"]`, the same module
-as `admission_facts_carrier_module_id`). A scope from any other owner may carry `kind`,
+**Authority gate.** `agent_id`, `on_behalf_of_agent`, `delegates`, `flow_id`,
+`flow_version`, `flow_code_hash`, `flow_install_id` and `run_id` may be set only by
+the scope-authority owner, listed in the daemon config key `scope_authority_owners`.
+A scope from any other owner may carry `kind`,
 `parent`, `child_owners`, `carriers`, `expires_at_ms`, `workdir` and `project_id`, with empty attributes; a sync or
 apply that sets a gated attribute from an unlisted owner is refused per record by name
 (`scope_attribute_not_permitted`). `expires_at_ms` is not gated by this list. `scope_authority_owners` is a
@@ -201,7 +205,7 @@ scope but never revives an ended one while its tombstone is held.
 ### Flow identity: `flow_id`
 
 The optional `attributes.flow_id` means "this scope belongs to flow X". The
-scope's owner (prefrontal), and only an owner in `scope_authority_owners`, may set
+scope-authority owner, and only an owner in `scope_authority_owners`, may set
 it; an unlisted owner receives `scope_attribute_not_permitted`, just as for
 `agent_id`. The daemon stamps it verbatim in `ScopeStamp.attributes` on
 `route.bind`. Providers use it to distinguish a flow's routes from a head's,
@@ -218,6 +222,38 @@ same-epoch change (including adding or removing `flow_id`) is accepted, bumps th
 scope's content version, and drains every route under it with
 `scope_delegation_changed`. New binds carry the new value; an unchanged re-sync
 neither bumps the version nor drains routes.
+
+An installed, approved version can additionally carry these optional attributes:
+
+| Field | Grammar |
+|---|---|
+| `flow_version` | unsigned integer from 1 through 9007199254740991 (2^53 − 1) |
+| `flow_code_hash` | exactly 64 lowercase hexadecimal characters: SHA-256 of the approved code |
+| `flow_install_id` | shared opaque token: 1–256 printable non-space ASCII bytes (`0x21`–`0x7E`), like `flow_id` |
+
+All three must be present together or all absent, and require `flow_id`. When
+registering an identity, a partial set or any installed identity without `flow_id` refuses that record as
+`scope_attribute_not_permitted`, naming the fields, just like other invalid
+attribute combinations. Malformed individual values refuse the whole sync or
+apply as `invalid_control_body`, naming the field. Only the scope-authority owner
+may set them; a carrier cannot assert its own approved identity.
+
+Unlike `flow_id` alone, the installed identity is immutable within an epoch.
+Adding, changing or removing any of the three fields refuses the record as
+`scope_flow_identity_changed` and leaves the live record and routes unchanged.
+This immutability refusal also applies when a change would leave a partial set.
+Re-sending the same values is idempotent. A new installed version needs a new
+scope or a higher epoch; replacing an epoch closes its old routes as usual. A
+provider that grants something to one installed version of a flow, such as a
+secret, should key the grant on these daemon-stamped fields, never on a
+version the carrier reports in a request.
+
+The daemon includes these three fields in `route.bind` only when the captured
+target manifest's `capabilities.provides` declares `flow-identity-scopes/v1`, and
+in `scope.describe` only when the calling module provides the same capability.
+Otherwise it strips all three, preserving the legacy stamp bytes. This reader
+capability does not replace `flow-scopes/v1` or `call-modes/v1` admission, and
+neither of those older capabilities implies installed-identity reader support.
 
 ### Agent-run identity: `run_id`
 
@@ -664,6 +700,11 @@ The Rust SDK exposes the attribute on both
 Swift's management decoder preserves unknown stamp fields; the TypeScript provider has
 no typed scope stamp and its client has no describe decoder, so neither needs a new field.
 
+Describe similarly returns `attributes.flow_version`, `attributes.flow_code_hash`
+and `attributes.flow_install_id` only for a caller whose registered manifest
+provides `flow-identity-scopes/v1`. It strips all three for every other reader,
+including the scope owner if it has not declared reader support.
+
 How a reader holding something bound to `(owner, ref, scope_epoch)` decides, in this order:
 1. `live` with the same `scope_epoch`: use it.
 2. `live` with a different `scope_epoch`: a new session under a reused ref. Refuse by name; the
@@ -752,11 +793,12 @@ caller may re-open within its own deadline.
 | `scope_sync_not_authority` | `scope.sync`, `scope.apply` | the connection fails the owner's authority check | no |
 | `scope_sync_required` | `scope.apply` | this connection must first take authority through an accepted full sync | no |
 | `scope_sync_stale` | `scope.sync`, `scope.apply` | the generation is not larger than the last accepted | no |
-| `invalid_control_body` | whole sync or apply | an empty or duplicate ref, a ref in both apply lists, or an invalid `flow_id` or `run_id` token | no |
+| `invalid_control_body` | whole sync or apply | an empty or duplicate ref, a ref in both apply lists, or a malformed flow/run identity field | no |
 | `scope_live_limit_exceeded` | whole sync or apply | an input list or resulting live set exceeds 10,000 scopes | no |
 | `scope_attributes_too_large` | whole sync or apply | a record's attributes exceed 4 KiB | no |
 | `scope_epoch_regressed` | per upsert in sync or apply | the epoch is lower than the one held | no |
-| `scope_attribute_not_permitted` | per upsert in sync or apply | a gated attribute from an owner not in `scope_authority_owners`, or `on_behalf_of_agent` with agent/delegation/flow/run attributes | no |
+| `scope_attribute_not_permitted` | per upsert in sync or apply | a gated attribute from an owner not in `scope_authority_owners`, `on_behalf_of_agent` with agent/delegation/flow/run attributes, or installed flow identity incomplete or without `flow_id` | no |
+| `scope_flow_identity_changed` | per upsert in sync or apply | `flow_version`, `flow_code_hash` or `flow_install_id` added, changed or removed within an epoch | no |
 | `scope_carrier_targets_invalid` | per upsert in sync or apply | a carrier's target list is empty or has more than 16 entries | no |
 | `scope_delegates_without_agent` | per upsert in sync or apply | `delegates: true` without `agent_id` | no |
 | `scope_run_id_without_agent` | per upsert in sync or apply | `run_id` without `agent_id` | no |
@@ -874,6 +916,13 @@ uses the same wall-clock source as accepted calls and admission; a timer only pr
     until `scope.subscribe` ships in stage 7.
 
 ## 8. Compatibility
+
+Installed flow identity uses a readers-first rollout: upgrade the daemon first,
+then upgrade readers and have them declare `flow-identity-scopes/v1`, then let
+the scope-authority owner set all three fields. Owners wait for the daemon to
+advertise that capability in HELLO_ACK `subc_capabilities` or `server.describe`.
+Older strict `ScopeAttributes` readers receive stamps without the new fields;
+scopes without installed identity serialize byte-identically to before.
 
 A provider requiring scope identity refuses a bind without the daemon's scope stamp (§5). Scope owners and their authorized carriers—the modules allowed to open routes for an owner—use scopes only when the daemon advertises `scopes/v1`; failure to open a stamped route returns `scope_unsupported`, never an unscoped fallback.
 

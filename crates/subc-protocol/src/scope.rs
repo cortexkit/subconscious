@@ -176,6 +176,10 @@ impl ScopeCarrier {
 /// [`crate::call_mode::CALL_MODES_CAPABILITY`] admits flow scopes.
 pub const FLOW_SCOPES_CAPABILITY: &str = "flow-scopes/v1";
 
+/// Declaring this capability promises that a reader accepts the installed flow
+/// identity fields in scope stamps. It does not replace flow-scope admission.
+pub const FLOW_IDENTITY_SCOPES_CAPABILITY: &str = "flow-identity-scopes/v1";
+
 /// Declaring this in a manifest's `capabilities.provides` promises that the
 /// module recognises `run_id` as one agent run and does not exercise the agent's
 /// delegated authority under that scope.
@@ -238,6 +242,22 @@ pub struct ScopeAttributes {
     /// the target must also apply flow behaviour instead of agent behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_id: Option<String>,
+    /// The approved installed version, from 1 through 2^53 - 1. Together with
+    /// `flow_code_hash` and `flow_install_id`, requires `flow_id` and is immutable
+    /// within an epoch (`scope_flow_identity_changed`). Stamped only for readers
+    /// providing [`FLOW_IDENTITY_SCOPES_CAPABILITY`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_version: Option<u64>,
+    /// SHA-256 of the approved flow code: exactly 64 lowercase hex characters.
+    /// Present together with `flow_version` and `flow_install_id`, under the same
+    /// authority, immutability and capability rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_code_hash: Option<String>,
+    /// Opaque installed-flow token, validated with [`validate_flow_install_id`].
+    /// Present together with `flow_version` and `flow_code_hash`, under the same
+    /// authority, immutability and capability rules.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_install_id: Option<String>,
     /// Identifies one run carried out on behalf of `agent_id`. Requires
     /// `agent_id`, forbids `flow_id`, and uses
     /// [`validate_run_id`]'s token rule.
@@ -281,6 +301,24 @@ impl ScopeAttributes {
     }
 
     #[must_use]
+    pub fn with_flow_version(mut self, flow_version: Option<u64>) -> Self {
+        self.flow_version = flow_version;
+        self
+    }
+
+    #[must_use]
+    pub fn with_flow_code_hash(mut self, flow_code_hash: Option<String>) -> Self {
+        self.flow_code_hash = flow_code_hash;
+        self
+    }
+
+    #[must_use]
+    pub fn with_flow_install_id(mut self, flow_install_id: Option<String>) -> Self {
+        self.flow_install_id = flow_install_id;
+        self
+    }
+
+    #[must_use]
     pub fn with_run_id(mut self, run_id: Option<String>) -> Self {
         self.run_id = run_id;
         self
@@ -291,6 +329,9 @@ impl ScopeAttributes {
             && self.on_behalf_of_agent.is_none()
             && !self.delegates
             && self.flow_id.is_none()
+            && self.flow_version.is_none()
+            && self.flow_code_hash.is_none()
+            && self.flow_install_id.is_none()
             && self.run_id.is_none()
     }
 }
@@ -300,6 +341,35 @@ impl ScopeAttributes {
 /// are not subject to this token rule.
 pub fn validate_flow_id(flow_id: &str) -> Result<(), crate::tool_call::OpaqueFieldError> {
     crate::tool_call::validate_opaque_field("flow_id", flow_id)
+}
+
+/// Check an installed flow version: 1 through 9007199254740991 (2^53 - 1), the
+/// largest integer every JSON reader, including JavaScript, decodes exactly.
+pub fn validate_flow_version(flow_version: u64) -> Result<(), &'static str> {
+    if !(1..=9_007_199_254_740_991).contains(&flow_version) {
+        return Err("flow_version must be from 1 to 9007199254740991");
+    }
+    Ok(())
+}
+
+/// Check the approved flow code's SHA-256. Errors name `flow_code_hash`.
+pub fn validate_flow_code_hash(flow_code_hash: &str) -> Result<(), &'static str> {
+    if flow_code_hash.len() != 64
+        || !flow_code_hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("flow_code_hash must contain exactly 64 lowercase hex characters");
+    }
+    Ok(())
+}
+
+/// Check an installed flow token using the same opaque-token rule as `flow_id`.
+/// Errors name `flow_install_id`.
+pub fn validate_flow_install_id(
+    flow_install_id: &str,
+) -> Result<(), crate::tool_call::OpaqueFieldError> {
+    crate::tool_call::validate_opaque_field("flow_install_id", flow_install_id)
 }
 
 /// Check a run id using the shared opaque-token rule: 1–256 ASCII bytes in
@@ -816,6 +886,75 @@ mod tests {
             );
             assert_eq!(error.field(), "flow_id");
         }
+    }
+
+    #[test]
+    fn flow_identity_validators_enforce_boundaries_and_name_fields() {
+        for valid in [1, 9_007_199_254_740_991] {
+            assert_eq!(validate_flow_version(valid), Ok(()));
+        }
+        for invalid in [0, 9_007_199_254_740_992, u64::MAX] {
+            assert!(validate_flow_version(invalid)
+                .unwrap_err()
+                .contains("flow_version"));
+        }
+        assert_eq!(
+            validate_flow_code_hash(&"0123456789abcdef".repeat(4)),
+            Ok(())
+        );
+        for invalid in [
+            "a".repeat(63),
+            "a".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+        ] {
+            assert!(validate_flow_code_hash(&invalid)
+                .unwrap_err()
+                .contains("flow_code_hash"));
+        }
+        for valid in ["i", "!~Install:7/path", &"i".repeat(256)] {
+            assert_eq!(validate_flow_install_id(valid), Ok(()));
+        }
+        for invalid in ["", "i i", "i\t", "ié", "i\u{7f}", &"i".repeat(257)] {
+            assert_eq!(
+                validate_flow_install_id(invalid).unwrap_err().field(),
+                "flow_install_id"
+            );
+        }
+    }
+
+    #[test]
+    fn flow_identity_round_trips_and_legacy_stamp_keeps_exact_bytes() {
+        let attributes = ScopeAttributes::new().with_flow_id(Some("flow:7".into()));
+        let stamp = ScopeStamp::new(Principal::Direct, "session", 1, ScopeKind::Head)
+            .with_attributes(attributes.clone());
+        assert_eq!(
+            serde_json::to_string(&stamp).unwrap(),
+            r#"{"owner":{"kind":"direct"},"ref":"session","scope_epoch":1,"kind":"head","attributes":{"flow_id":"flow:7"},"owner_authorized":false}"#
+        );
+        let attributes = attributes
+            .with_flow_version(Some(9_007_199_254_740_991))
+            .with_flow_code_hash(Some("a".repeat(64)))
+            .with_flow_install_id(Some("install:7".into()));
+        let stamp = stamp.with_attributes(attributes.clone());
+        let encoded = serde_json::to_string(&stamp).unwrap();
+        assert_eq!(serde_json::from_str::<ScopeStamp>(&encoded).unwrap(), stamp);
+        assert_eq!(
+            serde_json::from_str::<ScopeAttributes>(&serde_json::to_string(&attributes).unwrap())
+                .unwrap(),
+            attributes
+        );
+        assert!(
+            serde_json::from_str::<ScopeAttributes>(r#"{"flow_version":1,"unknown":true}"#)
+                .is_err()
+        );
+        assert!(!ScopeAttributes::new().with_flow_version(Some(1)).is_empty());
+        assert!(!ScopeAttributes::new()
+            .with_flow_code_hash(Some("a".repeat(64)))
+            .is_empty());
+        assert!(!ScopeAttributes::new()
+            .with_flow_install_id(Some("i".into()))
+            .is_empty());
     }
 
     #[test]

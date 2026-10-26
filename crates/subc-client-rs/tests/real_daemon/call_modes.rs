@@ -114,6 +114,101 @@ async fn declarer_sdk_receives_scope_modes_and_the_described_run_deadline() {
     assert!(serve_task.await.unwrap().is_ok());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_flow_identity_is_gated_in_real_daemon_binds_and_describe() {
+    use subc_protocol::scope::FLOW_IDENTITY_SCOPES_CAPABILITY;
+
+    let attributes = json!({
+        "flow_id": "flow:7",
+        "flow_version": 3,
+        "flow_code_hash": "a".repeat(64),
+        "flow_install_id": "install:7",
+    });
+    let mut run = run_scope_owner_with_config(
+        json!([
+            sync_step(
+                1,
+                json!([{
+                    "ref": "flow-a", "scope_epoch": 1, "kind": "ephemeral",
+                    "carriers": [{ "principal": { "kind": "direct" } }],
+                    "attributes": attributes,
+                }])
+            ),
+            describe_step(&sdk_scope_owner(), "flow-a"),
+        ]),
+        json!({ "scope_authority_owners": [SDK_SCOPE_OWNER] }),
+    )
+    .await;
+    assert_eq!(run.results[0]["ok"]["results"][0]["outcome"], "created");
+    assert_eq!(
+        run.results[1]["ok"]["scope"]["attributes"],
+        json!({"flow_id": "flow:7"})
+    );
+
+    let consumer = SubcConsumer::connect(&run.daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let mut serve_tasks = Vec::new();
+    for (module_id, supported) in [("flow-legacy", false), ("flow-identity", true)] {
+        let mut manifest =
+            inline_capability_module_manifest(module_id, Some(CALL_MODES_CAPABILITY));
+        if supported {
+            manifest
+                .capabilities
+                .as_mut()
+                .unwrap()
+                .provides
+                .push(FLOW_IDENTITY_SCOPES_CAPABILITY.into());
+        }
+        let recorder = ModeRecorder::default();
+        let (provider, serve_task) = spawn_inline_module_with_handler(
+            &run.daemon.connection_file,
+            manifest,
+            recorder.clone(),
+        )
+        .await;
+        wait_for_catalog_module(&run.daemon.connection_file, module_id, START_TIMEOUT).await;
+        consumer
+            .open_route_scoped(
+                tool_target(module_id),
+                consumer_identity(module_id),
+                selector("flow-a"),
+                fast_call_options(),
+            )
+            .await
+            .unwrap();
+        let stamp = recorder
+            .0
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .scope
+            .clone()
+            .unwrap();
+        assert!(stamp.owner_authorized);
+        assert_eq!(
+            serde_json::to_value(&stamp.attributes).unwrap(),
+            if supported {
+                attributes.clone()
+            } else {
+                json!({"flow_id": "flow:7"})
+            }
+        );
+        let reply = provider
+            .scope_describe(sdk_scope_owner(), "flow-a".into())
+            .await
+            .unwrap();
+        assert_eq!(reply.scope, Some(stamp));
+        serve_tasks.push(serve_task);
+    }
+    consumer.close().await;
+    run.daemon.kill_and_wait();
+    for task in serve_tasks {
+        assert!(task.await.unwrap().is_ok());
+    }
+}
+
 // Capture raw binds so SDK fallback cannot conceal a missing field, and typed
 // decoding cannot conceal a new field accidentally sent to a legacy reader.
 async fn wire_provider(path: &Path, module_id: &str, capability: Option<&str>) -> TcpStream {

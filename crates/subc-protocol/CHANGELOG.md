@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.2
+
+- Add optional `ScopeAttributes::{flow_version, flow_code_hash, flow_install_id}`, their `with_*` builders and validators, `FLOW_IDENTITY_SCOPES_CAPABILITY` (`flow-identity-scopes/v1`), and `SCOPE_FLOW_IDENTITY_CHANGED` (`scope_flow_identity_changed`). Installed identity is all-or-none with `flow_id`, authority-owner controlled, and epoch-fixed. Unset fields preserve legacy wire bytes; strict readers must declare the capability before receiving the new attributes.
+
 ## 0.33.1
 
 - Add the empty-omitted `ModuleManifest::role_declarations` map and builder method for opaque per-role JSON objects. Keys use capability-name grammar and the complete compact map is bounded by `MAX_ROLE_DECLARATIONS_BYTES` (16,384). Invalid maps are dropped whole without refusing HELLO; the daemon relays valid maps through `catalog.list` without interpreting role-owned schemas. Older daemons silently drop the field.

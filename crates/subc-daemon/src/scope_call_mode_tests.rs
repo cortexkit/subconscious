@@ -41,6 +41,83 @@ fn assert_golden(bind: &Frame, golden: &str) {
     assert_eq!(bind_snapshot(bind), expected);
 }
 
+fn installed_flow_scope() -> ScopeRecord {
+    flow_scope().with_attributes(
+        ScopeAttributes::new()
+            .with_flow_id(Some("flow:7".into()))
+            .with_flow_version(Some(3))
+            .with_flow_code_hash(Some("a".repeat(64)))
+            .with_flow_install_id(Some("install:7".into())),
+    )
+}
+
+fn expected_flow_attributes(supported: bool) -> Value {
+    if supported {
+        serde_json::json!({
+            "flow_id": "flow:7", "flow_version": 3,
+            "flow_code_hash": "a".repeat(64), "flow_install_id": "install:7"
+        })
+    } else {
+        serde_json::json!({"flow_id": "flow:7"})
+    }
+}
+
+#[tokio::test]
+async fn flow_identity_bind_stamp_is_gated_by_target_capability() {
+    for provides in [
+        vec![subc_protocol::scope::FLOW_SCOPES_CAPABILITY],
+        vec![CALL_MODES_CAPABILITY],
+        vec![
+            CALL_MODES_CAPABILITY,
+            subc_protocol::scope::FLOW_IDENTITY_SCOPES_CAPABILITY,
+        ],
+    ] {
+        let mut rig = call_mode_rig(&provides).await;
+        rig.sync(vec![installed_flow_scope()]).await;
+        let route = rig
+            .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+            .await;
+        assert!(rig.live(&route));
+        let body: Value = serde_json::from_slice(&route.bind.body).unwrap();
+        assert_eq!(
+            body["scope"]["attributes"],
+            expected_flow_attributes(
+                provides.contains(&subc_protocol::scope::FLOW_IDENTITY_SCOPES_CAPABILITY)
+            )
+        );
+    }
+}
+
+#[tokio::test]
+async fn flow_identity_describe_reply_is_gated_by_caller_capability() {
+    for provides in [
+        vec![],
+        vec![CALL_MODES_CAPABILITY],
+        vec![subc_protocol::scope::FLOW_IDENTITY_SCOPES_CAPABILITY],
+    ] {
+        let mut rig = call_mode_rig(&provides).await;
+        rig.sync(vec![installed_flow_scope()]).await;
+        let request = ModuleControlRequestFromModule::ScopeDescribe {
+            owner: Principal::Reserved {
+                module_id: OWNER.into(),
+            },
+            scope_ref: "s".into(),
+        };
+        let reply = call(&rig.handler, &rig.modules[PLEXUS].0, &request).await;
+        assert_eq!(reply.header.ty, FrameType::Response);
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        assert_eq!(
+            body["scope"]["attributes"],
+            expected_flow_attributes(
+                provides.contains(&subc_protocol::scope::FLOW_IDENTITY_SCOPES_CAPABILITY)
+            )
+        );
+        let legacy = call(&rig.handler, &rig.owner, &request).await;
+        let body: Value = serde_json::from_slice(&legacy.body).unwrap();
+        assert_eq!(body["scope"]["attributes"], expected_flow_attributes(false));
+    }
+}
+
 #[tokio::test]
 async fn on_behalf_of_agent_bind_stamp_bytes_are_gated_by_target_capability() {
     for provides in [

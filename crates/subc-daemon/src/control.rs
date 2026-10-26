@@ -961,6 +961,7 @@ impl ControlHandler {
                 subc_protocol::manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1.to_string(),
                 subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
+                subc_protocol::scope::FLOW_IDENTITY_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_SERVED_BY_CAPABILITY.to_string(),
                 subc_control::ACTIVITY_LEDGER_CAPABILITY.to_string(),
             ]),
@@ -3446,6 +3447,22 @@ impl ControlHandler {
                 stamp.attributes.on_behalf_of_agent = None;
             }
         }
+        if !registered
+            .manifest
+            .capabilities
+            .as_ref()
+            .is_some_and(|caps| {
+                caps.provides
+                    .iter()
+                    .any(|cap| cap == subc_protocol::scope::FLOW_IDENTITY_SCOPES_CAPABILITY)
+            })
+        {
+            if let Some(stamp) = description.stamp.as_mut() {
+                stamp.attributes.flow_version = None;
+                stamp.attributes.flow_code_hash = None;
+                stamp.attributes.flow_install_id = None;
+            }
+        }
         let owner_configured = match &owner {
             // Ask whether the owner is configured (`is_configured`), not
             // whether it is on the roster (`get(..).is_some()`): a supervised
@@ -5047,6 +5064,17 @@ impl ControlHandler {
         }) {
             if let Some(stamp) = scope_stamp.as_mut() {
                 stamp.attributes.on_behalf_of_agent = None;
+            }
+        }
+        if !relay_capabilities.is_some_and(|caps| {
+            caps.provides
+                .iter()
+                .any(|cap| cap == subc_protocol::scope::FLOW_IDENTITY_SCOPES_CAPABILITY)
+        }) {
+            if let Some(stamp) = scope_stamp.as_mut() {
+                stamp.attributes.flow_version = None;
+                stamp.attributes.flow_code_hash = None;
+                stamp.attributes.flow_install_id = None;
             }
         }
         let call_mode = if relay_capabilities

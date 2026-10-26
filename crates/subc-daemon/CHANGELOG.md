@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.9
+
+- Validate approved installed flow identity (`flow_version`, `flow_code_hash`, `flow_install_id`) from the scope-authority owner. Refuse incomplete identities or identities without `flow_id` per record, and refuse same-epoch additions, changes or removals as `scope_flow_identity_changed`. Advertise `flow-identity-scopes/v1` and include the new fields only for bind targets and describe callers declaring it, preserving legacy-reader stamps.
+
 ## 0.37.8
 
 - Bound ordinary supervised subc children to a first HELLO within 120 seconds of spawn, with per-module `register_timeout_s` from 10 to 3600 seconds. Expiry stops and reaps the child and records `registration_timeout` in terminal disposition detail as a crash, using the normal restart budget and slow retry. HELLO, child exit, operator stop/disable/removal and daemon shutdown cancel the wait. Non-wire children and the separate reload/swap deadlines are unchanged.

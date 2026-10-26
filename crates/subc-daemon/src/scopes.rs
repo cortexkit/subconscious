@@ -1276,6 +1276,30 @@ impl ScopeTable {
                     message: error.to_string(),
                 })?;
             }
+            if let Some(version) = record.attributes.flow_version {
+                subc_protocol::scope::validate_flow_version(version).map_err(|message| {
+                    SyncRefusal {
+                        code: INVALID_CONTROL_BODY,
+                        message: message.to_string(),
+                    }
+                })?;
+            }
+            if let Some(hash) = &record.attributes.flow_code_hash {
+                subc_protocol::scope::validate_flow_code_hash(hash).map_err(|message| {
+                    SyncRefusal {
+                        code: INVALID_CONTROL_BODY,
+                        message: message.to_string(),
+                    }
+                })?;
+            }
+            if let Some(install_id) = &record.attributes.flow_install_id {
+                subc_protocol::scope::validate_flow_install_id(install_id).map_err(|error| {
+                    SyncRefusal {
+                        code: INVALID_CONTROL_BODY,
+                        message: error.to_string(),
+                    }
+                })?;
+            }
             if let Some(run_id) = &record.attributes.run_id {
                 subc_protocol::scope::validate_run_id(run_id).map_err(|error| SyncRefusal {
                     code: INVALID_CONTROL_BODY,
@@ -1360,7 +1384,7 @@ impl ScopeTable {
         if !record.attributes.is_empty() && !owner_authorized {
             return Some((
                 error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
-                "agent_id, on_behalf_of_agent, delegates, flow_id and run_id may be set only by an owner listed in \
+                "agent_id, on_behalf_of_agent, delegates, flow_id, flow_version, flow_code_hash, flow_install_id and run_id may be set only by an owner listed in \
                  scope_authority_owners"
                     .to_string(),
             ));
@@ -1425,6 +1449,17 @@ impl ScopeTable {
                 ))
             }
             Some(held)
+                if epoch == held.record.scope_epoch
+                    && (record.attributes.flow_version != held.record.attributes.flow_version
+                        || record.attributes.flow_code_hash != held.record.attributes.flow_code_hash
+                        || record.attributes.flow_install_id != held.record.attributes.flow_install_id) =>
+            {
+                Some((
+                    error_codes::SCOPE_FLOW_IDENTITY_CHANGED,
+                    format!("flow_version, flow_code_hash and flow_install_id are fixed for scope_epoch {epoch}; use a higher epoch to change them"),
+                ))
+            }
+            Some(held)
                 if epoch == held.record.scope_epoch && record.workdir != held.record.workdir =>
             {
                 Some((
@@ -1455,6 +1490,20 @@ impl ScopeTable {
         };
         if epoch_refusal.is_some() {
             return epoch_refusal;
+        }
+        let identity_fields = [
+            record.attributes.flow_version.is_some(),
+            record.attributes.flow_code_hash.is_some(),
+            record.attributes.flow_install_id.is_some(),
+        ];
+        if identity_fields.iter().any(|present| *present)
+            && (!identity_fields.iter().all(|present| *present)
+                || record.attributes.flow_id.is_none())
+        {
+            return Some((
+                error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
+                "flow_version, flow_code_hash and flow_install_id must be present together and require flow_id".to_string(),
+            ));
         }
         if let Some(held) = held.filter(|held| epoch == held.record.scope_epoch) {
             return (held.record.expires_at_ms != record.expires_at_ms).then(|| (
@@ -2589,6 +2638,213 @@ mod tests {
     }
 
     // ---- epochs and kinds ---------------------------------------------------
+
+    fn flow_identity() -> ScopeAttributes {
+        ScopeAttributes::new()
+            .with_flow_id(Some("flow:7".into()))
+            .with_flow_version(Some(1))
+            .with_flow_code_hash(Some("a".repeat(64)))
+            .with_flow_install_id(Some("install:7".into()))
+    }
+
+    #[test]
+    fn flow_identity_requires_all_three_fields_and_flow_id() {
+        for mask in 1..7 {
+            let mut table = table();
+            let mut attributes = flow_identity();
+            if mask & 1 == 0 {
+                attributes.flow_version = None;
+            }
+            if mask & 2 == 0 {
+                attributes.flow_code_hash = None;
+            }
+            if mask & 4 == 0 {
+                attributes.flow_install_id = None;
+            }
+            let applied = sync(
+                &mut table,
+                PREFRONTAL,
+                conn(1),
+                1,
+                vec![head("s", 1).with_attributes(attributes)],
+            );
+            let result = outcome(&applied, "s");
+            assert_eq!(
+                result.code.as_deref(),
+                Some(error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED),
+                "mask {mask}"
+            );
+            for field in [
+                "flow_version",
+                "flow_code_hash",
+                "flow_install_id",
+                "flow_id",
+            ] {
+                assert!(result.message.as_deref().unwrap().contains(field));
+            }
+        }
+        let mut table = table();
+        let attributes = flow_identity().with_flow_id(None);
+        let applied = sync(
+            &mut table,
+            PREFRONTAL,
+            conn(1),
+            1,
+            vec![head("s", 1).with_attributes(attributes)],
+        );
+        assert_eq!(
+            outcome(&applied, "s").code.as_deref(),
+            Some(error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED)
+        );
+    }
+
+    #[test]
+    fn flow_identity_requires_an_authority_owner() {
+        for attributes in [
+            flow_identity(),
+            flow_identity().with_flow_id(None),
+            ScopeAttributes::new().with_flow_version(Some(1)),
+        ] {
+            let mut table = table();
+            let applied = sync(
+                &mut table,
+                MAGIC,
+                conn(1),
+                1,
+                vec![head("s", 1).with_attributes(attributes)],
+            );
+            assert_eq!(
+                outcome(&applied, "s").code.as_deref(),
+                Some(error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED)
+            );
+        }
+    }
+
+    #[test]
+    fn flow_identity_changes_require_a_new_epoch() {
+        for delta in [false, true] {
+            let change = |table: &mut ScopeTable, generation, record| {
+                if delta {
+                    table
+                        .apply(
+                            PREFRONTAL,
+                            conn(1),
+                            any_current,
+                            generation,
+                            vec![record],
+                            vec![],
+                        )
+                        .unwrap()
+                } else {
+                    sync(table, PREFRONTAL, conn(1), generation, vec![record])
+                }
+            };
+            let original = flow_identity();
+            let absent = ScopeAttributes::new().with_flow_id(original.flow_id.clone());
+            for (before, after) in [
+                (
+                    original.clone(),
+                    original.clone().with_flow_version(Some(2)),
+                ),
+                (
+                    original.clone(),
+                    original.clone().with_flow_code_hash(Some("b".repeat(64))),
+                ),
+                (
+                    original.clone(),
+                    original
+                        .clone()
+                        .with_flow_install_id(Some("install:8".into())),
+                ),
+                (original.clone(), absent.clone()),
+                (absent, original),
+            ] {
+                let mut table = table();
+                let record = head("s", 1).with_attributes(before.clone());
+                sync(&mut table, PREFRONTAL, conn(1), 1, vec![record.clone()]);
+                let applied = change(&mut table, 2, record);
+                assert_eq!(
+                    outcome(&applied, "s").outcome,
+                    ScopeRecordOutcome::Unchanged
+                );
+                let first_version = version(&table, PREFRONTAL, "s");
+                let applied = change(&mut table, 3, head("s", 1).with_attributes(after.clone()));
+                assert_eq!(
+                    outcome(&applied, "s").code.as_deref(),
+                    Some(error_codes::SCOPE_FLOW_IDENTITY_CHANGED)
+                );
+                assert_eq!(version(&table, PREFRONTAL, "s"), first_version);
+                assert_eq!(
+                    describe(&table, PREFRONTAL, "s").stamp.unwrap().attributes,
+                    before
+                );
+                let applied = change(&mut table, 4, head("s", 2).with_attributes(after.clone()));
+                assert_eq!(outcome(&applied, "s").outcome, ScopeRecordOutcome::Replaced);
+                assert_eq!(
+                    describe(&table, PREFRONTAL, "s").stamp.unwrap().attributes,
+                    after
+                );
+            }
+            let full = flow_identity();
+            let empty = ScopeAttributes::new().with_flow_id(full.flow_id.clone());
+            for (before, after) in [
+                (full.clone(), full.clone().with_flow_version(None)),
+                (full.clone(), full.clone().with_flow_code_hash(None)),
+                (full.clone(), full.with_flow_install_id(None)),
+                (empty.clone(), empty.clone().with_flow_version(Some(1))),
+                (
+                    empty.clone(),
+                    empty.clone().with_flow_code_hash(Some("a".repeat(64))),
+                ),
+                (
+                    empty.clone(),
+                    empty.with_flow_install_id(Some("install:7".into())),
+                ),
+            ] {
+                let mut table = table();
+                sync(
+                    &mut table,
+                    PREFRONTAL,
+                    conn(1),
+                    1,
+                    vec![head("s", 1).with_attributes(before)],
+                );
+                let applied = change(&mut table, 2, head("s", 1).with_attributes(after));
+                assert_eq!(
+                    outcome(&applied, "s").code.as_deref(),
+                    Some(error_codes::SCOPE_FLOW_IDENTITY_CHANGED)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flow_identity_invalid_values_refuse_the_sync_by_field_name() {
+        for (field, attributes) in [
+            ("flow_version", flow_identity().with_flow_version(Some(0))),
+            (
+                "flow_code_hash",
+                flow_identity().with_flow_code_hash(Some("A".repeat(64))),
+            ),
+            (
+                "flow_install_id",
+                flow_identity().with_flow_install_id(Some("has space".into())),
+            ),
+        ] {
+            let mut table = table();
+            let refusal = table
+                .sync(
+                    PREFRONTAL,
+                    conn(1),
+                    any_current,
+                    1,
+                    vec![head("s", 1).with_attributes(attributes)],
+                )
+                .unwrap_err();
+            assert_eq!(refusal.code, INVALID_CONTROL_BODY);
+            assert!(refusal.message.contains(field));
+        }
+    }
 
     #[test]
     fn a_higher_epoch_ends_the_old_scope_and_a_lower_one_is_refused() {

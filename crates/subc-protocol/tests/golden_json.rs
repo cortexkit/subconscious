@@ -150,6 +150,21 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
         panic!("expected a scoped bind");
     }
     assert_golden("module_control_request_route_bind_with_flow_id", &flow_bind);
+    if let ModuleControlRequest::RouteBind {
+        scope: Some(stamp), ..
+    } = &mut flow_bind
+    {
+        stamp.attributes = stamp
+            .attributes
+            .clone()
+            .with_flow_version(Some(9_007_199_254_740_991))
+            .with_flow_code_hash(Some("a".repeat(64)))
+            .with_flow_install_id(Some("install:7".into()));
+    }
+    assert_golden(
+        "module_control_request_route_bind_with_flow_identity",
+        &flow_bind,
+    );
     let mut flow_record = scope_head_record();
     flow_record.attributes =
         ScopeAttributes::new().with_flow_id(Some("flow:run-7/step-2".to_string()));

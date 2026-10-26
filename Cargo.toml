@@ -64,8 +64,8 @@ opt-level = 3
 # cortexkit-test-support (a dev-dependency) depends on subc-os from crates.io.
 # Without this patch the lockfile holds that copy beside the workspace crate, and
 # `cargo test -p subc-os` becomes ambiguous, which breaks every command that names
-# the package by itself (the mutation catalogue among them). The patch applies
-# only inside this workspace; published crates are unaffected.
+# the package by itself. The patch applies only inside this workspace; published
+# crates are unaffected.
 [patch.crates-io]
 subc-os = { path = "crates/subc-os" }
 # async-nats uses tryhard for JetStream reconnects; its commons copy keeps

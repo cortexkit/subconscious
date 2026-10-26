@@ -22,8 +22,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: ck-alpha-ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Each master commit keeps its own run; other refs cancel their older runs.
+  group: ck-alpha-ci-${{ github.ref }}-${{ github.ref == 'refs/heads/master' && github.sha || 'latest' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
   static-analysis:

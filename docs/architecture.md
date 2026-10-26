@@ -183,6 +183,5 @@ Operator guides:
 - [`daemon-config.md`](daemon-config.md): timeouts, restart budget, `protocol`.
 - [`restarting-the-module-that-serves-you.md`](restarting-the-module-that-serves-you.md).
 - [`hermetic-daemon.md`](hermetic-daemon.md): running an isolated daemon for tests.
-- [`mutations.md`](mutations.md): the mutation catalogue.
 - [`contribution-gate.md`](contribution-gate.md), [`npm-trusted-publishing.md`](npm-trusted-publishing.md)
   and [`renaming-a-module.md`](renaming-a-module.md): for maintainers.

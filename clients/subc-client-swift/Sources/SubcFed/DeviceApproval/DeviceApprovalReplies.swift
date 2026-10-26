@@ -51,6 +51,16 @@ public struct DeviceApprovalServerRefusal: Equatable, Sendable {
         return try decode(json, statusCode: statusCode, allowed: codes)
     }
 
+    /// Refusals of the held-merge list (`GET /v1/device/merges`): the common closed
+    /// set for an active-device GET plus the two ineligible-credential codes. The
+    /// list names no id, so it has no `merge_not_found`.
+    static func decodeMergeList(_ json: Data, statusCode: Int) throws -> Self {
+        let codes: [Int: Set<String>] = [400: ["invalid_request"], 413: ["payload_too_large"], 429: ["rate_limited"],
+            401: ["auth_failed"], 403: ["account_not_active", "device_pending", "device_approval_required"],
+            503: ["approval_unavailable"]]
+        return try decode(json, statusCode: statusCode, allowed: codes)
+    }
+
     private static func decode(_ json: Data, statusCode: Int, allowed: [Int: Set<String>]) throws -> Self {
         let object = try ApprovalJSONObject(json: json)
         let retryable = statusCode == 429 || statusCode == 503

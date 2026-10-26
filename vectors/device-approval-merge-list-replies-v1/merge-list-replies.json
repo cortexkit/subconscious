@@ -1,0 +1,38 @@
+[
+  {
+    "route": "/v1/machine/merges",
+    "case": "non-enforced",
+    "status": 200,
+    "reply_bytes": "{\"merges\":[],\"cursor\":null}"
+  },
+  {
+    "route": "/v1/device/merges",
+    "case": "non-enforced",
+    "status": 200,
+    "reply_bytes": "{\"merges\":[],\"cursor\":null}"
+  },
+  {
+    "route": "/v1/machine/merges",
+    "case": "two-item",
+    "status": 200,
+    "reply_bytes": "{\"merges\":[{\"merge_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAY\",\"primary_account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"primary_lifecycle_generation\":\"1\",\"secondary_account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"secondary_lifecycle_generation\":\"1\",\"state\":\"closing\",\"state_version\":\"1\",\"created_at_ms\":\"2\",\"execute_after_ms\":\"1800172800000\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":true},{\"merge_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAX\",\"primary_account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"primary_lifecycle_generation\":\"1\",\"secondary_account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"secondary_lifecycle_generation\":\"1\",\"state\":\"pending\",\"state_version\":\"1\",\"created_at_ms\":\"10\",\"execute_after_ms\":\"1800172800000\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":true}],\"cursor\":null}"
+  },
+  {
+    "route": "/v1/device/merges",
+    "case": "two-item",
+    "status": 200,
+    "reply_bytes": "{\"merges\":[{\"merge_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAY\",\"primary_account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"primary_lifecycle_generation\":\"1\",\"secondary_account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"secondary_lifecycle_generation\":\"1\",\"state\":\"closing\",\"state_version\":\"1\",\"created_at_ms\":\"2\",\"execute_after_ms\":\"1800172800000\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":true},{\"merge_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAX\",\"primary_account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"primary_lifecycle_generation\":\"1\",\"secondary_account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"secondary_lifecycle_generation\":\"1\",\"state\":\"pending\",\"state_version\":\"1\",\"created_at_ms\":\"10\",\"execute_after_ms\":\"1800172800000\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":true}],\"cursor\":null}"
+  },
+  {
+    "route": "/v1/machine/merges",
+    "case": "empty",
+    "status": 200,
+    "reply_bytes": "{\"merges\":[],\"cursor\":null}"
+  },
+  {
+    "route": "/v1/device/merges",
+    "case": "empty",
+    "status": 200,
+    "reply_bytes": "{\"merges\":[],\"cursor\":null}"
+  }
+]

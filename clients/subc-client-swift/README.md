@@ -243,6 +243,25 @@ are opaque strings or null, never numbers; outbound cursor query values are
 percent-encoded without changing their bytes. `retry_after_s` alone is a JSON
 integer, exposed as `UInt64`.
 
+`DeviceApprovalRequests.mergeList()` returns the bodiless GET for
+`/v1/device/merges`, the held account merges involving the device's account, so
+the app can show pending merges without having recorded their ids. Its
+`decodeReply(_:statusCode:)` returns `DeviceApprovalMergeList` with `merges`
+(each the same closed `DeviceApprovalMergeView` that `mergeStatus` returns) and
+`cursor` (an opaque string or null; the service sends null until it defines
+paging). The reply object and every merge are closed: unknown, missing and
+duplicate members refuse. Ids are canonical ULIDs; generations, `state_version`,
+`created_at_ms` and `execute_after_ms` are decimal strings at most 2^53 − 1, never
+JSON numbers; `state` is `pending|cancelled|closing|merged` and `automatic_hold`
+is null or one of the four defined holds, with any other value refused. Any
+status other than 200, or a malformed body, throws `DeviceApprovalMergeListError`
+and never yields an empty list. Its `refusal` holds the typed
+`DeviceApprovalServerRefusal` when a non-200 body is one of the route's closed
+refusals, and `reason` holds the `DeviceApprovalError` for a malformed body.
+Computers read the same shape from `/v1/machine/merges`; the account service's
+replies for both routes are pinned byte for byte in
+`vectors/device-approval-merge-list-replies-v1`.
+
 From those typed views, use `approvalChallenge`, `removalChallenge`,
 `selfRevokeChallenge`, `mergeChallenge`, `registrationChallenge` or
 `possessionChallenge` to obtain the challenge route's `method`, `path` and

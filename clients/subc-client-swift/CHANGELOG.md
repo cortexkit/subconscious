@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add a strict `DeviceCapabilitiesUpdate` reply decoder: only a `{"ok":true}` body with no additional members at HTTP 200 succeeds. Route-specific refusals retain typed codes (including unknown codes) without matching display text; malformed replies and unexpected statuses throw transport faults for the app to retry later. Pin the account service's 16 real reply vectors and verify their vendored checksum in tests and CI. No existing public enum gains a case.
 - Restore saved device-approval Secure Enclave keys with `DeviceApprovalActionKey(dataRepresentation:)`, preserving the public key so registration can be repeated after relaunch with a fresh challenge. Save key data before registration; invalid references refuse with `key_restoration_failed`, and unsupported hardware/simulators still refuse with `secure_enclave_unavailable`. Fresh user presence and low-S signing are unchanged.
 
 - Add a separate `SubcFedTestSupport` library product and `SoftwareDeviceApprovalSigner` for simulator/app tests to construct action keys and signed decision requests without `@testable import SubcFed`. Shared construction/signing seams use Swift 5.9 `package` access, not public software-key APIs or SPI in `SubcFed`; keep this product out of production app targets.

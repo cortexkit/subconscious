@@ -1,0 +1,288 @@
+[
+  {
+    "name": "success",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "eyJjYXBhYmlsaXRpZXMiOlsiZmVkLXNlcnZlIl19"
+    },
+    "response": {
+      "status": 200,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"ok\":true}"
+    }
+  },
+  {
+    "name": "malformed_json",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "eyJjYXBhYmlsaXRpZXMiOg=="
+    },
+    "response": {
+      "status": 400,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"bad_request\",\"message\":\"unexpected token\"}"
+    }
+  },
+  {
+    "name": "missing_capabilities",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "e30="
+    },
+    "response": {
+      "status": 400,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"bad_request\",\"message\":\"capabilities request contains unknown or missing top-level fields\"}"
+    }
+  },
+  {
+    "name": "extra_top_level_key",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "eyJjYXBhYmlsaXRpZXMiOltdLCJleHRyYSI6dHJ1ZX0="
+    },
+    "response": {
+      "status": 400,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"bad_request\",\"message\":\"capabilities request contains unknown or missing top-level fields\"}"
+    }
+  },
+  {
+    "name": "non_array_capabilities",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "eyJjYXBhYmlsaXRpZXMiOiJmZWQtc2VydmUifQ=="
+    },
+    "response": {
+      "status": 400,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"bad_request\",\"message\":\"capabilities must be an array with at most 8 entries\"}"
+    }
+  },
+  {
+    "name": "too_many_capabilities",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "eyJjYXBhYmlsaXRpZXMiOlsiYSIsImIiLCJjIiwiZCIsImUiLCJmIiwiZyIsImgiLCJpIl19"
+    },
+    "response": {
+      "status": 400,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"bad_request\",\"message\":\"capabilities must be an array with at most 8 entries\"}"
+    }
+  },
+  {
+    "name": "entry_outside_grammar",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "eyJjYXBhYmlsaXRpZXMiOlsiRmVkLXNlcnZlIl19"
+    },
+    "response": {
+      "status": 400,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"bad_request\",\"message\":\"capabilities entries must match ^[a-z][a-z0-9-]{0,31}$\"}"
+    }
+  },
+  {
+    "name": "unsorted_capabilities",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "eyJjYXBhYmlsaXRpZXMiOlsieiIsImEiXX0="
+    },
+    "response": {
+      "status": 400,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"bad_request\",\"message\":\"capabilities must be unique and sorted by byte order\"}"
+    }
+  },
+  {
+    "name": "duplicate_capabilities",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "eyJjYXBhYmlsaXRpZXMiOlsiYSIsImEiXX0="
+    },
+    "response": {
+      "status": 400,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"bad_request\",\"message\":\"capabilities must be unique and sorted by byte order\"}"
+    }
+  },
+  {
+    "name": "utf8_bom",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "77u/eyJjYXBhYmlsaXRpZXMiOlsiZmVkLXNlcnZlIl19"
+    },
+    "response": {
+      "status": 400,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"bad_request\",\"message\":\"BOM is not allowed\"}"
+    }
+  },
+  {
+    "name": "invalid_utf8",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "eyJjYXBhYmlsaXRpZXMiOlsi/yJdfQ=="
+    },
+    "response": {
+      "status": 400,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"bad_request\",\"message\":\"invalid UTF-8\"}"
+    }
+  },
+  {
+    "name": "missing_bearer",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body_base64": "eyJjYXBhYmlsaXRpZXMiOlsiZmVkLXNlcnZlIl19"
+    },
+    "response": {
+      "status": 401,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"auth_failed\",\"message\":\"missing Bearer token\"}"
+    }
+  },
+  {
+    "name": "rotated_device_token",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "eyJjYXBhYmlsaXRpZXMiOlsiZmVkLXNlcnZlIl19"
+    },
+    "response": {
+      "status": 401,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"revoked\",\"message\":\"device token revoked\"}"
+    }
+  },
+  {
+    "name": "expired_device_token",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "eyJjYXBhYmlsaXRpZXMiOlsiZmVkLXNlcnZlIl19"
+    },
+    "response": {
+      "status": 401,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"device_token_expired\"}"
+    }
+  },
+  {
+    "name": "get_not_found",
+    "request": {
+      "method": "GET",
+      "headers": {
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": ""
+    },
+    "response": {
+      "status": 404,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"not_found\"}"
+    }
+  },
+  {
+    "name": "internal_fault",
+    "request": {
+      "method": "PUT",
+      "headers": {
+        "content-type": "application/json",
+        "authorization": "Bearer eyJhY2NvdW50X2lkIjoiY2FwYWJpbGl0aWVzLXB1dC1yZXBseS12ZWN0b3JzIiwiZXhwaXJlc19hdF9tcyI6IjE4MDAwODY0MDAwMDAiLCJ0b2tlbl9pZCI6ImNhcGFiaWxpdGllcy1wdXQtdmVjdG9yLXRva2VuIiwidG9rZW5fdmVyc2lvbiI6IjEiLCJ4MjU1MTlfcHVia2V5X2hleCI6IjdiNGU5MDliYmU3ZmZlNDRjNDY1YTIyMDAzN2Q2MDhlZTM1ODk3ZDMxZWY5NzJmMDdmNzQ4OTJjYjBmNzNmMTMifQ.H0tv4QkHhVjF6km-jrW_6GY6cH-6rp0hwzHNNGDY_94"
+      },
+      "body_base64": "eyJjYXBhYmlsaXRpZXMiOlsiZmVkLXNlcnZlIl19"
+    },
+    "response": {
+      "status": 500,
+      "headers": {
+        "content-type": "application/json"
+      },
+      "body": "{\"error\":\"internal\",\"message\":\"internal\"}"
+    }
+  }
+]

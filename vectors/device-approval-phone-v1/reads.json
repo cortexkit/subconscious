@@ -1,0 +1,199 @@
+{
+  "format": "device-approval-phone-reads-v1",
+  "routes": [
+    {
+      "refusals": [
+        {
+          "body": "{\"error\":\"invalid_request\"}",
+          "status_code": 400
+        },
+        {
+          "body": "{\"error\":\"rate_limited\",\"retry_after_s\":60}",
+          "status_code": 429
+        },
+        {
+          "body": "{\"error\":\"approval_unavailable\",\"retry_after_s\":30}",
+          "status_code": 503
+        },
+        {
+          "body": "{\"error\":\"enrollment_not_found\"}",
+          "status_code": 404
+        }
+      ],
+      "reply_rejections": [
+        {
+          "body": "{\"enrollment\":{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"machine\",\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":{\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAX\",\"approval_generation\":\"3\",\"approval_fingerprint\":\"abababababababababababababababababababababababababababababababab\"},\"projection_failure\":null},\"retry_after_s\":60,\"unexpected\":true}",
+          "error_code": "unknown_member",
+          "field": "unexpected",
+          "status_code": 200
+        },
+        {
+          "body": "{\"enrollment\":{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"machine\",\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":{\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAX\",\"approval_generation\":\"3\",\"approval_fingerprint\":\"abababababababababababababababababababababababababababababababab\"},\"projection_failure\":null},\"retry_after_s\":\"60\"}",
+          "error_code": "invalid_field",
+          "field": "retry_after_s",
+          "status_code": 200
+        }
+      ],
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "/v1/device/enrollments/01ARZ3NDEKTSV4RRFFQ69G5FAW"
+      },
+      "requested_cursor": null,
+      "requested_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "route": "enrollmentStatus",
+      "success_body": "{\"enrollment\":{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"machine\",\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":{\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAX\",\"approval_generation\":\"3\",\"approval_fingerprint\":\"abababababababababababababababababababababababababababababababab\"},\"projection_failure\":null},\"retry_after_s\":60}"
+    },
+    {
+      "refusals": [
+        {
+          "body": "{\"error\":\"invalid_request\"}",
+          "status_code": 400
+        },
+        {
+          "body": "{\"error\":\"rate_limited\",\"retry_after_s\":60}",
+          "status_code": 429
+        },
+        {
+          "body": "{\"error\":\"approval_unavailable\",\"retry_after_s\":30}",
+          "status_code": 503
+        }
+      ],
+      "reply_rejections": [
+        {
+          "body": "{\"enrollments\":[{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"machine\",\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":{\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAX\",\"approval_generation\":\"3\",\"approval_fingerprint\":\"abababababababababababababababababababababababababababababababab\"},\"projection_failure\":null},{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"rendezvous\",\"device_id\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"fingerprint\":\"8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"x25519_pubkey_hex\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"device_name\":\"Example device\",\"platform\":\"ios\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":null,\"projection_failure\":null}],\"cursor\":null,\"unexpected\":true}",
+          "error_code": "unknown_member",
+          "field": "unexpected",
+          "status_code": 200
+        },
+        {
+          "body": "{\"enrollments\":[{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"machine\",\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":{\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAX\",\"approval_generation\":\"3\",\"approval_fingerprint\":\"abababababababababababababababababababababababababababababababab\"},\"projection_failure\":null},{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"rendezvous\",\"device_id\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"fingerprint\":\"8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"x25519_pubkey_hex\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"device_name\":\"Example device\",\"platform\":\"ios\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":null,\"projection_failure\":null}],\"cursor\":1}",
+          "error_code": "invalid_field",
+          "field": "cursor",
+          "status_code": 200
+        },
+        {
+          "body": "{\"enrollments\":[{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"machine\",\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":{\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAX\",\"approval_generation\":\"3\",\"approval_fingerprint\":\"abababababababababababababababababababababababababababababababab\"},\"projection_failure\":null},{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"rendezvous\",\"device_id\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"fingerprint\":\"8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"x25519_pubkey_hex\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"device_name\":\"Example device\",\"platform\":\"ios\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":null,\"projection_failure\":null}],\"cursor\":false}",
+          "error_code": "invalid_field",
+          "field": "cursor",
+          "status_code": 200
+        },
+        {
+          "body": "{\"enrollments\":[{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"machine\",\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":{\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAX\",\"approval_generation\":\"3\",\"approval_fingerprint\":\"abababababababababababababababababababababababababababababababab\"},\"projection_failure\":null},{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"rendezvous\",\"device_id\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"fingerprint\":\"8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"x25519_pubkey_hex\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"device_name\":\"Example device\",\"platform\":\"ios\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":null,\"projection_failure\":null}],\"cursor\":{}}",
+          "error_code": "invalid_field",
+          "field": "cursor",
+          "status_code": 200
+        },
+        {
+          "body": "{\"enrollments\":[{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"machine\",\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":{\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAX\",\"approval_generation\":\"3\",\"approval_fingerprint\":\"abababababababababababababababababababababababababababababababab\"},\"projection_failure\":null},{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"rendezvous\",\"device_id\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"fingerprint\":\"8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"x25519_pubkey_hex\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"device_name\":\"Example device\",\"platform\":\"ios\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":null,\"projection_failure\":null}],\"cursor\":[]}",
+          "error_code": "invalid_field",
+          "field": "cursor",
+          "status_code": 200
+        }
+      ],
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "/v1/device/approvals"
+      },
+      "requested_cursor": null,
+      "requested_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "route": "approvals",
+      "success_body": "{\"enrollments\":[{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"machine\",\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":{\"device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAX\",\"approval_generation\":\"3\",\"approval_fingerprint\":\"abababababababababababababababababababababababababababababababab\"},\"projection_failure\":null},{\"enrollment_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"roster\":\"rendezvous\",\"device_id\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"fingerprint\":\"8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"x25519_pubkey_hex\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"device_name\":\"Example device\",\"platform\":\"ios\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"activate_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"installation_acknowledged\":false,\"access_ready\":false,\"automatic_hold\":null,\"predecessor\":null,\"projection_failure\":null}],\"cursor\":null}"
+    },
+    {
+      "refusals": [
+        {
+          "body": "{\"error\":\"invalid_request\"}",
+          "status_code": 400
+        },
+        {
+          "body": "{\"error\":\"rate_limited\",\"retry_after_s\":60}",
+          "status_code": 429
+        },
+        {
+          "body": "{\"error\":\"approval_unavailable\",\"retry_after_s\":30}",
+          "status_code": 503
+        }
+      ],
+      "reply_rejections": [
+        {
+          "body": "{\"removals\":[{\"removal_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"target_roster\":\"rendezvous\",\"target_device_id\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"target_approval_generation\":\"3\",\"target_approval_fingerprint\":\"8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"x25519_pubkey_hex\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"kind\":\"rotate-token\",\"device_name\":\"Example device\",\"platform\":\"ios\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false},{\"removal_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"target_roster\":\"machine\",\"target_device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"target_approval_generation\":\"3\",\"target_approval_fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"kind\":\"revoke\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false}],\"cursor\":\"page/2+token=\",\"unexpected\":true}",
+          "error_code": "unknown_member",
+          "field": "unexpected",
+          "status_code": 200
+        },
+        {
+          "body": "{\"removals\":[{\"removal_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"target_roster\":\"rendezvous\",\"target_device_id\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"target_approval_generation\":\"3\",\"target_approval_fingerprint\":\"8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"x25519_pubkey_hex\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"kind\":\"rotate-token\",\"device_name\":\"Example device\",\"platform\":\"ios\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false},{\"removal_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"target_roster\":\"machine\",\"target_device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"target_approval_generation\":\"3\",\"target_approval_fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"kind\":\"revoke\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false}],\"cursor\":1}",
+          "error_code": "invalid_field",
+          "field": "cursor",
+          "status_code": 200
+        },
+        {
+          "body": "{\"removals\":[{\"removal_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"target_roster\":\"rendezvous\",\"target_device_id\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"target_approval_generation\":\"3\",\"target_approval_fingerprint\":\"8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"x25519_pubkey_hex\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"kind\":\"rotate-token\",\"device_name\":\"Example device\",\"platform\":\"ios\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false},{\"removal_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"target_roster\":\"machine\",\"target_device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"target_approval_generation\":\"3\",\"target_approval_fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"kind\":\"revoke\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false}],\"cursor\":false}",
+          "error_code": "invalid_field",
+          "field": "cursor",
+          "status_code": 200
+        },
+        {
+          "body": "{\"removals\":[{\"removal_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"target_roster\":\"rendezvous\",\"target_device_id\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"target_approval_generation\":\"3\",\"target_approval_fingerprint\":\"8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"x25519_pubkey_hex\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"kind\":\"rotate-token\",\"device_name\":\"Example device\",\"platform\":\"ios\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false},{\"removal_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"target_roster\":\"machine\",\"target_device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"target_approval_generation\":\"3\",\"target_approval_fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"kind\":\"revoke\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false}],\"cursor\":{}}",
+          "error_code": "invalid_field",
+          "field": "cursor",
+          "status_code": 200
+        },
+        {
+          "body": "{\"removals\":[{\"removal_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"target_roster\":\"rendezvous\",\"target_device_id\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"target_approval_generation\":\"3\",\"target_approval_fingerprint\":\"8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"x25519_pubkey_hex\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"kind\":\"rotate-token\",\"device_name\":\"Example device\",\"platform\":\"ios\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false},{\"removal_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"target_roster\":\"machine\",\"target_device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"target_approval_generation\":\"3\",\"target_approval_fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"kind\":\"revoke\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false}],\"cursor\":[]}",
+          "error_code": "invalid_field",
+          "field": "cursor",
+          "status_code": 200
+        }
+      ],
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "/v1/device/removals?cursor=page%2F2%2Btoken%3D"
+      },
+      "requested_cursor": "page/2+token=",
+      "requested_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "route": "removals",
+      "success_body": "{\"removals\":[{\"removal_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"target_roster\":\"rendezvous\",\"target_device_id\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"target_approval_generation\":\"3\",\"target_approval_fingerprint\":\"8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"x25519_pubkey_hex\":\"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\",\"kind\":\"rotate-token\",\"device_name\":\"Example device\",\"platform\":\"ios\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false},{\"removal_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"target_roster\":\"machine\",\"target_device_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"target_approval_generation\":\"3\",\"target_approval_fingerprint\":\"d7970dfb76fb5257abfc1d7ca4f1ceabf40a0e9e10b97cdd3db5f4b729f14b20\",\"ed25519_pubkey_hex\":\"8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394\",\"kind\":\"revoke\",\"device_name\":\"Example device\",\"platform\":\"linux\",\"signin_method\":\"email\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"state\":\"pending\",\"state_version\":\"2\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false}],\"cursor\":\"page/2+token=\"}"
+    },
+    {
+      "refusals": [
+        {
+          "body": "{\"error\":\"invalid_request\"}",
+          "status_code": 400
+        },
+        {
+          "body": "{\"error\":\"rate_limited\",\"retry_after_s\":60}",
+          "status_code": 429
+        },
+        {
+          "body": "{\"error\":\"approval_unavailable\",\"retry_after_s\":30}",
+          "status_code": 503
+        },
+        {
+          "body": "{\"error\":\"merge_not_found\"}",
+          "status_code": 404
+        }
+      ],
+      "reply_rejections": [
+        {
+          "body": "{\"merge\":{\"merge_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"primary_account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"primary_lifecycle_generation\":\"0\",\"secondary_account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAY\",\"secondary_lifecycle_generation\":\"9007199254740991\",\"state\":\"pending\",\"state_version\":\"1\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false},\"unexpected\":true}",
+          "error_code": "unknown_member",
+          "field": "unexpected",
+          "status_code": 200
+        }
+      ],
+      "request": {
+        "body": null,
+        "method": "GET",
+        "path": "/v1/device/merges/01ARZ3NDEKTSV4RRFFQ69G5FAW"
+      },
+      "requested_cursor": null,
+      "requested_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+      "route": "mergeStatus",
+      "success_body": "{\"merge\":{\"merge_id\":\"01ARZ3NDEKTSV4RRFFQ69G5FAW\",\"primary_account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAV\",\"primary_lifecycle_generation\":\"0\",\"secondary_account\":\"01ARZ3NDEKTSV4RRFFQ69G5FAY\",\"secondary_lifecycle_generation\":\"9007199254740991\",\"state\":\"pending\",\"state_version\":\"1\",\"created_at_ms\":\"1999999000000\",\"execute_after_ms\":\"2000171800000\",\"automatic_hold\":null,\"owner_fenced\":false,\"external_cleanup_pending\":false}}"
+    }
+  ]
+}

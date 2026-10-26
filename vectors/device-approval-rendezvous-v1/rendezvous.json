@@ -1,0 +1,821 @@
+{
+  "cases": [
+    {
+      "code": "8770-3785-4794",
+      "ed25519_seed_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+      },
+      "fingerprint_hex": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+      "name": "shared-harness-key",
+      "sha256_hex": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+      "transcript": "ck-device-fingerprint-v1|rendezvous|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+    },
+    {
+      "code": "0772-8973-4556",
+      "ed25519_seed_hex": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c",
+        "roster": "rendezvous",
+        "x25519_hex": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+      },
+      "fingerprint_hex": "8a891d21283ea19ca39eb26b1a3b0789db1d65b5acb67de34601ff29f6759654",
+      "name": "leading-zero-code",
+      "sha256_hex": "8a891d21283ea19ca39eb26b1a3b0789db1d65b5acb67de34601ff29f6759654",
+      "transcript": "ck-device-fingerprint-v1|rendezvous|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|43a72e714401762df66b68c26dfbdf2682aaec9f2474eca4613e424a0fbafd3c"
+    },
+    {
+      "code": "9880-7362-8877",
+      "ed25519_seed_hex": "0202020202020202020202020202020202020202020202020202020202020202",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4eea"
+      },
+      "fingerprint_hex": "1de5803b18c4d4cdcd79dab5370f90b23a9a2aa10a59256b6940561145f6370b",
+      "name": "ordinary-key-high-bit",
+      "sha256_hex": "1de5803b18c4d4cdcd79dab5370f90b23a9a2aa10a59256b6940561145f6370b",
+      "transcript": "ck-device-fingerprint-v1|rendezvous|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4eea|8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394"
+    },
+    {
+      "family": "A",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_key_id": "-",
+        "approver_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "approver_generation": "4",
+        "approver_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "enrollment_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "enrollment_version": "2",
+        "expires_at_ms": "1900000000123",
+        "lifecycle_generation": "0",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "predecessor_approval_fingerprint_or_dash": "-",
+        "predecessor_approval_generation_or_dash": "-",
+        "predecessor_device_id_or_dash": "-",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_device_id": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "target_roster": "rendezvous"
+      },
+      "name": "approve-addition",
+      "public_key_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "sha256_hex": "276b3cc795a473058652bb37b95c9931c59de01758a0635de27ee048724cb500",
+      "signature_hex": "acbcff41a3af671344d4c3b64206324f7b485facaf1216aff32d94c367a85246a374166cc9ec853f6d622b2c56d0c727b2d158c9d0536494bfd62aebbe2bf50c",
+      "transcript": "ck-device-approval-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|0|rendezvous|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|-|-|-|rendezvous|de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f|4|-|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": true
+    },
+    {
+      "family": "A",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_key_id": "-",
+        "approver_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "approver_generation": "4",
+        "approver_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "enrollment_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "enrollment_version": "2",
+        "expires_at_ms": "1900000000123",
+        "lifecycle_generation": "0",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "predecessor_approval_fingerprint_or_dash": "1967a299914b432a3ae59d1b7184cf63ce149f20de4cdc9a7de619065a155d84",
+        "predecessor_approval_generation_or_dash": "3",
+        "predecessor_device_id_or_dash": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_device_id": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "target_roster": "rendezvous"
+      },
+      "name": "approve-replacement",
+      "public_key_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "sha256_hex": "b24c5e908ca732806b760d4e322d35864b9ab81713383b852b6a701f1ea60a39",
+      "signature_hex": "6a99b50c00454bac20ec7357a531a36f8ed3278fcd3c9273afe33d6c44b4f85d8e287492c64421bf3dccd99049141c01dab1705553d2840031154afebbf63106",
+      "transcript": "ck-device-approval-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|0|rendezvous|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f|3|1967a299914b432a3ae59d1b7184cf63ce149f20de4cdc9a7de619065a155d84|rendezvous|de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f|4|-|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": true
+    },
+    {
+      "family": "A",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_key_id": "-",
+        "approver_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "approver_generation": "4",
+        "approver_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "enrollment_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "enrollment_version": "2",
+        "expires_at_ms": "1900000000123",
+        "lifecycle_generation": "0",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "predecessor_approval_fingerprint_or_dash": "-",
+        "predecessor_approval_generation_or_dash": "-",
+        "predecessor_device_id_or_dash": "-",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_device_id": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "target_roster": "rendezvous"
+      },
+      "name": "cancel-addition",
+      "public_key_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "sha256_hex": "2ce2c44b523d068301642bb41f25097aac29af017613e2c885f2de9d030cae4f",
+      "signature_hex": "99e31c4a23f3357b1ed67d04bd935e89af5ac8fc8108a071cea8393438add7a02546030545d8718f5e304da0f540dc8383d70289ace12efcf50171d9efd88a00",
+      "transcript": "ck-device-cancel-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|0|rendezvous|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|-|-|-|rendezvous|de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f|4|-|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": true
+    },
+    {
+      "family": "A",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_key_id": "-",
+        "approver_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "approver_generation": "4",
+        "approver_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "enrollment_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "enrollment_version": "2",
+        "expires_at_ms": "1900000000123",
+        "lifecycle_generation": "0",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "predecessor_approval_fingerprint_or_dash": "1967a299914b432a3ae59d1b7184cf63ce149f20de4cdc9a7de619065a155d84",
+        "predecessor_approval_generation_or_dash": "3",
+        "predecessor_device_id_or_dash": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_device_id": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "target_roster": "rendezvous"
+      },
+      "name": "cancel-replacement",
+      "public_key_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "sha256_hex": "c511cb873d2c7c201b42aaa5cc20f445de2729528ef4efb7b134099dbc705317",
+      "signature_hex": "554a7dfe893d65e20dab8edc4b621c84a136f264f9ba5a357b6ef83996092d8e8456c565187261f08db56016b47fba19c61a6f54181bc17b32c7d63cd5587203",
+      "transcript": "ck-device-cancel-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|0|rendezvous|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f|3|1967a299914b432a3ae59d1b7184cf63ce149f20de4cdc9a7de619065a155d84|rendezvous|de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f|4|-|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": true
+    },
+    {
+      "family": "A",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_key_id": "-",
+        "approver_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "approver_generation": "4",
+        "approver_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "enrollment_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "enrollment_version": "2",
+        "expires_at_ms": "1900000000123",
+        "lifecycle_generation": "0",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "predecessor_approval_fingerprint_or_dash": "-",
+        "predecessor_approval_generation_or_dash": "-",
+        "predecessor_device_id_or_dash": "-",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_device_id": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "target_roster": "rendezvous"
+      },
+      "name": "wrong-key",
+      "public_key_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "sha256_hex": "276b3cc795a473058652bb37b95c9931c59de01758a0635de27ee048724cb500",
+      "signature_hex": "0bcc3374664f9e183b80449df03c75485c4670d48fbb0fb8ee9a7ac75783802bb772511ff21cbeea6a1aeb06ff0924e5c2173741f2c03adc11414cc39341670c",
+      "signing_public_key_hex": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+      "transcript": "ck-device-approval-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|0|rendezvous|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|-|-|-|rendezvous|de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f|4|-|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": false
+    },
+    {
+      "family": "P",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "enrollment_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "enrollment_version": "2",
+        "expires_at_ms": "1900000000123",
+        "lifecycle_generation": "9007199254740991",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "owner_generation": "4",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_approval_generation": "3"
+      },
+      "name": "collect",
+      "public_key_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "sha256_hex": "5407d66102a10fa8ea4968a74b19782c0df286a2df21a13ffb862d89f5342387",
+      "signature_hex": "90401df00539ceaafada9ffab81703e56e44b40c316f7fffa8a46a5ca5c779e1bcfd33ea343675b1d701538666b1f1266d415f6b3fbd7c223d225baea467d70a",
+      "transcript": "ck-device-collect-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|9007199254740991|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|3|4|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": true
+    },
+    {
+      "family": "P",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "enrollment_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "enrollment_version": "2",
+        "expires_at_ms": "1900000000123",
+        "lifecycle_generation": "9007199254740991",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "owner_generation": "4",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_approval_generation": "3"
+      },
+      "name": "refresh",
+      "public_key_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "sha256_hex": "6ed947e79b272176d19291f8e9c21929ca1c9c5ff397ebab58b3038d804c8df4",
+      "signature_hex": "74d2887a1805502ed0ec6158afc227a48886f61f8e54c733a6f4415de6df9b48039f52b3ae4361dad9f811ef63934e362d30832e04429e98622106a9e54d1208",
+      "transcript": "ck-device-refresh-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|9007199254740991|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|3|4|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": true
+    },
+    {
+      "family": "P",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "enrollment_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "enrollment_version": "2",
+        "expires_at_ms": "1900000000123",
+        "lifecycle_generation": "9007199254740991",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "owner_generation": "4",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_approval_generation": "3"
+      },
+      "name": "withdraw",
+      "public_key_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "sha256_hex": "53a27d15b365b68ac237ec38176aae7914f65c9e9dd2f78824fc77b6ca4424fa",
+      "signature_hex": "6bae46bf085188b22775867710370f1a3dba9e5eb8597d3cd52fd69e78296c8a015e6b21e87688e5fed42b5370c816b5ccfaee3aee6434d2b3daaf316e63550f",
+      "transcript": "ck-device-withdraw-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|9007199254740991|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|3|4|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": true
+    },
+    {
+      "family": "P",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "enrollment_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "enrollment_version": "2",
+        "expires_at_ms": "1900000000123",
+        "lifecycle_generation": "9007199254740991",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "owner_generation": "4",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_approval_generation": "3"
+      },
+      "name": "wrong-key",
+      "public_key_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "sha256_hex": "5407d66102a10fa8ea4968a74b19782c0df286a2df21a13ffb862d89f5342387",
+      "signature_hex": "ba567e18fc0238871bf61dc8502ea8cd7773e2feb1dac1f52888d233b17d27de3f61ba8ba879d0461ce339ac1f310234bc2d15aa58ca9fe3981efdcbff144a08",
+      "signing_public_key_hex": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+      "transcript": "ck-device-collect-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|9007199254740991|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|3|4|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": false
+    },
+    {
+      "family": "D",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_approval_generation": "4",
+        "actor_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "actor_key_id": "-",
+        "actor_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "expires_at_ms": "1900000000123",
+        "kind": "revoke",
+        "lifecycle_generation": "7",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "removal_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "removal_version": "2",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_approval_generation": "3",
+        "target_device_id": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "target_roster": "rendezvous"
+      },
+      "name": "authorize-revoke",
+      "public_key_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "sha256_hex": "d6a8db5cb5121dd2d3b1de591c69a12232b946128de91b6079fb7ca00e1e906f",
+      "signature_hex": "448ebf826c5cf0a7a825b6d566eb2d82ff168f2edfb325b882a48df4237072a234976843e2538fad5224a7459a58f65f191135de538d0b13d70c24e79b69160c",
+      "transcript": "ck-device-removal-authorize-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|7|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|revoke|rendezvous|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|3|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|rendezvous|de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f|4|-|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": true
+    },
+    {
+      "family": "D",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_approval_generation": "4",
+        "actor_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "actor_key_id": "-",
+        "actor_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "expires_at_ms": "1900000000123",
+        "kind": "revoke",
+        "lifecycle_generation": "7",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "removal_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "removal_version": "2",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_approval_generation": "3",
+        "target_device_id": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "target_roster": "rendezvous"
+      },
+      "name": "cancel-revoke",
+      "public_key_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "sha256_hex": "1f2986e96ea75d021a3d8736bcac994a11d1e247ce452f979a1cbadee2357a8a",
+      "signature_hex": "cefe497cbc619922fd03d1fa1ef306fb20ddbb7116b61191fd02c379aaded1d094e63dfb9ea2cbc36909dd6d96c5961d347e2b841cd4f3b98553a213b87f240a",
+      "transcript": "ck-device-removal-cancel-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|7|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|revoke|rendezvous|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|3|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|rendezvous|de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f|4|-|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": true
+    },
+    {
+      "family": "D",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_approval_generation": "4",
+        "actor_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "actor_key_id": "-",
+        "actor_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "expires_at_ms": "1900000000123",
+        "kind": "rotate-token",
+        "lifecycle_generation": "7",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "removal_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "removal_version": "2",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_approval_generation": "3",
+        "target_device_id": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "target_roster": "rendezvous"
+      },
+      "name": "authorize-rotate-token",
+      "public_key_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "sha256_hex": "d1926afefd5e6bb3d468c53c6e9681744abf6184a250277789a3e1aeae34173a",
+      "signature_hex": "3df3ca06a088830e9c82c56051646a171b2bea296a69ed9a0ab16187889408b6a6838d18b56caa59c7230ebef475726757f4e95bf71b43527994ed081ea76509",
+      "transcript": "ck-device-removal-authorize-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|7|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|rotate-token|rendezvous|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|3|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|rendezvous|de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f|4|-|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": true
+    },
+    {
+      "family": "D",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_approval_generation": "4",
+        "actor_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "actor_key_id": "-",
+        "actor_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "expires_at_ms": "1900000000123",
+        "kind": "rotate-token",
+        "lifecycle_generation": "7",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "removal_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "removal_version": "2",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_approval_generation": "3",
+        "target_device_id": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "target_roster": "rendezvous"
+      },
+      "name": "cancel-rotate-token",
+      "public_key_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "sha256_hex": "80f03d2272d1bfb430a2ab1f6a01523eba0f2894d0a41a8832b290ad79f7ec32",
+      "signature_hex": "8d220530d26859e09ef069e9d820e8df17ce4fa4d15cb62de00306cb2e861776263c93045669f817f9a04faaed6f6019902664f36094c7f747ae88a1f28e270e",
+      "transcript": "ck-device-removal-cancel-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|7|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|rotate-token|rendezvous|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|3|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|rendezvous|de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f|4|-|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": true
+    },
+    {
+      "family": "D",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_approval_generation": "3",
+        "actor_device_id": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "actor_key_id": "-",
+        "actor_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "expires_at_ms": "1900000000123",
+        "kind": "revoke",
+        "lifecycle_generation": "7",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "removal_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "removal_version": "2",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_approval_generation": "3",
+        "target_device_id": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "target_roster": "rendezvous"
+      },
+      "name": "self-revoke",
+      "public_key_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+      "sha256_hex": "542d03e331f12452a305cc91ed264d3b3a501db678463618e855f86985297e86",
+      "signature_hex": "2e60520b38d08c4808526cb265866f5fccbac6b13083d8d69a920414c5c84fbf7c0e6dccb55dcb9f07bbf74eab5715f54bd56109f334bbed0159a6090d86590e",
+      "transcript": "ck-device-removal-authorize-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|7|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|revoke|rendezvous|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|3|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|rendezvous|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|3|-|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": true
+    },
+    {
+      "family": "D",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_approval_generation": "4",
+        "actor_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "actor_key_id": "-",
+        "actor_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "expires_at_ms": "1900000000123",
+        "kind": "revoke",
+        "lifecycle_generation": "7",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "removal_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "removal_version": "2",
+        "target_approval_fingerprint": "8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9",
+        "target_approval_generation": "3",
+        "target_device_id": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "target_roster": "rendezvous"
+      },
+      "name": "wrong-key",
+      "public_key_hex": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+      "sha256_hex": "d6a8db5cb5121dd2d3b1de591c69a12232b946128de91b6079fb7ca00e1e906f",
+      "signature_hex": "257dc06974ae5d6d74131ed784746381bb18a52d3106a3d22cc6b8239aeb11726652d58f1f49949c2ddf993aa66e3ba5377b0f1649bae62a7124cdeb60a3a204",
+      "signing_public_key_hex": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
+      "transcript": "ck-device-removal-authorize-v1|account.cortexkit.io|01ARZ3NDEKTSV4RRFFQ69G5FAV|7|01ARZ3NDEKTSV4RRFFQ69G5FAW|2|revoke|rendezvous|8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a|3|8b5391699779104ad11d3b6f1eac7bd57ff27610650560a3177a3da8b9dc8dd9|rendezvous|de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f|4|-|01ARZ3NDEKTSV4RRFFQ69G5FAX|-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s|1900000000123",
+      "verify": false
+    }
+  ],
+  "design_revision": 3,
+  "refusals": [
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "name": "low-order-0"
+    },
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "0000000000000000000000000000000000000000000000000000000000000080"
+      },
+      "name": "low-order-0-high-bit"
+    },
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "0100000000000000000000000000000000000000000000000000000000000000"
+      },
+      "name": "low-order-1"
+    },
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "0100000000000000000000000000000000000000000000000000000000000080"
+      },
+      "name": "low-order-1-high-bit"
+    },
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800"
+      },
+      "name": "low-order-order-8-e0eb7a7c"
+    },
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b880"
+      },
+      "name": "low-order-order-8-e0eb7a7c-high-bit"
+    },
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157"
+      },
+      "name": "low-order-order-8-5f9c95bc"
+    },
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f11d7"
+      },
+      "name": "low-order-order-8-5f9c95bc-high-bit"
+    },
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+      },
+      "name": "low-order-p-minus-1"
+    },
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "name": "low-order-p-minus-1-high-bit"
+    },
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+      },
+      "name": "low-order-p"
+    },
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "name": "low-order-p-high-bit"
+    },
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"
+      },
+      "name": "low-order-p-plus-1"
+    },
+    {
+      "error": "X25519Key",
+      "family": "F",
+      "fields": {
+        "ed25519_hex": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+        "roster": "rendezvous",
+        "x25519_hex": "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      "name": "low-order-p-plus-1-high-bit"
+    },
+    {
+      "error": "X25519Key",
+      "family": "A",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_key_id": "-",
+        "approver_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "approver_generation": "4",
+        "approver_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "enrollment_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "enrollment_version": "2",
+        "expires_at_ms": "1900000000123",
+        "lifecycle_generation": "0",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "predecessor_approval_fingerprint_or_dash": "-",
+        "predecessor_approval_generation_or_dash": "-",
+        "predecessor_device_id_or_dash": "-",
+        "target_approval_fingerprint": "280a92f20014c92b031c20b6c85ca07aa5b5dc4f36870c771326650bd05cd209",
+        "target_device_id": "0000000000000000000000000000000000000000000000000000000000000000",
+        "target_roster": "rendezvous"
+      },
+      "name": "low-order-0"
+    },
+    {
+      "error": "X25519Key",
+      "family": "A",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_key_id": "-",
+        "approver_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "approver_generation": "4",
+        "approver_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "enrollment_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "enrollment_version": "2",
+        "expires_at_ms": "1900000000123",
+        "lifecycle_generation": "0",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "predecessor_approval_fingerprint_or_dash": "-",
+        "predecessor_approval_generation_or_dash": "-",
+        "predecessor_device_id_or_dash": "-",
+        "target_approval_fingerprint": "dc3305627b30f4f8d5a2b9091c42cfce42fd1c3ff5fcd7cba9074f6628367a64",
+        "target_device_id": "0000000000000000000000000000000000000000000000000000000000000080",
+        "target_roster": "rendezvous"
+      },
+      "name": "low-order-0-high-bit"
+    },
+    {
+      "error": "X25519Key",
+      "family": "D",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_approval_generation": "4",
+        "actor_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "actor_key_id": "-",
+        "actor_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "expires_at_ms": "1900000000123",
+        "kind": "revoke",
+        "lifecycle_generation": "7",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "removal_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "removal_version": "2",
+        "target_approval_fingerprint": "280a92f20014c92b031c20b6c85ca07aa5b5dc4f36870c771326650bd05cd209",
+        "target_approval_generation": "3",
+        "target_device_id": "0000000000000000000000000000000000000000000000000000000000000000",
+        "target_roster": "rendezvous"
+      },
+      "name": "low-order-0"
+    },
+    {
+      "error": "X25519Key",
+      "family": "D",
+      "fields": {
+        "account": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "actor_approval_generation": "4",
+        "actor_device_id": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f",
+        "actor_key_id": "-",
+        "actor_roster": "rendezvous",
+        "audience": "account.cortexkit.io",
+        "challenge_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX",
+        "expires_at_ms": "1900000000123",
+        "kind": "revoke",
+        "lifecycle_generation": "7",
+        "nonce": "-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_v7-_s",
+        "removal_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW",
+        "removal_version": "2",
+        "target_approval_fingerprint": "dc3305627b30f4f8d5a2b9091c42cfce42fd1c3ff5fcd7cba9074f6628367a64",
+        "target_approval_generation": "3",
+        "target_device_id": "0000000000000000000000000000000000000000000000000000000000000080",
+        "target_roster": "rendezvous"
+      },
+      "name": "low-order-0-high-bit"
+    },
+    {
+      "error": "Ulid",
+      "field": "ulid",
+      "name": "lowercase-ulid",
+      "value": "01arz3ndektsv4rrffq69g5fav"
+    },
+    {
+      "error": "Ulid",
+      "field": "ulid",
+      "name": "overflow-ulid",
+      "value": "81ARZ3NDEKTSV4RRFFQ69G5FAV"
+    },
+    {
+      "error": "Ulid",
+      "field": "ulid",
+      "name": "alias-ulid",
+      "value": "01ARZ3NDEKTSV4RRFFQ69G5FAI"
+    },
+    {
+      "error": "Hex",
+      "field": "hex",
+      "name": "uppercase-hex",
+      "value": "ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB"
+    },
+    {
+      "error": "Hex",
+      "field": "hex",
+      "name": "short-hex",
+      "value": "ab"
+    },
+    {
+      "error": "Decimal",
+      "field": "decimal",
+      "name": "leading-zero-decimal",
+      "value": "01"
+    },
+    {
+      "error": "Decimal",
+      "field": "decimal",
+      "name": "above-safe-integer",
+      "value": "9007199254740992"
+    },
+    {
+      "error": "PositiveDecimal",
+      "field": "positive",
+      "name": "zero-generation",
+      "value": "0"
+    },
+    {
+      "error": "Decimal",
+      "field": "decimal",
+      "name": "signed-decimal",
+      "value": "+1"
+    },
+    {
+      "error": "Decimal",
+      "field": "decimal",
+      "name": "fraction-decimal",
+      "value": "1.0"
+    },
+    {
+      "error": "Decimal",
+      "field": "decimal",
+      "name": "exponent-decimal",
+      "value": "1e3"
+    },
+    {
+      "error": "Nonce",
+      "field": "nonce",
+      "name": "padded-base64url",
+      "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    },
+    {
+      "error": "Nonce",
+      "field": "nonce",
+      "name": "noncanonical-base64url-bits",
+      "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB"
+    },
+    {
+      "error": "Nonce",
+      "field": "nonce",
+      "name": "short-nonce",
+      "value": "AA"
+    },
+    {
+      "error": "Predecessor",
+      "field": "predecessor",
+      "name": "mixed-predecessor",
+      "value": [
+        "-",
+        "1",
+        "-"
+      ]
+    },
+    {
+      "error": "Ulid",
+      "field": "ulid",
+      "name": "pipe-in-field",
+      "value": "01ARZ3NDEKTSV4RRFFQ69G5FA|"
+    },
+    {
+      "error": "Roster",
+      "field": "roster",
+      "name": "unknown-roster",
+      "value": "phone"
+    },
+    {
+      "error": "ActorKeyId",
+      "field": "actor_key_id",
+      "name": "computer-actor-key",
+      "value": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    },
+    {
+      "error": "RemovalKind",
+      "field": "kind",
+      "name": "unknown-kind",
+      "value": "rotate"
+    },
+    {
+      "error": "Ed25519Key",
+      "field": "ed25519",
+      "name": "weak-ed25519",
+      "value": "0100000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "error": "X25519Key",
+      "field": "x25519",
+      "name": "small-order-x25519",
+      "value": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

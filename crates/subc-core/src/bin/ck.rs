@@ -611,7 +611,15 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             _ => None,
         };
         if let Some((kind, module, drain)) = action {
-            return inline_actions::run(&mut client, kind, module, drain, inline).await;
+            return inline_actions::run(
+                &mut client,
+                kind,
+                module,
+                drain,
+                inline,
+                args.wait == Some(true),
+            )
+            .await;
         }
     }
 

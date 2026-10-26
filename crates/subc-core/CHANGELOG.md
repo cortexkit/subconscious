@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.20.140
+
+- `ck module restart`, `stop` and `start` no longer follow the module inline
+  when `ck` itself runs inside a supervised module's process tree, for example
+  from an agent's shell. Waiting there could hold up the very restart being
+  watched, so `ck` prints the acknowledgement and says why it is not following.
+  `--wait` still follows; `--no-wait` is unchanged.
+
 ## 0.20.139
 
 - Terminal module restart, stop and start show live phases and an observed result.

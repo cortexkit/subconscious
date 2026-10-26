@@ -41,6 +41,15 @@ fn reading(pid: Option<u32>, spawned_at_ms: u64, health: &str) -> Vec<ScriptedCo
     ]
 }
 
+#[cfg(target_os = "linux")]
+fn ancestry_snapshot(module: &str, pid: u32) -> ScriptedControlStep {
+    reply(
+        ClientControlRequest::SupervisorSpawnSnapshot {},
+        json!({"op":"supervisor.spawn_snapshot", "cursor":{"daemon_incarnation":"scripted", "seq":1}, "ring_bound":100,
+            "live":[{"module_id":module, "spawn_generation":1, "pid":pid, "spawned_at_ms":1000}]}),
+    )
+}
+
 fn action(verb: &str) -> ClientControlRequest {
     match verb {
         "restart" => ClientControlRequest::SupervisorRestart {
@@ -152,11 +161,12 @@ async fn terminal_actions_follow_only_ck_by_default_and_json_never_follows() {
             for flag in [None, Some("--no-wait"), Some("--wait")] {
                 let follow = flag == Some("--wait") || (!ckni && flag.is_none());
                 let inline = !ckni && follow;
-                let daemon = ScriptedDaemon::start_concurrent_sessions(
-                    "inline-pty",
-                    steps(verb, follow, inline, "ok"),
-                )
-                .await;
+                let mut sessions = steps(verb, follow, inline, "ok");
+                if inline && flag.is_none() {
+                    sessions[0].insert(0, ancestry_snapshot("elsewhere", u32::MAX));
+                }
+                let daemon =
+                    ScriptedDaemon::start_concurrent_sessions("inline-pty", sessions).await;
                 let (_link, cmd) = command(ckni, &daemon.connection_file_path, verb, flag);
                 let output = upgrade_terminal_output(&cmd);
                 assert_exit(&output, 0);
@@ -182,6 +192,138 @@ async fn terminal_actions_follow_only_ck_by_default_and_json_never_follows() {
             assert!(!text(&output.stdout).contains('\x1b'));
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn assert_ancestry_stops_at_ack(module: Option<&str>) {
+    for verb in ["restart", "stop", "start"] {
+        let probe = if let Some(module) = module {
+            ancestry_snapshot(module, std::process::id())
+        } else {
+            ScriptedControlStep {
+                expected: ClientControlRequest::SupervisorSpawnSnapshot {},
+                action: ScriptedControlAction::Error(subc_protocol::ErrorBody {
+                    code: "unavailable".into(),
+                    message: "snapshot unavailable".into(),
+                    detail: None,
+                }),
+            }
+        };
+        let mut sender = vec![];
+        if verb != "restart" {
+            sender.push(reply(ClientControlRequest::SupervisorList {}, roster(true)));
+        }
+        sender.push(reply(action(verb), ack()));
+        let mut daemon =
+            ScriptedDaemon::start_concurrent_sessions("inline-ancestry", vec![vec![probe], sender])
+                .await;
+        let (_link, cmd) = command(false, &daemon.connection_file_path, verb, None);
+        let output = upgrade_terminal_output(&cmd);
+        assert_exit(&output, 0);
+        assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+        let expected = module.map_or_else(
+            || "Not following: ck couldn't read the module roster.\n".to_string(),
+            |module| format!("Not following: this shell runs inside {module}, so waiting could hold a drain. Check it with ck module list.\n"),
+        );
+        assert_eq!(text(&output.stdout), expected);
+        daemon.assert_complete().await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_of_the_target_stops_at_the_ack() {
+    assert_ancestry_stops_at_ack(Some("broca")).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_of_a_non_target_module_stops_at_the_ack() {
+    assert_ancestry_stops_at_ack(Some("aft")).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_snapshot_stops_at_the_ack_with_the_roster_line() {
+    assert_ancestry_stops_at_ack(None).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_elsewhere_follows_to_healthy() {
+    let mut sessions = steps("restart", true, true, "ok");
+    sessions[0].insert(0, ancestry_snapshot("aft", u32::MAX));
+    let daemon = ScriptedDaemon::start_concurrent_sessions("inline-elsewhere", sessions).await;
+    let (_link, cmd) = command(false, &daemon.connection_file_path, "restart", None);
+    let output = upgrade_terminal_output(&cmd);
+    assert_exit(&output, 0);
+    assert!(text(&output.stdout).contains("✓ broca restarted"));
+    assert!(text(&output.stdout).contains("pid 222 · healthy after 2.1 s"));
+    assert!(!text(&output.stdout).contains("Not following:"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_wait_follows_even_inside_a_module() {
+    let mut sessions = steps("restart", true, true, "ok");
+    for step in &mut sessions[0] {
+        if step.expected == (ClientControlRequest::SupervisorSpawnSnapshot {}) {
+            if let ScriptedControlAction::Reply(response) = &mut step.action {
+                if let ClientControlResponse::SupervisorSpawnSnapshot { snapshot } =
+                    response.as_mut()
+                {
+                    let mut ancestor = snapshot.live[0].clone();
+                    ancestor.module_id = "aft".into();
+                    ancestor.pid = std::process::id();
+                    snapshot.live.push(ancestor);
+                }
+            }
+        }
+    }
+    let daemon = ScriptedDaemon::start_concurrent_sessions("inline-force-wait", sessions).await;
+    let (_link, cmd) = command(
+        false,
+        &daemon.connection_file_path,
+        "restart",
+        Some("--wait"),
+    );
+    let output = upgrade_terminal_output(&cmd);
+    assert_exit(&output, 0);
+    assert!(text(&output.stdout).contains("✓ broca restarted"));
+    assert!(!text(&output.stdout).contains("Not following:"));
+}
+
+// Unlike the Linux-only ancestry tests above, this one exercises parent_pid on
+// every platform CI runs, so it keeps no platform gate.
+#[test]
+fn parent_pid_lookup_reads_the_actual_parent_on_each_platform() {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "inline_actions::parent_pid_lookup_child",
+            "--nocapture",
+        ])
+        .env("CK_EXPECT_PARENT_PID", std::process::id().to_string())
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    assert!(
+        text(&output.stdout).contains("parent pid verified"),
+        "{}",
+        text(&output.stdout)
+    );
+}
+
+#[test]
+fn parent_pid_lookup_child() {
+    let Ok(expected) = std::env::var("CK_EXPECT_PARENT_PID") else {
+        return;
+    };
+    assert_eq!(
+        subc_os::parent_pid(std::process::id()),
+        Some(expected.parse().unwrap())
+    );
+    println!("parent pid verified");
 }
 
 #[cfg(target_os = "linux")]

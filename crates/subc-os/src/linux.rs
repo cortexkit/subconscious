@@ -66,6 +66,19 @@ pub(crate) fn start_time(pid: u32) -> Option<u64> {
     start_time_from_stat(&stat)
 }
 
+pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parent_pid_from_stat(&stat)
+}
+
+fn parent_pid_from_stat(stat: &str) -> Option<u32> {
+    let mut fields = stat.rsplit_once(')')?.1.split_whitespace();
+    if matches!(fields.next()?, "Z" | "X" | "x") {
+        return None;
+    }
+    fields.next()?.parse().ok()
+}
+
 /// Field 22 (`starttime`) of `/proc/<pid>/stat`, or `None` for a process that
 /// has exited and awaits reaping (state `Z`) or is being torn down (`X`).
 ///
@@ -161,7 +174,16 @@ pub(crate) fn signal(pid: u32, pidfd: Option<&OwnedFd>, signal: Signal) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{cpu_ticks_from_stat, memory_from_status, start_time_from_stat};
+    use super::{
+        cpu_ticks_from_stat, memory_from_status, parent_pid_from_stat, start_time_from_stat,
+    };
+
+    #[test]
+    fn parent_pid_parser_ignores_parentheses_in_the_command_name() {
+        assert_eq!(parent_pid_from_stat("123 (foo) bar) S 42 99"), Some(42));
+        assert_eq!(parent_pid_from_stat("123 (foo) Z 42 99"), None);
+        assert_eq!(parent_pid_from_stat("123 (foo) S"), None);
+    }
 
     #[test]
     fn stat_parser_reads_user_and_system_ticks() {

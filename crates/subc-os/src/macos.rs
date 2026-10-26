@@ -1,6 +1,6 @@
 //! macOS process identity through `sysctl(KERN_PROC_PID)` and `proc_pidpath`,
 //! and resource usage through `proc_pid_rusage` and `mach_timebase_info`.
-//! These four foreign calls are this crate's only unsafe code.
+//! Parent pids come from `proc_pidinfo(PROC_PIDTBSDINFO)`.
 
 use std::{
     ffi::{c_int, c_void, OsStr},
@@ -66,6 +66,27 @@ fn kinfo_proc(pid: u32) -> Option<KinfoProc> {
 
 pub(crate) fn exists(pid: u32) -> bool {
     start_time(pid).is_some()
+}
+
+pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
+    let pid = c_int::try_from(pid).ok()?;
+    // SAFETY: proc_bsdinfo is a C output structure; all-zero bytes are valid.
+    #[allow(unsafe_code)]
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as c_int;
+    // SAFETY: info points to a writable, correctly aligned buffer of size bytes.
+    #[allow(unsafe_code)]
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    (read == size && info.pbi_pid == pid as u32 && info.pbi_status != u32::from(SZOMB))
+        .then_some(info.pbi_ppid)
 }
 
 /// Microseconds since the epoch at which the process started, or `None` if it

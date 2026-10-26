@@ -178,6 +178,24 @@ pub fn start_time(pid: u32) -> Option<u64> {
     }
 }
 
+/// The parent pid reported by the kernel, or `None` when it cannot be read.
+/// On Windows a reused parent pid (created after the child) is rejected.
+pub fn parent_pid(pid: u32) -> Option<u32> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::parent_pid(pid)
+    }
+    #[cfg(windows)]
+    {
+        windows::parent_pid(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// True where [`resource_usage`] can read a live process. Elsewhere it always
 /// answers `None`, and a caller can use this to say "not supported here"
 /// rather than "could not read".

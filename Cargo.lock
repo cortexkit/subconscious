@@ -2456,7 +2456,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.139"
+version = "0.20.140"
 dependencies = [
  "base64",
  "ck-ui",
@@ -2571,7 +2571,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "cortexkit-test-support",
  "libc",

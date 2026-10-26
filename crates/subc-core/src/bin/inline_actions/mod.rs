@@ -27,7 +27,17 @@ pub(super) async fn run(
     module: &str,
     drain_timeout_ms: Option<u64>,
     inline: bool,
+    force_wait: bool,
 ) -> Result<(), CkError> {
+    let not_following = if inline && !force_wait {
+        match spawns(client).await {
+            Ok(processes) => module_ancestor(std::process::id(), &processes, subc_os::parent_pid)
+                .map(|module| format!("Not following: this shell runs inside {module}, so waiting could hold a drain. Check it with ck module list.")),
+            Err(_) => Some("Not following: ck couldn't read the module roster.".into()),
+        }
+    } else {
+        None
+    };
     let source = CliAction {
         path: client.path.clone(),
         client: tokio::sync::Mutex::new(client),
@@ -35,6 +45,11 @@ pub(super) async fn run(
         gauges: std::sync::Mutex::new(None),
         inline,
     };
+    if let Some(reason) = not_following {
+        source.send(kind, module, drain_timeout_ms).await?;
+        println!("{reason}");
+        return Ok(());
+    }
     let mut line = String::new();
     let following = actions::run_action(
         &source,
@@ -89,6 +104,29 @@ pub(super) async fn run(
     } else {
         Err(CkError::RenderedExit { exit_code: 1 })
     }
+}
+
+fn module_ancestor(
+    mut pid: u32,
+    processes: &std::collections::HashMap<String, LiveProcess>,
+    mut parent: impl FnMut(u32) -> Option<u32>,
+) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(pid);
+    for _ in 0..64 {
+        if pid <= 1 {
+            return None;
+        }
+        pid = parent(pid)?;
+        if pid <= 1 || !seen.insert(pid) {
+            return None;
+        }
+        // A tool shell may belong to a different module than the action target.
+        if let Some((module, _)) = processes.iter().find(|(_, process)| process.pid == pid) {
+            return Some(module.clone());
+        }
+    }
+    None
 }
 
 struct CliAction<'a> {
@@ -238,5 +276,82 @@ async fn spawns(
         other => Err(CkError::Message(format!(
             "unexpected spawn snapshot: {other:?}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod ancestry_tests {
+    use super::*;
+
+    fn process_at(pid: u32) -> std::collections::HashMap<String, LiveProcess> {
+        std::collections::HashMap::from([(
+            "tool".into(),
+            LiveProcess {
+                pid,
+                generation: 1,
+                spawned_at: Timestamp::from_unix_millis(1000),
+            },
+        )])
+    }
+
+    #[test]
+    fn a_root_or_current_pid_is_not_a_module_ancestor() {
+        for pid in [0, 1, 10] {
+            assert_eq!(module_ancestor(10, &process_at(pid), |_| Some(pid)), None);
+        }
+    }
+
+    #[test]
+    fn the_64th_ancestor_matches_but_the_65th_does_not() {
+        assert_eq!(
+            module_ancestor(10, &process_at(74), |pid| Some(pid + 1)),
+            Some("tool".into())
+        );
+        assert_eq!(
+            module_ancestor(10, &process_at(75), |pid| Some(pid + 1)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_not_inside_a_module() {
+        let mut steps = 0;
+        assert_eq!(
+            module_ancestor(10, &Default::default(), |pid| {
+                steps += 1;
+                Some(if pid == 10 { 20 } else { 10 })
+            }),
+            None
+        );
+        assert_eq!(steps, 2);
+    }
+
+    #[test]
+    fn ancestry_stops_at_roots_missing_parents_and_64_steps() {
+        for root in [0, 1] {
+            let mut steps = 0;
+            assert_eq!(
+                module_ancestor(10, &Default::default(), |_| {
+                    steps += 1;
+                    Some(root)
+                }),
+                None
+            );
+            assert_eq!(steps, 1);
+            assert_eq!(
+                module_ancestor(root, &Default::default(), |_| panic!("root has no parent")),
+                None
+            );
+        }
+        assert_eq!(module_ancestor(10, &Default::default(), |_| None), None);
+        let mut steps = 0;
+        assert_eq!(
+            module_ancestor(10, &Default::default(), |pid| {
+                steps += 1;
+                Some(pid + 1)
+            }),
+            None
+        );
+        assert_eq!(steps, 64);
     }
 }

@@ -30,6 +30,13 @@ pub enum ScriptedControlAction {
 }
 
 impl ScriptedDaemon {
+    pub async fn assert_complete(&mut self) {
+        tokio::time::timeout(Duration::from_secs(10), &mut self.task)
+            .await
+            .expect("ck sends every scripted request")
+            .expect("scripted sessions complete without mismatches");
+    }
+
     pub async fn start(name: &str, steps: Vec<ScriptedControlStep>) -> Self {
         Self::start_sessions(name, vec![steps]).await
     }

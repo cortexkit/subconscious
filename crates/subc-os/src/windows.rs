@@ -13,13 +13,20 @@ use std::{
     time::Duration,
 };
 use windows_sys::Win32::{
-    Foundation::{ERROR_INVALID_PARAMETER, FILETIME, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    Foundation::{
+        ERROR_INVALID_PARAMETER, FILETIME, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
+    },
     Storage::FileSystem::{
         FileAttributeTagInfo, FileIdInfo, GetFileInformationByHandleEx,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
         FILE_ID_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
     },
     System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+            TH32CS_SNAPPROCESS,
+        },
         ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         Threading::{
             GetProcessTimes, OpenProcess, TerminateProcess, WaitForSingleObject,
@@ -278,6 +285,56 @@ fn times(handle: HANDLE) -> Option<(u64, u64, u64)> {
     let ticks =
         |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
     Some((ticks(creation), ticks(kernel), ticks(user)))
+}
+
+pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
+    // Query-only handles also work for ancestors we may not terminate. Holding
+    // the child handle prevents its pid from being reused during the snapshot.
+    let query = |pid| {
+        // SAFETY: OpenProcess accepts a numeric pid and returns an owned handle.
+        let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if raw.is_null() {
+            None
+        } else {
+            // SAFETY: successful OpenProcess transfers ownership of this handle.
+            Some(unsafe { OwnedHandle::from_raw_handle(raw) })
+        }
+    };
+    let child = query(pid)?;
+    let child_time = times(child.as_raw_handle())?.0;
+    // SAFETY: no pointers are passed; a successful snapshot is an owned handle.
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if raw == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    // SAFETY: the successful snapshot transfers ownership of this handle.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
+    // SAFETY: PROCESSENTRY32W is a C output structure with valid zero values.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: the snapshot is live and entry has the required size and alignment.
+    let mut found = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) };
+    while found != 0 {
+        if entry.th32ProcessID == pid {
+            let parent = query(entry.th32ParentProcessID)?;
+            let parent_time = times(parent.as_raw_handle())?.0;
+            return older_parent(entry.th32ParentProcessID, parent_time, child_time);
+        }
+        // SAFETY: the snapshot and the initialized entry remain valid.
+        found = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) };
+    }
+    None
+}
+
+fn older_parent(parent: u32, parent_time: u64, child_time: u64) -> Option<u32> {
+    (parent_time <= child_time).then_some(parent)
+}
+
+#[test]
+fn a_parent_created_after_its_child_is_a_reused_pid() {
+    assert_eq!(older_parent(42, 101, 100), None);
+    assert_eq!(older_parent(42, 100, 100), Some(42));
+    assert_eq!(older_parent(42, 99, 100), Some(42));
 }
 
 pub(crate) fn wait(process: &Process, timeout: Duration) -> io::Result<bool> {

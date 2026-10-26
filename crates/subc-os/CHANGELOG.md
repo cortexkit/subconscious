@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.20
+
+- Add `parent_pid(pid)`: the parent process id the kernel reports, on macOS,
+  Linux and Windows, or `None` when it can't be read (another user's process,
+  a zombie, or an exited process). On Windows a parent id that now names a
+  process created after the child is rejected as reused.
+
 ## 0.1.19
 
 - Run Unix launch-nonce descriptor-sensitive tests in separate processes so parallel tests opening files, sockets or pidfds cannot change their descriptor-number assumptions. Require the child to report the exact passing test and a one-test success summary, since a filter matching no tests also exits successfully. Production handoff behavior is unchanged.

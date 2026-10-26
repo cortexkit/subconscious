@@ -45,6 +45,7 @@ enum FedSQLiteStoreRows {
     );
     \(confirmedRangeSchema)
     \(peerMachineIDSchema)
+    \(deviceApprovalSeenSchema)
     """
 
     /// The confirmed ranges of `FedDestinationState.confirmedEffectRanges`.
@@ -70,6 +71,14 @@ enum FedSQLiteStoreRows {
     CREATE TABLE IF NOT EXISTS peer_machine_id(
         responder_fp TEXT PRIMARY KEY NOT NULL,
         machine_id TEXT NOT NULL
+    );
+    """
+
+    /// Additive notice retention, independent of origin recovery state.
+    static let deviceApprovalSeenSchema = """
+    CREATE TABLE IF NOT EXISTS device_approval_seen (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        marks BLOB NOT NULL
     );
     """
 

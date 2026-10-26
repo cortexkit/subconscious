@@ -353,6 +353,51 @@ high-S twins instead of normalizing received signatures. All new refusals are
 `DeviceApprovalError` with an extensible `Code` string struct and a `field`;
 no cases were added to existing public enums.
 
+### Signed approval control notices and opt-in
+
+Approvals are off by default. First open the identity-bound `FedSQLiteStateStore`
+and set `FedRendezvousClient.Configuration.deviceApprovals` to a
+`DeviceApprovalNoticeHandling(store:present:)`. The synchronous presentation sink
+must emit the reviewed card/outcome before returning: the store then commits its
+seen mark, and only then does the rendezvous client send a receipt-only ack.
+A commit failure closes the connection without an ack. Reconnect replay is the
+retry; there is no client ack outbox. `FedMemoryStateStore` implements the same
+ordering for tests, but is not durable and must not be used for phone opt-in.
+
+The app then sends `DeviceCapabilitiesUpdate.approvals(enabled:current:)` using
+its `method`, `path`, and canonical `body`, authenticated with the device token.
+Use the current self-row's capabilities; the builder preserves unknown valid
+tokens, including `fed-serve`, while adding/removing only `device-approval-v1`.
+The app owns this HTTP call. Constructing a client does not advertise the token.
+On opt-out, send the removal update before disconnecting the approval reader.
+If a notice arrives without configured handling, the client advances its cursor
+but neither records nor acknowledges it, keeping discovery live and allowing
+replay in a later configured session. `unhandledDeviceApprovalNoticeCount` counts
+these deliveries; a diagnostic is logged once per session.
+
+The client verifies the pinned account signature before decoding each notice;
+`DeviceApprovalNotice.verify(_:pin:)` also supports fetched envelopes. Pending
+views validate the full target keys and derive fingerprints and comparison codes
+locally. The sink should remove the pending card when a resolved outcome arrives.
+Seen marks retain only receipt metadata, not signed envelopes. Resolved outcomes
+drop pending marks atomically; local pending deadlines and a seven-day maximum
+bound retention. Pruning runs on connect and delivery; the app should also call
+`pruneDeviceApprovalNotices(nowMS:)` on resume or periodic maintenance when no
+connection is active. Expiry controls presentation only, never authorization.
+
+Before signing an `ActionChallenge`, pass the **exact view the app showed** to
+`DeviceApprovalActionSigner.sign(_:presentedView:keyData:reason:)`, or call
+`requirePresentedView(_:)` before the original signing overload. A changed
+predecessor refuses as `predecessor_mismatch` before user presence is requested.
+The check also binds the account, operation, version and target keys.
+
+`DeviceApprovalPush(json:)` parses only the fixed-alert APNs wake-up hint
+and returns its kind and notice id. Fetch and verify the signed notice before
+showing any action. Never approve from push bytes.
+
+The rendezvous server's published notice set is pinned byte for byte in
+`vectors/rdv-device-approval-notices-v1`; its checksum is checked by Swift tests.
+
 Shared vectors live in `vectors/device-approval-rendezvous-v1` and
 `vectors/device-approval-phone-v1` at the repository root. The first set is pinned
 byte for byte; the second has a deterministic RFC 6979 generator. Swift tests

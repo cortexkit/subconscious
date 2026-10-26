@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Keep the rendezvous session and contiguous cursor alive when approval handling is not configured: discard notice presentation without persisting or acknowledging it, count unhandled deliveries, and log once per session so a later configured session can replay them.
+
+- Refuse rendezvous control-session `seq` and `server_seq` values above 2^53 - 1 (9007199254740991), uniformly for ordinary frames and device-approval notices/acks. Other decimal-string fields keep their existing validation.
+
+- Read all six signed device-approval/removal/merge rendezvous notice types with the account-key pin, strict closed JSON, locally recomputed comparison fingerprints/codes, contiguous cursor participation and receipt-only acknowledgements. Opt-in handling presents a card before committing its seen mark to the fed state store, then acknowledges every delivery; resolved, deadline and seven-day pruning suppress obsolete or repeated cards without an ack outbox. Add canonical capability update bodies for app-owned opt-in/out HTTP calls, a predecessor-bound signing overload with `predecessor_mismatch`, and a closed APNs wake-up hint parser that never authorizes an action. Pin and verify the rendezvous server's published notice set. No existing public enum gains a case.
+
 - Expose `SecureEnclaveP256Signer` for purpose-separated keys and raw-byte signing, returning P1363 and DER encodings of the same low-S signature. Device-approval signing retains its checked-challenge API and delegates to this shared implementation for key creation, fresh per-signature user presence and normalization. Apps must use a separate key for vault agent-secret approvals and must never use the raw-byte primitive directly with their device-approval key.
 
 - Decode Ed25519 points explicitly and reject weak encodings for both rosters. Apply exactly libsodium's seven-entry X25519 low-order blocklist with bit 255 masked, refusing all fourteen encodings in fingerprints and phone approval/removal challenges without a broader DH test. Pin all fourteen F/A/D refusals, weak/non-point Ed25519 keys (including machine targets), and X25519 device-id mismatch cases in shared phone vectors; keep the published rendezvous file unchanged.

@@ -85,6 +85,16 @@ public struct ActionChallenge: Sendable {
     public var nonce: DeviceApprovalValue { context["nonce"] }
     public var expiresAtMS: DeviceApprovalValue { context["expires_at_ms"] }
 
+    /// Check the card the user reviewed before signing a fresh challenge. A
+    /// replacement must not silently change which predecessor will be retired.
+    public func requirePresentedView(_ view: DeviceApprovalEnrollmentView) throws {
+        try approvalRequire(predecessor == view.predecessor, "predecessor", .predecessorMismatch)
+        try approvalRequire(account == view.account, "account")
+        try approvalRequire(enrollmentID == view.enrollmentID, "enrollment_id")
+        try approvalRequire(enrollmentVersion == view.stateVersion, "enrollment_version")
+        try approvalRequire(target == view.target, "target")
+    }
+
     public init(json: Data) throws {
         let (object, decoded) = try ApprovalChallengeContext.decode(json, family: "A", extra: ["action", "predecessor", "transcript"], target: true)
         guard let action = try Action(rawValue: object.string("action")) else {

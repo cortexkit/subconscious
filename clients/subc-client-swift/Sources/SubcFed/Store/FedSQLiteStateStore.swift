@@ -40,7 +40,7 @@ import SQLite3
 /// Close is terminal for this actor. On return, create a new store and new
 /// clients; they reload the same disk state and incarnation. Clients retaining
 /// a closed actor fail with `FedStateStoreClosed`, not ownership contention.
-public actor FedSQLiteStateStore: FedStateStore {
+public actor FedSQLiteStateStore: FedDeviceApprovalNoticeStore {
     public static let databaseFileName = "fed-state.sqlite"
     private static let documentFileName = "fed-state.json"
     private static let migratedDocumentFileName = "fed-state.json.migrated"
@@ -308,6 +308,7 @@ public actor FedSQLiteStateStore: FedStateStore {
             try db.keepWriteAheadLogFiles()
             try db.execute(FedSQLiteStoreRows.confirmedRangeSchema)
             try db.execute(FedSQLiteStoreRows.peerMachineIDSchema)
+            try db.execute(FedSQLiteStoreRows.deviceApprovalSeenSchema)
             return db
         } catch {
             throw Self.openFailure(error)
@@ -555,6 +556,35 @@ public actor FedSQLiteStateStore: FedStateStore {
         var records = try read { db in try FedSQLiteStoreRows.unsettledEffects(fp: fp, in: db) }
         applyPendingSentPhases(to: &records, fp: fp)
         return records
+    }
+
+    public func processDeviceApprovalNotice(
+        _ notice: DeviceApprovalNotice, account: String, nowMS: UInt64,
+        present: @Sendable (DeviceApprovalNotice) -> Void
+    ) async throws {
+        _ = try write { db in
+            var marks = try Self.noticeMarks(in: db)
+            FedDeviceApprovalSeenMark.process(notice, account: account, nowMS: nowMS, marks: &marks, present: present)
+            try Self.saveNoticeMarks(marks, in: db)
+        }
+    }
+
+    public func pruneDeviceApprovalNotices(nowMS: UInt64) async throws {
+        _ = try write { db in
+            let marks = try Self.noticeMarks(in: db).filter { !$0.expired(at: nowMS) }
+            try Self.saveNoticeMarks(marks, in: db)
+        }
+    }
+
+    private static func noticeMarks(in db: FedSQLiteConnection) throws -> [FedDeviceApprovalSeenMark] {
+        let statement = try db.prepare("SELECT marks FROM device_approval_seen WHERE id = 1")
+        guard try statement.step() else { return [] }
+        guard case .blob(let bytes) = statement.value(0) else { throw FedFailure.storeCorrupt }
+        return try JSONDecoder().decode([FedDeviceApprovalSeenMark].self, from: bytes)
+    }
+
+    private static func saveNoticeMarks(_ marks: [FedDeviceApprovalSeenMark], in db: FedSQLiteConnection) throws {
+        try db.run("INSERT OR REPLACE INTO device_approval_seen (id, marks) VALUES (1, ?)", [.blob(try JSONEncoder().encode(marks))])
     }
 
     // MARK: - Reservation and settlement rules

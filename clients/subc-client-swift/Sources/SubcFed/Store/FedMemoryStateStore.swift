@@ -2,7 +2,21 @@ import Foundation
 
 /// In-memory store used by deterministic tests. Production construction must
 /// never silently substitute this for a durable store.
-public actor FedMemoryStateStore: FedStateStore {
+public actor FedMemoryStateStore: FedDeviceApprovalNoticeStore {
+    private var deviceApprovalMarks: [FedDeviceApprovalSeenMark] = []
+
+    public func processDeviceApprovalNotice(
+        _ notice: DeviceApprovalNotice, account: String, nowMS: UInt64,
+        present: @Sendable (DeviceApprovalNotice) -> Void
+    ) async throws {
+        _ = try await snapshot()
+        FedDeviceApprovalSeenMark.process(notice, account: account, nowMS: nowMS, marks: &deviceApprovalMarks, present: present)
+    }
+
+    public func pruneDeviceApprovalNotices(nowMS: UInt64) async throws {
+        _ = try await snapshot()
+        deviceApprovalMarks.removeAll { $0.expired(at: nowMS) }
+    }
     private var document: FedStateDocument?
     private let expectedPublicKey: Data?
 

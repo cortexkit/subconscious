@@ -101,6 +101,9 @@ public actor FedRendezvousClient {
         public var controlURL: URL
         public var identity: FedRendezvousIdentity
         public var signingKeyPin: RdvAccountSigningKeyPin
+        /// Nil by default: enabling approvals requires a durable store and a
+        /// presentation sink, not merely recognizing the wire vocabulary.
+        public var deviceApprovals: DeviceApprovalNoticeHandling?
 
         public init(controlURL: URL, identity: FedRendezvousIdentity, signingKeyPin: RdvAccountSigningKeyPin) {
             self.controlURL = controlURL
@@ -141,6 +144,10 @@ public actor FedRendezvousClient {
     /// client is silently acting on none of it — including, potentially, a
     /// revocation.
     private(set) public var undecodablePayloadCount = 0
+    /// Verified notice deliveries discarded because the app has not configured
+    /// approval handling. No seen mark or acknowledgement is emitted for them.
+    private(set) public var unhandledDeviceApprovalNoticeCount = 0
+    private var loggedUnhandledDeviceApprovalNotice = false
     private(set) public var lastRefusal: RdvRefusal?
     private(set) public var lastJoinReceipt: RdvDeviceJoinedReceipt?
 
@@ -219,9 +226,13 @@ public actor FedRendezvousClient {
     static let keepalivePongDeadline: TimeInterval = 10
 
     private func establishSession() async throws {
+        if let handling = configuration.deviceApprovals {
+            try await handling.store.pruneDeviceApprovalNotices(nowMS: handling.nowMS())
+        }
         state = .connecting
         let stream = try await streamFactory(configuration.controlURL)
         self.stream = stream
+        loggedUnhandledDeviceApprovalNotice = false
         // Probe from connect, not from `.ready`: a link that dies during the
         // hello/barrier exchange hangs those awaits exactly like a dead ready
         // session, and the probe's kill fails them identically.
@@ -405,18 +416,18 @@ public actor FedRendezvousClient {
             guard let message else { return .closed }
             // The control WS is text-only; binary frames belong to the relay pipe.
             guard case .text(let text) = message else { continue }
-            if let outcome = processInbound(text) { return outcome }
+            if let outcome = await processInbound(text) { return outcome }
         }
     }
 
     /// Process one inbound text frame. Returns a terminal outcome only when the
     /// stream must stop (resync, lockout); nil means keep reading.
-    private func processInbound(_ text: String) -> ReadLoopOutcome? {
+    private func processInbound(_ text: String) async -> ReadLoopOutcome? {
         guard let object = try? Self.parseObject(text) else { return nil }
         guard case .string(let type)? = object["type"] else { return nil }
         switch type {
         case "signed":
-            return processSigned(object)
+            return await processSigned(object)
         case "relay_grant":
             return processRelayGrant(object)
         case "refusal":
@@ -485,7 +496,7 @@ public actor FedRendezvousClient {
 
     private func classifyCursor(_ serverSeq: String) -> CursorDisposition {
         guard let expected = expectedNextSeq else { return .uninitialized }
-        guard let seq = try? RdvDecimalString.parse(serverSeq) else { return .uninitialized }
+        guard let seq = try? RdvSessionSequence.parse(serverSeq, field: "server_seq") else { return .uninitialized }
         if seq < expected {
             droppedFrameCount += 1
             return .dropped
@@ -520,7 +531,7 @@ public actor FedRendezvousClient {
         }
     }
 
-    private func processSigned(_ object: RdvJSONObject) -> ReadLoopOutcome? {
+    private func processSigned(_ object: RdvJSONObject) async -> ReadLoopOutcome? {
         guard let envelope = try? RdvSignedEnvelope.decode(object) else { return nil }
 
         // key_id pin FIRST: a differing key_id is the account_key_mismatch lockout
@@ -545,6 +556,18 @@ public actor FedRendezvousClient {
         } catch {
             invalidSignatureCount += 1
             return nil
+        }
+
+        // Keep the new notice vocabulary separate from the public payload enum:
+        // applications already switch exhaustively over its existing cases.
+        if case .string(let type)? = envelope.payload["type"], DeviceApprovalNotice.isNoticeType(type) {
+            let notice: DeviceApprovalNotice
+            do { notice = try DeviceApprovalNotice.decode(envelope.payload) }
+            catch {
+                undecodablePayloadCount += 1
+                return nil
+            }
+            return await processDeviceApprovalNotice(notice)
         }
 
         // The envelope's signature has already verified, so these bytes genuinely
@@ -586,7 +609,7 @@ public actor FedRendezvousClient {
         }
 
         guard let expected = expectedNextSeq else { return nil }
-        guard let seq = try? RdvDecimalString.parse(seqString) else { return nil }
+        guard let seq = try? RdvSessionSequence.parse(seqString, field: "server_seq") else { return nil }
 
         if seq < expected {
             // Regression or duplicate → drop + count, never act.
@@ -606,6 +629,47 @@ public actor FedRendezvousClient {
             expectedNextSeq = expected + 1
         }
         return outcome
+    }
+
+    private func processDeviceApprovalNotice(_ notice: DeviceApprovalNotice) async -> ReadLoopOutcome? {
+        if quarantined { return nil }
+        let disposition = classifyCursor(notice.serverSeq)
+        switch disposition {
+        case .uninitialized: return nil
+        case .gap: return .needsResync
+        case .apply, .dropped: break
+        }
+        guard let handling = configuration.deviceApprovals else {
+            unhandledDeviceApprovalNoticeCount += 1
+            if !loggedUnhandledDeviceApprovalNotice {
+                payloadLog.error("RDV_DEVICE_APPROVAL_NOTICE_UNHANDLED: approval handling is not configured; notices are not presented, recorded or acknowledged in this session")
+                loggedUnhandledDeviceApprovalNotice = true
+            }
+            // Discarding presentation does not discard cursor participation.
+            // Leave the server's notice unacknowledged for a configured session.
+            if case .apply = disposition { advanceCursor() }
+            return nil
+        }
+        do {
+            // With configured handling, the cursor advances only after a durable
+            // commit. A same-session duplicate therefore needs just another
+            // receipt, not another write. Fresh-sequence replays consult the store.
+            if case .apply = disposition {
+                try await handling.store.processDeviceApprovalNotice(
+                    notice, account: configuration.identity.accountId, nowMS: handling.nowMS(), present: handling.present
+                )
+            }
+            guard let stream else { return .closed }
+            sessionSeq += 1
+            let ack = try DeviceApprovalNoticeAck(notice: notice, seq: String(sessionSeq))
+            try await stream.send(.text(try ack.encode()))
+            if case .apply = disposition { advanceCursor() }
+            return nil
+        } catch {
+            // Without a durable mark there can be no receipt. A new session
+            // replays the server inbox; no client ack outbox is necessary.
+            return .closed
+        }
     }
 
     /// Apply a verified, in-sequence signed payload to local state. Returns
@@ -673,7 +737,7 @@ public actor FedRendezvousClient {
             next[Self.mirrorKey(device.x25519PubkeyHex)] = device
         }
         mirror = next
-        if let seq = try? RdvDecimalString.parse(snapshot.serverSeq) {
+        if let seq = try? RdvSessionSequence.parse(snapshot.serverSeq, field: "server_seq") {
             expectedNextSeq = seq + 1
         }
         quarantined = false

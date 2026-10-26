@@ -14,6 +14,7 @@ public struct DeviceApprovalError: Error, Equatable, Sendable {
         public static let invalidJSON = Self(rawValue: "invalid_json")
         public static let transcriptMismatch = Self(rawValue: "transcript_mismatch")
         public static let fingerprintMismatch = Self(rawValue: "fingerprint_mismatch")
+        public static let predecessorMismatch = Self(rawValue: "predecessor_mismatch")
         public static let invalidSignature = Self(rawValue: "signature_invalid")
         public static let secureEnclaveUnavailable = Self(rawValue: "secure_enclave_unavailable")
         public static let keyMismatch = Self(rawValue: "key_mismatch")

@@ -50,6 +50,14 @@ public enum DeviceApprovalActionSigner {
         try sign(challenge.transcript, keyData: keyData, reason: reason)
     }
 
+    /// Use the exact enrollment card the app showed, not a newly fetched view.
+    /// Context is compared before requesting user presence or touching the key.
+    public static func sign(_ challenge: ActionChallenge, presentedView: DeviceApprovalEnrollmentView,
+                            keyData: Data, reason: String) throws -> String {
+        try challenge.requirePresentedView(presentedView)
+        return try sign(challenge, keyData: keyData, reason: reason)
+    }
+
     public static func sign(_ challenge: RemovalChallenge, keyData: Data, reason: String) throws -> String {
         try sign(challenge.transcript, keyData: keyData, reason: reason)
     }

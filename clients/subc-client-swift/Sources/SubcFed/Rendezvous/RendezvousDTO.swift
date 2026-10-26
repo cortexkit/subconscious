@@ -30,6 +30,12 @@ struct RdvFieldDecoder {
         return value
     }
 
+    mutating func sequenceString(_ key: String) throws -> String {
+        let value = try decimalString(key)
+        _ = try RdvSessionSequence.parse(value, field: key)
+        return value
+    }
+
     mutating func bool(_ key: String) throws -> Bool {
         guard case .boolean(let value) = try value(key) else { throw RdvJSONError.wrongType(field: key) }
         return value
@@ -327,7 +333,7 @@ public struct RdvRefusal: Sendable, Equatable {
         let type = try decoder.string("type")
         guard type == "refusal" else { throw RdvJSONError.wrongType(field: "type") }
         let refusal = RdvRefusal(
-            serverSeq: try decoder.decimalString("server_seq"),
+            serverSeq: try decoder.sequenceString("server_seq"),
             ofType: try decoder.string("of_type"),
             ofSeq: try decoder.string("of_seq"),
             code: try decoder.string("code"),
@@ -396,7 +402,7 @@ public struct RdvRegistrySnapshot: Sendable, Equatable {
             guard case .object(let rowObject) = value else { throw RdvJSONError.wrongType(field: "devices") }
             devices.append(try RdvRegistryRow.decode(rowObject))
         }
-        let snapshot = RdvRegistrySnapshot(serverSeq: try decoder.decimalString("server_seq"), devices: devices)
+        let snapshot = RdvRegistrySnapshot(serverSeq: try decoder.sequenceString("server_seq"), devices: devices)
         try decoder.finish()
         return snapshot
     }
@@ -418,7 +424,7 @@ public struct RdvRegistryDelta: Sendable, Equatable {
         let type = try decoder.string("type")
         guard type == "registry_delta" else { throw RdvJSONError.wrongType(field: "type") }
         let delta = RdvRegistryDelta(
-            serverSeq: try decoder.decimalString("server_seq"),
+            serverSeq: try decoder.sequenceString("server_seq"),
             device: try RdvRegistryRow.decode(decoder.object("device")),
             change: try decoder.rawRepresentable("change")
         )
@@ -447,7 +453,7 @@ public struct RdvDeviceJoined: Sendable, Equatable {
         let type = try decoder.string("type")
         guard type == "device_joined" else { throw RdvJSONError.wrongType(field: "type") }
         let notice = RdvDeviceJoined(
-            serverSeq: try decoder.decimalString("server_seq"),
+            serverSeq: try decoder.sequenceString("server_seq"),
             joinEventId: try decoder.string("join_event_id"),
             device: try RdvRegistryRow.decode(decoder.object("device")),
             issuedAtMs: try decoder.decimalString("issued_at_ms")
@@ -471,7 +477,7 @@ public struct RdvDeviceJoinedReceipt: Sendable, Equatable {
         let type = try decoder.string("type")
         guard type == "device_joined_receipt" else { throw RdvJSONError.wrongType(field: "type") }
         let receipt = RdvDeviceJoinedReceipt(
-            serverSeq: try decoder.decimalString("server_seq"),
+            serverSeq: try decoder.sequenceString("server_seq"),
             joinEventId: try decoder.string("join_event_id")
         )
         try decoder.finish()
@@ -499,7 +505,7 @@ public struct RdvTombstone: Sendable, Equatable {
         let type = try decoder.string("type")
         guard type == "tombstone" else { throw RdvJSONError.wrongType(field: "type") }
         let tombstone = RdvTombstone(
-            serverSeq: try decoder.decimalString("server_seq"),
+            serverSeq: try decoder.sequenceString("server_seq"),
             x25519PubkeyHex: try decoder.string("x25519_pubkey_hex"),
             enrollmentId: try decoder.string("enrollment_id"),
             generation: try decoder.decimalString("generation"),
@@ -521,7 +527,7 @@ public struct RdvResyncRequired: Sendable, Equatable {
         var decoder = RdvFieldDecoder(object)
         let type = try decoder.string("type")
         guard type == "resync_required" else { throw RdvJSONError.wrongType(field: "type") }
-        let resync = RdvResyncRequired(serverSeq: try decoder.decimalString("server_seq"))
+        let resync = RdvResyncRequired(serverSeq: try decoder.sequenceString("server_seq"))
         try decoder.finish()
         return resync
     }
@@ -770,6 +776,7 @@ public struct RdvHello: Sendable, Equatable {
 
     /// Serialize as canonical rdv-wire JSON for the wire.
     public func encode() throws -> String {
+        _ = try RdvSessionSequence.parse(seq, field: "seq")
         let object = RdvJSONObject([
             "type": .string("hello"),
             "seq": .string(seq),
@@ -786,7 +793,7 @@ public struct RdvHello: Sendable, Equatable {
         let type = try decoder.string("type")
         guard type == "hello" else { throw RdvJSONError.wrongType(field: "type") }
         let hello = RdvHello(
-            seq: try decoder.decimalString("seq"),
+            seq: try decoder.sequenceString("seq"),
             challengeId: try decoder.string("challenge_id"),
             ed25519SigHex: try decoder.string("ed25519_sig_hex"),
             x25519ProofHex: try decoder.string("x25519_proof_hex")
@@ -816,6 +823,7 @@ public struct RdvRelayOpen: Sendable, Equatable {
 
     /// Serialize as canonical rdv-wire JSON for the wire.
     public func encode() throws -> String {
+        _ = try RdvSessionSequence.parse(seq, field: "seq")
         let object = RdvJSONObject([
             "type": .string("relay_open"),
             "seq": .string(seq),
@@ -831,7 +839,7 @@ public struct RdvRelayOpen: Sendable, Equatable {
         let type = try decoder.string("type")
         guard type == "relay_open" else { throw RdvJSONError.wrongType(field: "type") }
         let open = RdvRelayOpen(
-            seq: try decoder.decimalString("seq"),
+            seq: try decoder.sequenceString("seq"),
             to: try decoder.string("to"),
             nonce: try decoder.string("nonce")
         )
@@ -893,7 +901,7 @@ public struct RdvRelayGrant: Sendable, Equatable {
         let type = try decoder.string("type")
         guard type == "relay_grant" else { throw RdvJSONError.wrongType(field: "type") }
         let grant = RdvRelayGrant(
-            serverSeq: try decoder.decimalString("server_seq"),
+            serverSeq: try decoder.sequenceString("server_seq"),
             ofSeq: try decoder.optionalDecimalString("of_seq"),
             pipeID: try decoder.string("pipe_id"),
             relayURL: try decoder.string("relay_url"),

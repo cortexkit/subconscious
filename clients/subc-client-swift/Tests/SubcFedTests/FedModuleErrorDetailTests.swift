@@ -64,6 +64,25 @@ final class FedModuleErrorDetailTests: XCTestCase {
         XCTAssertNil(detail)
     }
 
+    func testMutationNotSentCodableRoundTripsWithAndWithoutOptionalFields() throws {
+        let failures: [FedFailure] = [
+            .mutationNotSent(code: "fed_busy"),
+            .mutationNotSent(code: "fed_busy", message: "peer is busy"),
+            .mutationNotSent(code: "fed_busy", detail: objectDetail),
+            .mutationNotSent(code: "fed_busy", message: "peer is busy", detail: .array([.integer(250), .null])),
+        ]
+        for failure in failures {
+            let data = try JSONEncoder().encode(failure)
+            let encoded = try FedJSONObject(jsonData: data)
+            XCTAssertEqual(encoded["kind"], .string("mutationNotSent"))
+            XCTAssertEqual(encoded["code"], .string("fed_busy"))
+            XCTAssertNil(encoded["hostRefusal"])
+            XCTAssertEqual(try JSONDecoder().decode(FedFailure.self, from: data), failure)
+        }
+        let codeOnly = Data(#"{"kind":"mutationNotSent","code":"fed_busy"}"#.utf8)
+        XCTAssertEqual(try JSONDecoder().decode(FedFailure.self, from: codeOnly), .mutationNotSent(code: "fed_busy"))
+    }
+
     func testModuleErrorWithNullDetailKeyDecodesAsNil() throws {
         let data = Data(#"{"kind":"moduleError","code":"account_reset","detail":null}"#.utf8)
         XCTAssertEqual(try JSONDecoder().decode(FedFailure.self, from: data), .moduleError(code: "account_reset"))

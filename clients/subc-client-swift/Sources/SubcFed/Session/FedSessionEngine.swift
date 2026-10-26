@@ -597,10 +597,11 @@ public actor FedSessionEngine {
                 await admission?.release(permit)
                 // Only now, with the row settled and the permit released, is
                 // the caller answered, judged by the settled row rather than
-                // the frame. A refusal (recorded error or not_sent) throws the
-                // module's error as a pure query's does; an ambiguous settlement
-                // throws indeterminateMutation because the call may have
-                // arrived. The message and detail come from the frame because
+                // the frame. A recorded error throws moduleError as a pure
+                // query's does; not_sent throws mutationNotSent because the
+                // call provably never arrived. An ambiguous settlement throws
+                // indeterminateMutation because the call may have arrived.
+                // The message and detail come from the frame because
                 // a not_sent row keeps no body; no host-refusal hint is carried
                 // on this path.
                 return try settled.callerResult(message: errorMessage, detail: errorDetail)

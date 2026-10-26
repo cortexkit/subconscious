@@ -336,9 +336,9 @@ final class FedAuditHardeningTests: XCTestCase {
     }
 
     /// An ambiguous settlement (here `fed_seq_fenced`) means the module may
-    /// already have received the call. It must not reach the caller as a
-    /// module error, which an app reads as "never arrived, safe to resend",
-    /// so it throws `indeterminateMutation` after settling like any other.
+    /// already have received the call. It must not reach the caller as the
+    /// retry-safe `mutationNotSent`, so it throws `indeterminateMutation`
+    /// after settling like any other.
     func testAmbiguousSettlementOfMutationThrowsIndeterminateAfterSettling() async throws {
         try await assertRefusedMutationThrowsAfterSettling(
             body: #"{"code":"fed_seq_fenced","message":"sequence fenced"}"#,
@@ -348,18 +348,44 @@ final class FedAuditHardeningTests: XCTestCase {
     }
 
     /// A not_sent settlement (here `fed_busy`) proves the call never reached
-    /// the module, so it is reported as the module error carrying that code.
-    func testNotSentSettlementOfMutationThrowsModuleError() async throws {
+    /// the module, so it is reported as retry-safe rather than a module refusal.
+    func testNotSentSettlementOfMutationThrowsMutationNotSent() async throws {
         try await assertRefusedMutationThrowsAfterSettling(
-            body: #"{"code":"fed_busy","message":"peer is busy"}"#,
-            expected: .moduleError(
+            body: #"{"code":"fed_busy","message":"peer is busy","detail":{"retry_after_ms":250}}"#,
+            expected: .mutationNotSent(
                 code: "fed_busy",
                 message: "peer is busy",
-                hostRefusal: nil,
-                detail: nil
+                detail: .object(FedJSONObject(["retry_after_ms": .integer(250)]))
             ),
             disposition: .notSent
         )
+    }
+
+    func testBeforeDispatchMutationThrowsMutationNotSent() async throws {
+        try await assertRefusedMutationThrowsAfterSettling(
+            body: #"{"code":"fed_target_unavailable","message":"target is warming"}"#,
+            expected: .mutationNotSent(code: "fed_target_unavailable", message: "target is warming"),
+            disposition: .notSent,
+            provenance: .provablyBeforeDispatch
+        )
+    }
+
+    /// Replaying a settled send-log row has no live frame's message or detail,
+    /// but must preserve the same retry-safe failure and its diagnostic code.
+    func testReplayedNotSentMutationThrowsMutationNotSentWithCode() throws {
+        let record = FedUnresolvedEffectRecord(
+            effect: FedEffectID(incarnation: peerIncarnation, seq: 1),
+            responderStaticPublicKey: responder,
+            phase: .terminal,
+            disposition: .notSent,
+            terminalCode: "fed_busy"
+        )
+        let data = try JSONEncoder().encode(record)
+        let replayed = try JSONDecoder().decode(FedUnresolvedEffectRecord.self, from: data)
+        let outcome = try XCTUnwrap(FedSettledMutationOutcome(record: replayed))
+        XCTAssertThrowsError(try outcome.callerResult()) { error in
+            XCTAssertEqual(error as? FedFailure, .mutationNotSent(code: "fed_busy"))
+        }
     }
 
     /// A successful mutation still returns its body: the refusal check must
@@ -393,6 +419,7 @@ final class FedAuditHardeningTests: XCTestCase {
         body bodyText: String,
         expected: FedFailure,
         disposition: FedEffectDisposition = .recorded,
+        provenance: FedDispatchProvenance = .afterDispatchOrUnknown,
         file: StaticString = #filePath,
         line: UInt = #line
     ) async throws {
@@ -420,7 +447,8 @@ final class FedAuditHardeningTests: XCTestCase {
                 hostRefusal: frame.terminalHostRefusal,
                 errorDetail: frame.terminalDetail,
                 isMutation: true,
-                permit: admitted.permit
+                permit: admitted.permit,
+                provenance: provenance
             )
             XCTFail("a refused mutation returned a body: \(String(decoding: returned, as: UTF8.self))", file: file, line: line)
         } catch let error as FedFailure {

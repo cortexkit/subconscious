@@ -152,6 +152,18 @@ class FedOriginReconciliationTests: XCTestCase {
 
         let row = await store.committedTerminal(for: seeded)
         XCTAssertEqual(row?.disposition, .notSent, "three-way epoch agreement + complete ledger proves non-execution")
+        let committed = try XCTUnwrap(row)
+        // not_found carries no error code or body; keep the existing fallback
+        // code while reporting proven non-execution as retry-safe.
+        let outcome = FedSettledMutationOutcome(
+            disposition: committed.disposition,
+            kind: committed.kind,
+            code: nil,
+            body: committed.body
+        )
+        XCTAssertThrowsError(try outcome.callerResult()) { error in
+            XCTAssertEqual(error as? FedFailure, .mutationNotSent(code: "unspecified"))
+        }
     }
 
     // MARK: - 4. Collapse-catcher: not_found + ledger_complete FALSE → ambiguous

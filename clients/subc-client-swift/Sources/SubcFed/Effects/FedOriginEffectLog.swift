@@ -629,9 +629,9 @@ public actor FedOriginEffectLog {
 /// still a refusal: handing its error envelope back as a successful body lets a
 /// caller that does not look for a top-level `code` treat the refusal as
 /// success. Pure queries already throw the refusal; ``callerResult(message:detail:)``
-/// makes every settled mutation throw too (a refusal, or an indeterminate
-/// outcome when the settlement is ambiguous), whether the outcome was settled
-/// from a live terminal frame or adopted from a peer during reconciliation.
+/// also throws for settled mutation errors, distinguishing a module refusal
+/// from a call that never reached the module or an indeterminate outcome,
+/// whether settled from a live terminal frame or adopted during reconciliation.
 struct FedSettledMutationOutcome: Sendable, Equatable {
     let disposition: FedEffectDisposition
     /// Kept only for a recorded outcome, as the stores keep it.
@@ -671,16 +671,17 @@ struct FedSettledMutationOutcome: Sendable, Equatable {
     ///
     /// - recorded with kind `error`: the module's refusal, thrown as
     ///   `FedFailure.moduleError`.
-    /// - not_sent: `FedFailure.moduleError` with the settling code. not_sent
-    ///   proves the call never reached the module, which is what `moduleError`
-    ///   tells a caller (safe to edit or resend).
+    /// - not_sent: `FedFailure.mutationNotSent` with the settling code. The call
+    ///   provably never reached the module and is safe to send as a new call;
+    ///   this is not a module refusal.
     /// - ambiguous: `FedFailure.indeterminateMutation`. The module may already
     ///   have received the call, so reporting it as a refusal would invite a
     ///   resend that could apply the effect twice.
     /// - recorded with any other kind: the stored body.
     ///
-    /// For `moduleError`, a message or detail passed in (read from the terminal
-    /// frame) is preferred; otherwise both are read from the stored error body.
+    /// For `moduleError` and `mutationNotSent`, a message or detail passed in
+    /// (read from the terminal frame) is preferred; otherwise both are read
+    /// from the stored error body.
     /// A reconciled refusal is stored without a code, so the code is read from
     /// the body too. The host-refusal hint is never carried here: it is
     /// informational and only pure queries report it.
@@ -695,6 +696,13 @@ struct FedSettledMutationOutcome: Sendable, Equatable {
         case .recorded, .notSent:
             let stored = body.map {
                 FedFrame(type: FedFrameType.callFrame.rawValue, fields: [:], body: $0)
+            }
+            if disposition == .notSent {
+                throw FedFailure.mutationNotSent(
+                    code: code ?? stored?.terminalCode ?? "unspecified",
+                    message: message ?? stored?.terminalMessage,
+                    detail: detail ?? stored?.terminalDetail
+                )
             }
             throw FedFailure.moduleError(
                 code: code ?? stored?.terminalCode ?? "unspecified",

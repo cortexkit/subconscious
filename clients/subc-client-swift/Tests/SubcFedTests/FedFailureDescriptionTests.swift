@@ -58,6 +58,7 @@ final class FedFailureDescriptionTests: XCTestCase {
             .suspended,
             .disconnected,
             .moduleError(code: "x", message: "y"),
+            .mutationNotSent(code: "fed_busy", message: "peer is busy"),
             .indeterminateMutation,
             .admissionQueueFull,
             .admissionQueueTimedOut,
@@ -73,10 +74,15 @@ final class FedFailureDescriptionTests: XCTestCase {
             // after it; prose never does.
             XCTAssertFalse(
                 text.hasPrefix("invalidProfile(") || text.hasPrefix("moduleError(")
-                    || text.hasPrefix("candidateTimedOut("),
+                    || text.hasPrefix("candidateTimedOut(") || text.hasPrefix("mutationNotSent("),
                 "structural dump: \(text)"
             )
         }
+    }
+
+    func testMutationNotSentDescriptionSaysItIsSafeToSendAgain() {
+        let failure = FedFailure.mutationNotSent(code: "fed_busy", message: "peer is busy")
+        XCTAssertEqual(failure.description, "This change was not sent and is safe to send again (fed_busy).")
     }
 
     func testStoreLossReenrollmentFailureRoundTripsAndNamesTheCeremony() throws {

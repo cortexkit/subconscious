@@ -221,6 +221,11 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
     /// `detail` preserves the module's JSON error context without restricting it
     /// to an object. An absent or null wire detail is represented by nil.
     case moduleError(code: String, message: String? = nil, hostRefusal: FedHostRefusalHint? = nil, detail: FedJSONValue? = nil)
+    /// The mutating call settled `not_sent`, so it provably never reached the
+    /// module and is safe to send again as a new call. `code` is the refusal
+    /// that proved it, kept for diagnostics; callers must not treat this as a
+    /// module refusal.
+    case mutationNotSent(code: String, message: String? = nil, detail: FedJSONValue? = nil)
     case indeterminateMutation
     case admissionQueueFull
     case admissionQueueTimedOut
@@ -235,7 +240,7 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
              protocolViolation, catalogTargetUnavailable, fedBodyTooLarge,
              fedEffectsUnsupported, storeCorrupt, storeUnavailable, storeMigrationFailed,
              storeLocked, reservationFailed, persistenceFailed, cancelled, suspended, disconnected,
-             moduleError, indeterminateMutation, admissionQueueFull, admissionQueueTimedOut,
+             moduleError, mutationNotSent, indeterminateMutation, admissionQueueFull, admissionQueueTimedOut,
              noEligibleCandidates, allCandidatesFailed, pairingNotAccepted
     }
 
@@ -273,6 +278,12 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
                 message: try c.decodeIfPresent(String.self, forKey: .message),
                 // Absent in failures persisted before the hint existed.
                 hostRefusal: try c.decodeIfPresent(FedHostRefusalHint.self, forKey: .hostRefusal),
+                detail: try c.decodeIfPresent(FedJSONValue.self, forKey: .detail)
+            )
+        case .mutationNotSent:
+            self = .mutationNotSent(
+                code: try c.decode(String.self, forKey: .code),
+                message: try c.decodeIfPresent(String.self, forKey: .message),
                 detail: try c.decodeIfPresent(FedJSONValue.self, forKey: .detail)
             )
         case .indeterminateMutation: self = .indeterminateMutation
@@ -322,6 +333,11 @@ public enum FedFailure: Error, Codable, Sendable, Equatable {
             try c.encode(code, forKey: .code)
             try c.encodeIfPresent(message, forKey: .message)
             try c.encodeIfPresent(hostRefusal, forKey: .hostRefusal)
+            try c.encodeIfPresent(detail, forKey: .detail)
+        case .mutationNotSent(let code, let message, let detail):
+            try c.encode(Kind.mutationNotSent, forKey: .kind)
+            try c.encode(code, forKey: .code)
+            try c.encodeIfPresent(message, forKey: .message)
             try c.encodeIfPresent(detail, forKey: .detail)
         case .indeterminateMutation: try c.encode(Kind.indeterminateMutation, forKey: .kind)
         case .admissionQueueFull: try c.encode(Kind.admissionQueueFull, forKey: .kind)
@@ -493,6 +509,8 @@ extension FedFailure: CustomStringConvertible {
             // The module's own prose says what to do about it, so prefer it and
             // fall back to the code only when no message was sent.
             return message ?? ScopeBindProofCodes.message(for: code) ?? "The remote service refused this request (\(code))."
+        case let .mutationNotSent(code, _, _):
+            return "This change was not sent and is safe to send again (\(code))."
         case .indeterminateMutation:
             return "It is not known whether this change was applied."
         case .admissionQueueFull:

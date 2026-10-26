@@ -38,6 +38,7 @@ use common::{
 };
 
 mod inline_actions;
+mod inline_views;
 
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);

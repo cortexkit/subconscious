@@ -358,6 +358,16 @@ impl Theme {
         }
     }
 
+    /// Paint a foreground role in inline command output without changing the
+    /// terminal's background. NO_COLOR emits the text without escape sequences.
+    pub fn foreground_text(&self, text: &str, fg: Fg) -> String {
+        match self.fg(fg) {
+            Color::Rgb(r, g, b) => format!("\x1b[38;2;{r};{g};{b}m{text}\x1b[39m"),
+            Color::Indexed(n) => format!("\x1b[38;5;{n}m{text}\x1b[39m"),
+            _ => text.to_string(),
+        }
+    }
+
     pub fn bg(&self, bg: Bg) -> Color {
         match self.colors {
             Colors::Palette => Palette::for_mode(self.mode).bg(bg),
@@ -604,4 +614,28 @@ pub fn detect_theme() -> Theme {
         query_terminal_background()
     };
     theme_for(no_color.as_deref(), ck_theme.as_deref(), reply.as_deref())
+}
+#[cfg(test)]
+mod inline_tests {
+    use super::*;
+
+    #[test]
+    fn inline_text_uses_the_palette_and_restores_only_the_foreground() {
+        assert_eq!(
+            Theme::light().foreground_text("●", Fg::Ok),
+            "\x1b[38;2;30;138;63m●\x1b[39m"
+        );
+        assert_eq!(
+            Theme::dark().foreground_text("▲", Fg::Warn),
+            "\x1b[38;2;242;164;58m▲\x1b[39m"
+        );
+    }
+
+    #[test]
+    fn inline_text_respects_no_color() {
+        assert_eq!(
+            Theme::no_color(Mode::Light).foreground_text("▲", Fg::Warn),
+            "▲"
+        );
+    }
 }

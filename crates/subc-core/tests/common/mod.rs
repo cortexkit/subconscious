@@ -309,3 +309,4 @@ pub async fn connect_authed_client(path: impl AsRef<Path>) -> io::Result<TcpStre
 fn unique_temp_dir(name: &str) -> ScratchDir {
     ScratchDir::new(name)
 }
+pub mod terminal;

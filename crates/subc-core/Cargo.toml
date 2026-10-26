@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.20.140"
+version = "0.20.141"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -100,10 +100,12 @@ rustix = { version = "1", default-features = false, features = ["fs", "process"]
 cortexkit-test-support = "0.1.3"
 # Key events for driving the ck app in its live-daemon test.
 crossterm = "0.29"
+portable-pty = "0.9"
 tokio = { version = "1", features = ["test-util"] }
 subc-daemon = { path = "../subc-daemon", version = "0.37.0", features = ["test-support"] }
 # Keep required-feature CLI fixture targets enabled for integration tests.
 subc-core = { path = ".", version = "0.20.115", features = ["test-support"] }
+vt100 = "0.15"
 
 [lints.rust]
 # Package-wide so every target carries it, including the test-only `ck`

@@ -586,3 +586,30 @@ fn activity_help_and_invalid_filters_do_not_connect() {
         assert!(output.stdout.is_empty());
     }
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_recorded_activity_entry_names_subject_only_in_terminal_and_ckni() {
+    let mut fixture = Fixture::new();
+    let entry = json!({"seq":7, "at_ms":1001, "daemon_incarnation":"recorded", "module":"subc", "kind":"subc.module_restarted", "summary":"module restarted", "subject":{"type":"module", "id":"engram"}, "details":{"drain_ms":1500}, "actor":{"principal":{"kind":"direct"}}});
+    fixture.seed(&[entry]);
+    fixture.boot().await;
+    let piped = fixture.ck(&["activity"]);
+    success(&piped);
+    assert_eq!(String::from_utf8(piped.stdout).unwrap(), "time (UTC)               module  actor   summary         \n1970-01-01 00:00:01.001  subc    direct  module restarted\n");
+    let mut command = fixture.ck_command();
+    command.arg("activity");
+    let parser = common::terminal::screen(&command);
+    // Windows' pseudoconsole drops trailing spaces when it redraws a row, so
+    // compare each terminal row without them; the piped output above keeps
+    // its exact padding.
+    let rows = parser
+        .screen()
+        .contents()
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(rows, "time (UTC)               subject  actor   summary\n1970-01-01 00:00:01.001  engram   direct  engram restarted");
+    let output = fixture.face_command(true).arg("activity").output().unwrap();
+    success(&output);
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), "TIME (UTC)               SUBJECT  EVENT             BY    \n1970-01-01 00:00:01.001  engram   engram restarted  direct\n");
+}

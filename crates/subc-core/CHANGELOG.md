@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.20.141
+
+- In a terminal, `ck health` opens with a coloured one-line summary and lists
+  only the modules that need attention; `--verbose` still lists every module.
+  `ck module list` marks each status with a coloured glyph. Piped output and
+  `--json` are unchanged.
+- Activity names the subject module in a terminal and in `ckni` ("alpha
+  restarted" instead of "module restarted"). Piped `ck` output is unchanged.
+- `ck` exits 0 without an error when its reader closes early, as in
+  `ck health | head -1`, instead of panicking on the broken pipe.
+
 ## 0.20.140
 
 - `ck module restart`, `stop` and `start` no longer follow the module inline

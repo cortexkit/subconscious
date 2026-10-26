@@ -1,4 +1,8 @@
-use std::{ffi::OsString, io::Write, path::Path};
+use std::{
+    ffi::OsString,
+    io::{self, IsTerminal, Write},
+    path::Path,
+};
 
 use subc_client_rs::{ConsumerOptions, SubcConsumer};
 use subc_control::{ActivityEntry, ActivityQueryRequest};
@@ -164,9 +168,19 @@ async fn display(
                 .collect(),
         );
     } else {
+        let terminal = io::stdout().is_terminal();
         print_table(
-            &["time (UTC)", "module", "actor", "summary"],
-            reply.entries.iter().map(row).collect(),
+            &[
+                "time (UTC)",
+                if terminal { "subject" } else { "module" },
+                "actor",
+                "summary",
+            ],
+            reply
+                .entries
+                .iter()
+                .map(|entry| terminal_row(entry, terminal))
+                .collect(),
         );
     }
     flush()?;
@@ -205,7 +219,7 @@ async fn display(
                     else if ckni {
                         print_table(&super::ckni::activity_headers(verbose), vec![plain_row(&entry, verbose)]);
                     }
-                    else { println!("{}", row(&entry).join("  ")); }
+                    else { println!("{}", terminal_row(&entry, io::stdout().is_terminal()).join("  ")); }
                     flush()?;
                 }
             }
@@ -249,6 +263,26 @@ fn row(entry: &ActivityEntry) -> Vec<String> {
     ]
 }
 
+fn subject_summary(entry: &ActivityEntry) -> String {
+    match (&entry.subject, entry.summary.strip_prefix("module ")) {
+        (Some(subject), Some(rest)) if subject.subject_type == "module" => {
+            format!("{} {rest}", subject.id)
+        }
+        _ => entry.summary.clone(),
+    }
+}
+
+fn terminal_row(entry: &ActivityEntry, terminal: bool) -> Vec<String> {
+    let mut cells = row(entry);
+    if terminal {
+        if let Some(subject) = &entry.subject {
+            cells[1] = cell(&subject.id);
+        }
+        cells[3] = cell(&subject_summary(entry));
+    }
+    cells
+}
+
 fn plain_row(entry: &ActivityEntry, verbose: bool) -> Vec<String> {
     let actor = entry
         .actor
@@ -268,7 +302,7 @@ fn plain_row(entry: &ActivityEntry, verbose: bool) -> Vec<String> {
                 .map(|subject| subject.id.as_str())
                 .unwrap_or(""),
         ),
-        super::ckni::cell(&entry.summary),
+        super::ckni::cell(&subject_summary(entry)),
         super::ckni::cell(actor),
     ];
     if verbose {
@@ -320,8 +354,7 @@ fn print_stream_json(entry: &ActivityEntry, json: JsonOutput) -> Result<(), CkEr
 }
 
 fn flush() -> Result<(), CkError> {
-    std::io::stdout()
-        .flush()
+    super::stdout_result(std::io::stdout().flush())
         .map_err(|error| CkError::Message(format!("activity output failed: {error}")))
 }
 
@@ -385,7 +418,7 @@ mod tests {
             [
                 "1970-01-01 00:00:01.001",
                 "alpha",
-                "module restarted",
+                "alpha restarted",
                 "direct"
             ]
         );

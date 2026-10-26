@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.10
+
+- Add `Theme::foreground_text`, which colours inline command output with the
+  palette's foreground roles and leaves the terminal background alone.
+  `NO_COLOR` returns the text unchanged.
+
 ## 0.2.9
 
 - Share lifecycle sending and following between the terminal app and inline

@@ -8,10 +8,37 @@
 use subc_core::setup;
 use subc_core::setup::text::{human_blocking_outcome, upgrade_current_summary};
 
+// A reader may stop after the first line (for example, `ck health | head -1`).
+// Treat that as successful consumption, not a panic from std's print macros.
+macro_rules! print {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        if let Err(error) = $crate::stdout_result(std::io::stdout().lock().write_fmt(format_args!($($arg)*))) {
+            panic!("failed printing to stdout: {error}");
+        }
+    }};
+}
+
+macro_rules! println {
+    () => { print!("\n") };
+    ($($arg:tt)*) => { print!("{}\n", format_args!($($arg)*)) };
+}
+
+fn stdout_result(result: std::io::Result<()>) -> std::io::Result<()> {
+    if result
+        .as_ref()
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
+    {
+        std::process::exit(0);
+    }
+    result
+}
+
 #[path = "activity/mod.rs"]
 mod activity;
 mod ckni;
 mod inline_actions;
+mod inline_views;
 use ckni::JsonOutput;
 
 use std::{
@@ -638,7 +665,14 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     let result = match args.command {
         Command::Dashboard => unreachable!("handled before connecting"),
         Command::Module(ModuleCommand::List) => {
-            module_list(&mut client, json_output, args.verbose, args.subc.as_deref()).await
+            module_list(
+                &mut client,
+                json_output,
+                args.verbose,
+                args.subc.as_deref(),
+                inline,
+            )
+            .await
         }
         Command::Module(ModuleCommand::Status { module_id }) => {
             module_status(&mut client, &module_id, json_output, args.verbose).await
@@ -683,7 +717,14 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             provenance(&mut client, &module_id, json_output, args.verbose).await
         }
         Command::Health => {
-            health(&mut client, json_output, args.verbose, args.subc.as_deref()).await
+            health(
+                &mut client,
+                json_output,
+                args.verbose,
+                args.subc.as_deref(),
+                inline,
+            )
+            .await
         }
         Command::HealthDetail { module_id } => {
             health_detail(&mut client, &module_id, json_output, args.verbose).await
@@ -1847,6 +1888,7 @@ async fn module_list(
     json_output: JsonOutput,
     verbose: bool,
     subc: Option<&Path>,
+    inline: bool,
 ) -> Result<(), CkError> {
     let value = supervisor_list(client).await?;
     if json_output.enabled {
@@ -1862,7 +1904,7 @@ async fn module_list(
             )];
             print_help_footer(&footer);
         } else {
-            print_module_table(modules, verbose);
+            print_module_table(modules, verbose, inline);
         }
     }
     Ok(())
@@ -2564,9 +2606,7 @@ async fn follow_module_logs(
             print_follow_text(module_id, options, &source, &text, json_output)?;
         }
         use std::io::Write as _;
-        io::stdout()
-            .flush()
-            .map_err(|error| CkError::Message(error.to_string()))?;
+        stdout_result(io::stdout().flush()).map_err(|error| CkError::Message(error.to_string()))?;
     }
 }
 
@@ -3862,10 +3902,13 @@ async fn health(
     json_output: JsonOutput,
     verbose: bool,
     subc: Option<&Path>,
+    inline: bool,
 ) -> Result<(), CkError> {
     let value = supervisor_health(client).await?;
     if json_output.enabled {
         json_output.print(&value)?;
+    } else if inline {
+        inline_views::health(modules_array(&value), verbose);
     } else {
         print_health_table(modules_array(&value), verbose, subc);
     }
@@ -6095,7 +6138,7 @@ fn month_abbr(month: u32) -> &'static str {
     }
 }
 
-fn print_module_table(modules: &[Value], verbose: bool) {
+fn print_module_table(modules: &[Value], verbose: bool, inline: bool) {
     let show_nonce_source = modules
         .iter()
         .any(|module| module.get("launch_nonce_source").is_some());
@@ -6105,11 +6148,15 @@ fn print_module_table(modules: &[Value], verbose: bool) {
             .map(|module| {
                 let mut row = vec![
                     terminal_safe_string(&display_field(module, "module_id")),
-                    terminal_safe_string(&if enabled_drift_marker(module).is_empty() {
-                        display_field(module, "state")
-                    } else {
-                        module_status_text(module)
-                    }),
+                    inline_views::status_cell(
+                        module,
+                        &if enabled_drift_marker(module).is_empty() {
+                            display_field(module, "state")
+                        } else {
+                            module_status_text(module)
+                        },
+                        inline,
+                    ),
                     enabled_word(module.get("enabled").and_then(Value::as_bool)),
                     live_word(module),
                     terminal_safe_string(&human_health_status(&display_field(module, "health"))),
@@ -6141,7 +6188,7 @@ fn print_module_table(modules: &[Value], verbose: bool) {
         .map(|module| {
             let mut row = vec![
                 terminal_safe_string(&display_field(module, "module_id")),
-                terminal_safe_string(&module_status_text(module)),
+                inline_views::status_cell(module, &module_status_text(module), inline),
                 terminal_safe_string(&human_health_status(&display_field(module, "health"))),
                 reload_list_marker(module).to_string(),
             ];

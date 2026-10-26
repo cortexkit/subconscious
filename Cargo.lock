@@ -1491,7 +1491,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-stdio-adapter"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "cortexkit-log",
  "cortexkit-test-support",
@@ -2528,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.32.4"
+version = "0.32.5"
 dependencies = [
  "async-trait",
  "cortexkit-test-support",
@@ -2557,7 +2557,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.141"
+version = "0.20.142"
 dependencies = [
  "base64",
  "ck-ui",
@@ -2653,7 +2653,7 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.43"
+version = "0.1.44"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",

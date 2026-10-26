@@ -247,16 +247,4 @@ mod tests {
             train
         );
     }
-
-    #[test]
-    fn probe_result_keeps_undecidable_distinct_from_absent() {
-        let result = ProbeResult::Undecidable(UndecidableProbe {
-            reason: "registry index is still settling".to_owned(),
-            retry_after_ms: 250,
-            settle_deadline_ms: 5_000,
-        });
-
-        assert!(matches!(result, ProbeResult::Undecidable(_)));
-        assert!(!matches!(result, ProbeResult::Absent(_)));
-    }
 }

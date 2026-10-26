@@ -1038,13 +1038,6 @@ fn route_open_retry_predicate_matches_the_decision_table() {
 }
 
 #[test]
-fn target_flow_unsupported_is_terminal_in_the_shared_retry_predicate() {
-    assert!(!error_codes::is_retryable_route_open(
-        "target_flow_unsupported"
-    ));
-}
-
-#[test]
 fn target_agent_run_unsupported_is_terminal_in_the_shared_retry_predicate() {
     assert_eq!(
         error_codes::TARGET_AGENT_RUN_UNSUPPORTED,

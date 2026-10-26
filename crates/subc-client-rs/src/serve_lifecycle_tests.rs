@@ -129,43 +129,6 @@ async fn connector_localhost() {
     connector("localhost", "127.0.0.1").await;
 }
 
-#[test]
-fn connector_uses_host_port_pair_without_string_formatting() {
-    struct ConnectCalls(Vec<bool>);
-    impl<'ast> syn::visit::Visit<'ast> for ConnectCalls {
-        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-            if let syn::Expr::Path(path) = call.func.as_ref() {
-                let segments = path
-                    .path
-                    .segments
-                    .iter()
-                    .map(|part| part.ident.to_string())
-                    .collect::<Vec<_>>();
-                if segments == ["TcpStream", "connect"] {
-                    self.0.push(matches!(call.args.first(), Some(syn::Expr::Tuple(tuple)) if tuple.elems.len() == 2));
-                }
-            }
-            syn::visit::visit_expr_call(self, call);
-        }
-    }
-    let syntax = syn::parse_file(include_str!("lib.rs")).unwrap();
-    let connector = syntax
-        .items
-        .iter()
-        .find_map(|item| match item {
-            syn::Item::Fn(function) if function.sig.ident == "connect_endpoint" => Some(function),
-            _ => None,
-        })
-        .expect("connector exists");
-    let mut calls = ConnectCalls(Vec::new());
-    syn::visit::Visit::visit_item_fn(&mut calls, connector);
-    assert_eq!(
-        calls.0,
-        [true],
-        "the connector must pass one host/port tuple, not a formatted string"
-    );
-}
-
 struct Panics;
 #[async_trait]
 impl ModuleHandler for Panics {

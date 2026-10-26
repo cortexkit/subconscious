@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.44
+
+- Tests only: removed a duplicate manifest unit test; the executable manifest test still checks `runtime_computed`. No behaviour change.
+
 ## 0.1.43
 
 - Takes subc-protocol 0.33 and the matching daemon, control and transport releases. The gateway sends no `output_refs`: only an llm-runner resolves an agent's references to earlier tool output. No behavior change.

@@ -193,7 +193,7 @@ fn required_value(arguments: &mut impl Iterator<Item = OsString>, flag: &str) ->
 
 #[cfg(test)]
 mod tests {
-    use super::{manifest, manifest_json, StartupArgs, MODULE_ID};
+    use super::{manifest, StartupArgs, MODULE_ID};
     use subc_protocol::manifest::{Concurrency, ProviderRole};
 
     #[test]
@@ -219,12 +219,6 @@ mod tests {
             "Invoke a named tool on a configured child server and return the child's MCP result."
         ));
         assert_eq!(manifest.provides.len(), 1);
-    }
-
-    #[test]
-    fn manifest_output_always_includes_an_empty_runtime_computed_array() {
-        let value = manifest_json(manifest()).unwrap();
-        assert_eq!(value["runtime_computed"], serde_json::json!([]));
     }
 
     #[test]

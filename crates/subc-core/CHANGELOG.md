@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.142
+
+- Removed an unused internal setup helper (`desired_values`, never called or exported); no behaviour change.
+
 ## 0.20.141
 
 - In a terminal, `ck health` opens with a coloured one-line summary and lists

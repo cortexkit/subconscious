@@ -428,11 +428,6 @@ fn inserted_values(before: &Value, after: &Value) -> Vec<(String, Value)> {
     result
 }
 
-#[allow(dead_code)]
-pub fn desired_values(component: Component, binary_home: &Path) -> BTreeMap<String, Value> {
-    desired_values_with_key(component, binary_home, None)
-}
-
 fn desired_values_with_key(
     component: Component,
     binary_home: &Path,

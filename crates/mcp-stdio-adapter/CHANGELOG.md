@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.18
+
+- Tests only: removed a duplicate manifest unit test; the executable manifest test still checks `runtime_computed`. No behaviour change.
+
 ## 0.1.17
 
 - Take subc-client-rs 0.32: handler panics now fail serving for supervisor recovery. After the module handshake completes, daemon disconnects still exit cleanly on every OS, with EOF/reset reported through the connection-end hook; handshake disconnects remain errors.

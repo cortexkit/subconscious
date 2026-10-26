@@ -162,29 +162,6 @@ describe("Rust golden fixtures", () => {
     expect(present.size).toBeGreaterThanOrEqual(relied.length);
   });
 
-  test("reports the fixtures no TypeScript test reads", () => {
-    // Informational by design, and it does not assert a count. A fixture with no
-    // consumer is a shape Rust pins and this package does not check -- worth
-    // seeing when someone adds one, but not worth failing over, since the right
-    // response is sometimes "the client does not speak that".
-    const source = readFileSync(
-      join(import.meta.dir, "golden-conformance.test.ts"),
-      "utf8",
-    );
-    const unconsumed = readdirSync(GOLDEN_DIR)
-      .filter((name) => name.endsWith(".json"))
-      .map((name) => name.slice(0, -".json".length))
-      .filter((name) => !source.includes(`"${name}"`));
-    if (unconsumed.length > 0) {
-      console.log(
-        `golden fixtures with no TypeScript consumer: ${unconsumed.join(", ")}`,
-      );
-    }
-    // The scan reads this file, so it must at minimum find the names above. A
-    // read that returned nothing would report perfect coverage.
-    expect(source.length).toBeGreaterThan(0);
-  });
-
   test("a declared provenance block reaches HELLO field for field", () => {
     // The provider copies provenance field by field, so a field Rust sends and
     // the TypeScript type does not declare would be silently dropped here.

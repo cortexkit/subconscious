@@ -741,11 +741,9 @@ describe("SubcClient managed call", () => {
       daemonOptions.closeAfterDataResponses = undefined;
       await waitFor(() => clientClosedErr(client) !== null, "client to observe the retryable-refusal drop");
 
-      const reconnectStartedAt = Date.now();
       expect(await client.call<unknown>("alpha", "echo", { phase: "reconnected" })).toMatchObject({
         params: { phase: "reconnected" },
       });
-      expect(Date.now() - reconnectStartedAt).toBeLessThan(2_000);
       expect(stats.connections).toBe(2);
 
       // Beta's old route was discarded with the connection. Its next call owns

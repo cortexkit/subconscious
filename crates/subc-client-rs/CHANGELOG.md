@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.5
+
+- Tests only: removed a source-shape test of the TCP connector; the real IPv4, IPv6 and localhost connector tests remain. No behaviour change.
+
 ## 0.32.4
 
 - Treat a daemon reset after a validated HELLO_ACK as a connection end even if the module's `on_hello_ack` callback is still pending. Serving returns `Ok` and calls `on_connection_end(Reset)` once, instead of sometimes returning a raw frame I/O error. Disconnects before a valid HELLO_ACK remain registration errors. Reader and writer paths now share the reset/abort/broken-pipe classifier; a late flush disconnect after EOF, GOODBYE or a module stop still preserves the first connection-end reason. Frame I/O errors no longer repeat the `frame I/O error:` prefix. No API change.

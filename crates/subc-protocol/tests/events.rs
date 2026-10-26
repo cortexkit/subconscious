@@ -118,14 +118,6 @@ fn event_name_validation_table_matches_bus_token_rule() {
 }
 
 #[test]
-fn event_name_validation_refuses_empty_token() {
-    let body = hello(json!([{"name": "a..b", "version": 1, "headers": []}]));
-    let error = validate_hello_event_declarations(&body)
-        .expect_err("a doubled dot creates an empty event-name token");
-    assert_eq!(error.field(), "events[0].name");
-}
-
-#[test]
 fn event_validation_accepts_exact_bounds_and_tolerates_unknown_fields() {
     let entries: Vec<_> = (0..64)
         .map(|version| {

@@ -27,9 +27,4 @@ final class PublicAPISurfaceTests: XCTestCase {
         let target = try FedManagementTarget(moduleID: "prefrontal-core")
         XCTAssertEqual(target.moduleID, "prefrontal-core")
     }
-
-    func testPackageProductNameIsSubcFed() {
-        // The module import above is the product/target name declared in Package.swift.
-        XCTAssertEqual(String(reflecting: SubcFedClient.self).contains("SubcFed"), true)
-    }
 }

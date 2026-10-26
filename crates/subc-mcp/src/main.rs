@@ -2413,13 +2413,6 @@ fn print_manifest(manifest: ModuleManifest) {
 
 #[cfg(test)]
 #[test]
-fn manifest_output_always_includes_an_empty_runtime_computed_array() {
-    let value = manifest_json(supervision_manifest(MANIFEST_MODULE_ID.to_string()));
-    assert_eq!(value["runtime_computed"], serde_json::json!([]));
-}
-
-#[cfg(test)]
-#[test]
 fn manifest_output_keeps_provenance_in_the_static_manifest_object() {
     let mut manifest = supervision_manifest(MANIFEST_MODULE_ID.to_string());
     manifest.provenance = Some(

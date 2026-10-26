@@ -8,7 +8,10 @@ allow delivery-authority subscribe ck.box_goldenfixture.live.broca.>
 allow flow-engine publish ck.box_goldenfixture.live.basal.>
 allow flow-engine subscribe ck.box_goldenfixture.live.>
 allow astrocyte publish ck.box_goldenfixture.live.astrocyte.>
+allow astrocyte subscribe ck.box_goldenfixture.live.broca.step.finished.v1
 allow astrocyte subscribe ck.box_goldenfixture.live.insula.>
+allow astrocyte subscribe ck.box_goldenfixture.live.thalamus-harness.step.finished.v1
+allow astrocyte subscribe ck.box_goldenfixture.live.thalamus.step.finished.v1
 allow broca publish ck.box_goldenfixture.live.broca.>
 allow broca subscribe ck.box_goldenfixture.live.magic-context.compaction.>
 allow magic-context publish ck.box_goldenfixture.live.magic-context.>

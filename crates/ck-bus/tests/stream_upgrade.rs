@@ -514,7 +514,15 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
         (
             streams.event.clone(),
             "m_astrocyte",
-            vec![format!("ck.{}.event.insula.>", names.account())],
+            vec![
+                format!("ck.{}.event.insula.>", names.account()),
+                format!("ck.{}.event.broca.step.finished.v1", names.account()),
+                format!(
+                    "ck.{}.event.thalamus-harness.step.finished.v1",
+                    names.account()
+                ),
+                format!("ck.{}.event.thalamus.step.finished.v1", names.account()),
+            ],
         ),
         (
             streams.event.clone(),
@@ -818,7 +826,18 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
         ),
         (
             "m_astrocyte",
-            vec![format!("ck.{}.event.insula.>", plane.names.account())],
+            vec![
+                format!("ck.{}.event.insula.>", plane.names.account()),
+                format!("ck.{}.event.broca.step.finished.v1", plane.names.account()),
+                format!(
+                    "ck.{}.event.thalamus-harness.step.finished.v1",
+                    plane.names.account()
+                ),
+                format!(
+                    "ck.{}.event.thalamus.step.finished.v1",
+                    plane.names.account()
+                ),
+            ],
         ),
         (
             "m_prefrontal-routing",

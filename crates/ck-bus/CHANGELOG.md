@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.14
+
+- Take `cortexkit-bus-naming` 0.2.8, whose reader table gives `astrocyte` the
+  runners' `step.finished.v1` events. Live subscriptions mirror the event
+  reader's filters, so Astrocyte may now subscribe to
+  `ck.{acct}.live.{broca,thalamus-harness,thalamus}.step.finished.v1`; before,
+  those subscriptions were refused.
+
 ## 0.4.13
 
 - Live subjects, `ck.{acct}.live.<module>.<kind>`: plain publishes, delivered only to

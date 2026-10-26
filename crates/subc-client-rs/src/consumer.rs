@@ -86,6 +86,8 @@ const ACTIVITY_EVENT_BUFFER: usize = 2048;
 mod activity_consumer_tests;
 
 mod cancellation;
+mod reservation;
+pub use reservation::{CorrelationId, PendingReply, RequestBody, RequestReservation};
 mod supervisor_ops;
 pub use cancellation::{CancelHandle, CancelOutcome};
 use cancellation::{CancelRegistration, UnaryCancel};
@@ -3877,6 +3879,53 @@ impl Shared {
         self.send_request_cancellable(request, None).await
     }
 
+    fn allocate_request(
+        self: &Arc<Self>,
+        expected_handle: Option<RouteHandle>,
+        channel: u16,
+        epoch: u32,
+    ) -> Result<(PendingKey, mpsc::Sender<WriteCommand>), CallError> {
+        let mut inner = self.lock_inner();
+        if inner.closed {
+            return Err(CallError::not_sent("consumer closed"));
+        }
+        let generation = inner.generation;
+        if let Some(expected) = expected_handle {
+            let route_pair_matches =
+                channel == 0 || (expected.channel == channel && expected.epoch == epoch);
+            if expected.connection_token() != generation
+                || !route_pair_matches
+                || inner.route_epochs.get(&expected.channel) != Some(&expected)
+                || inner.retired_routes.contains(&expected)
+            {
+                return Err(CallError::StaleRouteHandle(expected));
+            }
+        }
+        let Some(writer) = inner.writer.clone() else {
+            return Err(CallError::not_sent("subc connection is down before send"));
+        };
+        let Some(corr) = inner.next_corr else {
+            drop(inner);
+            self.handle_generation_drop(
+                generation,
+                "channel-0 correlation allocator exhausted".to_string(),
+            );
+            return Err(CallError::not_sent(
+                "correlation allocator exhausted; connection closed",
+            ));
+        };
+        inner.next_corr = corr.checked_add(1);
+        Ok((
+            PendingKey {
+                generation,
+                channel,
+                epoch,
+                corr,
+            },
+            writer,
+        ))
+    }
+
     async fn send_request_cancellable(
         self: &Arc<Self>,
         request: RequestSend,
@@ -3899,55 +3948,18 @@ impl Shared {
                 "call deadline elapsed before request was sent",
             ));
         }
-        let (generation, corr, writer) = {
-            let mut inner = self.lock_inner();
-            if inner.closed {
-                return Err(CallError::not_sent("consumer closed"));
-            }
-            let generation = inner.generation;
-            if let Some(expected) = expected_handle {
-                let route_pair_matches =
-                    channel == 0 || (expected.channel == channel && expected.epoch == epoch);
-                if expected.connection_token() != generation
-                    || !route_pair_matches
-                    || inner.route_epochs.get(&expected.channel) != Some(&expected)
-                    || inner.retired_routes.contains(&expected)
-                {
-                    return Err(CallError::StaleRouteHandle(expected));
-                }
-            }
-            let Some(writer) = inner.writer.clone() else {
-                return Err(CallError::not_sent("subc connection is down before send"));
-            };
-            let Some(corr) = inner.next_corr else {
-                drop(inner);
-                self.handle_generation_drop(
-                    generation,
-                    "channel-0 correlation allocator exhausted".to_string(),
-                );
-                return Err(CallError::not_sent(
-                    "correlation allocator exhausted; connection closed",
-                ));
-            };
-            inner.next_corr = corr.checked_add(1);
-            (generation, corr, writer)
-        };
+        let (key, writer) = self.allocate_request(expected_handle, channel, epoch)?;
+        let generation = key.generation;
 
         let frame = Frame::build(
             FrameType::Request,
             Flags::new(binary, priority, false).with_admission_class(admission_class),
             channel,
             epoch,
-            corr,
+            key.corr,
             body,
         )
         .map_err(|err| CallError::not_sent(format!("failed to build request frame: {err}")))?;
-        let key = PendingKey {
-            generation,
-            channel,
-            epoch,
-            corr,
-        };
         let (tx, rx) = oneshot::channel();
         {
             let mut inner = self.lock_inner();
@@ -4023,6 +4035,17 @@ impl Shared {
             }
         }
 
+        self.wait_for_reply(registration, rx, deadline).await
+    }
+
+    async fn wait_for_reply(
+        self: &Arc<Self>,
+        mut registration: PendingRegistration,
+        rx: oneshot::Receiver<PendingResult>,
+        deadline: Instant,
+    ) -> Result<TerminalFrame, CallError> {
+        let key = registration.key;
+        let channel = key.channel;
         tokio::select! {
             result = timeout_at(deadline, rx) => match result {
                 Ok(Ok(result)) => {
@@ -4034,7 +4057,7 @@ impl Shared {
                     Err(CallError::not_sent("pending response channel closed"))
                 }
                 Err(_) => {
-                    let accepted = if retain_late_route_open {
+                    let accepted = if registration.retain_on_drop {
                         registration.disarm();
                         self.pending_accepted(key).unwrap_or(false)
                     } else {
@@ -4491,6 +4514,17 @@ impl Shared {
         let Some(entry) = inner.pending.get_mut(&key) else {
             return false;
         };
+        if entry
+            .send_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            let entry = inner.remove_pending(&key).unwrap();
+            drop(inner);
+            entry.settle_call_error(CallError::not_sent(
+                "call deadline elapsed before request was sent",
+            ));
+            return false;
+        }
         entry.accepted = true;
         true
     }
@@ -5322,6 +5356,7 @@ struct PendingKey {
 
 struct PendingEntry {
     accepted: bool,
+    send_deadline: Option<Instant>,
     retain_late_route_open: bool,
     expected_control_handle: Option<RouteHandle>,
     route_open_reverse_requests: Option<ReverseRequestRegistry>,
@@ -5355,6 +5390,7 @@ impl PendingEntry {
     ) -> Self {
         Self {
             accepted: false,
+            send_deadline: None,
             retain_late_route_open,
             expected_control_handle,
             route_open_reverse_requests,
@@ -5372,6 +5408,7 @@ impl PendingEntry {
     ) -> Self {
         Self {
             accepted: false,
+            send_deadline: None,
             retain_late_route_open: false,
             expected_control_handle: None,
             route_open_reverse_requests: None,
@@ -6888,6 +6925,332 @@ mod tests {
         assert!(error.message.contains("person prompt exploded"));
         assert!(shared.generation_is_current(1));
         release_reverse_request_registry(handle);
+    }
+
+    fn reservation_stand_in(
+        credit: usize,
+        capacity: usize,
+    ) -> (
+        Arc<Shared>,
+        SubcConsumer,
+        mpsc::Receiver<WriteCommand>,
+        RouteHandle,
+        Arc<Semaphore>,
+    ) {
+        let shared = writer_test_shared();
+        let (writer, rx) = mpsc::channel(capacity);
+        shared.lock_inner().writer = Some(writer);
+        let handle = RouteHandle::new(5, 3, 1);
+        let sem = Arc::new(Semaphore::new(credit));
+        shared
+            .install_one_shot_route(RouteState {
+                handle,
+                sem: Arc::clone(&sem),
+            })
+            .unwrap();
+        let consumer = SubcConsumer {
+            shared: Arc::clone(&shared),
+        };
+        (shared, consumer, rx, handle, sem)
+    }
+
+    #[tokio::test]
+    async fn reservation_send_is_synchronous_and_uses_prevalidated_body() {
+        let oversized = vec![0; subc_protocol::MAX_FRAME_BODY_LEN as usize + 1];
+        assert!(matches!(
+            RequestBody::new(oversized),
+            Err(CallError::NotSent(_))
+        ));
+        let body = RequestBody::new(b"valid".to_vec()).unwrap();
+        let (shared, consumer, mut rx, handle, sem) = reservation_stand_in(1, 1);
+        let reserved = consumer
+            .reserve(&handle, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let corr = reserved.correlation_id();
+        assert_eq!(shared.lock_inner().writer.as_ref().unwrap().capacity(), 0);
+        assert!(rx.try_recv().is_err());
+
+        // A concrete tuple proves send returns without awaiting. Inspect the
+        // writer queue before running the writer or polling PendingReply.
+        let (sent_corr, reply): (CorrelationId, PendingReply) =
+            reserved.send(body, CallOptions::default());
+        assert_eq!(sent_corr, corr);
+        let command = rx.try_recv().expect("send must enqueue without yielding");
+        assert_eq!(command.frame.body, b"valid");
+        assert_eq!(command.frame.header.corr, corr);
+        assert_eq!(sem.available_permits(), 0);
+        assert!(shared.mark_pending_accepted(command.pending.unwrap()));
+        dispatch_frame(
+            &shared,
+            1,
+            response_frame(handle.channel, handle.epoch, corr, b"reply".to_vec()),
+        )
+        .await;
+        assert_eq!(reply.await.unwrap(), b"reply");
+        assert_eq!(sem.available_permits(), 1);
+        consumer.close().await;
+    }
+
+    #[tokio::test]
+    async fn reservation_drop_releases_route_credit_and_writer_capacity_without_sending() {
+        let (shared, consumer, mut rx, handle, sem) = reservation_stand_in(1, 1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let first = consumer.reserve(&handle, deadline).await.unwrap();
+        let second = consumer.reserve(&handle, deadline);
+        tokio::pin!(second);
+        assert_pending(second.as_mut()).await;
+        assert_eq!(sem.available_permits(), 0);
+        drop(first);
+        let second = timeout_at(deadline, second).await.unwrap().unwrap();
+        drop(second);
+        assert_eq!(sem.available_permits(), 1);
+        assert_eq!(shared.lock_inner().writer.as_ref().unwrap().capacity(), 1);
+        assert!(shared.lock_inner().pending.is_empty());
+        assert!(rx.try_recv().is_err());
+        consumer.close().await;
+    }
+
+    #[tokio::test]
+    async fn reservation_route_closed_before_send_matches_an_ordinary_unwritten_request() {
+        let (shared, consumer, mut rx, handle, _) = reservation_stand_in(2, 4);
+        let reserved = consumer
+            .reserve(&handle, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let ordinary = consumer.request(&handle, b"ordinary".to_vec(), CallOptions::default());
+        tokio::pin!(ordinary);
+        assert_pending(ordinary.as_mut()).await;
+        let ordinary_command = rx.try_recv().unwrap();
+        assert_eq!(ordinary_command.frame.body, b"ordinary");
+        consumer
+            .close_handle(&handle, CloseRouteOptions::default())
+            .await
+            .unwrap();
+        let (_, reply) = reserved.send(
+            RequestBody::new(b"reserved".to_vec()).unwrap(),
+            CallOptions::default(),
+        );
+        let ordinary_error = ordinary.await.unwrap_err();
+        let reserved_error = reply.await.unwrap_err();
+        assert!(matches!(reserved_error, CallError::NotSent(_)));
+        assert_eq!(
+            reserved_error.close_reason(),
+            Some(&RouteEndReason::ClosedByCaller)
+        );
+        assert_eq!(reserved_error.to_string(), ordinary_error.to_string());
+        assert_eq!(reserved_error.close_reason(), ordinary_error.close_reason());
+
+        rx.close();
+        let writer = InstrumentedWriter::new(false);
+        writer_loop(Arc::clone(&shared), writer.clone(), rx, 1).await;
+        let bytes = writer.bytes();
+        let mut bytes = bytes.as_slice();
+        let frame = read_frame(&mut bytes).await.unwrap().unwrap();
+        assert_eq!(frame.header.ty, FrameType::Goodbye);
+        assert!(
+            bytes.is_empty(),
+            "the closed route's reserved request must not be written"
+        );
+        consumer.close().await;
+    }
+
+    #[tokio::test]
+    async fn reservation_connection_loss_after_send_preserves_existing_errors() {
+        for written in [false, true] {
+            let (shared, consumer, rx, handle, sem) = reservation_stand_in(1, 1);
+            let reserved = consumer
+                .reserve(&handle, Instant::now() + Duration::from_secs(1))
+                .await
+                .unwrap();
+            let (_, reply) = reserved.send(
+                RequestBody::new(b"request".to_vec()).unwrap(),
+                CallOptions::default(),
+            );
+            let writer = InstrumentedWriter::new(written);
+            if !written {
+                shared.handle_generation_drop(1, "connection lost before dequeue".to_string());
+            }
+            writer_loop(Arc::clone(&shared), writer.clone(), rx, 1).await;
+            let err = reply.await.unwrap_err();
+            assert_eq!(err.close_reason(), Some(&RouteEndReason::ConnectionLost));
+            if written {
+                assert!(matches!(err, CallError::OutcomeUnknown(_)));
+                assert_eq!(err.outcome_cause(), Some(OutcomeUnknownCause::WriterClosed));
+                assert!(!writer.bytes().is_empty());
+            } else {
+                assert!(matches!(err, CallError::NotSent(_)));
+                assert!(writer.bytes().is_empty());
+            }
+            assert_eq!(sem.available_permits(), 1);
+            consumer.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn reservation_correlations_are_unique_and_match_frames_written_out_of_order() {
+        let (shared, consumer, mut rx, handle, _) = reservation_stand_in(3, 3);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let first = consumer.reserve(&handle, deadline).await.unwrap();
+        let second = consumer.reserve(&handle, deadline).await.unwrap();
+        let third = consumer.reserve(&handle, deadline).await.unwrap();
+        let ids = [
+            first.correlation_id(),
+            second.correlation_id(),
+            third.correlation_id(),
+        ];
+        assert_eq!(ids.into_iter().collect::<HashSet<_>>().len(), 3);
+        let opts = CallOptions {
+            priority: Priority::Background,
+            admission_class: AdmissionClass::Expedite,
+            ..CallOptions::default()
+        };
+        let mut replies = Vec::new();
+        for (reserved, expected_id, body) in [
+            (third, ids[2], "third"),
+            (first, ids[0], "first"),
+            (second, ids[1], "second"),
+        ] {
+            let (corr, reply) = reserved.send(
+                RequestBody::new(body.as_bytes().to_vec()).unwrap(),
+                opts.clone(),
+            );
+            assert_eq!(corr, expected_id);
+            replies.push((corr, body, reply));
+        }
+        rx.close();
+        let writer = InstrumentedWriter::new(false);
+        writer_loop(Arc::clone(&shared), writer.clone(), rx, 1).await;
+        let bytes = writer.bytes();
+        let mut bytes = bytes.as_slice();
+        for (corr, body, reply) in replies {
+            let frame = read_frame(&mut bytes).await.unwrap().unwrap();
+            assert_eq!(frame.header.ty, FrameType::Request);
+            assert_eq!(frame.header.corr, corr);
+            assert_eq!(frame.header.channel, handle.channel);
+            assert_eq!(frame.header.epoch, handle.epoch);
+            assert_eq!(
+                frame.header.flags,
+                Flags::new(false, Priority::Background, false)
+                    .with_admission_class(AdmissionClass::Expedite)
+            );
+            assert_eq!(frame.body, body.as_bytes());
+            dispatch_frame(
+                &shared,
+                1,
+                response_frame(handle.channel, handle.epoch, corr, body.as_bytes().to_vec()),
+            )
+            .await;
+            assert_eq!(reply.await.unwrap(), body.as_bytes());
+        }
+        assert!(bytes.is_empty());
+        consumer.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reservation_deadline_before_send_prevents_writing_without_polling_reply() {
+        let (shared, consumer, mut rx, handle, sem) = reservation_stand_in(1, 1);
+        let reserved = consumer
+            .reserve(&handle, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let (_, reply) = reserved.send(
+            RequestBody::new(b"expired".to_vec()).unwrap(),
+            CallOptions::default(),
+        );
+        rx.close();
+        let writer = InstrumentedWriter::new(false);
+        writer_loop(Arc::clone(&shared), writer.clone(), rx, 1).await;
+        assert!(writer.bytes().is_empty());
+        assert!(matches!(reply.await, Err(CallError::NotSent(_))));
+        assert_eq!(sem.available_permits(), 1);
+        consumer.close().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reservation_deadline_bounds_writer_capacity_and_releases_credit() {
+        let (shared, consumer, mut rx, handle, sem) = reservation_stand_in(2, 1);
+        let first = consumer
+            .reserve(&handle, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let second = consumer
+            .reserve(&handle, Instant::now() + Duration::from_millis(25))
+            .await;
+        assert!(matches!(second, Err(CallError::NotSent(_))));
+        assert_eq!(sem.available_permits(), 1);
+        drop(first);
+        assert_eq!(sem.available_permits(), 2);
+        assert!(shared.lock_inner().pending.is_empty());
+        assert!(rx.try_recv().is_err());
+        consumer.close().await;
+    }
+
+    #[tokio::test]
+    async fn reservation_reconnect_during_writer_capacity_wait_fails_promptly_without_writing() {
+        let (shared, consumer, mut old_rx, handle, sem) = reservation_stand_in(1, 1);
+        let old_writer = shared.lock_inner().writer.clone().unwrap();
+        let held_capacity = old_writer.reserve_owned().await.unwrap();
+        let reserve = consumer.reserve(&handle, Instant::now() + Duration::from_secs(60));
+        tokio::pin!(reserve);
+        assert_pending(reserve.as_mut()).await;
+        assert_eq!(sem.available_permits(), 0);
+
+        let mut replacement_rx = drop_and_replace_test_transport(&shared);
+        assert_ne!(shared.lock_inner().generation, handle.connection_token());
+        drop(held_capacity);
+        let result = std::future::poll_fn(|cx| Poll::Ready(reserve.as_mut().poll(cx))).await;
+        assert!(matches!(
+            result,
+            Poll::Ready(Err(CallError::StaleRouteHandle(stale))) if stale == handle
+        ));
+        assert!(shared.lock_inner().pending.is_empty());
+        assert_eq!(sem.available_permits(), 1);
+        assert!(old_rx.try_recv().is_err());
+        assert!(replacement_rx.try_recv().is_err());
+
+        old_rx.close();
+        replacement_rx.close();
+        let writer = InstrumentedWriter::new(false);
+        writer_loop(
+            Arc::clone(&shared),
+            writer.clone(),
+            old_rx,
+            handle.connection_token(),
+        )
+        .await;
+        let generation = shared.lock_inner().generation;
+        writer_loop(
+            Arc::clone(&shared),
+            writer.clone(),
+            replacement_rx,
+            generation,
+        )
+        .await;
+        assert!(writer.bytes().is_empty());
+        consumer.close().await;
+    }
+
+    #[tokio::test]
+    async fn reservation_reply_drop_cleans_up_without_polling() {
+        let (shared, consumer, mut rx, handle, sem) = reservation_stand_in(1, 1);
+        let reserved = consumer
+            .reserve(&handle, Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        let (_, reply) = reserved.send(
+            RequestBody::new(b"request".to_vec()).unwrap(),
+            CallOptions::default(),
+        );
+        drop(reply);
+        assert!(shared.lock_inner().pending.is_empty());
+        assert_eq!(sem.available_permits(), 1);
+        rx.close();
+        let writer = InstrumentedWriter::new(false);
+        writer_loop(Arc::clone(&shared), writer.clone(), rx, 1).await;
+        assert!(writer.bytes().is_empty());
+        consumer.close().await;
     }
 
     #[tokio::test]

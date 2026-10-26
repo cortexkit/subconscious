@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.6
+
+- Add two-step sends on an open consumer route: validate bytes with `RequestBody::new`, await `SubcConsumer::reserve` outside a caller-owned database transaction to acquire route credit, writer capacity and a correlation id, then call synchronous, infallible `RequestReservation::send` inside the transaction that records the send. The returned `PendingReply` uses the same results and errors as `SubcConsumer::request`. Dropping an unsent reservation releases its resources and sends nothing; a request queued after its route closes is skipped by the writer, never written to the wire. Queuing is not delivery: a connection-loss error cannot establish whether the module saw the request, so callers must include their own idempotency key in the body for safe retries. Existing public signatures are unchanged.
+
 ## 0.32.5
 
 - Tests only: removed a source-shape test of the TCP connector; the real IPv4, IPv6 and localhost connector tests remain. No behaviour change.

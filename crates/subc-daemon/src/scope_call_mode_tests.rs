@@ -495,3 +495,88 @@ async fn call_modes_relay_legacy_run_omits_new_fields_from_admission_declarer() 
 async fn call_modes_relay_delegating_run_refused_and_reservation_released() {
     relay_to_legacy_replacement(true).await;
 }
+
+/// A codemode run registered for a worker: attributed to its head agent, but
+/// carrying no agent_id and so none of that agent's authority.
+fn worker_run_scope() -> ScopeRecord {
+    ScopeRecord::new("s", 1, ScopeKind::Ephemeral)
+        .with_carriers(vec![carrier(AFT, None)])
+        .with_attributes(
+            ScopeAttributes::new()
+                .with_on_behalf_of_agent(Some("head-agent".into()))
+                .with_run_id(Some("run:7".into())),
+        )
+        .with_expires_at_ms(Some(2_000))
+}
+
+#[tokio::test]
+async fn worker_run_bind_refused_unless_target_declares_worker_runs() {
+    for provides in [
+        vec![],
+        vec![CALL_MODES_CAPABILITY],
+        vec![subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY],
+        vec![
+            CALL_MODES_CAPABILITY,
+            subc_protocol::scope::AGENT_RUN_SCOPES_CAPABILITY,
+            subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY,
+        ],
+    ] {
+        let mut rig = call_mode_rig(&provides).await;
+        rig.sync(vec![worker_run_scope()]).await;
+        let (client, _client_rx, frame) =
+            rig.open_frame(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))));
+        let replies = tokio::time::timeout(
+            Duration::from_secs(2),
+            rig.handler.handle_control_frame(&client, frame),
+        )
+        .await
+        .expect("a worker run is refused without awaiting an ack")
+        .unwrap();
+        let body = parse_error(&replies[0]);
+        assert_eq!(
+            body["code"],
+            error_codes::TARGET_AGENT_RUN_UNSUPPORTED,
+            "provides={provides:?}"
+        );
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("worker-runs/v1"));
+        assert!(
+            rig.modules.get_mut(PLEXUS).unwrap().1.try_recv().is_err(),
+            "no worker-run bind reaches a target that did not declare worker-runs/v1"
+        );
+        assert_eq!(rig.forwarding.reserved_route_count().unwrap(), (0, 0));
+    }
+}
+
+#[tokio::test]
+async fn worker_run_bind_admitted_to_worker_runs_declarer_with_attribution_only() {
+    // Neither call-modes/v1 nor scope-on-behalf-of/v1: the declaration alone
+    // must deliver the mode and the run's only attribution.
+    for provides in [
+        vec![subc_protocol::scope::WORKER_RUNS_CAPABILITY],
+        vec![CALL_MODES_CAPABILITY, subc_protocol::scope::WORKER_RUNS_CAPABILITY],
+    ] {
+        let mut rig = call_mode_rig(&provides).await;
+        rig.sync(vec![worker_run_scope()]).await;
+        let route = rig
+            .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+            .await;
+        assert!(rig.live(&route));
+        let body: Value = serde_json::from_slice(&route.bind.body).unwrap();
+        assert_eq!(body["call_mode"], "codemode", "provides={provides:?}");
+        assert_eq!(
+            body["scope"]["attributes"],
+            serde_json::json!({"on_behalf_of_agent": "head-agent", "run_id": "run:7"})
+        );
+        assert!(body["scope"]["attributes"].get("agent_id").is_none());
+        assert!(body["scope"]["attributes"].get("delegates").is_none());
+        let stamp = route.stamp().unwrap();
+        assert!(stamp.attributes.agent_id.is_none());
+        assert_eq!(
+            stamp.attributes.on_behalf_of_agent.as_deref(),
+            Some("head-agent")
+        );
+    }
+}

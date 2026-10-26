@@ -199,8 +199,8 @@ pub mod error_codes {
     pub const SCOPE_CARRIER_TARGETS_INVALID: &str = "scope_carrier_targets_invalid";
     /// The record sets `delegates` without an `agent_id` to delegate.
     pub const SCOPE_DELEGATES_WITHOUT_AGENT: &str = "scope_delegates_without_agent";
-    /// The record sets `run_id` without `agent_id`, the agent this run is on
-    /// behalf of.
+    /// The record sets `run_id` without either `agent_id` (an agent run) or
+    /// `on_behalf_of_agent` (a worker run).
     pub const SCOPE_RUN_ID_WITHOUT_AGENT: &str = "scope_run_id_without_agent";
     /// The record sets both `run_id` and `flow_id`; a run scope is not a flow scope.
     pub const SCOPE_RUN_ID_WITH_FLOW_ID: &str = "scope_run_id_with_flow_id";

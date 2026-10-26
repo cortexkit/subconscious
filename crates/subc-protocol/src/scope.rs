@@ -192,6 +192,20 @@ pub const AGENT_RUN_SCOPES_CAPABILITY: &str = "agent-run-scopes/v1";
 /// The daemon also advertises this capability to scope-authority owners.
 pub const SCOPE_ON_BEHALF_OF_CAPABILITY: &str = "scope-on-behalf-of/v1";
 
+/// A *worker run* is a codemode run scope with `run_id` and
+/// `on_behalf_of_agent` but no `agent_id`: it works for an agent without that
+/// agent's authority. Declaring this in a manifest's `capabilities.provides`
+/// promises that the module handles a codemode bind carrying `run_id` and no
+/// `agent_id` as attribution only, and never acts as, consents for, or hands out
+/// per-agent handles of the attributed agent. A worker run binds only to a
+/// target declaring it; `call-modes/v1` and `agent-run-scopes/v1` alone do not
+/// admit one, because those providers assume a run carries its agent's
+/// identity. A declarer receives `call_mode: codemode` and the stamp's
+/// `on_behalf_of_agent` on a worker-run bind even without
+/// [`SCOPE_ON_BEHALF_OF_CAPABILITY`]. The daemon also advertises this capability
+/// so owners register worker runs only with a daemon that accepts them.
+pub const WORKER_RUNS_CAPABILITY: &str = "worker-runs/v1";
+
 /// The daemon can answer whether a module acknowledged a bind under an owned scope epoch.
 pub const SCOPE_SERVED_BY_CAPABILITY: &str = "scope-served-by/v1";
 
@@ -214,12 +228,15 @@ pub struct ScopeAttributes {
     /// its strength, or treat it as `agent_id`.
     ///
     /// Set only by a scope-authority owner and validated with `agent_id`'s
-    /// token rule. Mutually exclusive with `agent_id`, `delegates` and `flow_id`;
-    /// `run_id` requires `agent_id` and is therefore excluded too. Adding,
-    /// changing or removing this within an epoch increments the content version
-    /// and closes routes with `scope_delegation_changed`. Bind stamps include
-    /// it only for targets providing [`SCOPE_ON_BEHALF_OF_CAPABILITY`]; describe
-    /// replies include it only for callers providing that capability.
+    /// token rule. Mutually exclusive with `agent_id`, `delegates` and `flow_id`.
+    /// With `run_id` and no `agent_id` it marks a worker run (see
+    /// [`WORKER_RUNS_CAPABILITY`]). Adding, changing or removing this within an
+    /// epoch increments the content version and closes routes with
+    /// `scope_delegation_changed`. Bind stamps include it only for targets
+    /// providing [`SCOPE_ON_BEHALF_OF_CAPABILITY`], except that a worker run's
+    /// bind, which reaches only a target providing [`WORKER_RUNS_CAPABILITY`],
+    /// always includes it. Describe replies include it only for callers
+    /// providing [`SCOPE_ON_BEHALF_OF_CAPABILITY`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_behalf_of_agent: Option<String>,
     /// Whether a provider may act as `agent_id`. Refused without `agent_id`.
@@ -258,15 +275,17 @@ pub struct ScopeAttributes {
     /// authority, immutability and capability rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_install_id: Option<String>,
-    /// Identifies one run carried out on behalf of `agent_id`. Requires
-    /// `agent_id`, forbids `flow_id`, and uses
-    /// [`validate_run_id`]'s token rule.
+    /// Identifies one run: an agent run on behalf of `agent_id`, or a worker run
+    /// attributed to `on_behalf_of_agent` without that agent's authority. A
+    /// record with `run_id` carries exactly one of the two, forbids `flow_id`,
+    /// and uses [`validate_run_id`]'s token rule.
     /// Adding, changing or removing it within an epoch increments the scope's
     /// content version and closes routes under the scope with
-    /// `scope_delegation_changed`. The daemon sends this field in a bind only to
+    /// `scope_delegation_changed`. The daemon sends an agent run's bind only to
     /// a target module providing [`AGENT_RUN_SCOPES_CAPABILITY`] or
     /// [`crate::call_mode::CALL_MODES_CAPABILITY`]. A delegating run scope is
     /// accepted as a record, but binds only to a target providing the latter.
+    /// A worker run binds only to a target providing [`WORKER_RUNS_CAPABILITY`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
 }

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.37.11
+
+- Accept worker runs: a record with `run_id` must now carry exactly one of `agent_id` (an agent run, unchanged) or `on_behalf_of_agent` (a worker run, attribution only). Both is refused `scope_attribute_not_permitted`, neither stays `scope_run_id_without_agent`, and a worker run still refuses `delegates` and `flow_id`. No parent-kind check: a worker run may hang under a worker's task scope or a not-yet-linked parent.
+- A worker run's route binds only to a target whose captured endpoint declares `worker-runs/v1`; every other target, including `call-modes/v1`-only and legacy `agent-run-scopes/v1` ones, is refused with the terminal `target_agent_run_unsupported` naming `worker-runs/v1`, at admission and relay re-check. A declarer receives `call_mode: codemode`, the deadline, and `on_behalf_of_agent` in the stamp even without `scope-on-behalf-of/v1`. Advertise `worker-runs/v1` in HELLO_ACK and `server.describe`. Require subc-protocol 0.33.3.
+
 ## 0.37.10
 
 - Require subc-protocol 0.33.2, the first release with the flow-identity

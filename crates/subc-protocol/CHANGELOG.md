@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.3
+
+- Add `scope::WORKER_RUNS_CAPABILITY` (`worker-runs/v1`). A *worker run* is a run scope with `run_id` and `on_behalf_of_agent` but no `agent_id`: a codemode run that works for an agent without that agent's authority. Declaring the capability promises the provider handles such a codemode bind as attribution only and never acts as, consents for, or hands out per-agent handles of the attributed agent. Docs for `ScopeAttributes::{on_behalf_of_agent, run_id}` and `SCOPE_RUN_ID_WITHOUT_AGENT` now describe the rule that a record with `run_id` carries exactly one of `agent_id` or `on_behalf_of_agent`. Additive; no wire type changes.
+
 ## 0.33.2
 
 - Add optional `ScopeAttributes::{flow_version, flow_code_hash, flow_install_id}`, their `with_*` builders and validators, `FLOW_IDENTITY_SCOPES_CAPABILITY` (`flow-identity-scopes/v1`), and `SCOPE_FLOW_IDENTITY_CHANGED` (`scope_flow_identity_changed`). Installed identity is all-or-none with `flow_id`, authority-owner controlled, and epoch-fixed. Unset fields preserve legacy wire bytes; strict readers must declare the capability before receiving the new attributes.

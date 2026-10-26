@@ -603,13 +603,12 @@ fn on_behalf_of_agent_with_agent_id_is_refused_by_sync_and_apply() {
 }
 
 #[test]
-fn on_behalf_of_agent_forbids_delegates_flow_and_run_and_requires_authority() {
+fn on_behalf_of_agent_forbids_delegates_flow_and_requires_authority() {
     let attribution = ScopeAttributes::new().with_on_behalf_of_agent(Some("head".into()));
     for delta in [false, true] {
         for (owner, attributes) in [
             (OWNER, attribution.clone().with_delegates(true)),
             (OWNER, attribution.clone().with_flow_id(Some("flow".into()))),
-            (OWNER, attribution.clone().with_run_id(Some("run".into()))),
             (OTHER, attribution.clone()),
         ] {
             let (mut table, _) = clocked_table();
@@ -634,6 +633,99 @@ fn on_behalf_of_agent_forbids_delegates_flow_and_run_and_requires_authority() {
                 Some(error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED)
             );
             assert_eq!(status(&table, owner, "s"), ScopeStatus::NotLive);
+        }
+    }
+}
+
+#[test]
+fn worker_run_record_is_accepted_by_sync_and_apply_whatever_its_parent() {
+    let worker_run = ScopeAttributes::new()
+        .with_run_id(Some("run:7".into()))
+        .with_on_behalf_of_agent(Some("head".into()));
+    for delta in [false, true] {
+        let (mut table, _) = clocked_table();
+        let task = ScopeRecord::new("task", 1, ScopeKind::Worker);
+        sync(&mut table, OWNER, 1, vec![task.clone()]);
+        // One run parented to the worker's task scope, which has no agent_id,
+        // and one whose parent's owner has not synced, so its link is pending.
+        let runs = vec![
+            record("run", 1)
+                .with_parent(Some(ScopeParent::new(reserved(OWNER), "task", 1)))
+                .with_attributes(worker_run.clone()),
+            record("orphan-run", 1)
+                .with_parent(Some(ScopeParent::new(reserved(OTHER), "task", 1)))
+                .with_attributes(worker_run.clone()),
+        ];
+        let reply = if delta {
+            apply(&mut table, 2, runs, vec![])
+        } else {
+            let mut all = vec![task];
+            all.extend(runs);
+            sync(&mut table, OWNER, 2, all)
+        };
+        let outcomes: Vec<_> = reply
+            .results
+            .iter()
+            .filter(|result| result.scope_ref != "task")
+            .map(|result| (result.outcome, result.code.clone()))
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![(ScopeRecordOutcome::Created, None); 2],
+            "delta={delta}"
+        );
+        let stamp = table.describe(&reserved(OWNER), "run").stamp.unwrap();
+        assert_eq!(stamp.attributes.run_id.as_deref(), Some("run:7"));
+        assert_eq!(stamp.attributes.on_behalf_of_agent.as_deref(), Some("head"));
+        assert!(stamp.attributes.agent_id.is_none());
+        assert_eq!(stamp.parent_state, Some(ParentState::Linked));
+        let orphan = table
+            .describe(&reserved(OWNER), "orphan-run")
+            .stamp
+            .unwrap();
+        assert_eq!(orphan.parent_state, Some(ParentState::Pending));
+    }
+}
+
+#[test]
+fn run_id_needs_exactly_one_of_agent_id_and_on_behalf_of_agent() {
+    let run = ScopeAttributes::new().with_run_id(Some("run:7".into()));
+    for delta in [false, true] {
+        for (attributes, expected) in [
+            // Both attributions: a worker run must never also carry agent authority.
+            (
+                run.clone()
+                    .with_agent_id(Some("agent".into()))
+                    .with_on_behalf_of_agent(Some("head".into())),
+                error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
+            ),
+            // Neither attribution: a run must say whom it works for.
+            (run.clone(), error_codes::SCOPE_RUN_ID_WITHOUT_AGENT),
+            // A worker run cannot delegate: delegation needs agent_id.
+            (
+                run.clone()
+                    .with_on_behalf_of_agent(Some("head".into()))
+                    .with_delegates(true),
+                error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
+            ),
+            // A worker run is still not a flow.
+            (
+                run.clone()
+                    .with_on_behalf_of_agent(Some("head".into()))
+                    .with_flow_id(Some("flow".into())),
+                error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
+            ),
+        ] {
+            let (mut table, _) = clocked_table();
+            sync(&mut table, OWNER, 1, vec![]);
+            let invalid = record("s", 1).with_attributes(attributes);
+            let reply = if delta {
+                apply(&mut table, 2, vec![invalid], vec![])
+            } else {
+                sync(&mut table, OWNER, 2, vec![invalid])
+            };
+            assert_eq!(code(&reply), Some(expected), "delta={delta}");
+            assert_eq!(status(&table, OWNER, "s"), ScopeStatus::NotLive);
         }
     }
 }

@@ -103,8 +103,9 @@ Fields:
   - `flow_version` (optional unsigned integer), `flow_code_hash` (optional string),
     `flow_install_id` (optional string): the approved installed flow identity,
     present together and only with `flow_id` (see below).
-  - `run_id` (optional string): this `ephemeral` scope belongs to one agent run (section 2's
-    agent-run identity subsection).
+  - `run_id` (optional string): this `ephemeral` scope belongs to one run: an agent run with
+    `agent_id`, or a worker run with `on_behalf_of_agent` (section 2's agent-run identity
+    subsection).
 
 **Authority gate.** `agent_id`, `on_behalf_of_agent`, `delegates`, `flow_id`,
 `flow_version`, `flow_code_hash`, `flow_install_id` and `run_id` may be set only by
@@ -133,9 +134,10 @@ carry the scope's `workdir` and `project_id`; existing activity fields are uncha
 
 `on_behalf_of_agent` uses the agent token rule: 1–256 printable, non-space ASCII bytes
 (`0x21`–`0x7E`). Malformed tokens refuse the whole sync or apply as `invalid_control_body`.
-It is mutually exclusive with `agent_id`, `delegates: true` and `flow_id`; `run_id` requires
-`agent_id`, so it is excluded too. Conflicting combinations refuse that record in sync or
-apply as `scope_attribute_not_permitted`. Adding, changing or removing attribution within
+It is mutually exclusive with `agent_id`, `delegates: true` and `flow_id`. Conflicting
+combinations refuse that record in sync or apply as `scope_attribute_not_permitted`. It may
+accompany `run_id`, which makes the record a *worker run* (see "Agent-run identity" below).
+Adding, changing or removing attribution within
 an epoch increases the content version and closes routes with `scope_delegation_changed`.
 An unchanged resend does neither.
 
@@ -147,6 +149,9 @@ identity, removing attribution cannot grant agent authority: the scope has no `a
 or delegation. Declaring the capability promises attribution-only handling, not merely
 the ability to decode the field. The same capability gate protects describe readers:
 only a calling module declaring it receives the attribute (section 5).
+The one exception is a worker run's bind: it goes only to a `worker-runs/v1` declarer, which
+receives `on_behalf_of_agent` even without `scope-on-behalf-of/v1`, because the attribution
+is the run's only identity.
 
 Bounds: at most 10,000 live scopes per owner and 4 KiB of attributes per scope; past either the
 sync or apply is refused by name and nothing is applied. Tombstones (section 6) are capped at
@@ -257,14 +262,26 @@ neither of those older capabilities implies installed-identity reader support.
 
 ### Agent-run identity: `run_id`
 
-The optional `attributes.run_id` identifies one run on behalf of `agent_id`; run scopes use
-the existing `ephemeral` kind, not a new kind. Like `flow_id`, it is 1–256 printable non-space
+The optional `attributes.run_id` identifies one run; run scopes use the existing `ephemeral`
+kind, not a new kind. A record with `run_id` carries exactly one of:
+- `agent_id`: an *agent run*, which works for and as that agent under the rules below;
+- `on_behalf_of_agent` and no `agent_id`: a *worker run*, which works for that agent without
+  its authority. Masons and sidekicks run codemode under worker scopes, and a worker scope
+  never carries `agent_id`: giving the run one would hand the worker its head's authority.
+  A worker run keeps every other refusal: `delegates` needs `agent_id` and `on_behalf_of_agent`
+  cannot accompany `delegates` (`scope_attribute_not_permitted`), and `run_id` cannot
+  accompany `flow_id`. Record validation does not check the parent's kind: a worker run is
+  attribution-only whatever its parent is, and the parent may not be linked yet.
+
+Like `flow_id`, `run_id` is 1–256 printable non-space
 ASCII bytes. A malformed token refuses the whole sync or apply as `invalid_control_body`,
 naming `run_id`. Only an owner in `scope_authority_owners` may set it; an unlisted owner gets
 `scope_attribute_not_permitted` even when the scope has a permitted expiry.
 
 After the existing delegates-without-agent check, the daemon refuses a record with:
-- `run_id` but no `agent_id`: `scope_run_id_without_agent`;
+- `run_id` with both `agent_id` and `on_behalf_of_agent`: `scope_attribute_not_permitted`
+  (checked first, with the other attribution conflicts);
+- `run_id` with neither `agent_id` nor `on_behalf_of_agent`: `scope_run_id_without_agent`;
 - both `run_id` and `flow_id`: `scope_run_id_with_flow_id`.
 
 A run record may set `delegates: true`; the run-authority rule is enforced at route admission
@@ -277,6 +294,14 @@ in `ScopeStamp.attributes` on admitted binds. Changing, adding or removing it on
 epoch is accepted, bumps `version` and drains every route under the scope with
 `scope_delegation_changed`. An unchanged resend does neither. A scope with only `flow_id`
 retains its existing flow rules and capability gate.
+
+A worker run binds only to a module declaring `worker-runs/v1`, never to one declaring only
+`call-modes/v1` or `agent-run-scopes/v1`: both were written assuming a run carries its agent's
+identity (section 4b). The daemon advertises `worker-runs/v1` in HELLO_ACK `subc_capabilities`
+and `server.describe`. Rollout is readers first: the daemon ships first; providers declare
+`worker-runs/v1` only after checking their codemode path treats a run without `agent_id` as
+attribution only; and only then does the owner (core) register worker runs, and only with a
+daemon advertising the capability, since an older daemon refuses the record.
 
 ## 3. Registering: `scope.sync` and `scope.apply`
 
@@ -487,8 +512,10 @@ in section 5a):
 - `target_agent_run_unsupported`: the scope carries `run_id`, but the target's registered
   manifest provides neither `call-modes/v1` nor `agent-run-scopes/v1` in
   `capabilities.provides`, or the run delegates and the target does not provide
-  `call-modes/v1`. Terminal; the message names the target and capability requirement,
-  including delegation when that is the reason, and no bind is relayed. Never drop `run_id`
+  `call-modes/v1`, or the scope is a worker run (`run_id` without `agent_id`) and the target
+  does not provide `worker-runs/v1`. Terminal; the message names the target and capability
+  requirement, including delegation or `worker-runs/v1` when that is the reason, and no bind
+  is relayed. Never drop `run_id`
   to bypass the gate. Scopes without `run_id` and unscoped routes do not require the run gate.
 
 Both gates run at admission and again against the connection captured for relay; a failed
@@ -510,6 +537,8 @@ captured target declares `call-modes/v1`. Run and flow binds are capability-gate
 `attributes.on_behalf_of_agent` is included only for `scope-on-behalf-of/v1` targets;
 `scope.describe` returns the attribution field only to calling modules declaring that
 capability; other attributes and the deadline keep their existing behavior.
+A worker-run bind, which reaches only a `worker-runs/v1` declarer, also carries
+`expires_at_ms` and `attributes.on_behalf_of_agent` without either of those capabilities.
 
 **Commit.** When the module acks the bind, the daemon checks the captured `(scope_epoch,
 version)` against the current record before the route becomes routable. If the scope ended or
@@ -536,6 +565,8 @@ A target whose captured relay endpoint declares `call-modes/v1` (a *declarer*) r
 read the mode on every bind and handle all three known values. A provider must refuse an
 unknown mode; the wire enum preserves unknown strings as `CallMode::Unknown` rather than
 failing decoding.
+A target declaring `worker-runs/v1` also receives `call_mode: codemode` on a worker-run bind,
+whether or not it declares `call-modes/v1`.
 No other target receives `call_mode` or the stamp's `expires_at_ms`, because a reader that
 predates a field may reject it and stop serving. Field selection uses the captured endpoint,
 not the admission lookup by module id.
@@ -569,6 +600,12 @@ agent until the program finishes. Each run has its own scope, a *run scope*: a s
 `call_mode: codemode` (section 4a). This section is the contract for providers that serve
 those calls.
 
+A run is either an *agent run*, started by a head and carrying the head's `agent_id`, or a
+*worker run*, started by a worker (a mason or sidekick) and carrying only
+`on_behalf_of_agent`, which names the head the worker serves without granting its authority
+(section 2). Unless a paragraph says otherwise, this section describes agent runs; worker runs
+have their own paragraph below.
+
 **Who does what.**
 - The run's owner, a module listed in `scope_authority_owners`, registers and ends run scopes.
   Only such an owner may set `agent_id` and `run_id` (section 2). A carrier asks the owner for a
@@ -585,15 +622,31 @@ those calls.
 of section 2; the rest is how the owner registers a run:
 - `kind: ephemeral`;
 - `attributes.agent_id`, the agent the run acts for, and `attributes.run_id`, the run. A
-  `run_id` needs an `agent_id` and cannot sit beside a `flow_id`;
+  `run_id` needs exactly one of `agent_id` or `on_behalf_of_agent` and cannot sit beside a
+  `flow_id`;
 - `carriers`: the carrier module alone, targeted at the run's providers and the module that
   serves its model calls. A targeted entry lists at most 16 modules;
-- `parent`: the scope of the head that started the run, for attribution only. It grants nothing.
-  The run's owner opens runs only for heads, so a run's parent is always a head scope, and a
-  head scope always carries `attributes.agent_id`. Worker scopes carry none;
+- `parent`: for attribution only; it grants nothing. An agent run's parent is the scope of the
+  head that started it, and a head scope always carries `attributes.agent_id`. A worker run's
+  parent is the worker's task scope, which carries no `agent_id`. The daemon does not check
+  the parent's kind;
 - `expires_at_ms`: the run's deadline, fixed for the epoch and at most 24 hours ahead;
 - `delegates`: either value is accepted. A delegating run binds only to providers declaring
   `call-modes/v1`, which act as the agent only under the checks in section 7.
+
+**Worker runs.** A worker run is registered like an agent run, with these differences:
+`attributes.on_behalf_of_agent` instead of `agent_id`, never `delegates`, and the worker's task
+scope as `parent`. Its routes bind only to providers declaring `worker-runs/v1`; every other
+target, including one declaring only `call-modes/v1` or the legacy `agent-run-scopes/v1`, is
+refused `target_agent_run_unsupported` at admission and relay re-check. Declaring
+`worker-runs/v1` promises that the provider handles a codemode bind with `run_id` and no
+`agent_id` as attribution only: it never acts as, consents for, or hands out per-agent handles
+of the attributed agent, and it does not look up the agent's own access through the parent
+link (obligation 3 below applies only to agent runs). A declarer receives `call_mode:
+codemode` and the stamp's `on_behalf_of_agent` even without `scope-on-behalf-of/v1`, since the
+attribution is the run's only identity. Lifetime, re-checks and drains are those of any run.
+Rollout is readers first: daemon, then providers declaring `worker-runs/v1`, then the owner
+emitting worker runs (section 2).
 
 **Which tools a run may call.** A provider serves codemode runs by declaring `call-modes/v1`
 and listing `codemode` in the catalog `modes` of each tool that serves them. A tool whose
@@ -787,7 +840,7 @@ caller may re-open within its own deadline.
 | `scope_epoch_in_use` | `scope.sync` / `scope.apply`, per record | conditional epoch/proof replacement has routes, in-flight binds or connected presence holders | no |
 | `scope_not_carrier` | `route.open` | the opener is not the owner or a carrier, or not targeted at this module | no |
 | `target_flow_unsupported` | `route.open`, admission and relay re-check | a flow scope's target provides neither `call-modes/v1` nor `flow-scopes/v1` | no |
-| `target_agent_run_unsupported` | `route.open`, admission and relay re-check | a run scope's target provides neither `call-modes/v1` nor `agent-run-scopes/v1`, or the run delegates and the target lacks `call-modes/v1` | no |
+| `target_agent_run_unsupported` | `route.open`, admission and relay re-check | an agent run's target provides neither `call-modes/v1` nor `agent-run-scopes/v1`, or the run delegates and the target lacks `call-modes/v1`, or a worker run's target lacks `worker-runs/v1` | no |
 | `scope_unsupported` | carrier, before opening | the daemon does not advertise `scopes/v1` | no |
 | `not_registered` | `scope.sync`, `scope.apply`, `scope.describe` | the connection has no module registration | no |
 | `scope_sync_not_authority` | `scope.sync`, `scope.apply` | the connection fails the owner's authority check | no |
@@ -797,11 +850,11 @@ caller may re-open within its own deadline.
 | `scope_live_limit_exceeded` | whole sync or apply | an input list or resulting live set exceeds 10,000 scopes | no |
 | `scope_attributes_too_large` | whole sync or apply | a record's attributes exceed 4 KiB | no |
 | `scope_epoch_regressed` | per upsert in sync or apply | the epoch is lower than the one held | no |
-| `scope_attribute_not_permitted` | per upsert in sync or apply | a gated attribute from an owner not in `scope_authority_owners`, `on_behalf_of_agent` with agent/delegation/flow/run attributes, or installed flow identity incomplete or without `flow_id` | no |
+| `scope_attribute_not_permitted` | per upsert in sync or apply | a gated attribute from an owner not in `scope_authority_owners`, `on_behalf_of_agent` with `agent_id`, `delegates` or `flow_id` (including a run carrying both attributions), or installed flow identity incomplete or without `flow_id` | no |
 | `scope_flow_identity_changed` | per upsert in sync or apply | `flow_version`, `flow_code_hash` or `flow_install_id` added, changed or removed within an epoch | no |
 | `scope_carrier_targets_invalid` | per upsert in sync or apply | a carrier's target list is empty or has more than 16 entries | no |
 | `scope_delegates_without_agent` | per upsert in sync or apply | `delegates: true` without `agent_id` | no |
-| `scope_run_id_without_agent` | per upsert in sync or apply | `run_id` without `agent_id` | no |
+| `scope_run_id_without_agent` | per upsert in sync or apply | `run_id` with neither `agent_id` nor `on_behalf_of_agent` | no |
 | `scope_run_id_with_flow_id` | per upsert in sync or apply | both `run_id` and `flow_id` | no |
 | `scope_run_id_delegates` | older peers' record validation only | legacy refusal for `run_id` with `delegates: true`; retained as a stable code, no longer emitted by this daemon's validation | no |
 | `scope_parent_not_permitted` | per upsert in sync or apply | the parent's owner has synced, and the syncing owner is not the parent's owner or in its `child_owners`, or the parent epoch is not live | no |
@@ -930,7 +983,7 @@ A caller may retry route-open refusals `scope_changed` and `scope_not_synced`. O
 
 Before sending expiry, deltas or run identity, owners check HELLO_ACK's advertised module ops for `scope.apply` (§11). That operation shipped with `expires_at_ms` and `run_id` in subc-protocol 0.30.0, so its presence is their support check; older full-sync bodies without deadline or run ID still decode unchanged.
 
-The daemon sends run-scoped binds only to providers declaring `call-modes/v1` or `agent-run-scopes/v1`; a delegating run requires `call-modes/v1`. Before writing run scopes, owners upgrade any reader using subc-protocol versions older than 0.30.0 that can describe the owner's scope references, because those readers reject unknown `attributes.run_id` fields.
+The daemon sends run-scoped binds only to providers declaring `call-modes/v1` or `agent-run-scopes/v1`; a delegating run requires `call-modes/v1`, and a worker run requires `worker-runs/v1`. Owners register worker runs only with a daemon advertising `worker-runs/v1`; older daemons refuse a `run_id` without `agent_id`. Before writing run scopes, owners upgrade any reader using subc-protocol versions older than 0.30.0 that can describe the owner's scope references, because those readers reject unknown `attributes.run_id` fields.
 
 Callosum removes `flow-scopes/v1`, `agent-run-scopes/v1`, and `call-modes/v1` declarations from manifests it re-exports: a remote provider's ability to read these bind fields must not claim that the intervening federation relay can read them.
 
@@ -979,9 +1032,14 @@ Each fails by name when its rule is removed:
   `ended`, its old epoch is `scope_expired`, and a higher epoch is `created`;
 - deadlines are immutable on live epochs; the exact 24-hour horizon is accepted, beyond it
   (including `u64::MAX`) is refused, and a fresh store refuses a passed deadline;
-- `run_id` obeys the attribute-authority and token checks, requires `agent_id`, and cannot
-  coexist with `flow_id`; delegating run records are accepted, and changes drain with
-  `scope_delegation_changed`;
+- `run_id` obeys the attribute-authority and token checks, requires exactly one of `agent_id`
+  or `on_behalf_of_agent` (both and neither are refused), and cannot coexist with `flow_id`;
+  a worker run with `delegates` is refused; delegating run records are accepted, and changes
+  drain with `scope_delegation_changed`;
+- a worker run binds only to a `worker-runs/v1` declarer, which receives `call_mode:
+  codemode` and `on_behalf_of_agent` and no `agent_id`; a `call-modes/v1`-only or
+  `agent-run-scopes/v1` target is refused `target_agent_run_unsupported`, and the daemon
+  advertises `worker-runs/v1`;
 - both admission and relay re-check allow non-delegating runs with `call-modes/v1` or
   `agent-run-scopes/v1`, require `call-modes/v1` for delegating runs, and allow flows with
   `call-modes/v1` or `flow-scopes/v1`; unsupported targets receive no bind and a failed

@@ -960,6 +960,7 @@ impl ControlHandler {
                 subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V2.to_string(),
                 subc_protocol::manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1.to_string(),
                 subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY.to_string(),
+                subc_protocol::scope::WORKER_RUNS_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_WORKDIR_CAPABILITY.to_string(),
                 subc_protocol::scope::FLOW_IDENTITY_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_SERVED_BY_CAPABILITY.to_string(),
@@ -5057,11 +5058,25 @@ impl ControlHandler {
                 stamp.project_id = None;
             }
         }
-        if !relay_capabilities.is_some_and(|caps| {
-            caps.provides
-                .iter()
-                .any(|cap| cap == subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY)
-        }) {
+        // A worker run has no agent_id; on_behalf_of_agent is its only agent
+        // attribution. The run gate above has already required the target to
+        // declare `worker-runs/v1`, which promises to read both
+        // `on_behalf_of_agent` and `call_mode`.
+        let worker_run = scope_stamp
+            .as_ref()
+            .is_some_and(crate::scopes::is_worker_run)
+            && relay_capabilities.is_some_and(|caps| {
+                caps.provides
+                    .iter()
+                    .any(|cap| cap == subc_protocol::scope::WORKER_RUNS_CAPABILITY)
+            });
+        if !worker_run
+            && !relay_capabilities.is_some_and(|caps| {
+                caps.provides
+                    .iter()
+                    .any(|cap| cap == subc_protocol::scope::SCOPE_ON_BEHALF_OF_CAPABILITY)
+            })
+        {
             if let Some(stamp) = scope_stamp.as_mut() {
                 stamp.attributes.on_behalf_of_agent = None;
             }
@@ -5077,8 +5092,9 @@ impl ControlHandler {
                 stamp.attributes.flow_install_id = None;
             }
         }
-        let call_mode = if relay_capabilities
-            .is_some_and(|caps| caps.provides.iter().any(|cap| cap == CALL_MODES_CAPABILITY))
+        let call_mode = if worker_run
+            || relay_capabilities
+                .is_some_and(|caps| caps.provides.iter().any(|cap| cap == CALL_MODES_CAPABILITY))
         {
             Some(derive_call_mode(scope_stamp.as_ref()))
         } else {
@@ -12545,6 +12561,44 @@ mod tests {
             panic!("server.describe reply")
         };
         assert!(capabilities.iter().any(|cap| cap == "scope-workdir/v1"));
+    }
+
+    #[tokio::test]
+    async fn worker_runs_capability_is_advertised_in_hello_ack_and_server_describe() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let (module, mut rx) = route_ctx(ConnectionId::new(160));
+        let ack = hello_via_sink(
+            &handler,
+            &module,
+            &mut rx,
+            hello_frame("worker-run-owner", PROTOCOL_VERSION, 1),
+        )
+        .await;
+        assert!(parse_ack(&ack)
+            .subc_capabilities
+            .iter()
+            .any(|cap| cap == "worker-runs/v1"));
+        let (client, _rx) = route_ctx(ConnectionId::new(161));
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            5,
+            serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap(),
+        )
+        .unwrap();
+        let reply = handler
+            .handle_control_frame(&client, frame)
+            .await
+            .unwrap()
+            .remove(0);
+        let ClientControlResponse::ServerDescribe { capabilities, .. } =
+            serde_json::from_slice(&reply.body).unwrap()
+        else {
+            panic!("server.describe reply")
+        };
+        assert!(capabilities.iter().any(|cap| cap == "worker-runs/v1"));
     }
 
     #[tokio::test]

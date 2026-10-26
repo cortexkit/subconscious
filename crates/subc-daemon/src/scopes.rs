@@ -38,7 +38,7 @@ use subc_protocol::{
         ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector, ScopeStamp, ScopeStatus,
         AGENT_RUN_SCOPES_CAPABILITY, FLOW_SCOPES_CAPABILITY, MAX_CARRIER_TARGETS,
         MAX_LIVE_SCOPES_PER_OWNER, MAX_SCOPE_ATTRIBUTE_BYTES, MAX_SCOPE_EXPIRY_AHEAD_MS,
-        MAX_SCOPE_TOMBSTONES_PER_OWNER,
+        MAX_SCOPE_TOMBSTONES_PER_OWNER, WORKER_RUNS_CAPABILITY,
     },
     Principal, RouteCloseReason,
 };
@@ -371,21 +371,45 @@ pub(crate) fn check_target_flow_support(
     })
 }
 
+/// A worker run: a run scope attributed to an agent through
+/// `on_behalf_of_agent` but without its `agent_id`, so it carries none of that
+/// agent's authority. Record validation guarantees a `run_id` without `agent_id`
+/// carries `on_behalf_of_agent`, so the test needs only the first two fields.
+pub(crate) fn is_worker_run(stamp: &ScopeStamp) -> bool {
+    stamp.attributes.run_id.is_some() && stamp.attributes.agent_id.is_none()
+}
+
 /// A run requires `call-modes/v1` or, during migration, `agent-run-scopes/v1`.
 /// Delegating runs require `call-modes/v1`: legacy providers assumed a run never
 /// carries its agent's authority, so decoding the stamp alone is not sufficient.
+/// A worker run requires `worker-runs/v1` and nothing else admits it: both older
+/// capabilities were written assuming a run carries its agent's identity, so a
+/// provider declaring only those could read a run without `agent_id` wrongly.
 pub(crate) fn check_target_agent_run_support(
     stamp: &ScopeStamp,
     target_module: &str,
     capabilities: Option<&CapabilityDeclarations>,
 ) -> Result<(), ScopeAdmissionRefusal> {
-    if stamp.attributes.run_id.is_none()
-        || capabilities.is_some_and(|caps| {
-            caps.provides.iter().any(|cap| {
-                cap == CALL_MODES_CAPABILITY
-                    || (!stamp.attributes.delegates && cap == AGENT_RUN_SCOPES_CAPABILITY)
-            })
-        })
+    if stamp.attributes.run_id.is_none() {
+        return Ok(());
+    }
+    let provides = |wanted: &str| {
+        capabilities.is_some_and(|caps| caps.provides.iter().any(|cap| cap == wanted))
+    };
+    if is_worker_run(stamp) {
+        if provides(WORKER_RUNS_CAPABILITY) {
+            return Ok(());
+        }
+        return Err(ScopeAdmissionRefusal {
+            code: error_codes::TARGET_AGENT_RUN_UNSUPPORTED,
+            message: format!(
+                "target module '{target_module}' does not provide capability \
+                 '{WORKER_RUNS_CAPABILITY}', required for a worker run scope (run_id without agent_id)"
+            ),
+        });
+    }
+    if provides(CALL_MODES_CAPABILITY)
+        || (!stamp.attributes.delegates && provides(AGENT_RUN_SCOPES_CAPABILITY))
     {
         return Ok(());
     }
@@ -1389,16 +1413,19 @@ impl ScopeTable {
                     .to_string(),
             ));
         }
+        // A worker run (run_id with on_behalf_of_agent) is the one combination
+        // attribution may join: it names the agent the run works for without
+        // handing it that agent's authority. Its parent is deliberately not
+        // checked here; the run is attribution-only whatever it hangs under,
+        // and the parent may not be linked yet.
         if record.attributes.on_behalf_of_agent.is_some()
             && (record.attributes.agent_id.is_some()
                 || record.attributes.delegates
-                || record.attributes.flow_id.is_some()
-                || record.attributes.run_id.is_some())
+                || record.attributes.flow_id.is_some())
         {
             return Some((
                 error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
-                "on_behalf_of_agent cannot accompany agent_id, delegates, flow_id or run_id"
-                    .to_string(),
+                "on_behalf_of_agent cannot accompany agent_id, delegates or flow_id".to_string(),
             ));
         }
         if record.attributes.delegates && record.attributes.agent_id.is_none() {
@@ -1408,10 +1435,13 @@ impl ScopeTable {
             ));
         }
         if record.attributes.run_id.is_some() {
-            if record.attributes.agent_id.is_none() {
+            if record.attributes.agent_id.is_none()
+                && record.attributes.on_behalf_of_agent.is_none()
+            {
                 return Some((
                     error_codes::SCOPE_RUN_ID_WITHOUT_AGENT,
-                    "run_id requires an agent_id".to_string(),
+                    "run_id requires an agent_id or, for a worker run, an on_behalf_of_agent"
+                        .to_string(),
                 ));
             }
             if record.attributes.flow_id.is_some() {

@@ -5,7 +5,7 @@ use subc_protocol::{
         validate_run_id, ParentState, ScopeAttributes, ScopeCarrier, ScopeEnd, ScopeEndOutcome,
         ScopeEndResult, ScopeKind, ScopeParent, ScopeRecord, ScopeStamp,
         AGENT_RUN_SCOPES_CAPABILITY, MAX_SCOPE_EXPIRY_AHEAD_MS, SCOPE_APPLY_OP,
-        SCOPE_ON_BEHALF_OF_CAPABILITY,
+        SCOPE_ON_BEHALF_OF_CAPABILITY, WORKER_RUNS_CAPABILITY,
     },
     session::{ModuleControlRequestFromModule, ModuleControlResponseToModule},
     tool_call::OpaqueFieldError,
@@ -61,6 +61,7 @@ fn scope_construction_api_sets_required_and_optional_fields_from_a_dependent_cra
     assert_eq!(SCOPE_APPLY_OP, "scope.apply");
     assert_eq!(AGENT_RUN_SCOPES_CAPABILITY, "agent-run-scopes/v1");
     assert_eq!(SCOPE_ON_BEHALF_OF_CAPABILITY, "scope-on-behalf-of/v1");
+    assert_eq!(WORKER_RUNS_CAPABILITY, "worker-runs/v1");
     assert_eq!(MAX_SCOPE_EXPIRY_AHEAD_MS, 86_400_000);
 }
 

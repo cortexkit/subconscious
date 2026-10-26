@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.37.10
+
+- Require subc-protocol 0.33.2, the first release with the flow-identity
+  fields and validators this crate uses. 0.37.9 asked for 0.33.1, so its
+  published package could not build against the registry, and it was never
+  published; 0.37.10 carries the same changes.
+
 ## 0.37.9
 
 - Validate approved installed flow identity (`flow_version`, `flow_code_hash`, `flow_install_id`) from the scope-authority owner. Refuse incomplete identities or identities without `flow_id` per record, and refuse same-epoch additions, changes or removals as `scope_flow_identity_changed`. Advertise `flow-identity-scopes/v1` and include the new fields only for bind targets and describe callers declaring it, preserving legacy-reader stamps.

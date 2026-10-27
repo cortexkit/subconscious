@@ -3930,10 +3930,15 @@ fn external_domain_replaces_ck_and_preserves_signal_behavior() {
         "ck-signal-probe",
         "if [ \"$1\" = \"--ck-domain\" ]; then printf '%s\\n' 'Signal fixture'; exit 0; fi\n\
          trap 'printf \"term\\n\" > \"$CK_DOMAIN_TERM_MARKER\"; exit 7' TERM\n\
-         printf '%s\\n' \"$$\" > \"$CK_DOMAIN_STARTED_MARKER\"\n\
+         printf '%s\\n' \"$$\" > \"$CK_DOMAIN_STARTED_MARKER.tmp\"\n\
+         mv \"$CK_DOMAIN_STARTED_MARKER.tmp\" \"$CK_DOMAIN_STARTED_MARKER\"\n\
          while :; do sleep 0.05; done",
     );
 
+    // The fixture writes its pid to a temporary name and renames it into
+    // place, so the marker appears only once it holds the whole pid. The test
+    // reads the pid as soon as the marker exists, and a plain `>` redirect
+    // creates the file empty before writing to it.
     let started = temp.path().join("term-started");
     let term_marker = temp.path().join("term-received");
     let mut ck = ck_command()

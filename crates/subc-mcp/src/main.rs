@@ -6181,14 +6181,41 @@ struct OutageRefusal {
 }
 
 impl OutageRefusal {
-    /// The detail as one line: compact JSON, or a string detail as it is.
-    /// A line that breaks the block's rules is left out by the renderer.
+    /// The detail as one line: compact JSON with object keys sorted, or a
+    /// string detail as it is. A line that breaks the block's rules is left
+    /// out by the renderer.
+    ///
+    /// Keys are sorted explicitly because serde_json's map order is a build
+    /// feature: `preserve_order`, which another workspace crate enables,
+    /// keeps insertion order, and the default sorts. Without this the bytes
+    /// the model reads would depend on how the gateway was built.
     fn detail_line(&self) -> Option<String> {
         match self.detail.as_ref()? {
             serde_json::Value::Null => None,
             serde_json::Value::String(detail) => Some(detail.clone()),
-            other => Some(other.to_string()),
+            other => Some(sorted_json(other).to_string()),
         }
+    }
+}
+
+/// A copy of `value` whose objects, at every depth, list their keys in sorted
+/// order whatever map order serde_json was built with.
+fn sorted_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.iter().collect();
+            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.clone(), sorted_json(value)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(sorted_json).collect())
+        }
+        other => other.clone(),
     }
 }
 
@@ -10172,6 +10199,23 @@ mod tests {
         assert_eq!(result.is_error, Some(true));
         assert_eq!(result.content.len(), 1, "one text block");
         result.content[0].as_text().unwrap().text.clone()
+    }
+
+    #[test]
+    fn sorted_json_sorts_keys_at_every_depth() {
+        let mut inner = serde_json::Map::new();
+        inner.insert("z".to_owned(), serde_json::json!(1));
+        inner.insert("a".to_owned(), serde_json::json!(2));
+        let mut outer = serde_json::Map::new();
+        outer.insert(
+            "y".to_owned(),
+            serde_json::Value::Array(vec![serde_json::Value::Object(inner)]),
+        );
+        outer.insert("b".to_owned(), serde_json::json!("x"));
+        assert_eq!(
+            sorted_json(&serde_json::Value::Object(outer)).to_string(),
+            r#"{"b":"x","y":[{"a":2,"z":1}]}"#
+        );
     }
 
     #[test]

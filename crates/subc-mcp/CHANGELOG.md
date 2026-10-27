@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.47
+
+- The outage block's `detail` line lists object keys in sorted order on every
+  build. serde_json's map order depends on a build feature, so a workspace
+  build and a package build rendered the same detail differently.
+
 ## 0.1.46
 
 - A tool call whose provider module is restarting or down no longer fails as a JSON-RPC error when the daemon proves the call never reached the module: the daemon refused the route.open the call needed (a conversation route, or the provider's route reopened while the call waits), or answered the request itself with `module_reloading`, which it only does before forwarding. If the daemon's code is retryable (`module_reloading`, `module_warming`, `target_unavailable` and the others `is_retryable_route_open` lists), the gateway sends the call again with backoff for up to 90 seconds; a call that then succeeds returns its normal result. The host cancelling the call ends the wait. A terminal code, or a refusal still standing after 90 seconds, returns a normal tool result with `isError: true` and one text block in the outage format every CortexKit runner uses (`cortexkit-role-llm-runner` 0.7.9, CONTRACT §4.4 and §11.4): the message, then `module:`, `code:` (the daemon's code verbatim), `detail:` (when the daemon sent one, as one line), `nothing was sent`, and for a retryable code a `retry:` hint. A member that would break the format's rules is left out, never cut. Every other failure is unchanged and never retried: timeouts, lost replies, outcome-unknown, protocol and provider errors, including a `target_unavailable` Error answering the request. `SUBC_MCP_OUTAGE_WAIT_MS` overrides the 90-second wait (used by the tests).

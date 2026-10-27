@@ -5123,6 +5123,10 @@ impl ControlHandler {
         // Rendered BEFORE the move into the relay, because the accept arm below
         // is where it is logged and the principal is gone by then.
         let route_principal_label = principal_label(&principal);
+        // The opener's build class is an unattested claim meant only for the
+        // daemon's own prompt decision. A module must never see it, so that no
+        // module can come to rely on a claim any local process could make.
+        identity.build_class = None;
         let relay = ModuleControlRequest::RouteBind {
             route_channel: module_channel,
             epoch: module_epoch,
@@ -12082,6 +12086,70 @@ mod tests {
                 .unwrap();
             route_task.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn route_bind_never_relays_the_openers_build_class() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let (target_ctx, mut target_rx) = route_ctx(ConnectionId::new(80));
+        hello_via_sink(
+            &handler,
+            &target_ctx,
+            &mut target_rx,
+            hello_frame("target", PROTOCOL_VERSION, 1),
+        )
+        .await;
+
+        let root = unique_project_root("build-class");
+        let mut identity = BindIdentity::new(
+            root.path().to_path_buf(),
+            "unit".to_string(),
+            "s".to_string(),
+        );
+        identity.build_class = Some(subc_protocol::BUILD_CLASS_PRODUCTION.to_string());
+        let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+            target: RouteTarget::ToolProvider {
+                module_id: "target".to_string(),
+            },
+            identity,
+            consumer_identity: None,
+            consumer_capabilities: None,
+            role_versions: None,
+            admission_facts: None,
+            scope: None,
+        })
+        .unwrap();
+        let open = Frame::build(FrameType::Request, control_flags(), 0, 0, 30, body).unwrap();
+
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(81));
+        let route_handler = handler.clone();
+        let route_task = tokio::spawn(async move {
+            route_handler
+                .handle_control_frame(&client_ctx, open)
+                .await
+                .unwrap()
+        });
+        let bind_frame = target_rx.recv().await.unwrap();
+        let bind: ModuleControlRequest = serde_json::from_slice(&bind_frame.body).unwrap();
+        let ModuleControlRequest::RouteBind { identity, .. } = bind else {
+            panic!("expected route.bind")
+        };
+        assert_eq!(
+            identity.build_class, None,
+            "route.bind carried the build class"
+        );
+        assert!(
+            !String::from_utf8_lossy(&bind_frame.body).contains("build_class"),
+            "the route.bind bytes still name build_class"
+        );
+        handler
+            .handle_control_frame(&target_ctx, route_bind_ack(bind_frame.header.corr))
+            .await
+            .unwrap();
+        route_task.await.unwrap();
     }
 
     #[tokio::test]

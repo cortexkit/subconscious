@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.13
+
+- `route.bind` never carries the opener's `build_class`. The daemon clears it from the identity before relaying the bind, so no module can come to rely on a claim any local process can make. Callosum's production-build claim stays evidence for the daemon's own prompt decision only.
+
 ## 0.37.12
 
 - Project manifest `flow_operations` through `catalog.list` unchanged, so an install check can refuse a flow naming an operation its target never serves to flows. The daemon does not enforce the list; each module refuses the operations it does not admit. An invalid list (no `flow-scopes/v1` or `call-modes/v1`, an undeclared or repeated operation, more than 256 names, or not an array of strings) is dropped at HELLO with one WARN naming the reason, and the module still registers. Absent lists keep existing catalog bytes. Requires subc-protocol 0.33.4 and subc-control 0.33.3.

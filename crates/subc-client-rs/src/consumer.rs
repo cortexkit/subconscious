@@ -774,19 +774,6 @@ pub enum RouteEndReason {
     Unknown,
 }
 
-#[derive(Debug)]
-struct RouteEnded {
-    message: String,
-    reason: RouteEndReason,
-}
-
-impl fmt::Display for RouteEnded {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-impl Error for RouteEnded {}
-
 /// Whether a closed route may be reopened automatically from its reason alone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteCloseDisposition {
@@ -1388,8 +1375,9 @@ impl SubcConsumer {
                 return Err(CallError::route_open_refused(target_label, body));
             }
             _ => {
-                return Err(CallError::not_sent(
+                return Err(CallError::not_sent_with_cause(
                     "route.open returned a non-response frame",
+                    NotSentCause::RouteOpenAbandoned,
                 ));
             }
         };
@@ -1397,11 +1385,15 @@ impl SubcConsumer {
             route_channel,
             route_epoch,
         } = serde_json::from_slice(&body).map_err(|err| {
-            CallError::not_sent(format!("failed to decode route.open response: {err}"))
+            CallError::not_sent_with_cause(
+                format!("failed to decode route.open response: {err}"),
+                NotSentCause::RouteOpenAbandoned,
+            )
         })?
         else {
-            return Err(CallError::not_sent(
+            return Err(CallError::not_sent_with_cause(
                 "route.open returned an unexpected control response",
+                NotSentCause::RouteOpenAbandoned,
             ));
         };
         // Adopt the handle the socket reader installed for this response, which
@@ -1447,7 +1439,7 @@ impl SubcConsumer {
                 Ok(TerminalFrame::Response { body, .. }) => {
                     let response =
                         serde_json::from_slice::<ClientControlResponse>(&body).map_err(|err| {
-                            CallError::not_sent(format!(
+                            CallError::invalid_response(format!(
                                 "failed to decode catalog.list response: {err}"
                             ))
                         })?;
@@ -1457,7 +1449,7 @@ impl SubcConsumer {
                         subc_ops,
                     } = response
                     else {
-                        return Err(CallError::not_sent(
+                        return Err(CallError::invalid_response(
                             "catalog.list returned an unexpected control response",
                         ));
                     };
@@ -1469,7 +1461,9 @@ impl SubcConsumer {
                 }
                 Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
                 Ok(TerminalFrame::StreamEnd) => {
-                    return Err(CallError::not_sent("catalog.list returned StreamEnd"));
+                    return Err(CallError::invalid_response(
+                        "catalog.list returned StreamEnd",
+                    ));
                 }
                 Err(err)
                     if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
@@ -1510,7 +1504,7 @@ impl SubcConsumer {
                 Ok(TerminalFrame::Response { body, .. }) => {
                     let response =
                         serde_json::from_slice::<ClientControlResponse>(&body).map_err(|err| {
-                            CallError::not_sent(format!(
+                            CallError::invalid_response(format!(
                                 "failed to decode supervisor.list response: {err}"
                             ))
                         })?;
@@ -1519,7 +1513,7 @@ impl SubcConsumer {
                         modules,
                     } = response
                     else {
-                        return Err(CallError::not_sent(
+                        return Err(CallError::invalid_response(
                             "supervisor.list returned an unexpected control response",
                         ));
                     };
@@ -1530,7 +1524,9 @@ impl SubcConsumer {
                 }
                 Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
                 Ok(TerminalFrame::StreamEnd) => {
-                    return Err(CallError::not_sent("supervisor.list returned StreamEnd"));
+                    return Err(CallError::invalid_response(
+                        "supervisor.list returned StreamEnd",
+                    ));
                 }
                 Err(err)
                     if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
@@ -1575,13 +1571,13 @@ impl SubcConsumer {
                 Ok(TerminalFrame::Response { body, .. }) => {
                     let response =
                         serde_json::from_slice::<ClientControlResponse>(&body).map_err(|err| {
-                            CallError::not_sent(format!(
+                            CallError::invalid_response(format!(
                                 "failed to decode supervisor.spawn_snapshot response: {err}"
                             ))
                         })?;
                     let ClientControlResponse::SupervisorSpawnSnapshot { snapshot } = response
                     else {
-                        return Err(CallError::not_sent(
+                        return Err(CallError::invalid_response(
                             "supervisor.spawn_snapshot returned an unexpected control response",
                         ));
                     };
@@ -1589,7 +1585,7 @@ impl SubcConsumer {
                 }
                 Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
                 Ok(TerminalFrame::StreamEnd) => {
-                    return Err(CallError::not_sent(
+                    return Err(CallError::invalid_response(
                         "supervisor.spawn_snapshot returned StreamEnd",
                     ));
                 }
@@ -1631,12 +1627,16 @@ impl SubcConsumer {
             {
                 Ok(TerminalFrame::Response { body, .. }) => {
                     return serde_json::from_slice(&body).map_err(|err| {
-                        CallError::not_sent(format!("invalid activity.query response: {err}"))
+                        CallError::invalid_response(format!(
+                            "invalid activity.query response: {err}"
+                        ))
                     });
                 }
                 Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
                 Ok(TerminalFrame::StreamEnd) => {
-                    return Err(CallError::not_sent("activity.query returned StreamEnd"));
+                    return Err(CallError::invalid_response(
+                        "activity.query returned StreamEnd",
+                    ));
                 }
                 Err(err)
                     if is_retryable_catalog_transport_error(&err) && Instant::now() < deadline =>
@@ -1951,7 +1951,7 @@ impl SubcConsumer {
             TerminalFrame::Response { body, .. } => body,
             TerminalFrame::Error { body, .. } => return Err(CallError::Module(body)),
             TerminalFrame::StreamEnd => {
-                return Err(CallError::not_sent(
+                return Err(CallError::invalid_response(
                     "route.poll returned a non-response frame",
                 ));
             }
@@ -1961,15 +1961,16 @@ impl SubcConsumer {
             route_epoch,
             status,
             live,
-        } = serde_json::from_slice(&body)
-            .map_err(|err| CallError::not_sent(format!("failed to decode route.poll: {err}")))?
+        } = serde_json::from_slice(&body).map_err(|err| {
+            CallError::invalid_response(format!("failed to decode route.poll: {err}"))
+        })?
         else {
-            return Err(CallError::not_sent(
+            return Err(CallError::invalid_response(
                 "route.poll returned an unexpected control response",
             ));
         };
         if route_channel != handle.channel || route_epoch != handle.epoch {
-            return Err(CallError::not_sent(
+            return Err(CallError::invalid_response(
                 "route.poll response echoed a different route handle",
             ));
         }
@@ -2188,10 +2189,25 @@ impl SubcConsumer {
         opts: CallOptions,
         cancel: Option<Arc<UnaryCancel>>,
     ) -> Result<CallReply, CallError> {
+        let mut never_forwarded = true;
+        self.call_attempts(target, identity, body, opts, cancel, &mut never_forwarded)
+            .await
+            .map_err(|err| err.with_never_forwarded(never_forwarded))
+    }
+
+    async fn call_attempts(
+        &self,
+        target: RouteTarget,
+        identity: BindIdentity,
+        body: (Vec<u8>, bool),
+        opts: CallOptions,
+        cancel: Option<Arc<UnaryCancel>>,
+        never_forwarded: &mut bool,
+    ) -> Result<CallReply, CallError> {
         let (body, binary) = body;
         let call_deadline = Instant::now() + opts.timeout;
-        // One resend per call after a refusal that proves the module never
-        // received the request (route dead, or the module draining).
+        // Preserve the single resend policy even for older daemons whose
+        // unmarked refusals cannot prove that the module never saw the request.
         let mut resent_after_unsent_refusal = false;
         let consumer_identity = route_open_consumer_identity(&opts);
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
@@ -2261,6 +2277,18 @@ impl SubcConsumer {
                 .await;
             drop(permit);
 
+            let proven_undelivered = match &response {
+                Ok(TerminalFrame::Error { body, flags }) => {
+                    is_daemon_refusal_before_forward(*flags, &body.code)
+                }
+                Err(err) => {
+                    err.never_forwarded() == Some(true)
+                        || matches!(err, CallError::StaleRouteHandle(_))
+                }
+                _ => false,
+            };
+            *never_forwarded &= proven_undelivered;
+
             match response {
                 Ok(TerminalFrame::Response { body, flags, .. }) => {
                     return Ok(CallReply {
@@ -2274,19 +2302,9 @@ impl SubcConsumer {
                         binary: false,
                     });
                 }
-                // unknown_channel is the daemon ROUTER refusing an unrouted channel:
-                // the request provably never reached a module, so one in-place retry
-                // cannot double-execute. The cached bind is dead (module restarted;
-                // its route-gone GOODBYE raced or was missed) — invalidate it so the
-                // retry re-opens instead of resending into the same dead channel.
-                // stale_route_epoch is the same class with a sharper cause (issue
-                // #39): channel known, epoch released mid-flight. Its documented
-                // contract is NOT-FORWARDED (dropped before delivery), so the retry
-                // is safe by construction; the remedy is identical.
-                // module_reloading joins the same single resend: see
-                // `is_data_plane_drain_refusal`. All three codes share one
-                // budget, so a call resends at most once whichever arrives.
-                // Parity with the TS client's retry-once in call().
+                // Route-dead and drain refusals share one eviction/resend budget.
+                // Only the daemon-origin flag proves non-delivery; the retry
+                // policy itself stays compatible with unmarked older daemons.
                 Ok(TerminalFrame::Error { body, flags })
                     if (error_codes::is_established_route_dead(flags, &body.code)
                         || is_data_plane_drain_refusal(&body.code))
@@ -2297,6 +2315,17 @@ impl SubcConsumer {
                     resent_after_unsent_refusal = true;
                     self.shared.invalidate_route(&route_key, Some(route.handle));
                     continue;
+                }
+                Ok(TerminalFrame::Error { body, flags })
+                    if is_daemon_refusal_before_forward(flags, &body.code) =>
+                {
+                    return Err(CallError::not_sent_with_cause(
+                        format!(
+                            "daemon refused before forwarding: {} ({})",
+                            body.code, body.message
+                        ),
+                        NotSentCause::DaemonRefusedBeforeForward { code: body.code },
+                    ));
                 }
                 Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
                 Err(err)
@@ -2588,10 +2617,50 @@ impl fmt::Display for OutcomeUnknownSource {
 }
 impl Error for OutcomeUnknownSource {}
 
+/// Why an attempt was classified as [`CallError::NotSent`]. For resend safety
+/// across all attempts, also check [`CallError::never_forwarded`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum NotSentCause {
+    /// The daemon or module refused route.open before the data request.
+    RouteOpenRefused { code: String },
+    /// Route opening ended without a usable answer, including cancellation.
+    RouteOpenAbandoned,
+    /// Local validation, connection state or flow control prevented queueing.
+    BeforeQueue,
+    /// The deadline elapsed waiting for the writer's cancel-safe queue send.
+    WriterCapacity,
+    /// The writer did not accept the request for transmission.
+    WriterRejected,
+    /// A control response could not be decoded or had an unexpected shape.
+    InvalidResponse,
+    /// An internal completion channel dropped without proving non-delivery.
+    CompletionFailed,
+    /// A daemon-marked data-plane refusal proved this attempt was not forwarded.
+    DaemonRefusedBeforeForward { code: String },
+}
+
+#[derive(Debug, Clone)]
+struct NotSentSource {
+    message: String,
+    cause: NotSentCause,
+    never_forwarded: bool,
+    route_reason: Option<RouteEndReason>,
+    refusal: Option<Box<RouteOpenRefused>>,
+}
+
+impl fmt::Display for NotSentSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl Error for NotSentSource {}
+
 /// Managed call or subscription failure.
 #[derive(Debug)]
 pub enum CallError {
-    /// The request body was not accepted by the writer path, or route.open failed before data send.
+    /// A pre-send failure, proven non-delivery, or unusable reply or internal completion.
+    /// Check [`CallError::never_forwarded`] before treating the whole call as safe to resend.
     NotSent(Box<dyn Error + Send + Sync>),
     /// The request body was accepted by the writer path, but no terminal response was observed.
     OutcomeUnknown(Box<dyn Error + Send + Sync>),
@@ -2630,15 +2699,14 @@ impl CallError {
     /// this reason never makes a sent call safe to resend.
     pub fn close_reason(&self) -> Option<&RouteEndReason> {
         match self {
-            Self::NotSent(source) | Self::OutcomeUnknown(source) => source
-                .downcast_ref::<RouteEnded>()
-                .map(|ended| &ended.reason)
-                .or_else(|| {
-                    source
-                        .downcast_ref::<OutcomeUnknownSource>()?
-                        .route_reason
-                        .as_ref()
-                }),
+            Self::NotSent(source) => source
+                .downcast_ref::<NotSentSource>()?
+                .route_reason
+                .as_ref(),
+            Self::OutcomeUnknown(source) => source
+                .downcast_ref::<OutcomeUnknownSource>()?
+                .route_reason
+                .as_ref(),
             _ => None,
         }
     }
@@ -2650,6 +2718,32 @@ impl CallError {
             Self::OutcomeUnknown(source) => source
                 .downcast_ref::<OutcomeUnknownSource>()
                 .map(|source| source.cause),
+            _ => None,
+        }
+    }
+
+    /// Why the final attempt was classified as `NotSent`, without parsing its message.
+    /// Returns `None` for other variants and externally constructed untyped errors.
+    pub fn not_sent_cause(&self) -> Option<NotSentCause> {
+        match self {
+            Self::NotSent(source) => source
+                .downcast_ref::<NotSentSource>()
+                .map(|source| source.cause.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether no attempt of this call may have reached the module.
+    ///
+    /// `Some(false)` means this or an earlier attempt may have been forwarded.
+    /// For data-plane errors, only daemon-marked refusals prove non-delivery;
+    /// unmarked replies remain conservative on older daemons. Managed calls
+    /// include every attempt. Returns `None` except for crate-built `NotSent` errors.
+    pub fn never_forwarded(&self) -> Option<bool> {
+        match self {
+            Self::NotSent(source) => source
+                .downcast_ref::<NotSentSource>()
+                .map(|source| source.never_forwarded),
             _ => None,
         }
     }
@@ -2669,7 +2763,30 @@ impl CallError {
     }
 
     fn not_sent(reason: impl Into<String>) -> Self {
-        Self::NotSent(Box::new(SimpleError(reason.into())))
+        Self::not_sent_with_cause(reason, NotSentCause::BeforeQueue)
+    }
+
+    fn not_sent_with_cause(reason: impl Into<String>, cause: NotSentCause) -> Self {
+        Self::NotSent(Box::new(NotSentSource {
+            message: reason.into(),
+            cause,
+            never_forwarded: true,
+            route_reason: None,
+            refusal: None,
+        }))
+    }
+
+    fn with_never_forwarded(mut self, never_forwarded: bool) -> Self {
+        if let Self::NotSent(source) = &mut self {
+            if let Some(source) = source.downcast_mut::<NotSentSource>() {
+                source.never_forwarded &= never_forwarded;
+            }
+        }
+        self
+    }
+
+    fn invalid_response(reason: impl Into<String>) -> Self {
+        Self::not_sent_with_cause(reason, NotSentCause::InvalidResponse).with_never_forwarded(false)
     }
 
     fn outcome_unknown(reason: impl Into<String>, cause: OutcomeUnknownCause) -> Self {
@@ -2703,7 +2820,8 @@ impl CallError {
     pub fn route_open_refusal(&self) -> Option<&ErrorBody> {
         match self {
             Self::NotSent(err) => err
-                .downcast_ref::<RouteOpenRefused>()
+                .downcast_ref::<NotSentSource>()
+                .and_then(|source| source.refusal.as_ref())
                 .map(|refused| &refused.body),
             _ => None,
         }
@@ -2883,11 +3001,11 @@ impl RouteOpenRefusals {
 
     fn into_error(self, target: String) -> Option<CallError> {
         let body = self.best?;
-        Some(CallError::NotSent(Box::new(RouteOpenRefused {
+        Some(CallError::from_route_open_refusal(RouteOpenRefused {
             target,
             body,
             most_recent: self.most_recent,
-        })))
+        }))
     }
 }
 
@@ -2906,10 +3024,22 @@ fn route_target_label(target: &RouteTarget) -> String {
 
 impl CallError {
     fn route_open_refused(target: String, body: ErrorBody) -> Self {
-        Self::NotSent(Box::new(RouteOpenRefused {
+        Self::from_route_open_refusal(RouteOpenRefused {
             target,
             body,
             most_recent: None,
+        })
+    }
+
+    fn from_route_open_refusal(refusal: RouteOpenRefused) -> Self {
+        Self::NotSent(Box::new(NotSentSource {
+            message: refusal.to_string(),
+            cause: NotSentCause::RouteOpenRefused {
+                code: refusal.body.code.clone(),
+            },
+            never_forwarded: true,
+            route_reason: None,
+            refusal: Some(Box::new(refusal)),
         }))
     }
 }
@@ -3648,8 +3778,9 @@ impl Shared {
                     Ok(Ok(Err(err))) => return Err(err.into_call_error()),
                     Ok(Err(_)) => continue,
                     Err(_) => {
-                        return Err(CallError::not_sent(
+                        return Err(CallError::not_sent_with_cause(
                             "call deadline elapsed waiting for route.open",
+                            NotSentCause::RouteOpenAbandoned,
                         ));
                     }
                 },
@@ -3724,17 +3855,19 @@ impl Shared {
                 }) => {
                     let response =
                         serde_json::from_slice::<ClientControlResponse>(&body).map_err(|err| {
-                            CallError::not_sent(format!(
-                                "failed to decode route.open response: {err}"
-                            ))
+                            CallError::not_sent_with_cause(
+                                format!("failed to decode route.open response: {err}"),
+                                NotSentCause::RouteOpenAbandoned,
+                            )
                         })?;
                     let ClientControlResponse::RouteOpen {
                         route_channel,
                         route_epoch,
                     } = response
                     else {
-                        return Err(CallError::not_sent(
+                        return Err(CallError::not_sent_with_cause(
                             "route.open returned an unexpected control response",
+                            NotSentCause::RouteOpenAbandoned,
                         ));
                     };
                     let handle = self
@@ -3781,8 +3914,9 @@ impl Shared {
                                 // leak it, then report the close as a NotSent failure.
                                 self.send_route_goodbye(route.handle, true);
                                 self.uninstall_route_handle(route.handle);
-                                return Err(CallError::not_sent(
+                                return Err(CallError::not_sent_with_cause(
                                     "route was closed before route.open completed",
+                                    NotSentCause::RouteOpenAbandoned,
                                 ));
                             }
                             // Stale generation / writer gone: fall through to retry.
@@ -3819,7 +3953,10 @@ impl Shared {
                     continue;
                 }
                 Ok(TerminalFrame::StreamEnd) => {
-                    return Err(CallError::not_sent("route.open returned StreamEnd"));
+                    return Err(CallError::not_sent_with_cause(
+                        "route.open returned StreamEnd",
+                        NotSentCause::RouteOpenAbandoned,
+                    ));
                 }
                 Err(err) if err.is_not_sent() && Instant::now() < route_deadline => {
                     let delay = self.jittered(opts.route_retry.delay_after_attempt(attempt));
@@ -4022,8 +4159,9 @@ impl Shared {
             }
             Err(_) => {
                 let _ = registration.remove_pending();
-                return Err(CallError::not_sent(
+                return Err(CallError::not_sent_with_cause(
                     "call deadline elapsed waiting for writer capacity",
+                    NotSentCause::WriterCapacity,
                 ));
             }
         }
@@ -4054,7 +4192,9 @@ impl Shared {
                 }
                 Ok(Err(_)) => {
                     registration.disarm();
-                    Err(CallError::not_sent("pending response channel closed"))
+                    Err(CallError::not_sent_with_cause(
+                        "pending response channel closed", NotSentCause::CompletionFailed,
+                    ).with_never_forwarded(false))
                 }
                 Err(_) => {
                     let accepted = if registration.retain_on_drop {
@@ -4298,8 +4438,9 @@ impl Shared {
             }
             Err(_) => {
                 let _ = registration.remove_pending();
-                return Err(CallError::not_sent(
+                return Err(CallError::not_sent_with_cause(
                     "subscription deadline elapsed waiting for writer capacity",
+                    NotSentCause::WriterCapacity,
                 ));
             }
         }
@@ -4520,8 +4661,9 @@ impl Shared {
         {
             let entry = inner.remove_pending(&key).unwrap();
             drop(inner);
-            entry.settle_call_error(CallError::not_sent(
+            entry.settle_call_error(CallError::not_sent_with_cause(
                 "call deadline elapsed before request was sent",
+                NotSentCause::WriterRejected,
             ));
             return false;
         }
@@ -4836,9 +4978,12 @@ impl Shared {
         } else {
             inner.route_end_reason(handle.channel)
         };
-        CallError::NotSent(Box::new(RouteEnded {
+        CallError::NotSent(Box::new(NotSentSource {
             message: "route flow-control semaphore closed".into(),
-            reason,
+            cause: NotSentCause::BeforeQueue,
+            never_forwarded: true,
+            route_reason: Some(reason),
+            refusal: None,
         }))
     }
 
@@ -5254,27 +5399,17 @@ impl From<&RouteTarget> for RouteTargetKey {
 #[derive(Debug, Clone)]
 struct SharedCallFailure {
     kind: FailureKind,
-    message: String,
-    /// A route.open refusal travels typed, so every caller sharing this
-    /// failure (the single-flight leader and its waiters) still gets
-    /// `CallError::route_open_refusal`, not just the message text.
-    refusal: Option<RouteOpenRefused>,
 }
 
 impl SharedCallFailure {
     fn not_sent(message: impl Into<String>) -> Self {
-        Self {
-            kind: FailureKind::NotSent,
-            message: message.into(),
-            refusal: None,
-        }
+        CallError::not_sent_with_cause(message, NotSentCause::RouteOpenAbandoned).into()
     }
 
     fn into_call_error(self) -> CallError {
-        match (self.kind, self.refusal) {
-            (FailureKind::NotSent, Some(refused)) => CallError::NotSent(Box::new(refused)),
-            (FailureKind::NotSent, None) => CallError::not_sent(self.message),
-            (FailureKind::OutcomeUnknown(source), _) => CallError::outcome_unknown_source(source),
+        match self.kind {
+            FailureKind::NotSent(source) => CallError::NotSent(Box::new(source)),
+            FailureKind::OutcomeUnknown(source) => CallError::outcome_unknown_source(source),
         }
     }
 }
@@ -5283,9 +5418,11 @@ impl From<CallError> for SharedCallFailure {
     fn from(value: CallError) -> Self {
         match value {
             CallError::NotSent(err) => Self {
-                kind: FailureKind::NotSent,
-                message: err.to_string(),
-                refusal: err.downcast_ref::<RouteOpenRefused>().cloned(),
+                kind: FailureKind::NotSent(
+                    err.downcast_ref::<NotSentSource>()
+                        .expect("crate-built route.open failure has a typed source")
+                        .clone(),
+                ),
             },
             CallError::OutcomeUnknown(err) => Self {
                 kind: FailureKind::OutcomeUnknown(
@@ -5297,8 +5434,6 @@ impl From<CallError> for SharedCallFailure {
                             route_reason: None,
                         }),
                 ),
-                message: err.to_string(),
-                refusal: None,
             },
             CallError::Module(body) => Self {
                 kind: FailureKind::OutcomeUnknown(OutcomeUnknownSource {
@@ -5309,11 +5444,6 @@ impl From<CallError> for SharedCallFailure {
                     cause: OutcomeUnknownCause::CompletionFailed,
                     route_reason: None,
                 }),
-                message: format!(
-                    "unexpected module error during route.open: {} ({})",
-                    body.code, body.message
-                ),
-                refusal: None,
             },
             CallError::SubscriptionBackpressure(err) => Self {
                 kind: FailureKind::OutcomeUnknown(OutcomeUnknownSource {
@@ -5321,28 +5451,22 @@ impl From<CallError> for SharedCallFailure {
                     cause: OutcomeUnknownCause::CompletionFailed,
                     route_reason: None,
                 }),
-                message: err.to_string(),
-                refusal: None,
             },
-            CallError::StaleRouteHandle(handle) => Self {
-                kind: FailureKind::NotSent,
-                message: format!("stale route handle: {handle:?}"),
-                refusal: None,
-            },
+            CallError::StaleRouteHandle(handle) => {
+                CallError::not_sent(format!("stale route handle: {handle:?}")).into()
+            }
             error @ (CallError::CapabilityUnprovided { .. }
             | CallError::CapabilityAmbiguous { .. }
-            | CallError::InvalidCapabilityIdentifier { .. }) => Self {
-                kind: FailureKind::NotSent,
-                message: error.to_string(),
-                refusal: None,
-            },
+            | CallError::InvalidCapabilityIdentifier { .. }) => {
+                CallError::not_sent(error.to_string()).into()
+            }
         }
     }
 }
 
 #[derive(Debug, Clone)]
 enum FailureKind {
-    NotSent,
+    NotSent(NotSentSource),
     OutcomeUnknown(OutcomeUnknownSource),
 }
 
@@ -6255,9 +6379,10 @@ fn default_random_unit() -> f64 {
 
 fn request_not_sent_after_route_open_failure(err: CallError) -> CallError {
     match err {
-        CallError::OutcomeUnknown(source) => CallError::not_sent(format!(
-            "request not sent: route.open did not complete ({source})"
-        )),
+        CallError::OutcomeUnknown(source) => CallError::not_sent_with_cause(
+            format!("request not sent: route.open did not complete ({source})"),
+            NotSentCause::RouteOpenAbandoned,
+        ),
         other => other,
     }
 }
@@ -6270,7 +6395,7 @@ fn classify_failure(
     if accepted {
         CallError::outcome_unknown(reason, cause)
     } else {
-        CallError::not_sent(reason)
+        CallError::not_sent_with_cause(reason, NotSentCause::WriterRejected)
     }
 }
 
@@ -6294,18 +6419,20 @@ fn settle_route_pending_entries_with_cause(
     cause: OutcomeUnknownCause,
 ) {
     for entry in entries {
-        let source = Box::new(RouteEnded {
-            message: message.clone(),
-            reason: reason.clone(),
-        });
         let err = if entry.accepted {
             CallError::outcome_unknown_source(OutcomeUnknownSource {
-                message: source.message.clone(),
+                message: message.clone(),
                 cause,
                 route_reason: Some(reason.clone()),
             })
         } else {
-            CallError::NotSent(source)
+            CallError::NotSent(Box::new(NotSentSource {
+                message: message.clone(),
+                cause: NotSentCause::WriterRejected,
+                never_forwarded: true,
+                route_reason: Some(reason.clone()),
+                refusal: None,
+            }))
         };
         entry.settle_call_error(err);
     }
@@ -6393,6 +6520,16 @@ fn is_data_plane_drain_refusal(code: &str) -> bool {
     code == error_codes::MODULE_RELOADING
 }
 
+fn is_daemon_refusal_before_forward(flags: Flags, code: &str) -> bool {
+    flags.is_daemon_origin()
+        && matches!(
+            code,
+            error_codes::MODULE_RELOADING
+                | error_codes::UNKNOWN_CHANNEL
+                | error_codes::STALE_ROUTE_EPOCH
+        )
+}
+
 /// Whether `handle` names a route installed on the current connection. Channel 0 is the
 /// connection's own control channel: it is never installed as a route and is current for
 /// as long as the connection is, so a held channel-0 request (the spawn stream) can be
@@ -6444,6 +6581,8 @@ impl From<FrameBuildError> for CallError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod not_sent_tests;
 
     #[derive(Clone)]
     struct InstrumentedWriter {
@@ -8501,7 +8640,7 @@ mod tests {
         assert!(matches!(key.target, RouteTargetKey::InternalService { .. }));
     }
 
-    async fn assert_pending(mut future: Pin<&mut impl Future>) {
+    async fn assert_pending(mut future: Pin<&mut (impl Future + ?Sized)>) {
         assert!(
             std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx).is_pending())).await
         );

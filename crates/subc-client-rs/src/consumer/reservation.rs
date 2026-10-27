@@ -123,8 +123,9 @@ impl SubcConsumer {
             Ok(Ok(writer)) => writer,
             Ok(Err(_)) => return Err(CallError::not_sent("writer task closed before reservation")),
             Err(_) => {
-                return Err(CallError::not_sent(
+                return Err(CallError::not_sent_with_cause(
                     "call deadline elapsed waiting for writer capacity",
+                    NotSentCause::WriterCapacity,
                 ));
             }
         };

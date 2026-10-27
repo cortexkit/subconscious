@@ -105,12 +105,16 @@ impl SubcConsumer {
             {
                 Ok(TerminalFrame::Response { body, .. }) => {
                     return serde_json::from_slice::<ClientControlResponse>(&body).map_err(|err| {
-                        CallError::not_sent(format!("failed to decode {op} response: {err}"))
+                        CallError::invalid_response(format!(
+                            "failed to decode {op} response: {err}"
+                        ))
                     });
                 }
                 Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),
                 Ok(TerminalFrame::StreamEnd) => {
-                    return Err(CallError::not_sent(format!("{op} returned StreamEnd")));
+                    return Err(CallError::invalid_response(format!(
+                        "{op} returned StreamEnd"
+                    )));
                 }
                 Err(err)
                     if retry
@@ -388,7 +392,7 @@ impl SubcConsumer {
 }
 
 fn unexpected(op: &str) -> CallError {
-    CallError::not_sent(format!("{op} returned an unexpected control response"))
+    CallError::invalid_response(format!("{op} returned an unexpected control response"))
 }
 
 #[cfg(test)]

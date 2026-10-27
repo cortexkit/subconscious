@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.32.11
+
+- Add the non-exhaustive `NotSentCause` and `CallError::not_sent_cause()` for every crate-built `NotSent`, preserving route-open refusal bodies and route-close reasons. `CallError::never_forwarded()` reports whether **all** attempts of a managed call are proven not forwarded, not just its final attempt. A data-plane `module_reloading`, `unknown_channel` or `stale_route_epoch` proves non-delivery only with `FLAG_DAEMON_ORIGIN`; unmarked replies (including older daemons' replies) remain conservative. Both accessors return `None` for other error variants and externally constructed untyped `NotSent` sources.
+- A final daemon-marked data-plane `module_reloading`, `unknown_channel` or `stale_route_epoch` now returns `CallError::NotSent` with `DaemonRefusedBeforeForward { code }`, instead of `CallError::Module`. Callers matching `Module` for those codes must also handle `NotSent`, but only daemons marking their errors produce this category change. Without the flag the original `Module(body)` is preserved. The existing single-resend and eviction decisions are unchanged, as are sent calls that lose their route (`OutcomeUnknown`). No existing public signatures or `CallError` variants change.
+
 ## 0.32.10
 
 - Add `OperatorConfirmError::PresenceUnsupportedPlatform`, returned when the daemon answers `operator_presence_unavailable` with `detail.reason` `unsupported_platform`: it has no operator prompt on this platform (today Linux) and showed none. Before, this came back as `PresenceUnavailable`, the same variant as a failed or timed-out prompt, a dropped connection or an unknown reply, so a module couldn't tell "no prompt exists here" from "the prompt broke". Every other `operator_presence_unavailable` reply is still `PresenceUnavailable`. Like every variant, the new one refuses the write by default; a module may treat it differently only where its owner has ruled that a confirmation typed by a person in a local app counts on such a platform. The enum is `#[non_exhaustive]`, so this is additive.

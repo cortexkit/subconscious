@@ -5,6 +5,10 @@
 - The outage block's `detail` line lists object keys in sorted order on every
   build. serde_json's map order depends on a build feature, so a workspace
   build and a package build rendered the same detail differently.
+- Tests no longer depend on `cortexkit-role-llm-runner`. Its `serde_jcs`
+  dependency turned on serde_json's `float_roundtrip` for every crate in a
+  workspace test run, which broke another crate's test. The crate's published
+  outage samples are copied into `test-vectors/tool-outage-v1/` instead.
 
 ## 0.1.46
 

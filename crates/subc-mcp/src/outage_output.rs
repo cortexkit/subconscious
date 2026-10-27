@@ -6,10 +6,12 @@
 //! (CONTRACT.md §4.4 and §11.4 of that crate). The gateway copies them
 //! instead of depending on the crate because the crate pulls in packages the
 //! gateway does not otherwise build (`cortexkit-rich-ui-syntax`,
-//! `pulldown-cmark`, `serde_jcs`, `ryu-js`). The crate is a dev-dependency,
-//! and `copy_renders_like_the_crate` below checks this copy against it for
-//! every sample in the crate's `valid-error-outputs.json`, so a change to the
-//! shared block fails the gateway's tests instead of drifting silently.
+//! `pulldown-cmark`, `serde_jcs`, `ryu-js`). It is not a dev-dependency
+//! either: `serde_jcs` turns on serde_json's `float_roundtrip`, which would
+//! then apply to every crate's tests in a workspace test run. Instead the
+//! crate's published `valid-error-outputs.json` is copied into
+//! `test-vectors/tool-outage-v1/`, and `copy_renders_every_published_sample`
+//! below checks this copy against the crate's own rendering of each sample.
 //!
 //! The block is the message, then one line per present member in a fixed
 //! order: `module: <module>`, `code: <code>`, `detail: <detail>`,
@@ -158,117 +160,85 @@ fn is_valid_line(value: &str, max: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cortexkit_role_llm_runner::serializer_profile::error_output::{
-        self as shared, ErrorOutput,
-    };
     use serde_json::Value;
 
-    /// The crate's own samples, read from the package cargo unpacked. The
-    /// crate does not export the file, so its location comes from
-    /// `cargo metadata`, which names the manifest of every package in the
-    /// build, wherever cargo keeps it (registry cache or vendor folder).
+    /// The crate's published samples, copied byte for byte (see
+    /// `test-vectors/tool-outage-v1/README.md`).
     fn valid_samples() -> Vec<Value> {
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let output = std::process::Command::new(cargo)
-            .args([
-                "metadata",
-                "--format-version",
-                "1",
-                "--offline",
-                "--manifest-path",
-            ])
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
-            .output()
-            .expect("cargo metadata runs");
-        assert!(
-            output.status.success(),
-            "cargo metadata failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let metadata: Value = serde_json::from_slice(&output.stdout).unwrap();
-        let manifests: Vec<&str> = metadata["packages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|package| package["name"] == "cortexkit-role-llm-runner")
-            .map(|package| package["manifest_path"].as_str().unwrap())
-            .collect();
-        assert_eq!(manifests.len(), 1, "one llm-runner crate: {manifests:?}");
-        let path = std::path::Path::new(manifests[0])
-            .parent()
-            .unwrap()
-            .join("test-vectors/owned-broca-tool-outage/valid-error-outputs.json");
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        let file: Value = serde_json::from_str(&text).unwrap();
+        let text = include_str!("../test-vectors/tool-outage-v1/valid-error-outputs.json");
+        let file: Value = serde_json::from_str(text).unwrap();
         file["valid"].as_array().unwrap().clone()
     }
 
-    fn copy_of(output: &ErrorOutput) -> OutageOutput {
-        let mut copy = OutageOutput::new(output.message.clone());
-        if let Some(module) = &output.module {
+    fn text<'a>(output: &'a Value, member: &str) -> Option<&'a str> {
+        output.get(member).and_then(Value::as_str)
+    }
+
+    fn copy_of(output: &Value) -> OutageOutput {
+        let mut copy = OutageOutput::new(text(output, "message").unwrap());
+        if let Some(module) = text(output, "module") {
             copy = copy.with_module(module);
         }
-        if let Some(code) = &output.code {
+        if let Some(code) = text(output, "code") {
             copy = copy.with_code(code);
         }
-        if let Some(detail) = &output.detail {
+        if let Some(detail) = text(output, "detail") {
             copy = copy.with_detail(detail);
         }
-        if output.nothing_sent {
+        if output.get("nothing_sent") == Some(&Value::Bool(true)) {
             copy = copy.with_nothing_sent();
         }
-        if let Some(retry) = &output.retry {
+        if let Some(retry) = text(output, "retry") {
             copy = copy.with_retry(retry);
         }
         copy
     }
 
+    /// Every member of a published valid sample passes the copied rules (so
+    /// none is dropped), and the copy renders the crate's own bytes. The
+    /// samples include every member at its length limit.
     #[test]
-    fn copy_renders_like_the_crate() {
+    fn copy_renders_every_published_sample() {
         let samples = valid_samples();
         assert!(samples.len() >= 7, "expected the crate's 7 or more samples");
         for sample in samples {
             let name = sample["name"].as_str().unwrap();
-            let decoded = ErrorOutput::decode(&sample["output"])
-                .unwrap_or_else(|error| panic!("{name}: {error}"));
-            let copy = copy_of(&decoded);
-            // Every member of a valid sample passes the copied rules, so the
-            // copy kept them all, and renders the same bytes as the crate.
-            assert_eq!(copy.render(), shared::render(&decoded), "{name}");
-            assert_eq!(Value::from(copy.render()), sample["rendered"], "{name}");
+            let output = &sample["output"];
+            if let Some(module) = text(output, "module") {
+                assert!(is_valid_module(module), "{name}: module");
+            }
+            if let Some(code) = text(output, "code") {
+                assert!(is_valid_code(code), "{name}: code");
+            }
+            assert_eq!(
+                Value::from(copy_of(output).render()),
+                sample["rendered"],
+                "{name}"
+            );
         }
     }
 
     #[test]
-    fn copied_limits_match_the_crate() {
-        assert_eq!(MODULE_MAX, shared::MODULE_MAX);
-        assert_eq!(CODE_MAX, shared::CODE_MAX);
-        assert_eq!(DETAIL_MAX, shared::DETAIL_MAX);
-        assert_eq!(RETRY_MAX, shared::RETRY_MAX);
-        assert_eq!(NOTHING_SENT_LINE, shared::NOTHING_SENT_LINE);
-        for module in [
-            "aft",
-            "fed:peer-1:aft",
-            "a b",
-            "a\tb",
-            "a\nb",
-            "",
-            "aft\u{85}",
-        ] {
-            assert_eq!(
-                is_valid_module(module),
-                shared::is_valid_module(module),
-                "{module:?}"
-            );
+    fn module_and_code_rules_match_the_contract() {
+        for module in ["aft", "fed:peer-1:aft", "a b", "\u{e9}t\u{e9}"] {
+            assert!(is_valid_module(module), "{module:?}");
         }
-        for code in ["a", "module_reloading", "Upper", "_a", "0a", "a-b", ""] {
-            assert_eq!(is_valid_code(code), shared::is_valid_code(code), "{code:?}");
+        for module in ["", "a\tb", "a\nb", "aft\u{85}", "aft\u{7f}"] {
+            assert!(!is_valid_module(module), "{module:?}");
         }
+        assert!(is_valid_module(&"m".repeat(MODULE_MAX)));
+        assert!(!is_valid_module(&"m".repeat(MODULE_MAX + 1)));
+        for code in ["a", "module_reloading", "a0_b"] {
+            assert!(is_valid_code(code), "{code:?}");
+        }
+        for code in ["", "Upper", "_a", "0a", "a-b"] {
+            assert!(!is_valid_code(code), "{code:?}");
+        }
+        assert!(is_valid_code(&"c".repeat(CODE_MAX)));
+        assert!(!is_valid_code(&"c".repeat(CODE_MAX + 1)));
     }
 
-    /// A member breaking its rule is left out rather than truncated, and what
-    /// remains still passes the crate's own producer check.
+    /// A member breaking its rule is left out rather than truncated.
     #[test]
     fn members_breaking_a_rule_are_left_out() {
         let output = OutageOutput::new("the module is unavailable")
@@ -284,13 +254,13 @@ mod tests {
             .with_detail(&"x".repeat(DETAIL_MAX))
             .with_nothing_sent()
             .with_retry(&"r".repeat(RETRY_MAX));
-        let shared_output = ErrorOutput::new("the module is unavailable")
-            .with_module("aft")
-            .with_code("module_reloading")
-            .with_detail("x".repeat(DETAIL_MAX))
-            .with_nothing_sent()
-            .with_retry("r".repeat(RETRY_MAX));
-        assert_eq!(shared_output.check(), Ok(()));
-        assert_eq!(output.render(), shared_output.render());
+        assert_eq!(
+            output.render(),
+            format!(
+                "the module is unavailable\nmodule: aft\ncode: module_reloading\ndetail: {}\n{NOTHING_SENT_LINE}\nretry: {}",
+                "x".repeat(DETAIL_MAX),
+                "r".repeat(RETRY_MAX)
+            )
+        );
     }
 }

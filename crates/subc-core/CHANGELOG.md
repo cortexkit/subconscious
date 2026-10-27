@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.144
+
+- Formatting only: one test binding reflowed by `cargo fmt`; no behaviour change.
+
 ## 0.20.143
 
 - `ck module logs --since` now also filters the module's own log files: a line carrying its own timestamp is dropped when it is older than the window, even when the strict log grammar would not parse the rest of the line. Lines with no timestamp are shown as before.

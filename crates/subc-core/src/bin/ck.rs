@@ -12205,8 +12205,7 @@ mod tests {
             level: None,
             lane: None,
         };
-        let (mut entries, counts) =
-            collect_log_entries("callosum", &sources, &options).unwrap();
+        let (mut entries, counts) = collect_log_entries("callosum", &sources, &options).unwrap();
         sort_log_entries(&mut entries);
 
         assert_eq!(counts.total, 3);

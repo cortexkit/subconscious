@@ -20,14 +20,17 @@ enum RootsMode {
 }
 
 impl ClientHandler for RootsClient {
-    fn get_info(&self) -> ClientInfo {
-        let mut info = ClientInfo::default();
+    fn get_info(&self) -> ClientConfig {
+        let mut info = host_client_config(ClientConfig::default());
         if self.roots.is_some() {
             info.capabilities.roots = Some(Default::default());
         }
         info
     }
 
+    // rmcp 3 deprecates roots (dropped in 2026-07-28); the gateway still asks
+    // for them on the 2025-11-25 sessions these tests open.
+    #[allow(deprecated)]
     async fn list_roots(
         &self,
         _context: rmcp::service::RequestContext<RoleClient>,

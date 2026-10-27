@@ -357,6 +357,10 @@ fn canonical_dir(path: &Path) -> Result<PathBuf> {
         .map_err(|error| other_error(format!("session workdir {}: {error}", path.display())))
 }
 
+// rmcp 3 marks the roots API deprecated because the 2026-07-28 protocol drops
+// it. The gateway only serves 2025-11-25 and older sessions, where `roots/list`
+// is how it learns the host's project folder.
+#[allow(deprecated)]
 async fn session_workdir(peer: &Peer<RoleServer>, fallback: &Path) -> Result<String> {
     let supports_roots = peer
         .peer_info()

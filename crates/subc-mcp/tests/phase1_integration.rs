@@ -24,9 +24,9 @@ use std::{
 use rmcp::{
     model::{
         CallToolRequest, CallToolRequestParams, CancelledNotificationParam, ClientCapabilities,
-        ClientInfo, ClientRequest, CreateElicitationRequestParams, CreateElicitationResult,
-        ElicitationAction, ErrorCode, ErrorData as McpErrorData, GetPromptRequestParams,
-        Implementation, JsonObject, ProgressNotificationParam,
+        ClientConfig, ClientRequest, ElicitRequestParams, ElicitResult, ElicitationAction,
+        ErrorCode, ErrorData as McpErrorData, GetPromptRequestParams, Implementation, JsonObject,
+        ProgressNotificationParam, ProtocolVersion,
     },
     service::{
         MaybeSendFuture, NotificationContext, PeerRequestOptions, RunningService, ServiceError,
@@ -214,6 +214,10 @@ impl TestMcpClient {
 }
 
 impl ClientHandler for TestMcpClient {
+    fn get_info(&self) -> ClientConfig {
+        host_client_config(ClientConfig::default())
+    }
+
     fn on_progress(
         &self,
         params: ProgressNotificationParam,
@@ -603,9 +607,8 @@ struct ReverseTestClient {
     capabilities: ClientCapabilities,
     prompt_count: Arc<AtomicUsize>,
     cancel_count: Arc<AtomicUsize>,
-    response_tx: mpsc::Sender<std::result::Result<CreateElicitationResult, McpErrorData>>,
-    response_rx:
-        Arc<TokioMutex<mpsc::Receiver<std::result::Result<CreateElicitationResult, McpErrorData>>>>,
+    response_tx: mpsc::Sender<std::result::Result<ElicitResult, McpErrorData>>,
+    response_rx: Arc<TokioMutex<mpsc::Receiver<std::result::Result<ElicitResult, McpErrorData>>>>,
 }
 
 impl ReverseTestClient {
@@ -620,7 +623,7 @@ impl ReverseTestClient {
         }
     }
 
-    async fn respond_elicitation(&self, result: CreateElicitationResult) {
+    async fn respond_elicitation(&self, result: ElicitResult) {
         self.response_tx
             .send(Ok(result))
             .await
@@ -647,20 +650,19 @@ impl ReverseTestClient {
 }
 
 impl ClientHandler for ReverseTestClient {
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::new(
+    fn get_info(&self) -> ClientConfig {
+        host_client_config(ClientConfig::new(
             self.capabilities.clone(),
             Implementation::new("subc-mcp-reverse-test", "0"),
-        )
+        ))
     }
 
     fn create_elicitation(
         &self,
-        _request: CreateElicitationRequestParams,
+        _request: ElicitRequestParams,
         context: rmcp::service::RequestContext<RoleClient>,
-    ) -> impl Future<Output = std::result::Result<CreateElicitationResult, McpErrorData>>
-           + MaybeSendFuture
-           + '_ {
+    ) -> impl Future<Output = std::result::Result<ElicitResult, McpErrorData>> + MaybeSendFuture + '_
+    {
         let prompt_count = Arc::clone(&self.prompt_count);
         let response_rx = Arc::clone(&self.response_rx);
         async move {
@@ -671,7 +673,7 @@ impl ClientHandler for ReverseTestClient {
                     response_rx.recv().await
                 } => {
                     response.unwrap_or_else(|| {
-                        Ok(CreateElicitationResult::new(ElicitationAction::Decline))
+                        Ok(ElicitResult::new(ElicitationAction::Decline))
                     })
                 }
                 _ = context.ct.cancelled() => Err(McpErrorData::internal_error(
@@ -948,8 +950,179 @@ fn elicitation_body(label: &str) -> Value {
     })
 }
 
-fn accepted_elicitation(content: Value) -> CreateElicitationResult {
-    CreateElicitationResult::new(ElicitationAction::Accept).with_content(content)
+fn accepted_elicitation(content: Value) -> ElicitResult {
+    ElicitResult::new(ElicitationAction::Accept).with_content(content)
+}
+
+/// Pins a test client to protocol version 2025-11-25, the version current
+/// hosts send in `initialize`. rmcp's own default is its newest version, which
+/// would make every test client open as a 2026-07-28 host instead.
+fn host_client_config(config: ClientConfig) -> ClientConfig {
+    config.with_protocol_version(ProtocolVersion::V_2025_11_25)
+}
+
+/// Sends a raw `initialize` naming `protocol_version` and returns the gateway's
+/// whole JSON-RPC answer, so tests can check the exact wire shape a host sees.
+async fn raw_initialize(harness: &mut ReverseHarness, protocol_version: &str) -> Value {
+    let initialize = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": protocol_version,
+            "capabilities": {},
+            "clientInfo": { "name": "subc-mcp-raw-version-test", "version": "0" }
+        }
+    });
+    write_raw_mcp_message(
+        harness
+            .shim
+            .stdin
+            .as_mut()
+            .expect("shim stdin should remain available"),
+        &initialize,
+    )
+    .await;
+    read_raw_mcp_response(
+        harness
+            .shim
+            .stdout
+            .as_mut()
+            .expect("shim stdout should remain available"),
+        1,
+    )
+    .await
+}
+
+/// Reads raw messages until the response to request `id`, skipping any
+/// notifications the gateway sends first.
+async fn read_raw_mcp_response(reader: &mut ChildStdout, id: u64) -> Value {
+    loop {
+        let message = read_raw_mcp_message(reader).await;
+        if message.get("method").is_none() && message.get("id") == Some(&json!(id)) {
+            return message;
+        }
+    }
+}
+
+/// The `initialize` result a host gets back when the gateway answers with
+/// `protocol_version`. The whole object is compared so that any field rmcp
+/// adds (a new capability, result metadata) shows up as a difference.
+fn expected_initialize_result(protocol_version: &str) -> Value {
+    json!({
+        "protocolVersion": protocol_version,
+        "capabilities": {
+            "prompts": { "listChanged": true },
+            "tools": { "listChanged": true }
+        },
+        "serverInfo": { "name": "subc-mcp", "version": env!("CARGO_PKG_VERSION") }
+    })
+}
+
+async fn initialize_answer_for(label: &str, requested_version: &str) -> Value {
+    let mut harness = ReverseHarness::start_attach_window(label).await;
+    harness.provider.wait_bound().await;
+    let response = raw_initialize(&mut harness, requested_version).await;
+    drop(harness.shim.stdin.take());
+    harness.shutdown().await;
+    response
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| panic!("initialize for {requested_version} failed: {response}"))
+}
+
+#[tokio::test]
+async fn mcp_initialize_2025_11_25_is_answered_with_2025_11_25() {
+    let result = initialize_answer_for("mcp-version-2025-11-25", "2025-11-25").await;
+    assert_eq!(result, expected_initialize_result("2025-11-25"));
+}
+
+#[tokio::test]
+async fn mcp_initialize_2025_06_18_is_answered_with_2025_06_18() {
+    // Older hosts keep getting their own version back, as they did before the
+    // gateway moved to rmcp 3.
+    let result = initialize_answer_for("mcp-version-2025-06-18", "2025-06-18").await;
+    assert_eq!(result, expected_initialize_result("2025-06-18"));
+}
+
+#[tokio::test]
+async fn mcp_initialize_2026_07_28_is_answered_with_2025_11_25() {
+    // The gateway does not serve 2026-07-28 yet, so a host asking for it over
+    // `initialize` is offered the newest version the gateway does serve, with
+    // no 2026-only capability in the answer.
+    let result = initialize_answer_for("mcp-version-2026-07-28", "2026-07-28").await;
+    assert_eq!(result, expected_initialize_result("2025-11-25"));
+}
+
+#[tokio::test]
+async fn mcp_tools_call_result_for_legacy_session_has_no_result_type() {
+    let mut harness = ReverseHarness::start_attach_window("mcp-legacy-call-result").await;
+    harness.provider.wait_bound().await;
+    let initialize = raw_initialize(&mut harness, "2025-11-25").await;
+    assert_eq!(
+        initialize.pointer("/result/protocolVersion"),
+        Some(&json!("2025-11-25"))
+    );
+
+    let tool_name = harness.provider.exposed_tool_name();
+    let stdin = harness
+        .shim
+        .stdin
+        .as_mut()
+        .expect("shim stdin should remain available");
+    write_raw_mcp_message(
+        stdin,
+        &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    )
+    .await;
+    write_raw_mcp_message(
+        stdin,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": tool_name, "arguments": {} }
+        }),
+    )
+    .await;
+
+    // The provider labels its result with the `resultType` field that only
+    // 2026-07-28 sessions carry, and sends an explicit null `structuredContent`.
+    // A 2025-11-25 host never received either from the rmcp 1 gateway, which
+    // dropped both, and must not receive them now.
+    let forward_request = harness.provider.wait_route_request().await;
+    harness
+        .provider
+        .send_route_response(
+            &forward_request,
+            json!({
+                "resultType": "complete",
+                "content": [{ "type": "text", "text": "legacy-ok" }],
+                "structuredContent": null,
+                "isError": false,
+            }),
+        )
+        .await;
+    let response = read_raw_mcp_response(
+        harness
+            .shim
+            .stdout
+            .as_mut()
+            .expect("shim stdout should remain available"),
+        2,
+    )
+    .await;
+    assert_eq!(
+        response.get("result"),
+        Some(&json!({
+            "content": [{ "type": "text", "text": "legacy-ok" }],
+            "isError": false,
+        })),
+        "unexpected tools/call answer: {response}"
+    );
+
+    drop(harness.shim.stdin.take());
+    harness.shutdown().await;
 }
 
 async fn write_raw_mcp_message(writer: &mut ChildStdin, message: &Value) {
@@ -1347,10 +1520,10 @@ async fn mcp_reverse_elicitation_forward_cancel_settles_prompt_and_provider() {
         .await;
     harness.client_handler.wait_for_prompts(1).await;
 
-    peer.notify_cancelled(CancelledNotificationParam {
-        request_id,
-        reason: Some("test cancellation".to_owned()),
-    })
+    peer.notify_cancelled(CancelledNotificationParam::new(
+        Some(request_id),
+        Some("test cancellation".to_owned()),
+    ))
     .await
     .unwrap();
 
@@ -1726,7 +1899,14 @@ async fn mcp_initialize_advertises_tools_and_prompts_capabilities() {
         .as_ref()
         .expect("subc-mcp should advertise the MCP prompts capability");
     assert_eq!(prompts_capability.list_changed, Some(true));
-    assert_eq!(server_info.server_info.name, "subc-mcp");
+    assert_eq!(
+        server_info
+            .server_info
+            .as_ref()
+            .expect("subc-mcp should name itself in the initialize result")
+            .name,
+        "subc-mcp"
+    );
 
     harness.shutdown().await;
 }
@@ -2129,10 +2309,10 @@ async fn mcp_tools_call_cancel_sends_route_cancel() {
         .await
         .unwrap();
     let request_id = handle.id.clone();
-    peer.notify_cancelled(CancelledNotificationParam {
-        request_id,
-        reason: Some("test cancellation".to_owned()),
-    })
+    peer.notify_cancelled(CancelledNotificationParam::new(
+        Some(request_id),
+        Some("test cancellation".to_owned()),
+    ))
     .await
     .unwrap();
 

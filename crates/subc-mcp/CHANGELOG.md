@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.45
+
+- Moves the gateway to rmcp 3.8 (from 1.7), which needs Rust 1.88 or later. No behaviour change for current hosts. A host that asks for 2025-11-25, 2025-06-18, 2025-03-26 or 2024-11-05 in `initialize` still gets that version back, and results carry no `resultType` field. Reverse elicitation requests and progress notifications work as before. A host asking for 2026-07-28 is answered with 2025-11-25, because the gateway does not serve 2026-07-28 yet. A request that names 2026-07-28 in its own `_meta` without `initialize` is refused as an unsupported version. Host messages still have no size limit; rmcp 3 would otherwise drop any line over 16 MiB. A provider's `"structuredContent": null` is still left out of the result, as rmcp 1.7 did.
+
 ## 0.1.44
 
 - Tests only: removed a duplicate manifest unit test; the executable manifest test still checks `runtime_computed`. No behaviour change.

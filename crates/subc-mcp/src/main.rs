@@ -6,6 +6,7 @@ mod session_scope;
 use session_scope::{LocalSessionScope, ScopeOwner};
 
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     env,
     error::Error,
@@ -30,12 +31,12 @@ use prompts::{
 };
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResult, CancelledNotificationParam, ClientCapabilities,
-        ClientResult, Content, CustomRequest, ErrorCode, ErrorData, GetPromptRequestParams,
-        GetPromptResult, Implementation, InitializeRequestParams, InitializeResult, JsonObject,
-        ListPromptsResult, ListToolsResult, Meta, PaginatedRequestParams,
-        ProgressNotificationParam, ProgressToken, RequestId, ServerCapabilities, ServerInfo,
-        ServerRequest, Tool as McpTool, ToolAnnotations,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelledNotificationParam,
+        ClientCapabilities, ClientResult, ContentBlock, CustomRequest, ErrorCode, ErrorData,
+        GetPromptRequestParams, GetPromptResponse, Implementation, InitializeRequestParams,
+        InitializeResult, JsonObject, ListPromptsResult, ListToolsResult, PaginatedRequestParams,
+        ProgressNotificationParam, ProgressToken, ProtocolVersion, RequestId, RequestMetaObject,
+        ServerCapabilities, ServerConfig, ServerRequest, Tool as McpTool, ToolAnnotations,
     },
     service::{NotificationContext, Peer, PeerRequestOptions, RequestContext, ServiceError},
     transport::async_rw::AsyncRwTransport,
@@ -342,10 +343,10 @@ impl RelayCancelHandle {
     async fn cancel(self, reason: &'static str) {
         if let Err(error) = self
             .peer
-            .notify_cancelled(CancelledNotificationParam {
-                request_id: self.request_id,
-                reason: Some(reason.to_owned()),
-            })
+            .notify_cancelled(CancelledNotificationParam::new(
+                Some(self.request_id),
+                Some(reason.to_owned()),
+            ))
             .await
         {
             tracing::error!(target: "relay", "failed to cancel reverse MCP request: {error}");
@@ -2545,7 +2546,12 @@ async fn handle_shim_connection(
         Arc::clone(&conversation),
     );
     let (read_half, write_half) = stream.into_split();
-    let transport = AsyncRwTransport::<RoleServer, _, _>::new_server(read_half, write_half);
+    // rmcp 1.x read host messages without a size limit; rmcp 3 caps a line at
+    // 16 MiB by default and drops longer ones. These lines come from the MCP host
+    // through its local stdio shim, so keep the unbounded behaviour rather than
+    // silently dropping a large request or elicitation answer.
+    let transport = AsyncRwTransport::<RoleServer, _, _>::new_server(read_half, write_half)
+        .with_max_line_length(usize::MAX);
     let serve_result = serve_mcp_server(handler, transport).await;
     let _ = shutdown_tx.send(true);
     let _reconcile_guard = reconcile_gate.lock().await;
@@ -4777,7 +4783,7 @@ enum ToolUseIdMeta<'a> {
     Malformed,
 }
 
-fn claude_code_tool_use_id(meta: &Meta) -> ToolUseIdMeta<'_> {
+fn claude_code_tool_use_id(meta: &RequestMetaObject) -> ToolUseIdMeta<'_> {
     match meta.get(CLAUDE_CODE_TOOL_USE_ID_META_KEY) {
         None => ToolUseIdMeta::Absent,
         Some(serde_json::Value::String(id)) if !id.is_empty() => ToolUseIdMeta::Present(id),
@@ -4836,7 +4842,7 @@ impl ConversationRouteRefusal {
     }
 
     fn tool_result(&self, module_id: &str) -> CallToolResult {
-        CallToolResult::error(vec![Content::text(format!(
+        CallToolResult::error(vec![ContentBlock::text(format!(
             "This tool call was not sent to '{module_id}': CortexKit could not tell which \
              Claude Code conversation made it ({}). Sending it anyway could act on another \
              conversation.",
@@ -5289,8 +5295,19 @@ impl ServerHandler for SubcMcpServer {
         Ok(self.get_info())
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+    /// The gateway serves the session-based protocol versions that begin with an
+    /// `initialize` handshake, 2025-11-25 and older. rmcp negotiates against this
+    /// list after `initialize` returns: a host asking for one of these versions
+    /// gets that version back, exactly as before rmcp 3, and a host asking for
+    /// anything else (including 2026-07-28) is answered with 2025-11-25.
+    /// Requests that name a version outside the list in their own `_meta`, as
+    /// 2026-07-28 clients do without `initialize`, are refused by rmcp.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2025_11_25))
+    }
+
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
@@ -5298,6 +5315,9 @@ impl ServerHandler for SubcMcpServer {
                 .enable_prompts_list_changed()
                 .build(),
         )
+        // rmcp's default is its newest version, 2026-07-28, which the gateway
+        // does not serve yet; name the newest version it does serve.
+        .with_protocol_version(ProtocolVersion::V_2025_11_25)
         .with_server_info(Implementation::new("subc-mcp", env!("CARGO_PKG_VERSION")))
     }
 
@@ -5317,7 +5337,7 @@ impl ServerHandler for SubcMcpServer {
         &self,
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<GetPromptResult, ErrorData> {
+    ) -> std::result::Result<GetPromptResponse, ErrorData> {
         self.refresh_policy_if_needed(&context.peer).await?;
         let is_visible = self
             .state
@@ -5327,6 +5347,7 @@ impl ServerHandler for SubcMcpServer {
         self.prompts
             .get_prompt_if_visible(request, is_visible)
             .await
+            .map(GetPromptResponse::from)
     }
 
     async fn list_tools(
@@ -5357,13 +5378,14 @@ impl ServerHandler for SubcMcpServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, ErrorData> {
+    ) -> std::result::Result<CallToolResponse, ErrorData> {
         self.refresh_policy_if_needed(&context.peer).await?;
         self.reopen_stale_routes_if_needed(&context.peer).await?;
-        match self.state.surface_mode() {
+        let result = match self.state.surface_mode() {
             SurfaceMode::Full => self.call_tool_over_route(request, context).await,
             SurfaceMode::Search => self.call_search_mode_tool(request, context).await,
-        }
+        };
+        result.map(CallToolResponse::from)
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
@@ -5678,12 +5700,19 @@ impl SubcMcpServer {
                             }
                         }
                         FrameType::Response => {
-                            return serde_json::from_slice::<CallToolResult>(&frame.body).map_err(|source| {
+                            let mut result = serde_json::from_slice::<CallToolResult>(&frame.body).map_err(|source| {
                                 ErrorData::internal_error(
                                     format!("provider returned malformed tool result: {source}"),
                                     None,
                                 )
-                            });
+                            })?;
+                            // rmcp 3 keeps a provider's `"structuredContent": null` and
+                            // sends it on; rmcp 1 read it as absent and left it out.
+                            // Hosts keep getting the rmcp 1 shape.
+                            if result.structured_content == Some(serde_json::Value::Null) {
+                                result.structured_content = None;
+                            }
+                            return Ok(result);
                         }
                         FrameType::Error => {
                             return Err(subc_error_to_mcp("subc route tool call failed", &frame.body));
@@ -9244,12 +9273,14 @@ mod tests {
     #[test]
     fn tool_use_id_is_read_from_the_claude_code_meta_key() {
         let meta = |value: serde_json::Value| {
-            let mut meta = Meta::new();
-            meta.0
-                .insert(CLAUDE_CODE_TOOL_USE_ID_META_KEY.to_owned(), value);
+            let mut meta = RequestMetaObject::new();
+            meta.insert(CLAUDE_CODE_TOOL_USE_ID_META_KEY.to_owned(), value);
             meta
         };
-        assert_eq!(claude_code_tool_use_id(&Meta::new()), ToolUseIdMeta::Absent);
+        assert_eq!(
+            claude_code_tool_use_id(&RequestMetaObject::new()),
+            ToolUseIdMeta::Absent
+        );
         assert_eq!(
             claude_code_tool_use_id(&meta(serde_json::json!("toolu_01"))),
             ToolUseIdMeta::Present("toolu_01")

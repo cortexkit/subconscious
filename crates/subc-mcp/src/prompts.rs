@@ -2,7 +2,7 @@ use std::{future::Future, pin::Pin, sync::Arc};
 
 use rmcp::model::{
     ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResult, JsonObject, ListPromptsResult,
-    Prompt, PromptArgument, PromptMessage, PromptMessageRole,
+    Prompt, PromptArgument, PromptMessage, Role,
 };
 use serde_json::Value;
 
@@ -110,11 +110,16 @@ impl PromptService {
         &self,
         mut is_visible: impl FnMut(&str) -> bool,
     ) -> ListPromptsResult {
+        // `result_type: None` leaves out the `resultType` field that rmcp 3's
+        // constructors add for 2026-07-28 sessions. The gateway serves only
+        // older sessions, where the field does not exist, so the result is
+        // exactly what hosts receive.
         ListPromptsResult {
             prompts: prompt_descriptors()
                 .into_iter()
                 .filter(|prompt| is_visible(&prompt.name))
                 .collect(),
+            result_type: None,
             ..Default::default()
         }
     }
@@ -159,10 +164,10 @@ impl PromptService {
             name => return Err(unknown_prompt(name)),
         };
 
-        Ok(GetPromptResult::new(vec![PromptMessage::new_text(
-            PromptMessageRole::User,
-            text,
-        )]))
+        let mut result = GetPromptResult::new(vec![PromptMessage::new_text(Role::User, text)]);
+        // Leave out rmcp 3's 2026-07-28 `resultType` field, as in `list_prompts`.
+        result.result_type = None;
+        Ok(result)
     }
 }
 

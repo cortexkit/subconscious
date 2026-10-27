@@ -62,6 +62,73 @@ impl fmt::Debug for ConnectionInfo {
     }
 }
 
+/// The daemon's same-user local listener, published in the connection file under
+/// the optional `local_endpoint` key: `{"kind":"unix","path":"…"}` for a
+/// Unix-domain socket (macOS, Linux) or `{"kind":"pipe","name":"…"}` for a
+/// Windows named pipe.
+///
+/// It lives beside `ConnectionInfo` rather than inside it because
+/// `ConnectionInfo` has only public fields and other crates build it by struct
+/// literal, so adding a field there would break them. `ConnectionInfo` ignores
+/// unknown keys, so `read` still accepts a file that carries this one; only
+/// `read_with_local_endpoint` and `write_atomic_with_local_endpoint` see it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum LocalEndpoint {
+    /// A Unix-domain socket at this filesystem path.
+    Unix { path: PathBuf },
+    /// A Windows named pipe with this full pipe name (`\\.\pipe\…`).
+    Pipe { name: String },
+}
+
+impl LocalEndpoint {
+    /// Refuses an empty path or pipe name: neither names a listener a client
+    /// could connect to.
+    pub fn validate(&self) -> Result<(), ConnectionFileError> {
+        let empty = match self {
+            Self::Unix { path } => path.as_os_str().is_empty(),
+            Self::Pipe { name } => name.is_empty(),
+        };
+        if empty {
+            return Err(ConnectionFileError::Invalid {
+                reason: "connection file local_endpoint must name a path or pipe".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// A connection file's `ConnectionInfo` together with its optional
+/// `local_endpoint`, both read from the same owner-checked file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionInfoWithLocalEndpoint {
+    pub info: ConnectionInfo,
+    /// `None` when the file has no `local_endpoint` key, as in every file
+    /// written before the key existed or by a daemon with no local listener.
+    pub local_endpoint: Option<LocalEndpoint>,
+}
+
+/// The `local_endpoint` key on its own, parsed from the same bytes as
+/// `ConnectionInfo` so the `ConnectionInfo` parse is exactly the one `read`
+/// performs.
+#[derive(Deserialize)]
+struct LocalEndpointField {
+    #[serde(default)]
+    local_endpoint: Option<LocalEndpoint>,
+}
+
+/// The on-disk shape written by `write_atomic_with_local_endpoint`: every
+/// `ConnectionInfo` key in its usual order, then `local_endpoint` when present.
+/// With no endpoint the bytes are identical to `write_atomic`'s.
+#[derive(Serialize)]
+struct ConnectionFileOut<'a> {
+    #[serde(flatten)]
+    info: &'a ConnectionInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_endpoint: Option<&'a LocalEndpoint>,
+}
+
 /// A connection file selected by reader-side discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Discovered {
@@ -181,8 +248,32 @@ pub fn write_atomic(
     path: impl AsRef<Path>,
     info: &ConnectionInfo,
 ) -> Result<(), ConnectionFileError> {
+    write_atomic_with_local_endpoint(path, info, None)
+}
+
+/// Like `write_atomic`, and also publishes `local_endpoint` when one is given.
+/// With `None` the key is omitted and the file is byte-identical to the one
+/// `write_atomic` writes.
+pub fn write_atomic_with_local_endpoint(
+    path: impl AsRef<Path>,
+    info: &ConnectionInfo,
+    local_endpoint: Option<&LocalEndpoint>,
+) -> Result<(), ConnectionFileError> {
     let path = path.as_ref();
     info.validate()?;
+    if let Some(endpoint) = local_endpoint {
+        endpoint.validate()?;
+    }
+    // Serialise before touching the filesystem so a value that cannot be
+    // written (a non-UTF-8 socket path) leaves no temp behind.
+    let json = serde_json::to_vec_pretty(&ConnectionFileOut {
+        info,
+        local_endpoint,
+    })
+    .map_err(|source| ConnectionFileError::JsonWrite {
+        path: path.to_path_buf(),
+        source,
+    })?;
 
     let parent = path
         .parent()
@@ -211,7 +302,7 @@ pub fn write_atomic(
     sweep_stale_temps(parent, file_name);
 
     let temp_path = temp_path(parent, file_name)?;
-    let result = write_atomic_inner(path, &temp_path, info);
+    let result = write_atomic_inner(path, &temp_path, &json);
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
@@ -391,6 +482,49 @@ fn sweep_stale_temps(parent: &Path, file_name: &std::ffi::OsStr) {
 
 pub fn read(path: impl AsRef<Path>) -> Result<ConnectionInfo, ConnectionFileError> {
     let path = path.as_ref();
+    let bytes = read_owner_checked(path)?;
+    parse_info(path, &bytes)
+}
+
+/// Reads `ConnectionInfo` and the optional `local_endpoint` from one read of
+/// one owner-checked file, so the endpoint and the key always come from the
+/// same file the same check accepted.
+///
+/// A missing `local_endpoint` is `None`. A key that is present but malformed
+/// (unknown `kind`, missing or empty `path`/`name`) is an error rather than
+/// `None`: a caller that asked for the local endpoint must not mistake a
+/// damaged one for an absent one.
+pub fn read_with_local_endpoint(
+    path: impl AsRef<Path>,
+) -> Result<ConnectionInfoWithLocalEndpoint, ConnectionFileError> {
+    let path = path.as_ref();
+    let bytes = read_owner_checked(path)?;
+    let info = parse_info(path, &bytes)?;
+    let LocalEndpointField { local_endpoint } =
+        serde_json::from_slice(&bytes).map_err(|source| ConnectionFileError::JsonRead {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if let Some(endpoint) = &local_endpoint {
+        endpoint.validate()?;
+    }
+    Ok(ConnectionInfoWithLocalEndpoint {
+        info,
+        local_endpoint,
+    })
+}
+
+/// `read_with_local_endpoint` with the same wire-version check as
+/// `read_for_client`.
+pub fn read_for_client_with_local_endpoint(
+    path: impl AsRef<Path>,
+) -> Result<ConnectionInfoWithLocalEndpoint, ConnectionFileError> {
+    let read = read_with_local_endpoint(path)?;
+    read.info.validate_wire_version(PROTOCOL_VERSION)?;
+    Ok(read)
+}
+
+fn read_owner_checked(path: &Path) -> Result<Vec<u8>, ConnectionFileError> {
     let mut file = File::open(path).map_err(|source| ConnectionFileError::Io {
         op: "open",
         path: path.to_path_buf(),
@@ -406,8 +540,12 @@ pub fn read(path: impl AsRef<Path>) -> Result<ConnectionInfo, ConnectionFileErro
             path: path.to_path_buf(),
             source,
         })?;
+    Ok(bytes)
+}
+
+fn parse_info(path: &Path, bytes: &[u8]) -> Result<ConnectionInfo, ConnectionFileError> {
     let info: ConnectionInfo =
-        serde_json::from_slice(&bytes).map_err(|source| ConnectionFileError::JsonRead {
+        serde_json::from_slice(bytes).map_err(|source| ConnectionFileError::JsonRead {
             path: path.to_path_buf(),
             source,
         })?;
@@ -647,14 +785,8 @@ pub fn generate_daemon_id() -> Result<[u8; DAEMON_ID_LEN], ConnectionFileError> 
 fn write_atomic_inner(
     path: &Path,
     temp_path: &Path,
-    info: &ConnectionInfo,
+    json: &[u8],
 ) -> Result<(), ConnectionFileError> {
-    let json =
-        serde_json::to_vec_pretty(info).map_err(|source| ConnectionFileError::JsonWrite {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
     {
         let mut file =
             open_owner_only_new(temp_path).map_err(|source| ConnectionFileError::Io {
@@ -662,7 +794,7 @@ fn write_atomic_inner(
                 path: temp_path.to_path_buf(),
                 source,
             })?;
-        file.write_all(&json)
+        file.write_all(json)
             .and_then(|()| file.sync_all())
             .map_err(|source| ConnectionFileError::Io {
                 op: "write_temp",
@@ -1401,6 +1533,189 @@ mod tests {
         assert!(rendered.contains(&PROTOCOL_VERSION.to_string()));
         assert!(rendered.contains("binary must be upgraded"));
         let _ = fs::remove_file(&path);
+    }
+
+    fn unix_endpoint() -> LocalEndpoint {
+        LocalEndpoint::Unix {
+            path: PathBuf::from("/run/user/1000/cortexkit/subc.sock"),
+        }
+    }
+
+    fn pipe_endpoint() -> LocalEndpoint {
+        LocalEndpoint::Pipe {
+            name: r"\\.\pipe\subc-0123456789abcdef".to_owned(),
+        }
+    }
+
+    /// Writes raw JSON as an owner-only file so a test can hand the readers a
+    /// shape the writer would never produce.
+    fn write_raw_owner_only(path: &Path, json: &serde_json::Value) {
+        let mut file = open_owner_only_new(path).expect("create owner-only fixture");
+        file.write_all(&serde_json::to_vec_pretty(json).unwrap())
+            .expect("write fixture");
+    }
+
+    #[test]
+    fn local_endpoint_serialises_as_kind_tagged_objects() {
+        assert_eq!(
+            serde_json::to_value(unix_endpoint()).unwrap(),
+            serde_json::json!({"kind": "unix", "path": "/run/user/1000/cortexkit/subc.sock"})
+        );
+        assert_eq!(
+            serde_json::to_value(pipe_endpoint()).unwrap(),
+            serde_json::json!({"kind": "pipe", "name": r"\\.\pipe\subc-0123456789abcdef"})
+        );
+    }
+
+    #[test]
+    fn writer_without_local_endpoint_matches_write_atomic_byte_for_byte() {
+        let dir = unique_temp_dir("local-endpoint-absent");
+        let plain = dir.join("plain.json");
+        let variant = dir.join("variant.json");
+        write_atomic(&plain, &sample_info()).expect("write plain");
+        write_atomic_with_local_endpoint(&variant, &sample_info(), None).expect("write variant");
+
+        let variant_bytes = fs::read(&variant).unwrap();
+        assert_eq!(fs::read(&plain).unwrap(), variant_bytes);
+        assert!(
+            !String::from_utf8(variant_bytes)
+                .unwrap()
+                .contains("local_endpoint"),
+            "an absent endpoint must be omitted, never written as null"
+        );
+
+        let read_back = read_with_local_endpoint(&variant).expect("read variant");
+        assert_eq!(read_back.info, sample_info());
+        assert_eq!(read_back.local_endpoint, None);
+    }
+
+    #[test]
+    fn local_endpoint_round_trips_and_the_plain_reader_still_parses_the_file() {
+        for endpoint in [unix_endpoint(), pipe_endpoint()] {
+            let dir = unique_temp_dir("local-endpoint-round-trip");
+            let path = dir.join(CONNECTION_FILE_NAME);
+            let mut info = sample_info();
+            info.wire_version = Some(PROTOCOL_VERSION);
+            write_atomic_with_local_endpoint(&path, &info, Some(&endpoint)).expect("write");
+
+            let json: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                json["local_endpoint"],
+                serde_json::to_value(&endpoint).unwrap()
+            );
+            assert_eq!(json["schema"], serde_json::json!(SCHEMA_VERSION));
+
+            assert_eq!(
+                read_with_local_endpoint(&path).expect("read with endpoint"),
+                ConnectionInfoWithLocalEndpoint {
+                    info: info.clone(),
+                    local_endpoint: Some(endpoint.clone()),
+                }
+            );
+            assert_eq!(
+                read_for_client_with_local_endpoint(&path)
+                    .expect("client read with endpoint")
+                    .local_endpoint,
+                Some(endpoint)
+            );
+            // Existing readers ignore the key and see the same ConnectionInfo.
+            assert_eq!(read(&path).expect("plain read"), info);
+            assert_eq!(read_for_client(&path).expect("plain client read"), info);
+        }
+    }
+
+    #[test]
+    fn a_file_written_before_local_endpoint_existed_reads_as_absent() {
+        let dir = unique_temp_dir("local-endpoint-legacy");
+        let path = dir.join(CONNECTION_FILE_NAME);
+        // The exact key set an older daemon writes, with no wire_version either.
+        let key = vec![0xABu8; KEY_LEN];
+        let daemon_id = [0x11u8; DAEMON_ID_LEN];
+        write_raw_owner_only(
+            &path,
+            &serde_json::json!({
+                "schema": SCHEMA_VERSION,
+                "endpoints": [{"host": "127.0.0.1", "port": 8799}],
+                "key": key,
+                "daemon_id": daemon_id,
+                "pid": 4242,
+                "daemon_ver": "subc-test",
+            }),
+        );
+
+        assert_eq!(read(&path).expect("legacy plain read"), sample_info());
+        let read_back = read_with_local_endpoint(&path).expect("legacy read with endpoint");
+        assert_eq!(read_back.info, sample_info());
+        assert_eq!(read_back.local_endpoint, None);
+    }
+
+    #[test]
+    fn a_malformed_local_endpoint_is_an_error_not_absent_and_the_plain_reader_ignores_it() {
+        let malformed = [
+            serde_json::json!({"kind": "tcp", "host": "127.0.0.1"}),
+            serde_json::json!({"kind": "unix"}),
+            serde_json::json!({"path": "/tmp/subc.sock"}),
+            serde_json::json!("/tmp/subc.sock"),
+            serde_json::json!({"kind": "unix", "path": ""}),
+            serde_json::json!({"kind": "pipe", "name": ""}),
+        ];
+        for (index, endpoint) in malformed.into_iter().enumerate() {
+            let dir = unique_temp_dir("local-endpoint-malformed");
+            let path = dir.join(CONNECTION_FILE_NAME);
+            let mut json = serde_json::to_value(sample_info()).unwrap();
+            json["local_endpoint"] = endpoint.clone();
+            write_raw_owner_only(&path, &json);
+
+            assert!(
+                matches!(
+                    read_with_local_endpoint(&path),
+                    Err(ConnectionFileError::JsonRead { .. } | ConnectionFileError::Invalid { .. })
+                ),
+                "case {index}: {endpoint} must not read as an absent endpoint"
+            );
+            assert_eq!(
+                read(&path).expect("plain reader ignores local_endpoint"),
+                sample_info(),
+                "case {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn writer_refuses_an_empty_local_endpoint_without_publishing() {
+        let dir = unique_temp_dir("local-endpoint-empty");
+        let path = dir.join(CONNECTION_FILE_NAME);
+        for endpoint in [
+            LocalEndpoint::Unix {
+                path: PathBuf::new(),
+            },
+            LocalEndpoint::Pipe {
+                name: String::new(),
+            },
+        ] {
+            assert!(matches!(
+                write_atomic_with_local_endpoint(&path, &sample_info(), Some(&endpoint)),
+                Err(ConnectionFileError::Invalid { .. })
+            ));
+            assert!(!path.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_with_local_endpoint_keeps_the_owner_only_check() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = unique_temp_dir("local-endpoint-perms");
+        let path = dir.join(CONNECTION_FILE_NAME);
+        write_atomic_with_local_endpoint(&path, &sample_info(), Some(&unix_endpoint()))
+            .expect("write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("relax");
+        assert!(matches!(
+            read_with_local_endpoint(&path),
+            Err(ConnectionFileError::InsecurePermissions { mode, .. }) if mode == 0o644
+        ));
     }
 
     #[cfg(unix)]

@@ -17,8 +17,9 @@ pub use auth::{
 };
 pub use connection_file::{
     discover, discovery_candidates, generate_daemon_id, generate_key, read, read_for_client,
-    user_connection_token, write_atomic, ConnectionFileError, ConnectionInfo, Discovered,
-    DiscoveryError, Endpoint, TriedCandidate, CONNECTION_FILE_NAME, DAEMON_ID_LEN, KEY_LEN,
-    MIN_KEY_LEN, SCHEMA_VERSION,
+    read_for_client_with_local_endpoint, read_with_local_endpoint, user_connection_token,
+    write_atomic, write_atomic_with_local_endpoint, ConnectionFileError, ConnectionInfo,
+    ConnectionInfoWithLocalEndpoint, Discovered, DiscoveryError, Endpoint, LocalEndpoint,
+    TriedCandidate, CONNECTION_FILE_NAME, DAEMON_ID_LEN, KEY_LEN, MIN_KEY_LEN, SCHEMA_VERSION,
 };
 pub use frame_io::{read_frame, write_frame, FrameIoError, ReadStage};

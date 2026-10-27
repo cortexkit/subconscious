@@ -2707,7 +2707,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.14.0"
+version = "0.14.1"
 dependencies = [
  "cortexkit-test-support",
  "getrandom 0.2.17",

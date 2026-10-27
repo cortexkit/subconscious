@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.1
+
+- Additive. The connection file may carry an optional `local_endpoint` key naming the daemon's same-user local listener: `{"kind":"unix","path":"…"}` or `{"kind":"pipe","name":"…"}`. New `LocalEndpoint` type; `read_with_local_endpoint` and `read_for_client_with_local_endpoint` return it beside `ConnectionInfo` from the same owner-checked read (absent key is `None`, a malformed one is an error); `write_atomic_with_local_endpoint` writes it, and with `None` writes bytes identical to `write_atomic`. `ConnectionInfo` and its fields are unchanged, and `read`/`read_for_client` still parse files with or without the key.
+
 ## 0.14.0
 
 - **Breaking dependency upgrade.** Re-export subc-protocol 0.33, whose `ToolCallRequest` gains the optional `output_refs` member (breaking for struct literals). A consumer that also depends on subc-protocol directly must move both together. No other change.

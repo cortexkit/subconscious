@@ -44,6 +44,11 @@
 //! For the machine as a whole, [`host`] reads total and available memory, the
 //! load averages and the space on a filesystem, again for reporting only.
 //!
+//! For the peer of an accepted local-endpoint connection (a Unix-domain
+//! socket, or a named-pipe client on Windows), [`local_peer`] reads the
+//! kernel's record of the connecting process: its user, pid and executable,
+//! and on macOS its code-signing identifier.
+//!
 //! And it carries the launch nonce from the daemon to each module it spawns
 //! over an inherited Unix pipe or a PID-authenticated Windows named pipe:
 //! [`launch_nonce`] is the one cached reader every module uses. Windows keeps
@@ -56,6 +61,7 @@
 pub mod fork_exec_test;
 pub mod host;
 pub mod launch_nonce;
+pub mod local_peer;
 pub mod privacy_identity;
 pub mod process_identity;
 pub mod socket_peer;

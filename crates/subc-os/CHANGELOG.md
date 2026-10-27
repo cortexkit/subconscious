@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.21
+
+- Add `local_peer`, which describes the process at the other end of an accepted local-endpoint connection from kernel primitives read on that connection. `observe_unix_peer` takes an accepted Unix-domain socket: on macOS it reads the `LOCAL_PEERTOKEN` audit token (effective uid and pid) and the guest code the token names (its path, and its signing identifier only when `SecCodeCheckValidity` with no requirement passes); on Linux it reads `SO_PEERPIDFD` and `SO_PEERCRED`, reads `/proc/<pid>/exe` and keeps it only if the pidfd still reports the peer alive after the read, and reports the peer unobserved when the kernel lacks `SO_PEERPIDFD`. `observe_pipe_client` takes a connected Windows named-pipe server instance: a local client's pid from `GetNamedPipeClientProcessId`, then, through a `PROCESS_QUERY_LIMITED_INFORMATION` handle, its token user SID and `QueryFullProcessImageNameW` path; a client on another machine is unobserved. A failed uid or SID read makes the peer unobserved; a failed executable or signing-identifier read leaves out only that value. With `test-support`, `observe_unix_peer_forcing` and `observe_pipe_client_forcing` force each read failure. Observations describe the peer and authorize nothing. On macOS the Core Foundation and Security frameworks are loaded on the first observation rather than linked, so programs that link this crate but never observe a peer don't load them (Core Foundation's start-up adds `__CF_USER_TEXT_ENCODING` to the process environment).
+
 ## 0.1.20
 
 - Add `parent_pid(pid)`: the parent process id the kernel reports, on macOS,

@@ -82,6 +82,9 @@ macro_rules! open_string_enum {
 mod rescan_checked;
 pub use rescan_checked::*;
 
+mod app_open;
+pub use app_open::*;
+
 /// Daemon-spawned consumer identity presented on route.open.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ConsumerIdentity {
@@ -147,6 +150,7 @@ pub mod ops {
     pub const ACTIVITY_RECORD: &str = "activity.record";
     pub const ACTIVITY_QUERY: &str = "activity.query";
     pub const ACTIVITY_SUBSCRIBE: &str = "activity.subscribe";
+    pub const APP_OPEN: &str = "app.open";
 }
 
 /// Client-originated channel-0 control RPC body.
@@ -2041,6 +2045,13 @@ pub struct CatalogEntry {
     /// from before the field. The daemon relays it and never enforces it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_operations: Option<Vec<String>>,
+    /// Management operations the module guards with `operator.confirm`,
+    /// mirrored unchanged from its manifest. Absent means the module did not
+    /// say (or declared an invalid list, which the daemon dropped), so a reader
+    /// treats the answer as unknown. Absence preserves catalog bytes from before
+    /// the field. The daemon relays it and refuses nothing on its basis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_operations: Option<Vec<String>>,
     /// Rich-UI descriptor mirrored verbatim from the registering manifest.
     /// The daemon does not fetch or interpret the manifest described here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2076,6 +2087,7 @@ impl CatalogEntry {
             operation_delivery: BTreeMap::new(),
             operation_payload: BTreeMap::new(),
             flow_operations: None,
+            confirm_operations: None,
             rich_ui: None,
             role_declarations: BTreeMap::new(),
             nonce_verified: false,
@@ -2097,6 +2109,14 @@ impl CatalogEntry {
     #[must_use]
     pub fn with_flow_operations(mut self, flow_operations: Option<Vec<String>>) -> Self {
         self.flow_operations = flow_operations;
+        self
+    }
+
+    /// Set or clear the confirm-guarded operation list mirrored from the
+    /// registered manifest. `None` is omitted from the wire.
+    #[must_use]
+    pub fn with_confirm_operations(mut self, confirm_operations: Option<Vec<String>>) -> Self {
+        self.confirm_operations = confirm_operations;
         self
     }
 

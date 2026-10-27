@@ -1,0 +1,7 @@
+{
+  "kind": "operation",
+  "op": "operator.confirm",
+  "route_channel": 7,
+  "route_epoch": 42,
+  "summary": "Delete 3 records"
+}

@@ -289,16 +289,79 @@ pub struct OperatorConfirmRequest {
     pub route_channel: u16,
     /// The epoch of that route on the asking module's connection.
     pub route_epoch: u32,
+    /// What the asking module says it is confirming. Absent (an older module)
+    /// means the same as an unrecognised kind: the person is prompted. Only
+    /// [`OperatorConfirmKind::Operation`] can ever be answered without a
+    /// prompt; [`OperatorConfirmKind::Enrollment`] always prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<OperatorConfirmKind>,
+    /// The management operation being confirmed, as the asking module's
+    /// manifest names it in `confirm_operations`. Meaningful only with
+    /// [`OperatorConfirmKind::Operation`]; absent means the person is prompted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
 }
 
 impl OperatorConfirmRequest {
+    /// A request with neither `kind` nor `operation`, whose bytes match what
+    /// modules sent before those fields existed.
     pub fn new(summary: impl Into<String>, route_channel: u16, route_epoch: u32) -> Self {
         Self {
             op: OperatorConfirmOp::Confirm,
             summary: summary.into(),
             route_channel,
             route_epoch,
+            kind: None,
+            operation: None,
         }
+    }
+
+    /// Set or clear `kind`.
+    #[must_use]
+    pub fn with_kind(mut self, kind: Option<OperatorConfirmKind>) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    /// Set or clear `operation`.
+    #[must_use]
+    pub fn with_operation(mut self, operation: Option<String>) -> Self {
+        self.operation = operation;
+        self
+    }
+}
+
+/// The `kind` of an [`OperatorConfirmRequest`].
+///
+/// A value from a newer module decodes as [`OperatorConfirmKind::Unknown`],
+/// keeping its spelling, rather than refusing the request. The daemon prompts
+/// for every kind except an explicit `operation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorConfirmKind {
+    /// A management operation the module declares in `confirm_operations`.
+    Operation,
+    /// Pairing or enrolling a device or credential. Always prompts.
+    Enrollment,
+    Unknown(String),
+}
+
+impl Serialize for OperatorConfirmKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::Operation => "operation",
+            Self::Enrollment => "enrollment",
+            Self::Unknown(value) => value,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for OperatorConfirmKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "operation" => Self::Operation,
+            "enrollment" => Self::Enrollment,
+            value => Self::Unknown(value.to_owned()),
+        })
     }
 }
 

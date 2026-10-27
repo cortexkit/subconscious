@@ -1,0 +1,96 @@
+{
+  "capabilities": {
+    "must_never_reach": [
+      "federation-transport/v1"
+    ],
+    "provides": [
+      "credentials-provider/v1"
+    ],
+    "requires": [
+      {
+        "capability": "context-transform/v1",
+        "need": "optional"
+      }
+    ]
+  },
+  "confirm_operations": [
+    "reset"
+  ],
+  "control_ops": [
+    "route.bind",
+    "route.status"
+  ],
+  "module_id": "aft-tools",
+  "module_version": "0.9.3",
+  "ready": true,
+  "roles": [
+    {
+      "concurrency": "module_managed",
+      "emits_push": true,
+      "identity_scope": [
+        "project",
+        "session"
+      ],
+      "role": "tool_provider",
+      "sub_supervises": true,
+      "tools": [
+        {
+          "execution_mode": "pure",
+          "name": "memory.read",
+          "schema": {
+            "required": [
+              "id"
+            ],
+            "type": "object"
+          }
+        }
+      ]
+    },
+    {
+      "applies_to": {
+        "model": "claude",
+        "provider": "anthropic"
+      },
+      "conformance_class": "lossless",
+      "declares_frozen_floor": true,
+      "interface": "proxy-transform-v1",
+      "needs_signals": [
+        "route.status"
+      ],
+      "role": "pipeline_stage",
+      "stage": "transform"
+    },
+    {
+      "concurrency": "module_managed",
+      "config_schema": {
+        "type": "object"
+      },
+      "identity_scope": [
+        "project"
+      ],
+      "observability": [
+        {
+          "kind": "snapshot",
+          "name": "memory.stats"
+        }
+      ],
+      "operations": [
+        {
+          "description": "List stored memory items and return their identifiers and metadata.",
+          "kind": "query",
+          "name": "memory.list"
+        }
+      ],
+      "role": "management_surface"
+    },
+    {
+      "agent_facing": true,
+      "operations": [
+        "llm.complete"
+      ],
+      "role": "internal_service",
+      "service_id": "llm",
+      "transport": "bulk"
+    }
+  ]
+}

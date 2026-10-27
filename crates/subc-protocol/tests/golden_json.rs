@@ -2,6 +2,10 @@ use std::{fmt::Debug, fs, path::PathBuf};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
+use subc_protocol::peer::{
+    encode_route_bind, ObservedPeer, ObservedPeerStatus, OperatorApp, RouteBindPeer,
+    OBSERVED_PEER_CAPABILITY, OPERATOR_APP_CAPABILITY,
+};
 use subc_protocol::{
     call_mode::CallMode,
     error_codes,
@@ -19,9 +23,10 @@ use subc_protocol::{
     session::{
         HealthStatus, ModuleControlCommand, ModuleControlPush, ModuleControlRequest,
         ModuleControlRequestFromModule, ModuleControlResponse, ModuleControlResponseToModule,
+        OperatorConfirmKind, OperatorConfirmRequest,
     },
     BindIdentity, ErrorBody, ModuleHelloAckBody, ModuleHelloBody, Principal, RouteCloseReason,
-    RouteTarget, FLAG_SUBSCRIPTION, PROTOCOL_VERSION,
+    RouteTarget, BUILD_CLASS_PRODUCTION, FLAG_SUBSCRIPTION, PROTOCOL_VERSION,
 };
 
 // Drift-prevention contract: UPDATE_GOLDEN=1 rewrites the committed JSON
@@ -490,6 +495,237 @@ fn call_mode_route_binds_match_golden_json_and_round_trip() {
         }
         assert_golden(name, &bind);
     }
+}
+
+/// The four `route.bind` peer-key combinations: neither (a target declaring
+/// neither capability), only `observed_peer`, only `operator_app`, and both.
+/// Neither must be the exact bytes of the bind as encoded before the keys
+/// existed; otherwise the keys follow the bind's own keys.
+#[test]
+fn route_bind_peer_keys_match_golden_json_and_round_trip() {
+    let bind = module_control_request(
+        Some(vec!["elicitation".to_string(), "roots".to_string()]),
+        Some(serde_json::json!({"schema": 1, "verified_class": "member"})),
+    );
+    let legacy = serde_json::to_vec(&bind).unwrap();
+    assert_eq!(
+        encode_route_bind(&bind, &RouteBindPeer::new()).unwrap(),
+        legacy
+    );
+    let legacy_golden: Value = serde_json::from_str(
+        &fs::read_to_string(golden_path("module_control_request_route_bind")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        legacy_golden,
+        serde_json::from_slice::<Value>(&legacy).unwrap()
+    );
+    let legacy_peer: RouteBindPeer = serde_json::from_slice(&legacy).unwrap();
+    assert!(legacy_peer.is_empty());
+
+    let observed = ObservedPeer::observed_uid(501)
+        .with_exe(Some(
+            "/Applications/Alfonso.app/Contents/MacOS/Alfonso".to_string(),
+        ))
+        .with_signing_id(Some("io.cortexkit.alfonso.desktop".to_string()));
+    let app = OperatorApp::new("alfonso-desktop", 4242);
+    for (name, peer) in [
+        (
+            "module_control_request_route_bind_with_observed_peer",
+            RouteBindPeer::new().with_observed_peer(Some(observed.clone())),
+        ),
+        (
+            "module_control_request_route_bind_with_operator_app",
+            RouteBindPeer::new().with_operator_app(Some(app.clone())),
+        ),
+        (
+            "module_control_request_route_bind_with_observed_peer_and_operator_app",
+            RouteBindPeer::new()
+                .with_observed_peer(Some(observed.clone()))
+                .with_operator_app(Some(app.clone())),
+        ),
+    ] {
+        let encoded = encode_route_bind(&bind, &peer).unwrap();
+        // The bind's own keys come first, unchanged, then the peer keys.
+        assert!(encoded.starts_with(&legacy[..legacy.len() - 1]), "{name}");
+        let actual: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            actual.get("observed_peer").is_some(),
+            peer.observed_peer.is_some(),
+            "{name}"
+        );
+        assert_eq!(
+            actual.get("operator_app").is_some(),
+            peer.operator_app.is_some(),
+            "{name}"
+        );
+        assert!(actual["identity"].get("build_class").is_none());
+        let path = golden_path(name);
+        if std::env::var_os("UPDATE_GOLDEN").is_some() {
+            fs::write(
+                &path,
+                format!("{}\n", serde_json::to_string_pretty(&actual).unwrap()),
+            )
+            .unwrap();
+        }
+        let expected: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(actual, expected, "golden JSON drift for {name}");
+        // A module decodes the same body as the bind and as the peer keys.
+        assert_eq!(
+            serde_json::from_value::<ModuleControlRequest>(expected.clone()).unwrap(),
+            bind
+        );
+        assert_eq!(
+            serde_json::from_value::<RouteBindPeer>(expected).unwrap(),
+            peer
+        );
+    }
+
+    assert!(
+        encode_route_bind(&ModuleControlRequest::HealthCheck {}, &RouteBindPeer::new()).is_err()
+    );
+}
+
+#[test]
+fn observed_peer_shapes_match_golden_json_and_round_trip() {
+    let tcp = ObservedPeer::unobserved();
+    assert_eq!(
+        serde_json::to_string(&tcp).unwrap(),
+        r#"{"status":"unobserved"}"#
+    );
+    for (name, peer) in [
+        ("observed_peer_unobserved", tcp),
+        (
+            "observed_peer_uid_with_exe",
+            ObservedPeer::observed_uid(1000).with_exe(Some("/usr/bin/alfonso".to_string())),
+        ),
+        (
+            "observed_peer_uid_without_exe",
+            ObservedPeer::observed_uid(1000),
+        ),
+        (
+            "observed_peer_uid_with_signing_id",
+            ObservedPeer::observed_uid(501)
+                .with_exe(Some(
+                    "/Applications/Alfonso.app/Contents/MacOS/Alfonso".to_string(),
+                ))
+                .with_signing_id(Some("io.cortexkit.alfonso.desktop".to_string())),
+        ),
+        (
+            "observed_peer_sid_with_exe",
+            ObservedPeer::observed_sid("S-1-5-21-1004336348-1177238915-682003330-1001")
+                .with_exe(Some(r"C:\Program Files\Alfonso\Alfonso.exe".to_string())),
+        ),
+    ] {
+        assert_golden(name, &peer);
+    }
+    assert_golden("operator_app", &OperatorApp::new("alfonso-desktop", 4242));
+
+    // A status from a newer daemon keeps its spelling and is not `observed`.
+    let newer: ObservedPeer =
+        serde_json::from_value(serde_json::json!({"status": "attested", "uid": 7})).unwrap();
+    assert_eq!(
+        newer.status,
+        ObservedPeerStatus::Unknown("attested".to_string())
+    );
+    assert_eq!(
+        serde_json::to_value(&newer).unwrap(),
+        serde_json::json!({"status": "attested", "uid": 7})
+    );
+    assert_eq!(OBSERVED_PEER_CAPABILITY, "observed-peer/v1");
+    assert_eq!(OPERATOR_APP_CAPABILITY, "operator-app/v1");
+}
+
+/// `operator.confirm` with each kind (absent, `operation`, `enrollment`, and
+/// one this crate does not know), each with and without `operation`.
+#[test]
+fn operator_confirm_kinds_match_golden_json_and_round_trip() {
+    for (kind_name, kind) in [
+        ("absent", None),
+        ("operation", Some(OperatorConfirmKind::Operation)),
+        ("enrollment", Some(OperatorConfirmKind::Enrollment)),
+        (
+            "unknown",
+            Some(OperatorConfirmKind::Unknown("delegation".to_string())),
+        ),
+    ] {
+        for operation in [None, Some("records.delete".to_string())] {
+            let suffix = if operation.is_some() {
+                "with_operation"
+            } else {
+                "without_operation"
+            };
+            let request = OperatorConfirmRequest::new("Delete 3 records", 7, 42)
+                .with_kind(kind.clone())
+                .with_operation(operation);
+            assert_golden(
+                &format!("operator_confirm_request_kind_{kind_name}_{suffix}"),
+                &request,
+            );
+        }
+    }
+    // Absent kind and operation keep the bytes older modules send.
+    assert_eq!(
+        serde_json::to_string(&OperatorConfirmRequest::new("Delete 3 records", 7, 42)).unwrap(),
+        r#"{"op":"operator.confirm","summary":"Delete 3 records","route_channel":7,"route_epoch":42}"#
+    );
+}
+
+#[test]
+fn bind_identity_build_class_matches_golden_json_and_older_readers_drop_it() {
+    let mut identity = bind_identity();
+    identity.build_class = Some(BUILD_CLASS_PRODUCTION.to_string());
+    assert_golden("bind_identity_with_build_class", &identity);
+    // Absent keeps the existing identity bytes.
+    assert!(serde_json::to_value(bind_identity())
+        .unwrap()
+        .get("build_class")
+        .is_none());
+
+    // A reader built before the field, which like BindIdentity has no
+    // deny_unknown_fields, decodes the identity and drops the claim.
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct OlderBindIdentity {
+        project_root: PathBuf,
+        harness: String,
+        session: String,
+        #[serde(default)]
+        project_id: Option<String>,
+    }
+    let wire: Value = serde_json::from_str(
+        &fs::read_to_string(golden_path("bind_identity_with_build_class")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(wire["build_class"], "production");
+    let older: OlderBindIdentity = serde_json::from_value(wire).unwrap();
+    assert_eq!(older.harness, "opencode");
+
+    // Any other value still decodes; the daemon treats it as absent.
+    let mut other = bind_identity();
+    other.build_class = Some("development".to_string());
+    let decoded: BindIdentity =
+        serde_json::from_value(serde_json::to_value(&other).unwrap()).unwrap();
+    assert_eq!(decoded.build_class.as_deref(), Some("development"));
+}
+
+#[test]
+fn manifest_confirm_operations_match_golden_json() {
+    let mut manifest = management_surface_manifest(None);
+    manifest.confirm_operations = Some(vec!["records.list".to_string()]);
+    assert!(manifest.validate_confirm_operations().is_ok());
+    assert_golden(
+        "management_surface_manifest_with_confirm_operations",
+        &manifest,
+    );
+    // Absent: the existing vector carries no key.
+    let absent: Value = serde_json::from_str(
+        &fs::read_to_string(golden_path(
+            "management_surface_manifest_without_description",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(absent.get("confirm_operations").is_none());
 }
 
 fn scope_head_record() -> ScopeRecord {

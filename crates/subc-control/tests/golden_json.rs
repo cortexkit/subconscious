@@ -3,18 +3,19 @@ use std::{collections::BTreeMap, fmt::Debug, fs, path::PathBuf};
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use subc_control::{
-    BusyGaugeReading, CatalogEntry, ChildMemoryKind, ChildResourceReading,
-    ChildResourceUnavailableReason, ChildResourceUsage, ClientControlPush, ClientControlRequest,
-    ClientControlResponse, ConsumerIdentity, DaemonBuildProvenance, DaemonObservedProcess,
-    LaunchSpecAgreement, LaunchSpecUnavailableReason, LiveSpawn, ModuleDeclaredProvenance,
-    ModuleProtocol, NotReadyReason, PendingReloadVerdict, PollKind, ReloadPathAgreement,
-    ReloadPathUnavailableReason, RescanExpect, RescanModuleAction, RescanModuleActionKind,
-    RouteCloseReason, RunningImageAgreement, RunningImageEvidence, RunningImageUnavailableReason,
-    SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot, StagedGeneration, StderrCaptureState,
-    StderrTail, StderrTailEntry, SupervisorDaemonProvenance, SupervisorEntry,
-    SupervisorHealthEntry, SupervisorHealthStatus, SupervisorModuleProvenance,
+    AppOpenReply, AppOpenRequest, BusyGaugeReading, CatalogEntry, ChildMemoryKind,
+    ChildResourceReading, ChildResourceUnavailableReason, ChildResourceUsage, ClientControlPush,
+    ClientControlRequest, ClientControlResponse, ConsumerIdentity, DaemonBuildProvenance,
+    DaemonObservedProcess, LaunchSpecAgreement, LaunchSpecUnavailableReason, LiveSpawn,
+    ModuleDeclaredProvenance, ModuleProtocol, NotReadyReason, PendingReloadVerdict, PollKind,
+    ReloadPathAgreement, ReloadPathUnavailableReason, RescanExpect, RescanModuleAction,
+    RescanModuleActionKind, RouteCloseReason, RunningImageAgreement, RunningImageEvidence,
+    RunningImageUnavailableReason, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot,
+    StagedGeneration, StderrCaptureState, StderrTail, StderrTailEntry, SupervisorDaemonProvenance,
+    SupervisorEntry, SupervisorHealthEntry, SupervisorHealthStatus, SupervisorModuleProvenance,
     SupervisorObservedProcess, SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer,
-    SupervisorRouteModule,
+    SupervisorRouteModule, APP_NOT_INSTALLED, APP_OPEN_DISABLED, APP_OPEN_ERROR_CODES,
+    APP_OPEN_NOT_USED, APP_UNKNOWN, APP_VERIFICATION_FAILED,
 };
 use subc_protocol::{
     manifest::{
@@ -25,7 +26,7 @@ use subc_protocol::{
         SelfSignalEffect, SelfSignalKind, SignalAnchor, SignalCadence, Tool,
     },
     session::HealthStatus,
-    BindIdentity, RouteTarget, PROTOCOL_VERSION,
+    BindIdentity, ErrorBody, RouteTarget, PROTOCOL_VERSION,
 };
 
 // Drift-prevention contract: UPDATE_GOLDEN=1 rewrites the committed JSON
@@ -246,6 +247,78 @@ fn catalog_operation_delivery_round_trips_open_strings() {
         .with_operation_delivery(BTreeMap::new())
         .operation_delivery
         .is_empty());
+}
+
+/// `route.open` whose bind identity carries the opener's `build_class`, and
+/// the same open without it, which keeps the existing request bytes.
+#[test]
+fn route_open_build_class_matches_golden_json_and_round_trip() {
+    let without = route_open_role_versions(false);
+    let ClientControlRequest::RouteOpen { identity, .. } = &without else {
+        unreachable!("the helper builds a route.open");
+    };
+    assert!(identity.build_class.is_none());
+    assert_golden(
+        "client_control_request_route_open_without_role_versions",
+        &without,
+    );
+
+    let mut with = without.clone();
+    let ClientControlRequest::RouteOpen { identity, .. } = &mut with else {
+        unreachable!("the helper builds a route.open");
+    };
+    identity.build_class = Some(subc_protocol::BUILD_CLASS_PRODUCTION.to_string());
+    assert_golden("client_control_request_route_open_with_build_class", &with);
+    let wire = serde_json::to_value(&with).unwrap();
+    assert_eq!(wire["identity"]["build_class"], "production");
+    assert!(wire.get("build_class").is_none());
+}
+
+#[test]
+fn catalog_confirm_operations_match_golden_json_and_absence_keeps_bytes() {
+    assert_golden("catalog_entry", &catalog_entry());
+    let absent = serde_json::to_value(catalog_entry()).unwrap();
+    assert!(absent.get("confirm_operations").is_none());
+    assert_golden(
+        "catalog_entry_with_confirm_operations",
+        &catalog_entry().with_confirm_operations(Some(vec!["reset".to_string()])),
+    );
+}
+
+#[test]
+fn app_open_shapes_match_golden_json_and_round_trip() {
+    assert_eq!(subc_control::ops::APP_OPEN, "app.open");
+    assert_golden(
+        "client_control_request_app_open",
+        &AppOpenRequest::new("alfonso-desktop"),
+    );
+    assert_golden(
+        "client_control_response_app_open_launched",
+        &AppOpenReply::launched(4242),
+    );
+    assert_golden(
+        "client_control_response_app_open_already_running",
+        &AppOpenReply::already_running(4242),
+    );
+    assert_eq!(
+        serde_json::to_string(&AppOpenReply::already_running(7)).unwrap(),
+        r#"{"op":"app.open","status":"already_running","pid":7}"#
+    );
+    for (code, spelling) in [
+        (APP_OPEN_NOT_USED, "app_open_not_used"),
+        (APP_OPEN_DISABLED, "app_open_disabled"),
+        (APP_UNKNOWN, "app_unknown"),
+        (APP_NOT_INSTALLED, "app_not_installed"),
+        (APP_VERIFICATION_FAILED, "app_verification_failed"),
+    ] {
+        assert_eq!(code, spelling);
+        assert!(APP_OPEN_ERROR_CODES.contains(&code));
+        assert_golden(
+            &format!("client_control_error_{code}"),
+            &ErrorBody::new(code, format!("app.open refused: {code}")),
+        );
+    }
+    assert_eq!(APP_OPEN_ERROR_CODES.len(), 5);
 }
 
 fn assert_golden<T>(name: &str, value: &T)

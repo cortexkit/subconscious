@@ -2548,7 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.33.3"
+version = "0.33.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -2699,7 +2699,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.33.4"
+version = "0.33.5"
 dependencies = [
  "serde",
  "serde_json",

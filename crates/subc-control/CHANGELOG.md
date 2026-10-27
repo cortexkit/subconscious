@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.33.4
+
+- Add `CatalogEntry::confirm_operations` and `with_confirm_operations`, mirroring the manifest's list of management operations guarded with `operator.confirm`. Absent means unknown; absence is omitted and keeps existing catalog bytes. The daemon relays it and refuses nothing on its basis.
+- Add standalone `app.open` bodies, kept out of the exhaustive control enums so no existing match changes: `AppOpenRequest` (`{"op":"app.open","app":"<id>"}`), `AppOpenReply` with `launched` and `already_running` constructors, the open string enum `AppOpenStatus`, `ops::APP_OPEN`, and the refusal codes `app_open_not_used`, `app_open_disabled`, `app_unknown`, `app_not_installed` and `app_verification_failed` (`APP_OPEN_ERROR_CODES`, in the order the daemon checks them).
+- Requires `subc-protocol` 0.33.5. `route.open` may carry `identity.build_class` through the protocol's `BindIdentity`; omitted when absent, so existing request bytes are unchanged.
+
 ## 0.33.3
 
 - Add `CatalogEntry::flow_operations` and `with_flow_operations`, mirroring the manifest's list of management operations served to flow-scoped calls. Absent means the module did not say, not that it admits none; absence is omitted and keeps existing catalog bytes. `CatalogEntry` remains non-exhaustive and builder-compatible.

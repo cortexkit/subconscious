@@ -1,0 +1,13 @@
+{
+  "identity": {
+    "build_class": "production",
+    "harness": "opencode",
+    "project_root": "/tmp/subc/project",
+    "session": "session-0001"
+  },
+  "op": "route.open",
+  "target": {
+    "kind": "tool_provider",
+    "module_id": "aft"
+  }
+}

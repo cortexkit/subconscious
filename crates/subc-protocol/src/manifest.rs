@@ -22,6 +22,9 @@ pub const MAX_ROLE_DECLARATIONS_BYTES: usize = 16_384;
 /// Maximum number of names in [`ModuleManifest::flow_operations`].
 pub const MAX_FLOW_OPERATIONS: usize = 256;
 
+/// Maximum number of names in [`ModuleManifest::confirm_operations`].
+pub const MAX_CONFIRM_OPERATIONS: usize = 256;
+
 /// A module's full declared participation in the subc mesh.
 ///
 /// Construct via [`ModuleManifest::builder()`], never a struct literal. Adding a
@@ -141,6 +144,24 @@ pub struct ModuleManifest {
     /// and older daemons silently drop the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_operations: Option<Vec<String>>,
+    /// Management operations this module guards by asking the person through
+    /// `operator.confirm` before it acts.
+    ///
+    /// `Some(list)` names them; `Some(vec![])` names none. `None` means the
+    /// module has not said, which a reader treats as unknown. A module asking
+    /// `operator.confirm` with kind `operation` names one of these in the
+    /// request's `operation`; the daemon may answer without a prompt only for an
+    /// operation listed here, and prompts for everything else.
+    ///
+    /// Decoding drops the whole list, without refusing HELLO, when it is not an
+    /// array of strings, holds more than [`MAX_CONFIRM_OPERATIONS`] names,
+    /// repeats a name, or names something that is not a management operation of
+    /// this same manifest; see [`ModuleManifest::validate_confirm_operations`].
+    /// The daemon relays a valid list through `catalog.list` and refuses nothing
+    /// on its basis. Absence preserves legacy bytes, and older daemons silently
+    /// drop the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_operations: Option<Vec<String>>,
     /// An opaque rich-UI manifest descriptor discoverable from `catalog.list`.
     ///
     /// The daemon validates the descriptor's shape at HELLO and relays it without
@@ -177,6 +198,7 @@ pub struct ModuleManifestBuilder {
     operation_delivery: BTreeMap<String, OperationDelivery>,
     operation_payload: BTreeMap<String, OperationPayload>,
     flow_operations: Option<Vec<String>>,
+    confirm_operations: Option<Vec<String>>,
     rich_ui: Option<RichUiDescriptor>,
     role_declarations: BTreeMap<String, serde_json::Map<String, Value>>,
 }
@@ -209,6 +231,7 @@ impl ModuleManifest {
             operation_delivery: BTreeMap::new(),
             operation_payload: BTreeMap::new(),
             flow_operations: None,
+            confirm_operations: None,
             rich_ui: None,
             role_declarations: BTreeMap::new(),
         }
@@ -325,6 +348,17 @@ impl ModuleManifestBuilder {
         self
     }
 
+    /// Declares the management operations guarded with `operator.confirm`.
+    ///
+    /// `None` (the default) leaves the answer unknown and preserves legacy wire
+    /// bytes. Check the result with
+    /// [`ModuleManifest::validate_confirm_operations`], because an invalid list
+    /// is dropped when the manifest is decoded.
+    pub fn confirm_operations(mut self, confirm_operations: Option<Vec<String>>) -> Self {
+        self.confirm_operations = confirm_operations;
+        self
+    }
+
     /// Adds an opaque rich-UI manifest descriptor to this module's manifest.
     pub fn rich_ui(mut self, rich_ui: Option<RichUiDescriptor>) -> Self {
         self.rich_ui = rich_ui;
@@ -358,6 +392,7 @@ impl ModuleManifestBuilder {
             operation_delivery: self.operation_delivery,
             operation_payload: self.operation_payload,
             flow_operations: self.flow_operations,
+            confirm_operations: self.confirm_operations,
             rich_ui: self.rich_ui,
             role_declarations: self.role_declarations,
         }
@@ -412,6 +447,9 @@ struct ModuleManifestWire {
     // Kept raw so an invalid list can be dropped rather than refusing HELLO.
     #[serde(default)]
     flow_operations: Option<Value>,
+    // Kept raw for the same reason as `flow_operations`.
+    #[serde(default)]
+    confirm_operations: Option<Value>,
     #[serde(default)]
     rich_ui: Option<RichUiDescriptor>,
     // `runtime_computed` belongs to --manifest output rather than the retained
@@ -473,6 +511,9 @@ impl<'de> Deserialize<'de> for ModuleManifest {
         manifest.flow_operations = wire
             .flow_operations
             .and_then(|value| decode_flow_operations(&manifest, &value).ok());
+        manifest.confirm_operations = wire
+            .confirm_operations
+            .and_then(|value| decode_confirm_operations(&manifest, &value).ok());
         manifest
             .validate_capability_grammar()
             .map_err(D::Error::custom)?;
@@ -2481,6 +2522,125 @@ pub fn validate_hello_flow_operations(hello: &Value) -> Result<(), FlowOperation
         return Ok(());
     };
     decode_flow_operations(&manifest, value).map(|_| ())
+}
+
+/// Why a [`ModuleManifest::confirm_operations`] list is dropped.
+///
+/// A dropped list leaves the manifest as if the module had not declared one;
+/// it never refuses HELLO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ConfirmOperationsError {
+    /// The wire value is not an array of strings.
+    NotAList,
+    /// The list holds more than [`MAX_CONFIRM_OPERATIONS`] names.
+    TooMany { count: usize },
+    /// The same name appears more than once.
+    DuplicateOperation { operation: String },
+    /// The name is not a management operation declared by the same manifest.
+    UnknownOperation { operation: String },
+}
+
+impl fmt::Display for ConfirmOperationsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAList => {
+                f.write_str("confirm_operations must be an array of operation names")
+            }
+            Self::TooMany { count } => write!(
+                f,
+                "confirm_operations lists {count} names, more than {MAX_CONFIRM_OPERATIONS}"
+            ),
+            Self::DuplicateOperation { operation } => {
+                write!(f, "confirm_operations names '{operation}' more than once")
+            }
+            Self::UnknownOperation { operation } => write!(
+                f,
+                "confirm_operations names '{operation}', which is not a declared management operation"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConfirmOperationsError {}
+
+impl ModuleManifest {
+    /// Checks a present [`Self::confirm_operations`] list: it holds at most
+    /// [`MAX_CONFIRM_OPERATIONS`] distinct names, and each name is a management
+    /// operation of this manifest. An absent list is always valid.
+    pub fn validate_confirm_operations(&self) -> Result<(), ConfirmOperationsError> {
+        match &self.confirm_operations {
+            Some(operations) => check_confirm_operations(self, operations),
+            None => Ok(()),
+        }
+    }
+}
+
+fn check_confirm_operations(
+    manifest: &ModuleManifest,
+    operations: &[String],
+) -> Result<(), ConfirmOperationsError> {
+    if operations.len() > MAX_CONFIRM_OPERATIONS {
+        return Err(ConfirmOperationsError::TooMany {
+            count: operations.len(),
+        });
+    }
+    let mut seen = HashSet::new();
+    for operation in operations {
+        if !seen.insert(operation.as_str()) {
+            return Err(ConfirmOperationsError::DuplicateOperation {
+                operation: operation.clone(),
+            });
+        }
+        if !declares_management_operation(manifest, operation) {
+            return Err(ConfirmOperationsError::UnknownOperation {
+                operation: operation.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn declares_management_operation(manifest: &ModuleManifest, operation: &str) -> bool {
+    manifest.provides.iter().any(|role| match role {
+        ProviderRole::ManagementSurface { operations, .. } => {
+            operations.iter().any(|op| op.name == operation)
+        }
+        _ => false,
+    })
+}
+
+/// Decodes and checks a raw `confirm_operations` value against the rest of its
+/// manifest. JSON `null` is treated by callers as absent, never as a list.
+fn decode_confirm_operations(
+    manifest: &ModuleManifest,
+    value: &Value,
+) -> Result<Vec<String>, ConfirmOperationsError> {
+    let operations: Vec<String> =
+        serde_json::from_value(value.clone()).map_err(|_| ConfirmOperationsError::NotAList)?;
+    check_confirm_operations(manifest, &operations)?;
+    Ok(operations)
+}
+
+/// Checks the `confirm_operations` list of a raw HELLO, so the daemon can warn
+/// about a list that decoding will drop.
+///
+/// Returns `Ok` when the list is absent or `null`, and also when the manifest
+/// itself does not decode: that HELLO is refused for its own reason.
+pub fn validate_hello_confirm_operations(hello: &Value) -> Result<(), ConfirmOperationsError> {
+    let Some(manifest_value) = hello.get("manifest") else {
+        return Ok(());
+    };
+    let Some(value) = manifest_value
+        .get("confirm_operations")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(());
+    };
+    let Ok(manifest) = ModuleManifest::deserialize(manifest_value) else {
+        return Ok(());
+    };
+    decode_confirm_operations(&manifest, value).map(|_| ())
 }
 
 /// Operation exposed on the management plane.

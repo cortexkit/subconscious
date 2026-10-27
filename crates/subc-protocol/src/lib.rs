@@ -41,6 +41,7 @@ pub mod frame;
 pub mod framed_body;
 pub mod machine_id;
 pub mod manifest;
+pub mod peer;
 pub mod scope;
 pub mod session;
 pub mod tool_call;
@@ -354,7 +355,25 @@ pub struct BindIdentity {
     /// fallback ids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// The opener's claim about the kind of build it is, sent on `route.open`.
+    /// [`BUILD_CLASS_PRODUCTION`] marks a production build whose integrity the
+    /// opener has verified.
+    ///
+    /// Like every other field here it is unattested. The daemon honours it only
+    /// when the opener's principal is `Reserved { module_id: "callosum" }`, and
+    /// only the exact value [`BUILD_CLASS_PRODUCTION`]; any other value counts
+    /// as absent. From any other opener it is ignored. The daemon never relays
+    /// it to the target module: the identity on `route.bind` never carries it.
+    ///
+    /// Absent is omitted from the wire, so existing identities keep their bytes,
+    /// and a reader that predates the field drops it, which grants nothing.
+    /// Set it on the public field after [`BindIdentity::new`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_class: Option<String>,
 }
+
+/// The only [`BindIdentity::build_class`] value the daemon honours.
+pub const BUILD_CLASS_PRODUCTION: &str = "production";
 
 impl BindIdentity {
     /// Constructs an identity with no registered project id.
@@ -371,6 +390,7 @@ impl BindIdentity {
             harness: harness.into(),
             session: session.into(),
             project_id: None,
+            build_class: None,
         }
     }
 }

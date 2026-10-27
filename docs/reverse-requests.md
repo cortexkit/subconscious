@@ -96,6 +96,44 @@ stdio session. This keeps the gateway dumb, and it means the SAME body shape
 works for Mode-2 plugin consumers (opencode/pi plugins answer it in-process,
 no MCP host involved) — one asking convention across both fronts.
 
+One optional top-level field links a question to the call it belongs to:
+`"in_reply_to": <corr>`, the corr of the module's in-flight forward request
+on the same route (the daemon rewrites only channel and epoch, so this is the
+corr the consumer sent). It is absent when the module does not send it, and
+consumers that ignore it are unaffected. The daemon forwards it unread like
+the rest of the body.
+
+### 5.1.1 Hosts on MCP 2026-07-28 and later
+
+Those hosts start without `initialize` and refuse server→client requests,
+so the gateway never sends them one. When a module asks `elicitation/create`
+during a tools/call, the gateway answers that tools/call with the question in
+the MRTR form (`resultType: "input_required"`, `inputRequests`, and an opaque
+`requestState`) and keeps the module's forward request open. The host repeats
+the tools/call with `inputResponses` and the same `requestState`; the gateway
+answers the module's reverse request with the host's result, under the
+module's corr as always, and the module's eventual result answers the
+repeated call. The module sees no difference.
+
+- With `in_reply_to`, the question goes to exactly that tools/call. If it
+  names no call waiting on the route, or one whose request did not declare
+  elicitation in its `_meta` client capabilities, the module gets an Error
+  frame; the question never goes to another call.
+- Without it, the question goes to the one tools/call waiting on the route.
+  When several are waiting, the module gets an Error frame: a question shown
+  under the wrong tool call could be answered as though it were about another
+  action.
+- One question per call at a time; a second while the first is outstanding
+  is answered with an Error frame.
+- A host that never comes back within the relay TTL
+  (`SUBC_MCP_REVERSE_RELAY_TTL_MS`, 10 minutes by default) is treated as a
+  decline: the module receives `{"action": "decline"}`.
+- `sampling/createMessage` and `roots/list` are answered with an Error frame
+  for these hosts.
+
+Hosts that sent `initialize` (2025-11-25 and older) keep the server→client
+relay above; `in_reply_to` changes nothing for them.
+
 ### 5.2 Fail-closed relay boundary
 
 Before the MCP host completes `initialize`, or when it has not declared the requested elicitation, sampling or roots capability, the gateway returns an Error frame to the requesting module immediately without prompting the host. It also returns Error when the route no longer maps to a live shim session.

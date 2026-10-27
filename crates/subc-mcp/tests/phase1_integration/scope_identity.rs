@@ -9,6 +9,8 @@ struct RootsClient {
     roots: Option<Vec<PathBuf>>,
     non_file: bool,
     fail_roots: bool,
+    /// How many times the gateway asked this host for its roots.
+    roots_asked: Arc<AtomicUsize>,
 }
 
 enum RootsMode {
@@ -35,6 +37,7 @@ impl ClientHandler for RootsClient {
         &self,
         _context: rmcp::service::RequestContext<RoleClient>,
     ) -> Result<rmcp::model::ListRootsResult, McpErrorData> {
+        self.roots_asked.fetch_add(1, Ordering::SeqCst);
         if self.fail_roots {
             return Err(McpErrorData::internal_error(
                 "roots service is unavailable",
@@ -170,6 +173,7 @@ struct IdentityHarness {
     project: TestProject,
     root: PathBuf,
     proxy: AttributionProxy,
+    roots_asked: Arc<AtomicUsize>,
 }
 
 impl IdentityHarness {
@@ -184,6 +188,21 @@ impl IdentityHarness {
         token: bool,
         reserved: bool,
         mode: AttributionMode,
+    ) -> Self {
+        Self::start_full(scoped, roots, resolve, token, reserved, mode, false).await
+    }
+
+    /// `modern` serves the host as an MCP 2026-07-28 client, which sends no
+    /// `initialize`.
+    #[allow(clippy::too_many_arguments)]
+    async fn start_full(
+        scoped: bool,
+        roots: RootsMode,
+        resolve: Value,
+        token: bool,
+        reserved: bool,
+        mode: AttributionMode,
+        modern: bool,
     ) -> Self {
         let server = TestServer::start().await;
         let proxy = AttributionProxy::start(&server, mode).await;
@@ -235,17 +254,22 @@ impl IdentityHarness {
                 child,
             }
         };
-        let client = shim
-            .serve_mcp_client(RootsClient {
-                non_file: matches!(roots, RootsMode::NonFile),
-                fail_roots: matches!(roots, RootsMode::Error),
-                roots: match roots {
-                    RootsMode::Absent => None,
-                    RootsMode::Empty | RootsMode::NonFile | RootsMode::Error => Some(vec![]),
-                    RootsMode::Folder => Some(vec![root.join("nested")]),
-                },
-            })
-            .await;
+        let roots_asked = Arc::new(AtomicUsize::new(0));
+        let handler = RootsClient {
+            non_file: matches!(roots, RootsMode::NonFile),
+            fail_roots: matches!(roots, RootsMode::Error),
+            roots: match roots {
+                RootsMode::Absent => None,
+                RootsMode::Empty | RootsMode::NonFile | RootsMode::Error => Some(vec![]),
+                RootsMode::Folder => Some(vec![root.join("nested")]),
+            },
+            roots_asked: Arc::clone(&roots_asked),
+        };
+        let client = if modern {
+            shim.serve_mcp_client_2026(handler).await
+        } else {
+            shim.serve_mcp_client(handler).await
+        };
         Self {
             server,
             module,
@@ -256,6 +280,7 @@ impl IdentityHarness {
             project,
             root,
             proxy,
+            roots_asked,
         }
     }
 
@@ -649,5 +674,91 @@ async fn scope_fallback_roots_error_uses_shim_root() {
         bind.pointer("/scope/workdir"),
         Some(&json!(daemon_canonical(h.project.path.as_ref())))
     );
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn scope_identity_2026_host_starts_its_session_once_without_initialize() {
+    // A 2026-07-28 host sends no `initialize`, so the session's start-up
+    // (scope record, project resolve, provider routes, catalog lifecycle) has
+    // to run on its first request, and only once across many.
+    let mut h = IdentityHarness::start_full(
+        true,
+        RootsMode::Folder,
+        explicit(),
+        false,
+        true,
+        AttributionMode::Normal,
+        true,
+    )
+    .await;
+    let peer = h.client.peer().clone();
+    let (first, second, prompts) = tokio::join!(
+        peer.list_tools(None),
+        peer.list_tools(None),
+        peer.list_prompts(None)
+    );
+    for tools in [first.unwrap(), second.unwrap()] {
+        assert!(tools
+            .tools
+            .iter()
+            .any(|tool| tool.name == "scope-probe_probe"));
+    }
+    prompts.unwrap();
+    for _ in 0..2 {
+        let result = h
+            .client
+            .call_tool(CallToolRequestParams::new("scope-probe_probe"))
+            .await
+            .expect("tools/call on a 2026-07-28 session");
+        assert_ne!(result.is_error, Some(true));
+    }
+    assert_eq!(h.provider.requests.lock().await.len(), 2);
+
+    // roots/list is a server-to-client request such a host refuses, so the
+    // scope's workdir is the shim's project root even though the host
+    // declares roots.
+    let bind = h.provider.bound().await;
+    assert_eq!(
+        bind.pointer("/scope/workdir"),
+        Some(&json!(daemon_canonical(h.project.path.as_ref())))
+    );
+    assert_eq!(h.roots_asked.load(Ordering::SeqCst), 0);
+
+    // One route bind, one project resolve, one scope registration
+    // (scope.sync, then scope.apply), however many requests came in.
+    assert!(
+        timeout(QUIET_TIMEOUT, h.provider.binds.recv())
+            .await
+            .is_err(),
+        "the provider route must be bound once"
+    );
+    assert_eq!(
+        *h.entorhinal.requests.lock().await,
+        vec![
+            json!({"method":"resolve", "params":{"canonicalRoot":daemon_canonical(h.project.path.as_ref())}})
+        ]
+    );
+    assert_eq!(h.proxy.scope_requests.load(Ordering::SeqCst), 2);
+
+    // The catalog lifecycle started too: a provider that registers later
+    // shows up in tools/list.
+    let _late = IdentityProvider::start(&h.server, "late-probe", false, None).await;
+    timeout(READ_TIMEOUT, async {
+        loop {
+            let tools = peer.list_tools(None).await.expect("tools/list");
+            if tools
+                .tools
+                .iter()
+                .any(|tool| tool.name == "late-probe_probe")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first request must start the catalog lifecycle");
+    assert_eq!(h.proxy.scope_requests.load(Ordering::SeqCst), 2);
     h.shutdown().await;
 }

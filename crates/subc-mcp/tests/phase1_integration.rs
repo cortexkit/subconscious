@@ -3,6 +3,9 @@
 #[path = "phase1_integration/scope_identity.rs"]
 mod scope_identity;
 
+#[path = "phase1_integration/mcp_2026.rs"]
+mod mcp_2026;
+
 use cortexkit_test_support::ScratchDir;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
@@ -31,7 +34,7 @@ use rmcp::{
     service::{
         MaybeSendFuture, NotificationContext, PeerRequestOptions, RunningService, ServiceError,
     },
-    ClientHandler, RoleClient, ServiceExt,
+    ClientHandler, ClientServiceExt, RoleClient, ServiceExt,
 };
 use serde_json::{json, Value};
 use subc_control::{
@@ -170,6 +173,25 @@ impl ShimProcess {
             .serve((stdout, stdin))
             .await
             .expect("rmcp client should initialize through subc-mcp shim")
+    }
+
+    /// Serves `handler` as a host on MCP 2026-07-28: no `initialize`, every
+    /// request carrying its protocol version and capabilities in `_meta`.
+    async fn serve_mcp_client_2026<H>(&mut self, handler: H) -> RunningService<RoleClient, H>
+    where
+        H: ClientHandler,
+    {
+        let stdout = self.stdout.take().expect("shim stdout should be available");
+        let stdin = self.stdin.take().expect("shim stdin should be available");
+        handler
+            .serve_with_lifecycle(
+                (stdout, stdin),
+                rmcp::ClientLifecycleMode::Discover {
+                    preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                },
+            )
+            .await
+            .expect("rmcp 2026-07-28 client should start through subc-mcp shim")
     }
 }
 
@@ -1057,9 +1079,10 @@ async fn mcp_initialize_2025_06_18_is_answered_with_2025_06_18() {
 
 #[tokio::test]
 async fn mcp_initialize_2026_07_28_is_answered_with_2025_11_25() {
-    // The gateway does not serve 2026-07-28 yet, so a host asking for it over
-    // `initialize` is offered the newest version the gateway does serve, with
-    // no 2026-only capability in the answer.
+    // A host that sends `initialize` naming 2026-07-28, a revision without
+    // `initialize`, is offered the newest version that has one, with no
+    // 2026-only capability in the answer. (A 2026-07-28 host that skips
+    // `initialize` is served 2026-07-28; see mcp_2026.rs.)
     let result = initialize_answer_for("mcp-version-2026-07-28", "2026-07-28").await;
     assert_eq!(result, expected_initialize_result("2025-11-25"));
 }

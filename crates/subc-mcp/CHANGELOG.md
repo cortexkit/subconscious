@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.48
+
+- Serves MCP 2026-07-28. A host on that revision sends no `initialize`, so the gateway starts the session (scope record, project resolve, provider routes, catalog lifecycle) on the host's first request, once per session; a failed scope registration still logs one warning and falls back to unscoped routes. The scope's workdir is the shim's project root, because `roots/list` is a server-to-client request. Hosts that send `initialize` (2025-11-25 and older) keep their exact behaviour, and a host that sends `initialize` naming 2026-07-28 is still answered with 2025-11-25.
+- A 2026-07-28 host is never sent a server-to-client request. When a module asks `elicitation/create` during a tools/call, that tools/call is answered in the MRTR form (`resultType: "input_required"`, `inputRequests`, `requestState`), the module's call stays open, and the host's follow-up call with `inputResponses` hands the module its answer and returns the module's result. One question per call at a time; a host that does not come back within the reverse-relay TTL (10 minutes, `SUBC_MCP_REVERSE_RELAY_TTL_MS`) is answered to the module as a decline. Sampling and roots requests from a module are refused for these hosts.
+- A reverse request may name the forward call it belongs to in an optional top-level `in_reply_to` field (docs/reverse-requests.md §5.1). A 2026-07-28 host gets the question under exactly that call; without the field the question is accepted only when one call is waiting on the route, and refused when several are. Older hosts are unaffected.
+- List changes reach 2026-07-28 hosts on `subscriptions/listen`. That revision forbids unsolicited notifications, so the gateway sends a host on it `notifications/tools/list_changed` and `notifications/prompts/list_changed` only on a stream the host opened, and only the types that stream asked for (`toolsListChanged`, `promptsListChanged`); other filter fields are not accepted. The stream is fed by the same catalog poller, provider-goodbye, reconnect and config-refresh events that send `initialize` hosts their notifications, so both revisions see the same changes. Opening a stream starts the session if it is the host's first request. A 2026-07-28 host with no stream open is sent nothing and sees changes on its next list. Progress notifications for a call are sent as before.
+
 ## 0.1.47
 
 - The outage block's `detail` line lists object keys in sorted order on every

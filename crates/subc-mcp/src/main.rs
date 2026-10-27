@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod held_call;
 mod outage_output;
 mod prompts;
 mod session_scope;
 
+use held_call::{HeldCall, HeldCallEvent, HeldCalls, InputWaiterGuard};
 use session_scope::{LocalSessionScope, ScopeOwner};
 
 use std::{
@@ -35,11 +37,16 @@ use rmcp::{
         CallToolRequestParams, CallToolResponse, CallToolResult, CancelledNotificationParam,
         ClientCapabilities, ClientResult, ContentBlock, CustomRequest, ErrorCode, ErrorData,
         GetPromptRequestParams, GetPromptResponse, Implementation, InitializeRequestParams,
-        InitializeResult, JsonObject, ListPromptsResult, ListToolsResult, PaginatedRequestParams,
+        InitializeResult, InputRequest, InputRequests, InputRequiredResult, InputResponses,
+        JsonObject, ListPromptsResult, ListToolsResult, PaginatedRequestParams,
         ProgressNotificationParam, ProgressToken, ProtocolVersion, RequestId, RequestMetaObject,
-        ServerCapabilities, ServerConfig, ServerRequest, Tool as McpTool, ToolAnnotations,
+        ServerCapabilities, ServerConfig, ServerRequest, SubscriptionFilter, Tool as McpTool,
+        ToolAnnotations,
     },
-    service::{NotificationContext, Peer, PeerRequestOptions, RequestContext, ServiceError},
+    service::{
+        NotificationContext, Peer, PeerRequestOptions, RequestContext, ServiceError,
+        SubscriptionContext,
+    },
     transport::async_rw::AsyncRwTransport,
     RoleServer, ServerHandler,
 };
@@ -260,12 +267,66 @@ struct RelayPeerState {
     capabilities: Option<ReverseCapabilities>,
 }
 
+/// A module's question on its way to a host that negotiated MCP 2026-07-28 or
+/// later. Such a host refuses server-to-client requests, so the question is
+/// handed to the tools/call it belongs to, which returns it to the host in
+/// the `inputRequests` form of MCP multi round-trip requests (MRTR) instead
+/// of a tool result.
+#[derive(Debug)]
+struct InputAsk {
+    /// The relay's pending entry for the module's reverse request.
+    pending_key: PendingKey,
+    request: InputRequest,
+    /// When the module asked. The host's answer has to arrive within the
+    /// relay TTL counted from here, the same bound the reverse-request relay
+    /// gives a 2025-11-25 host.
+    asked_at: time::Instant,
+}
+
+/// A tools/call from a 2026-07-28 host that is held at a module and may carry
+/// one of that module's questions back to the host.
+#[derive(Debug)]
+struct InputWaiter {
+    id: u64,
+    route: RouteHandle,
+    /// The forward request's corr on the route, which the module sees too and
+    /// may name in a reverse request's `in_reply_to`.
+    corr: u64,
+    tx: mpsc::Sender<InputAsk>,
+    /// Whether the call's request declared elicitation on a protocol version
+    /// with `inputRequests` answers. Calls that did not are still listed, so
+    /// a question without `in_reply_to` is never guessed onto the one eligible
+    /// call when another call on the route may be the one asking.
+    eligible: bool,
+    /// Set while a question for this call is outstanding: a call carries at
+    /// most one at a time.
+    asked: bool,
+}
+
 #[derive(Debug)]
 struct RelaySession {
     id: String,
     peer_state: RwLock<RelayPeerState>,
     local_scope: Option<LocalSessionScope>,
     scope: OnceLock<ScopeSelector>,
+    /// Set when the host started the session without `initialize`, as MCP
+    /// 2026-07-28 hosts do. Such a host is never sent a server-to-client
+    /// request; its module questions travel through `input_waiters`.
+    inline_host: OnceLock<()>,
+    input_waiters: std::sync::Mutex<Vec<InputWaiter>>,
+    next_input_waiter: AtomicU64,
+    /// Tool and prompt list changes for a host that started without
+    /// `initialize`. Such a host takes list-change notifications only on a
+    /// `subscriptions/listen` stream it opened; each open stream reads from
+    /// here (`SubcMcpServer::listen`).
+    list_changes: broadcast::Sender<ListChange>,
+}
+
+/// A list a host can be told has changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListChange {
+    Tools,
+    Prompts,
 }
 
 impl RelaySession {
@@ -275,11 +336,154 @@ impl RelaySession {
             peer_state: RwLock::new(RelayPeerState::default()),
             local_scope: None,
             scope: OnceLock::new(),
+            inline_host: OnceLock::new(),
+            input_waiters: std::sync::Mutex::new(Vec::new()),
+            next_input_waiter: AtomicU64::new(1),
+            list_changes: broadcast::channel(SUBC_EVENT_BUFFER).0,
         }
     }
 
     fn id(&self) -> &str {
         &self.id
+    }
+
+    /// Records that the host started this session without `initialize`. The
+    /// first request's declared capabilities stand for the session when
+    /// routes are opened, as `initialize`'s do for older hosts; only
+    /// elicitation is kept, because it is the one module question such a host
+    /// can be asked (through `inputRequests`). Later calls do not change the
+    /// record.
+    fn record_inline_host(&self, capabilities: Option<&ClientCapabilities>) {
+        if self.inline_host.set(()).is_err() {
+            return;
+        }
+        let declared = ReverseCapabilities {
+            elicitation: capabilities.is_some_and(|caps| caps.elicitation.is_some()),
+            sampling: false,
+            roots: false,
+        };
+        let mut state = self.peer_state.write().unwrap_or_else(|poisoned| {
+            tracing::warn!(target: "relay",
+                "recovering from poisoned reverse-relay peer-state write lock"
+            );
+            poisoned.into_inner()
+        });
+        state.capabilities = Some(declared);
+    }
+
+    fn is_inline_host(&self) -> bool {
+        self.inline_host.get().is_some()
+    }
+
+    fn lock_input_waiters(&self) -> std::sync::MutexGuard<'_, Vec<InputWaiter>> {
+        self.input_waiters.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!(target: "relay", "recovering from poisoned input-waiter lock");
+            poisoned.into_inner()
+        })
+    }
+
+    fn register_input_waiter(
+        &self,
+        route: RouteHandle,
+        corr: u64,
+        eligible: bool,
+    ) -> (u64, mpsc::Receiver<InputAsk>) {
+        let id = self.next_input_waiter.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel(1);
+        self.lock_input_waiters().push(InputWaiter {
+            id,
+            route,
+            corr,
+            tx,
+            eligible,
+            asked: false,
+        });
+        (id, rx)
+    }
+
+    fn remove_input_waiter(&self, id: u64) {
+        self.lock_input_waiters().retain(|waiter| waiter.id != id);
+    }
+
+    fn clear_input_asked(&self, id: u64) {
+        if let Some(waiter) = self
+            .lock_input_waiters()
+            .iter_mut()
+            .find(|waiter| waiter.id == id)
+        {
+            waiter.asked = false;
+        }
+    }
+
+    /// Hands a module question to the tools/call it belongs to. A reverse
+    /// request that names its forward request (`in_reply_to`) goes to exactly
+    /// that call. One that does not is accepted only when a single call is
+    /// held on the route: with several, the gateway cannot tell which action
+    /// the question is about, and a person answering a permission question
+    /// under the wrong tool call is worse than the module hearing no.
+    fn deliver_input_ask(
+        &self,
+        route: RouteHandle,
+        in_reply_to: Option<u64>,
+        ask: InputAsk,
+    ) -> std::result::Result<(), ErrorData> {
+        let mut waiters = self.lock_input_waiters();
+        let waiter = match in_reply_to {
+            Some(corr) => waiters
+                .iter_mut()
+                .find(|waiter| waiter.route == route && waiter.corr == corr)
+                .ok_or_else(|| {
+                    ErrorData::internal_error(
+                        format!(
+                            "no tool call that can carry a question to the MCP host is waiting on this route for request {corr}"
+                        ),
+                        None,
+                    )
+                })?,
+            None => {
+                let mut on_route = waiters.iter_mut().filter(|waiter| waiter.route == route);
+                match (on_route.next(), on_route.next()) {
+                    (Some(waiter), None) => waiter,
+                    (None, _) => {
+                        return Err(ErrorData::internal_error(
+                            "no tool call that can carry a question to the MCP host is waiting on this route",
+                            None,
+                        ))
+                    }
+                    (Some(_), Some(_)) => {
+                        let count = waiters.iter().filter(|waiter| waiter.route == route).count();
+                        tracing::warn!(target: "relay",
+                            "refusing a module question without in_reply_to: {count} tool calls are waiting on route ({}, {})",
+                            route.channel, route.epoch
+                        );
+                        return Err(ErrorData::internal_error(
+                            format!(
+                                "{count} tool calls are waiting on this route; name the one this question belongs to in in_reply_to"
+                            ),
+                            None,
+                        ));
+                    }
+                }
+            }
+        };
+        if !waiter.eligible {
+            return Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                "the tool call's MCP request did not declare support for elicitation/create",
+                None,
+            ));
+        }
+        if waiter.asked {
+            return Err(ErrorData::internal_error(
+                "the tool call already has a question waiting for the MCP host",
+                None,
+            ));
+        }
+        waiter.tx.try_send(ask).map_err(|_| {
+            ErrorData::internal_error("the tool call can no longer carry a question", None)
+        })?;
+        waiter.asked = true;
+        Ok(())
     }
 
     fn record_peer(&self, peer: Peer<RoleServer>) {
@@ -350,6 +554,12 @@ struct ReverseMcpRequest {
     method: String,
     #[serde(default)]
     params: Option<serde_json::Value>,
+    /// The corr of the module's forward request on the same route that this
+    /// question belongs to (the daemon rewrites only channel and epoch, so it
+    /// is the corr the gateway sent). Optional: only a 2026-07-28 host needs
+    /// it, to show the question under the right tool call.
+    #[serde(default)]
+    in_reply_to: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -611,6 +821,12 @@ impl ReverseRelay {
             return;
         };
 
+        if session.is_inline_host() {
+            self.relay_question_through_tool_call(route_handle, key, &session, request, capability)
+                .await;
+            return;
+        }
+
         let peer = match session.peer_for_capability(&request.method, capability) {
             Ok(peer) => peer,
             Err(error) => {
@@ -620,32 +836,8 @@ impl ReverseRelay {
             }
         };
 
-        let created_at = {
-            let mut pending = self.pending.lock().await;
-            if pending.contains_key(&key) {
-                return;
-            }
-            let session_pending = pending
-                .values()
-                .filter(|entry| entry.session_id == session.id())
-                .count();
-            if session_pending >= self.max_pending_per_session {
-                drop(pending);
-                self.send_reverse_error(
-                    route_handle,
-                    reverse_corr,
-                    ErrorData::internal_error(
-                        "too many pending reverse MCP requests for this MCP session",
-                        None,
-                    ),
-                )
-                .await;
-                return;
-            }
-            let entry = PendingRelayEntry::new(session.id().to_owned());
-            let created_at = entry.created_at;
-            pending.insert(key, entry);
-            created_at
+        let Some(created_at) = self.admit_pending(key, &session).await else {
+            return;
         };
 
         let host_request =
@@ -701,6 +893,107 @@ impl ReverseRelay {
             cancel
                 .cancel("reverse MCP request was settled before the host request started")
                 .await;
+        }
+    }
+
+    /// Admits a reverse request into the pending table, bounded per MCP
+    /// session. Returns when it was admitted, or `None` when the same request
+    /// is already pending (it is ignored) or the session is at its cap (the
+    /// module is answered with an Error frame here).
+    async fn admit_pending(
+        &self,
+        key: PendingKey,
+        session: &RelaySession,
+    ) -> Option<time::Instant> {
+        let mut pending = self.pending.lock().await;
+        if pending.contains_key(&key) {
+            return None;
+        }
+        let session_pending = pending
+            .values()
+            .filter(|entry| entry.session_id == session.id())
+            .count();
+        if session_pending >= self.max_pending_per_session {
+            drop(pending);
+            self.send_reverse_error(
+                self.route_handle(key.0, key.1),
+                key.2,
+                ErrorData::internal_error(
+                    "too many pending reverse MCP requests for this MCP session",
+                    None,
+                ),
+            )
+            .await;
+            return None;
+        }
+        let entry = PendingRelayEntry::new(session.id().to_owned());
+        let created_at = entry.created_at;
+        pending.insert(key, entry);
+        Some(created_at)
+    }
+
+    /// The reverse-request relay for a host on MCP 2026-07-28 or later. That
+    /// revision forbids server-to-client requests, so nothing is sent to the
+    /// host from here: the module's question is handed to the tools/call it
+    /// belongs to, which answers the host with the question in
+    /// `inputRequests`, and the host's follow-up call brings the answer back
+    /// (`SubcMcpServer::resume_held_call`). Only elicitation travels this way;
+    /// sampling and roots are refused, as for a host that did not declare them.
+    async fn relay_question_through_tool_call(
+        &self,
+        route_handle: RouteHandle,
+        key: PendingKey,
+        session: &RelaySession,
+        request: ReverseMcpRequest,
+        capability: ReverseCapability,
+    ) {
+        let reverse_corr = key.2;
+        if !matches!(capability, ReverseCapability::Elicitation) {
+            self.send_reverse_error(
+                route_handle,
+                reverse_corr,
+                ErrorData::new(
+                    ErrorCode::METHOD_NOT_FOUND,
+                    format!(
+                        "MCP host on protocol 2026-07-28 or later cannot be sent {}",
+                        request.method
+                    ),
+                    None,
+                ),
+            )
+            .await;
+            return;
+        }
+        let in_reply_to = request.in_reply_to;
+        let input_request = match serde_json::from_value::<InputRequest>(serde_json::json!({
+            "method": request.method,
+            "params": request.params,
+        })) {
+            Ok(input_request @ InputRequest::Elicitation(_)) => input_request,
+            Ok(_) | Err(_) => {
+                self.send_reverse_error(
+                    route_handle,
+                    reverse_corr,
+                    ErrorData::invalid_params(
+                        "malformed elicitation/create params in reverse MCP request",
+                        None,
+                    ),
+                )
+                .await;
+                return;
+            }
+        };
+        let Some(asked_at) = self.admit_pending(key, session).await else {
+            return;
+        };
+        let ask = InputAsk {
+            pending_key: key,
+            request: input_request,
+            asked_at,
+        };
+        if let Err(error) = session.deliver_input_ask(route_handle, in_reply_to, ask) {
+            let frame = self.build_reverse_error(route_handle, reverse_corr, error);
+            self.settle_pending_frame(key, frame).await;
         }
     }
 
@@ -2564,6 +2857,7 @@ async fn handle_shim_connection(
         prompt_backend,
         Arc::clone(&conversation),
     );
+    let held_calls = handler.held_calls.clone();
     let (read_half, write_half) = stream.into_split();
     // rmcp 1.x read host messages without a size limit; rmcp 3 caps a line at
     // 16 MiB by default and drops longer ones. These lines come from the MCP host
@@ -2573,6 +2867,7 @@ async fn handle_shim_connection(
         .with_max_line_length(usize::MAX);
     let serve_result = serve_mcp_server(handler, transport).await;
     let _ = shutdown_tx.send(true);
+    held_calls.release_all();
     let _reconcile_guard = reconcile_gate.lock().await;
     subc.relay()
         .fail_session(&attached.relay_session, "MCP host session disconnected")
@@ -4237,11 +4532,15 @@ async fn refresh_policy_if_changed(
     }))
 }
 
-async fn notify_policy_refresh(peer: &Peer<RoleServer>, changes: PolicyRefreshChanges) -> bool {
-    if changes.tools_changed && !notify_tool_list_changed(peer).await {
+async fn notify_policy_refresh(
+    peer: &Peer<RoleServer>,
+    session: &RelaySession,
+    changes: PolicyRefreshChanges,
+) -> bool {
+    if changes.tools_changed && !notify_tool_list_changed(peer, session).await {
         return false;
     }
-    if changes.prompts_changed && !notify_prompt_list_changed(peer).await {
+    if changes.prompts_changed && !notify_prompt_list_changed(peer, session).await {
         return false;
     }
     true
@@ -4275,7 +4574,7 @@ async fn session_lifecycle(
                     &reconcile_gate,
                 ).await {
                     Ok(Some(changes)) => {
-                        if !notify_policy_refresh(&peer, changes).await {
+                        if !notify_policy_refresh(&peer, &relay_session, changes).await {
                             break;
                         }
                     }
@@ -4289,7 +4588,7 @@ async fn session_lifecycle(
                 match event {
                     Ok(SubcEvent::RouteGoodbye { handle }) => {
                         conversation.forget_route(handle);
-                        if state.remove_route(handle) && !notify_tool_list_changed(&peer).await {
+                        if state.remove_route(handle) && !notify_tool_list_changed(&peer, &relay_session).await {
                             break;
                         }
                     }
@@ -4303,7 +4602,7 @@ async fn session_lifecycle(
                         };
                         match reopened {
                             Ok(true) => {
-                                if !notify_tool_list_changed(&peer).await {
+                                if !notify_tool_list_changed(&peer, &relay_session).await {
                                     break;
                                 }
                             }
@@ -4342,7 +4641,7 @@ async fn session_lifecycle(
                                 };
                                 match reconciliation {
                                     Ok(true) => {
-                                        if !notify_tool_list_changed(&peer).await {
+                                        if !notify_tool_list_changed(&peer, &relay_session).await {
                                             break;
                                         }
                                     }
@@ -4382,7 +4681,7 @@ async fn session_lifecycle(
                                 };
                                 match reconciliation {
                                     Ok(true) => {
-                                        if !notify_tool_list_changed(&peer).await {
+                                        if !notify_tool_list_changed(&peer, &relay_session).await {
                                             break;
                                         }
                                     }
@@ -4404,7 +4703,28 @@ async fn session_lifecycle(
     }
 }
 
-async fn notify_tool_list_changed(peer: &Peer<RoleServer>) -> bool {
+/// Whether `peer` is a host that may be sent unsolicited list-change
+/// notifications. A host that started without `initialize` (MCP 2026-07-28
+/// and later) receives them only on a `subscriptions/listen` stream it opened,
+/// and the spec forbids sending notification types it did not ask for. For
+/// such a host the change goes to the session's open streams instead
+/// (`RelaySession::list_changes`), each of which sends only the types its
+/// host asked for.
+fn host_takes_unsolicited_notifications(peer: &Peer<RoleServer>) -> bool {
+    peer.peer_info().is_some()
+}
+
+/// Hands a list change to the session's `subscriptions/listen` streams. A
+/// session with no stream open drops it; the host's next list shows it.
+fn publish_list_change(session: &RelaySession, change: ListChange) -> bool {
+    let _ = session.list_changes.send(change);
+    true
+}
+
+async fn notify_tool_list_changed(peer: &Peer<RoleServer>, session: &RelaySession) -> bool {
+    if !host_takes_unsolicited_notifications(peer) {
+        return publish_list_change(session, ListChange::Tools);
+    }
     match peer.notify_tool_list_changed().await {
         Ok(()) => true,
         Err(error) => {
@@ -4414,7 +4734,10 @@ async fn notify_tool_list_changed(peer: &Peer<RoleServer>) -> bool {
     }
 }
 
-async fn notify_prompt_list_changed(peer: &Peer<RoleServer>) -> bool {
+async fn notify_prompt_list_changed(peer: &Peer<RoleServer>, session: &RelaySession) -> bool {
+    if !host_takes_unsolicited_notifications(peer) {
+        return publish_list_change(session, ListChange::Prompts);
+    }
     match peer.notify_prompt_list_changed().await {
         Ok(()) => true,
         Err(error) => {
@@ -5233,6 +5556,9 @@ struct SubcMcpServer {
     prompts: PromptService,
     conversation: Arc<ConversationRouter>,
     outage_wait: OutageWait,
+    /// Tool calls held at their modules while a 2026-07-28 host answers a
+    /// module's question.
+    held_calls: HeldCalls,
 }
 
 /// The tool-call request body the gateway sends on a route is the shared
@@ -5359,15 +5685,16 @@ impl ServerHandler for SubcMcpServer {
         Ok(self.get_info())
     }
 
-    /// The gateway serves the session-based protocol versions that begin with an
-    /// `initialize` handshake, 2025-11-25 and older. rmcp negotiates against this
-    /// list after `initialize` returns: a host asking for one of these versions
-    /// gets that version back, exactly as before rmcp 3, and a host asking for
-    /// anything else (including 2026-07-28) is answered with 2025-11-25.
-    /// Requests that name a version outside the list in their own `_meta`, as
-    /// 2026-07-28 clients do without `initialize`, are refused by rmcp.
+    /// Every revision up to 2026-07-28. Hosts that begin with `initialize`
+    /// (2025-11-25 and older) are negotiated by rmcp against this list exactly
+    /// as before: a host asking for one of those versions gets it back, and a
+    /// host that sends `initialize` naming 2026-07-28 (a revision without
+    /// `initialize`) or anything unknown is answered with 2025-11-25, from
+    /// `get_info`. A 2026-07-28 host sends no `initialize`: it names the
+    /// version in each request's `_meta`, and the gateway starts the session
+    /// on its first request (`start_inline_session`).
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2025_11_25))
+        Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2026_07_28))
     }
 
     fn get_info(&self) -> ServerConfig {
@@ -5379,8 +5706,9 @@ impl ServerHandler for SubcMcpServer {
                 .enable_prompts_list_changed()
                 .build(),
         )
-        // rmcp's default is its newest version, 2026-07-28, which the gateway
-        // does not serve yet; name the newest version it does serve.
+        // The version an `initialize` answer falls back to. rmcp's default is
+        // its newest version, 2026-07-28, which has no `initialize`; name the
+        // newest one that does.
         .with_protocol_version(ProtocolVersion::V_2025_11_25)
         .with_server_info(Implementation::new("subc-mcp", env!("CARGO_PKG_VERSION")))
     }
@@ -5390,6 +5718,7 @@ impl ServerHandler for SubcMcpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListPromptsResult, ErrorData> {
+        self.start_inline_session(&context).await;
         self.refresh_policy_if_needed(&context.peer).await?;
         let config = self.state.config_snapshot();
         Ok(self
@@ -5402,6 +5731,7 @@ impl ServerHandler for SubcMcpServer {
         request: GetPromptRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<GetPromptResponse, ErrorData> {
+        self.start_inline_session(&context).await;
         self.refresh_policy_if_needed(&context.peer).await?;
         let is_visible = self
             .state
@@ -5419,6 +5749,7 @@ impl ServerHandler for SubcMcpServer {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
+        self.start_inline_session(&context).await;
         self.refresh_policy_if_needed(&context.peer).await?;
         Ok(ListToolsResult {
             tools: self
@@ -5443,13 +5774,84 @@ impl ServerHandler for SubcMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, ErrorData> {
+        self.start_inline_session(&context).await;
         self.refresh_policy_if_needed(&context.peer).await?;
         self.reopen_stale_routes_if_needed(&context.peer).await?;
-        let result = match self.state.surface_mode() {
-            SurfaceMode::Full => self.call_tool_over_route(request, context).await,
-            SurfaceMode::Search => self.call_search_mode_tool(request, context).await,
+        let tool_name = request.name.to_string();
+        let outcome = if self.relay_session.is_inline_host() && request.request_state.is_some() {
+            self.resume_held_call(request, &context).await
+        } else {
+            match self.state.surface_mode() {
+                SurfaceMode::Full => self.call_tool_over_route(request, context).await,
+                SurfaceMode::Search => self.call_search_mode_tool(request, context).await,
+            }
         };
-        result.map(CallToolResponse::from)
+        Ok(match outcome? {
+            ToolCallOutcome::Done(result) => CallToolResponse::from(result),
+            ToolCallOutcome::NeedsInput(held, ask) => CallToolResponse::from(self.held_calls.park(
+                tool_name,
+                held,
+                ask,
+                self.subc.clone(),
+            )),
+        })
+    }
+
+    /// The gateway sends the list changes it already sends to `initialize`
+    /// hosts: tools and prompts. rmcp narrows this to what the host asked for
+    /// and to the capabilities `get_info` advertises.
+    fn accepted_subscription_filter(
+        &self,
+        _requested: &SubscriptionFilter,
+    ) -> Option<SubscriptionFilter> {
+        Some(
+            SubscriptionFilter::builder()
+                .tools_list_changed()
+                .prompts_list_changed()
+                .build(),
+        )
+    }
+
+    /// One `subscriptions/listen` stream from a host on MCP 2026-07-28 or
+    /// later, open until the host cancels it. It carries the same list
+    /// changes the session lifecycle sends an `initialize` host as
+    /// unsolicited notifications, but only the types this stream asked for.
+    async fn listen(&self, context: SubscriptionContext) -> std::result::Result<(), ErrorData> {
+        // Subscribed before start-up, so a change found while starting the
+        // session is not missed.
+        let mut changes = self.relay_session.list_changes.subscribe();
+        // A host may open its stream before any other request.
+        self.start_inline_session(context.request_context()).await;
+        let accepted = context.accepted().clone();
+        let wants = |change: ListChange| match change {
+            ListChange::Tools => accepted.tools_list_changed == Some(true),
+            ListChange::Prompts => accepted.prompts_list_changed == Some(true),
+        };
+        loop {
+            let due: &[ListChange] = tokio::select! {
+                _ = context.cancelled() => return Ok(()),
+                change = changes.recv() => match change {
+                    Ok(ListChange::Tools) => &[ListChange::Tools],
+                    Ok(ListChange::Prompts) => &[ListChange::Prompts],
+                    // Changes were missed: tell the host both lists may have
+                    // changed rather than leave it on a stale one.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        &[ListChange::Tools, ListChange::Prompts]
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                },
+            };
+            for &change in due.iter().filter(|&&change| wants(change)) {
+                let sent = match change {
+                    ListChange::Tools => context.sink().notify_tool_list_changed().await,
+                    ListChange::Prompts => context.sink().notify_prompt_list_changed().await,
+                };
+                if let Err(error) = sent {
+                    tracing::debug!("subscriptions/listen stream ended: {error}");
+                    return Ok(());
+                }
+            }
+        }
     }
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
@@ -5467,12 +5869,56 @@ impl ServerHandler for SubcMcpServer {
         }
 
         self.subc.ensure_catalog_poller();
+        let peer = context.peer.clone();
+        self.relay_session.record_peer(peer.clone());
+        self.spawn_session_lifecycle(peer);
+    }
+}
+
+impl SubcMcpServer {
+    /// Session start-up for a host that sends no `initialize`, as MCP
+    /// 2026-07-28 hosts do: the first request does what `on_initialized` does
+    /// for older hosts (session scope, provider routes, catalog poller and
+    /// session lifecycle). It runs once per session however many requests
+    /// arrive, concurrently or not; requests after the first go on at once,
+    /// and the scope and route steps they repeat in `refresh_policy_if_needed`
+    /// wait for the first request's work instead of redoing it.
+    async fn start_inline_session(&self, context: &RequestContext<RoleServer>) {
+        // rmcp records the host's `initialize` before any other request is
+        // served, so a session without it has no peer info.
+        if context.peer.peer_info().is_some() {
+            return;
+        }
+        // Recorded before the start-up claim, so a concurrent request that
+        // finds start-up already claimed still sees an inline session.
+        self.relay_session
+            .record_inline_host(context.client_capabilities().as_ref());
+        if self
+            .lifecycle_started
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        tracing::info!(
+            "MCP host started its session without initialize; starting it on the first request"
+        );
+        // The scope's workdir comes from the shim's project root: rmcp
+        // records no client capabilities without `initialize`, so roots/list
+        // (a server-to-client request such a host refuses) is never sent.
+        self.ensure_session_scope(&context.peer).await;
+        if let Err(error) = self.initialize_session_routes().await {
+            tracing::error!("failed to open initial MCP provider routes: {error}");
+        }
+        self.subc.ensure_catalog_poller();
+        self.spawn_session_lifecycle(context.peer.clone());
+    }
+
+    fn spawn_session_lifecycle(&self, peer: Peer<RoleServer>) {
         let subc = self.subc.clone();
         let state = Arc::clone(&self.state);
         let relay_session = Arc::clone(&self.relay_session);
         let events = self.subc.subscribe_events();
-        let peer = context.peer.clone();
-        self.relay_session.record_peer(peer.clone());
         let shutdown = self.shutdown.clone();
         let reconcile_gate = Arc::clone(&self.reconcile_gate);
         let conversation = Arc::clone(&self.conversation);
@@ -5486,6 +5932,35 @@ impl ServerHandler for SubcMcpServer {
             reconcile_gate,
             conversation,
         ));
+    }
+
+    /// A 2026-07-28 host's follow-up to a tools/call answered with a module
+    /// question: hands the module the host's answer and goes on waiting for
+    /// the held call's result.
+    async fn resume_held_call(
+        &self,
+        request: CallToolRequestParams,
+        context: &RequestContext<RoleServer>,
+    ) -> std::result::Result<ToolCallOutcome, ErrorData> {
+        let token = request.request_state.as_deref().unwrap_or_default();
+        let held = self
+            .held_calls
+            .resume(token, &request.name, request.input_responses.as_ref())
+            .await?;
+        let module_id = held.module_id.clone();
+        match self.await_held_call(*held, context).await? {
+            CallAttempt::Answered(result) => Ok(ToolCallOutcome::Done(result)),
+            CallAttempt::NeedsInput(held, ask) => Ok(ToolCallOutcome::NeedsInput(held, ask)),
+            // The call reached the module (it asked a question), so a refusal
+            // proving otherwise is reported as the outage it describes, not retried.
+            CallAttempt::NothingSent(refusal) => Ok(ToolCallOutcome::Done(outage_tool_result(
+                &module_id, &refusal,
+            ))),
+            CallAttempt::RouteGone => Err(ErrorData::internal_error(
+                "subc route tool call failed: the route closed while the call waited for input",
+                None,
+            )),
+        }
     }
 }
 
@@ -5543,6 +6018,7 @@ impl SubcMcpServer {
             prompts: PromptService::new(instance_token, prompt_backend),
             conversation,
             outage_wait: OutageWait::from_env(),
+            held_calls: HeldCalls::default(),
         }
     }
 
@@ -5564,7 +6040,7 @@ impl SubcMcpServer {
             return Ok(());
         };
 
-        if !notify_policy_refresh(peer, changes).await {
+        if !notify_policy_refresh(peer, &self.relay_session, changes).await {
             return Err(ErrorData::internal_error(
                 "failed to notify MCP list change after immediate policy refresh",
                 None,
@@ -5599,7 +6075,7 @@ impl SubcMcpServer {
                 .await
                 .map_err(relay_error_to_mcp)?
         };
-        if changed && !notify_tool_list_changed(peer).await {
+        if changed && !notify_tool_list_changed(peer, &self.relay_session).await {
             return Err(ErrorData::internal_error(
                 "failed to notify MCP list change after reopening provider routes",
                 None,
@@ -5612,9 +6088,12 @@ impl SubcMcpServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, ErrorData> {
+    ) -> std::result::Result<ToolCallOutcome, ErrorData> {
         match request.name.as_ref() {
-            TOOLS_SEARCH_NAME => self.handle_tools_search(request.arguments).await,
+            TOOLS_SEARCH_NAME => self
+                .handle_tools_search(request.arguments)
+                .await
+                .map(ToolCallOutcome::Done),
             TOOLS_INVOKE_NAME => self.handle_tools_invoke(request.arguments, context).await,
             other => Err(unknown_tool_error(other)),
         }
@@ -5660,7 +6139,7 @@ impl SubcMcpServer {
         &self,
         arguments: Option<JsonObject>,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, ErrorData> {
+    ) -> std::result::Result<ToolCallOutcome, ErrorData> {
         let args: ToolsInvokeArgs = parse_tool_arguments(TOOLS_INVOKE_NAME, arguments)?;
         let Some(binding) = self.state.private_binding(&args.name) else {
             return Err(unknown_tool_error(&args.name));
@@ -5674,7 +6153,7 @@ impl SubcMcpServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, ErrorData> {
+    ) -> std::result::Result<ToolCallOutcome, ErrorData> {
         let Some(binding) = self.state.direct_binding(&request.name) else {
             return Err(unknown_tool_error(&request.name));
         };
@@ -5694,11 +6173,11 @@ impl SubcMcpServer {
         binding: ToolBinding,
         arguments: JsonObject,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, ErrorData> {
+    ) -> std::result::Result<ToolCallOutcome, ErrorData> {
         match binding {
             ToolBinding::AckOnly { acks } => {
                 acks.fetch_add(1, Ordering::Relaxed);
-                ack_only_tool_result()
+                ack_only_tool_result().map(ToolCallOutcome::Done)
             }
             ToolBinding::Forward(forward) => {
                 self.call_bound_tool(lookup, forward, arguments, context)
@@ -5722,7 +6201,7 @@ impl SubcMcpServer {
         binding: ForwardBinding,
         mut arguments: JsonObject,
         context: RequestContext<RoleServer>,
-    ) -> std::result::Result<CallToolResult, ErrorData> {
+    ) -> std::result::Result<ToolCallOutcome, ErrorData> {
         if mutation_replay_protected_tool(&binding.bare_tool_name) {
             arguments.insert(
                 "command_id".to_string(),
@@ -5737,7 +6216,10 @@ impl SubcMcpServer {
             .send_bound_call(&binding, arguments.clone(), &context, false)
             .await?
         {
-            CallAttempt::Answered(result) => return Ok(result),
+            CallAttempt::Answered(result) => return Ok(ToolCallOutcome::Done(result)),
+            CallAttempt::NeedsInput(held, ask) => {
+                return Ok(ToolCallOutcome::NeedsInput(held, ask))
+            }
             CallAttempt::NothingSent(refusal) => refusal,
             // `send_bound_call` reports a closed route this way only on a
             // retried attempt; the first one keeps the route's own error.
@@ -5756,7 +6238,9 @@ impl SubcMcpServer {
                     "tool call to '{module_id}' not sent: the module is unavailable ({})",
                     refusal.code
                 );
-                return Ok(outage_tool_result(&module_id, &refusal));
+                return Ok(ToolCallOutcome::Done(outage_tool_result(
+                    &module_id, &refusal,
+                )));
             };
             tokio::select! {
                 _ = context.ct.cancelled() => return Err(tool_call_cancelled_error()),
@@ -5773,7 +6257,10 @@ impl SubcMcpServer {
                 .send_bound_call(&binding, arguments.clone(), &context, true)
                 .await?
             {
-                CallAttempt::Answered(result) => return Ok(result),
+                CallAttempt::Answered(result) => return Ok(ToolCallOutcome::Done(result)),
+                CallAttempt::NeedsInput(held, ask) => {
+                    return Ok(ToolCallOutcome::NeedsInput(held, ask))
+                }
                 CallAttempt::NothingSent(next) => refusal = next,
                 // The route closed before this attempt reached the daemon's
                 // router: the module is still coming back. Keep waiting on the
@@ -5804,7 +6291,7 @@ impl SubcMcpServer {
         };
         match reopened {
             Ok((changed, mut refusals)) => {
-                if changed && !notify_tool_list_changed(peer).await {
+                if changed && !notify_tool_list_changed(peer, &self.relay_session).await {
                     tracing::warn!("failed to notify MCP list change while waiting out an outage");
                 }
                 if let Some(found) = refusals.remove(module_id) {
@@ -5909,72 +6396,136 @@ impl SubcMcpServer {
             .subc
             .build_route_frame(FrameType::Request, data_flags(), route, corr, body)
             .map_err(relay_error_to_mcp)?;
-        let mut frames = self
+        // Listed before the request goes out: the module may ask its question
+        // as soon as it receives the call.
+        let input = self.input_waiter_for(route, corr, context);
+        let frames = self
             .subc
             .request_route_frames(route, frame)
             .await
             .map_err(relay_error_to_mcp)?;
+        let held = HeldCall::new(
+            route,
+            corr,
+            binding.module_id.clone(),
+            retrying,
+            frames,
+            input,
+        );
+        self.await_held_call(held, context).await
+    }
 
+    /// Waits for the module's answer to a call already sent, forwarding its
+    /// progress to the host. For a host on MCP 2026-07-28 or later it also
+    /// stops when the module asks the host a question, handing back the call
+    /// still held at the module so the host's follow-up can resume it.
+    async fn await_held_call(
+        &self,
+        mut held: HeldCall,
+        context: &RequestContext<RoleServer>,
+    ) -> std::result::Result<CallAttempt, ErrorData> {
+        let (route, corr, retrying) = (held.route, held.corr, held.retrying);
+        let progress_token = context.meta.get_progress_token();
         loop {
-            tokio::select! {
-                _ = context.ct.cancelled() => {
+            let event = tokio::select! {
+                _ = context.ct.cancelled() => HeldCallEvent::Cancelled,
+                frame = held.frames.next() => HeldCallEvent::Frame(frame),
+                ask = held.input.next() => HeldCallEvent::Input(Box::new(ask)),
+            };
+            let frame = match event {
+                HeldCallEvent::Cancelled => {
                     let cancel_result = self.send_route_cancel(route, corr).await;
                     self.subc.abandon_request(route, corr).await;
                     cancel_result.map_err(mcp_internal_error)?;
                     return Err(tool_call_cancelled_error());
                 }
-                frame = frames.recv() => {
-                    let Some(frame) = frame else {
-                        return Err(route_closed_error(route, corr));
-                    };
+                HeldCallEvent::Input(ask) => {
+                    return Ok(CallAttempt::NeedsInput(Box::new(held), *ask));
+                }
+                HeldCallEvent::Frame(None) => return Err(route_closed_error(route, corr)),
+                HeldCallEvent::Frame(Some(frame)) => frame,
+            };
 
-                    match frame.header.ty {
-                        FrameType::Push => {
-                            if let Err(err) =
-                                forward_progress(context, progress_token.clone(), &frame.body).await
-                            {
-                                let cancel_result = self.send_route_cancel(route, corr).await;
-                                self.subc.abandon_request(route, corr).await;
-                                cancel_result.map_err(mcp_internal_error)?;
-                                return Err(err);
-                            }
-                        }
-                        FrameType::Response => {
-                            let mut result = serde_json::from_slice::<CallToolResult>(&frame.body).map_err(|source| {
-                                ErrorData::internal_error(
-                                    format!("provider returned malformed tool result: {source}"),
-                                    None,
-                                )
-                            })?;
-                            // rmcp 3 keeps a provider's `"structuredContent": null` and
-                            // sends it on; rmcp 1 read it as absent and left it out.
-                            // Hosts keep getting the rmcp 1 shape.
-                            if result.structured_content == Some(serde_json::Value::Null) {
-                                result.structured_content = None;
-                            }
-                            return Ok(CallAttempt::Answered(result));
-                        }
-                        FrameType::Error => {
-                            if let Some(attempt) =
-                                unsent_call_attempt(frame.header.flags, &frame.body, retrying)
-                            {
-                                return Ok(attempt);
-                            }
-                            return Err(subc_error_to_mcp("subc route tool call failed", &frame.body));
-                        }
-                        ty => {
-                            return Err(ErrorData::internal_error(
-                                format!(
-                                    "unexpected route frame {ty:?} on handle ({}, {}) corr {}",
-                                    frame.header.channel, frame.header.epoch, frame.header.corr
-                                ),
-                                None,
-                            ));
-                        }
+            match frame.header.ty {
+                FrameType::Push => {
+                    if let Err(err) =
+                        forward_progress(context, progress_token.clone(), &frame.body).await
+                    {
+                        let cancel_result = self.send_route_cancel(route, corr).await;
+                        self.subc.abandon_request(route, corr).await;
+                        cancel_result.map_err(mcp_internal_error)?;
+                        return Err(err);
                     }
+                }
+                FrameType::Response => {
+                    let mut result = serde_json::from_slice::<CallToolResult>(&frame.body)
+                        .map_err(|source| {
+                            ErrorData::internal_error(
+                                format!("provider returned malformed tool result: {source}"),
+                                None,
+                            )
+                        })?;
+                    // rmcp 3 keeps a provider's `"structuredContent": null` and
+                    // sends it on; rmcp 1 read it as absent and left it out.
+                    // Hosts keep getting the rmcp 1 shape.
+                    if result.structured_content == Some(serde_json::Value::Null) {
+                        result.structured_content = None;
+                    }
+                    return Ok(CallAttempt::Answered(result));
+                }
+                FrameType::Error => {
+                    if let Some(attempt) =
+                        unsent_call_attempt(frame.header.flags, &frame.body, retrying)
+                    {
+                        return Ok(attempt);
+                    }
+                    return Err(subc_error_to_mcp(
+                        "subc route tool call failed",
+                        &frame.body,
+                    ));
+                }
+                ty => {
+                    return Err(ErrorData::internal_error(
+                        format!(
+                            "unexpected route frame {ty:?} on handle ({}, {}) corr {}",
+                            frame.header.channel, frame.header.epoch, frame.header.corr
+                        ),
+                        None,
+                    ));
                 }
             }
         }
+    }
+
+    /// Lists a call from a host that started without `initialize` (MCP
+    /// 2026-07-28 and later) as one a module question may travel on. Calls
+    /// from older hosts are not listed: their questions use the
+    /// reverse-request relay.
+    fn input_waiter_for(
+        &self,
+        route: RouteHandle,
+        corr: u64,
+        context: &RequestContext<RoleServer>,
+    ) -> Option<InputWaiterGuard> {
+        if !self.relay_session.is_inline_host() {
+            return None;
+        }
+        // rmcp lets an `inputRequests` answer reach only a request on
+        // 2026-07-28 or later, and the host has to have declared elicitation
+        // on this request.
+        let eligible = context
+            .protocol_version()
+            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+            && context
+                .client_capabilities()
+                .is_some_and(|capabilities| capabilities.elicitation.is_some());
+        Some(InputWaiterGuard::register(
+            Arc::clone(&self.relay_session),
+            self.subc.relay(),
+            route,
+            corr,
+            eligible,
+        ))
     }
 
     async fn send_route_cancel(&self, route: RouteHandle, corr: u64) -> Result<()> {
@@ -6161,12 +6712,24 @@ enum BindingLookup {
 enum CallAttempt {
     /// The provider answered, or the call was refused with a tool result.
     Answered(CallToolResult),
+    /// The module asked a host on MCP 2026-07-28 or later a question while
+    /// handling the call, which is still held at the module.
+    NeedsInput(Box<HeldCall>, InputAsk),
     /// The daemon proved the call never reached the provider.
     NothingSent(OutageRefusal),
     /// A retried attempt went out on a route the daemon had already closed
     /// (`unknown_channel` or `stale_route_epoch`, answered before the
     /// daemon's router forwards anything).
     RouteGone,
+}
+
+/// How a tools/call that reached the routing code ended.
+#[derive(Debug)]
+enum ToolCallOutcome {
+    Done(CallToolResult),
+    /// The module's question goes to the host in `inputRequests`, and
+    /// the call waits for the host's follow-up.
+    NeedsInput(Box<HeldCall>, InputAsk),
 }
 
 /// A daemon refusal proving a tool call never reached its provider: a

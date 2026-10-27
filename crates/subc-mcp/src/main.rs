@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod outage_output;
 mod prompts;
 mod session_scope;
 
@@ -147,6 +148,24 @@ const CONVERSATION_RESOLVE_TIMEOUT: Duration = Duration::from_secs(8);
 /// call that would need one more is refused with a tool error rather than
 /// evicting a route a running subagent may still be using.
 const MAX_CONVERSATION_ROUTES: usize = 32;
+/// Longest a tool call waits, in total, for its provider module to come back
+/// after a refusal that proves the call never reached it and that the daemon
+/// marks retryable (a module restarting or starting up). A call that then
+/// succeeds returns its normal result, so a short restart never reaches the
+/// host; one still refused after this returns the shared outage block.
+const DEFAULT_OUTAGE_WAIT: Duration = Duration::from_secs(90);
+/// First pause between attempts while waiting out an outage; it doubles up to
+/// `OUTAGE_RETRY_DELAY_MAX`.
+const OUTAGE_RETRY_DELAY_INITIAL: Duration = Duration::from_millis(250);
+const OUTAGE_RETRY_DELAY_MAX: Duration = Duration::from_secs(5);
+/// Overrides `DEFAULT_OUTAGE_WAIT`, in milliseconds. The integration tests
+/// set it so a module that stays down is reported in seconds, not 90 s.
+const OUTAGE_WAIT_MS_ENV: &str = "SUBC_MCP_OUTAGE_WAIT_MS";
+/// The outage block's `message`: one plain sentence for the model.
+const OUTAGE_MESSAGE: &str = "The module that provides this tool is unavailable.";
+/// The outage block's `retry` hint, given only for a retryable refusal code.
+const OUTAGE_RETRY_HINT: &str =
+    "the module was restarting or starting up; the call can be retried in a minute";
 
 static NEXT_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
 static LOGGER_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -2750,6 +2769,17 @@ struct RouteOpenRefused {
     target: String,
     code: String,
     message: String,
+    /// The daemon's `detail`, verbatim; reported in a call's outage block.
+    detail: Option<serde_json::Value>,
+}
+
+impl RouteOpenRefused {
+    fn outage_refusal(&self) -> OutageRefusal {
+        OutageRefusal {
+            code: self.code.clone(),
+            detail: self.detail.clone(),
+        }
+    }
 }
 
 impl std::fmt::Display for RouteOpenRefused {
@@ -2834,6 +2864,7 @@ async fn open_scoped_route(
                 target: target_label.to_string(),
                 code: error.code,
                 message: error.message,
+                detail: error.detail,
             })),
             Err(_) => Err(error_response(
                 &format!("subc rejected route.open for target '{target_label}'"),
@@ -4032,6 +4063,21 @@ async fn reconcile_session_from_catalog(
     catalog: CatalogSnapshot,
     config: &GatewayConfig,
 ) -> Result<bool> {
+    reconcile_session_reporting_refusals(subc, state, relay_session, catalog, config)
+        .await
+        .map(|(changed, _refusals)| changed)
+}
+
+/// Reconciles the session with `catalog`, as `reconcile_session_from_catalog`
+/// does, and also returns the daemon's refusal for each provider whose
+/// route.open it refused in this pass, keyed by module id.
+async fn reconcile_session_reporting_refusals(
+    subc: &SubcClient,
+    state: &SessionState,
+    relay_session: &Arc<RelaySession>,
+    catalog: CatalogSnapshot,
+    config: &GatewayConfig,
+) -> Result<(bool, HashMap<String, OutageRefusal>)> {
     let desired = desired_session_from_catalog(config, &catalog.modules)?;
     // A route minted on an earlier relay connection died with it (the daemon
     // closes a connection's routes when the connection ends), so it is treated
@@ -4058,6 +4104,7 @@ async fn reconcile_session_from_catalog(
     // Same refusal scoping as attach_session: a per-target refusal drops that
     // provider from this reconcile pass rather than failing the whole refresh.
     let mut refused = Vec::new();
+    let mut refusals = HashMap::new();
     let mut desired = desired;
     for provider in &desired.providers {
         if let Some(route) = existing_routes.get(&provider.module_id) {
@@ -4090,6 +4137,9 @@ async fn reconcile_session_from_catalog(
                     "skipping provider '{}' on policy refresh: {error}",
                     provider.module_id
                 );
+                if let Some(refusal) = error.downcast_ref::<RouteOpenRefused>() {
+                    refusals.insert(provider.module_id.clone(), refusal.outage_refusal());
+                }
                 refused.push(provider.module_id.clone());
                 continue;
             }
@@ -4131,7 +4181,7 @@ async fn reconcile_session_from_catalog(
         }
         let _ = send_route_goodbyes(subc, removed_routes).await;
     }
-    Ok(changed)
+    Ok((changed, refusals))
 }
 
 /// Reopens the session's provider routes when any of them was minted on a
@@ -4814,6 +4864,10 @@ enum ConversationRouteRefusal {
     RouteLimit(usize),
     /// The daemon did not open a route to the module for the conversation.
     RouteOpenFailed(String),
+    /// The daemon refused the route.open for the conversation's route. The
+    /// call was never sent, so it is reported, or waited out, as a module
+    /// outage rather than as a conversation that could not be told apart.
+    RouteOpenRefused(OutageRefusal),
     /// The MCP connection is closing; no new route is opened for it.
     Closed,
 }
@@ -4837,6 +4891,10 @@ impl ConversationRouteRefusal {
             Self::RouteOpenFailed(error) => {
                 format!("no route to the module could be opened for the conversation: {error}")
             }
+            Self::RouteOpenRefused(refusal) => format!(
+                "the daemon refused to open a route to the module for the conversation: {}",
+                refusal.code
+            ),
             Self::Closed => "the MCP connection is closing".to_owned(),
         }
     }
@@ -5098,7 +5156,12 @@ impl ConversationRouter {
             tracing::debug!(target: "conversation",
                 "failed to open a conversation route to '{module_id}': {error}"
             );
-            ConversationRouteRefusal::RouteOpenFailed(error.to_string())
+            match error.downcast_ref::<RouteOpenRefused>() {
+                Some(refusal) => {
+                    ConversationRouteRefusal::RouteOpenRefused(refusal.outage_refusal())
+                }
+                None => ConversationRouteRefusal::RouteOpenFailed(error.to_string()),
+            }
         })?;
 
         let closed = {
@@ -5169,6 +5232,7 @@ struct SubcMcpServer {
     reconcile_gate: Arc<Mutex<()>>,
     prompts: PromptService,
     conversation: Arc<ConversationRouter>,
+    outage_wait: OutageWait,
 }
 
 /// The tool-call request body the gateway sends on a route is the shared
@@ -5478,6 +5542,7 @@ impl SubcMcpServer {
             reconcile_gate,
             prompts: PromptService::new(instance_token, prompt_backend),
             conversation,
+            outage_wait: OutageWait::from_env(),
         }
     }
 
@@ -5600,7 +5665,8 @@ impl SubcMcpServer {
         let Some(binding) = self.state.private_binding(&args.name) else {
             return Err(unknown_tool_error(&args.name));
         };
-        self.dispatch_bound_tool(binding, args.arguments, context)
+        let lookup = BindingLookup::Private(args.name.clone());
+        self.dispatch_bound_tool(lookup, binding, args.arguments, context)
             .await
     }
 
@@ -5612,12 +5678,19 @@ impl SubcMcpServer {
         let Some(binding) = self.state.direct_binding(&request.name) else {
             return Err(unknown_tool_error(&request.name));
         };
-        self.dispatch_bound_tool(binding, request.arguments.unwrap_or_default(), context)
-            .await
+        let lookup = BindingLookup::Direct(request.name.to_string());
+        self.dispatch_bound_tool(
+            lookup,
+            binding,
+            request.arguments.unwrap_or_default(),
+            context,
+        )
+        .await
     }
 
     async fn dispatch_bound_tool(
         &self,
+        lookup: BindingLookup,
         binding: ToolBinding,
         arguments: JsonObject,
         context: RequestContext<RoleServer>,
@@ -5628,13 +5701,24 @@ impl SubcMcpServer {
                 ack_only_tool_result()
             }
             ToolBinding::Forward(forward) => {
-                self.call_bound_tool(forward, arguments, context).await
+                self.call_bound_tool(lookup, forward, arguments, context)
+                    .await
             }
         }
     }
 
+    /// Sends the call to its provider. When the daemon proves the call never
+    /// reached the provider (a call-time route.open refusal, or
+    /// `module_reloading` on the request) and marks the refusal retryable,
+    /// the call is sent again, with backoff, until it gets through or
+    /// `outage_wait.budget` is spent; the host can cancel the wait. A refusal
+    /// that is terminal, or still standing when the budget is spent, comes
+    /// back as a tool result carrying the shared outage block. Every other
+    /// failure, including any where the call may have run, is returned as
+    /// before and never retried.
     async fn call_bound_tool(
         &self,
+        lookup: BindingLookup,
         binding: ForwardBinding,
         mut arguments: JsonObject,
         context: RequestContext<RoleServer>,
@@ -5648,17 +5732,177 @@ impl SubcMcpServer {
                 )),
             );
         }
+        let module_id = binding.module_id.clone();
+        let mut refusal = match self
+            .send_bound_call(&binding, arguments.clone(), &context, false)
+            .await?
+        {
+            CallAttempt::Answered(result) => return Ok(result),
+            CallAttempt::NothingSent(refusal) => refusal,
+            // `send_bound_call` reports a closed route this way only on a
+            // retried attempt; the first one keeps the route's own error.
+            CallAttempt::RouteGone => {
+                return Err(ErrorData::internal_error(
+                    "subc route tool call failed: the route closed before the call was sent",
+                    None,
+                ))
+            }
+        };
+        let deadline = time::Instant::now() + self.outage_wait.budget;
+        let mut delay = self.outage_wait.initial_delay;
+        loop {
+            let Some(pause) = outage_pause(&refusal, time::Instant::now(), deadline, delay) else {
+                tracing::info!(
+                    "tool call to '{module_id}' not sent: the module is unavailable ({})",
+                    refusal.code
+                );
+                return Ok(outage_tool_result(&module_id, &refusal));
+            };
+            tokio::select! {
+                _ = context.ct.cancelled() => return Err(tool_call_cancelled_error()),
+                _ = time::sleep(pause) => {}
+            }
+            delay = delay.saturating_mul(2).min(self.outage_wait.max_delay);
+            let Some(binding) = self
+                .binding_for_retry(&lookup, &module_id, &context.peer, &mut refusal)
+                .await
+            else {
+                continue;
+            };
+            match self
+                .send_bound_call(&binding, arguments.clone(), &context, true)
+                .await?
+            {
+                CallAttempt::Answered(result) => return Ok(result),
+                CallAttempt::NothingSent(next) => refusal = next,
+                // The route closed before this attempt reached the daemon's
+                // router: the module is still coming back. Keep waiting on the
+                // refusal already known.
+                CallAttempt::RouteGone => {}
+            }
+        }
+    }
+
+    /// The binding a retried call goes out on. While the provider's route is
+    /// still open (its module draining), that route. Once the route has
+    /// closed and the session has not reopened it, the session's routes are
+    /// reconciled now, and when the daemon refuses the provider's route.open
+    /// its refusal replaces `refusal` and no binding is returned.
+    async fn binding_for_retry(
+        &self,
+        lookup: &BindingLookup,
+        module_id: &str,
+        peer: &Peer<RoleServer>,
+        refusal: &mut OutageRefusal,
+    ) -> Option<ForwardBinding> {
+        if let Some(binding) = self.forward_binding(lookup) {
+            return Some(binding);
+        }
+        let reopened = {
+            let _reconcile_guard = self.reconcile_gate.lock().await;
+            reconcile_session_now(&self.subc, &self.state, &self.relay_session).await
+        };
+        match reopened {
+            Ok((changed, mut refusals)) => {
+                if changed && !notify_tool_list_changed(peer).await {
+                    tracing::warn!("failed to notify MCP list change while waiting out an outage");
+                }
+                if let Some(found) = refusals.remove(module_id) {
+                    *refusal = found;
+                    return None;
+                }
+            }
+            Err(error) => {
+                tracing::warn!("could not reopen routes while waiting for '{module_id}': {error}");
+                return None;
+            }
+        }
+        if let Some(binding) = self.forward_binding(lookup) {
+            return Some(binding);
+        }
+        // The catalog does not list the module: one that crashed or is
+        // restarting is deregistered until it is back, so the reconcile above
+        // never asked the daemon about it. Ask directly, so a module that is
+        // gone for good (`unknown_module`) ends the wait instead of using up
+        // the budget.
+        if let Some(found) = self.probe_provider_route(module_id).await {
+            *refusal = found;
+        }
+        None
+    }
+
+    fn forward_binding(&self, lookup: &BindingLookup) -> Option<ForwardBinding> {
+        let binding = match lookup {
+            BindingLookup::Direct(name) => self.state.direct_binding(name),
+            BindingLookup::Private(name) => self.state.private_binding(name),
+        };
+        match binding {
+            Some(ToolBinding::Forward(forward)) => Some(forward),
+            Some(ToolBinding::AckOnly { .. }) | None => None,
+        }
+    }
+
+    /// Asks the daemon for a route to `module_id` only to learn why it is
+    /// unavailable. A route it opens is closed again at once: the session's
+    /// reconcile owns the provider's real route.
+    async fn probe_provider_route(&self, module_id: &str) -> Option<OutageRefusal> {
+        match open_provider_route(
+            &self.subc,
+            module_id,
+            &self.state.identity,
+            self.relay_session.consumer_capabilities(),
+            Arc::clone(&self.relay_session),
+            None,
+        )
+        .await
+        {
+            Ok(route) => {
+                self.subc.relay().drop_route(route).await;
+                let _ = send_route_goodbye(&self.subc, route).await;
+                None
+            }
+            Err(error) => match error.downcast_ref::<RouteOpenRefused>() {
+                Some(refused) => Some(refused.outage_refusal()),
+                None => {
+                    tracing::warn!("could not ask the daemon about '{module_id}': {error}");
+                    None
+                }
+            },
+        }
+    }
+
+    /// One attempt at the call. `retrying` is false for the first attempt,
+    /// whose failures are all reported as they always were; on a later
+    /// attempt a route the daemon no longer knows is reported as
+    /// [`CallAttempt::RouteGone`].
+    async fn send_bound_call(
+        &self,
+        binding: &ForwardBinding,
+        arguments: JsonObject,
+        context: &RequestContext<RoleServer>,
+        retrying: bool,
+    ) -> std::result::Result<CallAttempt, ErrorData> {
         let route = match self
             .conversation
-            .route_for_call(&binding, claude_code_tool_use_id(&context.meta))
+            .route_for_call(binding, claude_code_tool_use_id(&context.meta))
             .await
         {
             Ok(route) => route,
-            Err(refusal) => return Ok(refusal.tool_result(&binding.module_id)),
+            Err(ConversationRouteRefusal::RouteOpenRefused(refusal)) => {
+                return Ok(CallAttempt::NothingSent(refusal))
+            }
+            Err(refusal) => {
+                return Ok(CallAttempt::Answered(
+                    refusal.tool_result(&binding.module_id),
+                ))
+            }
         };
         let progress_token = context.meta.get_progress_token();
-        let body =
-            route_tool_call_request(binding.bare_tool_name, arguments, progress_token.clone())?;
+        let body = route_tool_call_request(
+            binding.bare_tool_name.clone(),
+            arguments,
+            progress_token.clone(),
+        )?;
         let body = serde_json::to_vec(&body).map_err(mcp_internal_error)?;
         let corr = self.subc.next_corr().map_err(mcp_internal_error)?;
         let frame = self
@@ -5677,11 +5921,7 @@ impl SubcMcpServer {
                     let cancel_result = self.send_route_cancel(route, corr).await;
                     self.subc.abandon_request(route, corr).await;
                     cancel_result.map_err(mcp_internal_error)?;
-                    return Err(ErrorData::new(
-                        ErrorCode::INTERNAL_ERROR,
-                        "tool call cancelled by MCP client",
-                        None,
-                    ));
+                    return Err(tool_call_cancelled_error());
                 }
                 frame = frames.recv() => {
                     let Some(frame) = frame else {
@@ -5691,7 +5931,7 @@ impl SubcMcpServer {
                     match frame.header.ty {
                         FrameType::Push => {
                             if let Err(err) =
-                                forward_progress(&context, progress_token.clone(), &frame.body).await
+                                forward_progress(context, progress_token.clone(), &frame.body).await
                             {
                                 let cancel_result = self.send_route_cancel(route, corr).await;
                                 self.subc.abandon_request(route, corr).await;
@@ -5712,9 +5952,14 @@ impl SubcMcpServer {
                             if result.structured_content == Some(serde_json::Value::Null) {
                                 result.structured_content = None;
                             }
-                            return Ok(result);
+                            return Ok(CallAttempt::Answered(result));
                         }
                         FrameType::Error => {
+                            if let Some(attempt) =
+                                unsent_call_attempt(frame.header.flags, &frame.body, retrying)
+                            {
+                                return Ok(attempt);
+                            }
                             return Err(subc_error_to_mcp("subc route tool call failed", &frame.body));
                         }
                         ty => {
@@ -5898,6 +6143,160 @@ fn route_closed_error(route: RouteHandle, corr: u64) -> ErrorData {
             "route_epoch": route.epoch,
         })),
     )
+}
+
+/// Which of the session's bindings a call was made through, so a retried call
+/// can find the binding again once its provider's route has been reopened.
+#[derive(Debug, Clone)]
+enum BindingLookup {
+    /// A tool on the advertised surface, by its exposed name.
+    Direct(String),
+    /// A tool reached through `tools_invoke`, by its exposed name.
+    Private(String),
+}
+
+/// How one attempt at a tool call ended, apart from the errors returned as
+/// they always were.
+#[derive(Debug)]
+enum CallAttempt {
+    /// The provider answered, or the call was refused with a tool result.
+    Answered(CallToolResult),
+    /// The daemon proved the call never reached the provider.
+    NothingSent(OutageRefusal),
+    /// A retried attempt went out on a route the daemon had already closed
+    /// (`unknown_channel` or `stale_route_epoch`, answered before the
+    /// daemon's router forwards anything).
+    RouteGone,
+}
+
+/// A daemon refusal proving a tool call never reached its provider: a
+/// route.open refusal for a route the call needed, or `module_reloading` on
+/// the request itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutageRefusal {
+    /// The daemon's code, verbatim.
+    code: String,
+    /// The daemon's `detail`, verbatim.
+    detail: Option<serde_json::Value>,
+}
+
+impl OutageRefusal {
+    /// The detail as one line: compact JSON, or a string detail as it is.
+    /// A line that breaks the block's rules is left out by the renderer.
+    fn detail_line(&self) -> Option<String> {
+        match self.detail.as_ref()? {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(detail) => Some(detail.clone()),
+            other => Some(other.to_string()),
+        }
+    }
+}
+
+/// The tool result a call refused by a module outage returns: `isError` and
+/// one text block, the outage rendering every CortexKit runner uses.
+fn outage_tool_result(module_id: &str, refusal: &OutageRefusal) -> CallToolResult {
+    let mut output = outage_output::OutageOutput::new(OUTAGE_MESSAGE)
+        .with_module(module_id)
+        .with_code(&refusal.code);
+    if let Some(detail) = refusal.detail_line() {
+        output = output.with_detail(&detail);
+    }
+    output = output.with_nothing_sent();
+    if subc_protocol::error_codes::is_retryable_route_open(&refusal.code) {
+        output = output.with_retry(OUTAGE_RETRY_HINT);
+    }
+    CallToolResult::error(vec![ContentBlock::text(output.render())])
+}
+
+/// How long a call waits out a module outage, and how often it tries again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutageWait {
+    budget: Duration,
+    initial_delay: Duration,
+    max_delay: Duration,
+}
+
+impl OutageWait {
+    fn with_budget(budget: Duration) -> Self {
+        Self {
+            budget,
+            initial_delay: OUTAGE_RETRY_DELAY_INITIAL,
+            max_delay: OUTAGE_RETRY_DELAY_MAX,
+        }
+    }
+
+    fn from_env() -> Self {
+        let budget = match env::var(OUTAGE_WAIT_MS_ENV) {
+            Ok(raw) => match raw.parse::<u64>() {
+                Ok(0) => DEFAULT_OUTAGE_WAIT,
+                Ok(ms) => Duration::from_millis(ms),
+                Err(error) => {
+                    tracing::warn!("ignoring invalid {OUTAGE_WAIT_MS_ENV}={raw:?}: {error}");
+                    DEFAULT_OUTAGE_WAIT
+                }
+            },
+            Err(_) => DEFAULT_OUTAGE_WAIT,
+        };
+        Self::with_budget(budget)
+    }
+}
+
+/// How long to pause before trying a refused call again, or `None` to stop
+/// and report the refusal: its code is terminal, or the wait has reached
+/// `deadline`. The last pause is cut short so one final attempt is made at
+/// the deadline.
+fn outage_pause(
+    refusal: &OutageRefusal,
+    now: time::Instant,
+    deadline: time::Instant,
+    delay: Duration,
+) -> Option<Duration> {
+    if !subc_protocol::error_codes::is_retryable_route_open(&refusal.code) || now >= deadline {
+        return None;
+    }
+    Some(delay.min(deadline - now))
+}
+
+/// Reads a route Error answering a tool call for the cases where the call
+/// provably never reached the provider. `module_reloading` is one: the daemon
+/// returns it only before forwarding the request
+/// (`subc_protocol::error_codes::MODULE_RELOADING`). On a retried attempt, a
+/// route the daemon no longer knows is another; on the first attempt it keeps
+/// its old JSON-RPC error. Anything else is `None` and stays as it was.
+fn unsent_call_attempt(flags: Flags, body: &[u8], retrying: bool) -> Option<CallAttempt> {
+    let error = serde_json::from_slice::<ErrorBody>(body).ok()?;
+    if error.code == subc_protocol::error_codes::MODULE_RELOADING {
+        return Some(CallAttempt::NothingSent(OutageRefusal {
+            code: error.code,
+            detail: error.detail,
+        }));
+    }
+    if retrying && subc_protocol::error_codes::is_established_route_dead(flags, &error.code) {
+        return Some(CallAttempt::RouteGone);
+    }
+    None
+}
+
+fn tool_call_cancelled_error() -> ErrorData {
+    ErrorData::new(
+        ErrorCode::INTERNAL_ERROR,
+        "tool call cancelled by MCP client",
+        None,
+    )
+}
+
+/// Reconciles the session with the daemon's current catalog, reporting the
+/// providers whose route.open the daemon refused. The caller holds the
+/// session's reconcile gate.
+async fn reconcile_session_now(
+    subc: &SubcClient,
+    state: &SessionState,
+    relay_session: &Arc<RelaySession>,
+) -> Result<(bool, HashMap<String, OutageRefusal>)> {
+    let catalog = catalog_list(subc).await?;
+    let config = state.config_snapshot();
+    reconcile_session_reporting_refusals(subc, state, relay_session, catalog, &config.effective)
+        .await
 }
 
 fn subc_error_to_mcp(prefix: &str, body: &[u8]) -> ErrorData {
@@ -9767,5 +10166,213 @@ mod tests {
             Err(ConversationRouteRefusal::Closed)
         );
         assert!(router.close().is_empty());
+    }
+
+    fn outage_text(result: &CallToolResult) -> String {
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(result.content.len(), 1, "one text block");
+        result.content[0].as_text().unwrap().text.clone()
+    }
+
+    #[test]
+    fn outage_result_renders_the_shared_block() {
+        let reloading = OutageRefusal {
+            code: "module_reloading".to_owned(),
+            detail: None,
+        };
+        assert_eq!(
+            outage_text(&outage_tool_result("aft", &reloading)),
+            "The module that provides this tool is unavailable.\n\
+             module: aft\n\
+             code: module_reloading\n\
+             nothing was sent\n\
+             retry: the module was restarting or starting up; the call can be retried in a minute"
+        );
+
+        // A terminal code carries no retry hint; an object detail is one line
+        // of compact JSON.
+        let warming_detail = OutageRefusal {
+            code: "unknown_module".to_owned(),
+            detail: Some(serde_json::json!({"reason": "declared_not_ready", "n": 1})),
+        };
+        assert_eq!(
+            outage_text(&outage_tool_result("fed:peer-1:aft", &warming_detail)),
+            "The module that provides this tool is unavailable.\n\
+             module: fed:peer-1:aft\n\
+             code: unknown_module\n\
+             detail: {\"n\":1,\"reason\":\"declared_not_ready\"}\n\
+             nothing was sent"
+        );
+
+        // Members breaking a rule are left out whole, never cut.
+        let unruly = OutageRefusal {
+            code: "Not-A-Code".to_owned(),
+            detail: Some(serde_json::json!("first line\nnothing was sent")),
+        };
+        assert_eq!(
+            outage_text(&outage_tool_result("a\nb", &unruly)),
+            "The module that provides this tool is unavailable.\nnothing was sent"
+        );
+        let long = OutageRefusal {
+            code: "target_unavailable".to_owned(),
+            detail: Some(serde_json::json!("x".repeat(1025))),
+        };
+        assert!(!outage_text(&outage_tool_result("aft", &long)).contains("detail:"));
+        let string_detail = OutageRefusal {
+            code: "target_unavailable".to_owned(),
+            detail: Some(serde_json::json!("supervisor_not_live")),
+        };
+        assert!(outage_text(&outage_tool_result("aft", &string_detail))
+            .contains("\ndetail: supervisor_not_live\n"));
+    }
+
+    #[test]
+    fn outage_pause_stops_for_terminal_codes_and_at_the_deadline() {
+        let now = time::Instant::now();
+        let deadline = now + Duration::from_secs(90);
+        let refusal = |code: &str| OutageRefusal {
+            code: code.to_owned(),
+            detail: None,
+        };
+        let delay = Duration::from_millis(250);
+        for code in ["module_reloading", "module_warming", "target_unavailable"] {
+            assert_eq!(
+                outage_pause(&refusal(code), now, deadline, delay),
+                Some(delay),
+                "{code}"
+            );
+        }
+        for code in [
+            "unknown_module",
+            "module_removed",
+            "principal_denied",
+            "made_up",
+        ] {
+            assert_eq!(
+                outage_pause(&refusal(code), now, deadline, delay),
+                None,
+                "{code}"
+            );
+        }
+        let reloading = refusal("module_reloading");
+        assert_eq!(
+            outage_pause(
+                &reloading,
+                deadline - Duration::from_millis(100),
+                deadline,
+                delay
+            ),
+            Some(Duration::from_millis(100)),
+            "the last pause ends at the deadline"
+        );
+        assert_eq!(outage_pause(&reloading, deadline, deadline, delay), None);
+    }
+
+    #[test]
+    fn outage_wait_defaults_to_ninety_seconds() {
+        assert_eq!(
+            OutageWait::with_budget(DEFAULT_OUTAGE_WAIT).budget,
+            Duration::from_secs(90)
+        );
+    }
+
+    #[test]
+    fn only_module_reloading_on_the_request_proves_nothing_was_sent() {
+        let body = |code: &str, detail: Option<serde_json::Value>| {
+            serde_json::to_vec(&ErrorBody {
+                code: code.to_owned(),
+                message: "m".to_owned(),
+                detail,
+            })
+            .unwrap()
+        };
+        let flags = data_flags();
+        for retrying in [false, true] {
+            match unsent_call_attempt(flags, &body("module_reloading", None), retrying) {
+                Some(CallAttempt::NothingSent(refusal)) => assert_eq!(
+                    refusal,
+                    OutageRefusal {
+                        code: "module_reloading".to_owned(),
+                        detail: None
+                    }
+                ),
+                other => panic!("expected nothing sent, got {other:?}"),
+            }
+            // Codes that do not prove the call never ran keep their error.
+            for code in [
+                "target_unavailable",
+                "module_warming",
+                "route_closed",
+                SUBC_CONNECTION_LOST_CODE,
+                "handler_failed",
+            ] {
+                let detail = Some(serde_json::json!({"send_outcome": "outcome_unknown"}));
+                assert!(
+                    unsent_call_attempt(flags, &body(code, detail), retrying).is_none(),
+                    "{code}"
+                );
+            }
+        }
+        // A route the daemon no longer knows ends a retried attempt only; the
+        // first attempt keeps its old error.
+        for code in ["unknown_channel", "stale_route_epoch"] {
+            assert!(unsent_call_attempt(flags, &body(code, None), false).is_none());
+            assert!(matches!(
+                unsent_call_attempt(flags, &body(code, None), true),
+                Some(CallAttempt::RouteGone)
+            ));
+        }
+        assert!(unsent_call_attempt(flags, b"not json", true).is_none());
+    }
+
+    /// A daemon refusing a conversation route's route.open is reported as the
+    /// refusal itself, code and detail verbatim, so the call can wait it out
+    /// or report it as a module outage.
+    #[tokio::test]
+    async fn conversation_route_open_refusal_carries_the_daemon_refusal() {
+        let (client, mut server) = connected_tcp_stream_pair().await;
+        let subc = SubcClient::start(client);
+        let daemon = tokio::spawn(async move {
+            let frame = read_frame(&mut server).await.unwrap().unwrap();
+            let body = serde_json::to_vec(&ErrorBody {
+                code: "module_warming".to_owned(),
+                message: "not ready".to_owned(),
+                detail: Some(serde_json::json!({"reason": "declared_not_ready"})),
+            })
+            .unwrap();
+            let response = build_frame(
+                FrameType::Error,
+                control_flags(),
+                0,
+                0,
+                frame.header.corr,
+                body,
+            )
+            .unwrap();
+            write_frame(&mut server, &response).await.unwrap();
+            server.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+        let resolver = Arc::new(MockPromptRouteClient::new([Ok(
+            serde_json::json!({"session": "sid-1"}),
+        )]));
+        let router = ConversationRouter::new(
+            subc,
+            conversation_test_identity(),
+            Arc::new(RelaySession::new("relay-session".to_owned())),
+            Some(TEST_INSTANCE_TOKEN.to_owned()),
+            resolver,
+        );
+        let binding = forward_binding(&router, true);
+        assert_eq!(
+            router
+                .route_for_call(&binding, ToolUseIdMeta::Present("toolu_1"))
+                .await,
+            Err(ConversationRouteRefusal::RouteOpenRefused(OutageRefusal {
+                code: "module_warming".to_owned(),
+                detail: Some(serde_json::json!({"reason": "declared_not_ready"})),
+            }))
+        );
+        daemon.abort();
     }
 }

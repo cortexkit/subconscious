@@ -587,10 +587,20 @@ impl ScriptedProvider {
     }
 
     async fn send_route_response(&self, request: &Frame, body: Value) {
+        self.send_route_answer(request, FrameType::Response, body)
+            .await;
+    }
+
+    async fn send_route_error(&self, request: &Frame, body: Value) {
+        self.send_route_answer(request, FrameType::Error, body)
+            .await;
+    }
+
+    async fn send_route_answer(&self, request: &Frame, ty: FrameType, body: Value) {
         let body = serde_json::to_vec(&body).unwrap();
         let frame = Frame::build_with_version(
             request.header.ver,
-            FrameType::Response,
+            ty,
             request.header.flags,
             request.header.channel,
             request.header.epoch,
@@ -2368,6 +2378,14 @@ async fn mcp_tools_call_splits_tool_errors_from_subc_errors() {
         .call_tool(CallToolRequestParams::new("fake-aft_fake_read"))
         .await
         .unwrap_err();
+    // This stays a JSON-RPC error. A module outage that proves the call never
+    // reached the provider (a call-time route.open refusal, or
+    // `module_reloading` on the request) is waited out and then returned as a
+    // tool result with the shared outage block; see the
+    // `mcp_module_outage_*` tests. A `target_unavailable` Error answering the
+    // request itself carries no such proof: only `module_reloading` is
+    // guaranteed to be answered before the daemon forwards anything, so this
+    // call may have run and is reported exactly as before.
     match subc_error {
         ServiceError::McpError(error) => {
             assert!(
@@ -2378,6 +2396,279 @@ async fn mcp_tools_call_splits_tool_errors_from_subc_errors() {
         other => panic!("expected JSON-RPC MCP error for subc-level failure, got {other:?}"),
     }
     subc_error_harness.shutdown().await;
+}
+
+fn module_reloading_body() -> Value {
+    json!({ "code": "module_reloading", "message": "module endpoint is reloading" })
+}
+
+/// Starts a reverse harness whose `raw` provider is scripted, with the
+/// gateway's outage wait cut to `wait_ms`, and waits for the route to bind.
+async fn outage_harness(label: &str, wait_ms: &str) -> ReverseHarness {
+    let mut harness = ReverseHarness::start_with_module_env(
+        label,
+        ClientCapabilities::default(),
+        &[("SUBC_MCP_OUTAGE_WAIT_MS", wait_ms)],
+    )
+    .await;
+    harness.provider.wait_bound().await;
+    harness
+}
+
+fn spawn_tool_call(
+    harness: &ReverseHarness,
+) -> JoinHandle<Result<rmcp::model::CallToolResult, ServiceError>> {
+    let peer = harness.client.as_ref().unwrap().peer().clone();
+    let name = harness.provider.exposed_tool_name();
+    tokio::spawn(async move {
+        peer.call_tool(
+            CallToolRequestParams::new(name)
+                .with_arguments(json!({ "q": "outage" }).as_object().unwrap().clone()),
+        )
+        .await
+    })
+}
+
+fn route_request_body(frame: &Frame) -> Value {
+    serde_json::from_slice(&frame.body).unwrap()
+}
+
+/// A call refused with `module_reloading` (answered before the request is
+/// forwarded, so it never ran) is sent again once the module is back, and the
+/// host sees only the real result.
+#[tokio::test]
+async fn mcp_module_outage_reloading_call_waits_and_returns_the_real_result() {
+    let mut harness = outage_harness("mcp-outage-wait", "20000").await;
+    let call = spawn_tool_call(&harness);
+
+    let first = harness.provider.wait_route_request().await;
+    harness
+        .provider
+        .send_route_error(&first, module_reloading_body())
+        .await;
+    let second = harness.provider.wait_route_request().await;
+    assert_ne!(first.header.corr, second.header.corr);
+    assert_eq!(
+        route_request_body(&second),
+        route_request_body(&first),
+        "the retried call carries the same request"
+    );
+    harness
+        .provider
+        .send_route_response(
+            &second,
+            json!({ "content": [{ "type": "text", "text": "back" }], "isError": false }),
+        )
+        .await;
+
+    let result = timeout(READ_TIMEOUT, call).await.unwrap().unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        json!({ "content": [{ "type": "text", "text": "back" }], "isError": false })
+    );
+    harness.shutdown().await;
+}
+
+/// A module still reloading when the wait is spent comes back as a tool
+/// result carrying exactly the shared outage block.
+#[tokio::test]
+async fn mcp_module_outage_past_the_budget_returns_the_shared_block() {
+    let mut harness = outage_harness("mcp-outage-budget", "1500").await;
+    let started = Instant::now();
+    let mut call = spawn_tool_call(&harness);
+
+    let mut refused = 0;
+    let result = loop {
+        tokio::select! {
+            result = &mut call => break result.unwrap().unwrap(),
+            request = harness.provider.wait_route_request() => {
+                refused += 1;
+                harness.provider.send_route_error(&request, module_reloading_body()).await;
+            }
+        }
+    };
+    assert!(
+        started.elapsed() >= Duration::from_millis(1500),
+        "the call should wait out the budget, ended after {:?}",
+        started.elapsed()
+    );
+    assert!(
+        refused >= 2,
+        "the call should be retried, sent {refused} times"
+    );
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        json!({
+            "content": [{
+                "type": "text",
+                "text": "The module that provides this tool is unavailable.\n\
+                         module: raw\n\
+                         code: module_reloading\n\
+                         nothing was sent\n\
+                         retry: the module was restarting or starting up; the call can be retried in a minute",
+            }],
+            "isError": true,
+        })
+    );
+    harness.shutdown().await;
+}
+
+/// A terminal refusal ends the wait at once instead of using up the budget:
+/// the provider answers `module_reloading` and then leaves for good, so the
+/// daemon refuses the reopened route with `unknown_module`.
+#[tokio::test]
+async fn mcp_module_outage_terminal_refusal_returns_the_block_without_waiting() {
+    let mut harness = outage_harness("mcp-outage-terminal", "30000").await;
+    let started = Instant::now();
+    let call = spawn_tool_call(&harness);
+
+    let first = harness.provider.wait_route_request().await;
+    harness
+        .provider
+        .send_route_error(&first, module_reloading_body())
+        .await;
+    let _ = harness
+        .provider
+        .command_tx
+        .send(ScriptedProviderCommand::Shutdown)
+        .await;
+
+    let result = timeout(READ_TIMEOUT, call).await.unwrap().unwrap().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "a terminal refusal must not wait out the 30 s budget, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        json!({
+            "content": [{
+                "type": "text",
+                "text": "The module that provides this tool is unavailable.\n\
+                         module: raw\n\
+                         code: unknown_module\n\
+                         nothing was sent",
+            }],
+            "isError": true,
+        })
+    );
+    harness.shutdown().await;
+}
+
+/// The host cancelling the call while it waits out an outage ends the wait,
+/// and nothing more is sent to the provider.
+#[tokio::test]
+async fn mcp_module_outage_host_cancellation_ends_the_wait() {
+    let mut harness = outage_harness("mcp-outage-cancel", "30000").await;
+    let peer = harness.client.as_ref().unwrap().peer().clone();
+    let handle = peer
+        .send_cancellable_request(
+            ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(
+                harness.provider.exposed_tool_name(),
+            ))),
+            PeerRequestOptions::no_options(),
+        )
+        .await
+        .unwrap();
+    let first = harness.provider.wait_route_request().await;
+    let started = Instant::now();
+    harness
+        .provider
+        .send_route_error(&first, module_reloading_body())
+        .await;
+    peer.notify_cancelled(CancelledNotificationParam::new(
+        Some(handle.id.clone()),
+        Some("test cancellation".to_owned()),
+    ))
+    .await
+    .unwrap();
+
+    let err = timeout(READ_TIMEOUT, handle.await_response())
+        .await
+        .unwrap()
+        .unwrap_err();
+    match &err {
+        ServiceError::Cancelled { .. } => {}
+        ServiceError::McpError(error) if error.message.contains("cancelled") => {}
+        other => panic!("expected a cancelled call, got {other:?}"),
+    }
+    assert!(started.elapsed() < Duration::from_secs(15));
+    // Past the first retry pause: a wait that ignored the cancellation would
+    // have sent the call again by now.
+    assert!(
+        next_route_request_within(&mut harness.provider, Duration::from_millis(1500))
+            .await
+            .is_none(),
+        "no call may be sent after the host cancelled"
+    );
+    harness.shutdown().await;
+}
+
+/// A failure after the call may have run is never waited out or retried and
+/// keeps its JSON-RPC error with the unknown outcome.
+#[tokio::test]
+async fn mcp_module_outage_outcome_unknown_failure_is_unchanged() {
+    let mut harness = outage_harness("mcp-outage-unknown", "30000").await;
+    let call = spawn_tool_call(&harness);
+    let first = harness.provider.wait_route_request().await;
+    harness
+        .provider
+        .send_route_error(
+            &first,
+            json!({
+                "code": "route_closed",
+                "message": "route closed after the request was dispatched",
+                "detail": { "send_outcome": "outcome_unknown" },
+            }),
+        )
+        .await;
+
+    let err = timeout(READ_TIMEOUT, call)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    let ServiceError::McpError(error) = err else {
+        panic!("expected a JSON-RPC error, got {err:?}");
+    };
+    assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+    assert_eq!(
+        error.message,
+        "subc route tool call failed: route_closed: route closed after the request was dispatched"
+    );
+    assert_eq!(
+        error.data,
+        Some(json!({
+            "subc_code": "route_closed",
+            "send_outcome": "outcome_unknown",
+            "request_dispatched": true,
+        }))
+    );
+    assert!(
+        next_route_request_within(&mut harness.provider, QUIET_TIMEOUT)
+            .await
+            .is_none(),
+        "a call that may have run is never retried"
+    );
+    harness.shutdown().await;
+}
+
+/// The next tool call the scripted provider receives within `wait`, if any.
+async fn next_route_request_within(
+    provider: &mut ScriptedProvider,
+    wait: Duration,
+) -> Option<Frame> {
+    timeout(wait, async {
+        while let Some(event) = provider.events_rx.recv().await {
+            if let ScriptedProviderEvent::RouteRequest(frame) = event {
+                return Some(frame);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[tokio::test]

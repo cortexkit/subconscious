@@ -2321,9 +2321,19 @@ fn collect_log_text(
                 continue;
             }
         }
-        // A stamped capture line has a time even when the module's bytes are
-        // not a log line, so `--since` applies to it as well.
-        if since.is_some_and(|since| timestamp.is_some_and(|timestamp| timestamp < since)) {
+        // `--since` compares each line's own time. A stamped capture line
+        // already carries the daemon's capture time above, whatever the
+        // module wrote after it. A stamped line otherwise keeps its own time
+        // even when the strict fleet grammar rejects it for something
+        // unrelated to the time itself: an unpadded level, a trailing context
+        // bracket, or another shape the module's own writer emits. Without a
+        // fallback the module's own dated segments are immune to `--since`,
+        // and their old lines fill the `-n` tail because undated lines sort
+        // after dated ones. Lines with no stamp at all stay undated: capture
+        // lines inherit a neighbour's stamp above, and the rest are shown and
+        // counted below, exactly as before.
+        let since_time = timestamp.or_else(|| since_stamp(line));
+        if since.is_some_and(|since| since_time.is_some_and(|time| time < since)) {
             counts.before_since += 1;
             continue;
         }
@@ -2361,6 +2371,16 @@ struct LineFacts<'a> {
 
 fn capture_stamp_time(line: &str) -> Option<SystemTime> {
     split_capture_stamp(line).map(|(at_ms, _)| UNIX_EPOCH + Duration::from_millis(at_ms))
+}
+
+/// A line's own leading timestamp for `--since`, read without requiring the
+/// rest of the fleet grammar: the strict reader rejects a stamped line for
+/// its level padding, logger spelling, or bracket placement, and none of
+/// those changes when the line was written. Only a leading UTC stamp counts,
+/// using the same shapes the r1 stamp reader accepts; anything else leaves
+/// the line undated, exactly as the strict reader left it.
+fn since_stamp(line: &str) -> Option<SystemTime> {
+    parse_r1_timestamp(line.split_once(' ')?.0)
 }
 
 /// The time and facts of one line of the daemon's capture file.
@@ -12143,5 +12163,71 @@ mod tests {
         assert!(entries
             .iter()
             .all(|entry| entry.time_inherited || entry.line.contains("recent stamped")));
+    }
+
+    /// `--since` drops old lines from the module's own dated segments even
+    /// when the strict fleet grammar rejects them: a fleet line with trailing
+    /// context still carries its own time and must filter by it. A recent
+    /// line of the same shape is kept, and it stays after the dated lines,
+    /// exactly where an undated line sorts.
+    #[test]
+    fn module_logs_since_filters_dated_segments_by_line_time() {
+        let root = ScratchDir::new("mod-logs-since-dated");
+        let dirs = log_dirs(&root);
+        let now = SystemTime::now();
+        let old_stamp = format_capture_test_time(now - Duration::from_secs(14 * 24 * 60 * 60));
+        let new_stamp = format_capture_test_time(now - Duration::from_secs(60));
+        let retry_stamp = format_capture_test_time(now - Duration::from_secs(30));
+        append(
+            &dirs.module_logs.join(format!(
+                "callosum.{}.log",
+                utc_day_string(now - Duration::from_secs(14 * 24 * 60 * 60))
+            )),
+            &format!("{old_stamp} INFO  callosum.rdv-control: inbound refused [peer=7f3a]\n"),
+        );
+        append(
+            &dirs
+                .module_logs
+                .join(format!("callosum.{}.log", utc_day_string(now))),
+            &format!(
+                "{new_stamp} INFO  callosum.rdv-control: dial ok peer=abc\n\
+                 {retry_stamp} INFO  callosum.rdv-control: dial retrying [peer=def]\n"
+            ),
+        );
+        let sources = discover_log_sources_in(&dirs, "callosum", true).unwrap();
+        assert_eq!(sources.len(), 2);
+        assert!(sources.iter().all(|source| source.lane == "mod"));
+        let options = ModuleLogsOptions {
+            lines: 200,
+            follow: false,
+            since: Some(Duration::from_secs(10 * 60)),
+            tag: None,
+            level: None,
+            lane: None,
+        };
+        let (mut entries, counts) =
+            collect_log_entries("callosum", &sources, &options).unwrap();
+        sort_log_entries(&mut entries);
+
+        assert_eq!(counts.total, 3);
+        assert_eq!(counts.before_since, 1);
+        assert_eq!(counts.unparsed, 1);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.line.clone())
+                .collect::<Vec<_>>(),
+            [
+                format!("{new_stamp} INFO  callosum.rdv-control: dial ok peer=abc"),
+                format!("{retry_stamp} INFO  callosum.rdv-control: dial retrying [peer=def]"),
+            ]
+        );
+        assert!(entries.iter().all(|entry| entry.lane == "mod"));
+    }
+
+    fn utc_day_string(time: SystemTime) -> String {
+        let secs = time.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let parts = utc_parts_from_epoch_secs(secs);
+        format!("{:04}-{:02}-{:02}", parts.year, parts.month, parts.day)
     }
 }

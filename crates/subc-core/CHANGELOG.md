@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.143
+
+- `ck module logs --since` now also filters the module's own log files: a line carrying its own timestamp is dropped when it is older than the window, even when the strict log grammar would not parse the rest of the line. Lines with no timestamp are shown as before.
+
 ## 0.20.142
 
 - Removed an unused internal setup helper (`desired_values`, never called or exported); no behaviour change.

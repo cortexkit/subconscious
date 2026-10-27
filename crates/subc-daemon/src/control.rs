@@ -47,9 +47,9 @@ use tracing::{debug, info, warn};
 use crate::{
     caller_identity::CallerIdentity,
     capability_requirements::{
-        log_duplicate_claim_events, log_requirement_events, CapabilityRequirementEvaluator,
-        CapabilityVerdict, DuplicateClaimSource, RegisteredModule, RequirementStatus,
-        RuntimeModule,
+        log_duplicate_claim_events, log_manifest_change, log_requirement_events,
+        CapabilityRequirementEvaluator, CapabilityVerdict, DuplicateClaimSource, RegisteredModule,
+        RequirementStatus, RuntimeModule,
     },
     child_roster::DaemonShutdownFlag,
     daemon_config::{PrivilegedOperatorPrompt, RestartRequiredSection},
@@ -1396,8 +1396,8 @@ impl ControlHandler {
     }
 
     /// The capability side effects of a module becoming the active registration
-    /// for its id: cache its manifest (warning if its claims drifted), run the
-    /// deny census when its declarations call for one, and recompute the
+    /// for its id: cache its manifest (logging how it differs from the cached
+    /// one), run the deny census when its declarations call for one, and recompute the
     /// requirement statuses. An ordinary HELLO does this as it registers; a swap
     /// candidate's does not, and the supervisor does it at promotion instead,
     /// through [`crate::supervise::SwapPromotionObserver`].
@@ -1407,12 +1407,8 @@ impl ControlHandler {
             module_version: registration.manifest.module_version.clone(),
             capabilities: registration.manifest.capabilities.clone(),
         };
-        if self.capability_evaluator.record_hello(&cached_registration) {
-            warn!(
-                module_id = %cached_registration.module_id,
-                "capability claims drifted from the cached manifest"
-            );
-        }
+        let change = self.capability_evaluator.record_hello(&cached_registration);
+        log_manifest_change(&cached_registration.module_id, &change);
         if capability_census_trigger(None, registration.manifest.capabilities.as_ref()) {
             self.enforce_capability_denies();
         }

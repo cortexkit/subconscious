@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.14
+
+- A module re-registering with a new version but the same capability claims now logs `module version changed` at INFO with `from` and `to`, instead of the `capability claims drifted from the cached manifest` WARN (#148). The WARN is kept for a real change to `provides` and now names the `added` and `removed` capability ids in sorted order, plus `from` and `to` when the version changed too. Claims listed in a different order are no longer treated as a change.
+
 ## 0.37.13
 
 - `route.bind` never carries the opener's `build_class`. The daemon clears it from the identity before relaying the bind, so no module can come to rely on a claim any local process can make. Callosum's production-build claim stays evidence for the daemon's own prompt decision only.

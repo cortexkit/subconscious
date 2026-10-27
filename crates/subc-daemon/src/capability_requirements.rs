@@ -99,6 +99,95 @@ pub(crate) struct RegisteredModule {
     pub capabilities: Option<CapabilityDeclarations>,
 }
 
+/// A module's version before and after a re-registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VersionChange {
+    pub from: String,
+    pub to: String,
+}
+
+/// How a module's HELLO differs from the manifest the daemon cached for the
+/// same id earlier in this daemon's lifetime.
+///
+/// A version bump with identical capability claims is a routine upgrade, while
+/// a change to the claimed capabilities can break consumers that require them.
+/// Keeping the two apart lets the log treat the first as information and the
+/// second as a warning that names exactly what was gained or lost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ManifestChange {
+    /// Same version and same claimed capabilities, or nothing cached to compare.
+    Unchanged,
+    /// The version changed; the claimed capabilities did not.
+    VersionOnly(VersionChange),
+    /// The claimed capabilities changed. Both lists are sorted and deduplicated.
+    /// `version` is set when the version changed in the same HELLO.
+    ProvidesChanged {
+        added: Vec<String>,
+        removed: Vec<String>,
+        version: Option<VersionChange>,
+    },
+}
+
+impl ManifestChange {
+    fn between(
+        old_version: &str,
+        old_provides: &[String],
+        new_version: &str,
+        new_provides: &[String],
+    ) -> Self {
+        // Claims are compared as sets: the same capabilities listed in another
+        // order (or listed twice) promise consumers nothing different.
+        let old = old_provides.iter().collect::<BTreeSet<_>>();
+        let new = new_provides.iter().collect::<BTreeSet<_>>();
+        let added = new
+            .difference(&old)
+            .map(|id| (*id).clone())
+            .collect::<Vec<_>>();
+        let removed = old
+            .difference(&new)
+            .map(|id| (*id).clone())
+            .collect::<Vec<_>>();
+        let version = (old_version != new_version).then(|| VersionChange {
+            from: old_version.to_string(),
+            to: new_version.to_string(),
+        });
+        match (added.is_empty() && removed.is_empty(), version) {
+            (true, None) => Self::Unchanged,
+            (true, Some(version)) => Self::VersionOnly(version),
+            (false, version) => Self::ProvidesChanged {
+                added,
+                removed,
+                version,
+            },
+        }
+    }
+}
+
+/// Log a re-registration's manifest change: nothing when unchanged, INFO for a
+/// version-only upgrade, and WARN when the claimed capabilities changed.
+pub(crate) fn log_manifest_change(module_id: &str, change: &ManifestChange) {
+    match change {
+        ManifestChange::Unchanged => {}
+        ManifestChange::VersionOnly(VersionChange { from, to }) => {
+            info!(module_id, from = %from, to = %to, "module version changed");
+        }
+        ManifestChange::ProvidesChanged {
+            added,
+            removed,
+            version,
+        } => {
+            warn!(
+                module_id,
+                added = ?added,
+                removed = ?removed,
+                from = version.as_ref().map(|version| version.from.as_str()),
+                to = version.as_ref().map(|version| version.to.as_str()),
+                "capability claims drifted from the cached manifest"
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct RequirementKey {
     consumer: String,
@@ -221,9 +310,13 @@ impl CapabilityRequirementEvaluator {
         self.wake.notify_one();
     }
 
-    /// Record an attested HELLO as the last-known manifest for a configured id.
-    /// Returning true means the claim set drifted from its previous cached value.
-    pub(crate) fn record_hello(&self, registration: &RegisteredModule) -> bool {
+    /// Record an attested HELLO as the last-known manifest for a configured id,
+    /// and report how it differs from the manifest cached for that id before.
+    ///
+    /// The cache lives only in memory, so the first HELLO for an id after a
+    /// daemon start has nothing to compare against and reports `Unchanged`, as
+    /// does a HELLO from an id that is not configured (it is never cached).
+    pub(crate) fn record_hello(&self, registration: &RegisteredModule) -> ManifestChange {
         let declarations = registration
             .capabilities
             .clone()
@@ -233,16 +326,20 @@ impl CapabilityRequirementEvaluator {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !state.configured.contains_key(&registration.module_id) {
-            return false;
+            return ManifestChange::Unchanged;
         }
-        let drifted = state
+        let change = state
             .cached
             .get(&registration.module_id)
             .map(|cached| {
-                cached.declarations.provides != declarations.provides
-                    || cached.module_version != registration.module_version
+                ManifestChange::between(
+                    &cached.module_version,
+                    &cached.declarations.provides,
+                    &registration.module_version,
+                    &declarations.provides,
+                )
             })
-            .unwrap_or(false);
+            .unwrap_or(ManifestChange::Unchanged);
         let config_generation = state.config_generation;
         state.cached.insert(
             registration.module_id.clone(),
@@ -254,7 +351,7 @@ impl CapabilityRequirementEvaluator {
         );
         drop(state);
         self.wake.notify_one();
-        drifted
+        change
     }
 
     /// Before a module's HELLO lets it into the catalog, return one conflict for
@@ -1220,5 +1317,149 @@ mod tests {
             .claimants,
             ["vault", "squatter"]
         );
+    }
+
+    fn versioned(module_id: &str, version: &str, provides: &[&str]) -> RegisteredModule {
+        RegisteredModule {
+            module_version: version.to_string(),
+            ..registered(module_id, provides, &[])
+        }
+    }
+
+    /// Records each event this module logs, as (level, message, fields), while
+    /// `body` runs on the current thread.
+    fn capture_logs(body: impl FnOnce()) -> Vec<(tracing::Level, BTreeMap<String, String>)> {
+        use std::sync::{Arc, Mutex};
+        use tracing::{
+            field::{Field, Visit},
+            Event, Subscriber,
+        };
+        use tracing_subscriber::{layer::Context, prelude::*, Layer};
+
+        type Captured = Arc<Mutex<Vec<(tracing::Level, BTreeMap<String, String>)>>>;
+        struct Capture(Captured);
+        struct Fields(BTreeMap<String, String>);
+        impl Visit for Fields {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.insert(field.name().into(), value.to_owned());
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                self.0.insert(field.name().into(), format!("{value:?}"));
+            }
+        }
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+                // The events come from the parent module, not this test module.
+                if event.metadata().target() == "subc_daemon::capability_requirements" {
+                    let mut fields = Fields(BTreeMap::new());
+                    event.record(&mut fields);
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((*event.metadata().level(), fields.0));
+                }
+            }
+        }
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(Capture(captured.clone()));
+        tracing::subscriber::with_default(subscriber, body);
+        let events = captured.lock().unwrap().clone();
+        events
+    }
+
+    #[test]
+    fn version_only_rehello_reports_the_version_change_and_logs_info() {
+        let evaluator = CapabilityRequirementEvaluator::new();
+        evaluator.configure([("m".to_string(), true)], BTreeMap::new());
+        evaluator.record_hello(&versioned("m", "1.0.0", &["a/v1", "b/v1"]));
+        // The same claims in another order are the same claim set.
+        let change = evaluator.record_hello(&versioned("m", "1.1.0", &["b/v1", "a/v1"]));
+        assert_eq!(
+            change,
+            ManifestChange::VersionOnly(VersionChange {
+                from: "1.0.0".to_string(),
+                to: "1.1.0".to_string(),
+            })
+        );
+        let logs = capture_logs(|| log_manifest_change("m", &change));
+        assert_eq!(logs.len(), 1);
+        let (level, fields) = &logs[0];
+        assert_eq!(*level, tracing::Level::INFO);
+        assert_eq!(fields["message"], "module version changed");
+        assert_eq!(fields["module_id"], "m");
+        assert_eq!(fields["from"], "1.0.0");
+        assert_eq!(fields["to"], "1.1.0");
+    }
+
+    #[test]
+    fn provides_change_reports_exactly_the_sorted_added_and_removed_ids() {
+        let evaluator = CapabilityRequirementEvaluator::new();
+        evaluator.configure([("m".to_string(), true)], BTreeMap::new());
+        evaluator.record_hello(&versioned(
+            "m",
+            "1.0.0",
+            &["keep/v1", "gone/v1", "also-gone/v1"],
+        ));
+        let same_version = evaluator.record_hello(&versioned(
+            "m",
+            "1.0.0",
+            &["zeta/v1", "keep/v1", "alpha/v1"],
+        ));
+        assert_eq!(
+            same_version,
+            ManifestChange::ProvidesChanged {
+                added: vec!["alpha/v1".to_string(), "zeta/v1".to_string()],
+                removed: vec!["also-gone/v1".to_string(), "gone/v1".to_string()],
+                version: None,
+            }
+        );
+        let logs = capture_logs(|| log_manifest_change("m", &same_version));
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].0, tracing::Level::WARN);
+        assert_eq!(
+            logs[0].1["message"],
+            "capability claims drifted from the cached manifest"
+        );
+        assert_eq!(logs[0].1["added"], r#"["alpha/v1", "zeta/v1"]"#);
+        assert_eq!(logs[0].1["removed"], r#"["also-gone/v1", "gone/v1"]"#);
+        assert!(!logs[0].1.contains_key("from"));
+
+        let with_version = evaluator.record_hello(&versioned("m", "2.0.0", &["keep/v1"]));
+        assert_eq!(
+            with_version,
+            ManifestChange::ProvidesChanged {
+                added: Vec::new(),
+                removed: vec!["alpha/v1".to_string(), "zeta/v1".to_string()],
+                version: Some(VersionChange {
+                    from: "1.0.0".to_string(),
+                    to: "2.0.0".to_string(),
+                }),
+            }
+        );
+        let logs = capture_logs(|| log_manifest_change("m", &with_version));
+        assert_eq!(logs[0].1["from"], "1.0.0");
+        assert_eq!(logs[0].1["to"], "2.0.0");
+    }
+
+    #[test]
+    fn identical_rehello_is_unchanged_and_logs_nothing() {
+        let evaluator = CapabilityRequirementEvaluator::new();
+        evaluator.configure([("m".to_string(), true)], BTreeMap::new());
+        evaluator.record_hello(&versioned("m", "1.0.0", &["a/v1"]));
+        let change = evaluator.record_hello(&versioned("m", "1.0.0", &["a/v1"]));
+        assert_eq!(change, ManifestChange::Unchanged);
+        assert!(capture_logs(|| log_manifest_change("m", &change)).is_empty());
+    }
+
+    #[test]
+    fn first_registration_without_a_cached_manifest_logs_nothing() {
+        let evaluator = CapabilityRequirementEvaluator::new();
+        evaluator.configure([("m".to_string(), true)], BTreeMap::new());
+        let logs = capture_logs(|| {
+            let change = evaluator.record_hello(&versioned("m", "9.9.9", &["a/v1"]));
+            assert_eq!(change, ManifestChange::Unchanged);
+            log_manifest_change("m", &change);
+        });
+        assert!(logs.is_empty(), "unexpected logs: {logs:?}");
     }
 }

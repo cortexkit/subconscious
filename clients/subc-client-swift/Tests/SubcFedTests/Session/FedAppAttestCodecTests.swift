@@ -98,6 +98,25 @@ final class FedAppAttestCodecTests: XCTestCase {
         )
     }
 
+    /// The verifier's published App Attest vectors were captured from a
+    /// production phone build over the fixed handshake hash
+    /// `SHA-256("ck-attest-vector-h-v1")`, and that capture verifies against
+    /// these two client-data hashes. Pinning them here keeps this library's
+    /// derivation equal to the one a real attestation and real assertions
+    /// were made over. The capture itself is not copied into this repository.
+    func testClientDataHashesMatchTheCapturedVectorHandshake() throws {
+        let h = Data(SHA256.hash(data: Data("ck-attest-vector-h-v1".utf8)))
+        XCTAssertEqual(h.lowercaseHex, "a721e77921fe38793a9d31e0afb89be861722376964385cfec745a3f0f9e201a")
+        XCTAssertEqual(
+            FedAppAttestCodec.pairingClientDataHash(handshakeHash: h).lowercaseHex,
+            "04adea2ece801561117ef55d7d76d3725d7a69c100e06d38261a07978fdfcf03"
+        )
+        XCTAssertEqual(
+            FedAppAttestCodec.sessionClientDataHash(handshakeHash: h).lowercaseHex,
+            "e10061ef96a1d3aad81184caec1180ee74cbfd611218170a291355bed89f98e3"
+        )
+    }
+
     func testClientDataHashIsSHA256OfChallenge() throws {
         let hash = Data(repeating: 0xAB, count: 32)
         let pairingChallenge = FedAppAttestCodec.pairingChallenge(handshakeHash: hash)

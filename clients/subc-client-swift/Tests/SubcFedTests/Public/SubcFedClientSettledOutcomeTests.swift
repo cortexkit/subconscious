@@ -24,6 +24,131 @@ final class SubcFedClientSettledOutcomeTests: XCTestCase {
 
     // MARK: - Lost reply, recovered
 
+    func testPreSendCheckIsForwardedByEveryPublicManagementForm() async throws {
+        let target = try FedManagementTarget(moduleID: "example-module")
+        let transport = ScriptedPeerTransport(
+            behaviour: .answerCalls(.response(Data("unexpected reply".utf8))), liveEpoch: liveEpoch,
+            catalogJSON: #"{"modules":[{"module_id":"example-module","management":{"operations":[{"name":"item.update","kind":"mutate","payload":{"max_bytes":32}}]}}]}"#,
+            features: ["mgmt-v1", "effects-v1", FedFramedBodyCodec.feature])
+        let factory = RecordingDialFactory { _, context in
+            let engine = FedSessionEngine(deps: .init(
+                transport: transport, store: context.stateStore, clock: FedFakeClock(),
+                localPublicKey: context.localPublicKey, responderStaticPublicKey: context.responderStaticPublicKey,
+                helloPolicy: try FedHelloPolicy(), connectionAttemptID: context.attemptID))
+            return FedDialedSession(engine: engine, transport: transport)
+        }
+        let client = SubcFedClient(
+            profile: try FedPublicTestSupport.humanProfile(), keyStore: try FedPublicTestSupport.keyStore(),
+            stateStore: FedMemoryStateStore(), observedNetwork: { try! FedPublicTestSupport.observedHomeLAN() },
+            managementTarget: target, clock: FedFakeClock(), dialFactory: factory)
+        try await withTimeout { try await client.connect() }
+        let probe = FedPreSendProbe()
+        probe.setAllowed(false)
+        let check: @Sendable () -> Bool = { probe.check() }
+        for form in 0..<6 {
+            do {
+                try await withTimeout {
+                    switch form {
+                    case 0:
+                        _ = try await client.callManagement(method: "item.update", params: [:], preSendCheck: check)
+                    case 1:
+                        _ = try await client.callManagement(target: target, method: "item.update", params: [:], preSendCheck: check)
+                    case 2:
+                        _ = try await client.callManagement(target: target, method: "item.update", params: [:], payload: Data([0, 255]), preSendCheck: check)
+                    case 3:
+                        _ = try await client.callManagementTracked(method: "item.update", params: [:], preSendCheck: check)
+                    case 4:
+                        _ = try await client.callManagementTracked(target: target, method: "item.update", params: [:], preSendCheck: check)
+                    default:
+                        _ = try await client.callManagementTracked(target: target, method: "item.update", params: [:], payload: Data([0, 255]), preSendCheck: check)
+                    }
+                }
+                XCTFail("public form \(form) must forward the veto")
+            } catch let error as FedTrackedCallError {
+                XCTAssertTrue(error.underlying is FedPreSendVetoed)
+                XCTAssertNotNil(error.effect)
+            } catch {
+                XCTAssertTrue(error is FedPreSendVetoed)
+            }
+        }
+        XCTAssertEqual(probe.events, Array(repeating: "check", count: 6))
+        let calls = await transport.sentFrames.filter { $0.knownType == .call }
+        XCTAssertTrue(calls.isEmpty)
+        let pending = await client.pendingCallCount
+        XCTAssertEqual(pending, 0)
+        await client.disconnect()
+    }
+
+    func testPreSendVetoIsTrackedAsNotSentAndSurvivesRelaunchWithoutSending() async throws {
+        let directory = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
+        let store = FedSQLiteStateStore(directoryURL: directory)
+        let peer = PeerScript(liveEpoch: liveEpoch) { _ in .dropCalls }
+        let client = try await makeConnectedClient(store: store, peer: peer)
+        let effect: FedEffectID
+        do {
+            _ = try await withTimeout {
+                try await client.callManagementTracked(
+                    target: try FedManagementTarget(moduleID: "example-module"),
+                    method: "item.update", params: [:], preSendCheck: { false }
+                )
+            }
+            XCTFail("the caller must receive the veto, not a reply")
+            throw FedFailure.disconnected
+        } catch let error as FedTrackedCallError {
+            XCTAssertTrue(error.underlying is FedPreSendVetoed)
+            effect = try XCTUnwrap(error.effect)
+        }
+        let retained = try await store.retainedOutcome(of: effect)
+        XCTAssertEqual(retained?.disposition, .notSent)
+        let first = try await peer.transport(at: 0)
+        let firstCalls = await first.sentFrames.filter { $0.knownType == .call }
+        XCTAssertTrue(firstCalls.isEmpty)
+        let responder = try FedPublicTestSupport.responderPublicKey()
+        let unsettled = try await store.unsettledEffects(forResponderPublicKey: responder)
+        XCTAssertTrue(unsettled.isEmpty, "a veto must not remain recovery work")
+        await client.disconnect()
+        try await store.close()
+
+        let reopened = FedSQLiteStateStore(directoryURL: directory)
+        let recoveryPeer = PeerScript(liveEpoch: liveEpoch) { _ in .answerStatus(.notFound, hold: false) }
+        let relaunched = try makeClient(store: reopened, peer: recoveryPeer)
+        do {
+            _ = try await withTimeout { try await relaunched.settledOutcome(of: effect) }
+            XCTFail("a recovered veto must report not sent")
+        } catch {
+            XCTAssertEqual(error as? FedFailure, .mutationNotSent(code: "fed_pre_send_vetoed"))
+        }
+        try await relaunched.connect()
+        let recovered = try await recoveryPeer.transport(at: 0)
+        let recoveryFrames = await recovered.sentFrames
+        XCTAssertFalse(recoveryFrames.contains { $0.knownType == .call || $0.knownType == .effectStatus })
+        await relaunched.disconnect()
+        try await reopened.close()
+    }
+
+    func testPreSendVetoOnUntrackedCallThrowsStandaloneError() async throws {
+        let store = FedMemoryStateStore()
+        let peer = PeerScript(liveEpoch: liveEpoch) { _ in .dropCalls }
+        let client = try await makeConnectedClient(store: store, peer: peer)
+        do {
+            _ = try await withTimeout {
+                try await client.callManagement(
+                    target: try FedManagementTarget(moduleID: "example-module"),
+                    method: "item.update", params: [:], preSendCheck: { false }
+                )
+            }
+            XCTFail("a veto must fail before writing")
+        } catch {
+            XCTAssertTrue(error is FedPreSendVetoed)
+        }
+        let transport = try await peer.transport(at: 0)
+        let calls = await transport.sentFrames.filter { $0.knownType == .call }
+        XCTAssertTrue(calls.isEmpty)
+        let unsettled = try await store.unsettledEffects(forResponderPublicKey: try FedPublicTestSupport.responderPublicKey())
+        XCTAssertTrue(unsettled.isEmpty)
+        await client.disconnect()
+    }
+
     /// The reply to a tracked mutation is lost. The call fails with the
     /// mutation's effect id; `settledOutcome` waits while reconciliation is
     /// outstanding (it must not return before the outcome is committed) and
@@ -543,7 +668,7 @@ private actor PeerScript {
 /// The computer's side of one session. Every frame the phone writes is
 /// decoded on `send`, and the computer's answers are queued for `receive`.
 private actor ScriptedPeerTransport: FedSessionByteTransport {
-    private static let features: Set<String> = ["mgmt-v1", "effects-v1"]
+    private let features: Set<String>
     private static let peerIncarnation = "00000000-0000-4000-8000-0000000000aa"
 
     private let behaviour: PeerBehaviour
@@ -556,10 +681,12 @@ private actor ScriptedPeerTransport: FedSessionByteTransport {
     private var held: [Data] = []
     private(set) var sentFrames: [FedFrame] = []
 
-    init(behaviour: PeerBehaviour, liveEpoch: String, catalogJSON: String) {
+    init(behaviour: PeerBehaviour, liveEpoch: String, catalogJSON: String,
+         features: Set<String> = ["mgmt-v1", "effects-v1"]) {
         self.behaviour = behaviour
         self.liveEpoch = liveEpoch
         self.catalogJSON = catalogJSON
+        self.features = features
     }
 
     func send(_ bytes: Data) async throws {
@@ -567,7 +694,7 @@ private actor ScriptedPeerTransport: FedSessionByteTransport {
         var decoder = FedFrameStreamDecoder(
             negotiatedMaximumBodyLength: FedFrameCodec.defaultMaximumBodyLength,
             negotiationComplete: helloSent,
-            negotiatedFeatures: Self.features
+            negotiatedFeatures: features
         )
         for frame in try decoder.append(bytes) {
             sentFrames.append(frame)
@@ -600,7 +727,7 @@ private actor ScriptedPeerTransport: FedSessionByteTransport {
         case .hello:
             helloSent = true
             try enqueue(FedHelloCodec.buildLocalHello(
-                policy: try FedHelloPolicy(features: Array(Self.features)),
+                policy: try FedHelloPolicy(features: Array(features)),
                 incarnation: Self.peerIncarnation,
                 ledgerEpoch: liveEpoch,
                 connectionAttemptID: String(repeating: "f", count: 32)
@@ -638,7 +765,7 @@ private actor ScriptedPeerTransport: FedSessionByteTransport {
             let bytes = try FedFrameCodec.encode(
                 FedFrame(type: FedFrameType.effectStatusResult.rawValue, fields: fields, body: body),
                 negotiationComplete: true,
-                negotiatedFeatures: Self.features
+                negotiatedFeatures: features
             )
             if hold { held.append(bytes) } else { enqueue(bytes) }
         default:
@@ -650,7 +777,7 @@ private actor ScriptedPeerTransport: FedSessionByteTransport {
         enqueue(try FedFrameCodec.encode(
             frame,
             negotiationComplete: negotiationComplete,
-            negotiatedFeatures: negotiationComplete ? Self.features : []
+            negotiatedFeatures: negotiationComplete ? features : []
         ))
     }
 

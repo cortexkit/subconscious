@@ -132,12 +132,44 @@ public struct FedPreparedManagementCall: Sendable {
     public let permit: FedAdmissionPermit
     public let isMutation: Bool
     let frame: FedFrame
+    let preSendGate: FedManagementPreSendGate?
 
-    init(effect: FedEffectID, permit: FedAdmissionPermit, isMutation: Bool, frame: FedFrame) {
+    init(effect: FedEffectID, permit: FedAdmissionPermit, isMutation: Bool, frame: FedFrame,
+         preSendCheck: (@Sendable () -> Bool)? = nil) {
         self.effect = effect
         self.permit = permit
         self.isMutation = isMutation
         self.frame = frame
+        self.preSendGate = preSendCheck.map { FedManagementPreSendGate(check: $0) }
+    }
+}
+
+private struct FedPreSendRejection: Error {
+    let mayHaveArrived: Bool
+}
+
+/// Copies of a prepared call share write provenance, even on a replacement
+/// session. A throwing transport send may have delivered bytes before failing,
+/// so provenance changes before entering the transport, not after it returns.
+final class FedManagementPreSendGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private let check: @Sendable () -> Bool
+    private var attemptedWrite = false
+    private var rejection: FedPreSendRejection?
+
+    init(check: @escaping @Sendable () -> Bool) { self.check = check }
+
+    func checkAndNoteWriteAttempt() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        // A veto is terminal: redispatch must not resurrect a settled call.
+        if let rejection { throw rejection }
+        guard check() else {
+            let veto = FedPreSendRejection(mayHaveArrived: attemptedWrite)
+            rejection = veto
+            throw veto
+        }
+        attemptedWrite = true
     }
 }
 
@@ -400,13 +432,15 @@ public actor FedSessionEngine {
         moduleID: String,
         method: String,
         params: FedJSONObject,
-        policy: FedAdmissionPolicySnapshot
+        policy: FedAdmissionPolicySnapshot,
+        preSendCheck: (@Sendable () -> Bool)? = nil
     ) async throws -> (effect: FedEffectID, permit: FedAdmissionPermit, isMutation: Bool) {
         let prepared = try await prepareManagementCall(
             moduleID: moduleID,
             method: method,
             params: params,
-            policy: policy
+            policy: policy,
+            preSendCheck: preSendCheck
         )
         try await dispatchPreparedCall(prepared)
         return (prepared.effect, prepared.permit, prepared.isMutation)
@@ -423,13 +457,16 @@ public actor FedSessionEngine {
     /// to keep its outcome (`FedRetainedOutcome`), and a failure after that
     /// commit is thrown as `FedPreparedEffectFailure` so the caller learns the
     /// effect id the mutation was given. Without it, errors are thrown as is.
+    /// `preSendCheck` is kept for dispatch, not called during preparation. It
+    /// must be synchronous and nonblocking; it runs after the frame-writer wait.
     public func prepareManagementCall(
         moduleID: String,
         method: String,
         params: FedJSONObject,
         policy: FedAdmissionPolicySnapshot,
         payload: Data? = nil,
-        retainingOutcome: Bool = false
+        retainingOutcome: Bool = false,
+        preSendCheck: (@Sendable () -> Bool)? = nil
     ) async throws -> FedPreparedManagementCall {
         guard phase == .ready, role == .primary else {
             throw FedFailure.disconnected
@@ -528,7 +565,8 @@ public actor FedSessionEngine {
                 effect: effect,
                 permit: permit,
                 isMutation: classification.isMutation,
-                frame: frame
+                frame: frame,
+                preSendCheck: preSendCheck
             )
         } catch {
             if classification.isMutation {
@@ -555,12 +593,34 @@ public actor FedSessionEngine {
     /// send failure the permit is released (pure query) or retained for recovery
     /// (mutation whose intent is already durable); the caller resumes its own
     /// continuation with the thrown error.
+    /// A pre-send veto instead commits a terminal not-sent or ambiguous outcome
+    /// before releasing the permit and throwing the corresponding caller error.
     public func dispatchPreparedCall(_ prepared: FedPreparedManagementCall) async throws {
         guard let admission, let effectLog else {
             throw FedFailure.disconnected
         }
         do {
-            try await sendFrame(prepared.frame)
+            try await sendFrame(prepared.frame, preSendGate: prepared.preSendGate)
+        } catch let veto as FedPreSendRejection {
+            if prepared.isMutation {
+                do {
+                    try await effectLog.commitTerminal(
+                        prepared.effect,
+                        disposition: veto.mayHaveArrived ? .ambiguous : .notSent,
+                        code: "fed_pre_send_vetoed"
+                    )
+                } catch {
+                    await effectLog.noteIndeterminateLoss(prepared.effect)
+                    await admission.retainLedgeredForRecovery(prepared.permit)
+                    throw error
+                }
+                noteEffectSettledOnDrain(prepared.effect.seq)
+            } else {
+                openPureQuerySequences.remove(prepared.effect.seq)
+            }
+            await admission.release(prepared.permit)
+            if veto.mayHaveArrived { throw FedFailure.indeterminateMutation }
+            throw FedPreSendVetoed()
         } catch {
             if prepared.isMutation {
                 // Intent is already durable; leave the row for reconciliation.
@@ -1064,7 +1124,11 @@ public actor FedSessionEngine {
         }
     }
 
-    private func sendFrame(_ frame: FedFrame, negotiationComplete: Bool? = nil) async throws {
+    private func sendFrame(
+        _ frame: FedFrame,
+        negotiationComplete: Bool? = nil,
+        preSendGate: FedManagementPreSendGate? = nil
+    ) async throws {
         if cancelledActivities { throw FedFailure.cancelled }
         if FedSubscriptionCodec.frameTypes.contains(frame.typeName ?? "") {
             try FedSubscriptionCodec.validateDirection(frame, fromOrigin: true)
@@ -1098,6 +1162,8 @@ public actor FedSessionEngine {
         try await acquireFrameWriter()
         defer { releaseFrameWriter() }
         guard !cancelledActivities else { throw FedFailure.cancelled }
+        // No suspension is allowed between the caller's check and transport handoff.
+        try preSendGate?.checkAndNoteWriteAttempt()
         try await deps.transport.send(bytes)
         // Watch requests must not accumulate payload history for the life of a session.
         if !FedSubscriptionCodec.frameTypes.contains(frame.typeName ?? "") { emittedFrames.append(frame) }

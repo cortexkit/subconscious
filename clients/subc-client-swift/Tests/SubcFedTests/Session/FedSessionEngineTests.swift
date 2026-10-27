@@ -595,9 +595,103 @@ final class FedSessionEngineTests: XCTestCase {
 }
 
 extension FedSessionEngineTests {
+    func testPreSendAcceptingCheckPreservesExactWireBytesWithAndWithoutPayload() async throws {
+        let features = ["mgmt-v1", "effects-v1", FedFramedBodyCodec.feature]
+        let baselineStore = FedMemoryStateStore()
+        _ = try await baselineStore.open(localPublicKey: localKey)
+        let directory = try FedStoreUnderTest.temporaryDirectory(removedAfter: self)
+        // Share only initial identity/counters; each engine prepares its own frame.
+        try FedSQLiteTestSeed.write(try await baselineStore.snapshot(), in: directory)
+        let checkedStore = FedSQLiteStateStore(directoryURL: directory)
+        let (baselineEngine, baselineTransport) = try await framedSession(features: features,
+            declaration: ",\"payload\":{\"max_bytes\":32}", kind: "query", store: baselineStore)
+        let (checkedEngine, checkedTransport) = try await framedSession(features: features,
+            declaration: ",\"payload\":{\"max_bytes\":32}", kind: "query", store: checkedStore)
+        for payload: Data? in [nil, Data(), Data([0, 255, 42])] {
+            let probe = FedPreSendProbe()
+            let unchecked = try await baselineEngine.prepareManagementCall(
+                moduleID: "upload", method: "chunk", params: ["offset": .integer(17)],
+                policy: FedAdmissionPolicySnapshot(defaultDeadlineMs: 60_000), payload: payload)
+            let checked = try await checkedEngine.prepareManagementCall(
+                moduleID: "upload", method: "chunk", params: ["offset": .integer(17)],
+                policy: FedAdmissionPolicySnapshot(defaultDeadlineMs: 60_000), payload: payload,
+                preSendCheck: { probe.check() })
+            XCTAssertTrue(probe.events.isEmpty, "admission must not run the check")
+            await baselineTransport.clearSent()
+            await checkedTransport.clearSent()
+            try await baselineEngine.dispatchPreparedCall(unchecked)
+            let withoutCheck = await baselineTransport.sent
+            try await checkedEngine.dispatchPreparedCall(checked)
+            let withCheck = await checkedTransport.sent
+            XCTAssertEqual(withoutCheck.count, 1)
+            XCTAssertEqual(withCheck.count, 1)
+            XCTAssertEqual(withCheck, withoutCheck, "compare actual transport bytes, with identical correlation fields")
+            XCTAssertEqual(probe.events, ["check"])
+            await baselineEngine.releasePermit(unchecked.permit)
+            await checkedEngine.releasePermit(checked.permit)
+        }
+        await baselineEngine.disconnect()
+        await checkedEngine.disconnect()
+        try await checkedStore.close()
+    }
+
+    func testPreSendVetoAfterPossiblyDeliveredWriteOnReplacementSessionSettlesUncertain() async throws {
+        let features = ["mgmt-v1", "effects-v1"]
+        let (engine, transport, store) = try await framedSession(features: features, declaration: "")
+        let probe = FedPreSendProbe()
+        let prepared = try await engine.prepareManagementCall(
+            moduleID: "upload", method: "chunk", params: [:],
+            policy: FedAdmissionPolicySnapshot(defaultDeadlineMs: 60_000), retainingOutcome: true,
+            preSendCheck: { probe.check() })
+        await transport.setFailAfterSend(true)
+        do {
+            try await engine.dispatchPreparedCall(prepared)
+            XCTFail("the transport must fail after recording the write")
+        } catch {
+            XCTAssertEqual(error as? FedFailure, .disconnected)
+        }
+        let intent = try await store.unsettledEffects(forResponderPublicKey: responderKey)
+        XCTAssertEqual(intent.first?.phase, .intent, "a throwing write never reached markSent")
+        XCTAssertEqual(probe.events, ["check"])
+
+        let replacementTransport = FedLoopbackByteTransport()
+        let replacement = FedSessionEngine(deps: .init(
+            transport: replacementTransport, store: store, clock: FedFakeClock(),
+            localPublicKey: localKey, responderStaticPublicKey: responderKey,
+            helloPolicy: try FedHelloPolicy(), connectionAttemptID: String(repeating: "d", count: 32),
+            sharedAdmission: await engine.admissionController, sharedEffectLog: await engine.originEffectLog
+        ))
+        let establish = Task { try await replacement.establish() }
+        try await completeEstablish(transport: replacementTransport, task: establish,
+            modulesJSON: #"{"modules":[{"module_id":"upload","management":{"operations":[{"name":"chunk","kind":"mutate"}]}}]}"#)
+        probe.setAllowed(false)
+        do {
+            try await replacement.dispatchPreparedCall(prepared)
+            XCTFail("a resend veto must not report success")
+        } catch {
+            XCTAssertEqual(error as? FedFailure, .indeterminateMutation)
+        }
+        XCTAssertEqual(probe.events, ["check", "check"], "one synchronous check per attempted write")
+        let firstCalls = try await transport.sentFrames().filter { $0.knownType == .call }
+        let secondCalls = try await replacementTransport.sentFrames().filter { $0.knownType == .call }
+        XCTAssertEqual(firstCalls.count, 1)
+        XCTAssertTrue(secondCalls.isEmpty)
+        let outcome = try await store.retainedOutcome(of: prepared.effect)
+        XCTAssertEqual(outcome?.disposition, .ambiguous)
+        let permits = await replacement.admissionController?.inFlightCount
+        XCTAssertEqual(permits, 0)
+        await replacement.disconnect()
+        await engine.disconnect()
+    }
+
     private func framedSession(features: [String], declaration: String, kind: String = "mutate") async throws -> (FedSessionEngine, FedLoopbackByteTransport, FedMemoryStateStore) {
-        let transport = FedLoopbackByteTransport()
         let store = FedMemoryStateStore()
+        let (engine, transport) = try await framedSession(features: features, declaration: declaration, kind: kind, store: store)
+        return (engine, transport, store)
+    }
+
+    private func framedSession(features: [String], declaration: String, kind: String, store: any FedStateStore) async throws -> (FedSessionEngine, FedLoopbackByteTransport) {
+        let transport = FedLoopbackByteTransport()
         let engine = FedSessionEngine(deps: .init(
             transport: transport, store: store, clock: FedFakeClock(),
             localPublicKey: localKey, responderStaticPublicKey: responderKey,
@@ -607,7 +701,7 @@ extension FedSessionEngineTests {
         try await completeEstablish(transport: transport, task: establish,
             modulesJSON: "{\"modules\":[{\"module_id\":\"upload\",\"management\":{\"operations\":[{\"name\":\"chunk\",\"kind\":\"\(kind)\"\(declaration)}]}}]}",
             features: features)
-        return (engine, transport, store)
+        return (engine, transport)
     }
 
     private func assertFramedRefusal(features: [String], declaration: String, payload: Data, expected: FedFramedCallError) async throws {

@@ -76,6 +76,26 @@ available for teardown. This is a fail-closed backstop, not coordination for
 closing beneath active calls: an interrupted mutation still needs ledger
 reconciliation by the next owner, never blind replay.
 
+## Checking a management call just before sending
+
+All `callManagement` and `callManagementTracked` forms, including calls with a
+payload, accept an optional `preSendCheck: (@Sendable () -> Bool)? = nil`.
+Use it to recheck a short-lived authorization, a deadline or app state after a
+call has waited for admission. The check runs synchronously on the session's
+executor, after admission and any wait for the frame writer, immediately before
+handing the request bytes to the transport. It must not block or await. It runs
+once per write attempt, including any attempt to resend the same prepared call;
+returning `true` leaves the wire bytes unchanged. Returning `false` before the
+first write throws `FedPreSendVetoed` and settles a mutation as not sent, so
+recovery never sends it. If an earlier write may have arrived, a veto instead
+settles the mutation as uncertain and throws `FedFailure.indeterminateMutation`,
+without another write. Tracked calls wrap these errors in `FedTrackedCallError`;
+`settledOutcome(of:)` reports a first-write veto as
+`FedFailure.mutationNotSent(code: "fed_pre_send_vetoed", message: nil, detail: nil)`
+and an uncertain veto as `FedFailure.indeterminateMutation`. The library does
+not automatically resend mutations; reconnect recovery queries their outcomes.
+Omitting the check preserves existing behavior.
+
 ## Recovering a mutation whose reply was lost
 
 A mutating `callManagement` call whose reply is lost (the session drops after
@@ -119,10 +139,10 @@ do {
   session too. The wait honours task cancellation, and an optional `timeout`
   throws `FedSettledOutcomeError.timedOut`; neither decides anything.
 - **A recovered result or refusal is the one the module recorded; "not sent"
-  and "may have arrived" are what reconciliation concluded.** Do not call the
-  module again for the same intent: sending the same mutation again is a
-  second mutation. Only `mutationNotSent` means the call is safe to send
-  again, as a new call.
+  and "may have arrived" are conclusions from reconciliation or a local pre-send
+  veto.** Do not call the module again for the same intent: sending the same
+  mutation again is a second mutation. For a recovered outcome, only
+  `mutationNotSent` means the call is safe to send again, as a new call.
 - The outcome is read from the state store, never from the computer, so it can
   be read any number of times and works before `connect()`. It survives a
   relaunch only with `FedSQLiteStateStore` (a new store over the same

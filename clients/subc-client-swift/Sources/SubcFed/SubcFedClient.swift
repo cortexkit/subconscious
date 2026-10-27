@@ -411,45 +411,59 @@ public actor SubcFedClient {
 
     /// Issues one management call. Params must already be a strict FedJSONObject;
     /// invalid values never reach this method from the worker adapter.
-    public func callManagement(method: String, params: FedJSONObject) async throws -> Data {
+    /// `preSendCheck` runs synchronously on the session executor immediately
+    /// before each request write attempt, after admission and writer waits.
+    /// A veto throws `FedPreSendVetoed` before any write, or
+    /// `FedFailure.indeterminateMutation` after a possibly delivered write.
+    public func callManagement(
+        method: String,
+        params: FedJSONObject,
+        preSendCheck: (@Sendable () -> Bool)? = nil
+    ) async throws -> Data {
         try await checkStateStoreLifetime()
         guard let target = defaultManagementTarget else {
             throw FedFailure.catalogTargetUnavailable
         }
-        return try await callManagement(target: target, method: method, params: params)
+        return try await callManagement(target: target, method: method, params: params, preSendCheck: preSendCheck)
     }
 
     /// Management calls that already know their target module.
-    public func callManagement(
-        target: FedManagementTarget,
-        method: String,
-        params: FedJSONObject
-    ) async throws -> Data {
-        try await callManagementImpl(target: target, method: method, params: params, payload: nil)
-    }
-
-    /// Sends raw bytes only to a payload-declaring operation on a session that
-    /// negotiated framed-calls-v1. Local refusals happen before admission or writes.
+    /// The optional `preSendCheck` has the same contract as the default-target form.
     public func callManagement(
         target: FedManagementTarget,
         method: String,
         params: FedJSONObject,
-        payload: Data
+        preSendCheck: (@Sendable () -> Bool)? = nil
     ) async throws -> Data {
-        try await callManagementImpl(target: target, method: method, params: params, payload: payload)
+        try await callManagementImpl(target: target, method: method, params: params, payload: nil, preSendCheck: preSendCheck)
+    }
+
+    /// Sends raw bytes only to a payload-declaring operation on a session that
+    /// negotiated framed-calls-v1. Local refusals happen before admission or writes.
+    /// The optional `preSendCheck` runs at the same writer boundary as other calls.
+    public func callManagement(
+        target: FedManagementTarget,
+        method: String,
+        params: FedJSONObject,
+        payload: Data,
+        preSendCheck: (@Sendable () -> Bool)? = nil
+    ) async throws -> Data {
+        try await callManagementImpl(target: target, method: method, params: params, payload: payload, preSendCheck: preSendCheck)
     }
 
     private func callManagementImpl(
         target: FedManagementTarget,
         method: String,
         params: FedJSONObject,
-        payload: Data?
+        payload: Data?,
+        preSendCheck: (@Sendable () -> Bool)?
     ) async throws -> Data {
         try await runManagementCall(
             target: target,
             method: method,
             params: params,
             payload: payload,
+            preSendCheck: preSendCheck,
             retainingOutcome: false,
             onEffectAssigned: { _ in }
         )
@@ -466,7 +480,11 @@ public actor SubcFedClient {
     ///
     /// Retries, admission and the mapping of outcomes to errors are those of
     /// `callManagement`; only the error is wrapped.
-    public func callManagementTracked(method: String, params: FedJSONObject) async throws -> FedTrackedCallResult {
+    public func callManagementTracked(
+        method: String,
+        params: FedJSONObject,
+        preSendCheck: (@Sendable () -> Bool)? = nil
+    ) async throws -> FedTrackedCallResult {
         do {
             try await checkStateStoreLifetime()
         } catch {
@@ -475,7 +493,7 @@ public actor SubcFedClient {
         guard let target = defaultManagementTarget else {
             throw FedTrackedCallError(effect: nil, underlying: FedFailure.catalogTargetUnavailable)
         }
-        return try await callManagementTracked(target: target, method: method, params: params)
+        return try await callManagementTracked(target: target, method: method, params: params, preSendCheck: preSendCheck)
     }
 
     /// Tracked form of `callManagement(target:method:params:)`; see
@@ -483,9 +501,10 @@ public actor SubcFedClient {
     public func callManagementTracked(
         target: FedManagementTarget,
         method: String,
-        params: FedJSONObject
+        params: FedJSONObject,
+        preSendCheck: (@Sendable () -> Bool)? = nil
     ) async throws -> FedTrackedCallResult {
-        try await callManagementTrackedImpl(target: target, method: method, params: params, payload: nil)
+        try await callManagementTrackedImpl(target: target, method: method, params: params, payload: nil, preSendCheck: preSendCheck)
     }
 
     /// Tracked form of `callManagement(target:method:params:payload:)`; see
@@ -494,16 +513,18 @@ public actor SubcFedClient {
         target: FedManagementTarget,
         method: String,
         params: FedJSONObject,
-        payload: Data
+        payload: Data,
+        preSendCheck: (@Sendable () -> Bool)? = nil
     ) async throws -> FedTrackedCallResult {
-        try await callManagementTrackedImpl(target: target, method: method, params: params, payload: payload)
+        try await callManagementTrackedImpl(target: target, method: method, params: params, payload: payload, preSendCheck: preSendCheck)
     }
 
     private func callManagementTrackedImpl(
         target: FedManagementTarget,
         method: String,
         params: FedJSONObject,
-        payload: Data?
+        payload: Data?,
+        preSendCheck: (@Sendable () -> Bool)?
     ) async throws -> FedTrackedCallResult {
         var assigned: FedEffectID?
         do {
@@ -512,6 +533,7 @@ public actor SubcFedClient {
                 method: method,
                 params: params,
                 payload: payload,
+                preSendCheck: preSendCheck,
                 retainingOutcome: true,
                 onEffectAssigned: { assigned = $0 }
             )
@@ -527,11 +549,13 @@ public actor SubcFedClient {
     /// `FedFailure.mutationNotSent` when it provably never reached the module,
     /// and `FedFailure.indeterminateMutation` when reconciliation could only
     /// settle it as possibly delivered.
+    /// A first-write veto is retained as `mutationNotSent` with code
+    /// `fed_pre_send_vetoed`, rather than the immediate `FedPreSendVetoed` error.
     ///
     /// A result or a refusal is the one the module recorded. "Not sent" and
     /// "may have arrived" are not module records: they are what reconciliation
-    /// concluded about the call. Either way the outcome is read from the state
-    /// store, never from the computer, so it can be read any number of times
+    /// or a local pre-send veto concluded about the call. The outcome is read
+    /// from the state store, never from the computer, so it can be read any number of times
     /// while the store keeps it: at most seven days after it settles, less if
     /// the 256-row limit removes it sooner. Only `FedSQLiteStateStore` keeps
     /// it across a relaunch (a new store over the same directory);
@@ -629,6 +653,7 @@ public actor SubcFedClient {
         method: String,
         params: FedJSONObject,
         payload: Data?,
+        preSendCheck: (@Sendable () -> Bool)?,
         retainingOutcome: Bool,
         onEffectAssigned: (FedEffectID) -> Void
     ) async throws -> Data {
@@ -651,7 +676,8 @@ public actor SubcFedClient {
                 params: params,
                 policy: policy,
                 payload: payload,
-                retainingOutcome: retainingOutcome
+                retainingOutcome: retainingOutcome,
+                preSendCheck: preSendCheck
             )
         } catch let failure as FedPreparedEffectFailure {
             onEffectAssigned(failure.effect)

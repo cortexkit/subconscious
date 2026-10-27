@@ -20,6 +20,67 @@ final class SubcFedClientCallRaceTests: XCTestCase {
     ]}}]}
     """
 
+    func testPreSendCheckRunsSynchronouslyExactlyOnceBeforeTransportWrite() async throws {
+        let transport = GatedMgmtTransport()
+        let engine = try makeEngine(transport: transport)
+        let client = try await makeReadyClient(transport: transport, engine: engine)
+        let probe = FedPreSendProbe()
+        await transport.setSendObserver { probe.noteWrite() }
+        let prepared = try await engine.prepareManagementCall(
+            moduleID: "prefrontal-core", method: "board.state", params: [:],
+            policy: FedAdmissionPolicySnapshot(), preSendCheck: { probe.check() })
+        XCTAssertTrue(probe.events.isEmpty)
+        try await engine.dispatchPreparedCall(prepared)
+        XCTAssertEqual(probe.events, ["check", "write"])
+        await engine.releasePermit(prepared.permit)
+        await client.disconnect()
+    }
+
+    func testPreSendCheckWaitsForAdmissionAndFrameWriterAndCanVetoAfterWaiting() async throws {
+        let transport = GatedMgmtTransport()
+        let engine = try makeEngine(transport: transport)
+        let client = try await makeReadyClient(transport: transport, engine: engine)
+        let controller = await engine.admissionController
+        let admission = try XCTUnwrap(controller)
+        await admission.updatePeerMaxInFlight(1)
+        let first = try await engine.prepareManagementCall(
+            moduleID: "prefrontal-core", method: "board.state", params: [:],
+            policy: FedAdmissionPolicySnapshot())
+        await transport.armGate()
+        let firstWrite = Task { try await engine.dispatchPreparedCall(first) }
+        try await waitForCondition { await transport.requestSent }
+
+        let probe = FedPreSendProbe()
+        let queued = Task {
+            try await engine.prepareManagementCall(
+                moduleID: "prefrontal-core", method: "board.state", params: [:],
+                policy: FedAdmissionPolicySnapshot(), preSendCheck: { probe.check() })
+        }
+        try await waitForCondition { await admission.queuedCount == 1 }
+        XCTAssertTrue(probe.events.isEmpty, "the queued admission must not consume the check")
+        await engine.releasePermit(first.permit)
+        let prepared = try await queued.value
+        let secondWrite = Task { try await engine.dispatchPreparedCall(prepared) }
+        // The first send still owns the writer, even though admission has room.
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertTrue(probe.events.isEmpty, "the check must wait for the frame writer too")
+        probe.setAllowed(false)
+        await transport.releaseGate()
+        try await firstWrite.value
+        do {
+            try await withTimeout(3_000_000_000) { try await secondWrite.value }
+            XCTFail("authorization changed while waiting for the writer")
+        } catch {
+            XCTAssertTrue(error is FedPreSendVetoed)
+        }
+        XCTAssertEqual(probe.events, ["check"])
+        let calls = try await transport.sentFrames(negotiationComplete: true).filter { $0.knownType == .call }
+        XCTAssertEqual(calls.count, 1, "only the call holding the writer was sent")
+        let inFlight = await admission.inFlightCount
+        XCTAssertEqual(inFlight, 0)
+        await client.disconnect()
+    }
+
     /// A fast response that arrives while the request frame is still being written
     /// must be matched to the caller. The gate holds the request write so the
     /// response is delivered to the receive loop BEFORE registration could happen
@@ -699,6 +760,7 @@ private actor GatedMgmtTransport: FedSessionByteTransport {
     private var waiters: [CheckedContinuation<Data, Error>] = []
     private var closed = false
     private var sentBytes: [Data] = []
+    private var sendObserver: (@Sendable () -> Void)?
 
     private var armed = false
     private var gateTriggered = false
@@ -714,6 +776,10 @@ private actor GatedMgmtTransport: FedSessionByteTransport {
 
     func armGate() {
         armed = true
+    }
+
+    func setSendObserver(_ observer: @escaping @Sendable () -> Void) {
+        sendObserver = observer
     }
 
     func releaseGate() {
@@ -734,6 +800,7 @@ private actor GatedMgmtTransport: FedSessionByteTransport {
 
     func send(_ bytes: Data) async throws {
         if closed { throw FedFailure.disconnected }
+        sendObserver?()
         sentBytes.append(bytes)
         if armed && !gateTriggered {
             gateTriggered = true

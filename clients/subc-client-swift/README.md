@@ -99,12 +99,19 @@ Omitting the check preserves existing behavior.
 ## Recovering a mutation whose reply was lost
 
 A mutating `callManagement` call whose reply is lost (the session drops after
-the request went out) fails with `FedFailure.disconnected` or
-`FedFailure.indeterminateMutation`: the phone cannot tell whether the module
-applied it. The library does not resend it. On the next session,
-reconciliation asks the computer what its ledger recorded for that mutation
-and settles it from the answer. To get that answer back, send the mutation with
-`callManagementTracked` and keep its effect id:
+the request went out) fails with `FedFailure.indeterminateMutation`: the phone
+cannot tell whether the module applied it, so never treat it as a network
+failure that is safe to send again. The library does not resend it. If the
+session drops before the request reached the transport at all, the call
+instead fails with
+`FedFailure.mutationNotSent(code: "session_lost_before_write", message: nil, detail: nil)`:
+it provably never left the phone and is safe to send again as a new call. That
+code is local to this library and never appears on the wire. If recording that
+not-sent outcome fails, the call throws the store's error instead, and the
+mutation stays undecided until reconciliation. On the next
+session, reconciliation asks the computer what its ledger recorded for an
+undecided mutation and settles it from the answer. To get that answer back,
+send the mutation with `callManagementTracked` and keep its effect id:
 
 ```swift
 let target = try FedManagementTarget(moduleID: "example-module")

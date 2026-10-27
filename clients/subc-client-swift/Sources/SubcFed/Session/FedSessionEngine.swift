@@ -133,6 +133,9 @@ public struct FedPreparedManagementCall: Sendable {
     public let isMutation: Bool
     let frame: FedFrame
     let preSendGate: FedManagementPreSendGate?
+    /// Shared by every copy of this prepared call, so it remembers a write
+    /// made on any session, including one dispatched before a reconnect.
+    let writeRecord = FedRequestWriteRecord()
 
     init(effect: FedEffectID, permit: FedAdmissionPermit, isMutation: Bool, frame: FedFrame,
          preSendCheck: (@Sendable () -> Bool)? = nil) {
@@ -146,6 +149,26 @@ public struct FedPreparedManagementCall: Sendable {
 
 private struct FedPreSendRejection: Error {
     let mayHaveArrived: Bool
+}
+
+/// Whether a prepared call's request frame ever reached `transport.send`.
+/// It is set before the transport is entered, not after it returns, because
+/// a send that throws may still have delivered some bytes.
+final class FedRequestWriteRecord: @unchecked Sendable {
+    private let lock = NSLock()
+    private var reached = false
+
+    var reachedTransport: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return reached
+    }
+
+    func noteReachedTransport() {
+        lock.lock()
+        reached = true
+        lock.unlock()
+    }
 }
 
 /// Copies of a prepared call share write provenance, even on a replacement
@@ -254,6 +277,15 @@ public actor FedSessionEngine {
     private var cancelledActivities = false
     private var admittedEffectSequences: Set<UInt64> = []
     private var openPureQuerySequences: Set<UInt64> = []
+    /// Set once a `transport.send` has thrown. The send may have written part
+    /// of a frame, so anything written after it would be misframed; no
+    /// further write is attempted on this session. It also means a request
+    /// still waiting to write will never leave the device on this session.
+    private var transportWriteFailed = false
+    /// What `resolveMutationLostWithSession` decided for each mutation, so the
+    /// session teardown and the call's own failed dispatch, which can both
+    /// ask, get the same answer and the not-sent outcome is committed once.
+    private var lostMutationOutcomes: [UInt64: Task<any Error, Never>] = [:]
     private var receiveTask: Task<Void, Never>?
     /// Closing the transport can wake the reader before the timer task catches
     /// its error, so both paths need the original timeout reason for logging.
@@ -592,7 +624,9 @@ public actor FedSessionEngine {
     /// response continuation under prepared.effect.seq before calling this. On
     /// send failure the permit is released (pure query) or retained for recovery
     /// (mutation whose intent is already durable); the caller resumes its own
-    /// continuation with the thrown error.
+    /// continuation with the thrown error. A mutation whose write failed, or
+    /// whose session ended before the write, throws what
+    /// `resolveMutationLostWithSession` decides instead of the transport error.
     /// A pre-send veto instead commits a terminal not-sent or ambiguous outcome
     /// before releasing the permit and throwing the corresponding caller error.
     public func dispatchPreparedCall(_ prepared: FedPreparedManagementCall) async throws {
@@ -600,7 +634,11 @@ public actor FedSessionEngine {
             throw FedFailure.disconnected
         }
         do {
-            try await sendFrame(prepared.frame, preSendGate: prepared.preSendGate)
+            try await sendFrame(
+                prepared.frame,
+                preSendGate: prepared.preSendGate,
+                writeRecord: prepared.writeRecord
+            )
         } catch let veto as FedPreSendRejection {
             if prepared.isMutation {
                 do {
@@ -623,6 +661,15 @@ public actor FedSessionEngine {
             throw FedPreSendVetoed()
         } catch {
             if prepared.isMutation {
+                if cancelledActivities || transportWriteFailed || prepared.writeRecord.reachedTransport {
+                    // This session can no longer write (it is disconnected, or
+                    // an earlier write on its transport failed), or this
+                    // request reached the transport before failing. Either
+                    // way the caller must learn whether the call can have
+                    // arrived, not see a bare transport error that reads as
+                    // "nothing sent".
+                    throw await resolveMutationLostWithSession(prepared)
+                }
                 // Intent is already durable; leave the row for reconciliation.
                 await effectLog.noteIndeterminateLoss(prepared.effect)
                 await admission.retainLedgeredForRecovery(prepared.permit)
@@ -646,6 +693,71 @@ public actor FedSessionEngine {
 
     public func releasePermit(_ permit: FedAdmissionPermit) async {
         await admission?.release(permit)
+    }
+
+    /// The `mutationNotSent` code for a mutation whose session ended before
+    /// its request reached the transport. It is local to this library and
+    /// never appears on the wire.
+    static let sessionLostBeforeWriteCode = "session_lost_before_write"
+
+    /// The error for a mutation whose session ended (or whose write failed)
+    /// with no answer. Asking twice for one call returns the same error.
+    ///
+    /// - `FedFailure.indeterminateMutation` when the request reached the
+    ///   transport, on this session or an earlier one: the computer may have
+    ///   received and run it, so the row is left for reconciliation on the
+    ///   next session.
+    /// - `FedFailure.mutationNotSent(code: sessionLostBeforeWriteCode)` when
+    ///   it never did and this session can no longer write: it is
+    ///   disconnected, or an earlier write on its transport failed. That is
+    ///   proof the request never left the device, so it is settled not sent
+    ///   here, as a pre-send veto is, and is safe to send again.
+    /// - The store's error if that settlement cannot be committed; the row
+    ///   is then left for reconciliation.
+    ///
+    /// While the session can still write, a write could yet start, so the
+    /// call is treated as possibly delivered.
+    func resolveMutationLostWithSession(_ prepared: FedPreparedManagementCall) async -> any Error {
+        let effect = prepared.effect
+        if let decided = lostMutationOutcomes[effect.seq] {
+            return await decided.value
+        }
+        // Decided before the first suspension, from state that cannot change
+        // once the session can no longer write.
+        let canStillWrite = !cancelledActivities && !transportWriteFailed
+        let mayHaveArrived = prepared.writeRecord.reachedTransport || canStillWrite
+        let decision = Task { () -> any Error in
+            await self.settleMutationLostWithSession(
+                effect: effect,
+                permit: prepared.permit,
+                mayHaveArrived: mayHaveArrived
+            )
+        }
+        lostMutationOutcomes[effect.seq] = decision
+        return await decision.value
+    }
+
+    private func settleMutationLostWithSession(
+        effect: FedEffectID,
+        permit: FedAdmissionPermit,
+        mayHaveArrived: Bool
+    ) async -> any Error {
+        guard let effectLog, let admission else { return FedFailure.indeterminateMutation }
+        if mayHaveArrived {
+            await effectLog.noteIndeterminateLoss(effect)
+            await admission.retainLedgeredForRecovery(permit)
+            return FedFailure.indeterminateMutation
+        }
+        do {
+            try await effectLog.commitTerminal(effect, disposition: .notSent, code: Self.sessionLostBeforeWriteCode)
+        } catch {
+            await effectLog.noteIndeterminateLoss(effect)
+            await admission.retainLedgeredForRecovery(permit)
+            return error
+        }
+        noteEffectSettledOnDrain(effect.seq)
+        await admission.release(permit)
+        return FedFailure.mutationNotSent(code: Self.sessionLostBeforeWriteCode)
     }
 
     public func handleInboundTerminal(
@@ -1127,7 +1239,8 @@ public actor FedSessionEngine {
     private func sendFrame(
         _ frame: FedFrame,
         negotiationComplete: Bool? = nil,
-        preSendGate: FedManagementPreSendGate? = nil
+        preSendGate: FedManagementPreSendGate? = nil,
+        writeRecord: FedRequestWriteRecord? = nil
     ) async throws {
         if cancelledActivities { throw FedFailure.cancelled }
         if FedSubscriptionCodec.frameTypes.contains(frame.typeName ?? "") {
@@ -1162,9 +1275,20 @@ public actor FedSessionEngine {
         try await acquireFrameWriter()
         defer { releaseFrameWriter() }
         guard !cancelledActivities else { throw FedFailure.cancelled }
+        guard !transportWriteFailed else { throw FedFailure.disconnected }
         // No suspension is allowed between the caller's check and transport handoff.
         try preSendGate?.checkAndNoteWriteAttempt()
-        try await deps.transport.send(bytes)
+        // Marked before the transport is entered, not after it returns: a
+        // send that throws may still have delivered some bytes. With no
+        // suspension between the checks above and this mark, a session that
+        // is disconnected or whose transport failed never gains a new mark.
+        writeRecord?.noteReachedTransport()
+        do {
+            try await deps.transport.send(bytes)
+        } catch {
+            transportWriteFailed = true
+            throw error
+        }
         // Watch requests must not accumulate payload history for the life of a session.
         if !FedSubscriptionCodec.frameTypes.contains(frame.typeName ?? "") { emittedFrames.append(frame) }
         if var activeKeepalive = keepalive {

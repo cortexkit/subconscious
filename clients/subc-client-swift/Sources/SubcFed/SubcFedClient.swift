@@ -175,6 +175,11 @@ public actor SubcFedClient {
         let effect: FedEffectID
         let isMutation: Bool
         let permit: FedAdmissionPermit
+        /// The session engine the request was dispatched on, and the request
+        /// itself; together they decide what a mutation's caller is told when
+        /// that session ends with no answer.
+        let engine: FedSessionEngine
+        let prepared: FedPreparedManagementCall
         let continuation: CheckedContinuation<Data, Error>
         let method: String
         let startedAtNs: UInt64
@@ -415,6 +420,16 @@ public actor SubcFedClient {
     /// before each request write attempt, after admission and writer waits.
     /// A veto throws `FedPreSendVetoed` before any write, or
     /// `FedFailure.indeterminateMutation` after a possibly delivered write.
+    ///
+    /// When the session ends before a mutation is answered, the call throws
+    /// `FedFailure.indeterminateMutation` if its request reached the
+    /// transport (the computer may have received and run it), or
+    /// `FedFailure.mutationNotSent(code: "session_lost_before_write")` if it
+    /// provably never did, which is safe to send again. That code is local
+    /// to this library and never appears on the wire. If recording that
+    /// not-sent outcome fails, the call throws the store's error instead and
+    /// the mutation stays undecided. A read-only call throws
+    /// `FedFailure.disconnected` as before.
     public func callManagement(
         method: String,
         params: FedJSONObject,
@@ -551,6 +566,8 @@ public actor SubcFedClient {
     /// settle it as possibly delivered.
     /// A first-write veto is retained as `mutationNotSent` with code
     /// `fed_pre_send_vetoed`, rather than the immediate `FedPreSendVetoed` error.
+    /// A mutation whose session ended before its request was written is
+    /// retained as `mutationNotSent` with code `session_lost_before_write`.
     ///
     /// A result or a refusal is the one the module recorded. "Not sent" and
     /// "may have arrived" are not module records: they are what reconciliation
@@ -704,6 +721,8 @@ public actor SubcFedClient {
                         effect: prepared.effect,
                         isMutation: prepared.isMutation,
                         permit: prepared.permit,
+                        engine: session.engine,
+                        prepared: prepared,
                         continuation: continuation,
                         method: method,
                         startedAtNs: startedAtNs,
@@ -1724,7 +1743,18 @@ public actor SubcFedClient {
         subscriptions.removeAll()
         let pending = Array(pendingCalls.values)
         pendingCalls.removeAll()
-        for call in pending { call.continuation.resume(throwing: pendingError ?? reason) }
+        // A mutation is answered only after its engine is disconnected below,
+        // because only then can the engine tell for certain whether the
+        // request ever reached the transport. A store that closed under the
+        // calls keeps its own typed error, as before.
+        var lostMutations: [PendingCall] = []
+        for call in pending {
+            if call.isMutation, pendingError == nil {
+                lostMutations.append(call)
+            } else {
+                call.continuation.resume(throwing: pendingError ?? reason)
+            }
+        }
         negotiatedFeatures = []
         peerAdvertisedFeatures = []
         peerMachineID = nil
@@ -1738,6 +1768,14 @@ public actor SubcFedClient {
         await signal?.stop()
         if let session {
             await session.engine.disconnect(reason: reason)
+        }
+        // A mutation that may have reached the computer must not be reported
+        // as a plain disconnect, which reads as "nothing happened, safe to
+        // send again". The engine answers indeterminateMutation for those,
+        // and mutationNotSent only for a request that provably never left.
+        for call in lostMutations {
+            let error = await call.engine.resolveMutationLostWithSession(call.prepared)
+            call.continuation.resume(throwing: error)
         }
     }
 

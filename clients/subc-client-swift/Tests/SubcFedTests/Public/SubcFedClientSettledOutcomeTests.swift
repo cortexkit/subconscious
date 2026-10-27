@@ -518,7 +518,7 @@ final class SubcFedClientSettledOutcomeTests: XCTestCase {
             XCTFail("the call must fail when its reply is lost")
             throw FedFailure.disconnected
         } catch let error as FedTrackedCallError {
-            XCTAssertEqual(error.failure, .disconnected, "the same failure callManagement reports")
+            XCTAssertEqual(error.failure, .indeterminateMutation, "a written mutation whose session ended may have run")
             let sent = await transport.sentFrames.last { $0.knownType == .call }?.header["effect"]
             let effect = try XCTUnwrap(error.effect, "a lost mutation reports its effect id")
             XCTAssertEqual(sent.flatMap(FedEffectID.fromJSON), effect)

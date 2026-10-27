@@ -648,7 +648,10 @@ extension FedSessionEngineTests {
             try await engine.dispatchPreparedCall(prepared)
             XCTFail("the transport must fail after recording the write")
         } catch {
-            XCTAssertEqual(error as? FedFailure, .disconnected)
+            // The write reached the transport before it failed, so the call
+            // may have arrived: that is an undecided mutation, not a plain
+            // network failure.
+            XCTAssertEqual(error as? FedFailure, .indeterminateMutation)
         }
         let intent = try await store.unsettledEffects(forResponderPublicKey: responderKey)
         XCTAssertEqual(intent.first?.phase, .intent, "a throwing write never reached markSent")

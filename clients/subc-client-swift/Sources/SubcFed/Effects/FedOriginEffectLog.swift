@@ -166,9 +166,12 @@ public actor FedOriginEffectLog {
     /// Atomically claims the ordered mutating lane, reserves a sequence, and
     /// commits the intent row before returning a send capability. Concurrent
     /// callers wait on the lane rather than check-then-act across awaits.
+    /// With `retainingOutcome` the same write also asks the store to keep the
+    /// mutation's outcome once it settles (`FedRetainedOutcome`).
     public func claimMutationAndCommitIntent(
         peerIncarnation: String?,
-        peerLedgerEpoch: String?
+        peerLedgerEpoch: String?,
+        retainingOutcome: Bool = false
     ) async throws -> FedMutationSendCapability {
         try await acquireLane()
         do {
@@ -186,11 +189,21 @@ public actor FedOriginEffectLog {
 
             // One call, so a store that can reserve and commit the intent in
             // a single durable write does (the SQLite store does).
-            let effect = try await store.reserveEffectSequenceAndCommitIntent(
-                responderStaticPublicKey: responderStaticPublicKey,
-                peerLedgerEpoch: peerLedgerEpoch,
-                peerIncarnation: peerIncarnation
-            )
+            let effect: FedEffectID
+            if retainingOutcome {
+                effect = try await store.reserveEffectSequenceAndCommitIntent(
+                    responderStaticPublicKey: responderStaticPublicKey,
+                    peerLedgerEpoch: peerLedgerEpoch,
+                    peerIncarnation: peerIncarnation,
+                    retainingOutcome: true
+                )
+            } else {
+                effect = try await store.reserveEffectSequenceAndCommitIntent(
+                    responderStaticPublicKey: responderStaticPublicKey,
+                    peerLedgerEpoch: peerLedgerEpoch,
+                    peerIncarnation: peerIncarnation
+                )
+            }
             openMutatingSequences.insert(effect.seq)
             return FedMutationSendCapability(effect: effect)
         } catch {
@@ -247,6 +260,9 @@ public actor FedOriginEffectLog {
             terminalKind: kind,
             terminalCode: code
         )
+        // Anyone waiting in `SubcFedClient.settledOutcome(of:)` reads the
+        // store again; the outcome is durable by now.
+        FedOutcomeSettlementSignal.shared.notify()
         openMutatingSequences.remove(effect.seq)
         if openMutatingSequences.isEmpty {
             releaseLane()

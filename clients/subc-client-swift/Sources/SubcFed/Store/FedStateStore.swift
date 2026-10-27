@@ -96,6 +96,26 @@ public protocol FedStateStore: Sendable {
 
     /// Unsettled ledgered effects for one destination.
     func unsettledEffects(forResponderPublicKey publicKey: Data) async throws -> [FedUnresolvedEffectRecord]
+
+    /// Like the three-argument form; when `retainingOutcome` is true the same
+    /// write also adds a pending `FedRetainedOutcome` row for the effect, which
+    /// `commitTerminal` fills in, so the outcome can be read back after the
+    /// send-log record is pruned. Used by `SubcFedClient.callManagementTracked`.
+    ///
+    /// The default implementation below keeps no outcome: it makes the
+    /// three-argument call and ignores `retainingOutcome`, so a store written
+    /// outside this library still compiles and reports every outcome as gone.
+    func reserveEffectSequenceAndCommitIntent(
+        responderStaticPublicKey: Data,
+        peerLedgerEpoch: String?,
+        peerIncarnation: String?,
+        retainingOutcome: Bool
+    ) async throws -> FedEffectID
+
+    /// The kept outcome of a tracked mutation, pending or settled; nil when
+    /// the effect was never tracked or its row has expired or been evicted.
+    /// The default implementation keeps nothing and returns nil.
+    func retainedOutcome(of effect: FedEffectID) async throws -> FedRetainedOutcome?
 }
 
 extension FedStateStore {
@@ -111,6 +131,25 @@ extension FedStateStore {
             peerIncarnation: peerIncarnation,
             peerLedgerEpoch: peerLedgerEpoch
         )
+    }
+
+    /// Keeps no outcome; see the requirement.
+    public func reserveEffectSequenceAndCommitIntent(
+        responderStaticPublicKey: Data,
+        peerLedgerEpoch: String?,
+        peerIncarnation: String?,
+        retainingOutcome: Bool
+    ) async throws -> FedEffectID {
+        try await reserveEffectSequenceAndCommitIntent(
+            responderStaticPublicKey: responderStaticPublicKey,
+            peerLedgerEpoch: peerLedgerEpoch,
+            peerIncarnation: peerIncarnation
+        )
+    }
+
+    /// Keeps no outcome; see the requirement.
+    public func retainedOutcome(of effect: FedEffectID) async throws -> FedRetainedOutcome? {
+        nil
     }
 
     /// Reserves with `reserveEffectSequence`, then commits the intent with
@@ -289,5 +328,29 @@ public actor FedFaultInjectingStateStore: FedStateStore {
 
     public func unsettledEffects(forResponderPublicKey publicKey: Data) async throws -> [FedUnresolvedEffectRecord] {
         try await inner.unsettledEffects(forResponderPublicKey: publicKey)
+    }
+
+    public func reserveEffectSequenceAndCommitIntent(
+        responderStaticPublicKey: Data,
+        peerLedgerEpoch: String?,
+        peerIncarnation: String?,
+        retainingOutcome: Bool
+    ) async throws -> FedEffectID {
+        try check(.reserveEffect)
+        do {
+            try check(.commitIntent)
+        } catch {
+            throw FedFailure.reservationFailed
+        }
+        return try await inner.reserveEffectSequenceAndCommitIntent(
+            responderStaticPublicKey: responderStaticPublicKey,
+            peerLedgerEpoch: peerLedgerEpoch,
+            peerIncarnation: peerIncarnation,
+            retainingOutcome: retainingOutcome
+        )
+    }
+
+    public func retainedOutcome(of effect: FedEffectID) async throws -> FedRetainedOutcome? {
+        try await inner.retainedOutcome(of: effect)
     }
 }

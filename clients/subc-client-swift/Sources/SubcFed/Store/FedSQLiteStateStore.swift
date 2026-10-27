@@ -115,6 +115,14 @@ public actor FedSQLiteStateStore: FedDeviceApprovalNoticeStore {
     /// every read from this instance, and folded into its next commit.
     private var sentNotYetDurable: [FedEffectID: String] = [:]
 
+    /// Unix milliseconds used to date retained outcomes (`FedOutcomeRetention`).
+    private var nowMilliseconds: @Sendable () -> UInt64 = { FedOutcomeRetention.systemNowMilliseconds() }
+
+    /// Test hook replacing the clock that dates retained outcomes.
+    func setNowMilliseconds(_ now: @escaping @Sendable () -> UInt64) {
+        nowMilliseconds = now
+    }
+
     /// Derives the store directory from an Application Support base URL and a
     /// stable identity namespace dedicated to one local X25519 public key.
     public init(applicationSupportBaseURL: URL, identityNamespace: String) throws {
@@ -225,6 +233,9 @@ public actor FedSQLiteStateStore: FedDeviceApprovalNoticeStore {
         sentNotYetDurable.removeAll()
         durableCommitCount = 0
         storeLock = nil
+        // Callers of `SubcFedClient.settledOutcome(of:)` waiting on this store
+        // read it again and learn that it is closed.
+        FedOutcomeSettlementSignal.shared.notify()
     }
 
     /// A non-opening lifetime check for clients with cached session state.
@@ -309,6 +320,7 @@ public actor FedSQLiteStateStore: FedDeviceApprovalNoticeStore {
             try db.execute(FedSQLiteStoreRows.confirmedRangeSchema)
             try db.execute(FedSQLiteStoreRows.peerMachineIDSchema)
             try db.execute(FedSQLiteStoreRows.deviceApprovalSeenSchema)
+            try db.execute(FedSQLiteStoreRows.retainedOutcomeSchema)
             return db
         } catch {
             throw Self.openFailure(error)
@@ -367,7 +379,29 @@ public actor FedSQLiteStateStore: FedDeviceApprovalNoticeStore {
         peerLedgerEpoch: String?,
         peerIncarnation: String?
     ) async throws -> FedEffectID {
+        try await reserveEffectSequenceAndCommitIntent(
+            responderStaticPublicKey: responderStaticPublicKey,
+            peerLedgerEpoch: peerLedgerEpoch,
+            peerIncarnation: peerIncarnation,
+            retainingOutcome: false
+        )
+    }
+
+    public func commitIntent(_ record: FedUnresolvedEffectRecord) async throws {
+        _ = try write { db in try Self.insertIntent(record, in: db) }
+    }
+
+    /// Reserves the sequence, commits the intent row and, when
+    /// `retainingOutcome` is true, adds the pending retained outcome, all in
+    /// one transaction.
+    public func reserveEffectSequenceAndCommitIntent(
+        responderStaticPublicKey: Data,
+        peerLedgerEpoch: String?,
+        peerIncarnation: String?,
+        retainingOutcome: Bool
+    ) async throws -> FedEffectID {
         _ = try requireConnection()
+        let now = nowMilliseconds()
         do {
             return try write { db in
                 let effect = try Self.reserveEffectSequence(in: db)
@@ -380,6 +414,17 @@ public actor FedSQLiteStateStore: FedDeviceApprovalNoticeStore {
                     ),
                     in: db
                 )
+                if retainingOutcome {
+                    try FedSQLiteStoreRows.insertRetainedOutcome(
+                        FedOutcomeRetention.pending(
+                            effect: effect,
+                            responderStaticPublicKey: responderStaticPublicKey,
+                            nowMs: now
+                        ),
+                        in: db
+                    )
+                    try Self.pruneRetainedOutcomes(nowMs: now, in: db)
+                }
                 return effect
             }.value
         } catch {
@@ -388,8 +433,12 @@ public actor FedSQLiteStateStore: FedDeviceApprovalNoticeStore {
         }
     }
 
-    public func commitIntent(_ record: FedUnresolvedEffectRecord) async throws {
-        _ = try write { db in try Self.insertIntent(record, in: db) }
+    public func retainedOutcome(of effect: FedEffectID) async throws -> FedRetainedOutcome? {
+        let now = nowMilliseconds()
+        guard let outcome = try read({ db in try FedSQLiteStoreRows.retainedOutcome(of: effect, in: db) }),
+              !FedOutcomeRetention.isExpired(outcome, nowMs: now)
+        else { return nil }
+        return outcome
     }
 
     /// Records the phase in memory only; see `sentNotYetDurable`. The effect is
@@ -434,6 +483,19 @@ public actor FedSQLiteStateStore: FedDeviceApprovalNoticeStore {
                 ]
             )
             guard db.changes > 0 else { throw FedFailure.persistenceFailed }
+            if var retained = try FedSQLiteStoreRows.retainedOutcome(of: effect, in: db) {
+                let now = nowMilliseconds()
+                FedOutcomeRetention.settle(
+                    &retained,
+                    disposition: disposition,
+                    terminalBody: terminalBody,
+                    terminalKind: terminalKind,
+                    terminalCode: terminalCode,
+                    nowMs: now
+                )
+                try FedSQLiteStoreRows.insertRetainedOutcome(retained, in: db)
+                try Self.pruneRetainedOutcomes(nowMs: now, in: db)
+            }
             try Self.applySettlementRules(fp: fp, in: db) { view, localIncarnation in
                 FedSettlementRules.afterTerminal(
                     &view,
@@ -588,6 +650,14 @@ public actor FedSQLiteStateStore: FedDeviceApprovalNoticeStore {
     }
 
     // MARK: - Reservation and settlement rules
+
+    /// Deletes the retained outcomes `FedOutcomeRetention.evictions` drops.
+    private static func pruneRetainedOutcomes(nowMs: UInt64, in db: FedSQLiteConnection) throws {
+        let summaries = try FedSQLiteStoreRows.retainedOutcomeSummaries(in: db)
+        for effect in FedOutcomeRetention.evictions(summaries, nowMs: nowMs) {
+            try FedSQLiteStoreRows.deleteRetainedOutcome(effect, in: db)
+        }
+    }
 
     private static func reserveEffectSequence(in db: FedSQLiteConnection) throws -> FedEffectID {
         var global = try FedSQLiteStoreRows.readGlobal(from: db)

@@ -406,12 +406,18 @@ public actor FedSessionEngine {
     /// dispatchPreparedCall so a fast response can never be processed before the
     /// continuation exists. On any failure here the permit is released (or retained
     /// for an indeterminate mutation) and nothing is sent.
+    ///
+    /// With `retainingOutcome`, a mutation's intent commit also asks the store
+    /// to keep its outcome (`FedRetainedOutcome`), and a failure after that
+    /// commit is thrown as `FedPreparedEffectFailure` so the caller learns the
+    /// effect id the mutation was given. Without it, errors are thrown as is.
     public func prepareManagementCall(
         moduleID: String,
         method: String,
         params: FedJSONObject,
         policy: FedAdmissionPolicySnapshot,
-        payload: Data? = nil
+        payload: Data? = nil,
+        retainingOutcome: Bool = false
     ) async throws -> FedPreparedManagementCall {
         guard phase == .ready, role == .primary else {
             throw FedFailure.disconnected
@@ -477,7 +483,8 @@ public actor FedSessionEngine {
                 // Lane claim + intent commit are one atomic API on the effect log.
                 let capability = try await effectLog.claimMutationAndCommitIntent(
                     peerIncarnation: negotiation.peerIncarnation,
-                    peerLedgerEpoch: negotiation.peerLedgerEpoch
+                    peerLedgerEpoch: negotiation.peerLedgerEpoch,
+                    retainingOutcome: retainingOutcome
                 )
                 effect = capability.effect
                 intentCommitted = true
@@ -517,6 +524,9 @@ public actor FedSessionEngine {
                     // Leave durable row for reconciliation; retain permit.
                     await effectLog.noteIndeterminateLoss(effect)
                     await admission.retainLedgeredForRecovery(permit)
+                    if retainingOutcome {
+                        throw FedPreparedEffectFailure(effect: effect, underlying: error)
+                    }
                 } else {
                     await admission.release(permit)
                 }

@@ -19,9 +19,19 @@ public actor FedMemoryStateStore: FedDeviceApprovalNoticeStore {
     }
     private var document: FedStateDocument?
     private let expectedPublicKey: Data?
+    /// Tracked mutation outcomes in the order they were added; see
+    /// `FedOutcomeRetention`.
+    private var retainedOutcomes: [FedRetainedOutcome] = []
+    /// Unix milliseconds used to date retained outcomes.
+    private var nowMilliseconds: @Sendable () -> UInt64 = { FedOutcomeRetention.systemNowMilliseconds() }
 
     public init(expectedPublicKey: Data? = nil) {
         self.expectedPublicKey = expectedPublicKey
+    }
+
+    /// Test hook replacing the clock that dates retained outcomes.
+    func setNowMilliseconds(_ now: @escaping @Sendable () -> UInt64) {
+        nowMilliseconds = now
     }
 
     public func open(localPublicKey: Data) async throws -> FedStateOpenResult {
@@ -132,6 +142,13 @@ public actor FedMemoryStateStore: FedDeviceApprovalNoticeStore {
             }
             record.terminalCode = terminalCode
         }
+        settleRetainedOutcome(
+            effect: effect,
+            disposition: disposition,
+            terminalBody: terminalBody,
+            terminalKind: terminalKind,
+            terminalCode: terminalCode
+        )
         applySettlementRules(
             responderStaticPublicKey: responderStaticPublicKey,
             effect: effect,
@@ -224,7 +241,68 @@ public actor FedMemoryStateStore: FedDeviceApprovalNoticeStore {
         return destination.unresolvedEffects.filter { !$0.isSettled }
     }
 
+    /// Commits the intent as the three-argument form does, then adds the
+    /// pending retained outcome. Nothing can run on this actor in between
+    /// that a caller could observe: the effect id is not returned until both
+    /// are done.
+    public func reserveEffectSequenceAndCommitIntent(
+        responderStaticPublicKey: Data,
+        peerLedgerEpoch: String?,
+        peerIncarnation: String?,
+        retainingOutcome: Bool
+    ) async throws -> FedEffectID {
+        let effect = try await reserveEffectSequenceAndCommitIntent(
+            responderStaticPublicKey: responderStaticPublicKey,
+            peerLedgerEpoch: peerLedgerEpoch,
+            peerIncarnation: peerIncarnation
+        )
+        if retainingOutcome {
+            let now = nowMilliseconds()
+            retainedOutcomes.append(FedOutcomeRetention.pending(
+                effect: effect,
+                responderStaticPublicKey: responderStaticPublicKey,
+                nowMs: now
+            ))
+            pruneRetainedOutcomes(nowMs: now)
+        }
+        return effect
+    }
+
+    public func retainedOutcome(of effect: FedEffectID) async throws -> FedRetainedOutcome? {
+        _ = try requireDocument()
+        guard let outcome = retainedOutcomes.first(where: { $0.effect == effect }),
+              !FedOutcomeRetention.isExpired(outcome, nowMs: nowMilliseconds())
+        else { return nil }
+        return outcome
+    }
+
     // MARK: - Internals
+
+    private func settleRetainedOutcome(
+        effect: FedEffectID,
+        disposition: FedEffectDisposition,
+        terminalBody: Data?,
+        terminalKind: String?,
+        terminalCode: String?
+    ) {
+        guard let index = retainedOutcomes.firstIndex(where: { $0.effect == effect }) else { return }
+        let now = nowMilliseconds()
+        FedOutcomeRetention.settle(
+            &retainedOutcomes[index],
+            disposition: disposition,
+            terminalBody: terminalBody,
+            terminalKind: terminalKind,
+            terminalCode: terminalCode,
+            nowMs: now
+        )
+        pruneRetainedOutcomes(nowMs: now)
+    }
+
+    private func pruneRetainedOutcomes(nowMs: UInt64) {
+        let evicted = FedOutcomeRetention.evictions(retainedOutcomes, nowMs: nowMs)
+        guard !evicted.isEmpty else { return }
+        retainedOutcomes.removeAll { evicted.contains($0.effect) }
+    }
 
     private func requireDocument() throws -> FedStateDocument {
         guard let document else { throw FedFailure.storeUnavailable }

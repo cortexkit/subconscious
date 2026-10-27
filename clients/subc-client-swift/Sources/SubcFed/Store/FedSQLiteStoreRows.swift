@@ -46,6 +46,7 @@ enum FedSQLiteStoreRows {
     \(confirmedRangeSchema)
     \(peerMachineIDSchema)
     \(deviceApprovalSeenSchema)
+    \(retainedOutcomeSchema)
     """
 
     /// The confirmed ranges of `FedDestinationState.confirmedEffectRanges`.
@@ -81,6 +82,108 @@ enum FedSQLiteStoreRows {
         marks BLOB NOT NULL
     );
     """
+
+    /// Outcomes of tracked mutations (`FedRetainedOutcome`), kept apart from
+    /// the `effect` rows, which are pruned soon after they settle (recorded and
+    /// not-sent rows at once, except the regression sentinel; ambiguous rows
+    /// once the confirmed watermark passes them). Additive
+    /// like `confirmedRangeSchema`: `open` creates it in an older database,
+    /// and a build that predates it ignores it.
+    static let retainedOutcomeSchema = """
+    CREATE TABLE IF NOT EXISTS retained_outcome(
+        incarnation TEXT NOT NULL,
+        seq INTEGER NOT NULL,
+        responder_pubkey BLOB NOT NULL,
+        requested_at_ms INTEGER NOT NULL,
+        settled_at_ms INTEGER,
+        disposition TEXT NOT NULL,
+        terminal_kind TEXT,
+        terminal_code TEXT,
+        terminal_body BLOB,
+        body_retained INTEGER NOT NULL,
+        PRIMARY KEY (incarnation, seq)
+    );
+    """
+
+    private static let retainedOutcomeColumns = """
+        incarnation, seq, responder_pubkey, requested_at_ms, settled_at_ms, disposition,
+        terminal_kind, terminal_code, terminal_body, body_retained
+        """
+
+    static func insertRetainedOutcome(_ outcome: FedRetainedOutcome, in db: FedSQLiteConnection) throws {
+        try db.run(
+            "INSERT OR REPLACE INTO retained_outcome(\(retainedOutcomeColumns)) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                .text(outcome.effect.incarnation),
+                .unsigned(outcome.effect.seq),
+                .blob(outcome.responderStaticPublicKey),
+                .unsigned(outcome.requestedAtMs),
+                .unsignedOrNull(outcome.settledAtMs),
+                .text(outcome.disposition.rawValue),
+                .textOrNull(outcome.terminalKind),
+                .textOrNull(outcome.terminalCode),
+                .blobOrNull(outcome.terminalBody),
+                .integer(outcome.bodyRetained ? 1 : 0),
+            ]
+        )
+    }
+
+    /// The kept outcome of `effect`, or nil when there is none.
+    static func retainedOutcome(of effect: FedEffectID, in db: FedSQLiteConnection) throws -> FedRetainedOutcome? {
+        let row = try db.prepare(
+            "SELECT \(retainedOutcomeColumns) FROM retained_outcome WHERE incarnation = ? AND seq = ?"
+        )
+        try row.bind([.text(effect.incarnation), .unsigned(effect.seq)])
+        guard try row.step() else { return nil }
+        return try retainedOutcome(from: row, withBody: true)
+    }
+
+    /// Every kept outcome without its body: what the retention rules read.
+    static func retainedOutcomeSummaries(in db: FedSQLiteConnection) throws -> [FedRetainedOutcome] {
+        let rows = try db.prepare(
+            """
+            SELECT incarnation, seq, responder_pubkey, requested_at_ms, settled_at_ms, disposition,
+                NULL, NULL, NULL, body_retained
+            FROM retained_outcome ORDER BY rowid
+            """
+        )
+        var outcomes: [FedRetainedOutcome] = []
+        while try rows.step() {
+            outcomes.append(try retainedOutcome(from: rows, withBody: false))
+        }
+        return outcomes
+    }
+
+    static func deleteRetainedOutcome(_ effect: FedEffectID, in db: FedSQLiteConnection) throws {
+        try db.run(
+            "DELETE FROM retained_outcome WHERE incarnation = ? AND seq = ?",
+            [.text(effect.incarnation), .unsigned(effect.seq)]
+        )
+    }
+
+    private static func retainedOutcome(from row: FedSQLiteStatement, withBody: Bool) throws -> FedRetainedOutcome {
+        guard let incarnation = row.text(0),
+              let seq = row.unsigned(1),
+              let key = row.blob(2),
+              let requestedAtMs = row.unsigned(3),
+              let dispositionRaw = row.text(5),
+              let disposition = FedEffectDisposition(rawValue: dispositionRaw),
+              let bodyRetained = row.int64(9)
+        else {
+            throw FedFailure.storeCorrupt
+        }
+        return FedRetainedOutcome(
+            effect: FedEffectID(incarnation: incarnation, seq: seq),
+            responderStaticPublicKey: key,
+            requestedAtMs: requestedAtMs,
+            settledAtMs: row.unsigned(4),
+            disposition: disposition,
+            terminalKind: withBody ? row.text(6) : nil,
+            terminalCode: withBody ? row.text(7) : nil,
+            terminalBody: withBody ? row.blob(8) : nil,
+            bodyRetained: bodyRetained != 0
+        )
+    }
 
     static func peerMachineID(fp: String, in db: FedSQLiteConnection) throws -> String? {
         let row = try db.prepare("SELECT machine_id FROM peer_machine_id WHERE responder_fp = ?")

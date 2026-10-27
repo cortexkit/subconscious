@@ -26,6 +26,106 @@ public struct FedEffectID: Sendable, Equatable, Hashable, Codable {
         else { return nil }
         return FedEffectID(incarnation: incarnation, seq: seq)
     }
+
+    /// Prefix of ``persistentString``. Naming the format lets a later format
+    /// be told apart from this one instead of being misread as it.
+    static let persistentStringPrefix = "fedeffect1:"
+
+    /// A stable text form an app can save and turn back into the same id with
+    /// ``init(persistentString:)``, for example to recover a mutation's
+    /// outcome with `SubcFedClient.settledOutcome(of:)` after a relaunch.
+    ///
+    /// The form is `fedeffect1:<seq>:<incarnation>`: the sequence number in
+    /// decimal, then the incarnation verbatim. It never changes for a given
+    /// id. The sequence comes first so the incarnation may contain any
+    /// character, colons included. It round-trips every id with a non-empty
+    /// incarnation, which includes every id the library mints; an id built by
+    /// hand with an empty incarnation does not parse back.
+    public var persistentString: String {
+        "\(Self.persistentStringPrefix)\(seq):\(incarnation)"
+    }
+
+    /// Rebuilds an id from ``persistentString``. Returns nil for any text
+    /// that is not exactly that form: a missing or different prefix, a
+    /// sequence number that is not plain decimal digits (no sign, no leading
+    /// zero, no overflow), or an empty incarnation.
+    public init?(persistentString: String) {
+        guard persistentString.hasPrefix(Self.persistentStringPrefix) else { return nil }
+        let rest = persistentString.dropFirst(Self.persistentStringPrefix.count)
+        guard let colon = rest.firstIndex(of: ":") else { return nil }
+        let digits = rest[rest.startIndex..<colon]
+        let incarnation = rest[rest.index(after: colon)...]
+        guard !digits.isEmpty,
+              digits.utf8.allSatisfy({ $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }),
+              digits == "0" || digits.first != "0",
+              let seq = UInt64(digits),
+              !incarnation.isEmpty
+        else { return nil }
+        self.init(incarnation: String(incarnation), seq: seq)
+    }
+}
+
+/// The outcome a store keeps for one mutation sent with
+/// `SubcFedClient.callManagementTracked`, so `SubcFedClient.settledOutcome(of:)`
+/// can return it later. `FedSQLiteStateStore` keeps it across a relaunch;
+/// `FedMemoryStateStore` keeps it only for the life of the process, and a
+/// custom store using the default `FedStateStore` implementations keeps none.
+///
+/// It is kept apart from the send-log records (`FedUnresolvedEffectRecord`),
+/// which are deleted soon after they settle: recorded and not-sent records at
+/// once (except the regression sentinel), ambiguous ones once the confirmed
+/// watermark passes them. A row is written, still pending, in the same write
+/// that commits the mutation's intent, and is filled in by the same write that
+/// settles the mutation. A settled row is kept for at most seven days after
+/// it settles. Whenever the rows number more than 256, expired rows go first,
+/// then the oldest settled rows. Pending rows are never evicted, so they can
+/// keep the total above 256 until they settle; there are few, because a
+/// destination admits a new mutation only once its earlier ones have settled.
+public struct FedRetainedOutcome: Sendable, Equatable, Codable {
+    public let effect: FedEffectID
+    /// Authenticated responder static public key the mutation was sent to.
+    public let responderStaticPublicKey: Data
+    /// When the tracked call committed its intent, in Unix milliseconds by
+    /// the store's clock.
+    public var requestedAtMs: UInt64
+    /// When the mutation settled, in Unix milliseconds by the store's clock;
+    /// nil while it is unsettled.
+    public var settledAtMs: UInt64?
+    /// `.unknown` while the mutation is unsettled.
+    public var disposition: FedEffectDisposition
+    /// Kept only for a recorded outcome.
+    public var terminalKind: String?
+    public var terminalCode: String?
+    /// The recorded body, kept only for a recorded outcome no larger than
+    /// 64 KiB.
+    public var terminalBody: Data?
+    /// False when the recorded body was larger than 64 KiB and was dropped.
+    /// A refusal still keeps its code in that case.
+    public var bodyRetained: Bool
+
+    public init(
+        effect: FedEffectID,
+        responderStaticPublicKey: Data,
+        requestedAtMs: UInt64,
+        settledAtMs: UInt64? = nil,
+        disposition: FedEffectDisposition = .unknown,
+        terminalKind: String? = nil,
+        terminalCode: String? = nil,
+        terminalBody: Data? = nil,
+        bodyRetained: Bool = true
+    ) {
+        self.effect = effect
+        self.responderStaticPublicKey = responderStaticPublicKey
+        self.requestedAtMs = requestedAtMs
+        self.settledAtMs = settledAtMs
+        self.disposition = disposition
+        self.terminalKind = terminalKind
+        self.terminalCode = terminalCode
+        self.terminalBody = terminalBody
+        self.bodyRetained = bodyRetained
+    }
+
+    public var isSettled: Bool { settledAtMs != nil }
 }
 
 /// Confirmed settlement watermark asserted toward one destination.

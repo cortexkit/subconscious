@@ -76,6 +76,75 @@ available for teardown. This is a fail-closed backstop, not coordination for
 closing beneath active calls: an interrupted mutation still needs ledger
 reconciliation by the next owner, never blind replay.
 
+## Recovering a mutation whose reply was lost
+
+A mutating `callManagement` call whose reply is lost (the session drops after
+the request went out) fails with `FedFailure.disconnected` or
+`FedFailure.indeterminateMutation`: the phone cannot tell whether the module
+applied it. The library does not resend it. On the next session,
+reconciliation asks the computer what its ledger recorded for that mutation
+and settles it from the answer. To get that answer back, send the mutation with
+`callManagementTracked` and keep its effect id:
+
+```swift
+let target = try FedManagementTarget(moduleID: "example-module")
+do {
+    let result = try await client.callManagementTracked(
+        target: target, method: "item.update", params: params)
+    show(result.body)
+} catch let error as FedTrackedCallError {
+    guard let effect = error.effect else { throw error.underlying } // nothing was recorded
+    saveDurably(effect.persistentString)   // before telling the user "couldn't confirm"
+    // Later, in this launch or (with FedSQLiteStateStore) after a relaunch:
+    let body = try await client.settledOutcome(of: effect, timeout: .seconds(60))
+}
+```
+
+- `callManagementTracked` takes the same arguments as `callManagement` and
+  behaves the same way (admission, retries, which `FedFailure` each outcome
+  maps to). It returns `FedTrackedCallResult` (the body plus the effect id,
+  which is nil for a successful read-only query) and throws
+  `FedTrackedCallError`, which carries the unchanged error (`underlying`, or
+  `failure` when it is a `FedFailure`) and the effect id. `effect` is nil for
+  a read-only query and for a call refused before an effect id was assigned;
+  such a call left nothing to recover.
+- `settledOutcome(of:)` returns the outcome as the original call would have:
+  the body for a result the module recorded, `FedFailure.moduleError` with the
+  module's code, message and detail for a refusal the module recorded (only
+  the code when the refusal body was over 64 KiB, so the message and detail
+  may be missing), `FedFailure.mutationNotSent` when reconciliation proved the
+  call never reached the module, and `FedFailure.indeterminateMutation` when
+  reconciliation could only conclude that it may have arrived. If the mutation
+  has not settled yet, it waits until reconciliation settles it, on a later
+  session too. The wait honours task cancellation, and an optional `timeout`
+  throws `FedSettledOutcomeError.timedOut`; neither decides anything.
+- **A recovered result or refusal is the one the module recorded; "not sent"
+  and "may have arrived" are what reconciliation concluded.** Do not call the
+  module again for the same intent: sending the same mutation again is a
+  second mutation. Only `mutationNotSent` means the call is safe to send
+  again, as a new call.
+- The outcome is read from the state store, never from the computer, so it can
+  be read any number of times and works before `connect()`. It survives a
+  relaunch only with `FedSQLiteStateStore` (a new store over the same
+  directory); `FedMemoryStateStore` keeps it for the life of the process.
+  Save the id as `effect.persistentString` (rebuild it with
+  `FedEffectID(persistentString:)` or pass the text to
+  `settledOutcome(ofPersistentString:)`) or as the `Codable` `FedEffectID`.
+- The store keeps tracked outcomes only, for at most seven days after they
+  settle, and a result body only up to 64 KiB. Whenever more than 256 rows are
+  kept, expired rows are removed first and then the oldest settled ones, so an
+  outcome can go sooner than seven days. Rows still waiting for their mutation
+  to settle are never removed and can keep the total above 256 until they
+  settle; there are few, since the phone sends a computer a new mutation only
+  after the earlier ones to it have settled. Ordinary `callManagement` mutations keep nothing.
+  Errors about the lookup itself are `FedSettledOutcomeError`, a separate enum
+  rather than new `FedFailure` cases: `unknownEffect` (never tracked,
+  malformed saved text, or removed by those limits), `resultNotRetained` (the
+  result was over 64 KiB), `storeClosed` and `timedOut`.
+- A custom `FedStateStore` gets default implementations of the two new
+  requirements that keep nothing, so its outcomes always read as
+  `unknownEffect`.
+
 ## Share sessions beside the app's session
 
 Use `FedShareClient` for share-extension sends to a paired computer advertising

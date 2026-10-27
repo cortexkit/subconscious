@@ -411,6 +411,193 @@ public actor SubcFedClient {
         params: FedJSONObject,
         payload: Data?
     ) async throws -> Data {
+        try await runManagementCall(
+            target: target,
+            method: method,
+            params: params,
+            payload: payload,
+            retainingOutcome: false,
+            onEffectAssigned: { _ in }
+        )
+    }
+
+    // MARK: - Tracked mutations
+
+    /// `callManagement(method:params:)`, but the result carries the effect id
+    /// of a mutation and failures are thrown as `FedTrackedCallError`, so a
+    /// mutation whose reply was lost can be resolved later with
+    /// ``settledOutcome(of:timeout:)``. A tracked mutation's outcome is kept
+    /// in the state store for at most seven days after it settles; the
+    /// 256-row limit can remove it sooner (see `FedOutcomeRetention`).
+    ///
+    /// Retries, admission and the mapping of outcomes to errors are those of
+    /// `callManagement`; only the error is wrapped.
+    public func callManagementTracked(method: String, params: FedJSONObject) async throws -> FedTrackedCallResult {
+        do {
+            try await checkStateStoreLifetime()
+        } catch {
+            throw FedTrackedCallError(effect: nil, underlying: error)
+        }
+        guard let target = defaultManagementTarget else {
+            throw FedTrackedCallError(effect: nil, underlying: FedFailure.catalogTargetUnavailable)
+        }
+        return try await callManagementTracked(target: target, method: method, params: params)
+    }
+
+    /// Tracked form of `callManagement(target:method:params:)`; see
+    /// ``callManagementTracked(method:params:)``.
+    public func callManagementTracked(
+        target: FedManagementTarget,
+        method: String,
+        params: FedJSONObject
+    ) async throws -> FedTrackedCallResult {
+        try await callManagementTrackedImpl(target: target, method: method, params: params, payload: nil)
+    }
+
+    /// Tracked form of `callManagement(target:method:params:payload:)`; see
+    /// ``callManagementTracked(method:params:)``.
+    public func callManagementTracked(
+        target: FedManagementTarget,
+        method: String,
+        params: FedJSONObject,
+        payload: Data
+    ) async throws -> FedTrackedCallResult {
+        try await callManagementTrackedImpl(target: target, method: method, params: params, payload: payload)
+    }
+
+    private func callManagementTrackedImpl(
+        target: FedManagementTarget,
+        method: String,
+        params: FedJSONObject,
+        payload: Data?
+    ) async throws -> FedTrackedCallResult {
+        var assigned: FedEffectID?
+        do {
+            let body = try await runManagementCall(
+                target: target,
+                method: method,
+                params: params,
+                payload: payload,
+                retainingOutcome: true,
+                onEffectAssigned: { assigned = $0 }
+            )
+            return FedTrackedCallResult(body: body, effect: assigned)
+        } catch {
+            throw FedTrackedCallError(effect: assigned, underlying: error)
+        }
+    }
+
+    /// The outcome of a mutation sent with `callManagementTracked`, as that
+    /// call would have reported it: the body for a recorded result,
+    /// `FedFailure.moduleError` for a recorded refusal,
+    /// `FedFailure.mutationNotSent` when it provably never reached the module,
+    /// and `FedFailure.indeterminateMutation` when reconciliation could only
+    /// settle it as possibly delivered.
+    ///
+    /// A result or a refusal is the one the module recorded. "Not sent" and
+    /// "may have arrived" are not module records: they are what reconciliation
+    /// concluded about the call. Either way the outcome is read from the state
+    /// store, never from the computer, so it can be read any number of times
+    /// while the store keeps it: at most seven days after it settles, less if
+    /// the 256-row limit removes it sooner. Only `FedSQLiteStateStore` keeps
+    /// it across a relaunch (a new store over the same directory);
+    /// `FedMemoryStateStore` loses it with the process, and a custom store
+    /// using the default `FedStateStore` implementations keeps nothing.
+    ///
+    /// A refusal whose body was over 64 KiB keeps only its code, so the thrown
+    /// `moduleError` may then lack the message and detail.
+    ///
+    /// When the mutation has not settled yet (its reply was lost and
+    /// reconciliation has not run), this waits until reconciliation settles
+    /// it, on this session or a later one after reconnecting. The wait ends
+    /// with `CancellationError` when the task is cancelled and with
+    /// `FedSettledOutcomeError.timedOut` when `timeout` elapses; neither
+    /// decides anything about the mutation.
+    ///
+    /// Throws `FedSettledOutcomeError.unknownEffect` for an id the store keeps
+    /// no outcome for, `.resultNotRetained` for a result over 64 KiB, and
+    /// `.storeClosed` once the state store is closed.
+    public func settledOutcome(of effect: FedEffectID, timeout: Duration? = nil) async throws -> Data {
+        try await openStoreForOutcomeLookup()
+        let store = stateStore
+        guard let timeout else {
+            return try await Self.waitForSettledOutcome(of: effect, in: store)
+        }
+        return try await withThrowingTaskGroup(of: Data.self) { group in
+            group.addTask { try await Self.waitForSettledOutcome(of: effect, in: store) }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw FedSettledOutcomeError.timedOut
+            }
+            defer { group.cancelAll() }
+            guard let first = try await group.next() else { throw FedSettledOutcomeError.timedOut }
+            return first
+        }
+    }
+
+    /// ``settledOutcome(of:timeout:)`` for an id saved with
+    /// `FedEffectID.persistentString`. Text that is not a saved id throws
+    /// `FedSettledOutcomeError.unknownEffect`.
+    public func settledOutcome(ofPersistentString saved: String, timeout: Duration? = nil) async throws -> Data {
+        guard let effect = FedEffectID(persistentString: saved) else {
+            throw FedSettledOutcomeError.unknownEffect
+        }
+        return try await settledOutcome(of: effect, timeout: timeout)
+    }
+
+    /// Opens the state document the way `connect` does, so an outcome can be
+    /// read after a relaunch before any session exists.
+    private func openStoreForOutcomeLookup() async throws {
+        if let sqlite = stateStore as? FedSQLiteStateStore {
+            do {
+                try await sqlite.checkNotClosed()
+            } catch is FedStateStoreClosed {
+                throw FedSettledOutcomeError.storeClosed
+            }
+        }
+        do {
+            try await openStateDocumentIfNeeded(localPublicKey: try await keyStore.staticPublicKey())
+        } catch is FedStateStoreClosed {
+            throw FedSettledOutcomeError.storeClosed
+        }
+    }
+
+    /// Reads the retained outcome until it is settled, sleeping on
+    /// `FedOutcomeSettlementSignal` between reads.
+    private static func waitForSettledOutcome(
+        of effect: FedEffectID,
+        in store: any FedStateStore
+    ) async throws -> Data {
+        let signal = FedOutcomeSettlementSignal.shared
+        while true {
+            try Task.checkCancellation()
+            // Read before the store so a commit during the read is not missed.
+            let observed = signal.generation
+            let outcome: FedRetainedOutcome?
+            do {
+                outcome = try await store.retainedOutcome(of: effect)
+            } catch is FedStateStoreClosed {
+                throw FedSettledOutcomeError.storeClosed
+            }
+            guard let outcome else { throw FedSettledOutcomeError.unknownEffect }
+            if outcome.isSettled {
+                return try FedOutcomeRetention.callerResult(outcome)
+            }
+            try await signal.wait(after: observed)
+        }
+    }
+
+    /// Runs one management call. `onEffectAssigned` is called with a
+    /// mutation's effect id as soon as it has one, before the request is
+    /// written, so a tracked caller can report it with any later failure.
+    private func runManagementCall(
+        target: FedManagementTarget,
+        method: String,
+        params: FedJSONObject,
+        payload: Data?,
+        retainingOutcome: Bool,
+        onEffectAssigned: (FedEffectID) -> Void
+    ) async throws -> Data {
         try await checkStateStoreLifetime()
         guard let session = activeSession else { throw FedFailure.disconnected }
         guard case .ready = connectionState else { throw FedFailure.disconnected }
@@ -422,13 +609,23 @@ public actor SubcFedClient {
         // the engine has already released/retained the permit, so nothing leaks
         // and no continuation is created.
         let startedAtNs = clock.nowNanoseconds()
-        let prepared = try await session.engine.prepareManagementCall(
-            moduleID: target.moduleID,
-            method: method,
-            params: params,
-            policy: policy,
-            payload: payload
-        )
+        let prepared: FedPreparedManagementCall
+        do {
+            prepared = try await session.engine.prepareManagementCall(
+                moduleID: target.moduleID,
+                method: method,
+                params: params,
+                policy: policy,
+                payload: payload,
+                retainingOutcome: retainingOutcome
+            )
+        } catch let failure as FedPreparedEffectFailure {
+            onEffectAssigned(failure.effect)
+            throw failure.underlying
+        }
+        if prepared.isMutation {
+            onEffectAssigned(prepared.effect)
+        }
         let admittedAtNs = clock.nowNanoseconds()
 
         // Then register the response continuation under the actor's isolation

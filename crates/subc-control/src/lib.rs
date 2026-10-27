@@ -2034,6 +2034,13 @@ pub struct CatalogEntry {
     /// name. Empty maps preserve catalog bytes from before payload declarations.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub operation_payload: BTreeMap<String, OperationPayload>,
+    /// Management operations the module serves to a flow-scoped call, mirrored
+    /// unchanged from its manifest. Absent means the module did not say, so a
+    /// reader treats the answer as unknown rather than as "none"; an empty list
+    /// admits no operation under a flow scope. Absence preserves catalog bytes
+    /// from before the field. The daemon relays it and never enforces it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_operations: Option<Vec<String>>,
     /// Rich-UI descriptor mirrored verbatim from the registering manifest.
     /// The daemon does not fetch or interpret the manifest described here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2068,6 +2075,7 @@ impl CatalogEntry {
             events: None,
             operation_delivery: BTreeMap::new(),
             operation_payload: BTreeMap::new(),
+            flow_operations: None,
             rich_ui: None,
             role_declarations: BTreeMap::new(),
             nonce_verified: false,
@@ -2081,6 +2089,14 @@ impl CatalogEntry {
         operation_payload: BTreeMap<String, OperationPayload>,
     ) -> Self {
         self.operation_payload = operation_payload;
+        self
+    }
+
+    /// Set or clear the flow-scoped operation list mirrored from the registered
+    /// manifest. `None` is omitted from the wire.
+    #[must_use]
+    pub fn with_flow_operations(mut self, flow_operations: Option<Vec<String>>) -> Self {
+        self.flow_operations = flow_operations;
         self
     }
 

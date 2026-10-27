@@ -69,6 +69,99 @@ async fn payload_catalog_bridge_preserves_declarations_and_legacy_wire_bytes() {
     assert!(legacy_serving.await.unwrap().is_ok());
 }
 
+/// The running daemon binary relays a module's flow-operation list into
+/// `catalog.list` unchanged, and keeps it out of entries that do not declare one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flow_operations_reach_catalog_unchanged_through_real_daemon() {
+    const FLOW_MODULE_ID: &str = "subc-client-rs-flow-operations";
+    let harness = BinaryHarness::start().await;
+    let management = subc_protocol::manifest::ProviderRole::ManagementSurface {
+        operations: ["diagnostics.findings", "reset"]
+            .into_iter()
+            .map(|name| subc_protocol::manifest::ManagementOperation {
+                name: name.into(),
+                kind: subc_protocol::manifest::ManagementOperationKind::Query,
+                description: None,
+            })
+            .collect(),
+        config_schema: serde_json::json!({}),
+        observability: vec![],
+        identity_scope: vec![],
+        concurrency: subc_protocol::manifest::Concurrency::Serial,
+    };
+    let manifest = ModuleManifest::builder(FLOW_MODULE_ID, "1.0.0")
+        .provides(vec![management])
+        .capabilities(Some(subc_protocol::manifest::CapabilityDeclarations {
+            provides: vec!["flow-scopes/v1".into()],
+            requires: vec![],
+            must_never_reach: vec![],
+        }))
+        // Declared out of alphabetical order so a sorting relay would be caught.
+        .flow_operations(Some(vec!["reset".into(), "diagnostics.findings".into()]))
+        .build();
+    let (_, flow_serving) = spawn_inline_module_with_handler(
+        &harness.daemon.connection_file,
+        manifest,
+        BinaryReplyHandler,
+    )
+    .await;
+    wait_for_catalog_module(
+        &harness.daemon.connection_file,
+        FLOW_MODULE_ID,
+        START_TIMEOUT,
+    )
+    .await;
+
+    let consumer = harness.consumer().await;
+    let catalog = consumer.catalog_list().await.unwrap();
+    let flow_operations = |module_id: &str| {
+        catalog
+            .modules
+            .iter()
+            .find(|entry| entry.module_id == module_id)
+            .unwrap()
+            .flow_operations
+            .clone()
+    };
+    assert_eq!(
+        flow_operations(FLOW_MODULE_ID),
+        Some(vec![
+            "reset".to_string(),
+            "diagnostics.findings".to_string()
+        ])
+    );
+    assert_eq!(flow_operations(BINARY_MODULE_ID), None);
+
+    let mut client = connect_authed_client(&harness.daemon.connection_file)
+        .await
+        .unwrap();
+    let request = Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Interactive, false),
+        0,
+        0,
+        10,
+        serde_json::to_vec(&subc_control::ClientControlRequest::CatalogList { module_id: None })
+            .unwrap(),
+    )
+    .unwrap();
+    write_frame(&mut client, &request).await.unwrap();
+    let reply = read_frame_timeout(&mut client).await;
+    assert_eq!(reply.header.ty, FrameType::Response);
+    let body = String::from_utf8(reply.body).unwrap();
+    // Pin the daemon's actual bytes: present once, for the declaring module only.
+    assert_eq!(
+        body.matches(r#""flow_operations":["reset","diagnostics.findings"]"#)
+            .count(),
+        1,
+        "actual catalog body: {body}"
+    );
+    assert_eq!(body.matches("flow_operations").count(), 1);
+    consumer.close().await;
+    harness.stop().await;
+    assert!(flow_serving.await.unwrap().is_ok());
+}
+
 #[async_trait]
 impl ModuleHandler for BinaryReplyHandler {
     async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.12
+
+- Project manifest `flow_operations` through `catalog.list` unchanged, so an install check can refuse a flow naming an operation its target never serves to flows. The daemon does not enforce the list; each module refuses the operations it does not admit. An invalid list (no `flow-scopes/v1` or `call-modes/v1`, an undeclared or repeated operation, more than 256 names, or not an array of strings) is dropped at HELLO with one WARN naming the reason, and the module still registers. Absent lists keep existing catalog bytes. Requires subc-protocol 0.33.4 and subc-control 0.33.3.
+
 ## 0.37.11
 
 - Accept worker runs: a record with `run_id` must now carry exactly one of `agent_id` (an agent run, unchanged) or `on_behalf_of_agent` (a worker run, attribution only). Both is refused `scope_attribute_not_permitted`, neither stays `scope_run_id_without_agent`, and a worker run still refuses `delegates` and `flow_id`. No parent-kind check: a worker run may hang under a worker's task scope or a not-yet-linked parent.

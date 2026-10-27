@@ -22,9 +22,10 @@ use subc_protocol::{
     error_codes,
     manifest::{
         validate_hello_capability_grammar, validate_hello_event_declarations,
-        validate_hello_rich_ui_descriptor, validate_hello_role_declarations,
-        validate_hello_self_signal_declarations, CapabilityDeclarations, CapabilityNeed,
-        Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
+        validate_hello_flow_operations, validate_hello_rich_ui_descriptor,
+        validate_hello_role_declarations, validate_hello_self_signal_declarations,
+        CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
+        ProviderRole,
     },
     scope::{
         ScopeEnd, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
@@ -2354,6 +2355,12 @@ impl ControlHandler {
                 .unwrap_or("<unknown>");
             warn!(module_id, %reason, "dropping whole role_declarations map from HELLO");
         }
+        if let Err(reason) = validate_hello_flow_operations(&hello_value) {
+            let module_id = hello_value["manifest"]["module_id"]
+                .as_str()
+                .unwrap_or("<unknown>");
+            warn!(module_id, %reason, "dropping flow_operations from HELLO");
+        }
         let hello = match serde_json::from_value::<ModuleHelloBody>(hello_value) {
             Ok(hello) => hello,
             Err(err) => {
@@ -4025,6 +4032,7 @@ impl ControlHandler {
                 .with_events(registration.manifest.events)
                 .with_operation_delivery(registration.manifest.operation_delivery)
                 .with_operation_payload(registration.manifest.operation_payload)
+                .with_flow_operations(registration.manifest.flow_operations)
                 .with_rich_ui(registration.manifest.rich_ui)
                 .with_role_declarations(registration.manifest.role_declarations)
                 .with_nonce_verified(nonce_verified)
@@ -9635,6 +9643,169 @@ mod tests {
         assert_hello_drops_role_declarations_with_warning(
             json!({"routing/v1": {}, "overflow/v1": {"padding": "x".repeat(16_384)}}),
             "role_declarations exceeds 16384 compact JSON bytes",
+        );
+    }
+
+    fn hello_with_flow_operations(capabilities: Value, flow_operations: Option<Value>) -> Frame {
+        let mut body = serde_json::to_value(ModuleHelloBody {
+            manifest: manifest("flow-ops", PROTOCOL_VERSION),
+            protocol_ver: PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: None,
+        })
+        .unwrap();
+        body["manifest"]["provides"] = json!([{
+            "role": "management_surface",
+            "operations": [
+                {"name": "diagnostics.findings", "kind": "query"},
+                {"name": "reset", "kind": "mutate"}
+            ],
+            "config_schema": {}, "observability": [], "identity_scope": []
+        }]);
+        body["manifest"]["capabilities"] = json!({ "provides": capabilities });
+        if let Some(flow_operations) = flow_operations {
+            body["manifest"]["flow_operations"] = flow_operations;
+        }
+        Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            401,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn catalog_list_mirrors_flow_operations_unchanged() {
+        // Order is kept as declared (not sorted) and an empty list stays an
+        // affirmative "none", distinct from an absent declaration.
+        for (capability, flow_operations) in [
+            ("flow-scopes/v1", json!(["reset", "diagnostics.findings"])),
+            ("call-modes/v1", json!(["diagnostics.findings"])),
+            ("flow-scopes/v1", json!([])),
+        ] {
+            let registry = Arc::new(Registry::default());
+            let handler = ControlHandler::new(Arc::clone(&registry));
+            let connection = ConnectionId::new(401);
+            let response = handler
+                .handle_control(
+                    connection,
+                    hello_with_flow_operations(json!([capability]), Some(flow_operations.clone())),
+                )
+                .unwrap();
+            assert_eq!(response[0].header.ty, FrameType::HelloAck);
+            let registered = registry
+                .get_module_by_connection(connection)
+                .unwrap()
+                .unwrap()
+                .manifest;
+            assert_eq!(
+                serde_json::to_value(&registered.flow_operations).unwrap(),
+                flow_operations
+            );
+            let (raw, entry) = role_declarations_catalog(&handler);
+            assert_eq!(raw["flow_operations"], flow_operations);
+            assert_eq!(entry.flow_operations, registered.flow_operations);
+        }
+
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let response = handler
+            .handle_control(
+                ConnectionId::new(401),
+                hello_with_flow_operations(json!(["flow-scopes/v1"]), None),
+            )
+            .unwrap();
+        assert_eq!(response[0].header.ty, FrameType::HelloAck);
+        let (raw, entry) = role_declarations_catalog(&handler);
+        assert!(raw.get("flow_operations").is_none());
+        assert_eq!(entry.flow_operations, None);
+    }
+
+    fn assert_hello_drops_flow_operations_with_warning(
+        capabilities: Value,
+        flow_operations: Value,
+        reason: &str,
+    ) {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let response = handler
+            .handle_control(
+                ConnectionId::new(401),
+                hello_with_flow_operations(capabilities, Some(flow_operations)),
+            )
+            .unwrap();
+        assert_eq!(response[0].header.ty, FrameType::HelloAck);
+        let registered = registry
+            .get_module_by_connection(ConnectionId::new(401))
+            .unwrap()
+            .expect("the module still registers")
+            .manifest;
+        assert_eq!(registered.module_id, "flow-ops");
+        assert_eq!(registered.flow_operations, None);
+        let (raw, entry) = role_declarations_catalog(&handler);
+        assert_eq!(raw["module_id"], "flow-ops");
+        assert!(raw.get("flow_operations").is_none());
+        assert_eq!(entry.flow_operations, None);
+        let warnings: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("message").map(String::as_str)
+                    == Some("dropping flow_operations from HELLO")
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].level, tracing::Level::WARN);
+        assert_eq!(warnings[0].fields["module_id"], "\"flow-ops\"");
+        assert_eq!(warnings[0].fields["reason"], reason);
+    }
+
+    #[test]
+    fn hello_flow_operations_naming_unknown_operation_is_dropped_with_warning() {
+        assert_hello_drops_flow_operations_with_warning(
+            json!(["flow-scopes/v1"]),
+            json!(["diagnostics.findings", "missing"]),
+            "flow_operations names 'missing', which is not a declared management operation",
+        );
+    }
+
+    #[test]
+    fn hello_flow_operations_without_flow_capability_is_dropped_with_warning() {
+        assert_hello_drops_flow_operations_with_warning(
+            json!([]),
+            json!(["diagnostics.findings"]),
+            "flow_operations requires 'flow-scopes/v1' or 'call-modes/v1' in capabilities.provides",
+        );
+        // A run-only capability does not admit flows either.
+        assert_hello_drops_flow_operations_with_warning(
+            json!(["agent-run-scopes/v1"]),
+            json!([]),
+            "flow_operations requires 'flow-scopes/v1' or 'call-modes/v1' in capabilities.provides",
+        );
+    }
+
+    #[test]
+    fn hello_malformed_flow_operations_is_dropped_with_warning() {
+        assert_hello_drops_flow_operations_with_warning(
+            json!(["flow-scopes/v1"]),
+            json!(["reset", "reset"]),
+            "flow_operations names 'reset' more than once",
+        );
+        assert_hello_drops_flow_operations_with_warning(
+            json!(["flow-scopes/v1"]),
+            json!(vec!["reset"; 257]),
+            "flow_operations lists 257 names, more than 256",
+        );
+        assert_hello_drops_flow_operations_with_warning(
+            json!(["flow-scopes/v1"]),
+            json!("reset"),
+            "flow_operations must be an array of operation names",
         );
     }
 

@@ -19,6 +19,9 @@ use crate::PROTOCOL_VERSION;
 /// Maximum compact JSON size of the complete per-role declaration map.
 pub const MAX_ROLE_DECLARATIONS_BYTES: usize = 16_384;
 
+/// Maximum number of names in [`ModuleManifest::flow_operations`].
+pub const MAX_FLOW_OPERATIONS: usize = 256;
+
 /// A module's full declared participation in the subc mesh.
 ///
 /// Construct via [`ModuleManifest::builder()`], never a struct literal. Adding a
@@ -118,6 +121,26 @@ pub struct ModuleManifest {
     /// Watch operations cannot accept payloads. Empty maps preserve legacy bytes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub operation_payload: BTreeMap<String, OperationPayload>,
+    /// Management operations this module serves to a flow-scoped call.
+    ///
+    /// `Some(list)` says the module admits a call under a scope carrying
+    /// `flow_id` only for the named operations and refuses every other one;
+    /// `Some(vec![])` admits none. `None` means the module has not said, so a
+    /// reader (such as an install check) treats the answer as unknown and keeps
+    /// the module-wide view given by `flow-scopes/v1` or `call-modes/v1`; it never
+    /// means "none".
+    ///
+    /// Meaningful only beside one of those capabilities in
+    /// `capabilities.provides`. Decoding drops the whole list, without refusing
+    /// HELLO, when the manifest declares neither capability, when the list is not
+    /// an array of strings, holds more than [`MAX_FLOW_OPERATIONS`] names, repeats
+    /// a name, or names something that is not a management operation of this same
+    /// manifest; see [`ModuleManifest::validate_flow_operations`]. The daemon only
+    /// relays the list through `catalog.list` and never enforces it: each module
+    /// refuses the operations it does not admit. Absence preserves legacy bytes,
+    /// and older daemons silently drop the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_operations: Option<Vec<String>>,
     /// An opaque rich-UI manifest descriptor discoverable from `catalog.list`.
     ///
     /// The daemon validates the descriptor's shape at HELLO and relays it without
@@ -153,6 +176,7 @@ pub struct ModuleManifestBuilder {
     provenance: Option<ManifestProvenance>,
     operation_delivery: BTreeMap<String, OperationDelivery>,
     operation_payload: BTreeMap<String, OperationPayload>,
+    flow_operations: Option<Vec<String>>,
     rich_ui: Option<RichUiDescriptor>,
     role_declarations: BTreeMap<String, serde_json::Map<String, Value>>,
 }
@@ -184,6 +208,7 @@ impl ModuleManifest {
             provenance: None,
             operation_delivery: BTreeMap::new(),
             operation_payload: BTreeMap::new(),
+            flow_operations: None,
             rich_ui: None,
             role_declarations: BTreeMap::new(),
         }
@@ -289,6 +314,17 @@ impl ModuleManifestBuilder {
         self
     }
 
+    /// Declares the management operations served to a flow-scoped call.
+    ///
+    /// `None` (the default) leaves the answer unknown and preserves legacy wire
+    /// bytes; `Some(vec![])` admits no operation under a flow scope. Check the
+    /// result with [`ModuleManifest::validate_flow_operations`], because an
+    /// invalid list is dropped when the manifest is decoded.
+    pub fn flow_operations(mut self, flow_operations: Option<Vec<String>>) -> Self {
+        self.flow_operations = flow_operations;
+        self
+    }
+
     /// Adds an opaque rich-UI manifest descriptor to this module's manifest.
     pub fn rich_ui(mut self, rich_ui: Option<RichUiDescriptor>) -> Self {
         self.rich_ui = rich_ui;
@@ -321,6 +357,7 @@ impl ModuleManifestBuilder {
             provenance: self.provenance,
             operation_delivery: self.operation_delivery,
             operation_payload: self.operation_payload,
+            flow_operations: self.flow_operations,
             rich_ui: self.rich_ui,
             role_declarations: self.role_declarations,
         }
@@ -372,6 +409,9 @@ struct ModuleManifestWire {
     operation_delivery: Option<Value>,
     #[serde(default)]
     operation_payload: BTreeMap<String, OperationPayload>,
+    // Kept raw so an invalid list can be dropped rather than refusing HELLO.
+    #[serde(default)]
+    flow_operations: Option<Value>,
     #[serde(default)]
     rich_ui: Option<RichUiDescriptor>,
     // `runtime_computed` belongs to --manifest output rather than the retained
@@ -403,7 +443,7 @@ impl<'de> Deserialize<'de> for ModuleManifest {
         if let Some(ready) = wire.ready {
             builder = builder.ready(ready);
         }
-        let manifest = builder
+        let mut manifest = builder
             .provides(wire.provides)
             .consumes(wire.consumes)
             .bindings(wire.bindings)
@@ -428,6 +468,11 @@ impl<'de> Deserialize<'de> for ModuleManifest {
         manifest
             .validate_operation_payload()
             .map_err(D::Error::custom)?;
+        // Checked against the rest of the decoded manifest, so it runs after
+        // `provides` and `capabilities` are in place. Invalid lists are dropped.
+        manifest.flow_operations = wire
+            .flow_operations
+            .and_then(|value| decode_flow_operations(&manifest, &value).ok());
         manifest
             .validate_capability_grammar()
             .map_err(D::Error::custom)?;
@@ -2303,6 +2348,139 @@ impl ModuleManifest {
         }
         Ok(())
     }
+}
+
+/// Why a [`ModuleManifest::flow_operations`] list is dropped.
+///
+/// A dropped list leaves the manifest as if the module had not declared one;
+/// it never refuses HELLO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FlowOperationsError {
+    /// The manifest provides neither `flow-scopes/v1` nor `call-modes/v1`, so it
+    /// admits no flow-scoped call for the list to narrow.
+    FlowScopesNotDeclared,
+    /// The wire value is not an array of strings.
+    NotAList,
+    /// The list holds more than [`MAX_FLOW_OPERATIONS`] names.
+    TooMany { count: usize },
+    /// The same name appears more than once.
+    DuplicateOperation { operation: String },
+    /// The name is not a management operation declared by the same manifest.
+    UnknownOperation { operation: String },
+}
+
+impl fmt::Display for FlowOperationsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FlowScopesNotDeclared => write!(
+                f,
+                "flow_operations requires '{}' or '{}' in capabilities.provides",
+                crate::scope::FLOW_SCOPES_CAPABILITY,
+                crate::call_mode::CALL_MODES_CAPABILITY
+            ),
+            Self::NotAList => f.write_str("flow_operations must be an array of operation names"),
+            Self::TooMany { count } => write!(
+                f,
+                "flow_operations lists {count} names, more than {MAX_FLOW_OPERATIONS}"
+            ),
+            Self::DuplicateOperation { operation } => {
+                write!(f, "flow_operations names '{operation}' more than once")
+            }
+            Self::UnknownOperation { operation } => write!(
+                f,
+                "flow_operations names '{operation}', which is not a declared management operation"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FlowOperationsError {}
+
+impl ModuleManifest {
+    /// Checks a present [`Self::flow_operations`] list: the manifest provides
+    /// `flow-scopes/v1` or `call-modes/v1`, the list holds at most
+    /// [`MAX_FLOW_OPERATIONS`] distinct names, and each name is a management
+    /// operation of this manifest. An absent list is always valid.
+    pub fn validate_flow_operations(&self) -> Result<(), FlowOperationsError> {
+        match &self.flow_operations {
+            Some(operations) => check_flow_operations(self, operations),
+            None => Ok(()),
+        }
+    }
+}
+
+fn check_flow_operations(
+    manifest: &ModuleManifest,
+    operations: &[String],
+) -> Result<(), FlowOperationsError> {
+    let admits_flows = manifest.capabilities.as_ref().is_some_and(|capabilities| {
+        capabilities.provides.iter().any(|capability| {
+            capability == crate::scope::FLOW_SCOPES_CAPABILITY
+                || capability == crate::call_mode::CALL_MODES_CAPABILITY
+        })
+    });
+    if !admits_flows {
+        return Err(FlowOperationsError::FlowScopesNotDeclared);
+    }
+    if operations.len() > MAX_FLOW_OPERATIONS {
+        return Err(FlowOperationsError::TooMany {
+            count: operations.len(),
+        });
+    }
+    let mut seen = HashSet::new();
+    for operation in operations {
+        if !seen.insert(operation.as_str()) {
+            return Err(FlowOperationsError::DuplicateOperation {
+                operation: operation.clone(),
+            });
+        }
+        let declared = manifest.provides.iter().any(|role| match role {
+            ProviderRole::ManagementSurface { operations, .. } => {
+                operations.iter().any(|op| op.name == *operation)
+            }
+            _ => false,
+        });
+        if !declared {
+            return Err(FlowOperationsError::UnknownOperation {
+                operation: operation.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Decodes and checks a raw `flow_operations` value against the rest of its
+/// manifest. JSON `null` is treated by callers as absent, never as a list.
+fn decode_flow_operations(
+    manifest: &ModuleManifest,
+    value: &Value,
+) -> Result<Vec<String>, FlowOperationsError> {
+    let operations: Vec<String> =
+        serde_json::from_value(value.clone()).map_err(|_| FlowOperationsError::NotAList)?;
+    check_flow_operations(manifest, &operations)?;
+    Ok(operations)
+}
+
+/// Checks the `flow_operations` list of a raw HELLO, so the daemon can warn
+/// about a list that decoding will drop.
+///
+/// Returns `Ok` when the list is absent or `null`, and also when the manifest
+/// itself does not decode: that HELLO is refused for its own reason.
+pub fn validate_hello_flow_operations(hello: &Value) -> Result<(), FlowOperationsError> {
+    let Some(manifest_value) = hello.get("manifest") else {
+        return Ok(());
+    };
+    let Some(value) = manifest_value
+        .get("flow_operations")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(());
+    };
+    let Ok(manifest) = ModuleManifest::deserialize(manifest_value) else {
+        return Ok(());
+    };
+    decode_flow_operations(&manifest, value).map(|_| ())
 }
 
 /// Operation exposed on the management plane.

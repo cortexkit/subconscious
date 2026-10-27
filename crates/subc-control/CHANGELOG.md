@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.3
+
+- Add `CatalogEntry::flow_operations` and `with_flow_operations`, mirroring the manifest's list of management operations served to flow-scoped calls. Absent means the module did not say, not that it admits none; absence is omitted and keeps existing catalog bytes. `CatalogEntry` remains non-exhaustive and builder-compatible.
+
 ## 0.33.2
 
 - Add optional `SupervisorEntry::next_retry_at_ms` and its builder method so operators can see when a failed module will retry after exhausting its restart budget. This Unix-millisecond estimate is recomputed from the daemon's monotonic countdown on each read; macOS sleep pauses the countdown. `SupervisorEntry` remains non-exhaustive, and absent retry times are omitted so existing response bytes are unchanged.

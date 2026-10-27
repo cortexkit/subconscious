@@ -260,6 +260,31 @@ Otherwise it strips all three, preserving the legacy stamp bytes. This reader
 capability does not replace `flow-scopes/v1` or `call-modes/v1` admission, and
 neither of those older capabilities implies installed-identity reader support.
 
+### Operations served to flows: `flow_operations`
+
+`flow-scopes/v1` and `call-modes/v1` admit flows module-wide, but a module may serve
+only some of its management operations to a flow-scoped call and refuse the rest. It
+says which with the optional manifest list `flow_operations`, a list of its own
+management operation names:
+
+- **Present:** the module serves a flow-scoped call only for the listed operations.
+- **Empty list:** the module admits no operation under a flow scope.
+- **Absent:** the module has not said. A reader, such as an install check deciding
+  whether a flow can run against its targets, treats absence as unknown and falls
+  back to the module-wide capability. Absence never means "none".
+
+The list is meaningful only when the manifest provides `flow-scopes/v1` or
+`call-modes/v1` in `capabilities.provides`. At HELLO the daemon drops the whole list,
+with one WARN naming the reason, when the manifest declares neither capability, when
+a name is not a management operation of the same manifest, when a name repeats, when
+the list holds more than 256 names, or when it is not an array of strings. The module
+still registers, as if it had not declared a list.
+
+The daemon relays a valid list unchanged through `catalog.list` and never enforces
+it: it does not read request bodies. Each module refuses the operations it does not
+admit under a flow scope itself. The field is omitted when absent, so manifests and
+catalog entries without it keep their bytes, and older daemons ignore it.
+
 ### Agent-run identity: `run_id`
 
 The optional `attributes.run_id` identifies one run; run scopes use the existing `ephemeral`

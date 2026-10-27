@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.4
+
+- Add the optional `ModuleManifest::flow_operations` list and builder method, `MAX_FLOW_OPERATIONS` (256), `FlowOperationsError`, `ModuleManifest::validate_flow_operations`, and `validate_hello_flow_operations`. A present list names the management operations the module serves to a flow-scoped call; an empty list admits none; absence means unknown, never none. It is meaningful only beside `flow-scopes/v1` or `call-modes/v1` in `capabilities.provides`. A list declared without either capability, naming an operation the manifest does not declare, repeating a name, holding more than 256 names, or not an array of strings is dropped whole when decoding, without refusing the manifest. Absence keeps existing manifest bytes, and older decoders drop the unknown key. `ManagementOperation` is unchanged.
+
 ## 0.33.3
 
 - Add `scope::WORKER_RUNS_CAPABILITY` (`worker-runs/v1`). A *worker run* is a run scope with `run_id` and `on_behalf_of_agent` but no `agent_id`: a codemode run that works for an agent without that agent's authority. Declaring the capability promises the provider handles such a codemode bind as attribution only and never acts as, consents for, or hands out per-agent handles of the attributed agent. Docs for `ScopeAttributes::{on_behalf_of_agent, run_id}` and `SCOPE_RUN_ID_WITHOUT_AGENT` now describe the rule that a record with `run_id` carries exactly one of `agent_id` or `on_behalf_of_agent`. Additive; no wire type changes.

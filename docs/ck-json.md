@@ -306,11 +306,14 @@ provider argument validates a provider id but does not filter this raw payload.
   self_signals?:[self_signal], events?:[event], rich_ui?:rich_ui,
   operation_delivery?:{[operation:string]:string},
   operation_payload?:{[operation:string]:{max_bytes:number}},
+  flow_operations?:[string],
   role_declarations?:{[role:string]:object}, nonce_verified?:boolean}`.
   The `role`, `capabilities`, `self_signal`, `event` and `rich_ui` shapes are
   described below. An older daemon that omits `ready` is shown as `ready:true`.
   Empty operation/role maps and false `nonce_verified` are omitted.
   `operation_delivery` recognizes `"watch"`; other string values are retained.
+  `flow_operations` lists the operations served to flow-scoped calls; absent
+  means unknown, not none (see docs/scopes.md).
   Role-declaration object contents belong to the declaring module.
 - **Provenance**: `daemon` carries
   `{daemon_build:{build_git_sha?:string,build_lock_digest?:string},

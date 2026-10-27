@@ -483,3 +483,278 @@ async fn mcp_2026_prompts_subscription_does_not_receive_tools_list_changed() {
     late.shutdown().await;
     harness.shutdown().await;
 }
+
+// MCP tasks (the io.modelcontextprotocol/tasks extension): a call that
+// outlives the task promotion delay, or whose module asks a question, is
+// answered with a task handle the host polls.
+
+use rmcp::model::{
+    CancelTaskParams, CreateTaskResult, GetTaskParams, GetTaskResult, TaskPayload, TaskStatus,
+    UpdateTaskParams, TASKS_EXTENSION_ID,
+};
+
+/// A 2026-07-28 host that declares elicitation and the tasks extension on
+/// every request.
+async fn start_2026_tasks(label: &str, module_env: &[(&str, &str)]) -> ReverseHarness {
+    let mut capabilities = elicitation_capabilities();
+    capabilities.extensions = Some(
+        serde_json::from_value(json!({ TASKS_EXTENSION_ID: {} }))
+            .expect("the tasks extension capability should parse"),
+    );
+    let mut harness = ReverseHarness::start_inner(label, capabilities, module_env, false).await;
+    let client = harness
+        .shim
+        .serve_mcp_client_2026(harness.client_handler.clone())
+        .await;
+    harness.client = Some(client);
+    harness
+}
+
+async fn expect_task(call: JoinHandle<Result<CallToolResponse, ServiceError>>) -> CreateTaskResult {
+    match timeout(READ_TIMEOUT, call).await {
+        Ok(Ok(Ok(CallToolResponse::Task(task)))) => task,
+        other => panic!("expected a task handle, got {other:?}"),
+    }
+}
+
+async fn get_task(harness: &ReverseHarness, task_id: &str) -> Result<GetTaskResult, ServiceError> {
+    let peer = harness.client.as_ref().unwrap().peer().clone();
+    peer.get_task(GetTaskParams::new(task_id)).await
+}
+
+/// Polls `tasks/get` until the task reaches `status`, failing if it ends in
+/// another terminal status first.
+async fn poll_task_until(
+    harness: &ReverseHarness,
+    task_id: &str,
+    status: TaskStatus,
+) -> GetTaskResult {
+    let deadline = Instant::now() + READ_TIMEOUT;
+    loop {
+        let task = get_task(harness, task_id).await.expect("tasks/get");
+        let current = task.task.status();
+        if current == status {
+            return task;
+        }
+        assert!(
+            !current.is_terminal(),
+            "task {task_id} ended as {current:?}, expected {status:?}: {task:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "task {task_id} never reached {status:?}; last seen {current:?}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Fails if the module receives another tool call within the quiet window:
+/// a task must never send its call again.
+async fn assert_no_further_route_request(provider: &mut ScriptedProvider) {
+    let deadline = Instant::now() + QUIET_TIMEOUT;
+    while let Ok(Some(event)) = timeout(
+        deadline.saturating_duration_since(Instant::now()),
+        provider.events_rx.recv(),
+    )
+    .await
+    {
+        assert!(
+            !matches!(event, ScriptedProviderEvent::RouteRequest(_)),
+            "the module received the call again: {event:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn mcp_2026_long_tool_call_runs_as_a_task_polled_to_its_result() {
+    let mut harness = start_2026_tasks(
+        "mcp-2026-task-poll",
+        &[("SUBC_MCP_TASK_PROMOTION_DELAY_MS", "1000")],
+    )
+    .await;
+    let tool_name = harness.provider.exposed_tool_name();
+    harness.provider.wait_bound().await;
+
+    // A call the module answers within the delay is answered inline.
+    let quick = spawn_call_once(&harness, CallToolRequestParams::new(tool_name.clone()));
+    let forward = harness.provider.wait_route_request().await;
+    harness
+        .provider
+        .send_route_response(&forward, text_result("quick"))
+        .await;
+    assert_eq!(expect_complete_text(quick).await, json!("quick"));
+
+    // A call still running after the delay becomes a task.
+    let call = spawn_call_once(&harness, CallToolRequestParams::new(tool_name.clone()));
+    let forward = harness.provider.wait_route_request().await;
+    let created = expect_task(call).await;
+    assert_eq!(created.task.status, TaskStatus::Working);
+    assert_eq!(created.task.poll_interval_ms, Some(1000));
+    assert_eq!(
+        created.task.ttl_ms, None,
+        "a running task is kept for as long as its call runs"
+    );
+    let task_id = created.task.task_id.clone();
+    let working = get_task(&harness, &task_id).await.expect("tasks/get");
+    assert_eq!(working.task.status(), TaskStatus::Working);
+
+    harness
+        .provider
+        .send_route_response(&forward, text_result("long-ok"))
+        .await;
+    let done = poll_task_until(&harness, &task_id, TaskStatus::Completed).await;
+    match &done.task.payload {
+        TaskPayload::Completed { result } => {
+            assert_eq!(result_text(result), json!("long-ok"));
+        }
+        other => panic!("expected the module's result, got {other:?}"),
+    }
+    assert!(
+        done.task.task.ttl_ms.is_some(),
+        "a finished task reports when it will be dropped"
+    );
+    assert_no_further_route_request(&mut harness.provider).await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_2026_cancelling_a_task_cancels_the_module_call() {
+    let mut harness = start_2026_tasks(
+        "mcp-2026-task-cancel",
+        &[("SUBC_MCP_TASK_PROMOTION_DELAY_MS", "200")],
+    )
+    .await;
+    let tool_name = harness.provider.exposed_tool_name();
+    harness.provider.wait_bound().await;
+
+    let call = spawn_call_once(&harness, CallToolRequestParams::new(tool_name));
+    let forward = harness.provider.wait_route_request().await;
+    let task_id = expect_task(call).await.task.task_id;
+
+    let peer = harness.client.as_ref().unwrap().peer().clone();
+    peer.cancel_task(CancelTaskParams::new(task_id.clone()))
+        .await
+        .expect("tasks/cancel should be acknowledged");
+    harness
+        .provider
+        .wait_route_cancel(forward.header.corr)
+        .await;
+    poll_task_until(&harness, &task_id, TaskStatus::Cancelled).await;
+
+    // A result the module sends anyway changes nothing.
+    harness
+        .provider
+        .send_route_response(&forward, text_result("too-late"))
+        .await;
+    sleep(QUIET_TIMEOUT).await;
+    let after = get_task(&harness, &task_id).await.expect("tasks/get");
+    assert_eq!(after.task.status(), TaskStatus::Cancelled);
+    assert_no_further_route_request(&mut harness.provider).await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_2026_module_question_goes_through_input_required_and_back() {
+    // A delay no test waits out: the question alone makes the call a task.
+    let mut harness = start_2026_tasks(
+        "mcp-2026-task-input",
+        &[("SUBC_MCP_TASK_PROMOTION_DELAY_MS", "600000")],
+    )
+    .await;
+    let tool_name = harness.provider.exposed_tool_name();
+    let route = harness.provider.wait_bound().await;
+
+    let call = spawn_call_once(&harness, CallToolRequestParams::new(tool_name));
+    let forward = harness.provider.wait_route_request().await;
+    harness
+        .provider
+        .send_reverse_request(
+            route,
+            961,
+            form_elicitation_body("task", Some(forward.header.corr)),
+        )
+        .await;
+    let task_id = expect_task(call).await.task.task_id;
+
+    let asked = poll_task_until(&harness, &task_id, TaskStatus::InputRequired).await;
+    let key = match &asked.task.payload {
+        TaskPayload::InputRequired { input_requests } => {
+            assert_eq!(input_requests.len(), 1, "{input_requests:?}");
+            input_requests.keys().next().unwrap().clone()
+        }
+        other => panic!("expected the module's question, got {other:?}"),
+    };
+
+    let mut responses = InputResponses::new();
+    responses.insert(
+        key,
+        json!({ "action": "accept", "content": { "approved": true } }),
+    );
+    let peer = harness.client.as_ref().unwrap().peer().clone();
+    peer.update_task(UpdateTaskParams::new(task_id.clone(), responses))
+        .await
+        .expect("tasks/update should be acknowledged");
+    let answer = harness.provider.wait_reverse_response(961).await;
+    assert_eq!(answer.pointer("/content/approved"), Some(&json!(true)));
+    poll_task_until(&harness, &task_id, TaskStatus::Working).await;
+
+    harness
+        .provider
+        .send_route_response(&forward, text_result("answered-ok"))
+        .await;
+    let done = poll_task_until(&harness, &task_id, TaskStatus::Completed).await;
+    match &done.task.payload {
+        TaskPayload::Completed { result } => {
+            assert_eq!(result_text(result), json!("answered-ok"))
+        }
+        other => panic!("expected the module's result, got {other:?}"),
+    }
+    // The host was asked through the task, never through its handler.
+    harness.client_handler.assert_prompt_count_stays(0).await;
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_2026_finished_task_is_reported_expired_after_its_ttl() {
+    let mut harness = start_2026_tasks(
+        "mcp-2026-task-expiry",
+        &[
+            ("SUBC_MCP_TASK_PROMOTION_DELAY_MS", "200"),
+            ("SUBC_MCP_TASK_RESULT_TTL_MS", "400"),
+        ],
+    )
+    .await;
+    let tool_name = harness.provider.exposed_tool_name();
+    harness.provider.wait_bound().await;
+
+    let call = spawn_call_once(&harness, CallToolRequestParams::new(tool_name));
+    let forward = harness.provider.wait_route_request().await;
+    let task_id = expect_task(call).await.task.task_id;
+    harness
+        .provider
+        .send_route_response(&forward, text_result("kept-briefly"))
+        .await;
+    poll_task_until(&harness, &task_id, TaskStatus::Completed).await;
+
+    sleep(Duration::from_millis(800)).await;
+    match get_task(&harness, &task_id).await {
+        Err(ServiceError::McpError(error)) => {
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS, "{error:?}");
+            assert!(error.message.contains("expired"), "{error:?}");
+        }
+        other => panic!("expected the task to be reported expired, got {other:?}"),
+    }
+    // An id the session never handed out is unknown, not expired.
+    match get_task(&harness, "subc-mcp-task-9999").await {
+        Err(ServiceError::McpError(error)) => {
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS, "{error:?}");
+            assert!(error.message.contains("unknown task"), "{error:?}");
+        }
+        other => panic!("expected an unknown task, got {other:?}"),
+    }
+
+    harness.shutdown().await;
+}

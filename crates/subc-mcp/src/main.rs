@@ -4,9 +4,11 @@ mod held_call;
 mod outage_output;
 mod prompts;
 mod session_scope;
+mod tasks;
 
-use held_call::{HeldCall, HeldCallEvent, HeldCalls, InputWaiterGuard};
+use held_call::{next_held_event, HeldCall, HeldCallEvent, HeldCalls, InputWaiterGuard};
 use session_scope::{LocalSessionScope, ScopeOwner};
+use tasks::Tasks;
 
 use std::{
     borrow::Cow,
@@ -34,14 +36,14 @@ use prompts::{
 };
 use rmcp::{
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, CancelledNotificationParam,
-        ClientCapabilities, ClientResult, ContentBlock, CustomRequest, ErrorCode, ErrorData,
-        GetPromptRequestParams, GetPromptResponse, Implementation, InitializeRequestParams,
-        InitializeResult, InputRequest, InputRequests, InputRequiredResult, InputResponses,
-        JsonObject, ListPromptsResult, ListToolsResult, PaginatedRequestParams,
-        ProgressNotificationParam, ProgressToken, ProtocolVersion, RequestId, RequestMetaObject,
-        ServerCapabilities, ServerConfig, ServerRequest, SubscriptionFilter, Tool as McpTool,
-        ToolAnnotations,
+        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
+        CancelledNotificationParam, ClientCapabilities, ClientResult, ContentBlock, CustomRequest,
+        ErrorCode, ErrorData, GetPromptRequestParams, GetPromptResponse, GetTaskParams,
+        GetTaskResult, Implementation, InitializeRequestParams, InitializeResult, InputRequest,
+        InputRequests, InputRequiredResult, InputResponses, JsonObject, ListPromptsResult,
+        ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, ProgressToken,
+        ProtocolVersion, RequestId, RequestMetaObject, ServerCapabilities, ServerConfig,
+        ServerRequest, SubscriptionFilter, Tool as McpTool, ToolAnnotations, UpdateTaskParams,
     },
     service::{
         NotificationContext, Peer, PeerRequestOptions, RequestContext, ServiceError,
@@ -313,6 +315,10 @@ struct RelaySession {
     /// 2026-07-28 hosts do. Such a host is never sent a server-to-client
     /// request; its module questions travel through `input_waiters`.
     inline_host: OnceLock<()>,
+    /// Set when the host started the session with `initialize` (2025-11-25
+    /// and older). Such a session is never offered MCP tasks, so what it is
+    /// told and answered stays exactly what it was before tasks existed.
+    initialize_host: OnceLock<()>,
     input_waiters: std::sync::Mutex<Vec<InputWaiter>>,
     next_input_waiter: AtomicU64,
     /// Tool and prompt list changes for a host that started without
@@ -337,6 +343,7 @@ impl RelaySession {
             local_scope: None,
             scope: OnceLock::new(),
             inline_host: OnceLock::new(),
+            initialize_host: OnceLock::new(),
             input_waiters: std::sync::Mutex::new(Vec::new()),
             next_input_waiter: AtomicU64::new(1),
             list_changes: broadcast::channel(SUBC_EVENT_BUFFER).0,
@@ -373,6 +380,14 @@ impl RelaySession {
 
     fn is_inline_host(&self) -> bool {
         self.inline_host.get().is_some()
+    }
+
+    fn record_initialize_host(&self) {
+        let _ = self.initialize_host.set(());
+    }
+
+    fn started_with_initialize(&self) -> bool {
+        self.initialize_host.get().is_some()
     }
 
     fn lock_input_waiters(&self) -> std::sync::MutexGuard<'_, Vec<InputWaiter>> {
@@ -2858,6 +2873,7 @@ async fn handle_shim_connection(
         Arc::clone(&conversation),
     );
     let held_calls = handler.held_calls.clone();
+    let tasks = handler.tasks.clone();
     let (read_half, write_half) = stream.into_split();
     // rmcp 1.x read host messages without a size limit; rmcp 3 caps a line at
     // 16 MiB by default and drops longer ones. These lines come from the MCP host
@@ -2868,6 +2884,7 @@ async fn handle_shim_connection(
     let serve_result = serve_mcp_server(handler, transport).await;
     let _ = shutdown_tx.send(true);
     held_calls.release_all();
+    tasks.release_all();
     let _reconcile_guard = reconcile_gate.lock().await;
     subc.relay()
         .fail_session(&attached.relay_session, "MCP host session disconnected")
@@ -5559,6 +5576,9 @@ struct SubcMcpServer {
     /// Tool calls held at their modules while a 2026-07-28 host answers a
     /// module's question.
     held_calls: HeldCalls,
+    /// Tool calls that outlived their tools/call and continue as MCP tasks,
+    /// for 2026-07-28 hosts that declare the tasks extension.
+    tasks: Tasks,
 }
 
 /// The tool-call request body the gateway sends on a route is the shared
@@ -5675,6 +5695,8 @@ impl ServerHandler for SubcMcpServer {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<InitializeResult, ErrorData> {
+        // Recorded first, so the answer below already leaves tasks out.
+        self.relay_session.record_initialize_host();
         if context.peer.peer_info().is_none() {
             context.peer.set_peer_info(request);
         }
@@ -5698,19 +5720,27 @@ impl ServerHandler for SubcMcpServer {
     }
 
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_tool_list_changed()
-                .enable_prompts()
-                .enable_prompts_list_changed()
-                .build(),
-        )
-        // The version an `initialize` answer falls back to. rmcp's default is
-        // its newest version, 2026-07-28, which has no `initialize`; name the
-        // newest one that does.
-        .with_protocol_version(ProtocolVersion::V_2025_11_25)
-        .with_server_info(Implementation::new("subc-mcp", env!("CARGO_PKG_VERSION")))
+        let capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_tool_list_changed()
+            .enable_prompts()
+            .enable_prompts_list_changed();
+        // Tasks are offered only to hosts that start without `initialize`
+        // (2026-07-28 and later). rmcp answers `tasks/*` only while they are
+        // advertised here, so a session that began with `initialize` keeps
+        // both its `initialize` answer and its "method not found" for those
+        // methods exactly as they were.
+        let capabilities = if self.relay_session.started_with_initialize() {
+            capabilities.build()
+        } else {
+            capabilities.enable_tasks().build()
+        };
+        ServerConfig::new(capabilities)
+            // The version an `initialize` answer falls back to. rmcp's default is
+            // its newest version, 2026-07-28, which has no `initialize`; name the
+            // newest one that does.
+            .with_protocol_version(ProtocolVersion::V_2025_11_25)
+            .with_server_info(Implementation::new("subc-mcp", env!("CARGO_PKG_VERSION")))
     }
 
     async fn list_prompts(
@@ -5782,19 +5812,72 @@ impl ServerHandler for SubcMcpServer {
             self.resume_held_call(request, &context).await
         } else {
             match self.state.surface_mode() {
-                SurfaceMode::Full => self.call_tool_over_route(request, context).await,
-                SurfaceMode::Search => self.call_search_mode_tool(request, context).await,
+                SurfaceMode::Full => self.call_tool_over_route(request, context.clone()).await,
+                SurfaceMode::Search => self.call_search_mode_tool(request, context.clone()).await,
             }
         };
-        Ok(match outcome? {
-            ToolCallOutcome::Done(result) => CallToolResponse::from(result),
-            ToolCallOutcome::NeedsInput(held, ask) => CallToolResponse::from(self.held_calls.park(
-                tool_name,
-                held,
-                ask,
-                self.subc.clone(),
-            )),
-        })
+        let mut outcome = outcome?;
+        loop {
+            return Ok(match outcome {
+                ToolCallOutcome::Done(result) => CallToolResponse::from(result),
+                ToolCallOutcome::NeedsInput(held, ask) => CallToolResponse::from(
+                    self.held_calls
+                        .park(tool_name, held, ask, self.subc.clone()),
+                ),
+                ToolCallOutcome::Promote(held, ask) => {
+                    match self
+                        .tasks
+                        .start(held, ask, self.subc.clone())
+                        .map_err(|declined| *declined)
+                    {
+                        Ok(task) => CallToolResponse::Task(task),
+                        // The session has no room for another task: the
+                        // call goes on inline, its question (if any) in the
+                        // MRTR form a host without tasks gets.
+                        Err((held, Some(ask))) => CallToolResponse::from(self.held_calls.park(
+                            tool_name,
+                            held,
+                            ask,
+                            self.subc.clone(),
+                        )),
+                        Err((held, None)) => {
+                            let module_id = held.module_id.clone();
+                            let attempt = self.await_held_call(*held, &context, false).await?;
+                            outcome = held_call_outcome(
+                                attempt,
+                                &module_id,
+                                "subc route tool call failed: the route closed while the call was running",
+                            )?;
+                            continue;
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    async fn get_task(
+        &self,
+        request: GetTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<GetTaskResult, ErrorData> {
+        self.tasks.get(&request.task_id)
+    }
+
+    async fn update_task(
+        &self,
+        request: UpdateTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<(), ErrorData> {
+        self.tasks.update(&request.task_id, request.input_responses)
+    }
+
+    async fn cancel_task(
+        &self,
+        request: CancelTaskParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<(), ErrorData> {
+        self.tasks.cancel(&request.task_id)
     }
 
     /// The gateway sends the list changes it already sends to `initialize`
@@ -5948,19 +6031,32 @@ impl SubcMcpServer {
             .resume(token, &request.name, request.input_responses.as_ref())
             .await?;
         let module_id = held.module_id.clone();
-        match self.await_held_call(*held, context).await? {
-            CallAttempt::Answered(result) => Ok(ToolCallOutcome::Done(result)),
-            CallAttempt::NeedsInput(held, ask) => Ok(ToolCallOutcome::NeedsInput(held, ask)),
-            // The call reached the module (it asked a question), so a refusal
-            // proving otherwise is reported as the outage it describes, not retried.
-            CallAttempt::NothingSent(refusal) => Ok(ToolCallOutcome::Done(outage_tool_result(
-                &module_id, &refusal,
-            ))),
-            CallAttempt::RouteGone => Err(ErrorData::internal_error(
-                "subc route tool call failed: the route closed while the call waited for input",
-                None,
-            )),
-        }
+        let attempt = self.await_held_call(*held, context, true).await?;
+        held_call_outcome(
+            attempt,
+            &module_id,
+            "subc route tool call failed: the route closed while the call waited for input",
+        )
+    }
+}
+
+/// How a call held at its module ends for the host's tools/call. An outage
+/// refusal (`NothingSent`) becomes the outage tool result and is never
+/// retried here: the call was held because it had already reached the
+/// module, so sending it again could run it twice.
+fn held_call_outcome(
+    attempt: CallAttempt,
+    module_id: &str,
+    route_gone: &'static str,
+) -> std::result::Result<ToolCallOutcome, ErrorData> {
+    match attempt {
+        CallAttempt::Answered(result) => Ok(ToolCallOutcome::Done(result)),
+        CallAttempt::NeedsInput(held, ask) => Ok(ToolCallOutcome::NeedsInput(held, ask)),
+        CallAttempt::Promote(held, ask) => Ok(ToolCallOutcome::Promote(held, ask)),
+        CallAttempt::NothingSent(refusal) => Ok(ToolCallOutcome::Done(outage_tool_result(
+            module_id, &refusal,
+        ))),
+        CallAttempt::RouteGone => Err(ErrorData::internal_error(route_gone, None)),
     }
 }
 
@@ -6019,6 +6115,7 @@ impl SubcMcpServer {
             conversation,
             outage_wait: OutageWait::from_env(),
             held_calls: HeldCalls::default(),
+            tasks: Tasks::default(),
         }
     }
 
@@ -6220,6 +6317,7 @@ impl SubcMcpServer {
             CallAttempt::NeedsInput(held, ask) => {
                 return Ok(ToolCallOutcome::NeedsInput(held, ask))
             }
+            CallAttempt::Promote(held, ask) => return Ok(ToolCallOutcome::Promote(held, ask)),
             CallAttempt::NothingSent(refusal) => refusal,
             // `send_bound_call` reports a closed route this way only on a
             // retried attempt; the first one keeps the route's own error.
@@ -6261,6 +6359,7 @@ impl SubcMcpServer {
                 CallAttempt::NeedsInput(held, ask) => {
                     return Ok(ToolCallOutcome::NeedsInput(held, ask))
                 }
+                CallAttempt::Promote(held, ask) => return Ok(ToolCallOutcome::Promote(held, ask)),
                 CallAttempt::NothingSent(next) => refusal = next,
                 // The route closed before this attempt reached the daemon's
                 // router: the module is still coming back. Keep waiting on the
@@ -6412,26 +6511,28 @@ impl SubcMcpServer {
             frames,
             input,
         );
-        self.await_held_call(held, context).await
+        self.await_held_call(held, context, true).await
     }
 
     /// Waits for the module's answer to a call already sent, forwarding its
     /// progress to the host. For a host on MCP 2026-07-28 or later it also
     /// stops when the module asks the host a question, handing back the call
-    /// still held at the module so the host's follow-up can resume it.
+    /// still held at the module so the host's follow-up can resume it. When
+    /// `may_become_task` and the request lets the gateway answer with an MCP
+    /// task, it instead hands the call back for a task once the call has run
+    /// past the task promotion delay, or when the module asks a question.
     async fn await_held_call(
         &self,
         mut held: HeldCall,
         context: &RequestContext<RoleServer>,
+        may_become_task: bool,
     ) -> std::result::Result<CallAttempt, ErrorData> {
         let (route, corr, retrying) = (held.route, held.corr, held.retrying);
         let progress_token = context.meta.get_progress_token();
+        let promote_at = (may_become_task && self.request_takes_tasks(context))
+            .then(|| self.tasks.promotion_deadline());
         loop {
-            let event = tokio::select! {
-                _ = context.ct.cancelled() => HeldCallEvent::Cancelled,
-                frame = held.frames.next() => HeldCallEvent::Frame(frame),
-                ask = held.input.next() => HeldCallEvent::Input(Box::new(ask)),
-            };
+            let event = next_held_event(&mut held, context.ct.cancelled(), promote_at).await;
             let frame = match event {
                 HeldCallEvent::Cancelled => {
                     let cancel_result = self.send_route_cancel(route, corr).await;
@@ -6439,62 +6540,44 @@ impl SubcMcpServer {
                     cancel_result.map_err(mcp_internal_error)?;
                     return Err(tool_call_cancelled_error());
                 }
+                HeldCallEvent::Input(ask) if promote_at.is_some() => {
+                    return Ok(CallAttempt::Promote(Box::new(held), Some(*ask)));
+                }
                 HeldCallEvent::Input(ask) => {
                     return Ok(CallAttempt::NeedsInput(Box::new(held), *ask));
                 }
+                HeldCallEvent::Promote => return Ok(CallAttempt::Promote(Box::new(held), None)),
                 HeldCallEvent::Frame(None) => return Err(route_closed_error(route, corr)),
                 HeldCallEvent::Frame(Some(frame)) => frame,
             };
 
-            match frame.header.ty {
-                FrameType::Push => {
-                    if let Err(err) =
-                        forward_progress(context, progress_token.clone(), &frame.body).await
-                    {
-                        let cancel_result = self.send_route_cancel(route, corr).await;
-                        self.subc.abandon_request(route, corr).await;
-                        cancel_result.map_err(mcp_internal_error)?;
-                        return Err(err);
-                    }
+            if frame.header.ty == FrameType::Push {
+                if let Err(err) =
+                    forward_progress(context, progress_token.clone(), &frame.body).await
+                {
+                    let cancel_result = self.send_route_cancel(route, corr).await;
+                    self.subc.abandon_request(route, corr).await;
+                    cancel_result.map_err(mcp_internal_error)?;
+                    return Err(err);
                 }
-                FrameType::Response => {
-                    let mut result = serde_json::from_slice::<CallToolResult>(&frame.body)
-                        .map_err(|source| {
-                            ErrorData::internal_error(
-                                format!("provider returned malformed tool result: {source}"),
-                                None,
-                            )
-                        })?;
-                    // rmcp 3 keeps a provider's `"structuredContent": null` and
-                    // sends it on; rmcp 1 read it as absent and left it out.
-                    // Hosts keep getting the rmcp 1 shape.
-                    if result.structured_content == Some(serde_json::Value::Null) {
-                        result.structured_content = None;
-                    }
-                    return Ok(CallAttempt::Answered(result));
-                }
-                FrameType::Error => {
-                    if let Some(attempt) =
-                        unsent_call_attempt(frame.header.flags, &frame.body, retrying)
-                    {
-                        return Ok(attempt);
-                    }
-                    return Err(subc_error_to_mcp(
-                        "subc route tool call failed",
-                        &frame.body,
-                    ));
-                }
-                ty => {
-                    return Err(ErrorData::internal_error(
-                        format!(
-                            "unexpected route frame {ty:?} on handle ({}, {}) corr {}",
-                            frame.header.channel, frame.header.epoch, frame.header.corr
-                        ),
-                        None,
-                    ));
-                }
+                continue;
             }
+            return tool_call_answer(&frame, retrying);
         }
+    }
+
+    /// Whether this tools/call may be answered with an MCP task: the host
+    /// started without `initialize`, and the request names 2026-07-28 or
+    /// later and declares the tasks extension in its own `_meta`, as the
+    /// extension requires of every request a task answers.
+    fn request_takes_tasks(&self, context: &RequestContext<RoleServer>) -> bool {
+        self.relay_session.is_inline_host()
+            && context
+                .protocol_version()
+                .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+            && context
+                .client_capabilities()
+                .is_some_and(|capabilities| capabilities.supports_tasks())
     }
 
     /// Lists a call from a host that started without `initialize` (MCP
@@ -6529,19 +6612,61 @@ impl SubcMcpServer {
     }
 
     async fn send_route_cancel(&self, route: RouteHandle, corr: u64) -> Result<()> {
-        self.subc.validate_handle(route)?;
-        self.subc
-            .relay()
-            .cancel_route_prompts(route, "enclosing route request was cancelled")
-            .await;
-        let frame = self.subc.build_route_frame(
-            FrameType::Cancel,
-            data_flags(),
-            route,
-            corr,
-            Vec::new(),
-        )?;
-        self.subc.send_route_frame(route, frame).await
+        send_module_cancel(&self.subc, route, corr).await
+    }
+}
+
+/// What the module hears when the host cancels a tool call it sent: its
+/// questions still out on the route are withdrawn and the request gets a
+/// Cancel frame. The caller stops listening for the request afterwards.
+async fn send_module_cancel(subc: &SubcClient, route: RouteHandle, corr: u64) -> Result<()> {
+    subc.validate_handle(route)?;
+    subc.relay()
+        .cancel_route_prompts(route, "enclosing route request was cancelled")
+        .await;
+    let frame = subc.build_route_frame(FrameType::Cancel, data_flags(), route, corr, Vec::new())?;
+    subc.send_route_frame(route, frame).await
+}
+
+/// Reads the module's last frame for a tool call: its result, a refusal
+/// proving the call never reached it, or the error the call failed with.
+fn tool_call_answer(
+    frame: &SubcFrame,
+    retrying: bool,
+) -> std::result::Result<CallAttempt, ErrorData> {
+    match frame.header.ty {
+        FrameType::Response => {
+            let mut result =
+                serde_json::from_slice::<CallToolResult>(&frame.body).map_err(|source| {
+                    ErrorData::internal_error(
+                        format!("provider returned malformed tool result: {source}"),
+                        None,
+                    )
+                })?;
+            // rmcp 3 keeps a provider's `"structuredContent": null` and
+            // sends it on; rmcp 1 read it as absent and left it out.
+            // Hosts keep getting the rmcp 1 shape.
+            if result.structured_content == Some(serde_json::Value::Null) {
+                result.structured_content = None;
+            }
+            Ok(CallAttempt::Answered(result))
+        }
+        FrameType::Error => {
+            if let Some(attempt) = unsent_call_attempt(frame.header.flags, &frame.body, retrying) {
+                return Ok(attempt);
+            }
+            Err(subc_error_to_mcp(
+                "subc route tool call failed",
+                &frame.body,
+            ))
+        }
+        ty => Err(ErrorData::internal_error(
+            format!(
+                "unexpected route frame {ty:?} on handle ({}, {}) corr {}",
+                frame.header.channel, frame.header.epoch, frame.header.corr
+            ),
+            None,
+        )),
     }
 }
 
@@ -6715,6 +6840,11 @@ enum CallAttempt {
     /// The module asked a host on MCP 2026-07-28 or later a question while
     /// handling the call, which is still held at the module.
     NeedsInput(Box<HeldCall>, InputAsk),
+    /// The call, still held at the module, is ready to continue as an MCP
+    /// task: it ran past the task promotion delay, or the module asked the
+    /// question carried here. If the session has no room for another task,
+    /// the caller keeps it inline.
+    Promote(Box<HeldCall>, Option<InputAsk>),
     /// The daemon proved the call never reached the provider.
     NothingSent(OutageRefusal),
     /// A retried attempt went out on a route the daemon had already closed
@@ -6730,6 +6860,9 @@ enum ToolCallOutcome {
     /// The module's question goes to the host in `inputRequests`, and
     /// the call waits for the host's follow-up.
     NeedsInput(Box<HeldCall>, InputAsk),
+    /// The call is ready to continue as an MCP task, or inline if the session
+    /// has no room; see [`CallAttempt::Promote`].
+    Promote(Box<HeldCall>, Option<InputAsk>),
 }
 
 /// A daemon refusal proving a tool call never reached its provider: a

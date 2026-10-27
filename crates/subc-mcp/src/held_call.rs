@@ -121,7 +121,7 @@ impl HeldInput {
     /// Error frame when the host's follow-up carried none. The call is open
     /// to a further question before the answer goes out, because the module
     /// may ask again as soon as it has it.
-    async fn deliver_answer(&mut self, answer: Option<&serde_json::Value>) {
+    pub(super) async fn deliver_answer(&mut self, answer: Option<&serde_json::Value>) {
         let Some(guard) = &mut self.0 else {
             return;
         };
@@ -151,7 +151,7 @@ impl HeldInput {
     /// Records that `key`'s question went to the host. Returns the deadline
     /// for the host's answer: the reverse-request relay's TTL from when the
     /// module asked.
-    fn mark_outstanding(&mut self, ask: &InputAsk) -> time::Instant {
+    pub(super) fn mark_outstanding(&mut self, ask: &InputAsk) -> time::Instant {
         match &mut self.0 {
             Some(guard) => {
                 guard.outstanding = Some(ask.pending_key);
@@ -159,6 +159,23 @@ impl HeldInput {
             }
             None => ask.asked_at + DEFAULT_REVERSE_RELAY_TTL,
         }
+    }
+
+    /// The host never answered the outstanding question within the relay
+    /// TTL: the module hears what a person declining tells it, and the call
+    /// is open to a further question.
+    pub(super) async fn decline_outstanding(&mut self) {
+        let Some(guard) = &mut self.0 else {
+            return;
+        };
+        let Some(key) = guard.outstanding.take() else {
+            return;
+        };
+        guard.session.clear_input_asked(guard.id);
+        guard
+            .relay
+            .settle_with_answer(key, &unanswered_elicitation())
+            .await;
     }
 }
 
@@ -221,6 +238,34 @@ pub(super) enum HeldCallEvent {
     Cancelled,
     Frame(Option<SubcFrame>),
     Input(Box<InputAsk>),
+    /// The call has run past its task promotion delay. The caller hands it to
+    /// a task if the session has room, and keeps it inline otherwise.
+    Promote,
+}
+
+/// Waits for the next thing that happens to `held`: the host cancelling its
+/// request, a frame from the module, a module question, or `promote_at`
+/// passing. Exactly one of them wins. A frame that arrives as `promote_at`
+/// passes stays in the call's queue when promotion wins, so the module's
+/// answer is read exactly once, either here or by the task that takes the
+/// call over.
+pub(super) async fn next_held_event(
+    held: &mut HeldCall,
+    cancelled: impl std::future::Future<Output = ()>,
+    promote_at: Option<time::Instant>,
+) -> HeldCallEvent {
+    let promote = async {
+        match promote_at {
+            Some(at) => time::sleep_until(at).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        _ = cancelled => HeldCallEvent::Cancelled,
+        frame = held.frames.next() => HeldCallEvent::Frame(frame),
+        ask = held.input.next() => HeldCallEvent::Input(Box::new(ask)),
+        _ = promote => HeldCallEvent::Promote,
+    }
 }
 
 type ResumeReply = oneshot::Sender<Box<HeldCall>>;
@@ -390,14 +435,7 @@ async fn hold_parked_call(
 /// elicitation tells it and finishes its call; nobody is left to read the
 /// result, so the gateway stops listening for it.
 async fn expire_held_call(mut held: Box<HeldCall>, subc: &SubcClient) {
-    if let Some(guard) = &mut held.input.0 {
-        if let Some(key) = guard.outstanding.take() {
-            guard
-                .relay
-                .settle_with_answer(key, &unanswered_elicitation())
-                .await;
-        }
-    }
+    held.input.decline_outstanding().await;
     subc.abandon_request(held.route, held.corr).await;
 }
 
@@ -435,5 +473,63 @@ impl ReverseRelay {
     pub(super) async fn settle_with_error(&self, key: PendingKey, error: ErrorData) {
         let frame = self.build_reverse_error(self.route_handle(key.0, key.1), key.2, error);
         self.settle_pending_frame(key, frame).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The module's answer and the moment a call becomes a task can arrive
+    /// together. Whichever wins, the answer must be read exactly once: by the
+    /// inline wait, or left queued for the task that takes the call over.
+    #[tokio::test]
+    async fn answer_racing_task_promotion_is_read_exactly_once() {
+        let (mut inline, mut promoted) = (0, 0);
+        for _ in 0..200 {
+            let (tx, rx) = mpsc::channel(2);
+            let answer = build_frame(
+                FrameType::Response,
+                data_flags(),
+                1,
+                1,
+                7,
+                br#"{"content":[]}"#.to_vec(),
+            )
+            .unwrap();
+            tx.send(answer).await.unwrap();
+            let route = RouteHandle {
+                channel: 1,
+                epoch: 1,
+                connection_token: 1,
+            };
+            let mut held = HeldCall::new(route, 7, "module".to_owned(), false, rx, None);
+            // Already past, so promotion is as ready as the queued answer.
+            let promote_at = time::Instant::now().checked_sub(Duration::from_millis(50));
+            assert!(promote_at.is_some());
+            match next_held_event(&mut held, std::future::pending(), promote_at).await {
+                HeldCallEvent::Frame(Some(frame)) => {
+                    assert_eq!(frame.header.ty, FrameType::Response);
+                    assert!(
+                        held.frames.rx.try_recv().is_err(),
+                        "an answer read inline must not also reach a task"
+                    );
+                    inline += 1;
+                }
+                HeldCallEvent::Promote => {
+                    let frame = time::timeout(Duration::from_secs(1), held.frames.next())
+                        .await
+                        .expect("the answer should still be queued for the task")
+                        .expect("the call's frame queue should still be open");
+                    assert_eq!(frame.header.ty, FrameType::Response);
+                    promoted += 1;
+                }
+                _ => panic!("expected the answer or the promotion"),
+            }
+        }
+        assert!(
+            inline > 0 && promoted > 0,
+            "both outcomes should occur over 200 races (inline {inline}, promoted {promoted})"
+        );
     }
 }

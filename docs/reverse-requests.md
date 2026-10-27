@@ -131,6 +131,16 @@ repeated call. The module sees no difference.
 - `sampling/createMessage` and `roots/list` are answered with an Error frame
   for these hosts.
 
+When the tools/call's request also declares the MCP tasks extension
+(`io.modelcontextprotocol/tasks`), the call becomes a task instead (once the
+module has run past the gateway's promotion delay, or at once when it asks a
+question), unless the session's 32 task slots all hold running tasks, in
+which case it stays in the flow above. The question then appears as the task's `input_required` status,
+with the same `inputRequests` and the same `in_reply_to` rules, and the host
+answers it with `tasks/update`. The module sees no difference here either.
+An unanswered question is declined to the module after the relay TTL, and
+the task keeps running.
+
 Hosts that sent `initialize` (2025-11-25 and older) keep the server→client
 relay above; `in_reply_to` changes nothing for them.
 

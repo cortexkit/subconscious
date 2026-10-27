@@ -1028,6 +1028,10 @@ impl Router {
                         let mut goodbye = frame;
                         goodbye.header.channel = target.channel;
                         goodbye.header.epoch = target.epoch;
+                        // A module must never be able to make a frame look
+                        // daemon-authored, so the origin bit is cleared on
+                        // every module frame relayed to a client.
+                        goodbye.header.flags = goodbye.header.flags.without_daemon_origin();
                         if let Err(err) = target.sink.send_to_client(goodbye).await {
                             if target.close_on_delivery_failure()
                                 && self
@@ -1084,6 +1088,12 @@ impl Router {
                 let mut frame = frame;
                 frame.header.channel = route.client_channel;
                 frame.header.epoch = route.client_epoch;
+                // Responses, errors, stream data and ends, and reverse
+                // requests all pass through here. A module must never be able
+                // to make a frame look daemon-authored, so the origin bit a
+                // module may have set is cleared; every other flag bit and
+                // the body travel unchanged.
+                frame.header.flags = frame.header.flags.without_daemon_origin();
                 if let Err(err) = route.client_sink.send_to_client(frame).await {
                     if self
                         .forwarding
@@ -1423,6 +1433,10 @@ impl ForwardBackend {
         let mut frame = frame;
         frame.header.channel = route.module_channel;
         frame.header.epoch = route.module_epoch;
+        // The origin bit is the daemon's own signal to clients. A client
+        // frame carrying it must not reach a module appearing daemon-authored,
+        // so it is cleared here; every other flag bit travels unchanged.
+        frame.header.flags = frame.header.flags.without_daemon_origin();
         let result = route.module_sink.send(frame).await.map_err(|err| {
             RouterError::backend_with_epoch(channel, route.client_epoch, corr, err.to_string())
         });
@@ -1565,6 +1579,21 @@ impl RouterError {
     }
 }
 
+/// Flags for an ERROR frame the daemon authors itself.
+///
+/// Bit 6 (`FLAG_DAEMON_ORIGIN`) tells the client the daemon wrote this
+/// error, never a module. What a code then proves is per code: on a bound
+/// route the daemon writes `module_reloading`, `unknown_channel` and
+/// `stale_route_epoch` only before forwarding, so with the bit they mean the
+/// request was not delivered, while `frame_too_large` replaces a reply the
+/// module already produced. Every daemon-authored ERROR goes through here;
+/// frames a module sent keep their own flags with the bit cleared at the
+/// splice.
+/// Nothing else about the flags differs: passive priority, not binary, not last.
+pub(crate) fn daemon_error_flags() -> Flags {
+    Flags::new(false, Priority::Passive, false).with_daemon_origin()
+}
+
 fn error_frame(channel: u16, epoch: u32, corr: u64, code: &str, message: String) -> Option<Frame> {
     let body = serde_json::to_vec(&ErrorBody {
         code: code.to_string(),
@@ -1575,7 +1604,7 @@ fn error_frame(channel: u16, epoch: u32, corr: u64, code: &str, message: String)
 
     Frame::build(
         FrameType::Error,
-        Flags::new(false, Priority::Passive, false),
+        daemon_error_flags(),
         channel,
         epoch,
         corr,
@@ -1601,7 +1630,7 @@ fn frame_too_large_error(
     .expect("serializing a frame size error");
     Frame::build(
         FrameType::Error,
-        Flags::new(false, Priority::Passive, false).with_daemon_origin(),
+        daemon_error_flags(),
         channel,
         epoch,
         corr,
@@ -1760,6 +1789,237 @@ mod tests {
         let body: ErrorBody = serde_json::from_slice(&error_frame.body).unwrap();
         assert_eq!(body.code, "unknown_channel");
         assert_eq!(body.message, "unknown channel 99");
+    }
+
+    /// Every ERROR the daemon authors carries the daemon-origin bit, so a
+    /// client can tell a daemon refusal from a module's reply. Both the
+    /// unknown-channel and the stale-epoch errors below are received on the
+    /// client's own egress, not merely built.
+    #[tokio::test]
+    async fn daemon_authored_data_plane_errors_carry_daemon_origin() {
+        let router = Router::with_default_self_handler();
+        let (ctx, mut rx) = route_ctx();
+        router
+            .route_for_connection(&ctx, request(99, 5, b"payload"))
+            .await
+            .unwrap();
+        let unknown = rx.recv().await.unwrap();
+        assert_eq!(unknown.header.ty, FrameType::Error);
+        let body: ErrorBody = serde_json::from_slice(&unknown.body).unwrap();
+        assert_eq!(body.code, "unknown_channel");
+        assert!(
+            unknown.header.flags.is_daemon_origin(),
+            "unknown_channel must carry daemon origin: {:?}",
+            unknown.header.flags
+        );
+
+        let (
+            router,
+            _forwarding,
+            client_ctx,
+            mut client_rx,
+            _module_ctx,
+            _module_egress_rx,
+            _module_rx,
+            pending,
+        ) = dynamic_route_fixture(true);
+        let _ = client_rx.recv().await;
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Request,
+                    pending.client_channel,
+                    pending.client_epoch + 1,
+                    702,
+                ),
+            )
+            .await
+            .unwrap();
+        let stale = client_rx.recv().await.unwrap();
+        assert_eq!(stale.header.ty, FrameType::Error);
+        let body: ErrorBody = serde_json::from_slice(&stale.body).unwrap();
+        assert_eq!(body.code, "stale_route_epoch");
+        assert!(
+            stale.header.flags.is_daemon_origin(),
+            "stale_route_epoch must carry daemon origin: {:?}",
+            stale.header.flags
+        );
+    }
+
+    /// A module ERROR that spoofs a daemon code with the daemon-origin bit
+    /// set must reach the client with the bit cleared and the body
+    /// byte-identical: the bit means the daemon wrote the frame, and a module
+    /// must never be able to claim that.
+    #[tokio::test]
+    async fn module_error_with_daemon_bit_is_stripped_before_client_delivery() {
+        let (
+            router,
+            _forwarding,
+            client_ctx,
+            mut client_rx,
+            module_ctx,
+            _module_egress_rx,
+            mut module_rx,
+            pending,
+        ) = dynamic_route_fixture(true);
+        let _ = client_rx.recv().await;
+        // Open flow credit the way a real request would, so the terminal
+        // error exercises the credit-release path too.
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Request,
+                    pending.client_channel,
+                    pending.client_epoch,
+                    701,
+                ),
+            )
+            .await
+            .unwrap();
+        let _ = module_rx.recv().await;
+
+        let body = serde_json::to_vec(&ErrorBody::new("module_reloading", "try again")).unwrap();
+        let spoof = Frame::build(
+            FrameType::Error,
+            Flags::new(false, Priority::Interactive, false).with_daemon_origin(),
+            pending.module_channel,
+            pending.module_epoch,
+            701,
+            body.clone(),
+        )
+        .unwrap();
+        router
+            .route_for_connection(&module_ctx, spoof)
+            .await
+            .unwrap();
+        let delivered = client_rx.recv().await.unwrap();
+        assert_eq!(delivered.header.ty, FrameType::Error);
+        assert_eq!(delivered.header.channel, pending.client_channel);
+        assert_eq!(delivered.header.epoch, pending.client_epoch);
+        assert_eq!(delivered.header.corr, 701);
+        assert!(
+            !delivered.header.flags.is_daemon_origin(),
+            "module-set daemon origin must be cleared: {:?}",
+            delivered.header.flags
+        );
+        assert_eq!(delivered.body, body, "the body travels byte-identical");
+    }
+
+    /// Clearing the origin bit strips exactly that bit: priority, LAST and
+    /// subscription survive the splice unchanged.
+    #[tokio::test]
+    async fn module_response_with_daemon_bit_is_stripped_preserving_other_flags() {
+        use subc_protocol::FLAG_SUBSCRIPTION;
+        let (
+            router,
+            _forwarding,
+            client_ctx,
+            mut client_rx,
+            module_ctx,
+            _module_egress_rx,
+            mut module_rx,
+            pending,
+        ) = dynamic_route_fixture(true);
+        let _ = client_rx.recv().await;
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Request,
+                    pending.client_channel,
+                    pending.client_epoch,
+                    701,
+                ),
+            )
+            .await
+            .unwrap();
+        let _ = module_rx.recv().await;
+
+        let sent_flags = Flags(
+            Flags::new(true, Priority::Background, true).0
+                | FLAG_SUBSCRIPTION
+                | subc_protocol::FLAG_DAEMON_ORIGIN,
+        );
+        assert!(sent_flags.is_daemon_origin());
+        let response = Frame::build(
+            FrameType::Response,
+            sent_flags,
+            pending.module_channel,
+            pending.module_epoch,
+            701,
+            b"route-body".to_vec(),
+        )
+        .unwrap();
+        router
+            .route_for_connection(&module_ctx, response)
+            .await
+            .unwrap();
+        let delivered = client_rx.recv().await.unwrap();
+        assert_eq!(delivered.header.ty, FrameType::Response);
+        assert!(
+            !delivered.header.flags.is_daemon_origin(),
+            "module-set daemon origin must be cleared: {:?}",
+            delivered.header.flags
+        );
+        assert!(
+            delivered.header.flags.is_binary(),
+            "binary flag must survive: {:?}",
+            delivered.header.flags
+        );
+        assert!(
+            delivered.header.flags.is_last(),
+            "LAST flag must survive: {:?}",
+            delivered.header.flags
+        );
+        assert!(
+            delivered.header.flags.is_subscription(),
+            "subscription flag must survive: {:?}",
+            delivered.header.flags
+        );
+        assert_eq!(
+            delivered.header.flags.priority(),
+            Some(Priority::Background),
+            "priority must survive"
+        );
+    }
+
+    /// A client frame carrying the origin bit must not reach the module
+    /// looking daemon-authored either: the splice clears it symmetrically.
+    #[tokio::test]
+    async fn client_frame_with_daemon_bit_is_stripped_before_module_delivery() {
+        let (
+            router,
+            _forwarding,
+            client_ctx,
+            mut client_rx,
+            _module_ctx,
+            _module_egress_rx,
+            mut module_rx,
+            pending,
+        ) = dynamic_route_fixture(true);
+        let _ = client_rx.recv().await;
+        let spoof = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false).with_daemon_origin(),
+            pending.client_channel,
+            pending.client_epoch,
+            701,
+            b"route-body".to_vec(),
+        )
+        .unwrap();
+        router
+            .route_for_connection(&client_ctx, spoof)
+            .await
+            .unwrap();
+        let delivered = module_rx.recv().await.unwrap();
+        assert_eq!(delivered.header.ty, FrameType::Request);
+        assert!(
+            !delivered.header.flags.is_daemon_origin(),
+            "client-set daemon origin must be cleared: {:?}",
+            delivered.header.flags
+        );
     }
 
     #[tokio::test]

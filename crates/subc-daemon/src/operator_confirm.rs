@@ -304,10 +304,14 @@ impl Outcome {
         }
     }
     pub(crate) fn frame(self, request: &Frame) -> Frame {
-        let (ty, body) = if self.code == "confirmed" {
+        // A refusal is the daemon's own answer to the client's request, so
+        // its ERROR carries the daemon-origin bit; a confirmation is a plain
+        // response and keeps the control flags.
+        let (ty, body, daemon_origin) = if self.code == "confirmed" {
             (
                 FrameType::Response,
                 serde_json::to_vec(&OperatorConfirmReply::confirmed()).expect("serializable reply"),
+                false,
             )
         } else {
             let mut error = ErrorBody::new(self.code, "operator confirmation refused");
@@ -323,12 +327,18 @@ impl Outcome {
             (
                 FrameType::Error,
                 serde_json::to_vec(&error).expect("serializable error"),
+                true,
             )
+        };
+        let flags = if daemon_origin {
+            crate::router::daemon_error_flags()
+        } else {
+            Flags::new(false, Priority::Passive, false)
         };
         Frame::build_with_version(
             request.header.ver,
             ty,
-            Flags::new(false, Priority::Passive, false),
+            flags,
             0,
             0,
             request.header.corr,

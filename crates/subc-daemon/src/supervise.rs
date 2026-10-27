@@ -1810,6 +1810,7 @@ fn spawn_subscriber_lagged_frame(
     corr: u64,
     first_undelivered: SpawnCursor,
 ) -> Result<Frame, String> {
+    // The daemon authors this terminal Error, so it carries the daemon-origin bit.
     let body = serde_json::to_vec(&subc_protocol::ErrorBody {
         code: SPAWN_SUBSCRIBER_LAGGED_CODE.to_string(),
         message: "spawn subscriber fell behind and was dropped; resubscribe from the last cursor received"
@@ -1819,8 +1820,16 @@ fn spawn_subscriber_lagged_frame(
         })),
     })
     .map_err(|error| error.to_string())?;
-    Frame::build_with_version(version, FrameType::Error, control_flags(), 0, 0, corr, body)
-        .map_err(|error| error.to_string())
+    Frame::build_with_version(
+        version,
+        FrameType::Error,
+        crate::router::daemon_error_flags(),
+        0,
+        0,
+        corr,
+        body,
+    )
+    .map_err(|error| error.to_string())
 }
 
 pub trait ModuleProcessLiveness: Send + Sync {

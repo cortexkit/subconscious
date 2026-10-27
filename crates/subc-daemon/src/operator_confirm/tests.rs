@@ -22,6 +22,31 @@ fn frame(ty: FrameType, corr: u64, body: serde_json::Value) -> Frame {
     )
     .unwrap()
 }
+
+/// A refusal is the daemon's own answer, so its ERROR carries the
+/// daemon-origin bit; a confirmation stays a plain response without it.
+#[test]
+fn operator_outcome_frames_mark_only_refusals_as_daemon_origin() {
+    let request = frame(
+        FrameType::Request,
+        41,
+        serde_json::json!({"op": "operator.confirm"}),
+    );
+    let refused = Outcome::refusal(error_codes::OPERATOR_DECLINED).frame(&request);
+    assert_eq!(refused.header.ty, FrameType::Error);
+    assert!(
+        refused.header.flags.is_daemon_origin(),
+        "operator refusal must carry daemon origin: {:?}",
+        refused.header.flags
+    );
+    let confirmed = Outcome::from_provider(ProviderResult::Approved).frame(&request);
+    assert_eq!(confirmed.header.ty, FrameType::Response);
+    assert!(
+        !confirmed.header.flags.is_daemon_origin(),
+        "operator confirmation must not carry daemon origin: {:?}",
+        confirmed.header.flags
+    );
+}
 fn body(frame: &Frame) -> serde_json::Value {
     serde_json::from_slice(&frame.body).unwrap()
 }

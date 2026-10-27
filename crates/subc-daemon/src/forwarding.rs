@@ -347,7 +347,19 @@ pub(crate) struct ModuleConnectionTarget {
 #[derive(Debug, Clone)]
 pub(crate) enum RouteBindRelayOutcome {
     Accepted,
+    /// The module refused the bind with its own body. Relayed to the client
+    /// without the daemon-origin bit: the code and message are module-chosen,
+    /// so the frame must not claim daemon authorship, even when the module
+    /// picks a daemon code like `module_reloading`.
     Rejected(ErrorBody),
+    /// The daemon refused the bind itself — a drain or superseded endpoint
+    /// (`module_reloading`), a reply that arrived after the deadline
+    /// (`module_timeout`), or a scope that ended mid-bind. Carries the
+    /// daemon-origin bit because the daemon wrote it. The module may still
+    /// have received the bind (a late reply, or a drain that began after it
+    /// accepted); the daemon then ends that binding with a GOODBYE, so no
+    /// call runs on it.
+    DaemonRejected(ErrorBody),
     ModuleGone(String),
 }
 
@@ -1670,7 +1682,7 @@ impl ForwardingTable {
                 .flatten();
             let _ = pending
                 .sender
-                .send(RouteBindRelayOutcome::Rejected(ErrorBody {
+                .send(RouteBindRelayOutcome::DaemonRejected(ErrorBody {
                     code: "module_timeout".to_string(),
                     message: "route.bind response arrived after its daemon deadline".to_string(),
                     detail: None,
@@ -1769,7 +1781,7 @@ impl ForwardingTable {
                     .unwrap_or_else(|| "unknown".to_string());
                 let _ = pending
                     .sender
-                    .send(RouteBindRelayOutcome::Rejected(ErrorBody::new(
+                    .send(RouteBindRelayOutcome::DaemonRejected(ErrorBody::new(
                         "module_reloading",
                         format!("module_id '{module_id}' is reloading"),
                     )));
@@ -1805,7 +1817,7 @@ impl ForwardingTable {
                 let abandoned = abandoned_route_target(&inner, &pending.reservation);
                 let _ = pending
                     .sender
-                    .send(RouteBindRelayOutcome::Rejected(refusal));
+                    .send(RouteBindRelayOutcome::DaemonRejected(refusal));
                 return Ok(PendingRelayCompletion {
                     settled: true,
                     abandoned,
@@ -2357,7 +2369,7 @@ fn begin_drain_locked(
             }
             let _ = pending
                 .sender
-                .send(RouteBindRelayOutcome::Rejected(ErrorBody::new(
+                .send(RouteBindRelayOutcome::DaemonRejected(ErrorBody::new(
                     "module_reloading",
                     format!("module_id '{module_id}' is reloading"),
                 )));
@@ -4306,7 +4318,7 @@ mod tests {
             .expect("late accepted bind needs a route GOODBYE");
         assert_eq!(abandoned.channel, pending.module_channel);
         assert!(matches!(pending.receiver.try_recv().unwrap(),
-            RouteBindRelayOutcome::Rejected(error) if error.code == "module_reloading"));
+            RouteBindRelayOutcome::DaemonRejected(error) if error.code == "module_reloading"));
         assert_eq!(forwarding.reserved_route_count().unwrap(), (0, 0));
         assert_eq!(forwarding.active_binding_count().unwrap(), 0);
         assert!(
@@ -5475,7 +5487,9 @@ mod swap_slot_tests {
         assert_eq!(goodbye.epoch, early.module_epoch);
         assert_eq!(goodbye.kind, GoodbyeTargetKind::Module);
         match early.receiver.try_recv() {
-            Ok(RouteBindRelayOutcome::Rejected(body)) => assert_eq!(body.code, "module_reloading"),
+            Ok(RouteBindRelayOutcome::DaemonRejected(body)) => {
+                assert_eq!(body.code, "module_reloading")
+            }
             other => panic!("expected a retryable module_reloading answer, got {other:?}"),
         }
         assert!(matches!(
@@ -5545,7 +5559,7 @@ mod swap_slot_tests {
         );
         assert!(matches!(
             in_flight.receiver.try_recv(),
-            Ok(RouteBindRelayOutcome::Rejected(body)) if body.code == "module_reloading"
+            Ok(RouteBindRelayOutcome::DaemonRejected(body)) if body.code == "module_reloading"
         ));
         assert_eq!(
             forwarding.endpoint_routes(fixture.incumbent).unwrap().len(),

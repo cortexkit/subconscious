@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.37.15
+
+- Every ERROR frame the daemon writes itself now carries the daemon-origin flag (bit 6), so a client can tell a daemon refusal apart from a module's reply. That covers the data-plane errors (`unknown_channel`, `stale_route_epoch`, `frame_too_large`), the daemon's own channel-0 refusals including `route.open` refusals and the drain `module_reloading`, operator-confirmation refusals, and the lagged spawn-subscriber terminal. Responses and other non-error frames are unchanged. A module's own rejection relayed to a client (a refused route.bind answered as a route.open refusal, or a refused health probe) keeps plain flags with the bit clear, so a module that refuses with a daemon code like `module_reloading` still cannot mint a daemon refusal.
+- The daemon clears the daemon-origin flag on every frame it forwards between a module and a client (responses, errors, stream data and ends, reverse requests, GOODBYEs, and client frames relayed to a module). A module can no longer set the bit on one of its own frames and have it delivered looking daemon-authored, so the bit always means the daemon wrote the frame. It does not by itself mean the request never reached the module: `frame_too_large`, for one, replaces a reply the module already produced. Which daemon codes prove a request was never delivered stays the client's decision, code by code. Bodies, codes, messages, channels and epochs are unchanged; only the flag bit differs.
+
 ## 0.37.14
 
 - A module re-registering with a new version but the same capability claims now logs `module version changed` at INFO with `from` and `to`, instead of the `capability claims drifted from the cached manifest` WARN (#148). The WARN is kept for a real change to `provides` and now names the `added` and `removed` capability ids in sorted order, plus `from` and `to` when the version changed too. Claims listed in a different order are no longer treated as a change.

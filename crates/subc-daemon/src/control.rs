@@ -66,7 +66,7 @@ use crate::{
         process_start_time, spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity,
     },
     registry::{ChannelState, ConnectionId, RegistrationEndReason, Registry, RegistryError},
-    router::{RouteCtx, RouterError},
+    router::{daemon_error_flags, RouteCtx, RouterError},
     scopes::{HelloLaunchNonces, ScopeRecords, ScopeTable},
     server::MAX_PENDING_ROUTE_BINDS_PER_TARGET,
     stderr_tail::{CaptureState, TailEntry},
@@ -4140,6 +4140,67 @@ impl ControlHandler {
         control_error_frame(frame, code, message.into())
     }
 
+    /// Answer a waiting `route.open` whose relayed bind was refused.
+    ///
+    /// `daemon_authored` is provenance, not a code match: the daemon
+    /// synthesized the refusal itself (a drain, a late reply, a scope that
+    /// ended mid-bind) or the module refused the bind with its own body. A
+    /// daemon refusal carries the daemon-origin bit; a module's own
+    /// rejection is relayed with the bit clear, so a module that refuses
+    /// with `module_reloading` still cannot mint a daemon refusal.
+    #[allow(clippy::too_many_arguments)]
+    fn route_bind_rejection(
+        &self,
+        ctx: &RouteCtx,
+        caller: &RouteOpenCaller,
+        frame: &Frame,
+        target_module_id: &str,
+        body: ErrorBody,
+        daemon_authored: bool,
+    ) -> Result<Vec<Frame>, RouterError> {
+        // The daemon's own commit re-check refused the bind because the
+        // scope ended or changed after admission. The module accepted;
+        // counting it as a module rejection would blame the module. This
+        // branch only runs for daemon-synthesized bodies: a module that
+        // refuses with a scope code is answered as a module rejection below.
+        if daemon_authored {
+            let scope_code = match body.code.as_str() {
+                error_codes::SCOPE_CHANGED => Some(error_codes::SCOPE_CHANGED),
+                error_codes::SCOPE_ENDED => Some(error_codes::SCOPE_ENDED),
+                _ => None,
+            };
+            if let Some(code) = scope_code {
+                self.observe_route_open_refusal(
+                    ctx,
+                    caller,
+                    target_module_id,
+                    "scope_changed_before_commit",
+                    code,
+                );
+                return Ok(vec![control_error_body_frame(frame, body)?]);
+            }
+        }
+        self.counters
+            .increment_route_open_refused("module_rejected");
+        info!(
+            target: "control",
+            code = "module_rejected",
+            module_code = ?body.code,
+            module_id = ?target_module_id,
+            connection_id = ctx.connection_id.get(),
+            principal = %caller.principal,
+            scope = %caller.scope,
+            harness = %caller.harness,
+            "route.open refused"
+        );
+        let refusal = if daemon_authored {
+            control_error_body_frame(frame, body)?
+        } else {
+            control_relayed_error_body_frame(frame, body)?
+        };
+        Ok(vec![refusal])
+    }
+
     /// Refuse a `route.open` because the target module's bind-relay breaker is
     /// open, without attempting the relay.
     ///
@@ -5222,38 +5283,12 @@ impl ControlHandler {
                 // is a different condition with its own refusal and must not
                 // move the breaker.
                 breaker.record_inconclusive();
-                // The daemon's own commit re-check refused the bind because the
-                // scope ended or changed after admission. The module accepted;
-                // counting it as a module rejection would blame the module.
-                let scope_code = match body.code.as_str() {
-                    error_codes::SCOPE_CHANGED => Some(error_codes::SCOPE_CHANGED),
-                    error_codes::SCOPE_ENDED => Some(error_codes::SCOPE_ENDED),
-                    _ => None,
-                };
-                if let Some(code) = scope_code {
-                    self.observe_route_open_refusal(
-                        ctx,
-                        &caller,
-                        &target_module_id,
-                        "scope_changed_before_commit",
-                        code,
-                    );
-                    return Ok(vec![control_error_body_frame(&frame, body)?]);
-                }
-                self.counters
-                    .increment_route_open_refused("module_rejected");
-                info!(
-                    target: "control",
-                    code = "module_rejected",
-                    module_code = ?body.code,
-                    module_id = ?target_module_id,
-                    connection_id = ctx.connection_id.get(),
-                    principal = %caller.principal,
-                    scope = %caller.scope,
-                    harness = %caller.harness,
-                    "route.open refused"
-                );
-                Ok(vec![control_error_body_frame(&frame, body)?])
+                self.route_bind_rejection(ctx, &caller, &frame, &target_module_id, body, false)
+            }
+            Ok(Ok(RouteBindRelayOutcome::DaemonRejected(body))) => {
+                reservation.release_and_disarm();
+                breaker.record_inconclusive();
+                self.route_bind_rejection(ctx, &caller, &frame, &target_module_id, body, true)
             }
             Ok(Ok(RouteBindRelayOutcome::ModuleGone(message))) => {
                 reservation.release_and_disarm();
@@ -6658,7 +6693,9 @@ impl ControlHandler {
             }
             Ok(Ok(ModuleControlRpcOutcome::Rejected(body))) => {
                 guard.disarm();
-                Ok(vec![control_error_body_frame(&frame, body)?])
+                // The module refused the health probe with its own body, so
+                // the refusal is relayed without the daemon-origin bit.
+                Ok(vec![control_relayed_error_body_frame(&frame, body)?])
             }
             Ok(Ok(ModuleControlRpcOutcome::ModuleGone(message))) => {
                 guard.disarm();
@@ -7849,7 +7886,31 @@ pub(crate) fn control_error_frame(
     )
 }
 
+/// A channel-0 ERROR for a refusal the daemon decided itself: every
+/// route.open refusal, the drain `module_reloading` and scope-change/end
+/// bodies, spawn-subscription and supervisor refusals. Carries the
+/// daemon-origin bit, which is what lets a client treat `module_reloading`
+/// as proof that its request never reached a module. Response, push,
+/// goodbye and relay-request frames keep the plain control flags in their
+/// own builders.
 fn control_error_body_frame(frame: &Frame, error: ErrorBody) -> Result<Frame, RouterError> {
+    control_error_frame_with_flags(frame, error, daemon_error_flags())
+}
+
+/// A channel-0 ERROR relaying a module's own rejection body unchanged: a
+/// refused route.bind answered as a route.open refusal, or a refused
+/// module-control RPC. Plain control flags — the code and message are
+/// module-chosen, so the frame must not claim daemon authorship, even when
+/// the module picks a daemon code like `module_reloading`.
+fn control_relayed_error_body_frame(frame: &Frame, error: ErrorBody) -> Result<Frame, RouterError> {
+    control_error_frame_with_flags(frame, error, control_flags())
+}
+
+fn control_error_frame_with_flags(
+    frame: &Frame,
+    error: ErrorBody,
+    flags: Flags,
+) -> Result<Frame, RouterError> {
     let body = serde_json::to_vec(&error).map_err(|err| {
         RouterError::backend(
             0,
@@ -7861,7 +7922,7 @@ fn control_error_body_frame(frame: &Frame, error: ErrorBody) -> Result<Frame, Ro
     Frame::build_with_version(
         response_version(frame),
         FrameType::Error,
-        control_flags(),
+        flags,
         0,
         0,
         frame.header.corr,
@@ -13807,6 +13868,134 @@ mod tests {
         let logged = event.fields.get("module_id").expect("module_id field");
         assert!(!logged.bytes().any(|byte| byte < 0x20));
         assert_eq!(logged, r#""\u{1b}]52;c;AAAA\u{7}""#);
+    }
+
+    /// A route.open refusal is the daemon's own answer, so its ERROR carries
+    /// the daemon-origin bit on the frame the client receives.
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_open_refusal_carries_daemon_origin() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(95));
+        let response = handler
+            .handle_control_frame(
+                &ctx,
+                route_open_frame(395, "nobody", unique_project_root("refusal-origin")),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.len(), 1);
+        assert_eq!(response[0].header.ty, FrameType::Error);
+        assert_eq!(parse_error(&response[0])["code"], "unknown_module");
+        assert!(
+            response[0].header.flags.is_daemon_origin(),
+            "route.open refusal must carry daemon origin: {:?}",
+            response[0].header.flags
+        );
+    }
+
+    /// The drain `module_reloading` refusal is daemon-synthesized for an
+    /// endpoint that is reloading, so it carries the daemon-origin bit on the
+    /// frame the client receives.
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_open_to_draining_module_refuses_module_reloading_with_daemon_origin() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let module_connection = ConnectionId::new(95);
+        let (module_ctx, mut module_rx) = route_ctx(module_connection);
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame("aft", PROTOCOL_VERSION, 395),
+        )
+        .await;
+        forwarding
+            .begin_module_drain("aft", RouteCloseReason::Restart)
+            .unwrap()
+            .expect("the module endpoint drains");
+
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(96));
+        let response = handler
+            .handle_control_frame(
+                &client_ctx,
+                route_open_frame(396, "aft", unique_project_root("drain-origin")),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.len(), 1);
+        assert_eq!(response[0].header.ty, FrameType::Error);
+        assert_eq!(parse_error(&response[0])["code"], "module_reloading");
+        assert!(
+            response[0].header.flags.is_daemon_origin(),
+            "drain module_reloading must carry daemon origin: {:?}",
+            response[0].header.flags
+        );
+    }
+
+    /// A module that refuses a bind with a daemon code still cannot mint a
+    /// daemon refusal: the relayed `module_reloading` body reaches the client
+    /// with the daemon-origin bit clear.
+    #[tokio::test(flavor = "current_thread")]
+    async fn route_open_module_rejection_with_daemon_code_carries_no_daemon_origin() {
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let handler =
+            ControlHandler::with_forwarding(Arc::clone(&registry), Arc::clone(&forwarding));
+        let module_connection = ConnectionId::new(95);
+        let (module_ctx, mut module_rx) = route_ctx(module_connection);
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame("aft", PROTOCOL_VERSION, 395),
+        )
+        .await;
+
+        let client_connection = ConnectionId::new(96);
+        let (client_ctx, _client_rx) = route_ctx(client_connection);
+        let (route_task, bind) = relay_route_open(
+            &handler,
+            client_connection,
+            &client_ctx.egress,
+            &mut module_rx,
+            396,
+            "aft",
+            "spoofed-reloading",
+        )
+        .await;
+        // The module sets the origin bit on its own rejection too: neither
+        // the bit nor the daemon code may survive the relay as daemon-owned.
+        let rejection = Frame::build(
+            FrameType::Error,
+            crate::router::daemon_error_flags(),
+            0,
+            0,
+            bind.header.corr,
+            serde_json::to_vec(&ErrorBody::new(
+                "module_reloading",
+                "module refused route.bind",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        handler
+            .handle_control_frame(&module_ctx, rejection)
+            .await
+            .unwrap();
+
+        let response = route_task.await.unwrap();
+        assert_eq!(response.len(), 1);
+        assert_eq!(response[0].header.ty, FrameType::Error);
+        assert_eq!(parse_error(&response[0])["code"], "module_reloading");
+        assert!(
+            !response[0].header.flags.is_daemon_origin(),
+            "a module's own rejection must not carry daemon origin: {:?}",
+            response[0].header.flags
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

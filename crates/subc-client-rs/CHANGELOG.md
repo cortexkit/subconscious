@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.32.9
+
+- Add `ModuleHandle::confirm_enrollment(summary, caller_route)`, which sends the same `operator.confirm` request as `confirm_operator` with `kind: "enrollment"`, sharing its 290-second deadline, withdrawal-on-drop and error mapping. The daemon never approves an enrollment without an operator prompt, though it may still refuse one before prompting; a daemon built against subc-protocol before 0.33.5 ignores the kind and treats it as a plain `confirm_operator` request.
+- Require subc-protocol 0.33.5, the first release with `OperatorConfirmKind`. 0.32.8 already used that type while still declaring 0.33.0, so it failed to build against an older locked 0.33 release.
+
 ## 0.32.8
 
 - Add `ModuleHandle::confirm_operation(summary, caller_route, operation)`, which sends the same `operator.confirm` request as `confirm_operator` with `kind: "operation"` and the operation name set, sharing its 290-second deadline, withdrawal-on-drop and error mapping. An empty operation name is refused locally as the new `OperatorConfirmError::OperationInvalid` without sending. Any other name is sent as is; a name the module did not declare in its manifest `confirm_operations` still prompts, and `Ok(())` authorises only this one write.

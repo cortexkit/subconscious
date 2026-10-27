@@ -888,6 +888,38 @@ impl ModuleHandle {
         .await
     }
 
+    /// Ask the operator to authorise pairing or enrolling a device or credential.
+    ///
+    /// This sends the same `operator.confirm` request as [`Self::confirm_operator`],
+    /// with `kind` set to `"enrollment"`. It shares the same deadline,
+    /// withdrawal-on-drop and error mapping: every error means the module must
+    /// refuse the enrollment, and `Ok(())` authorises only the enrollment this
+    /// call was made for; it must never be cached or reused.
+    ///
+    /// The daemon never approves an enrollment without an operator prompt; it
+    /// may still refuse one before prompting, as for any confirmation. A
+    /// daemon built against subc-protocol before 0.33.5 ignores the kind and
+    /// treats the request as [`Self::confirm_operator`] does.
+    ///
+    /// A consumer call that may trigger confirmation must set
+    /// [`CallOptions::timeout`] to at least 300 seconds. This helper waits up to
+    /// 290 seconds, including egress backpressure, and dropping it withdraws an
+    /// accepted request.
+    pub async fn confirm_enrollment(
+        &self,
+        summary: &str,
+        caller_route: &RouteHandle,
+    ) -> Result<(), OperatorConfirmError> {
+        self.confirm_inner(
+            summary,
+            caller_route,
+            Some(OperatorConfirmKind::Enrollment),
+            None,
+            OPERATOR_CONFIRM_TIMEOUT,
+        )
+        .await
+    }
+
     pub(crate) async fn confirm_operator_with_deadline(
         &self,
         summary: &str,

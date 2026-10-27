@@ -683,6 +683,23 @@ async fn confirm_operation_sends_unusual_names_as_is() {
 }
 
 #[tokio::test]
+async fn confirm_enrollment_sends_kind_enrollment_without_an_operation() {
+    let (handle, mut rx) = handle();
+    let route = handle.route_handle(7, 3);
+    let mut call = Box::pin(handle.confirm_enrollment("Pair with Office Mac", &route));
+    still_pending(call.as_mut()).await;
+    let request = rx.recv().await.expect("enrollment request must send");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+        serde_json::json!({"op": "operator.confirm", "summary": "Pair with Office Mac",
+            "route_channel": 7, "route_epoch": 3, "kind": "enrollment"})
+    );
+    assert!(handle.handle_control_reply(confirmed(request.header.corr)));
+    assert_eq!(call.await, Ok(()));
+    assert_eq!(pending_count(&handle), 0);
+}
+
+#[tokio::test]
 async fn confirm_operation_empty_name_is_refused_without_sending() {
     let (handle, mut rx) = handle();
     assert_eq!(

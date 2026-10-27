@@ -582,3 +582,119 @@ async fn operator_confirm_closed_writer_fails_without_leaking_pending_entry() {
     );
     assert_eq!(pending_count(&handle), 0);
 }
+
+#[tokio::test]
+async fn operator_confirm_request_bytes_carry_neither_kind_nor_operation() {
+    let mut served =
+        super::stand_in::serve_against_stand_in_with_ops(|_| Echo, &[OPERATOR_CONFIRM_OP]).await;
+    let route = served.handle.route_handle(7, 3);
+    let mut call = Box::pin(served.handle.confirm_operator("Replace identity", &route));
+    still_pending(call.as_mut()).await;
+    let request = timeout(Duration::from_secs(2), read_frame(&mut served.daemon))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("confirm_operator body is JSON");
+    assert_eq!(
+        body,
+        serde_json::json!({"op": "operator.confirm", "summary": "Replace identity",
+            "route_channel": 7, "route_epoch": 3})
+    );
+    assert!(body.get("kind").is_none(), "legacy request must omit kind");
+    assert!(
+        body.get("operation").is_none(),
+        "legacy request must omit operation"
+    );
+    write_frame(&mut served.daemon, &confirmed(request.header.corr))
+        .await
+        .unwrap();
+    served.daemon.flush().await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), &mut call).await.unwrap(),
+        Ok(())
+    );
+    drop(call);
+    served.handle.close_connection();
+    timeout(Duration::from_secs(3), served.serve)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn confirm_operation_sends_kind_operation_plus_name() {
+    let mut served =
+        super::stand_in::serve_against_stand_in_with_ops(|_| Echo, &[OPERATOR_CONFIRM_OP]).await;
+    let route = served.handle.route_handle(7, 3);
+    let mut call = Box::pin(served.handle.confirm_operation(
+        "Replace identity",
+        &route,
+        "pair.device",
+    ));
+    still_pending(call.as_mut()).await;
+    let request = timeout(Duration::from_secs(2), read_frame(&mut served.daemon))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+        serde_json::json!({"op": "operator.confirm", "summary": "Replace identity",
+            "route_channel": 7, "route_epoch": 3,
+            "kind": "operation", "operation": "pair.device"})
+    );
+    write_frame(&mut served.daemon, &confirmed(request.header.corr))
+        .await
+        .unwrap();
+    served.daemon.flush().await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(2), &mut call).await.unwrap(),
+        Ok(())
+    );
+    assert_eq!(pending_count(&served.handle), 0);
+    drop(call);
+    served.handle.close_connection();
+    timeout(Duration::from_secs(3), served.serve)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn confirm_operation_sends_unusual_names_as_is() {
+    let (handle, mut rx) = handle();
+    let route = handle.route_handle(7, 3);
+    let mut call = Box::pin(handle.confirm_operation("Replace identity", &route, "has space"));
+    still_pending(call.as_mut()).await;
+    let request = rx.recv().await.expect("operation request must send");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+        serde_json::json!({"op": "operator.confirm", "summary": "Replace identity",
+            "route_channel": 7, "route_epoch": 3,
+            "kind": "operation", "operation": "has space"})
+    );
+    assert!(handle.handle_control_reply(confirmed(request.header.corr)));
+    assert_eq!(call.await, Ok(()));
+    assert_eq!(pending_count(&handle), 0);
+}
+
+#[tokio::test]
+async fn confirm_operation_empty_name_is_refused_without_sending() {
+    let (handle, mut rx) = handle();
+    assert_eq!(
+        handle
+            .confirm_operation("Replace identity", &handle.route_handle(7, 3), "")
+            .await,
+        Err(OperatorConfirmError::OperationInvalid)
+    );
+    assert_eq!(pending_count(&handle), 0);
+    assert!(rx.try_recv().is_err(), "invalid operation must not send");
+    assert_eq!(
+        OperatorConfirmError::OperationInvalid.to_string(),
+        "operator confirmation operation is invalid"
+    );
+}

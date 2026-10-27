@@ -69,8 +69,9 @@ use subc_protocol::{
     },
     session::{
         ModuleControlCommand, ModuleControlRequest, ModuleControlRequestFromModule,
-        ModuleControlResponse, ModuleControlResponseToModule, OperatorConfirmReply,
-        OperatorConfirmRequest, MODULE_CONTROL_OP_HEALTH_CHECK, MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+        ModuleControlResponse, ModuleControlResponseToModule, OperatorConfirmKind,
+        OperatorConfirmReply, OperatorConfirmRequest, MODULE_CONTROL_OP_HEALTH_CHECK,
+        MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     },
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
@@ -849,10 +850,77 @@ impl ModuleHandle {
             .await
     }
 
+    /// Ask the operator to authorise one in-flight, unchanged write for a named
+    /// management operation.
+    ///
+    /// This sends the same `operator.confirm` request as [`Self::confirm_operator`],
+    /// with `kind` set to `"operation"` and `operation` set to the given name.
+    /// It shares the same deadline, withdrawal-on-drop and error mapping: every
+    /// error means the module must refuse the write, and `Ok(())` authorises
+    /// only the write this call was made for; it must never be cached or reused.
+    ///
+    /// A later daemon may answer without a prompt only when the name is listed
+    /// in this module's manifest `confirm_operations`; the daemon decides.
+    /// Naming an operation the module did not declare still prompts; it is not
+    /// refused.
+    /// An empty name is refused locally as
+    /// [`OperatorConfirmError::OperationInvalid`] without sending anything.
+    ///
+    /// A consumer call that may trigger confirmation must set
+    /// [`CallOptions::timeout`] to at least 300 seconds. This helper waits up to
+    /// 290 seconds, including egress backpressure, and dropping it withdraws an
+    /// accepted request.
+    pub async fn confirm_operation(
+        &self,
+        summary: &str,
+        caller_route: &RouteHandle,
+        operation: &str,
+    ) -> Result<(), OperatorConfirmError> {
+        if operation.is_empty() {
+            return Err(OperatorConfirmError::OperationInvalid);
+        }
+        self.confirm_operation_with_deadline(
+            summary,
+            caller_route,
+            operation,
+            OPERATOR_CONFIRM_TIMEOUT,
+        )
+        .await
+    }
+
     pub(crate) async fn confirm_operator_with_deadline(
         &self,
         summary: &str,
         caller_route: &RouteHandle,
+        duration: Duration,
+    ) -> Result<(), OperatorConfirmError> {
+        self.confirm_inner(summary, caller_route, None, None, duration)
+            .await
+    }
+
+    async fn confirm_operation_with_deadline(
+        &self,
+        summary: &str,
+        caller_route: &RouteHandle,
+        operation: &str,
+        duration: Duration,
+    ) -> Result<(), OperatorConfirmError> {
+        self.confirm_inner(
+            summary,
+            caller_route,
+            Some(OperatorConfirmKind::Operation),
+            Some(operation.to_owned()),
+            duration,
+        )
+        .await
+    }
+
+    async fn confirm_inner(
+        &self,
+        summary: &str,
+        caller_route: &RouteHandle,
+        kind: Option<OperatorConfirmKind>,
+        operation: Option<String>,
         duration: Duration,
     ) -> Result<(), OperatorConfirmError> {
         if caller_route.connection_token() != self.shared.connection_token {
@@ -864,11 +932,11 @@ impl ModuleHandle {
         // Use the same absolute deadline for both capacity and the reply: a
         // slow writer must not extend the time a confirmation can remain live.
         let deadline = Instant::now() + duration;
-        let body = serde_json::to_vec(&OperatorConfirmRequest::new(
-            summary,
-            caller_route.channel,
-            caller_route.epoch,
-        ))
+        let body = serde_json::to_vec(
+            &OperatorConfirmRequest::new(summary, caller_route.channel, caller_route.epoch)
+                .with_kind(kind)
+                .with_operation(operation),
+        )
         .map_err(|_| OperatorConfirmError::PresenceUnavailable)?;
         let (corr, writer, rx) = self.shared.begin_operator_confirm()?;
         let mut guard = OperatorConfirmGuard {
@@ -1287,7 +1355,8 @@ impl Drop for OperatorConfirmGuard {
     }
 }
 
-/// Failure to authorise a write through [`ModuleHandle::confirm_operator`].
+/// Failure to authorise a write through [`ModuleHandle::confirm_operator`]
+/// or [`ModuleHandle::confirm_operation`].
 /// Every variant requires the module to refuse the write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1300,6 +1369,12 @@ pub enum OperatorConfirmError {
     },
     PresenceUnavailable,
     SummaryInvalid,
+    /// The operation name for [`ModuleHandle::confirm_operation`] was empty.
+    /// Operation names have no lexical grammar in Rust; membership in the
+    /// module's manifest `confirm_operations` is decided by the daemon, which
+    /// prompts for any name it does not recognise. Only the empty string can
+    /// never name an operation, so it is refused before sending.
+    OperationInvalid,
     NotPermitted,
     Unsupported,
 }
@@ -1313,6 +1388,7 @@ impl fmt::Display for OperatorConfirmError {
             }
             Self::PresenceUnavailable => "operator confirmation is unavailable",
             Self::SummaryInvalid => "operator confirmation summary is invalid",
+            Self::OperationInvalid => "operator confirmation operation is invalid",
             Self::NotPermitted => "operator confirmation is not permitted for this route",
             Self::Unsupported => "daemon does not support operator confirmation",
             Self::Backoff {

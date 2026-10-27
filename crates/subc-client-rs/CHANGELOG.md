@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.10
+
+- Add `OperatorConfirmError::PresenceUnsupportedPlatform`, returned when the daemon answers `operator_presence_unavailable` with `detail.reason` `unsupported_platform`: it has no operator prompt on this platform (today Linux) and showed none. Before, this came back as `PresenceUnavailable`, the same variant as a failed or timed-out prompt, a dropped connection or an unknown reply, so a module couldn't tell "no prompt exists here" from "the prompt broke". Every other `operator_presence_unavailable` reply is still `PresenceUnavailable`. Like every variant, the new one refuses the write by default; a module may treat it differently only where its owner has ruled that a confirmation typed by a person in a local app counts on such a platform. The enum is `#[non_exhaustive]`, so this is additive.
+
 ## 0.32.9
 
 - Add `ModuleHandle::confirm_enrollment(summary, caller_route)`, which sends the same `operator.confirm` request as `confirm_operator` with `kind: "enrollment"`, sharing its 290-second deadline, withdrawal-on-drop and error mapping. The daemon never approves an enrollment without an operator prompt, though it may still refuse one before prompting; a daemon built against subc-protocol before 0.33.5 ignores the kind and treats it as a plain `confirm_operator` request.

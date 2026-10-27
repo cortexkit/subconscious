@@ -1038,7 +1038,10 @@ async fn non_ckdev_refuses_test_provider() {
 async fn linux_unsupported_platform_without_prompt() {
     let h = Harness::clocks("approve", 5000, 5000, 1000, false).await;
     assert!(h.logs().contains("operator confirm test provider refused"));
-    assert_eq!(h.confirm("linux write").await["result"], "unavailable");
+    assert_eq!(
+        h.confirm("linux write").await["result"],
+        "unsupported_platform"
+    );
     assert_eq!(
         h.audit(
             "operator_presence_unavailable",

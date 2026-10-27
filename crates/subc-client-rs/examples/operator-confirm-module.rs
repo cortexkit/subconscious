@@ -178,6 +178,7 @@ fn answer(result: Result<(), OperatorConfirmError>) -> HandlerOutcome {
         Ok(()) => "confirmed",
         Err(OperatorConfirmError::Declined) => "declined",
         Err(OperatorConfirmError::PresenceUnavailable) => "unavailable",
+        Err(OperatorConfirmError::PresenceUnsupportedPlatform) => "unsupported_platform",
         Err(OperatorConfirmError::SummaryInvalid) => "summary_invalid",
         Err(OperatorConfirmError::NotPermitted) => "not_permitted",
         Err(OperatorConfirmError::Unsupported) => "unsupported",

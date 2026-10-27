@@ -222,6 +222,48 @@ async fn operator_confirm_daemon_errors_map_to_unit_variants() {
     }
 }
 
+/// Only the exact code plus `detail.reason` `unsupported_platform` names the
+/// missing prompt; every other presence failure, including that reason under
+/// another code or a missing detail, stays `PresenceUnavailable`.
+#[tokio::test]
+async fn operator_confirm_unsupported_platform_is_distinct_from_other_presence_failures() {
+    let cases = [
+        (
+            serde_json::json!({"code": "operator_presence_unavailable", "message": "refused",
+                "detail": {"reason": "unsupported_platform"}}),
+            OperatorConfirmError::PresenceUnsupportedPlatform,
+        ),
+        (
+            serde_json::json!({"code": "operator_presence_unavailable", "message": "refused",
+                "detail": {"reason": "provider_error"}}),
+            OperatorConfirmError::PresenceUnavailable,
+        ),
+        (
+            serde_json::json!({"code": "operator_presence_unavailable", "message": "refused"}),
+            OperatorConfirmError::PresenceUnavailable,
+        ),
+        (
+            serde_json::json!({"code": "some_new_code", "message": "refused",
+                "detail": {"reason": "unsupported_platform"}}),
+            OperatorConfirmError::PresenceUnavailable,
+        ),
+    ];
+    for (body, expected) in cases {
+        let (handle, mut rx) = handle();
+        let route = handle.route_handle(7, 3);
+        let mut call = Box::pin(handle.confirm_enrollment("Pair with Office PC", &route));
+        still_pending(call.as_mut()).await;
+        let request = rx.recv().await.unwrap();
+        assert!(handle.handle_control_reply(reply(
+            FrameType::Error,
+            request.header.corr,
+            body.clone()
+        )));
+        assert_eq!(call.await, Err(expected), "{body}");
+        assert_eq!(pending_count(&handle), 0);
+    }
+}
+
 #[tokio::test]
 async fn operator_confirm_daemon_errors_map_backoff_detail() {
     let cases = [

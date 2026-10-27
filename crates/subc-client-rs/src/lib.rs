@@ -1029,6 +1029,16 @@ impl ModuleHandle {
                             OperatorConfirmError::Declined
                         }
                     }
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE
+                        if body
+                            .detail
+                            .as_ref()
+                            .and_then(|detail| detail.get("reason"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some("unsupported_platform") =>
+                    {
+                        OperatorConfirmError::PresenceUnsupportedPlatform
+                    }
                     error_codes::OPERATOR_SUMMARY_INVALID => OperatorConfirmError::SummaryInvalid,
                     error_codes::OPERATOR_REQUEST_NOT_PERMITTED | "not_registered" => {
                         OperatorConfirmError::NotPermitted
@@ -1387,9 +1397,10 @@ impl Drop for OperatorConfirmGuard {
     }
 }
 
-/// Failure to authorise a write through [`ModuleHandle::confirm_operator`]
-/// or [`ModuleHandle::confirm_operation`].
-/// Every variant requires the module to refuse the write.
+/// Failure to authorise a write through [`ModuleHandle::confirm_operator`],
+/// [`ModuleHandle::confirm_operation`] or [`ModuleHandle::confirm_enrollment`].
+/// Every variant requires the module to refuse the write, with one exception
+/// described on [`OperatorConfirmError::PresenceUnsupportedPlatform`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum OperatorConfirmError {
@@ -1399,7 +1410,23 @@ pub enum OperatorConfirmError {
     Backoff {
         retry_after_ms: Option<u64>,
     },
+    /// The daemon could not get an answer from the operator: the prompt
+    /// failed or timed out, the connection dropped, or the reply was unknown
+    /// or malformed. A withdrawn prompt can instead come back as
+    /// [`OperatorConfirmError::Declined`].
     PresenceUnavailable,
+    /// The daemon has no operator prompt on this platform (today Linux), so
+    /// it showed none. It answered `operator_presence_unavailable` with
+    /// `detail.reason` `unsupported_platform`. Every other
+    /// `operator_presence_unavailable` reply stays
+    /// [`OperatorConfirmError::PresenceUnavailable`].
+    ///
+    /// Like every variant, this refuses the write by default. A module may
+    /// treat it differently only where its owner has ruled that, on a platform
+    /// without a prompt, a confirmation typed by a person in a local app
+    /// counts, and the product says so. It must never treat a
+    /// `PresenceUnavailable` that way.
+    PresenceUnsupportedPlatform,
     SummaryInvalid,
     /// The operation name for [`ModuleHandle::confirm_operation`] was empty.
     /// Operation names have no lexical grammar in Rust; membership in the
@@ -1419,6 +1446,9 @@ impl fmt::Display for OperatorConfirmError {
                 "operator confirmation refused without asking: a recent decline holds new prompts for a short time"
             }
             Self::PresenceUnavailable => "operator confirmation is unavailable",
+            Self::PresenceUnsupportedPlatform => {
+                "operator confirmation has no prompt on this platform"
+            }
             Self::SummaryInvalid => "operator confirmation summary is invalid",
             Self::OperationInvalid => "operator confirmation operation is invalid",
             Self::NotPermitted => "operator confirmation is not permitted for this route",

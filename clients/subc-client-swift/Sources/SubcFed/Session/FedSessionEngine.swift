@@ -158,6 +158,13 @@ public actor FedSessionEngine {
         public var sharedAdmission: FedAdmissionController?
         /// Peer-scoped origin effect log shared across sessions for one responder.
         public var sharedEffectLog: FedOriginEffectLog?
+        /// Noise IK handshake hash for this session. The session assertion
+        /// derives its client-data hash from it. Nil skips the assertion.
+        public var handshakeHash: Data?
+        /// Optional App Attest provider. Nil sends no session assertion.
+        /// Share sessions never reach this engine (`FedShareClient` runs its
+        /// own session and takes no provider), so they never send one.
+        public var appAttestProvider: (any FedAppAttestProvider)?
 
         public init(
             transport: any FedSessionByteTransport,
@@ -169,7 +176,9 @@ public actor FedSessionEngine {
             connectionAttemptID: String,
             sessionID: String = UUID().uuidString.lowercased(),
             sharedAdmission: FedAdmissionController? = nil,
-            sharedEffectLog: FedOriginEffectLog? = nil
+            sharedEffectLog: FedOriginEffectLog? = nil,
+            handshakeHash: Data? = nil,
+            appAttestProvider: (any FedAppAttestProvider)? = nil
         ) {
             self.transport = transport
             self.store = store
@@ -181,6 +190,8 @@ public actor FedSessionEngine {
             self.sessionID = sessionID
             self.sharedAdmission = sharedAdmission
             self.sharedEffectLog = sharedEffectLog
+            self.handshakeHash = handshakeHash
+            self.appAttestProvider = appAttestProvider
         }
     }
 
@@ -336,6 +347,7 @@ public actor FedSessionEngine {
         }
 
         phase = .exchangingCatalog
+        try await sendSessionAssertionIfConfigured()
         let generation = try await deps.store.reserveCatalogGeneration()
         let emptyCatalog = FedCatalogCodec.emptySnapshotFrame(generation: generation.value)
         try await sendFrame(emptyCatalog)
@@ -1110,6 +1122,25 @@ public actor FedSessionEngine {
 
     func sendSubscriptionFrame(_ frame: FedFrame) async throws {
         try await sendFrame(frame)
+    }
+
+    /// Sends the optional session assertion as the first frame after hello.
+    /// A missing provider, missing handshake hash, or provider failure sends
+    /// nothing, and the session continues without a session assertion.
+    private func sendSessionAssertionIfConfigured() async throws {
+        guard let provider = deps.appAttestProvider,
+              let handshakeHash = deps.handshakeHash
+        else { return }
+        let assertion: Data
+        do {
+            let clientDataHash = FedAppAttestCodec.sessionClientDataHash(handshakeHash: handshakeHash)
+            let produced = try await provider.sessionAssertion(clientDataHash: clientDataHash)
+            guard !produced.isEmpty else { return }
+            assertion = produced
+        } catch {
+            return
+        }
+        try await sendFrame(FedAppAttestCodec.sessionAssertionFrame(assertion: assertion))
     }
 
     func subscriptionAdmission(module: String, op: String, bodyBytes: Int) throws -> UInt64 {

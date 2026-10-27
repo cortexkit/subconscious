@@ -24,6 +24,8 @@ public struct FedDialAttemptContext: Sendable {
     /// callers that do not observe progress — adding a required parameter here
     /// would be a source break for every existing construction.
     public var progress: FedDialProgress? = nil
+    /// Optional App Attest provider for the session assertion. Nil sends none.
+    public var appAttestProvider: (any FedAppAttestProvider)? = nil
 }
 
 /// Result of a successful candidate dial through Noise and fed negotiation.
@@ -73,6 +75,7 @@ public actor SubcFedClient {
     private let entropy: any FedNoiseEntropy
     private let dialFactory: any FedCandidateDialFactory
     private let pairingDialFactory: FedNetworkDialFactory
+    private let appAttestProvider: (any FedAppAttestProvider)?
     private var pairingGeneration: UInt64 = 0
     private var pendingPairing: FedPendingPairing?
     private var defaultManagementTarget: FedManagementTarget?
@@ -191,7 +194,8 @@ public actor SubcFedClient {
         clock: any FedMonotonicClock = SystemFedMonotonicClock(),
         entropy: any FedNoiseEntropy = SystemFedNoiseEntropy(),
         dialFactory: any FedCandidateDialFactory = FedUnimplementedDialFactory(),
-        pairingDialFactory: FedNetworkDialFactory = FedNetworkDialFactory()
+        pairingDialFactory: FedNetworkDialFactory = FedNetworkDialFactory(),
+        appAttestProvider: (any FedAppAttestProvider)? = nil
     ) {
         self.activeProfile = profile
         self.dialPolicy = dialPolicy
@@ -203,6 +207,7 @@ public actor SubcFedClient {
         self.entropy = entropy
         self.dialFactory = dialFactory
         self.pairingDialFactory = pairingDialFactory
+        self.appAttestProvider = appAttestProvider
     }
 
     deinit {
@@ -266,6 +271,14 @@ public actor SubcFedClient {
                 await connected.session.close()
                 throw FedFailure.cancelled
             }
+            // Optional pairing attestation: one frame right after message 2,
+            // before the pairing words are shown. A missing provider or any failure
+            // sends nothing and the pairing completes without a pairing attestation.
+            await sendPairingAttestationIfConfigured(session: connected.session, handshakeHash: connected.handshakeHash)
+            guard pairingGeneration == generation, !Task.isCancelled else {
+                await connected.session.close()
+                throw FedFailure.cancelled
+            }
             let pending: FedPendingPairing
             do {
                 pending = try FedPendingPairing(qr: qr, session: connected.session, handshakeHash: connected.handshakeHash,
@@ -292,6 +305,27 @@ public actor SubcFedClient {
         let pending = pendingPairing
         pendingPairing = nil
         await pending?.cancel()
+    }
+
+    /// Sends one pairing attestation frame when a provider is configured.
+    /// Never fails the pairing: every error path sends nothing instead.
+    private func sendPairingAttestationIfConfigured(session: FedNoiseRecordSession, handshakeHash: Data) async {
+        guard let provider = appAttestProvider else { return }
+        do {
+            let clientDataHash = FedAppAttestCodec.pairingClientDataHash(handshakeHash: handshakeHash)
+            let attestation = try await provider.attestPairing(clientDataHash: clientDataHash)
+            guard !attestation.keyID.isEmpty, !attestation.attestation.isEmpty else { return }
+            let frame = FedAppAttestCodec.pairingAttestationFrame(keyID: attestation.keyID, attestation: attestation.attestation)
+            let bytes = try FedFrameCodec.encode(
+                frame,
+                negotiatedMaximumBodyLength: FedFrameCodec.defaultMaximumBodyLength,
+                negotiationComplete: false,
+                negotiatedFeatures: []
+            )
+            try await session.sendTransportPayload(bytes)
+        } catch {
+            return
+        }
     }
 
     /// Records that the embedding completed device re-enrollment after local
@@ -1080,7 +1114,8 @@ public actor SubcFedClient {
                 progress: { [weak self] phase in
                     guard let self else { return }
                     Task { await self.publish(phase, attemptID: attemptID, candidateID: candidate.candidateID) }
-                }
+                },
+                appAttestProvider: appAttestProvider
             )
             do {
                 let dialed = try await dialFactory.dial(candidate: candidate, context: context)

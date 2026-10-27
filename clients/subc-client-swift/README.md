@@ -521,6 +521,52 @@ an internal software-key seam. A separate test calls production key creation onl
 to check refusal when the enclave is unavailable. Hardware user-presence behavior
 still needs app integration tests on supported devices.
 
+## Confirm-marked operations
+
+Some management operations need an operator confirmation on the serving side.
+The catalog marks those with `"confirm": true`, and `FedCatalogOperation`
+exposes the mark as `confirm`, beside `payload?.maxBytes` and through
+`lookupOperation(moduleID:method:)`. The app reads the mark to ask its own
+user before sending; the serving module still enforces the check.
+
+Absent means `false`. Any value other than the boolean `true` drops that one
+operation, the same way a malformed `delivery` does, so a malformed mark can
+never widen access. The change is additive: the initializer defaults the new
+member to `false`, so existing construction and matching keep compiling, and
+no public enum gains a case.
+
+## App Attest elevation
+
+When the app supplies a `FedAppAttestProvider`, SubcFed asks it for App Attest
+material and sends it to the computer: an attestation when pairing, and an
+assertion at the start of every ordinary session. The computer verifies that
+material; SubcFed itself proves nothing about the build and performs no
+operator check. It never calls DeviceCheck and never stores the key, and the
+provider is optional:
+
+```swift
+let client = SubcFedClient(profile: profile, keyStore: keys, stateStore: store,
+    observedNetwork: { snapshot }, appAttestProvider: provider)
+```
+
+The provider implements two calls over client-data hashes SubcFed derives
+from the Noise handshake hash `h` of that session or pairing:
+
+- pairing: `SHA-256(label || h)`, then `SHA-256` of that challenge;
+- each ordinary session: the same double hash with its own session label.
+
+SubcFed asks the provider to attest the pairing key once, right after the
+pairing handshake and before the confirmation words are shown, and to assert
+the stored key on every ordinary session as the first frame after hello.
+Share sessions never carry an assertion. A missing provider, or a provider
+that throws or returns empty material, sends nothing: the pairing still
+completes and the session still becomes ready, only without the
+corresponding App Attest frame. Nothing else is sent before an assertion on a
+session that sends one.
+
+Tests use a fake provider and pin the challenge bytes and exact frame bytes
+from the wire description.
+
 ## Verification
 
 On macOS with Xcode installed:

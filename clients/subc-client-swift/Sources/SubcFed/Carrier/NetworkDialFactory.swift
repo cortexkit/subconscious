@@ -219,7 +219,9 @@ public struct FedNetworkDialFactory: FedCandidateDialFactory {
             localPublicKey: context.localPublicKey,
             responderStaticPublicKey: context.responderStaticPublicKey,
             helloPolicy: context.helloPolicy,
-            connectionAttemptID: context.attemptID
+            connectionAttemptID: context.attemptID,
+            handshakeHash: initiator.handshakeHash,
+            appAttestProvider: context.appAttestProvider
         ))
         return FedDialedSession(engine: engine, transport: transport)
     }

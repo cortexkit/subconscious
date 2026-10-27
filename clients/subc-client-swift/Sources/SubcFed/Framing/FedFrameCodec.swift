@@ -388,6 +388,7 @@ public enum FedFrameCodec {
         if type == "share_call" { return min(negotiatedMaximumBodyLength, FedShareCodec.maximumRequestBytes) }
         if type == "share_result" { return min(negotiatedMaximumBodyLength, FedShareCodec.maximumOutcomeBytes) }
         if type == "share_ready" { return 0 }
+        if FedAppAttestCodec.frameTypes.contains(type) { return 0 }
         if type == FedFrameType.catalog.rawValue {
             return min(negotiatedMaximumBodyLength, maximumCatalogBodyLength)
         }
@@ -406,6 +407,15 @@ public enum FedFrameCodec {
         }
         if FedSubscriptionCodec.frameTypes.contains(type) {
             try FedSubscriptionCodec.validateHeader(header, type: type, complete: negotiationComplete, features: negotiatedFeatures)
+            return
+        }
+        if FedAppAttestCodec.frameTypes.contains(type) {
+            try FedAppAttestCodec.validateHeader(
+                header,
+                type: type,
+                negotiationComplete: negotiationComplete,
+                negotiatedFeatures: negotiatedFeatures
+            )
             return
         }
         guard let knownType = FedFrameType(rawValue: type) else {
@@ -596,6 +606,10 @@ public enum FedFrameCodec {
         }
         if FedSubscriptionCodec.frameTypes.contains(type) {
             try FedSubscriptionCodec.validateBody(body, type: type, header: header)
+            return
+        }
+        if FedAppAttestCodec.frameTypes.contains(type) {
+            try FedAppAttestCodec.validateBody(body, type: type)
             return
         }
         let bodyless = [
@@ -855,6 +869,8 @@ public struct FedFrameStreamDecoder: Sendable {
                         FedFrameType.callCancel.rawValue,
                         FedFrameType.effectStatus.rawValue,
                         FedEffectsV2Codec.listQueryType,
+                        FedAppAttestCodec.pairingAttestationType,
+                        FedAppAttestCodec.sessionAssertionType,
                     ]
                     if bodyless.contains(type), declared != 0 {
                         throw FedFrameError.bodylessFrame(type: type, declared: declared)
@@ -865,6 +881,7 @@ public struct FedFrameStreamDecoder: Sendable {
                         && !FedEffectsV2Codec.frameTypes.contains(type)
                         && !FedSubscriptionCodec.frameTypes.contains(type)
                         && !FedShareCodec.frameTypes.contains(type)
+                        && !FedAppAttestCodec.frameTypes.contains(type)
                     bodyBuffer = discardBody ? Data() : Data(capacity: bodyLength)
                     if bodyLength == 0 {
                         try completeBody(&frames)

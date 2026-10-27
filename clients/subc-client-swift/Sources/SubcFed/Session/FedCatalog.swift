@@ -7,6 +7,9 @@ public struct FedCatalogOperation: Sendable, Equatable {
     public let kind: String
     public let delivery: Delivery?
     public let payload: FedOperationPayload?
+    /// Whether the serving module guards this operation with operator confirmation.
+    /// The mark is advice to the origin's user interface; the module's own check remains authoritative.
+    public let confirm: Bool
 
     public struct Delivery: RawRepresentable, Sendable, Hashable, Codable {
         public let rawValue: String
@@ -19,11 +22,12 @@ public struct FedCatalogOperation: Sendable, Equatable {
         public static let watch = Self(rawValue: "watch")
     }
 
-    public init(name: String, kind: String, delivery: Delivery? = nil, payload: FedOperationPayload? = nil) {
+    public init(name: String, kind: String, delivery: Delivery? = nil, payload: FedOperationPayload? = nil, confirm: Bool = false) {
         self.name = name
         self.kind = kind
         self.delivery = delivery
         self.payload = payload
+        self.confirm = confirm
     }
 
     public var isMutation: Bool {
@@ -207,7 +211,15 @@ public enum FedCatalogCodec {
                         }
                         payload = FedOperationPayload(maxBytes: Int(maximum))
                     }
-                    operations.append(FedCatalogOperation(name: name, kind: kind, delivery: delivery, payload: payload))
+                    var confirm = false
+                    if let value = op["confirm"] {
+                        guard case .value(.boolean(true)) = value else {
+                            logDrop(moduleID, reason: "operation has invalid confirm")
+                            continue
+                        }
+                        confirm = true
+                    }
+                    operations.append(FedCatalogOperation(name: name, kind: kind, delivery: delivery, payload: payload, confirm: confirm))
                 }
             }
 

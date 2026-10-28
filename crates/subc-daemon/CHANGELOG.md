@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.38.3
+
+- Test-only: each local-listener test gets its own socket directory. Two
+  listeners whose test tags started with the same letter shared one, and an
+  aborted listener removing its socket could delete the next one's, which
+  failed a connect on Linux CI. No library change.
+
 ## 0.38.2
 
 - Compile the desktop identity table, semver release floor and four operator shortcut switches into the daemon, with every switch off and no configuration override. Production app ids, Windows publisher and Windows/Linux install paths remain unset; Linux has no release-index identity and the reserved floor admits no release.

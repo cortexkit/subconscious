@@ -80,16 +80,23 @@ fn hello_frame(module_id: &str, launch_nonce: Option<&str>) -> Frame {
 /// directory uses nearly all of that.
 #[cfg(unix)]
 fn short_config(dir: &ScratchDir, tag: &str) -> LocalListenerConfig {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let tag: String = tag.chars().take(1).collect();
     // The socket directory is a short one under the system temporary directory,
     // not inside `dir`: a test harness's own directories (and the lockdown
     // sandbox's `/private/.../aft-w/...` prefix) can leave no room inside the
     // Unix socket path limit, and these tests are about the endpoint, not the
-    // harness's path length.
+    // harness's path length. Every call gets its own directory: an aborted
+    // listener removes its socket when its task is dropped, which can happen
+    // after the next listener bound the same path, so a shared directory lets
+    // one listener delete another's socket.
     let _ = dir;
-    LocalListenerConfig::in_socket_dir(
-        std::env::temp_dir().join(format!("subc-lt-{}-{tag}", std::process::id())),
-    )
+    LocalListenerConfig::in_socket_dir(std::env::temp_dir().join(format!(
+        "subc-lt-{}-{tag}{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )))
 }
 
 /// A connection file under the system temporary directory. The socket's name
@@ -199,10 +206,11 @@ mod unix {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_leftover_socket_from_a_dead_daemon_is_replaced() {
         let dir = ScratchDir::new("ml");
-        // One connection file, used by both starts: the socket's name comes from
-        // it, so the second start looks for exactly the socket the first left.
+        // One socket directory and one connection file, used by both starts, so
+        // the second start looks for exactly the socket the first left.
+        let config = short_config(&dir, "le");
         let connection_file = short_connection_file(&dir);
-        let first = local_listener::bind(&short_config(&dir, "le"), &connection_file).unwrap();
+        let first = local_listener::bind(&config, &connection_file).unwrap();
         let LocalEndpoint::Unix { path } = first.endpoint() else {
             panic!("a Unix listener publishes a socket path");
         };
@@ -217,7 +225,7 @@ mod unix {
         let stale = std::os::unix::net::UnixListener::bind(&path);
         assert!(stale.is_err(), "a live listener owns its path");
 
-        let second = local_listener::bind(&short_config(&dir, "le"), &connection_file)
+        let second = local_listener::bind(&config, &connection_file)
             .expect("a stale socket file is replaced, not refused");
         local_listener::release(&second);
         assert!(!path.exists());

@@ -134,6 +134,11 @@ impl ReleaseArtifactSource {
         let needed = component_binaries_for_target(component, target);
         let index = self.loaded_index()?;
         let Some(entry) = index.components.get(component.label()) else {
+            if component == Component::Mc {
+                return Ok(ReleaseAvailability::DeclaredUnavailable {
+                    message: super::text::MC_UNPUBLISHED_NOTE.to_string(),
+                });
+            }
             let missing_asset = needed
                 .first()
                 .map(|binary| format!("{}-{}.zip", binary, target.label()))
@@ -1953,5 +1958,152 @@ mod tests {
             operation,
             super::super::model::SetupOperation::OfferOptionalComponents
         )));
+    }
+
+    fn index_with_all_components_linux() -> ReleaseIndex {
+        let mut index = index_with_core_linux();
+        let entry = index.components["core"].clone();
+        for component in Component::ALL {
+            let mut entry = entry.clone();
+            entry.assets.insert(
+                "linux-x64".to_string(),
+                component_binaries_for_target(component, AlphaTarget::LinuxX64)
+                    .iter()
+                    .map(|binary| (binary.to_string(), asset(Some("0.16.0"))))
+                    .collect(),
+            );
+            index
+                .components
+                .insert(component.label().to_string(), entry);
+        }
+        index
+    }
+
+    fn setup_plan_from_source(
+        source: &mut ReleaseArtifactSource,
+    ) -> super::super::planner::SetupPlan {
+        use super::super::model::{PlatformObservation, SetupObserved, SetupRequest};
+
+        let mut observed = SetupObserved::unconfigured_current_host();
+        observed.platform = PlatformObservation::Supported(source.target);
+        for component in Component::ALL {
+            let availability = source
+                .release_availability(component)
+                .unwrap_or_else(|reason| ReleaseAvailability::Unresolvable { reason });
+            observed.releases.insert(component, availability);
+        }
+        super::super::planner::plan_setup(
+            &observed,
+            &SetupRequest::install(Component::ALL.to_vec()),
+        )
+    }
+
+    #[test]
+    fn setup_without_mc_index_entry_declares_plugin_only_and_installs_siblings() {
+        use super::super::model::{PlanOutcome, SetupOperation};
+
+        let mut index = index_with_all_components_linux();
+        index.components.remove("mc");
+        let mut source = ReleaseArtifactSource::from_index(index, AlphaTarget::LinuxX64);
+        let plan = setup_plan_from_source(&mut source);
+        let note = "Magic Context's module (ck-mc) isn't published for public installs yet. Magic Context runs fully inside its OpenCode and Pi plugin, so you don't need the module. Install the plugin with:\n  OpenCode:    npx @cortexkit/magic-context@latest setup\n  Pi:          npx @cortexkit/magic-context@latest setup --harness pi\n  Oh My Pi:    npx @cortexkit/magic-context@latest setup --harness omp\nThe module will install through `ck setup mc` once a release is published.";
+
+        let outcome = PlanOutcome::DeclaredUnavailable {
+            component: Component::Mc,
+            message: note.to_string(),
+        };
+        assert!(plan.outcomes.contains(&outcome), "{:?}", plan.outcomes);
+        assert_eq!(outcome.to_string(), note);
+        assert!(!outcome.blocks_execution());
+        assert!(plan.is_authorized());
+        for component in Component::ALL {
+            assert_eq!(
+                plan.operations
+                    .contains(&SetupOperation::InstallComponent { component }),
+                component != Component::Mc,
+                "{component}"
+            );
+        }
+        assert!(!plan.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PlanOutcome::ReleaseIncomplete { .. } | PlanOutcome::ReleaseUnresolvable { .. }
+        )));
+    }
+
+    #[test]
+    fn setup_with_mc_index_entry_still_installs_mc() {
+        use super::super::model::{PlanOutcome, SetupOperation};
+
+        let mut source = ReleaseArtifactSource::from_index(
+            index_with_all_components_linux(),
+            AlphaTarget::LinuxX64,
+        );
+        let plan = setup_plan_from_source(&mut source);
+
+        assert!(plan.is_authorized());
+        assert!(plan.operations.contains(&SetupOperation::InstallComponent {
+            component: Component::Mc,
+        }));
+        assert!(!plan.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            PlanOutcome::DeclaredUnavailable {
+                component: Component::Mc,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn setup_without_mc_index_entry_uses_the_owners_note_on_windows_too() {
+        use super::super::model::PlanOutcome;
+
+        for target in [AlphaTarget::WindowsX64, AlphaTarget::WindowsArm64] {
+            let mut index = index_with_all_components_linux();
+            index.components.remove("mc");
+            let mut source = ReleaseArtifactSource::from_index(index, target);
+            let plan = setup_plan_from_source(&mut source);
+
+            assert!(plan.outcomes.contains(&PlanOutcome::DeclaredUnavailable {
+                component: Component::Mc,
+                message: super::super::text::MC_UNPUBLISHED_NOTE.to_string(),
+            }));
+        }
+    }
+
+    #[test]
+    fn setup_index_load_failure_keeps_mc_unresolvable() {
+        use super::super::model::{PlanOutcome, SetupOperation};
+
+        for refusal in [
+            IndexRefusal::Unreachable {
+                url: "https://example.invalid/index.json".to_string(),
+                reason: "connection refused".to_string(),
+            },
+            IndexRefusal::Malformed {
+                url: "https://example.invalid/index.json".to_string(),
+                reason: "invalid index".to_string(),
+            },
+        ] {
+            let mut source = ReleaseArtifactSource::from_index(
+                index_with_all_components_linux(),
+                AlphaTarget::LinuxX64,
+            );
+            source.index = Some(Err(refusal));
+            let reason = source.ensure_index().expect_err("index must fail to load");
+            let plan = setup_plan_from_source(&mut source);
+
+            assert!(plan.outcomes.contains(&PlanOutcome::ReleaseUnresolvable {
+                component: Component::Mc,
+                reason,
+            }));
+            assert!(!plan
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, SetupOperation::InstallComponent { .. })));
+            assert!(!plan
+                .outcomes
+                .iter()
+                .any(|outcome| matches!(outcome, PlanOutcome::DeclaredUnavailable { .. })));
+        }
     }
 }

@@ -2237,6 +2237,89 @@ fn setup_mc_apply_reports_each_completed_change_without_a_plan() {
     );
 }
 
+#[cfg(not(windows))]
+#[test]
+fn setup_mc_missing_from_index_prints_instructions_for_ck_and_ckni() {
+    let fixture = SetupFixture::installed("ck-setup-mc-unpublished");
+    let index = serve_signed_index(|base| setup_index(base, None));
+    let (_link, ckni) = ckni_command("ckni");
+    let cases = [
+        ("ck", fixture.command(&index, &["setup", "mc"])),
+        (
+            "ck --json",
+            fixture.command(&index, &["--json", "setup", "mc"]),
+        ),
+        ("ckni", fixture.command_from(ckni, &index, &["setup", "mc"])),
+    ];
+    let expected = concat!(
+        "Magic Context's module (ck-mc) isn't published for public installs yet. ",
+        "Magic Context runs fully inside its OpenCode and Pi plugin, so you don't ",
+        "need the module. Install the plugin with:\n",
+        "  OpenCode:    npx @cortexkit/magic-context@latest setup\n",
+        "  Pi:          npx @cortexkit/magic-context@latest setup --harness pi\n",
+        "  Oh My Pi:    npx @cortexkit/magic-context@latest setup --harness omp\n",
+        "The module will install through `ck setup mc` once a release is published.\n",
+    );
+
+    for (face, mut command) in cases {
+        let output = command.output().unwrap();
+        assert_exit(&output, 0);
+        assert!(output.stderr.is_empty(), "{face}: {}", text(&output.stderr));
+        assert_eq!(text(&output.stdout), expected, "{face}");
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn upgrade_without_mc_index_entry_leaves_installed_mc_unchanged() {
+    let fixture = UpgradeFixture::new("ck-upgrade-mc-unpublished");
+    let mc_path = fixture
+        .home
+        .join(".local/share/cortexkit/bin")
+        .join(platform_binary("ck-mc"));
+    write_executable(&mc_path, "#!/bin/sh\necho 'ck-mc ck-mc-alpha.22464bf2'\n");
+    let binary_before = fs::read(&mc_path).unwrap();
+    let manifest = fixture
+        .home
+        .join(".local/share/cortexkit/installer-manifest.json");
+    let mut document: Value = serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+    document["mutations"].as_array_mut().unwrap().push(json!({
+        "kind": "managed-binary",
+        "path": mc_path,
+        "archive_sha256": "77".repeat(32),
+    }));
+    fs::write(&manifest, serde_json::to_vec(&document).unwrap()).unwrap();
+    let manifest_before = fs::read(&manifest).unwrap();
+    let index = serve_signed_index(|base| {
+        upgrade_index(
+            base,
+            "0.55.1",
+            &"22".repeat(32),
+            "0.17.9",
+            &"44".repeat(32),
+            "0.8.0",
+            &"55".repeat(32),
+        )
+    });
+
+    for args in [&["upgrade", "--check"][..], &["upgrade"][..]] {
+        let output = fixture
+            .command(&index, args)
+            .env("CK_TEST_MC_VERSION", "ck-mc-alpha.22464bf2")
+            .output()
+            .unwrap();
+
+        assert_exit(&output, 0);
+        assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+        let stdout = text(&output.stdout);
+        assert!(stdout.starts_with("Everything is up to date"), "{stdout}");
+        assert!(stdout.contains("ck-mc ck-mc-alpha.22464bf2"), "{stdout}");
+        assert!(!stdout.contains("ck-mc →"), "{stdout}");
+        assert_eq!(fs::read(&manifest).unwrap(), manifest_before);
+        assert_eq!(fs::read(&mc_path).unwrap(), binary_before);
+    }
+}
+
 #[test]
 fn setup_definition_command_matches_inventory_binary_path() {
     let fixture = SetupFixture::installed("ck-definition-command");

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.146
+
+- When the release index omits Magic Context, `ck setup` treats its module as unavailable without failing and prints how to install the Magic Context plugin, which works without the module. A module release published later still installs normally.
+
 ## 0.20.145
 
 - Builds against subc-daemon 0.38.0, whose shipped daemon serves a same-user local socket or pipe beside loopback TCP.

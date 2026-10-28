@@ -69,7 +69,7 @@ impl Component {
     pub const fn unavailable_message(self, target: AlphaTarget) -> Option<&'static str> {
         match (self, target) {
             (Self::Mc, AlphaTarget::WindowsX64 | AlphaTarget::WindowsArm64) => {
-                Some("magic-context: not available on windows in alpha")
+                Some("magic-context is not available on this platform yet; nothing was installed.")
             }
             _ => None,
         }
@@ -238,6 +238,9 @@ pub enum ComponentState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReleaseAvailability {
     Available,
+    DeclaredUnavailable {
+        message: String,
+    },
     Incomplete {
         missing_asset: String,
     },

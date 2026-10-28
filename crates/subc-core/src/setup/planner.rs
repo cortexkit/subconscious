@@ -167,14 +167,12 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
     let mut newly_configured_modules = Vec::new();
     let mut core_is_being_installed = false;
     for component in selected {
-        if let Some(message) = component.unavailable_message(*target) {
-            plan.outcomes.push(PlanOutcome::DeclaredUnavailable {
-                component,
-                message: message.to_string(),
-            });
-            continue;
-        }
         match observed.release(component) {
+            ReleaseAvailability::DeclaredUnavailable { message } => {
+                plan.outcomes
+                    .push(PlanOutcome::DeclaredUnavailable { component, message });
+                continue;
+            }
             ReleaseAvailability::NotYetPublished {
                 release_tag,
                 missing_asset,
@@ -200,6 +198,14 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
                 continue;
             }
             ReleaseAvailability::Available | ReleaseAvailability::NotRequired => {}
+        }
+
+        if let Some(message) = component.unavailable_message(*target) {
+            plan.outcomes.push(PlanOutcome::DeclaredUnavailable {
+                component,
+                message: message.to_string(),
+            });
+            continue;
         }
 
         let component_state = observed.component_state(component);
@@ -628,6 +634,12 @@ pub fn plan_upgrade(observed: &UpgradeObserved) -> UpgradePlan {
                     reason,
                 });
                 match release {
+                    ReleaseAvailability::DeclaredUnavailable { message } => {
+                        plan.outcomes.push(PlanOutcome::DeclaredUnavailable {
+                            component: target.component,
+                            message,
+                        });
+                    }
                     ReleaseAvailability::Incomplete { missing_asset } => {
                         plan.outcomes.push(PlanOutcome::ReleaseIncomplete {
                             component: target.component,
@@ -1724,7 +1736,7 @@ mod tests {
         assert!(plan.outcomes.iter().any(|outcome| matches!(
             outcome,
             PlanOutcome::DeclaredUnavailable { message, .. }
-                if message == "magic-context: not available on windows in alpha"
+                if message == "magic-context is not available on this platform yet; nothing was installed."
         )));
         assert!(plan.is_authorized());
     }

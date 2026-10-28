@@ -3,6 +3,14 @@
 
 use super::{ManagedUpgradeTarget, PlanOutcome, UpgradePlan};
 
+pub(super) const MC_UNPUBLISHED_NOTE: &str = concat!(
+    "Magic Context's module (ck-mc) isn't published for public installs yet. Magic Context runs fully inside its OpenCode and Pi plugin, so you don't need the module. Install the plugin with:\n",
+    "  OpenCode:    npx @cortexkit/magic-context@latest setup\n",
+    "  Pi:          npx @cortexkit/magic-context@latest setup --harness pi\n",
+    "  Oh My Pi:    npx @cortexkit/magic-context@latest setup --harness omp\n",
+    "The module will install through `ck setup mc` once a release is published.",
+);
+
 /// Setup leaves unfamiliar programs in place and names the safe next step.
 pub fn unowned_binary_refusal(path: &std::path::Path) -> String {
     format!(

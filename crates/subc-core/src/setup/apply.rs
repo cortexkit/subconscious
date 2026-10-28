@@ -182,7 +182,12 @@ impl SetupBackend {
                 PlatformObservation::Supported(target) if component.is_declared_unsupported_on(target)
             ) {
                 components.insert(component, ComponentState::Missing);
-                releases.insert(component, ReleaseAvailability::NotRequired);
+                let availability = if release_index.components.contains_key(component.label()) {
+                    ReleaseAvailability::NotRequired
+                } else {
+                    self.artifacts.release_availability(component)?
+                };
+                releases.insert(component, availability);
                 continue;
             }
             let config_ok = match components::configuration_is_correct(

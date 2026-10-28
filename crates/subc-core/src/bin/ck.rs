@@ -7469,12 +7469,36 @@ fn setup_unavailable_message(
                 component.label()
             ))
         }
-        setup::PlanOutcome::DeclaredUnavailable { component, .. } => Some(format!(
-            "{} is not available on this platform yet; nothing was installed.",
-            component.module_id().unwrap_or(component.label())
-        )),
+        setup::PlanOutcome::DeclaredUnavailable { message, .. } => Some(message.clone()),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod setup_message_tests {
+    use super::*;
+
+    #[test]
+    fn setup_declared_unavailable_renders_each_stored_message_verbatim() {
+        let observed = setup::SetupObserved::unconfigured_current_host();
+        for message in [
+            "Owner's plugin installation instructions:\n  install the plugin",
+            "magic-context is not available on this platform yet; nothing was installed.",
+        ] {
+            let mut plan = setup::plan_setup(
+                &observed,
+                &setup::SetupRequest::install(vec![setup::Component::Mc]),
+            );
+            plan.outcomes = vec![setup::PlanOutcome::DeclaredUnavailable {
+                component: setup::Component::Mc,
+                message: message.to_string(),
+            }];
+            assert_eq!(
+                setup_unavailable_message(&plan, &observed).as_deref(),
+                Some(message)
+            );
+        }
+    }
 }
 
 fn print_verbose_setup_outcomes(plan: &setup::SetupPlan, verbose: bool) {

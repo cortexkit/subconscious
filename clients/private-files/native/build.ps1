@@ -6,9 +6,12 @@ New-Item -ItemType Directory -Force $cache | Out-Null
 $base = "https://nodejs.org/dist/v$NodeVersion"
 $headers = Join-Path $cache 'headers.tar.gz'
 $library = Join-Path $cache 'node.lib'
-Invoke-WebRequest "$base/node-v$NodeVersion-headers.tar.gz" -OutFile $headers
-Invoke-WebRequest "$base/win-$Arch/node.lib" -OutFile $library
-$shas = (Invoke-WebRequest "$base/SHASUMS256.txt").Content
+# nodejs.org downloads sometimes end early on CI runners. Retry them; the
+# checksum check below still rejects anything that isn't the published file.
+$retry = @{ MaximumRetryCount = 4; RetryIntervalSec = 5 }
+Invoke-WebRequest "$base/node-v$NodeVersion-headers.tar.gz" -OutFile $headers @retry
+Invoke-WebRequest "$base/win-$Arch/node.lib" -OutFile $library @retry
+$shas = (Invoke-WebRequest "$base/SHASUMS256.txt" @retry).Content
 foreach ($item in @(@($headers, "node-v$NodeVersion-headers.tar.gz"), @($library, "win-$Arch/node.lib"))) {
   $hash = (Get-FileHash $item[0] -Algorithm SHA256).Hash.ToLower()
   if ($shas -notmatch "(?m)^$hash\s+$([regex]::Escape($item[1]))\s*$") { throw "Node download checksum mismatch: $($item[1])" }

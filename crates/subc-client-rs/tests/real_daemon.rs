@@ -1233,6 +1233,117 @@ async fn assert_supervised_launch_nonce_delivery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn module_handle_set_ready_controls_new_binds_without_interrupting_health_or_routes() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-readiness");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+
+    let module_id = "subc-client-rs-warming";
+    let manifest = ModuleManifest::builder(module_id, env!("CARGO_PKG_VERSION"))
+        .provides(vec![tool_provider_role(&["echo"])])
+        .ready(false)
+        .build();
+    let (handle, serve_task) = spawn_inline_module(&daemon.connection_file, manifest).await;
+    let mut client = connect_authed_client(&daemon.connection_file)
+        .await
+        .unwrap();
+    let project = unique_temp_dir("subc-client-rs-readiness-project");
+    let open = json!({
+        "op": "route.open",
+        "target": tool_target(module_id),
+        "identity": BindIdentity::new(project.keep(), "readiness-client", "warmup"),
+    });
+    let mut route = None;
+
+    for (corr, ready) in [(10_101, false), (10_102, true), (10_103, false)] {
+        if corr != 10_101 {
+            handle.set_ready(ready).await.unwrap();
+        }
+        write_frame(
+            &mut client,
+            &control_request_frame(corr, serde_json::to_vec(&open).unwrap()),
+        )
+        .await
+        .unwrap();
+        client.flush().await.unwrap();
+        let response = read_frame_timeout(&mut client).await;
+        assert_eq!(response.header.corr, corr);
+        assert_eq!(response.header.channel, 0);
+        if ready {
+            assert_eq!(
+                response.header.ty,
+                FrameType::Response,
+                "set_ready(true) must enable the same open: {}",
+                String::from_utf8_lossy(&response.body)
+            );
+            let response = json_body(&response.body);
+            route = Some((
+                response["route_channel"].as_u64().unwrap() as u16,
+                response["route_epoch"].as_u64().unwrap() as u32,
+            ));
+        } else {
+            assert_eq!(response.header.ty, FrameType::Error);
+            let error: ErrorBody = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(error.code, "module_warming");
+            assert_eq!(error.detail, Some(json!({"reason": "declared_not_ready"})));
+            assert!(subc_client_rs::is_retryable_route_open_code(&error.code));
+        }
+
+        let entries = catalog_modules(&daemon.connection_file, Some(module_id), corr + 100).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["ready"], ready);
+        assert_eq!(module_tool_names(&entries[0]), vec!["echo"]);
+
+        let health = control_rpc_on_stream(
+            &mut client,
+            corr + 200,
+            json!({"op": "supervisor.health_probe", "module_id": module_id}),
+        )
+        .await;
+        assert_eq!(health["status"], "ok");
+        assert_eq!(
+            health["detail"],
+            "no health implementation; inherited default"
+        );
+    }
+
+    let (channel, epoch) = route.expect("ready module accepted a route");
+    write_frame(
+        &mut client,
+        &data_request(channel, epoch, 10_104, b"still-serving"),
+    )
+    .await
+    .unwrap();
+    client.flush().await.unwrap();
+    let response = read_frame_timeout(&mut client).await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    assert_eq!(response.header.channel, channel);
+    assert_eq!(response.header.epoch, epoch);
+    assert_eq!(response.header.corr, 10_104);
+    assert_eq!(response.body, b"still-serving");
+
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn module_handle_catalog_update_refreshes_catalog_without_dropping_open_routes() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(

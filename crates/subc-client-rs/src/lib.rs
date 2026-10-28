@@ -28,7 +28,7 @@ pub use policy_cache::{
 };
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env,
     error::Error,
     ffi::OsString,
@@ -476,6 +476,7 @@ struct ModuleHandleShared {
     /// The handler-slot pools this connection's dispatcher uses. Replaced once,
     /// with the pools the module's handler declares, before serving starts.
     dispatch_pools: Mutex<Arc<DispatchPools>>,
+    catalog_send: tokio::sync::Mutex<()>,
     inner: Mutex<ModuleHandleState>,
 }
 
@@ -486,7 +487,32 @@ struct ModuleHandleState {
     pending_operator_confirms: HashMap<u64, oneshot::Sender<Frame>>,
     pending_activity_records: HashMap<u64, oneshot::Sender<Frame>>,
     pending_scope_served_by: HashMap<u64, oneshot::Sender<Frame>>,
+    current_provides: Option<Vec<ProviderRole>>,
+    catalog_changes: VecDeque<CatalogChange>,
     closed: bool,
+}
+
+struct CatalogChange {
+    corr: u64,
+    provides: Vec<ProviderRole>,
+    outcome: Option<CatalogChangeOutcome>,
+}
+
+enum CatalogChangeOutcome {
+    Accepted,
+    Rejected,
+    Unknown,
+}
+
+struct CatalogUpdateGuard {
+    shared: Arc<ModuleHandleShared>,
+    corr: u64,
+}
+
+impl Drop for CatalogUpdateGuard {
+    fn drop(&mut self) {
+        self.shared.remove_pending_catalog_update(self.corr);
+    }
 }
 
 impl ModuleHandle {
@@ -526,6 +552,7 @@ impl ModuleHandle {
                 dropped_route_frames: AtomicU64::new(0),
                 close_token,
                 dispatch_pools: Mutex::new(Arc::new(DispatchPools::new(RequestPools::new()))),
+                catalog_send: tokio::sync::Mutex::new(()),
                 inner: Mutex::new(ModuleHandleState {
                     writer: Some(writer),
                     next_corr: Some(HELLO_CORR + 1),
@@ -533,6 +560,8 @@ impl ModuleHandle {
                     pending_operator_confirms: HashMap::new(),
                     pending_activity_records: HashMap::new(),
                     pending_scope_served_by: HashMap::new(),
+                    current_provides: None,
+                    catalog_changes: VecDeque::new(),
                     closed: false,
                 }),
             }),
@@ -589,7 +618,7 @@ impl ModuleHandle {
         &self,
         provides: Vec<ProviderRole>,
     ) -> Result<(), CatalogUpdateError> {
-        self.catalog_update_inner(provides, None).await
+        self.catalog_update_inner(Some(provides), None, None).await
     }
 
     /// Replace provider roles and attest a new static capability declaration.
@@ -602,23 +631,62 @@ impl ModuleHandle {
         provides: Vec<ProviderRole>,
         capabilities: CapabilityDeclarations,
     ) -> Result<(), CatalogUpdateError> {
-        self.catalog_update_inner(provides, Some(capabilities))
+        self.catalog_update_inner(Some(provides), Some(capabilities), None)
             .await
+    }
+
+    /// Change readiness without changing provider roles or capability declarations.
+    ///
+    /// Register with `ready(false)`, start polling the serving future immediately,
+    /// and do slow startup work on another task before calling `set_ready(true)`.
+    /// Setting readiness to false refuses new binds but leaves existing routes up.
+    /// Requires subc-daemon 0.20.3 or later (including subc-daemon 0.38.x).
+    ///
+    /// Returns [`CatalogUpdateError::Protocol`] without sending if the current roles
+    /// are unknown: a catalog replacement is still in flight, or an earlier update
+    /// timed out, was cancelled or had an undecodable reply. After an uncertain result, a successful
+    /// explicit catalog replacement establishes the roles again.
+    pub async fn set_ready(&self, ready: bool) -> Result<(), CatalogUpdateError> {
+        self.catalog_update_inner(None, None, Some(ready)).await
     }
 
     async fn catalog_update_inner(
         &self,
-        provides: Vec<ProviderRole>,
+        provides: Option<Vec<ProviderRole>>,
         capabilities: Option<CapabilityDeclarations>,
+        ready: Option<bool>,
     ) -> Result<(), CatalogUpdateError> {
         if !self.shared.supports_catalog_update {
             return Err(CatalogUpdateError::NotSupported);
         }
 
+        // Order role snapshots and outbound updates together, but release the lock
+        // before waiting for ACKs so existing concurrent catalog RPCs still work.
+        let send_guard = self.shared.catalog_send.lock().await;
+        let provides = match provides {
+            Some(provides) => provides,
+            None => {
+                let inner = self.shared.lock_inner();
+                if inner.closed {
+                    return Err(CatalogUpdateError::ConnectionClosed);
+                }
+                inner
+                    .current_provides
+                    .as_ref()
+                    .filter(|_| inner.catalog_changes.is_empty())
+                    .cloned()
+                    .ok_or_else(|| {
+                        CatalogUpdateError::Protocol(
+                            "current provider roles are unknown or a catalog update is in flight"
+                                .into(),
+                        )
+                    })?
+            }
+        };
         let body = serde_json::to_vec(&ModuleControlRequestFromModule::CatalogUpdate {
-            provides,
+            provides: provides.clone(),
             capabilities,
-            ready: None,
+            ready,
         })
         .map_err(|err| {
             CatalogUpdateError::Protocol(format!(
@@ -626,6 +694,10 @@ impl ModuleHandle {
             ))
         })?;
         let (corr, writer, rx) = self.shared.begin_catalog_update()?;
+        let _pending = CatalogUpdateGuard {
+            shared: self.shared.clone(),
+            corr,
+        };
         let frame = Frame::build_with_version(
             self.shared.negotiated_ver,
             FrameType::Request,
@@ -642,10 +714,23 @@ impl ModuleHandle {
             ))
         })?;
 
-        if writer.send(frame).await.is_err() {
-            self.shared.remove_pending_catalog_update(corr);
-            return Err(CatalogUpdateError::ConnectionClosed);
-        }
+        let permit = match writer.reserve().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.shared.remove_pending_catalog_update(corr);
+                return Err(CatalogUpdateError::ConnectionClosed);
+            }
+        };
+        self.shared
+            .lock_inner()
+            .catalog_changes
+            .push_back(CatalogChange {
+                corr,
+                provides,
+                outcome: None,
+            });
+        permit.send(frame);
+        drop(send_guard);
 
         match timeout(CATALOG_UPDATE_TIMEOUT, rx).await {
             Ok(Ok(Ok(ModuleControlResponseToModule::CatalogUpdate {}))) => Ok(()),
@@ -1248,6 +1333,15 @@ impl ModuleHandle {
                 "unexpected catalog.update terminal frame: {ty:?}"
             ))),
         };
+        let outcome = match &result {
+            Ok(ModuleControlResponseToModule::CatalogUpdate {}) => CatalogChangeOutcome::Accepted,
+            Err(CatalogUpdateError::FrozenField(_))
+            | Err(CatalogUpdateError::NotRegistered(_))
+            | Err(CatalogUpdateError::Rejected(_)) => CatalogChangeOutcome::Rejected,
+            _ => CatalogChangeOutcome::Unknown,
+        };
+        self.shared
+            .finish_catalog_change(frame.header.corr, outcome);
         let _ = reply.send(result);
         true
     }
@@ -1303,7 +1397,39 @@ impl ModuleHandleShared {
     }
 
     fn remove_pending_catalog_update(&self, corr: u64) {
-        self.lock_inner().pending_catalog_updates.remove(&corr);
+        let removed = self
+            .lock_inner()
+            .pending_catalog_updates
+            .remove(&corr)
+            .is_some();
+        if removed {
+            self.finish_catalog_change(corr, CatalogChangeOutcome::Unknown);
+        }
+    }
+
+    fn finish_catalog_change(&self, corr: u64, outcome: CatalogChangeOutcome) {
+        let mut inner = self.lock_inner();
+        if let Some(change) = inner
+            .catalog_changes
+            .iter_mut()
+            .find(|change| change.corr == corr)
+        {
+            change.outcome = Some(outcome);
+        }
+        // Replies may arrive out of order. Apply their effects in send order,
+        // including replies whose caller dropped its waiting future.
+        while inner
+            .catalog_changes
+            .front()
+            .is_some_and(|change| change.outcome.is_some())
+        {
+            let change = inner.catalog_changes.pop_front().expect("completed change");
+            match change.outcome.expect("completed outcome") {
+                CatalogChangeOutcome::Accepted => inner.current_provides = Some(change.provides),
+                CatalogChangeOutcome::Rejected => {}
+                CatalogChangeOutcome::Unknown => inner.current_provides = None,
+            }
+        }
     }
 
     fn close_connection(&self) {
@@ -1314,6 +1440,8 @@ impl ModuleHandleShared {
             }
             inner.closed = true;
             inner.writer = None;
+            inner.current_provides = None;
+            inner.catalog_changes.clear();
             self.close_token.cancel();
             // Dropping these senders wakes raw-frame waiters immediately.
             inner.pending_operator_confirms.clear();
@@ -1477,7 +1605,7 @@ impl OperatorConfirmError {
 
 impl Error for OperatorConfirmError {}
 
-/// Errors returned by [`ModuleHandle::catalog_update`].
+/// Errors returned by [`ModuleHandle::catalog_update`] and [`ModuleHandle::set_ready`].
 #[derive(Debug)]
 pub enum CatalogUpdateError {
     NotSupported,
@@ -1851,6 +1979,11 @@ pub struct RequestCtx {
 }
 
 impl RequestCtx {
+    /// Clone the connection's control handle, for readiness and other module RPCs.
+    pub fn module_handle(&self) -> ModuleHandle {
+        self.module_handle.clone()
+    }
+
     /// Decodes a framed request only when ingress carried `FLAG_BINARY`.
     /// Call this only for management operations that declared `operation_payload`.
     /// Return a malformed body's named error as a refusal before doing any work;
@@ -2209,7 +2342,9 @@ impl ServeOptions {
 ///
 /// The returned serve future **must be awaited or spawned**. A module can give
 /// the returned handle to its handler's shared state before starting that future,
-/// so the handler can call [`ModuleHandle::confirm_operator`].
+/// so the handler can call [`ModuleHandle::confirm_operator`] or
+/// [`ModuleHandle::set_ready`]. Spawn the serve future before slow startup work
+/// or awaiting control RPCs: it reads their replies and answers health and stop.
 pub async fn serve_from_env_with_handle<H>(
     mut manifest: ModuleManifest,
     handler: H,
@@ -2285,6 +2420,7 @@ where
     let handler = Arc::new(handler);
 
     let mut hello_ack = None;
+    let provides = manifest.provides.clone();
     let handshake = async {
         send_hello(&tx, manifest).await?;
         // A validated ACK means the daemon accepted the module, even while the
@@ -2363,6 +2499,7 @@ where
         close_token,
         connection_runtime,
     );
+    handle.shared.lock_inner().current_provides = Some(provides);
     let serve_future = connection_serve_future_with_options(
         read_half,
         tx,
@@ -3782,6 +3919,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, CatalogUpdateError::NotSupported));
+        assert!(matches!(
+            handle.set_ready(true).await,
+            Err(CatalogUpdateError::NotSupported)
+        ));
         assert!(timeout(Duration::from_millis(75), rx.recv()).await.is_err());
     }
 
@@ -3815,10 +3956,189 @@ mod tests {
         assert_eq!(second_frame.header.channel, 0);
         assert_ne!(first_frame.header.corr, second_frame.header.corr);
 
+        let (earlier, later) =
+            if json_body(&first_frame.body)["provides"] == json!([test_provider_role(&["a"])]) {
+                (first, second)
+            } else {
+                (second, first)
+            };
         assert!(handle.handle_control_reply(catalog_update_response(second_frame.header.corr)));
+        assert!(later.await.unwrap().is_ok());
         assert!(handle.handle_control_reply(catalog_update_response(first_frame.header.corr)));
-        assert!(first.await.unwrap().is_ok());
-        assert!(second.await.unwrap().is_ok());
+        assert!(earlier.await.unwrap().is_ok());
+
+        let expected = json_body(&second_frame.body)["provides"].clone();
+        let (result, ()) = tokio::join!(handle.set_ready(true), async {
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(json_body(&frame.body)["provides"], expected);
+            assert_eq!(json_body(&frame.body)["ready"], true);
+            handle.handle_control_reply(catalog_update_response(frame.header.corr));
+        });
+        result.unwrap();
+    }
+
+    fn json_body(body: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(body).unwrap()
+    }
+
+    async fn ack_catalog_update(
+        handle: &ModuleHandle,
+        rx: &mut mpsc::Receiver<Frame>,
+        provides: &[ProviderRole],
+        ready: Option<bool>,
+        capabilities: Option<&CapabilityDeclarations>,
+    ) {
+        let frame = rx.recv().await.unwrap();
+        let mut expected = json!({"op": "catalog.update", "provides": provides});
+        if let Some(ready) = ready {
+            expected["ready"] = json!(ready);
+        }
+        if let Some(capabilities) = capabilities {
+            expected["capabilities"] = json!(capabilities);
+        }
+        assert_eq!(json_body(&frame.body), expected);
+        let mut wire = format!(
+            r#"{{"op":"catalog.update","provides":{}"#,
+            serde_json::to_string(provides).unwrap()
+        );
+        if let Some(capabilities) = capabilities {
+            wire.push_str(&format!(
+                r#","capabilities":{}"#,
+                serde_json::to_string(capabilities).unwrap()
+            ));
+        }
+        if let Some(ready) = ready {
+            wire.push_str(&format!(r#","ready":{ready}"#));
+        }
+        wire.push('}');
+        assert_eq!(frame.body, wire.as_bytes());
+        assert!(handle.handle_control_reply(catalog_update_response(frame.header.corr)));
+    }
+
+    #[tokio::test]
+    async fn catalog_update_set_ready_preserves_registered_and_replaced_roles() {
+        let (handle, mut rx) = test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE]);
+        let initial = vec![test_provider_role(&["initial", "second"])];
+        handle.shared.lock_inner().current_provides = Some(initial.clone());
+        let (result, ()) = tokio::join!(
+            handle.set_ready(true),
+            ack_catalog_update(&handle, &mut rx, &initial, Some(true), None)
+        );
+        result.unwrap();
+
+        let replaced = vec![test_provider_role(&["replacement"])];
+        let (result, ()) = tokio::join!(
+            handle.catalog_update(replaced.clone()),
+            ack_catalog_update(&handle, &mut rx, &replaced, None, None)
+        );
+        result.unwrap();
+        let (result, ()) = tokio::join!(
+            handle.set_ready(false),
+            ack_catalog_update(&handle, &mut rx, &replaced, Some(false), None)
+        );
+        result.unwrap();
+
+        let attested = vec![test_provider_role(&["attested"])];
+        let capabilities = CapabilityDeclarations {
+            provides: vec!["test.capability".into()],
+            requires: Vec::new(),
+            must_never_reach: Vec::new(),
+        };
+        let (result, ()) = tokio::join!(
+            handle.catalog_update_with_capabilities(attested.clone(), capabilities.clone()),
+            ack_catalog_update(&handle, &mut rx, &attested, None, Some(&capabilities))
+        );
+        result.unwrap();
+        let (result, ()) = tokio::join!(
+            handle.set_ready(true),
+            ack_catalog_update(&handle, &mut rx, &attested, Some(true), None)
+        );
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_update_set_ready_refuses_unknown_or_in_flight_roles() {
+        let (handle, mut rx) = test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE]);
+        assert!(matches!(
+            handle.set_ready(true).await,
+            Err(CatalogUpdateError::Protocol(_))
+        ));
+        assert!(rx.try_recv().is_err());
+
+        let updating = handle.clone();
+        let update = tokio::spawn(async move {
+            updating
+                .catalog_update(vec![test_provider_role(&["new"])])
+                .await
+        });
+        let frame = rx.recv().await.unwrap();
+        assert!(matches!(
+            handle.set_ready(true).await,
+            Err(CatalogUpdateError::Protocol(_))
+        ));
+        assert!(rx.try_recv().is_err());
+        update.abort();
+        assert!(update.await.unwrap_err().is_cancelled());
+        assert!(!handle.handle_control_reply(catalog_update_response(frame.header.corr)));
+        assert!(matches!(
+            handle.set_ready(true).await,
+            Err(CatalogUpdateError::Protocol(_))
+        ));
+
+        let roles = vec![test_provider_role(&["recovered"])];
+        let (result, ()) = tokio::join!(
+            handle.catalog_update(roles.clone()),
+            ack_catalog_update(&handle, &mut rx, &roles, None, None)
+        );
+        result.unwrap();
+        let (result, ()) = tokio::join!(
+            handle.set_ready(true),
+            ack_catalog_update(&handle, &mut rx, &roles, Some(true), None)
+        );
+        result.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn catalog_update_set_ready_timeout_does_not_replay_stale_roles() {
+        let (handle, mut rx) = test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE]);
+        handle.shared.lock_inner().current_provides = Some(vec![test_provider_role(&["old"])]);
+        assert!(matches!(
+            handle
+                .catalog_update(vec![test_provider_role(&["new"])])
+                .await,
+            Err(CatalogUpdateError::Timeout)
+        ));
+        let frame = rx.recv().await.unwrap();
+        assert!(!handle.handle_control_reply(catalog_update_response(frame.header.corr)));
+        assert!(matches!(
+            handle.set_ready(true).await,
+            Err(CatalogUpdateError::Protocol(_))
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn catalog_update_set_ready_rejection_retains_last_accepted_roles() {
+        let (handle, mut rx) = test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE]);
+        let initial = vec![test_provider_role(&["kept"])];
+        handle.shared.lock_inner().current_provides = Some(initial.clone());
+        let (result, ()) = tokio::join!(
+            handle.catalog_update(vec![test_provider_role(&["rejected"])]),
+            async {
+                let frame = rx.recv().await.unwrap();
+                handle.handle_control_reply(control_reply(
+                    FrameType::Error,
+                    frame.header.corr,
+                    br#"{"code":"catalog_update_frozen_field","message":"frozen"}"#.to_vec(),
+                ));
+            }
+        );
+        assert!(matches!(result, Err(CatalogUpdateError::FrozenField(_))));
+        let (result, ()) = tokio::join!(
+            handle.set_ready(true),
+            ack_catalog_update(&handle, &mut rx, &initial, Some(true), None)
+        );
+        result.unwrap();
     }
 
     fn control_reply(ty: FrameType, corr: u64, body: Vec<u8>) -> Frame {

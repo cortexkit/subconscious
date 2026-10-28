@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.32.14
+
+- Add `ModuleHandle::set_ready(bool)`, using the existing `catalog.update` ACK, typed-error and timeout path. It resends the current provider roles and preserves the capability declaration; existing catalog methods still omit `ready`. The handle remembers registered roles and acknowledged replacements in send order. If roles cannot be known (an update is in flight, or a prior update was cancelled, timed out or had an invalid reply), readiness changes return the existing `CatalogUpdateError::Protocol` without sending; a successful explicit catalog replacement recovers from an uncertain result. No public struct fields or enum variants change.
+- Reach the handle through `serve_from_env_with_handle` / `serve_with_handle`, or `RequestCtx::module_handle()` inside handlers. Start serving immediately after registration with `.ready(false)`, do slow startup work separately, then await `set_ready(true)`. Health and stop handling stay live during warmup.
+- Requires **subc-daemon 0.20.3 or later**, the first daemon release accepting readiness in `catalog.update`; subc-daemon 0.38.x also supports it. A false-to-true update enables new binds; setting false again makes new opens return retryable `module_warming` while existing routes continue working.
+
 ## 0.32.13
 
 - Add `SubcConsumer::connect_local(path, options)` and `connect_default_local(options)`. Existing `connect` and `connect_default` stay on TCP with unchanged handshake and frames. Local constructors read the current `local_endpoint` from the owner-checked connection file on every initial or reconnect attempt, use the Unix socket or Windows pipe only, and never fall back to TCP. An absent key returns the existing `ConsumerError::NoEndpoint`; connect failures remain `Connect` with their local endpoint and I/O error. `NoEndpoint` now displays "has no endpoint for the requested transport" for either transport. Require subc-transport 0.14.1 for its endpoint-aware reader.

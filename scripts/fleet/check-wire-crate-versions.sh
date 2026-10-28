@@ -57,6 +57,7 @@ done
 
 examined=0
 violations=0
+bumped_crates=()
 
 # This check compares COMMITS ($BASE...HEAD). Uncommitted working-tree edits
 # are invisible to it, so "clean" here answers a narrower question than "is
@@ -107,6 +108,9 @@ for crate in "${CRATES[@]}"; do
   # locked under the higher one.
   base_version=$(version_of "$merge_base" "$manifest")
   head_version=$(version_of HEAD "$manifest")
+  if [ -n "$base_version" ] && version_gt "$base_version" "$head_version"; then
+    bumped_crates+=("$crate" "$head_version")
+  fi
   if [ -n "$base_version" ] && [ -n "$head_version" ] \
     && [ "$base_version" != "$head_version" ] \
     && ! version_gt "$base_version" "$head_version"; then
@@ -190,9 +194,121 @@ if [ "$examined" -eq 0 ]; then
   exit 2
 fi
 
+# Path dependencies compile against the workspace's newest code even when their
+# registry requirement still permits an older release. Only dependents with
+# substantive changes under src/ need to raise that floor when a sibling is
+# bumped.
+if [ "${#bumped_crates[@]}" -gt 0 ]; then
+  # Cargo handles renamed, inherited and target-specific dependencies. Read a
+  # committed snapshot so uncommitted manifest edits cannot hide a stale floor.
+  mkdir -p target/scratch
+  snapshot=$(mktemp -d "$(pwd)/target/scratch/wire-versions.XXXXXX") || exit 2
+  trap 'rm -rf "$snapshot"' EXIT
+  if ! git archive HEAD | tar -x -C "$snapshot"; then
+    echo "  could not read committed workspace -- refusing" >&2
+    exit 2
+  fi
+  if ! (cd "$snapshot" && cargo metadata --format-version 1 --no-deps --offline) > "$snapshot/metadata.json"; then
+    echo "  cargo metadata failed for committed workspace -- refusing" >&2
+    exit 2
+  fi
+  python3 - "$snapshot" "$merge_base" "${bumped_crates[@]}" <<'PY'
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+snapshot = pathlib.Path(sys.argv[1])
+base = sys.argv[2]
+bumps = {f"crates/{crate}/Cargo.toml": version
+         for crate, version in zip(sys.argv[3::2], sys.argv[4::2])}
+metadata = json.loads((snapshot / "metadata.json").read_text())
+packages = [p for p in metadata["packages"] if p["id"] in metadata["workspace_members"]]
+bumped = {
+    p["name"]: bumps[str(pathlib.Path(p["manifest_path"]).relative_to(snapshot))]
+    for p in packages
+    if str(pathlib.Path(p["manifest_path"]).relative_to(snapshot)) in bumps
+}
+
+
+def version_key(version):
+    release, _, prerelease = version.split("+", 1)[0].partition("-")
+    numbers = tuple(map(int, release.split(".")))
+    identifiers = tuple((0, int(s)) if s.isdigit() else (1, s) for s in prerelease.split("."))
+    return numbers, not prerelease, identifiers
+
+
+def requirement_at_least(requirement, version):
+    # Cargo joins comparators with AND, so the strongest lower bound wins.
+    # Upper bounds alone (and '*') do not prevent selecting an older release.
+    for comparator in requirement.split(","):
+        match = re.fullmatch(r"\s*(>=|<=|>|<|=|\^|~)?\s*(\d+(?:\.\d+){0,2})(?:\.[*xX])?(-[0-9A-Za-z.-]+)?\s*", comparator)
+        if not match:
+            if comparator.strip() == "*":
+                continue
+            print(f"  unsupported Cargo requirement: {requirement} -- refusing", file=sys.stderr)
+            sys.exit(2)
+        operator, release, prerelease = match.groups()
+        if operator in ("<", "<="):
+            continue
+        numbers = list(map(int, release.split(".")))
+        width = len(numbers)
+        numbers += [0] * (3 - width)
+        if operator == ">":
+            if prerelease:
+                prerelease += ".0"
+            else:
+                numbers[width - 1] += 1
+                # An explicit prerelease comparator opts that release into
+                # Cargo's candidate set, including releases between patches.
+                next_release = ".".join(map(str, numbers))
+                if re.search(r"(?<![\d.])" + re.escape(next_release) + "-", requirement):
+                    prerelease = "-0"
+        floor = ".".join(map(str, numbers)) + (prerelease or "")
+        if version_key(floor) >= version_key(version):
+            return True
+    return False
+
+
+violations = 0
+for package in packages:
+    manifest = pathlib.Path(package["manifest_path"]).relative_to(snapshot)
+    result = subprocess.run(
+        ["git", "diff", "--no-ext-diff", "--no-color", base, "HEAD", "--", str(manifest.parent / "src")],
+        capture_output=True, text=True,
+    )
+    if result.returncode:
+        print(f"  source comparison failed: {result.stderr} -- refusing", file=sys.stderr)
+        sys.exit(2)
+    diff = result.stdout
+    # Match the version-bump check's exemption for prose and blank lines.
+    changed = [line[1:].lstrip() for line in diff.splitlines()
+               if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))]
+    if not any(line and not line.startswith(("//", "/*", "*")) for line in changed):
+        continue
+    for dependency in package["dependencies"]:
+        name = dependency["name"]
+        if name == package["name"] or name not in bumped:
+            continue
+        requirement = dependency["req"]
+        if not requirement_at_least(requirement, bumped[name]):
+            print(f"  {package['name']}: dependency {name} requires {requirement}, below new version {bumped[name]}")
+            print("      raise the sibling requirement when changing dependent source alongside a sibling bump.")
+            violations += 1
+sys.exit(1 if violations else 0)
+PY
+  sibling_rc=$?
+  if [ "$sibling_rc" -gt 1 ]; then
+    echo "  sibling requirement check failed -- refusing" >&2
+    exit 2
+  fi
+  violations=$((violations + sibling_rc))
+fi
+
 if [ "$violations" -gt 0 ]; then
-  echo "  $violations of $examined cross-repo crates changed without a version bump, or moved backwards"
+  echo "  version checks failed: missing bumps, backwards versions, or stale sibling requirements ($examined cross-repo crates examined)"
   exit 1
 fi
 
-echo "  $examined cross-repo crates examined against $BASE, none changed without a version bump"
+echo "  $examined cross-repo crates examined against $BASE, version bumps and sibling requirements are consistent"

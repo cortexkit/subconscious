@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "$0")/../../.." && pwd)
+checker="$repo_root/scripts/fleet/check-wire-crate-versions.sh"
+mkdir -p "$repo_root/target/scratch"
+sandbox=$(mktemp -d "$repo_root/target/scratch/check-wire-versions.XXXXXX")
+trap 'rm -rf "$sandbox"' EXIT
+
+new_fixture() {
+  fixture="$sandbox/$1"
+  mkdir -p "$fixture/crates/subc-protocol/src" "$fixture/crates/subc-daemon/src"
+  cd "$fixture"
+  git init -q
+  git config user.name 'Version check test'
+  git config user.email 'version-check@example.invalid'
+  cat > Cargo.toml <<'TOML'
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+TOML
+  cat > crates/subc-protocol/Cargo.toml <<'TOML'
+[package]
+name = "subc-protocol"
+version = "0.33.1"
+edition = "2021"
+TOML
+  cat > crates/subc-daemon/Cargo.toml <<'TOML'
+[package]
+name = "subc-daemon"
+version = "0.37.8"
+edition = "2021"
+
+[dependencies]
+subc-protocol = { path = "../subc-protocol", version = "0.33.1" }
+TOML
+  printf 'pub fn protocol() {}\n' > crates/subc-protocol/src/lib.rs
+  printf 'pub fn daemon() {}\n' > crates/subc-daemon/src/lib.rs
+  git add .
+  git commit -qm 'Base releases'
+  base=$(git rev-parse HEAD)
+}
+
+replace() {
+  # Keep fixture edits portable between GNU and BSD sed.
+  sed "s|$2|$3|" "$1" > "$1.new"
+  mv "$1.new" "$1"
+}
+
+bump_protocol() {
+  replace crates/subc-protocol/Cargo.toml '0.33.1' '0.33.2'
+  printf 'pub fn new_api() {}\n' >> crates/subc-protocol/src/lib.rs
+}
+
+change_daemon() {
+  replace crates/subc-daemon/Cargo.toml '0.37.8' '0.37.9'
+  printf 'pub fn uses_new_api() { subc_protocol::new_api(); }\n' >> crates/subc-daemon/src/lib.rs
+}
+
+commit_changes() {
+  git add .
+  git commit -qm 'Next releases'
+}
+
+run_check() {
+  local expected=$1 rc=0
+  output=$(bash "$checker" "$base" 2>&1) || rc=$?
+  if [ "$rc" -ne "$expected" ]; then
+    printf 'Expected exit %s, got %s:\n%s\n' "$expected" "$rc" "$output" >&2
+    return 1
+  fi
+}
+
+assert_stale_requirement() {
+  run_check 1
+  if ! printf '%s\n' "$output" | grep -Eq 'subc-daemon.*subc-protocol.*0\.33\.1.*0\.33\.2'; then
+    printf 'Missing dependent, dependency, requirement and new version in diagnostic:\n%s\n' "$output" >&2
+    return 1
+  fi
+}
+
+stale_requirement() {
+  new_fixture stale_requirement
+  bump_protocol
+  change_daemon
+  commit_changes
+  assert_stale_requirement
+}
+
+updated_requirement() {
+  new_fixture updated_requirement
+  bump_protocol
+  change_daemon
+  replace crates/subc-daemon/Cargo.toml '0.33.1' '0.33.2'
+  commit_changes
+  run_check 0
+}
+
+unchanged_dependent() {
+  new_fixture unchanged_dependent
+  bump_protocol
+  commit_changes
+  run_check 0
+}
+
+manifest_only_dependent() {
+  new_fixture manifest_only_dependent
+  bump_protocol
+  replace crates/subc-daemon/Cargo.toml '0.37.8' '0.37.9'
+  printf '\n[features]\nmanifest-only = []\n' >> crates/subc-daemon/Cargo.toml
+  commit_changes
+  run_check 0
+}
+
+comment_only_dependent() {
+  new_fixture comment_only_dependent
+  bump_protocol
+  printf '// No runtime change.\n' >> crates/subc-daemon/src/lib.rs
+  commit_changes
+  run_check 0
+}
+
+version_only_dependency_bump() {
+  new_fixture version_only_dependency_bump
+  replace crates/subc-protocol/Cargo.toml '0.33.1' '0.33.2'
+  change_daemon
+  commit_changes
+  assert_stale_requirement
+}
+
+no_dependency_bump() {
+  new_fixture no_dependency_bump
+  change_daemon
+  commit_changes
+  run_check 0
+}
+
+renamed_target_dependency() {
+  new_fixture renamed_target_dependency
+  replace crates/subc-daemon/Cargo.toml '\[dependencies\]' "[target.'cfg(unix)'.build-dependencies]"
+  replace crates/subc-daemon/Cargo.toml 'subc-protocol = {' 'wire = { package = "subc-protocol",'
+  bump_protocol
+  change_daemon
+  commit_changes
+  assert_stale_requirement
+}
+
+committed_requirements_only() {
+  new_fixture committed_requirements_only
+  bump_protocol
+  change_daemon
+  commit_changes
+  replace crates/subc-daemon/Cargo.toml '0.33.1' '0.33.2'
+  assert_stale_requirement
+}
+
+requirement_operators() {
+  local index=0 requirement expected
+  for requirement in '^0.33.1' '~0.33.1' '>=0.33.1, <0.34' '0.33.*' '*' \
+    '>0.33.1, >=0.33.2-alpha' '>0.33.2-alpha' \
+    '^0.33.2' '=0.33.2' '~0.33.2' '>=0.33.2, <0.34' '>0.33.1' '0.33.3'; do
+    new_fixture "requirement_operator_$index"
+    bump_protocol
+    change_daemon
+    replace crates/subc-daemon/Cargo.toml 'version = "0.33.1"' "version = \"$requirement\""
+    commit_changes
+    expected=0
+    [ "$index" -ge 7 ] || expected=1
+    run_check "$expected"
+    index=$((index + 1))
+  done
+}
+
+inherited_dependency() {
+  new_fixture inherited_dependency
+  printf '\n[workspace.dependencies]\nsubc-protocol = { path = "crates/subc-protocol", version = "0.33.1" }\n' >> Cargo.toml
+  replace crates/subc-daemon/Cargo.toml 'subc-protocol = .*' 'subc-protocol = { workspace = true }'
+  git add .
+  git commit -qm 'Inherit workspace dependency'
+  base=$(git rev-parse HEAD)
+  bump_protocol
+  change_daemon
+  commit_changes
+  assert_stale_requirement
+}
+
+dependent_outside_crates() {
+  new_fixture dependent_outside_crates
+  mkdir -p consumer/src
+  cat > consumer/Cargo.toml <<'TOML'
+[package]
+name = "consumer"
+version = "0.1.0"
+edition = "2021"
+
+[dev-dependencies]
+subc-protocol = { path = "../crates/subc-protocol", version = "0.33.1" }
+TOML
+  printf 'pub fn consumer() {}\n' > consumer/src/lib.rs
+  replace Cargo.toml 'members = .*' 'members = ["crates/*", "consumer"]'
+  git add .
+  git commit -qm 'Add another workspace member'
+  base=$(git rev-parse HEAD)
+  bump_protocol
+  printf 'pub fn changed_consumer() {}\n' >> consumer/src/lib.rs
+  commit_changes
+  run_check 1
+  printf '%s\n' "$output" | grep -Eq 'consumer.*subc-protocol.*0\.33\.1.*0\.33\.2'
+}
+
+tests=(stale_requirement updated_requirement unchanged_dependent manifest_only_dependent
+  comment_only_dependent version_only_dependency_bump no_dependency_bump
+  renamed_target_dependency committed_requirements_only requirement_operators
+  inherited_dependency dependent_outside_crates)
+count=0
+for test in "${tests[@]}"; do
+  if [ "${1:-all}" != all ] && [ "$1" != "$test" ]; then
+    continue
+  fi
+  "$test"
+  printf 'PASS %s\n' "$test"
+  count=$((count + 1))
+done
+[ "$count" -gt 0 ] || { echo "Unknown test: $1" >&2; exit 2; }
+printf '%s version-check tests passed\n' "$count"

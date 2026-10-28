@@ -69,8 +69,25 @@ jobs:
             Register-PSRepository -Default
           }
           Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-          Install-Module -Name PSScriptAnalyzer -Scope CurrentUser -Force -SkipPublisherCheck
-          Install-Module -Name Pester -MinimumVersion 5.0 -Scope CurrentUser -Force -SkipPublisherCheck
+          # Gallery downloads can fail transiently even on healthy runner images.
+          foreach ($module in @(
+            @{ Name = 'PSScriptAnalyzer' },
+            @{ Name = 'Pester'; MinimumVersion = '5.0' }
+          )) {
+            for ($attempt = 1; $attempt -le 4; $attempt++) {
+              try {
+                Install-Module @module -Scope CurrentUser -Force -SkipPublisherCheck -ErrorAction Stop
+                break
+              } catch {
+                if ($attempt -eq 4) {
+                  throw
+                }
+                $delay = 10 * [math]::Pow(2, $attempt - 1)
+                Write-Warning "Installing $($module.Name) failed (attempt $attempt/4): $($_.Exception.Message). Retrying in $delay seconds."
+                Start-Sleep -Seconds $delay
+              }
+            }
+          }
 
       - name: PSScriptAnalyzer installer scripts
         shell: pwsh

@@ -416,6 +416,33 @@ static void reserved_names(const wchar_t *root) {
   REQUIRE(!reserved_component(L"console.txt", 11));
   REQUIRE(!reserved_component(L"COM10", 5));
 }
+static void path_conversion(void) {
+  const wchar_t *inputs[] = {
+    L"C:\\private-files\\parent/./child/../token",
+    L"\\\\server\\share\\parent/./child/../token",
+    L"\\\\?\\C:\\private-files\\parent\\..\\token",
+    L"\\\\?\\UNC\\server\\share\\token",
+    L"\\\\.\\C:\\private-files\\token"
+  };
+  const wchar_t *expected[] = {
+    L"\\\\?\\C:\\private-files\\parent\\token",
+    L"\\\\?\\UNC\\server\\share\\parent\\token",
+    L"\\\\?\\C:\\private-files\\parent\\..\\token",
+    L"\\\\?\\UNC\\server\\share\\token",
+    L"\\\\.\\C:\\private-files\\token"
+  };
+  for (size_t i = 0; i < sizeof(inputs) / sizeof(inputs[0]); ++i) {
+    wchar_t *converted = extended_path(inputs[i]);
+    REQUIRE(converted && !wcscmp(converted, expected[i]));
+    free(converted);
+  }
+  wchar_t cwd[32768], expected_relative[32768];
+  REQUIRE(GetCurrentDirectoryW(32768, cwd));
+  swprintf(expected_relative, 32768, L"\\\\?\\%ls\\token", cwd);
+  wchar_t *relative = extended_path(L".\\parent\\..\\token");
+  REQUIRE(relative && !wcscmp(relative, expected_relative));
+  free(relative);
+}
 static void bounded_aces(void) {
   BYTE storage[256] = {0}; PACL acl = (PACL)storage;
   acl->AclSize = sizeof(storage); acl->AceCount = 1;
@@ -499,6 +526,7 @@ int main(int argc, char **argv) {
   else if (!strcmp(argv[1], "zeroize")) zeroize(root);
   else if (!strcmp(argv[1], "token-queries")) token_queries();
   else if (!strcmp(argv[1], "reserved-names")) reserved_names(root);
+  else if (!strcmp(argv[1], "path-conversion")) path_conversion();
   else if (!strcmp(argv[1], "bounded-aces")) bounded_aces();
   else if (!strcmp(argv[1], "secure-handle")) secure_handle(root);
   else if (!strcmp(argv[1], "delay-hook")) {

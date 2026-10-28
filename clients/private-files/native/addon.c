@@ -33,6 +33,7 @@ typedef struct {
   napi_async_work work;
   napi_deferred deferred;
   wchar_t *path;
+  wchar_t *original_path;
   int op, directory;
   BYTE *bytes;
   size_t length;
@@ -55,6 +56,41 @@ typedef struct {
 
 static void fail(Job *j, DWORD error, const char *reason) {
   if (!j->reason) { j->error = error; j->reason = reason; }
+}
+
+/* Win32 needs an extended-length absolute path even when long paths are enabled
+ * for Node. Resolve ordinary paths before adding the prefix, since prefixed paths
+ * do not normalize separators or dot components. Namespace paths are already exact. */
+static wchar_t *extended_path(const wchar_t *path) {
+  if (!wcsncmp(path, L"\\\\?\\", 4) || !wcsncmp(path, L"\\\\.\\", 4)) {
+    wchar_t *copy = _wcsdup(path);
+    if (!copy) SetLastError(ERROR_OUTOFMEMORY);
+    return copy;
+  }
+  DWORD capacity = GetFullPathNameW(path, 0, NULL, NULL);
+  if (!capacity) return NULL;
+  wchar_t *full = NULL;
+  DWORD length;
+  for (;;) {
+    full = calloc(capacity, sizeof(wchar_t));
+    if (!full) { SetLastError(ERROR_OUTOFMEMORY); return NULL; }
+    length = GetFullPathNameW(path, capacity, full, NULL);
+    if (!length) { DWORD error = GetLastError(); free(full); SetLastError(error); return NULL; }
+    if (length < capacity) break;
+    free(full);
+    capacity = length + 1;
+  }
+  int unc = !wcsncmp(full, L"\\\\", 2);
+  size_t prefix = unc ? 8u : 4u, skip = unc ? 2u : 0u;
+  if (length + prefix - skip > 32760) {
+    free(full); SetLastError(ERROR_FILENAME_EXCED_RANGE); return NULL;
+  }
+  wchar_t *result = calloc(length + prefix - skip + 1, sizeof(wchar_t));
+  if (!result) { free(full); SetLastError(ERROR_OUTOFMEMORY); return NULL; }
+  memcpy(result, unc ? L"\\\\?\\UNC\\" : L"\\\\?\\", prefix * sizeof(wchar_t));
+  memcpy(result + prefix, full + skip, (length - skip + 1) * sizeof(wchar_t));
+  free(full);
+  return result;
 }
 
 static int approved_owner(PSID owner, PSID user) {
@@ -337,8 +373,10 @@ static int safe_descriptor(Job *j, HANDLE h, DWORD dangerous) {
 }
 
 static void safe_level(Job *j, size_t end) {
-  memcpy(j->level, j->path, end * sizeof(wchar_t));
-  j->level[end] = 0;
+  size_t skip = j->original_path && wcsncmp(j->original_path, L"\\\\?\\", 4) &&
+      !wcsncmp(j->path, L"\\\\?\\", 4) ? 4u : 0u;
+  memcpy(j->level, j->path + skip, (end - skip) * sizeof(wchar_t));
+  j->level[end - skip] = 0;
 }
 
 /* Open one component relative to a pinned directory. No absolute pathname is
@@ -366,23 +404,23 @@ static HANDLE open_safe_component(Job *j, HANDLE parent, wchar_t *component, siz
   return handle;
 }
 
-static int pin_safe_parent(Job *j, const wchar_t *root, size_t length) {
+static int pin_safe_parent(Job *j, const wchar_t *root, size_t root_length, size_t length) {
   j->ancestors = calloc(length + 1, sizeof(HANDLE));
   j->ends = calloc(length + 1, sizeof(size_t));
   j->level = calloc(length + 1, sizeof(wchar_t));
   if (!j->ancestors || !j->ends || !j->level) {
     fail(j, ERROR_OUTOFMEMORY, "Directory handle allocation failed"); return 0;
   }
-  safe_level(j, 3);
+  safe_level(j, root_length);
   HANDLE h = CreateFileW(root, READ_CONTROL | FILE_READ_ATTRIBUTES,
       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, NULL);
   if (h == INVALID_HANDLE_VALUE) { fail(j, GetLastError(), "Cannot pin volume root"); return 0; }
-  j->ends[j->count] = 3;
+  j->ends[j->count] = root_length;
   j->ancestors[j->count++] = h;
   if (!attributes(j, h, 1)) return 0;
-  size_t start = 3;
-  for (size_t end = 3; end <= length && length > 3; ++end) {
+  size_t start = root_length;
+  for (size_t end = root_length; end <= length && length > root_length; ++end) {
     if (j->path[end] && j->path[end] != L'\\') continue;
     safe_level(j, end);
     h = open_safe_component(j, h, j->path + start, end - start);
@@ -411,11 +449,12 @@ static HANDLE open_object(Job *j, const wchar_t *path, DWORD access, DWORD dispo
 /* Supplying a descriptor creates a directory and returns its original handle;
  * metadata opens use the same native path conversion without creating objects. */
 static HANDLE open_native(Job *j, DWORD access, int directory, PSECURITY_DESCRIPTOR security) {
-  size_t length = wcslen(j->path) + 4;
+  size_t skip = !wcsncmp(j->path, L"\\\\?\\", 4) ? 4u : 0u;
+  size_t length = wcslen(j->path) + 4 - skip;
   wchar_t *buffer = calloc(length + 1, sizeof(wchar_t));
   if (!buffer) { fail(j, ERROR_OUTOFMEMORY, "Metadata path allocation failed"); return INVALID_HANDLE_VALUE; }
   memcpy(buffer, L"\\??\\", 4 * sizeof(wchar_t));
-  memcpy(buffer + 4, j->path, (length - 4) * sizeof(wchar_t));
+  memcpy(buffer + 4, j->path + skip, (length - 4) * sizeof(wchar_t));
   UNICODE_STRING name;
   name.Buffer = buffer;
   name.Length = (USHORT)(length * sizeof(wchar_t));
@@ -462,14 +501,17 @@ static int reserved_component(const wchar_t *component, size_t length) {
 
 static int pin_ancestors(Job *j) {
   size_t length = wcslen(j->path);
-  /* Reject device/UNC paths, streams, relative paths and ambiguous Win32 names.
-   * Callers pass an absolute local DOS path; no pathname normalization is trusted. */
-  if (length < (j->op == 4 ? 3u : 4u) || !((j->path[0] >= L'A' && j->path[0] <= L'Z') ||
-      (j->path[0] >= L'a' && j->path[0] <= L'z')) || j->path[1] != L':' || j->path[2] != L'\\') {
+  size_t drive = !wcsncmp(j->path, L"\\\\?\\", 4) ? 4u : 0u;
+  size_t root_length = drive + 3;
+  /* Extended local drive paths use the same fixed-volume and component checks.
+   * UNC and device namespaces still cannot establish the local-volume guarantee. */
+  if (length < root_length + (j->op == 4 ? 0u : 1u) || !((j->path[drive] >= L'A' && j->path[drive] <= L'Z') ||
+      (j->path[drive] >= L'a' && j->path[drive] <= L'z')) || j->path[drive + 1] != L':' || j->path[drive + 2] != L'\\') {
     j->refusal = "unsupported-filesystem";
     fail(j, ERROR_NOT_SUPPORTED, "Use an absolute local drive path, not UNC/device/network paths"); return 0;
   }
-  wchar_t root[4] = { j->path[0], L':', L'\\', 0 };
+  wchar_t root[8] = {0};
+  memcpy(root, j->path, root_length * sizeof(wchar_t));
   if (GetDriveTypeW(root) != DRIVE_FIXED) {
     j->refusal = "unsupported-filesystem";
     fail(j, ERROR_NOT_SUPPORTED, "Only fixed local ACL-capable volumes are supported; use NTFS"); return 0;
@@ -479,8 +521,8 @@ static int pin_ancestors(Job *j) {
     j->refusal = "unsupported-filesystem";
     fail(j, ERROR_NOT_SUPPORTED, "Volume cannot persist ACLs (FAT/exFAT unsupported); use NTFS"); return 0;
   }
-  size_t start = 3;
-  for (size_t i = 3; i <= length && length > 3; ++i) {
+  size_t start = root_length;
+  for (size_t i = root_length; i <= length && length > root_length; ++i) {
     wchar_t c = j->path[i];
     if (c == L'/' || c == L':' || (c && c < 32) || c == L'*' || c == L'?' || c == L'"' || c == L'<' || c == L'>' || c == L'|') {
       fail(j, ERROR_INVALID_NAME, "Ambiguous path component is forbidden"); return 0;
@@ -496,15 +538,15 @@ static int pin_ancestors(Job *j) {
       start = i + 1;
     }
   }
-  if (j->op == 4) return pin_safe_parent(j, root, length);
+  if (j->op == 4) return pin_safe_parent(j, root, root_length, length);
   j->ancestors = calloc(length, sizeof(HANDLE));
   if (!j->ancestors) { fail(j, ERROR_OUTOFMEMORY, "Handle allocation failed"); return 0; }
   HANDLE root_handle = open_object(j, root, READ_CONTROL | FILE_READ_ATTRIBUTES, OPEN_EXISTING, NULL, 1, 1);
   if (root_handle == INVALID_HANDLE_VALUE) return 0;
   j->ancestors[j->count++] = root_handle;
   if (!attributes(j, root_handle, 1) || !trusted_ancestor(j, root_handle,
-      j->op == 0 && wcschr(j->path + 3, L'\\') == NULL)) return 0;
-  for (size_t i = 3; i < length; ++i) {
+      j->op == 0 && wcschr(j->path + root_length, L'\\') == NULL)) return 0;
+  for (size_t i = root_length; i < length; ++i) {
     if (j->path[i] != L'\\') continue;
     wchar_t saved = j->path[i];
     j->path[i] = 0;
@@ -522,6 +564,9 @@ static void execute(napi_env env, void *data) {
   (void)env;
   Job *j = data;
   PACL acl = NULL;
+  j->original_path = j->path;
+  j->path = extended_path(j->original_path);
+  if (!j->path) { fail(j, GetLastError(), "Cannot resolve extended-length path"); goto done; }
   if (!user_sid(j) || !pin_ancestors(j)) goto done;
   if (j->op == 4) goto done;
   DWORD acl_size = sizeof(ACL) + sizeof(ACCESS_ALLOWED_ACE) - sizeof(DWORD) + GetLengthSid(j->sid);
@@ -621,6 +666,7 @@ static int js_allowed(napi_status status) {
 static void release_job(Job *j) {
   if (j->bytes) { SecureZeroMemory(j->bytes, j->length); free(j->bytes); }
   free(j->path);
+  free(j->original_path);
   free(j->level);
   if (j->detail) LocalFree(j->detail);
   free(j);
@@ -654,7 +700,7 @@ static napi_status security_error(napi_env env, Job *j, napi_value *result) {
   CHECK_NAPI(napi_set_named_property(env, error, "code", value));
   CHECK_NAPI(napi_create_uint32(env, j->error, &value));
   CHECK_NAPI(napi_set_named_property(env, error, "win32Code", value));
-  CHECK_NAPI(napi_create_string_utf16(env, (char16_t *)j->path, NAPI_AUTO_LENGTH, &value));
+  CHECK_NAPI(napi_create_string_utf16(env, (char16_t *)(j->original_path ? j->original_path : j->path), NAPI_AUTO_LENGTH, &value));
   CHECK_NAPI(napi_set_named_property(env, error, "path", value));
   if (j->level) {
     CHECK_NAPI(napi_create_string_utf16(env, (char16_t *)j->level, NAPI_AUTO_LENGTH, &value));

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.38.2
+
+- Compile the desktop identity table, semver release floor and four operator shortcut switches into the daemon, with every switch off and no configuration override. Production app ids, Windows publisher and Windows/Linux install paths remain unset; Linux has no release-index identity and the reserved floor admits no release.
+- On macOS, derive operator-app stamps at connection time from the captured audit token, the code requirement, hardened runtime and the validated code's signed version. Carry the stamp on routes and relay `operator_app` only to `operator-app/v1` targets with the switch enabled. A new connection after a daemon restart is checked afresh; the stamp preserves its token for subsequent revalidation. This release enables no prompt shortcut.
+
 ## 0.38.1
 
 - Send accept-time local peer observations in `route.bind` only to targets declaring `observed-peer/v1`. TCP and unavailable observations carry `unobserved`; targets without the capability keep their legacy bind bytes. Observations do not change the route's principal or stamp it as an operator app.

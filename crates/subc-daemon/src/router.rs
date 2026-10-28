@@ -888,12 +888,12 @@ impl Router {
         self.control.route_open_target(frame)
     }
 
-    pub(crate) fn record_observed_peer(
+    pub(crate) fn record_captured_peer(
         &self,
         connection: ConnectionId,
-        peer: subc_os::local_peer::ObservedPeer,
+        peer: subc_os::local_peer::CapturedPeer,
     ) {
-        self.control.record_observed_peer(connection, peer);
+        self.control.record_captured_peer(connection, peer);
     }
 
     pub(crate) fn record_caller_endpoints(

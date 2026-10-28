@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.23
+
+- Add `local_peer::capture_unix_peer` and `CapturedPeer::check_code_requirement`. macOS keeps the accept-time audit token private and uses it for `SecCodeCheckValidity`, requires hardened runtime, and returns the optional short version from the validated code's signing information. The result distinguishes satisfied, not satisfied and unverifiable; missing tokens and non-macOS platforms are unverifiable. No pid or executable path can stand in for a captured token. Existing advisory observation APIs are unchanged.
+- Do not construct an owned Core Foundation reference for a null Create/Copy result: dropping that reference called `CFRelease(NULL)` and trapped instead of returning an unverifiable result.
+
 ## 0.1.22
 
 - Add `named_pipe`, the Windows side of the daemon's local listener. `owner_only_security` builds a protected DACL that grants full access to the current user's SID, plus LocalSystem and Administrators, which Win32 lets into a kernel object whatever its DACL says; no other user is admitted. `create_end(name, first)` creates one end through tokio's overlapped named-pipe server with that DACL (`create_with_security_attributes_raw`, the one unsafe call tokio cannot wrap), `PIPE_REJECT_REMOTE_CLIENTS` and unlimited instances; `first` sets `FILE_FLAG_FIRST_PIPE_INSTANCE`, so a name another process already holds fails the bind instead of being shared. `reject_remote_client` and `reject_remote_client_raw` refuse a client that reached the pipe from another machine, as a second gate behind the kernel's. `current_user_sid_string` returns the current user's SID in `S-1-5-21-…` form. Other platforms report `Unsupported`.

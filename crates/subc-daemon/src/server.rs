@@ -498,7 +498,7 @@ async fn serve_unix_local(
             Err(source) => return Err(local_accept_error(&path, source)),
         };
         debug!(?path, "accepted a local-socket connection");
-        let peer = subc_os::local_peer::observe_unix_peer(&stream);
+        let peer = subc_os::local_peer::capture_unix_peer(&stream);
         let router = Arc::clone(&router);
         let auth = auth.clone();
         tokio::spawn(async move {
@@ -565,7 +565,7 @@ async fn serve_pipe_local(
             warn!(%error, "refused a non-local named-pipe client on the local endpoint");
             continue;
         }
-        let peer = subc_os::local_peer::observe_pipe_client(&server);
+        let peer = subc_os::local_peer::observe_pipe_client(&server).into();
         tokio::spawn(async move {
             let _ = handle_accepted_local_connection(server, router, auth, peer).await;
         });
@@ -590,7 +590,7 @@ async fn handle_accepted_local_connection<S>(
     stream: S,
     router: Arc<Router>,
     auth: ServerAuth,
-    peer: subc_os::local_peer::ObservedPeer,
+    peer: subc_os::local_peer::CapturedPeer,
 ) -> Result<(), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -703,7 +703,7 @@ async fn handle_connection_with_peer<S>(
     router: Arc<Router>,
     auth: ServerAuth,
     origin: LocalOrigin,
-    peer: Option<subc_os::local_peer::ObservedPeer>,
+    peer: Option<subc_os::local_peer::CapturedPeer>,
 ) -> Result<(), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -758,7 +758,7 @@ where
     let connection_id = connection.id();
     router.record_caller_endpoints(connection_id, endpoints);
     if let Some(peer) = peer {
-        router.record_observed_peer(connection_id, peer);
+        router.record_captured_peer(connection_id, peer);
     }
     // `authenticated.role` is CLIENT-SUPPLIED and unverified -- the handshake
     // proves possession of the connection key, nothing about who is calling. So

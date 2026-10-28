@@ -80,6 +80,9 @@ pub(crate) struct RouteBinding {
     /// Only Callosum's exact production claim is retained; never relayed.
     #[allow(dead_code)]
     pub build_class: Option<String>,
+    /// Captured at connect, carried through admission; not standing authority.
+    #[allow(dead_code)]
+    pub operator_app: Option<crate::operator_apps::OperatorAppStamp>,
     pub project_root: Option<ProjectRootId>,
     pub bound_at: Instant,
     pub flow: Arc<ChannelFlow>,
@@ -462,6 +465,7 @@ struct PendingRouteBindRelayEntry {
     scope: Option<BoundScope>,
     harness: String,
     build_class: Option<String>,
+    operator_app: Option<crate::operator_apps::OperatorAppStamp>,
     deadline: Instant,
     /// Set once `route.open` has finished putting the route.bind on the
     /// module's egress queue. A path that drops this entry WITHOUT a module
@@ -1139,6 +1143,7 @@ impl ForwardingTable {
         project_root: Option<ProjectRootId>,
         harness: String,
         build_class: Option<String>,
+        operator_app: Option<crate::operator_apps::OperatorAppStamp>,
         deadline: Instant,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         // Reserve egress capacity before taking the forwarding lock. The permit is
@@ -1162,6 +1167,7 @@ impl ForwardingTable {
             project_root,
             harness,
             build_class,
+            operator_app,
             deadline,
             client_permit,
         )
@@ -1191,6 +1197,7 @@ impl ForwardingTable {
             None,
             None,
             String::new(),
+            None,
             None,
             Instant::now() + std::time::Duration::from_secs(60),
             permit,
@@ -1378,6 +1385,7 @@ impl ForwardingTable {
         project_root: Option<ProjectRootId>,
         harness: String,
         build_class: Option<String>,
+        operator_app: Option<crate::operator_apps::OperatorAppStamp>,
         deadline: Instant,
         client_permit: crate::router::EgressPermit,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
@@ -1478,6 +1486,7 @@ impl ForwardingTable {
                 scope,
                 harness,
                 build_class,
+                operator_app,
                 deadline,
                 relay_enqueued: false,
                 sender,
@@ -3296,6 +3305,7 @@ fn commit_route_locked(
         principal: pending.principal,
         harness: pending.harness,
         build_class: pending.build_class,
+        operator_app: pending.operator_app,
         project_root: reservation.project_root.clone(),
         bound_at: Instant::now(),
         flow: Arc::new(ChannelFlow::new(window_for(&module.concurrency))),
@@ -4502,6 +4512,7 @@ mod tests {
                 None,
                 None,
                 "fixture".into(),
+                None,
                 None,
                 Instant::now() + Duration::from_secs(60),
             ),

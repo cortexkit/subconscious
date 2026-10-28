@@ -24,6 +24,7 @@ mod live_children;
 pub mod local_listener;
 pub mod machine_id;
 pub mod observability;
+pub mod operator_apps;
 pub mod operator_confirm;
 pub mod privileged_prompt;
 #[allow(dead_code)]

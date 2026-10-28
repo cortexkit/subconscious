@@ -38,6 +38,9 @@ mod windows;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(target_os = "macos", feature = "test-support"))]
+pub mod fixture;
+
 /// The result of observing the peer of an accepted local connection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ObservedPeer {
@@ -69,6 +72,97 @@ pub enum PeerUser {
     Uid(u32),
     /// The user SID of the peer process's token, in `S-1-…` string form.
     Sid(String),
+}
+
+/// An accept-time observation that may carry a private audit token for macOS
+/// code verification. Advisory fields alone cannot create that token.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct CapturedPeer {
+    observation: ObservedPeer,
+    #[cfg(target_os = "macos")]
+    token: Option<macos::AuditToken>,
+}
+
+impl std::fmt::Debug for CapturedPeer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapturedPeer")
+            .field("observation", &self.observation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl From<ObservedPeer> for CapturedPeer {
+    fn from(observation: ObservedPeer) -> Self {
+        Self {
+            observation,
+            #[cfg(target_os = "macos")]
+            token: None,
+        }
+    }
+}
+
+/// A signature check's closed result. Only `Satisfied` is affirmative;
+/// missing primitives, invalid requirements and read errors fail closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CodeRequirementOutcome {
+    /// The running code satisfies the requirement and uses hardened runtime.
+    Satisfied(VerifiedCode),
+    /// The code or its signature does not meet the policy.
+    NotSatisfied,
+    /// The platform could not establish the claim.
+    Unverifiable(CodeVerificationError),
+}
+
+/// Metadata copied from the signature-validated code, never a reopened path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VerifiedCode {
+    /// `CFBundleShortVersionString` from the validated signing information.
+    pub short_version: Option<String>,
+}
+
+/// Why verification could not establish a claim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CodeVerificationError {
+    UnsupportedPlatform,
+    MissingAuditToken,
+    FrameworkUnavailable,
+    InvalidRequirement,
+    GuestUnavailable,
+    SigningInformationUnavailable,
+    ValidityCheckFailed(i32),
+}
+
+impl CapturedPeer {
+    pub fn observation(&self) -> &ObservedPeer {
+        &self.observation
+    }
+
+    /// Evaluate a code-signing requirement against the captured peer token.
+    /// Hardened runtime is also required. Repeating this check revalidates the
+    /// same process incarnation; neither a pid nor a path is accepted as proof.
+    pub fn check_code_requirement(&self, requirement: &str) -> CodeRequirementOutcome {
+        #[cfg(target_os = "macos")]
+        return macos::check_requirement(self.token, requirement);
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = requirement;
+            CodeRequirementOutcome::Unverifiable(CodeVerificationError::UnsupportedPlatform)
+        }
+    }
+}
+
+/// Capture peer facts at accept and, on macOS, retain the private audit token
+/// for later code verification.
+#[cfg(unix)]
+pub fn capture_unix_peer(socket: &impl std::os::fd::AsFd) -> CapturedPeer {
+    #[cfg(target_os = "macos")]
+    return macos::capture(socket.as_fd(), ForcedFailures::default());
+    #[cfg(not(target_os = "macos"))]
+    observe_unix_peer(socket).into()
 }
 
 /// Read failures a test can force, to show how each one shapes the result

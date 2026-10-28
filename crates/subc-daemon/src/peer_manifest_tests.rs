@@ -231,6 +231,149 @@ async fn observed_peer_is_opt_in_tcp_is_unobserved_and_legacy_bytes_are_unchange
 }
 
 #[tokio::test]
+async fn operator_app_bind_is_gated_independently_and_the_stamp_survives_route_commit() {
+    for observed in [false, true] {
+        for operator in [false, true] {
+            for enabled in [false, true] {
+                for stamped in [false, true] {
+                    let handler = ControlHandler::default().with_test_operator_app_policy(
+                        crate::operator_apps::TestOperatorAppPolicy {
+                            macos_enabled: enabled,
+                            app: "fixture",
+                            requirement: "always",
+                            floor: semver::Version::new(1, 2, 10),
+                        },
+                    );
+                    let (target, mut rx) = route_ctx(ConnectionId::new(1));
+                    let mut hello: Value =
+                        serde_json::from_slice(&hello_frame("target", PROTOCOL_VERSION, 1).body)
+                            .unwrap();
+                    let mut capabilities = Vec::new();
+                    if observed {
+                        capabilities.push("observed-peer/v1");
+                    }
+                    if operator {
+                        capabilities.push("operator-app/v1");
+                    }
+                    hello["manifest"]["capabilities"] = json!({"provides": capabilities});
+                    hello_via_sink(
+                        &handler,
+                        &target,
+                        &mut rx,
+                        Frame::build(
+                            FrameType::Hello,
+                            control_flags(),
+                            0,
+                            0,
+                            1,
+                            serde_json::to_vec(&hello).unwrap(),
+                        )
+                        .unwrap(),
+                    )
+                    .await;
+                    let (client, _client_rx) = route_ctx(ConnectionId::new(2));
+                    if stamped {
+                        handler.operator_apps.lock().unwrap().insert(
+                            client.connection_id,
+                            crate::operator_apps::OperatorAppStamp::fixture("fixture", 42),
+                        );
+                    }
+                    let root = unique_project_root("operator-app-bind");
+                    let identity = BindIdentity::new(root.path().to_path_buf(), "unit", "s");
+                    let (bind, binding) =
+                        bind_route(&handler, &target, &mut rx, &client, identity, None).await;
+                    let raw: Value = serde_json::from_slice(&bind.body).unwrap();
+                    assert_eq!(
+                        raw.get("operator_app"),
+                        (operator && enabled && stamped)
+                            .then(|| json!({"app":"fixture", "pid":42}))
+                            .as_ref()
+                    );
+                    assert_eq!(
+                        raw.get("observed_peer"),
+                        observed.then(|| json!({"status":"unobserved"})).as_ref()
+                    );
+                    assert!(raw.get("build_class").is_none());
+                    assert_eq!(binding.principal, Principal::Direct);
+                    assert_eq!(binding.operator_app.is_some(), stamped);
+                    if !observed && !(operator && enabled && stamped) {
+                        let legacy: ModuleControlRequest =
+                            serde_json::from_slice(&bind.body).unwrap();
+                        assert_eq!(bind.body, serde_json::to_vec(&legacy).unwrap());
+                    }
+                    handler.cleanup_connection(client.connection_id).unwrap();
+                    assert!(!handler
+                        .operator_apps
+                        .lock()
+                        .unwrap()
+                        .contains_key(&client.connection_id));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn operator_app_native_connection_is_stamped_again_by_a_restarted_daemon() {
+    use subc_os::local_peer::fixture::SignedPeerFixture;
+    let root = cortexkit_test_support::ScratchDir::new("operator-restart");
+    let mut fixture = SignedPeerFixture::new(
+        &root,
+        "io.cortexkit.alfonso.fixture",
+        Some("1.2.10"),
+        true,
+        None,
+    );
+    let original_pid = fixture.pid();
+    for _restart in 0..2 {
+        let handler = ControlHandler::default().with_test_operator_app_policy(
+            crate::operator_apps::TestOperatorAppPolicy {
+                macos_enabled: true,
+                app: "fixture",
+                requirement: "identifier \"io.cortexkit.alfonso.fixture\"",
+                floor: semver::Version::new(1, 2, 10),
+            },
+        );
+        let (target, mut rx) = route_ctx(ConnectionId::new(1));
+        let mut hello: Value =
+            serde_json::from_slice(&hello_frame("target", PROTOCOL_VERSION, 1).body).unwrap();
+        hello["manifest"]["capabilities"] = json!({"provides":["operator-app/v1"]});
+        hello_via_sink(
+            &handler,
+            &target,
+            &mut rx,
+            Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                1,
+                serde_json::to_vec(&hello).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await;
+        let (client, _rx) = route_ctx(ConnectionId::new(2));
+        let (stream, peer) = fixture.connect();
+        handler.record_captured_peer(client.connection_id, peer);
+        let identity = BindIdentity::new(root.to_path_buf(), "unit", "s");
+        let (bind, binding) = bind_route(&handler, &target, &mut rx, &client, identity, None).await;
+        assert_eq!(binding.principal, Principal::Direct);
+        assert!(binding.operator_app.as_ref().unwrap().revalidate());
+        let raw: Value = serde_json::from_slice(&bind.body).unwrap();
+        assert_eq!(
+            raw["operator_app"],
+            json!({"app":"fixture", "pid":original_pid})
+        );
+        handler.cleanup_connection(client.connection_id).unwrap();
+        drop(stream);
+        drop(handler);
+    }
+    assert_eq!(fixture.pid(), original_pid);
+}
+
+#[tokio::test]
 async fn build_class_is_callosum_production_only_captured_not_relayed_and_warned_once() {
     for opener in [None, Some("other"), Some("callosum")] {
         let supervisor = SupervisorHandle::new();

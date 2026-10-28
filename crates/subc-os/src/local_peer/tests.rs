@@ -9,6 +9,55 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[test]
+fn code_requirement_without_a_captured_token_is_unverifiable() {
+    let peer: CapturedPeer = ObservedPeer::Unobserved.into();
+    let result = peer.check_code_requirement("always");
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        result,
+        CodeRequirementOutcome::Unverifiable(CodeVerificationError::MissingAuditToken)
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert_eq!(
+        result,
+        CodeRequirementOutcome::Unverifiable(CodeVerificationError::UnsupportedPlatform)
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn code_requirement_uses_the_captured_peer_and_signed_metadata() {
+    let root = cortexkit_test_support::ScratchDir::new("code-requirement");
+    let mut fixture = fixture::SignedPeerFixture::new(
+        &root,
+        "subc.requirement.fixture",
+        Some("1.2.10"),
+        true,
+        None,
+    );
+    let (_stream, peer) = fixture.connect();
+    assert_eq!(
+        peer.check_code_requirement("identifier \"subc.requirement.fixture\""),
+        CodeRequirementOutcome::Satisfied(VerifiedCode {
+            short_version: Some("1.2.10".into())
+        })
+    );
+    assert_eq!(
+        peer.check_code_requirement("identifier \"other\""),
+        CodeRequirementOutcome::NotSatisfied
+    );
+    assert_eq!(
+        peer.check_code_requirement("this is not a requirement"),
+        CodeRequirementOutcome::Unverifiable(CodeVerificationError::InvalidRequirement)
+    );
+    drop(fixture);
+    assert!(matches!(
+        peer.check_code_requirement("always"),
+        CodeRequirementOutcome::Unverifiable(CodeVerificationError::GuestUnavailable)
+    ));
+}
+
 /// Kills and reaps a fixture child however its test ends.
 struct ChildGuard(Child);
 

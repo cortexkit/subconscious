@@ -1,6 +1,9 @@
 #![allow(unsafe_code)]
 
-use super::{ForcedFailures, ObservedPeer, PeerObservation, PeerUser};
+use super::{
+    CapturedPeer, CodeRequirementOutcome, CodeVerificationError, ForcedFailures, ObservedPeer,
+    PeerObservation, PeerUser, VerifiedCode,
+};
 use std::{
     ffi::{c_char, c_void, CStr, OsString},
     mem::size_of,
@@ -25,7 +28,7 @@ const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 /// incarnation (bsm/audit.h).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct AuditToken {
+pub(super) struct AuditToken {
     val: [u32; 8],
 }
 
@@ -53,6 +56,11 @@ struct Api {
     cf_dictionary_get_value: unsafe extern "C" fn(CFTypeRef, CFTypeRef) -> CFTypeRef,
     cf_get_type_id: unsafe extern "C" fn(CFTypeRef) -> usize,
     cf_string_get_type_id: unsafe extern "C" fn() -> usize,
+    cf_dictionary_get_type_id: unsafe extern "C" fn() -> usize,
+    cf_number_get_type_id: unsafe extern "C" fn() -> usize,
+    cf_number_get_value: unsafe extern "C" fn(CFTypeRef, CFIndex, *mut c_void) -> u8,
+    cf_string_create_with_bytes:
+        unsafe extern "C" fn(CFTypeRef, *const u8, CFIndex, u32, u8) -> CFTypeRef,
     cf_string_get_length: unsafe extern "C" fn(CFTypeRef) -> CFIndex,
     cf_string_get_maximum_size_for_encoding: unsafe extern "C" fn(CFIndex, u32) -> CFIndex,
     cf_string_get_c_string: unsafe extern "C" fn(CFTypeRef, *mut c_char, CFIndex, u32) -> u8,
@@ -66,11 +74,15 @@ struct Api {
         unsafe extern "C" fn(CFTypeRef, CFTypeRef, u32, *mut CFTypeRef) -> OSStatus,
     sec_code_copy_path: unsafe extern "C" fn(CFTypeRef, u32, *mut CFTypeRef) -> OSStatus,
     sec_code_check_validity: unsafe extern "C" fn(CFTypeRef, u32, CFTypeRef) -> OSStatus,
+    sec_requirement_create_with_string:
+        unsafe extern "C" fn(CFTypeRef, u32, *mut CFTypeRef, *mut CFTypeRef) -> OSStatus,
     sec_code_copy_signing_information:
         unsafe extern "C" fn(CFTypeRef, u32, *mut CFTypeRef) -> OSStatus,
     /// The values of `kSecGuestAttributeAudit` and `kSecCodeInfoIdentifier`.
     guest_attribute_audit: CFTypeRef,
     code_info_identifier: CFTypeRef,
+    code_info_plist: CFTypeRef,
+    code_info_flags: CFTypeRef,
 }
 
 // SAFETY: the fields are function pointers and pointers to immutable framework
@@ -97,6 +109,10 @@ fn load() -> Option<Api> {
             cf_dictionary_get_value: function(cf, c"CFDictionaryGetValue")?,
             cf_get_type_id: function(cf, c"CFGetTypeID")?,
             cf_string_get_type_id: function(cf, c"CFStringGetTypeID")?,
+            cf_dictionary_get_type_id: function(cf, c"CFDictionaryGetTypeID")?,
+            cf_number_get_type_id: function(cf, c"CFNumberGetTypeID")?,
+            cf_number_get_value: function(cf, c"CFNumberGetValue")?,
+            cf_string_create_with_bytes: function(cf, c"CFStringCreateWithBytes")?,
             cf_string_get_length: function(cf, c"CFStringGetLength")?,
             cf_string_get_maximum_size_for_encoding: function(
                 cf,
@@ -116,12 +132,18 @@ fn load() -> Option<Api> {
             )?,
             sec_code_copy_path: function(security, c"SecCodeCopyPath")?,
             sec_code_check_validity: function(security, c"SecCodeCheckValidity")?,
+            sec_requirement_create_with_string: function(
+                security,
+                c"SecRequirementCreateWithStringAndErrors",
+            )?,
             sec_code_copy_signing_information: function(
                 security,
                 c"SecCodeCopySigningInformation",
             )?,
             guest_attribute_audit: constant(security, c"kSecGuestAttributeAudit")?,
             code_info_identifier: constant(security, c"kSecCodeInfoIdentifier")?,
+            code_info_plist: constant(security, c"kSecCodeInfoPList")?,
+            code_info_flags: constant(security, c"kSecCodeInfoFlags")?,
         })
     }
 }
@@ -170,7 +192,7 @@ struct Owned {
 impl Owned {
     /// Takes ownership of a reference returned by a Create or Copy call.
     fn new(api: &'static Api, value: CFTypeRef) -> Option<Self> {
-        (!value.is_null()).then_some(Self { value, api })
+        (!value.is_null()).then(|| Self { value, api })
     }
 }
 
@@ -183,13 +205,17 @@ impl Drop for Owned {
 }
 
 pub(super) fn observe(socket: BorrowedFd<'_>, forced: ForcedFailures) -> ObservedPeer {
+    capture(socket, forced).observation
+}
+
+pub(super) fn capture(socket: BorrowedFd<'_>, forced: ForcedFailures) -> CapturedPeer {
     let Some(token) = audit_token(socket).filter(|_| !forced.user) else {
-        return ObservedPeer::Unobserved;
+        return ObservedPeer::Unobserved.into();
     };
     // SAFETY: both functions read fields of the token passed by value.
     let (uid, pid) = unsafe { (audit_token_to_euid(token), audit_token_to_pid(token)) };
     let Ok(pid) = u32::try_from(pid) else {
-        return ObservedPeer::Unobserved;
+        return ObservedPeer::Unobserved.into();
     };
     let guest = guest_code(token);
     let exe = guest.as_ref().filter(|_| !forced.exe).and_then(code_path);
@@ -197,12 +223,15 @@ pub(super) fn observe(socket: BorrowedFd<'_>, forced: ForcedFailures) -> Observe
         .as_ref()
         .filter(|code| !forced.signing_id && valid(code))
         .and_then(signing_identifier);
-    ObservedPeer::Observed(PeerObservation {
-        user: PeerUser::Uid(uid),
-        pid,
-        exe,
-        signing_id,
-    })
+    CapturedPeer {
+        observation: ObservedPeer::Observed(PeerObservation {
+            user: PeerUser::Uid(uid),
+            pid,
+            exe,
+            signing_id,
+        }),
+        token: Some(token),
+    }
 }
 
 /// The audit token the kernel recorded for the peer when it connected.
@@ -301,6 +330,124 @@ fn valid(code: &Owned) -> bool {
     }
 }
 
+pub(super) fn check_requirement(
+    token: Option<AuditToken>,
+    requirement: &str,
+) -> CodeRequirementOutcome {
+    use CodeRequirementOutcome::{NotSatisfied, Satisfied, Unverifiable};
+    use CodeVerificationError::*;
+    let Some(token) = token else {
+        return Unverifiable(MissingAuditToken);
+    };
+    let Some(api) = api() else {
+        return Unverifiable(FrameworkUnavailable);
+    };
+    let Some(text) = make_string(api, requirement) else {
+        return Unverifiable(InvalidRequirement);
+    };
+    let mut requirement = null();
+    // SAFETY: text is a live CFString; both outputs are writable and any
+    // returned Create references are released below, including on parse errors.
+    let mut errors = null();
+    let status = unsafe {
+        (api.sec_requirement_create_with_string)(text.value, 0, &mut errors, &mut requirement)
+    };
+    let _errors = Owned::new(api, errors);
+    let requirement = Owned::new(api, requirement);
+    let Some(requirement) = requirement.filter(|_| status == ERR_SEC_SUCCESS) else {
+        return Unverifiable(InvalidRequirement);
+    };
+    let Some(code) = guest_code(token) else {
+        return Unverifiable(GuestUnavailable);
+    };
+    // SAFETY: the guest is resolved from the captured audit token, and both
+    // references remain live for the entire check.
+    let status = unsafe { (api.sec_code_check_validity)(code.value, 0, requirement.value) };
+    if status != ERR_SEC_SUCCESS {
+        return validity_failure(status);
+    }
+    let mut information = null();
+    // Copy the sealed plist and flags from the same validated guest.
+    // SAFETY: code is live and information is a writable out-pointer.
+    let status =
+        unsafe { (api.sec_code_copy_signing_information)(code.value, 1 << 1, &mut information) };
+    let information = Owned::new(api, information);
+    let Some(information) = information.filter(|_| status == ERR_SEC_SUCCESS) else {
+        return Unverifiable(SigningInformationUnavailable);
+    };
+    // Hardened runtime is a CodeDirectory flag, not a requirement-language
+    // entitlement. Inspect it only in the information of the validated guest.
+    let flags = dictionary_value(api, information.value, api.code_info_flags);
+    // SAFETY: check the CF type before reading the number as kCFNumberSInt64Type.
+    if flags.is_null() || unsafe { (api.cf_get_type_id)(flags) != (api.cf_number_get_type_id)() } {
+        return Unverifiable(SigningInformationUnavailable);
+    }
+    let mut flags_value: i64 = 0;
+    // SAFETY: the CFNumber was type-checked and the output is a live i64.
+    if unsafe { (api.cf_number_get_value)(flags, 4, (&mut flags_value as *mut i64).cast()) } == 0 {
+        return Unverifiable(SigningInformationUnavailable);
+    }
+    if flags_value & 0x1_0000 == 0 {
+        return NotSatisfied;
+    }
+    let plist = dictionary_value(api, information.value, api.code_info_plist);
+    let short_version = make_string(api, "CFBundleShortVersionString").and_then(|key| {
+        let version = dictionary_value(api, plist, key.value);
+        // SAFETY: check the CF type before treating the borrowed value as a string.
+        if version.is_null()
+            || unsafe { (api.cf_get_type_id)(version) != (api.cf_string_get_type_id)() }
+        {
+            None
+        } else {
+            cf_string(api, version)
+        }
+    });
+    // Recheck after copying metadata: a changed sealed plist cannot lend a
+    // version to code that no longer passes the requirement.
+    // SAFETY: the same guest and requirement references are still live.
+    let status = unsafe { (api.sec_code_check_validity)(code.value, 0, requirement.value) };
+    if status != ERR_SEC_SUCCESS {
+        return validity_failure(status);
+    }
+    Satisfied(VerifiedCode { short_version })
+}
+
+fn validity_failure(status: OSStatus) -> CodeRequirementOutcome {
+    if status == -67050 {
+        // errSecCSReqFailed: a definite requirement mismatch.
+        CodeRequirementOutcome::NotSatisfied
+    } else {
+        CodeRequirementOutcome::Unverifiable(CodeVerificationError::ValidityCheckFailed(status))
+    }
+}
+
+fn make_string(api: &'static Api, text: &str) -> Option<Owned> {
+    // SAFETY: text is readable for its length; the Create call copies its bytes.
+    Owned::new(api, unsafe {
+        (api.cf_string_create_with_bytes)(
+            null(),
+            text.as_ptr(),
+            text.len().try_into().ok()?,
+            CF_STRING_ENCODING_UTF8,
+            0,
+        )
+    })
+}
+
+fn dictionary_value(api: &Api, dictionary: CFTypeRef, key: CFTypeRef) -> CFTypeRef {
+    // SAFETY: all callers supply live CF references or null. Check the type
+    // before using the dictionary API; its borrowed value lives with its owner.
+    unsafe {
+        if dictionary.is_null()
+            || (api.cf_get_type_id)(dictionary) != (api.cf_dictionary_get_type_id)()
+        {
+            null()
+        } else {
+            (api.cf_dictionary_get_value)(dictionary, key)
+        }
+    }
+}
+
 fn signing_identifier(code: &Owned) -> Option<String> {
     let api = code.api;
     let mut information = null();
@@ -354,5 +501,10 @@ mod tests {
     #[test]
     fn audit_token_layout_is_eight_words() {
         assert_eq!(size_of::<AuditToken>(), 32);
+    }
+
+    #[test]
+    fn null_create_result_is_not_released() {
+        assert!(Owned::new(api().expect("macOS frameworks load"), null()).is_none());
     }
 }

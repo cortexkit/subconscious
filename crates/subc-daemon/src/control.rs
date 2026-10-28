@@ -27,7 +27,10 @@ use subc_protocol::{
         validate_hello_self_signal_declarations, CapabilityDeclarations, CapabilityNeed,
         Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
     },
-    peer::{encode_route_bind, ObservedPeer, RouteBindPeer, OBSERVED_PEER_CAPABILITY},
+    peer::{
+        encode_route_bind, ObservedPeer, RouteBindPeer, OBSERVED_PEER_CAPABILITY,
+        OPERATOR_APP_CAPABILITY,
+    },
     scope::{
         ScopeEnd, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
         CAP_ROUTE_ROLE_VERSIONS_V1, CAP_SCOPES_V1, SCOPE_APPLY_OP, SCOPE_DESCRIBE_OP,
@@ -409,6 +412,8 @@ pub struct ControlHandler {
     caller_endpoints: Arc<Mutex<HashMap<ConnectionId, (SocketAddr, SocketAddr)>>>,
     build_class_warned: Arc<Mutex<HashSet<ConnectionId>>>,
     observed_peers: Arc<Mutex<HashMap<ConnectionId, ObservedPeer>>>,
+    operator_app_policy: crate::operator_apps::OperatorAppPolicy,
+    operator_apps: Arc<Mutex<HashMap<ConnectionId, crate::operator_apps::OperatorAppStamp>>>,
     #[cfg(test)]
     caller_lookup: Option<TestCallerLookup>,
     /// The launch nonce each module connection presented at HELLO, which is how
@@ -994,6 +999,8 @@ impl ControlHandler {
             caller_endpoints: Arc::new(Mutex::new(HashMap::new())),
             build_class_warned: Arc::new(Mutex::new(HashSet::new())),
             observed_peers: Arc::new(Mutex::new(HashMap::new())),
+            operator_app_policy: Default::default(),
+            operator_apps: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             caller_lookup: None,
             hello_launch_nonces: Arc::new(Mutex::new(HelloLaunchNonces::default())),
@@ -1765,6 +1772,29 @@ impl ControlHandler {
         self.handle_control_frame_timed(ctx, frame, None).await
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_test_operator_app_policy(
+        mut self,
+        policy: crate::operator_apps::TestOperatorAppPolicy,
+    ) -> Self {
+        self.operator_app_policy = policy.into();
+        self
+    }
+
+    pub(crate) fn record_captured_peer(
+        &self,
+        connection: ConnectionId,
+        peer: subc_os::local_peer::CapturedPeer,
+    ) {
+        self.record_observed_peer(connection, peer.observation().clone());
+        if let Some(stamp) = self.operator_app_policy.stamp(peer) {
+            self.operator_apps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(connection, stamp);
+        }
+    }
+
     pub(crate) fn record_observed_peer(
         &self,
         connection: ConnectionId,
@@ -2047,6 +2077,10 @@ impl ControlHandler {
             .unwrap_or_else(|p| p.into_inner())
             .remove(&connection_id);
         self.observed_peers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&connection_id);
+        self.operator_apps
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&connection_id);
@@ -5093,6 +5127,12 @@ impl ControlHandler {
         // daemons) wins over the daemon-wide default.
         let route_bind_relay_timeout = self.route_bind_relay_timeout_for(&target_module_id);
         let relay_deadline = Instant::now() + route_bind_relay_timeout;
+        let operator_app = self
+            .operator_apps
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&ctx.connection_id)
+            .cloned();
         timings.enter(RouteOpenPhase::EgressReservation);
         let pending = match self
             .forwarding
@@ -5107,6 +5147,7 @@ impl ControlHandler {
                 Some(project_root),
                 identity.harness.clone(),
                 build_class,
+                operator_app.clone(),
                 relay_deadline,
             )
             .await
@@ -5281,22 +5322,35 @@ impl ControlHandler {
             scope: scope_stamp,
             call_mode,
         };
-        let peer = RouteBindPeer::new().with_observed_peer(
-            relay_capabilities
-                .is_some_and(|caps| {
-                    caps.provides
-                        .iter()
-                        .any(|cap| cap == OBSERVED_PEER_CAPABILITY)
-                })
-                .then(|| {
-                    self.observed_peers
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .get(&ctx.connection_id)
-                        .cloned()
-                        .unwrap_or_else(ObservedPeer::unobserved)
-                }),
-        );
+        let peer = RouteBindPeer::new()
+            .with_observed_peer(
+                relay_capabilities
+                    .is_some_and(|caps| {
+                        caps.provides
+                            .iter()
+                            .any(|cap| cap == OBSERVED_PEER_CAPABILITY)
+                    })
+                    .then(|| {
+                        self.observed_peers
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&ctx.connection_id)
+                            .cloned()
+                            .unwrap_or_else(ObservedPeer::unobserved)
+                    }),
+            )
+            .with_operator_app(
+                operator_app
+                    .filter(|_| {
+                        self.operator_app_policy.macos_enabled
+                            && relay_capabilities.is_some_and(|caps| {
+                                caps.provides
+                                    .iter()
+                                    .any(|cap| cap == OPERATOR_APP_CAPABILITY)
+                            })
+                    })
+                    .map(|stamp| stamp.app),
+            );
         let relay_body = encode_route_bind(&relay, &peer).map_err(|err| {
             RouterError::backend(
                 0,

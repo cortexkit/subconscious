@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.16
+
+- Test-only: the activity-identity test's relay treats a reset or broken
+  pipe from the exiting supervised reader as the end of the connection, as
+  it already treated EOF. On Linux the reader's socket can close with unread
+  bytes and reset, which panicked the relay and failed the test. No module
+  change.
+
 ## 0.4.15
 
 - Builds against subc-daemon 0.38.0. No change to the module itself.

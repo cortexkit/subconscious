@@ -87,18 +87,55 @@ async fn proxy(
     let (mut client_read, mut client_write) = reader.split();
     let (mut daemon_read, mut daemon_write) = daemon.split();
     let to_daemon = async {
-        while let Some(frame) = read_frame(&mut client_read).await.unwrap() {
-            write_frame(&mut daemon_write, &forwarded(frame, &observed))
-                .await
-                .unwrap();
+        while let Some(frame) = next_or_closed(read_frame(&mut client_read).await) {
+            if !written_or_closed(
+                write_frame(&mut daemon_write, &forwarded(frame, &observed)).await,
+            ) {
+                break;
+            }
         }
     };
     let to_client = async {
-        while let Some(frame) = read_frame(&mut daemon_read).await.unwrap() {
-            write_frame(&mut client_write, &frame).await.unwrap();
+        while let Some(frame) = next_or_closed(read_frame(&mut daemon_read).await) {
+            if !written_or_closed(write_frame(&mut client_write, &frame).await) {
+                break;
+            }
         }
     };
     tokio::select! { _ = to_daemon => {}, _ = to_client => {} }
+}
+
+/// The supervised reader exits once it has written its result, and on Linux
+/// a socket closed with unread bytes is reset rather than shut down cleanly.
+/// For this relay a reset or broken pipe ends the connection like EOF; any
+/// other frame error is still a test failure.
+fn closed_by_peer(error: &subc_transport::FrameIoError) -> bool {
+    matches!(
+        error,
+        subc_transport::FrameIoError::Io(io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+            )
+    )
+}
+
+fn next_or_closed(read: Result<Option<Frame>, subc_transport::FrameIoError>) -> Option<Frame> {
+    match read {
+        Ok(frame) => frame,
+        Err(error) if closed_by_peer(&error) => None,
+        Err(error) => panic!("relay read failed: {error:?}"),
+    }
+}
+
+fn written_or_closed(write: Result<(), subc_transport::FrameIoError>) -> bool {
+    match write {
+        Ok(()) => true,
+        Err(error) if closed_by_peer(&error) => false,
+        Err(error) => panic!("relay write failed: {error:?}"),
+    }
 }
 
 fn artifact(args: &[&str], name: &str) -> PathBuf {

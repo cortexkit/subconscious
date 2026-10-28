@@ -2189,10 +2189,20 @@ impl SubcConsumer {
         opts: CallOptions,
         cancel: Option<Arc<UnaryCancel>>,
     ) -> Result<CallReply, CallError> {
-        let mut never_forwarded = true;
-        self.call_attempts(target, identity, body, opts, cancel, &mut never_forwarded)
+        let mut history = CallAttemptHistory {
+            never_forwarded: true,
+            sent: false,
+        };
+        self.call_attempts(target, identity, body, opts, cancel, &mut history)
             .await
-            .map_err(|err| err.with_never_forwarded(never_forwarded))
+            .map_err(|err| {
+                let err = if history.sent && matches!(err, CallError::StaleRouteHandle(_)) {
+                    CallError::not_sent(err.to_string())
+                } else {
+                    err
+                };
+                err.with_never_forwarded(history.never_forwarded)
+            })
     }
 
     async fn call_attempts(
@@ -2202,7 +2212,7 @@ impl SubcConsumer {
         body: (Vec<u8>, bool),
         opts: CallOptions,
         cancel: Option<Arc<UnaryCancel>>,
-        never_forwarded: &mut bool,
+        history: &mut CallAttemptHistory,
     ) -> Result<CallReply, CallError> {
         let (body, binary) = body;
         let call_deadline = Instant::now() + opts.timeout;
@@ -2257,6 +2267,12 @@ impl SubcConsumer {
                 continue;
             }
 
+            // Snapshot trust for the route's generation before awaiting its reply;
+            // a reconnect must not lend a newer daemon's guarantees to an old frame.
+            let daemon_origin_trusted = {
+                let inner = self.shared.lock_inner();
+                inner.generation == route.handle.connection_token() && inner.daemon_origin_trusted
+            };
             let response = self
                 .shared
                 .send_request_cancellable(
@@ -2277,9 +2293,10 @@ impl SubcConsumer {
                 .await;
             drop(permit);
 
+            history.sent |= response.is_ok();
             let proven_undelivered = match &response {
                 Ok(TerminalFrame::Error { body, flags }) => {
-                    is_daemon_refusal_before_forward(*flags, &body.code)
+                    is_daemon_refusal_before_forward(daemon_origin_trusted, *flags, &body.code)
                 }
                 Err(err) => {
                     err.never_forwarded() == Some(true)
@@ -2287,7 +2304,7 @@ impl SubcConsumer {
                 }
                 _ => false,
             };
-            *never_forwarded &= proven_undelivered;
+            history.never_forwarded &= proven_undelivered;
 
             match response {
                 Ok(TerminalFrame::Response { body, flags, .. }) => {
@@ -2303,8 +2320,8 @@ impl SubcConsumer {
                     });
                 }
                 // Route-dead and drain refusals share one eviction/resend budget.
-                // Only the daemon-origin flag proves non-delivery; the retry
-                // policy itself stays compatible with unmarked older daemons.
+                // Only a trusted daemon-origin flag proves non-delivery; the retry
+                // policy itself stays compatible with older daemons.
                 Ok(TerminalFrame::Error { body, flags })
                     if (error_codes::is_established_route_dead(flags, &body.code)
                         || is_data_plane_drain_refusal(&body.code))
@@ -2317,7 +2334,11 @@ impl SubcConsumer {
                     continue;
                 }
                 Ok(TerminalFrame::Error { body, flags })
-                    if is_daemon_refusal_before_forward(flags, &body.code) =>
+                    if is_daemon_refusal_before_forward(
+                        daemon_origin_trusted,
+                        flags,
+                        &body.code,
+                    ) =>
                 {
                     return Err(CallError::not_sent_with_cause(
                         format!(
@@ -3107,6 +3128,7 @@ struct Shared {
 
 struct Inner {
     generation: u64,
+    daemon_origin_trusted: bool,
     epoch: u64,
     next_corr: Option<u64>,
     writer: Option<mpsc::Sender<WriteCommand>>,
@@ -3291,6 +3313,7 @@ impl Shared {
             opts,
             inner: Mutex::new(Inner {
                 generation: 1,
+                daemon_origin_trusted: false,
                 epoch: 1,
                 next_corr: Some(1),
                 writer: None,
@@ -3418,6 +3441,7 @@ impl Shared {
             inner.legacy_channel_reasons.clear();
             inner.next_corr = Some(1);
             inner.writer = Some(tx);
+            inner.daemon_origin_trusted = opened.daemon_origin_trusted;
             self.last_inbound_ms.store(0, Ordering::Release);
             (
                 generation,
@@ -4158,9 +4182,11 @@ impl Shared {
                 ));
             }
             Err(_) => {
-                let _ = registration.remove_pending();
-                return Err(CallError::not_sent_with_cause(
+                let accepted = registration.remove_pending().unwrap_or(false);
+                return Err(classify_failure_with_not_sent_cause(
+                    accepted,
                     "call deadline elapsed waiting for writer capacity",
+                    OutcomeUnknownCause::Deadline,
                     NotSentCause::WriterCapacity,
                 ));
             }
@@ -4437,9 +4463,11 @@ impl Shared {
                 ));
             }
             Err(_) => {
-                let _ = registration.remove_pending();
-                return Err(CallError::not_sent_with_cause(
+                let accepted = registration.remove_pending().unwrap_or(false);
+                return Err(classify_failure_with_not_sent_cause(
+                    accepted,
                     "subscription deadline elapsed waiting for writer capacity",
+                    OutcomeUnknownCause::Deadline,
                     NotSentCause::WriterCapacity,
                 ));
             }
@@ -5134,6 +5162,11 @@ struct RouteOpenParams<'a> {
     scope: Option<&'a ScopeSelector>,
 }
 
+struct CallAttemptHistory {
+    never_forwarded: bool,
+    sent: bool,
+}
+
 struct RequestSend {
     expected_handle: Option<RouteHandle>,
     channel: u16,
@@ -5767,6 +5800,7 @@ struct WriteCommand {
 
 struct OpenedConnection {
     stream: TcpStream,
+    daemon_origin_trusted: bool,
 }
 
 async fn open_connection(
@@ -5815,7 +5849,10 @@ async fn open_connection_with_info(
             endpoint: endpoint_label,
             source,
         })?;
-    Ok(OpenedConnection { stream })
+    Ok(OpenedConnection {
+        stream,
+        daemon_origin_trusted: trusts_daemon_origin(&conn.daemon_ver),
+    })
 }
 
 fn dispatch_reverse_request(shared: &Arc<Shared>, frame: Frame, handle: RouteHandle) {
@@ -6392,10 +6429,19 @@ fn classify_failure(
     reason: impl Into<String>,
     cause: OutcomeUnknownCause,
 ) -> CallError {
+    classify_failure_with_not_sent_cause(accepted, reason, cause, NotSentCause::WriterRejected)
+}
+
+fn classify_failure_with_not_sent_cause(
+    accepted: bool,
+    reason: impl Into<String>,
+    cause: OutcomeUnknownCause,
+    not_sent_cause: NotSentCause,
+) -> CallError {
     if accepted {
         CallError::outcome_unknown(reason, cause)
     } else {
-        CallError::not_sent_with_cause(reason, NotSentCause::WriterRejected)
+        CallError::not_sent_with_cause(reason, not_sent_cause)
     }
 }
 
@@ -6520,8 +6566,37 @@ fn is_data_plane_drain_refusal(code: &str) -> bool {
     code == error_codes::MODULE_RELOADING
 }
 
-fn is_daemon_refusal_before_forward(flags: Flags, code: &str) -> bool {
-    flags.is_daemon_origin()
+// 0.37.15 is the first daemon that marks its own errors and strips the bit from module frames.
+const DAEMON_ORIGIN_MIN_VERSION: (u64, u64, u64) = (0, 37, 15);
+
+/// Use the version from the same ConnectionInfo passed to authenticate_client,
+/// only after authentication succeeds. The handshake checks that the server's
+/// daemon_id equals conn.daemon_id, binding the connected daemon to the file it
+/// wrote at startup; daemon_ver itself is not covered by the server proof's HMAC.
+/// Never re-read the file for this decision. Fail closed on anything but three
+/// numeric version components, since an unfamiliar version cannot establish
+/// that the daemon strips forged origin flags.
+fn trusts_daemon_origin(daemon_ver: &str) -> bool {
+    let mut components = daemon_ver.split('.');
+    let mut next = || {
+        let component = components.next()?;
+        if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        component.parse::<u64>().ok()
+    };
+    let version = (next(), next(), next());
+    match version {
+        (Some(major), Some(minor), Some(patch)) if components.next().is_none() => {
+            (major, minor, patch) >= DAEMON_ORIGIN_MIN_VERSION
+        }
+        _ => false,
+    }
+}
+
+fn is_daemon_refusal_before_forward(daemon_origin_trusted: bool, flags: Flags, code: &str) -> bool {
+    daemon_origin_trusted
+        && flags.is_daemon_origin()
         && matches!(
             code,
             error_codes::MODULE_RELOADING

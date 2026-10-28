@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.32.12
+
+- A `module_reloading`, `unknown_channel` or `stale_route_epoch` carrying `FLAG_DAEMON_ORIGIN` now proves non-delivery only when the connection's daemon is 0.37.15 or later, the first release that strips the flag from module frames. The version is the `daemon_ver` in the `ConnectionInfo` the handshake authenticated against: the handshake proves that file's `daemon_id` belongs to the connected daemon, though its proof does not cover `daemon_ver` itself. Before 0.37.15 the data-plane proof is never claimed: even marked refusals count as possibly forwarded, and final refusals remain `CallError::Module`. Unrecognized version strings (including pre-release and build suffixes) are also untrusted. The existing resend and eviction policy is unchanged.
+- A managed call that encounters a stale route handle after an earlier attempt was sent now returns typed `NotSent(BeforeQueue)` with the whole-call `never_forwarded()` result and the stale handle in its message. A stale handle on the first attempt is unchanged. Writer-capacity timeouts classify pending entries by writer acceptance, preserving `OutcomeUnknown` if an entry was accepted. No public signatures or enum variants change.
+
 ## 0.32.11
 
 - Add the non-exhaustive `NotSentCause` and `CallError::not_sent_cause()` for every crate-built `NotSent`, preserving route-open refusal bodies and route-close reasons. `CallError::never_forwarded()` reports whether **all** attempts of a managed call are proven not forwarded, not just its final attempt. A data-plane `module_reloading`, `unknown_channel` or `stale_route_epoch` proves non-delivery only with `FLAG_DAEMON_ORIGIN`; unmarked replies (including older daemons' replies) remain conservative. Both accessors return `None` for other error variants and externally constructed untyped `NotSent` sources.

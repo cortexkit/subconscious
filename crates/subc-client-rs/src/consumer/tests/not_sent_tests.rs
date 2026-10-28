@@ -1,5 +1,100 @@
 use super::*;
 
+#[test]
+fn daemon_origin_version_gate_fails_closed() {
+    for daemon_ver in ["0.37.15", "0.38.0", "1.0.0"] {
+        assert!(trusts_daemon_origin(daemon_ver), "{daemon_ver}");
+    }
+    for daemon_ver in [
+        "0.37.14",
+        "0.37.15-rc1",
+        "0.38.0-rc1",
+        "0.37.15+x",
+        "0.37.15.1",
+        "1.0",
+        "",
+        "test",
+        " 0.37.15",
+        "0.37.15 ",
+        "+0.37.15",
+        "0..15",
+        "0.37.１５",
+        "99999999999999999999.0.0",
+    ] {
+        assert!(!trusts_daemon_origin(daemon_ver), "{daemon_ver}");
+    }
+}
+
+#[tokio::test]
+async fn installed_generation_uses_authenticated_connection_file_version() {
+    use subc_transport::{
+        authenticate_server, generate_daemon_id, generate_key, ConnectionInfo, Endpoint,
+        SCHEMA_VERSION,
+    };
+    use tokio::net::TcpListener;
+
+    let shared = writer_test_shared();
+    let mut servers = Vec::new();
+    for (index, (daemon_ver, trusted)) in [
+        ("0.37.15", true),
+        ("0.37.14", false),
+        ("test", false),
+        ("0.38.0", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let conn = ConnectionInfo {
+            schema: SCHEMA_VERSION,
+            wire_version: None,
+            endpoints: vec![Endpoint {
+                host: "127.0.0.1".into(),
+                port: listener.local_addr().unwrap().port(),
+            }],
+            key: generate_key().unwrap(),
+            daemon_id: generate_daemon_id().unwrap(),
+            pid: std::process::id(),
+            daemon_ver: daemon_ver.into(),
+        };
+        let server_conn = conn.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // The proof version is deliberately different: authentication binds
+            // the connection file's daemon_id, but does not return its version.
+            authenticate_server(
+                &mut stream,
+                &server_conn.key,
+                &server_conn.daemon_id,
+                "different-handshake-version",
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            stream
+        });
+        let opened = open_connection_with_info(
+            Path::new("unused-connection-file"),
+            &conn,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        servers.push(server.await.unwrap());
+        let kind = if index == 0 {
+            InstallKind::Initial
+        } else {
+            InstallKind::Reconnect
+        };
+        let (generation, _) = shared.install_connection(opened, kind).unwrap();
+        let inner = shared.lock_inner();
+        assert_eq!(inner.generation, generation);
+        assert_eq!(generation, index as u64 + 1);
+        assert_eq!(inner.daemon_origin_trusted, trusted, "{daemon_ver}");
+    }
+    shared.close_sync("test complete");
+}
+
 fn assert_not_sent(err: &CallError, cause: NotSentCause, never_forwarded: bool) {
     assert!(matches!(err, CallError::NotSent(_)), "{err:?}");
     assert_eq!(err.not_sent_cause(), Some(cause));
@@ -46,52 +141,72 @@ async fn marked_and_unmarked_retry_then_writer_timeout_preserves_whole_call_bit(
         error_codes::UNKNOWN_CHANNEL,
         error_codes::STALE_ROUTE_EPOCH,
     ] {
-        for marked in [true, false] {
-            for cancellable in [false, true] {
-                let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
-                let (_cancel, call) = consumer.call_cancellable(
-                    restart_target("plexus"),
-                    restart_identity(),
-                    b"ask".to_vec(),
-                    CallOptions {
-                        timeout: Duration::from_secs(5),
-                        ..CallOptions::default()
-                    },
-                );
-                let mut call = Box::pin(call);
-                let ordinary = drain_call(&consumer, b"ask");
-                let mut ordinary = Box::pin(ordinary);
-                let mut future: Pin<&mut dyn Future<Output = Result<Vec<u8>, CallError>>> =
-                    if cancellable {
-                        call.as_mut()
-                    } else {
-                        ordinary.as_mut()
-                    };
-                assert_pending(future.as_mut()).await;
-                let (corr, _) = next_route_open(&mut receiver, "first attempt").await;
-                assert!(dispatch_frame(&shared, 1, route_open_answer(corr, 41, None)).await);
-                assert_pending(future.as_mut()).await;
-                refuse_request(&shared, receiver.recv().await.unwrap(), code, marked).await;
-                assert_pending(future.as_mut()).await;
-                let (corr, _) = next_route_open(&mut receiver, "resend").await;
-                assert!(dispatch_frame(&shared, 1, route_open_answer(corr, 42, None)).await);
-                let mut full_writer = fill_writer(&shared);
-                assert_pending(future.as_mut()).await;
-                tokio::time::advance(Duration::from_secs(5)).await;
-                let err = future.await.unwrap_err();
-                assert_not_sent(&err, NotSentCause::WriterCapacity, marked);
-                assert_eq!(
-                    full_writer.recv().await.unwrap().frame.header.ty,
-                    FrameType::Ping
-                );
-                assert!(
-                    full_writer.try_recv().is_err(),
-                    "timed-out send queued a request"
-                );
-                assert!(shared.lock_inner().pending.is_empty());
+        for (daemon_ver, trusted) in [("0.37.14", false), ("0.37.15", true), ("test", false)] {
+            for marked in [true, false] {
+                for cancellable in [false, true] {
+                    let err =
+                        retry_then_writer_timeout(daemon_ver, code, marked, cancellable).await;
+                    assert_not_sent(&err, NotSentCause::WriterCapacity, trusted && marked);
+                }
             }
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn old_daemon_marked_refusal_then_writer_timeout_is_not_proven_unforwarded() {
+    let err =
+        retry_then_writer_timeout("0.37.14", error_codes::MODULE_RELOADING, true, false).await;
+    assert_not_sent(&err, NotSentCause::WriterCapacity, false);
+}
+
+async fn retry_then_writer_timeout(
+    daemon_ver: &str,
+    code: &str,
+    marked: bool,
+    cancellable: bool,
+) -> CallError {
+    let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
+    shared.lock_inner().daemon_origin_trusted = trusts_daemon_origin(daemon_ver);
+    let (_cancel, call) = consumer.call_cancellable(
+        restart_target("plexus"),
+        restart_identity(),
+        b"ask".to_vec(),
+        CallOptions {
+            timeout: Duration::from_secs(5),
+            ..CallOptions::default()
+        },
+    );
+    let mut call = Box::pin(call);
+    let ordinary = drain_call(&consumer, b"ask");
+    let mut ordinary = Box::pin(ordinary);
+    let mut future: Pin<&mut dyn Future<Output = Result<Vec<u8>, CallError>>> = if cancellable {
+        call.as_mut()
+    } else {
+        ordinary.as_mut()
+    };
+    assert_pending(future.as_mut()).await;
+    let (corr, _) = next_route_open(&mut receiver, "first attempt").await;
+    assert!(dispatch_frame(&shared, 1, route_open_answer(corr, 41, None)).await);
+    assert_pending(future.as_mut()).await;
+    refuse_request(&shared, receiver.recv().await.unwrap(), code, marked).await;
+    assert_pending(future.as_mut()).await;
+    let (corr, _) = next_route_open(&mut receiver, "resend").await;
+    assert!(dispatch_frame(&shared, 1, route_open_answer(corr, 42, None)).await);
+    let mut full_writer = fill_writer(&shared);
+    assert_pending(future.as_mut()).await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let err = future.await.unwrap_err();
+    assert_eq!(
+        full_writer.recv().await.unwrap().frame.header.ty,
+        FrameType::Ping
+    );
+    assert!(
+        full_writer.try_recv().is_err(),
+        "timed-out send queued a request"
+    );
+    assert!(shared.lock_inner().pending.is_empty());
+    err
 }
 
 #[tokio::test(start_paused = true)]
@@ -101,40 +216,45 @@ async fn final_marked_refusal_is_not_sent_but_unmarked_body_remains_module() {
         error_codes::UNKNOWN_CHANNEL,
         error_codes::STALE_ROUTE_EPOCH,
     ] {
-        for first_marked in [true, false] {
-            for final_marked in [true, false] {
-                // These calls are polled by hand. Start each scenario with a
-                // fresh Tokio cooperative budget so queueing need not yield.
-                tokio::task::yield_now().await;
-                let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
-                let mut call = Box::pin(drain_call(&consumer, b"ask"));
-                assert_pending(call.as_mut()).await;
-                let (corr, _) = next_route_open(&mut receiver, "first attempt").await;
-                assert!(dispatch_frame(&shared, 1, route_open_answer(corr, 41, None)).await);
-                assert_pending(call.as_mut()).await;
-                refuse_request(&shared, receiver.recv().await.unwrap(), code, first_marked).await;
-                assert_pending(call.as_mut()).await;
-                let (corr, _) = next_route_open(&mut receiver, "last attempt").await;
-                assert!(dispatch_frame(&shared, 1, route_open_answer(corr, 42, None)).await);
-                assert_pending(call.as_mut()).await;
-                refuse_request(&shared, receiver.recv().await.unwrap(), code, final_marked).await;
-                let err = call.await.unwrap_err();
-                if final_marked {
-                    assert_not_sent(
-                        &err,
-                        NotSentCause::DaemonRefusedBeforeForward { code: code.into() },
-                        first_marked,
-                    );
-                } else {
-                    let CallError::Module(body) = &err else {
-                        panic!("{err:?}");
-                    };
-                    assert_eq!(body.code, code);
-                    assert_eq!(body.message, "refused");
-                    assert_eq!(err.not_sent_cause(), None);
-                    assert_eq!(err.never_forwarded(), None);
+        for (daemon_ver, trusted) in [("0.37.14", false), ("0.37.15", true), ("test", false)] {
+            for first_marked in [true, false] {
+                for final_marked in [true, false] {
+                    // These calls are polled by hand. Start each scenario with a
+                    // fresh Tokio cooperative budget so queueing need not yield.
+                    tokio::task::yield_now().await;
+                    let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
+                    shared.lock_inner().daemon_origin_trusted = trusts_daemon_origin(daemon_ver);
+                    let mut call = Box::pin(drain_call(&consumer, b"ask"));
+                    assert_pending(call.as_mut()).await;
+                    let (corr, _) = next_route_open(&mut receiver, "first attempt").await;
+                    assert!(dispatch_frame(&shared, 1, route_open_answer(corr, 41, None)).await);
+                    assert_pending(call.as_mut()).await;
+                    refuse_request(&shared, receiver.recv().await.unwrap(), code, first_marked)
+                        .await;
+                    assert_pending(call.as_mut()).await;
+                    let (corr, _) = next_route_open(&mut receiver, "last attempt").await;
+                    assert!(dispatch_frame(&shared, 1, route_open_answer(corr, 42, None)).await);
+                    assert_pending(call.as_mut()).await;
+                    refuse_request(&shared, receiver.recv().await.unwrap(), code, final_marked)
+                        .await;
+                    let err = call.await.unwrap_err();
+                    if trusted && final_marked {
+                        assert_not_sent(
+                            &err,
+                            NotSentCause::DaemonRefusedBeforeForward { code: code.into() },
+                            first_marked,
+                        );
+                    } else {
+                        let CallError::Module(body) = &err else {
+                            panic!("{err:?}");
+                        };
+                        assert_eq!(body.code, code);
+                        assert_eq!(body.message, "refused");
+                        assert_eq!(err.not_sent_cause(), None);
+                        assert_eq!(err.never_forwarded(), None);
+                    }
+                    assert!(receiver.try_recv().is_err(), "call resent more than once");
                 }
-                assert!(receiver.try_recv().is_err(), "call resent more than once");
             }
         }
     }
@@ -144,6 +264,7 @@ async fn final_marked_refusal_is_not_sent_but_unmarked_body_remains_module() {
 async fn retry_then_route_open_failure_keeps_the_whole_call_bit_and_refusal() {
     for marked in [true, false] {
         let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
+        shared.lock_inner().daemon_origin_trusted = trusts_daemon_origin("0.37.15");
         let mut call = Box::pin(drain_call(&consumer, b"ask"));
         assert_pending(call.as_mut()).await;
         let (corr, _) = next_route_open(&mut receiver, "first route").await;
@@ -169,6 +290,137 @@ async fn retry_then_route_open_failure_keeps_the_whole_call_bit_and_refusal() {
             marked,
         );
         assert_eq!(err.route_open_refusal().unwrap().message, "gone");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_handle_after_refusal_preserves_whole_call_history() {
+    for earlier_marked in [None, Some(false), Some(true)] {
+        for cancellable in [false, true] {
+            let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
+            shared.lock_inner().daemon_origin_trusted = trusts_daemon_origin("0.37.15");
+            let (_cancel, call) = consumer.call_cancellable(
+                restart_target("plexus"),
+                restart_identity(),
+                b"ask".to_vec(),
+                CallOptions::default(),
+            );
+            let mut call = Box::pin(call);
+            let mut ordinary = Box::pin(drain_call(&consumer, b"ask"));
+            let mut future: Pin<&mut dyn Future<Output = Result<Vec<u8>, CallError>>> =
+                if cancellable {
+                    call.as_mut()
+                } else {
+                    ordinary.as_mut()
+                };
+            assert_pending(future.as_mut()).await;
+            let (corr, _) = next_route_open(&mut receiver, "first route").await;
+            if let Some(marked) = earlier_marked {
+                assert!(dispatch_frame(&shared, 1, route_open_answer(corr, 41, None)).await);
+                assert_pending(future.as_mut()).await;
+                refuse_request(
+                    &shared,
+                    receiver.recv().await.unwrap(),
+                    error_codes::MODULE_RELOADING,
+                    marked,
+                )
+                .await;
+                assert_pending(future.as_mut()).await;
+            }
+            let corr = if earlier_marked.is_some() {
+                next_route_open(&mut receiver, "replacement route").await.0
+            } else {
+                corr
+            };
+            assert!(dispatch_frame(&shared, 1, route_open_answer(corr, 42, None)).await);
+            let handle = shared.ingress_handle(1, 42, 1).unwrap();
+            // Retire the handle while route.open's reply is ready but before
+            // the managed call resumes and tries to queue its request.
+            shared.lock_inner().retired_routes.insert(handle);
+            let err = future.await.unwrap_err();
+            if let Some(marked) = earlier_marked {
+                assert_not_sent(&err, NotSentCause::BeforeQueue, marked);
+                assert!(err
+                    .to_string()
+                    .contains(&CallError::StaleRouteHandle(handle).to_string()));
+            } else {
+                assert!(matches!(err, CallError::StaleRouteHandle(stale) if stale == handle));
+                assert_eq!(err.never_forwarded(), None);
+            }
+            assert!(
+                receiver.try_recv().is_err(),
+                "stale attempt queued a request"
+            );
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn writer_capacity_timeouts_classify_pending_acceptance() {
+    for subscription in [false, true] {
+        for accepted in [false, true] {
+            let shared = writer_test_shared();
+            let mut receiver = fill_writer(&shared);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut future: Pin<Box<dyn Future<Output = Result<(), CallError>>>> = if subscription {
+                let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+                Box::pin(async {
+                    shared
+                        .send_subscription(SubscriptionSend {
+                            expected_handle: None,
+                            channel: 0,
+                            epoch: 0,
+                            body: b"watch".to_vec(),
+                            priority: Priority::Interactive,
+                            admission_class: AdmissionClass::Normal,
+                            event_buffer: 1,
+                            deadline,
+                            permit,
+                        })
+                        .await
+                        .map(|_| ())
+                })
+            } else {
+                Box::pin(async {
+                    shared
+                        .send_request(RequestSend {
+                            expected_handle: None,
+                            channel: 0,
+                            epoch: 0,
+                            body: b"ask".to_vec(),
+                            binary: false,
+                            priority: Priority::Interactive,
+                            admission_class: AdmissionClass::Normal,
+                            deadline,
+                            retain_late_route_open: false,
+                            route_open_reverse_requests: None,
+                        })
+                        .await
+                        .map(|_| ())
+                })
+            };
+            assert_pending(future.as_mut()).await;
+            let key = *shared.lock_inner().pending.keys().next().unwrap();
+            if accepted {
+                // Acceptance cannot normally precede queueing; force it here
+                // to verify timeout classification depends on the stored flag.
+                assert!(shared.mark_pending_accepted(key));
+            }
+            tokio::time::advance(Duration::from_secs(5)).await;
+            let err = future.await.unwrap_err();
+            if accepted {
+                assert_eq!(err.outcome_cause(), Some(OutcomeUnknownCause::Deadline));
+                assert_eq!(err.not_sent_cause(), None);
+            } else {
+                assert_not_sent(&err, NotSentCause::WriterCapacity, true);
+            }
+            assert!(shared.lock_inner().pending.is_empty());
+            assert_eq!(
+                receiver.recv().await.unwrap().frame.header.ty,
+                FrameType::Ping
+            );
+            assert!(receiver.try_recv().is_err());
+        }
     }
 }
 

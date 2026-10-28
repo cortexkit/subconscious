@@ -6,6 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::cli_output::println;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 

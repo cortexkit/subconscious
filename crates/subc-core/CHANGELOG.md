@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.148
+
+- `ck` and `ckni` setup and upgrade output now uses the same checked stdout writes as other commands, exiting quietly with status 0 when a reader closes the pipe early on Unix or Windows.
+- An empty install record is now covered for both `ck upgrade --check` and `ckni`: the summary explains that `ck upgrade` manages only what `ck setup` installed, never claims to be up to date, and makes no index request.
+
 ## 0.20.147
 
 - `ck quota --redact` also hides a reading's stored-credential label

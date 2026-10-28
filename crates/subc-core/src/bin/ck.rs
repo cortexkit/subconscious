@@ -5,6 +5,7 @@
 // a small `<domain> <verb>` dispatcher so future domains such as `ck vault ...`,
 // `ck quota ...`, and `ck account ...` can be added without reshaping the CLI.
 
+use subc_core::cli_output::stdout_result;
 use subc_core::setup;
 use subc_core::setup::text::{human_blocking_outcome, upgrade_current_summary};
 
@@ -12,26 +13,13 @@ use subc_core::setup::text::{human_blocking_outcome, upgrade_current_summary};
 // Treat that as successful consumption, not a panic from std's print macros.
 macro_rules! print {
     ($($arg:tt)*) => {{
-        use std::io::Write as _;
-        if let Err(error) = $crate::stdout_result(std::io::stdout().lock().write_fmt(format_args!($($arg)*))) {
-            panic!("failed printing to stdout: {error}");
-        }
+        subc_core::cli_output::print(format_args!($($arg)*));
     }};
 }
 
 macro_rules! println {
     () => { print!("\n") };
     ($($arg:tt)*) => { print!("{}\n", format_args!($($arg)*)) };
-}
-
-fn stdout_result(result: std::io::Result<()>) -> std::io::Result<()> {
-    if result
-        .as_ref()
-        .is_err_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
-    {
-        std::process::exit(0);
-    }
-    result
 }
 
 #[path = "activity/mod.rs"]

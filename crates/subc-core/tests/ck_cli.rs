@@ -3200,6 +3200,38 @@ fn upgrade_without_managed_binaries_is_not_current() {
 }
 
 #[test]
+fn empty_install_record_does_not_claim_an_upgrade_check_for_ck_or_ckni() {
+    let fixture = UpgradeFixture::new("empty-upgrade-check");
+    let cortexkit = fixture.home.join(".local/share/cortexkit");
+    fs::remove_dir_all(cortexkit.join("bin")).unwrap();
+    fs::write(
+        cortexkit.join("installer-manifest.json"),
+        br#"{"schema_version":1,"mutations":[]}"#,
+    )
+    .unwrap();
+    let index = serve_signed_index(|base| core_release_index(base, "0.20.148"));
+    let ck = fixture.command(&index, &["upgrade", "--check"]);
+    let (_ckni_dir, mut ckni) = ckni_command(&platform_binary("ckni"));
+    ckni.args(ck.get_args());
+    for (name, value) in ck.get_envs() {
+        match value {
+            Some(value) => ckni.env(name, value),
+            None => ckni.env_remove(name),
+        };
+    }
+    for mut command in [ck, ckni] {
+        let output = command.output().unwrap();
+        assert_exit(&output, 1);
+        assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
+        let stdout = text(&output.stdout);
+        assert_eq!(stdout, "No CortexKit programs installed by ck setup were found. ck upgrade manages only what ck setup installed. Run ck setup to install them or take over the ones already here. Nothing was changed.\n");
+        assert!(!stdout.contains("up to date"));
+        assert!(!stdout.contains("0.20.148"));
+    }
+    assert!(index.requests.lock().unwrap().is_empty());
+}
+
+#[test]
 #[cfg(target_os = "linux")]
 fn upgrade_mixed_ownership_refuses_before_checking_or_changing_binaries() {
     let fixture = UpgradeFixture::new("upgrade-mixed-ownership");
@@ -5669,6 +5701,31 @@ async fn module_status_and_health_unknown_module_errors_are_one_line() {
         !json_stderr.contains("next:"),
         "JSON error gained footer: {json_stderr}"
     );
+}
+
+#[test]
+fn closed_setup_output_pipe_is_quiet_for_ck_and_ckni() {
+    use std::process::Stdio;
+
+    let fixture = SetupFixture::new("closed-setup-pipe", false);
+    let index = serve_signed_index(|base| setup_index(base, None));
+    let (_ckni_dir, ckni) = ckni_command(&platform_binary("ckni"));
+    for command in [ck_command(), ckni] {
+        let mut child = fixture
+            .command_from(command, &index, &["setup", "--dry-run"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // A downstream command can close its end before setup prints its plan.
+        drop(child.stdout.take().unwrap());
+        let output = child.wait_with_output().unwrap();
+        let stderr = text(&output.stderr);
+        assert_ne!(output.status.code(), Some(101), "{stderr}");
+        assert!(!stderr.contains("panicked"), "{stderr}");
+        assert!(stderr.is_empty(), "{stderr}");
+        assert_exit(&output, 0);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

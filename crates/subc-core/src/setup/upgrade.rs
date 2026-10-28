@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::cli_output::println;
 use serde_json::Value;
 use subc_transport::connection_file;
 

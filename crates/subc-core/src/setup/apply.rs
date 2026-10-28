@@ -5,6 +5,7 @@ use std::{
     process::Command,
 };
 
+use crate::cli_output::println;
 use serde_json::{Map, Value};
 
 use super::{

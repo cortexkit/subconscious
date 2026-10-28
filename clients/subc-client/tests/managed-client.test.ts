@@ -58,6 +58,7 @@ interface FakeStats {
 
 interface FakeDaemonOptions {
   stats: FakeStats;
+  listenPath?: string;
   // Daemon-side HMAC key — a daemon started with a different key models the
   // key rotation that happens on every real daemon restart.
   key?: Uint8Array;
@@ -143,6 +144,98 @@ function newStats(): FakeStats {
 afterEach(async () => {
   for (const daemon of daemons.splice(0)) await daemon.stop();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+function localAddress(dir: string, name: string): string {
+  return process.platform === "win32"
+    ? `\\\\.\\pipe\\subc-sdk-${process.pid}-${name}-${Math.random().toString(16).slice(2)}`
+    : join(dir, `${name}.sock`);
+}
+
+function publishLocal(connFile: string, port: number, address?: string): void {
+  writeConnectionFile(connFile, port);
+  if (address === undefined) return;
+  const record = JSON.parse(readFileSync(connFile, "utf8"));
+  record.local_endpoint = process.platform === "win32"
+    ? { kind: "pipe", name: address }
+    : { kind: "unix", path: address };
+  writeFileSync(connFile, JSON.stringify(record), { mode: 0o600 });
+}
+
+describe("local transport", () => {
+  test("default transport stays TCP even with local metadata", async () => {
+    const { dir, connFile } = tempConnectionFile();
+    const stats = newStats();
+    const tcp = await startFakeDaemon({ stats });
+    publishLocal(connFile, tcp.port, localAddress(dir, "unreachable"));
+    const client = await SubcClient.connect({ connectionFile: connFile, identity: IDENTITY });
+    try {
+      expect(await client.call<unknown>("local-test", "echo", { n: 1 })).toEqual({ method: "echo", params: { n: 1 } });
+      expect(stats.connections).toBe(1);
+    } finally { client.close(); }
+  });
+
+  test("local reconnect rereads the endpoint and never attempts TCP", async () => {
+    const { dir, connFile } = tempConnectionFile();
+    const tcpStats = newStats();
+    const tcp = await startFakeDaemon({ stats: tcpStats });
+    const firstStats = newStats();
+    const oldAddress = localAddress(dir, "first");
+    await startFakeDaemon({ stats: firstStats, listenPath: oldAddress, closeAfterDataResponses: 1 });
+    publishLocal(connFile, tcp.port, oldAddress);
+    const nextAddress = localAddress(dir, "next");
+    const sleeps: number[] = [];
+    const client = await SubcClient.connect({ connectionFile: connFile, transport: "local", identity: IDENTITY, reconnectBackoff: BACKOFF,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+        publishLocal(connFile, tcp.port, nextAddress);
+      } });
+    try {
+      expect(await client.call<unknown>("local-test", "echo", { n: 1 })).toEqual({ method: "echo", params: { n: 1 } });
+      await waitFor(() => clientClosedErr(client) !== null, "local connection to close");
+      const nextStats = newStats();
+      await startFakeDaemon({ stats: nextStats, listenPath: nextAddress });
+      // ENOENT is transient in the TypeScript SDK. Rotate the file during the
+      // backoff to prove every attempt reads it, not only the first reconnect.
+      publishLocal(connFile, tcp.port, localAddress(dir, "unreachable"));
+      expect(await client.call<unknown>("local-test", "echo", { n: 2 })).toEqual({ method: "echo", params: { n: 2 } });
+      expect(sleeps).toEqual([BACKOFF.baseMs]);
+      expect(firstStats.connections).toBe(1);
+      expect(nextStats.connections).toBe(1);
+      expect(tcpStats.connections).toBe(0);
+    } finally { client.close(); }
+  });
+
+  for (const missing of [true, false]) {
+    test(`local ${missing ? "absent key" : "connect error"} is preserved on initial open and reconnect`, async () => {
+      const { dir, connFile } = tempConnectionFile();
+      const tcpStats = newStats();
+      const tcp = await startFakeDaemon({ stats: tcpStats });
+      const unreachable = localAddress(dir, "unreachable");
+      const checkError = (error: unknown) => {
+        if (missing) {
+          expect(error).toMatchObject({ code: "local_endpoint_absent" });
+        } else {
+          expect(error).toBeInstanceOf(DaemonUnavailableError);
+          expect(error).toMatchObject({ code: "ENOENT", cause: { code: "ENOENT", address: unreachable } });
+        }
+      };
+      publishLocal(connFile, tcp.port, missing ? undefined : unreachable);
+      checkError(await rejectionOf(SubcClient.connect({ connectionFile: connFile, transport: "local" })));
+      const address = localAddress(dir, "working");
+      await startFakeDaemon({ stats: newStats(), listenPath: address, closeAfterDataResponses: 1 });
+      publishLocal(connFile, tcp.port, address);
+      const client = await SubcClient.connect({ connectionFile: connFile, transport: "local", identity: IDENTITY,
+        reconnectBackoff: { ...BACKOFF, maxAttempts: 2 }, sleep: async () => {} });
+      try {
+        await client.call("local-test", "echo", {});
+        await waitFor(() => clientClosedErr(client) !== null, "local connection to close");
+        publishLocal(connFile, tcp.port, missing ? undefined : unreachable);
+        checkError(await rejectionOf(client.call("local-test", "echo", {})));
+        expect(tcpStats.connections).toBe(0);
+      } finally { client.close(); }
+    });
+  }
 });
 
 describe("daemon unavailable", () => {
@@ -1730,9 +1823,10 @@ async function startFakeDaemon(options: FakeDaemonOptions): Promise<FakeDaemon> 
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
+    if (options.listenPath) server.listen(options.listenPath, resolve);
+    else server.listen(0, "127.0.0.1", resolve);
   });
-  const port = (server.address() as AddressInfo).port;
+  const port = options.listenPath ? 0 : (server.address() as AddressInfo).port;
   let stopped = false;
   const daemon: FakeDaemon = {
     port,

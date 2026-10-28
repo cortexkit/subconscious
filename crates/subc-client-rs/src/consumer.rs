@@ -40,8 +40,8 @@ use subc_transport::{
     FrameIoError,
 };
 use tokio::{
-    io::{AsyncWrite, AsyncWriteExt, BufWriter},
-    net::{tcp::OwnedReadHalf, TcpStream},
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
+    net::TcpStream,
     sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
     time::{sleep, sleep_until, timeout_at, Instant},
@@ -416,6 +416,15 @@ impl RetryBackoff {
         }
         delay
     }
+}
+
+/// Transport used for the initial connection and every reconnect attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConsumerTransport {
+    /// Use the connection file's TCP endpoint (the default).
+    Tcp,
+    /// Use only `local_endpoint`, re-read on every connection attempt.
+    Local,
 }
 
 /// Options for [`SubcConsumer::connect`].
@@ -1154,8 +1163,33 @@ impl SubcConsumer {
         connection_file: &Path,
         opts: ConsumerOptions,
     ) -> Result<Self, ConsumerError> {
-        let opened = open_connection(connection_file, opts.handshake_timeout).await?;
-        let shared = Arc::new(Shared::new(connection_file.to_path_buf(), opts));
+        Self::connect_with_transport(connection_file, opts, ConsumerTransport::Tcp).await
+    }
+
+    /// Connect only to the connection file's same-user Unix socket or Windows pipe.
+    ///
+    /// Each connection attempt, including reconnects, reads the current local
+    /// endpoint and key from the same owner-checked file. A missing
+    /// `local_endpoint` returns [`ConsumerError::NoEndpoint`]; a local connect
+    /// failure retains its endpoint and I/O error. Neither case falls back to TCP.
+    pub async fn connect_local(
+        connection_file: &Path,
+        opts: ConsumerOptions,
+    ) -> Result<Self, ConsumerError> {
+        Self::connect_with_transport(connection_file, opts, ConsumerTransport::Local).await
+    }
+
+    async fn connect_with_transport(
+        connection_file: &Path,
+        opts: ConsumerOptions,
+        transport: ConsumerTransport,
+    ) -> Result<Self, ConsumerError> {
+        let opened = open_connection(connection_file, opts.handshake_timeout, transport).await?;
+        let shared = Arc::new(Shared::with_transport(
+            connection_file.to_path_buf(),
+            opts,
+            transport,
+        ));
         shared.install_initial(opened)?;
         Ok(Self { shared })
     }
@@ -1170,6 +1204,16 @@ impl SubcConsumer {
         let shared = Arc::new(Shared::new(discovered.path, opts));
         shared.install_initial(opened)?;
         Ok(Self { shared })
+    }
+
+    /// Discover the daemon's connection file and connect only to its local endpoint.
+    ///
+    /// Uses [`Self::connect_local`], including its per-attempt file reads and
+    /// refusal to fall back to TCP.
+    pub async fn connect_default_local(opts: ConsumerOptions) -> Result<Self, ConsumerError> {
+        let discovered = connection_file::discover(None)
+            .map_err(|source| ConsumerError::Discovery { source })?;
+        Self::connect_local(&discovered.path, opts).await
     }
 
     /// Open or reuse a managed route and return its connection-fenced handle.
@@ -2529,7 +2573,7 @@ impl Drop for SubcConsumer {
     }
 }
 
-/// Error returned by [`SubcConsumer::connect`] or [`SubcConsumer::connect_default`].
+/// Error returned by [`SubcConsumer`]'s TCP and local connection constructors.
 #[derive(Debug)]
 pub enum ConsumerError {
     Discovery {
@@ -2539,6 +2583,8 @@ pub enum ConsumerError {
         path: PathBuf,
         source: ConnectionFileError,
     },
+    /// No endpoint for the requested transport. [`SubcConsumer::connect_local`]
+    /// returns this when the connection file has no `local_endpoint`.
     NoEndpoint {
         path: PathBuf,
     },
@@ -2567,7 +2613,7 @@ impl fmt::Display for ConsumerError {
             Self::NoEndpoint { path } => {
                 write!(
                     f,
-                    "subc connection file '{}' has no endpoints",
+                    "subc connection file '{}' has no endpoint for the requested transport",
                     path.display()
                 )
             }
@@ -3093,6 +3139,7 @@ struct Opening {
 struct Shared {
     connection_file: PathBuf,
     opts: ConsumerOptions,
+    transport: ConsumerTransport,
     inner: Mutex<Inner>,
     notify: Notify,
     #[cfg(test)]
@@ -3308,9 +3355,18 @@ impl Inner {
 
 impl Shared {
     fn new(connection_file: PathBuf, opts: ConsumerOptions) -> Self {
+        Self::with_transport(connection_file, opts, ConsumerTransport::Tcp)
+    }
+
+    fn with_transport(
+        connection_file: PathBuf,
+        opts: ConsumerOptions,
+        transport: ConsumerTransport,
+    ) -> Self {
         Self {
             connection_file,
             opts,
+            transport,
             inner: Mutex::new(Inner {
                 generation: 1,
                 daemon_origin_trusted: false,
@@ -3416,7 +3472,7 @@ impl Shared {
             return Err(ConsumerError::Closed);
         }
 
-        let (reader, writer) = opened.stream.into_split();
+        let (reader, writer) = tokio::io::split(opened.stream);
         let (tx, rx) = mpsc::channel(EGRESS_BUFFER);
         let (generation, epoch, old_reader, old_writer) = {
             let mut inner = self.lock_inner();
@@ -3625,7 +3681,13 @@ impl Shared {
                 return Ok(());
             }
 
-            match open_connection(&self.connection_file, self.opts.handshake_timeout).await {
+            match open_connection(
+                &self.connection_file,
+                self.opts.handshake_timeout,
+                self.transport,
+            )
+            .await
+            {
                 Ok(opened) => {
                     // A newer drop may have installed its own attempt while this
                     // connection was opening. Do not let the stale attempt replace it.
@@ -5798,21 +5860,82 @@ struct WriteCommand {
     pending: Option<PendingKey>,
 }
 
+trait ConsumerStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ConsumerStream for T {}
+
 struct OpenedConnection {
-    stream: TcpStream,
+    stream: Box<dyn ConsumerStream>,
     daemon_origin_trusted: bool,
 }
 
 async fn open_connection(
     path: &Path,
     deadline: Duration,
+    transport: ConsumerTransport,
 ) -> Result<OpenedConnection, ConsumerError> {
+    if transport == ConsumerTransport::Local {
+        let read =
+            connection_file::read_for_client_with_local_endpoint(path).map_err(|source| {
+                ConsumerError::ConnectionFile {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+        let endpoint = read
+            .local_endpoint
+            .ok_or_else(|| ConsumerError::NoEndpoint {
+                path: path.to_path_buf(),
+            })?;
+        let label = match &endpoint {
+            connection_file::LocalEndpoint::Unix { path } => path.display().to_string(),
+            connection_file::LocalEndpoint::Pipe { name } => name.clone(),
+            _ => "unsupported local endpoint".to_owned(),
+        };
+        let mut stream =
+            connect_local(&endpoint)
+                .await
+                .map_err(|source| ConsumerError::Connect {
+                    path: path.to_path_buf(),
+                    endpoint: label.clone(),
+                    source,
+                })?;
+        authenticate_client(&mut stream, &read.info, deadline)
+            .await
+            .map_err(|source| ConsumerError::Auth {
+                path: path.to_path_buf(),
+                endpoint: label,
+                source,
+            })?;
+        return Ok(OpenedConnection {
+            stream,
+            daemon_origin_trusted: trusts_daemon_origin(&read.info.daemon_ver),
+        });
+    }
     let conn =
         connection_file::read_for_client(path).map_err(|source| ConsumerError::ConnectionFile {
             path: path.to_path_buf(),
             source,
         })?;
     open_connection_with_info(path, &conn, deadline).await
+}
+
+async fn connect_local(
+    endpoint: &connection_file::LocalEndpoint,
+) -> io::Result<Box<dyn ConsumerStream>> {
+    match endpoint {
+        #[cfg(unix)]
+        connection_file::LocalEndpoint::Unix { path } => {
+            Ok(Box::new(tokio::net::UnixStream::connect(path).await?))
+        }
+        #[cfg(windows)]
+        connection_file::LocalEndpoint::Pipe { name } => Ok(Box::new(
+            tokio::net::windows::named_pipe::ClientOptions::new().open(name)?,
+        )),
+        _ => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported local endpoint kind",
+        )),
+    }
 }
 
 async fn open_connection_with_info(
@@ -5850,7 +5973,7 @@ async fn open_connection_with_info(
             source,
         })?;
     Ok(OpenedConnection {
-        stream,
+        stream: Box::new(stream),
         daemon_origin_trusted: trusts_daemon_origin(&conn.daemon_ver),
     })
 }
@@ -5949,7 +6072,7 @@ fn join_error_message(error: tokio::task::JoinError) -> String {
     "reverse-request handler panicked".to_string()
 }
 
-async fn reader_loop(shared: Arc<Shared>, mut reader: OwnedReadHalf, generation: u64) {
+async fn reader_loop<R: AsyncRead + Unpin>(shared: Arc<Shared>, mut reader: R, generation: u64) {
     loop {
         match read_frame(&mut reader).await {
             Ok(Some(frame)) => {
@@ -6652,6 +6775,9 @@ impl From<FrameBuildError> for CallError {
         Self::not_sent(err.to_string())
     }
 }
+
+#[cfg(test)]
+mod local_transport_tests;
 
 #[cfg(test)]
 mod tests {

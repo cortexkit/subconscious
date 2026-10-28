@@ -1,6 +1,6 @@
 [package]
 name = "subc-client-rs"
-version = "0.32.12"
+version = "0.32.13"
 edition = "2021"
 publish = true
 description = "Shared serve + consume client for Rust subc modules."
@@ -22,7 +22,7 @@ sha2 = "0.10"
 subc-control = { path = "../subc-control", version = "0.33.0" }
 subc-os = { path = "../subc-os", version = "0.1.14" }
 subc-protocol = { path = "../subc-protocol", version = "0.33.5" }
-subc-transport = { path = "../subc-transport", version = "0.14.0" }
+subc-transport = { path = "../subc-transport", version = "0.14.1" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }

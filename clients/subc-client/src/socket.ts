@@ -140,12 +140,24 @@ export class SubcSocket {
   }
 
   static connect(host: string, port: number, deadlineMs: number): Promise<SubcSocket> {
+    return SubcSocket.connectTo({ host, port }, `${host}:${port}`, deadlineMs);
+  }
+
+  static connectLocal(path: string, deadlineMs: number): Promise<SubcSocket> {
+    return SubcSocket.connectTo({ path }, path, deadlineMs);
+  }
+
+  private static connectTo(
+    options: net.NetConnectOpts,
+    endpoint: string,
+    deadlineMs: number,
+  ): Promise<SubcSocket> {
     return new Promise((resolve, reject) => {
-      const sock = net.connect({ host, port });
+      const sock = net.connect(options);
       sock.setNoDelay(true);
       const timer = setTimeout(() => {
         sock.destroy();
-        reject(new SocketTimeoutError(`timed out connecting to ${host}:${port}`));
+        reject(new SocketTimeoutError(`timed out connecting to ${endpoint}`));
       }, Math.max(0, deadlineMs - Date.now()));
       sock.once("connect", () => {
         clearTimeout(timer);

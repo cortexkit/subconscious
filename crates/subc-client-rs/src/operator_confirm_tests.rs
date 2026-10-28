@@ -92,6 +92,43 @@ async fn assert_one_cancel(rx: &mut mpsc::Receiver<Frame>, corr: u64) {
     assert!(rx.try_recv().is_err(), "more than one Cancel was sent");
 }
 
+#[tokio::test(start_paused = true)]
+async fn operator_confirm_helpers_share_capacity_deadline_and_drop_withdrawal() {
+    for operation in [true, false] {
+        let (handle, mut rx) = handle();
+        let route = handle.route_handle(7, 3);
+        let confirm = || async {
+            if operation {
+                handle
+                    .confirm_operation("Replace identity", &route, "identity.replace")
+                    .await
+            } else {
+                handle.confirm_enrollment("Replace identity", &route).await
+            }
+        };
+        fill_egress(&handle);
+        let mut call = Box::pin(confirm());
+        still_pending(call.as_mut()).await;
+        tokio::time::advance(Duration::from_secs(200)).await;
+        assert_eq!(rx.recv().await.unwrap().header.corr, 999);
+        still_pending(call.as_mut()).await;
+        let request = rx.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(89)).await;
+        still_pending(call.as_mut()).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(call.await, Err(OperatorConfirmError::PresenceUnavailable));
+        assert_eq!(pending_count(&handle), 0);
+        assert_one_cancel(&mut rx, request.header.corr).await;
+
+        let mut call = Box::pin(confirm());
+        still_pending(call.as_mut()).await;
+        let request = rx.recv().await.unwrap();
+        drop(call);
+        assert_eq!(pending_count(&handle), 0);
+        assert_one_cancel(&mut rx, request.header.corr).await;
+    }
+}
+
 #[tokio::test]
 async fn operator_confirm_fake_daemon_confirmed_reply_succeeds() {
     let mut served =

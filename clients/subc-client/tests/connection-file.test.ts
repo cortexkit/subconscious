@@ -3,7 +3,7 @@ import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { ConnectionFileError, readConnectionFile, readConnectionFileForUid } from "../src/connection-file.js";
+import { ConnectionFileError, readConnectionFile, readConnectionFileForUid, readConnectionFileWithLocalEndpoint } from "../src/connection-file.js";
 import { PROTOCOL_VERSION } from "../src/envelope.js";
 import { rejectionOf, throwerOf } from "./settle.js";
 
@@ -35,6 +35,26 @@ afterEach(() => {
 });
 
 describe("connection file reader", () => {
+  test("local metadata is opt-in, optional, and validates both endpoint shapes", async () => {
+    expect((await readConnectionFileWithLocalEndpoint(tempFile(validInfo()))).localEndpoint).toBeUndefined();
+    for (const endpoint of [{ kind: "unix", path: "/run/subc.sock" }, { kind: "pipe", name: "\\\\.\\pipe\\subc" }] as const) {
+      const path = tempFile(validInfo({ local_endpoint: endpoint }));
+      expect((await readConnectionFileWithLocalEndpoint(path)).localEndpoint).toEqual(endpoint);
+      expect(await readConnectionFile(path)).not.toHaveProperty("localEndpoint");
+    }
+    const malformed = tempFile(validInfo({ local_endpoint: { kind: "unix", path: "" } }));
+    expect(await readConnectionFile(malformed)).not.toHaveProperty("localEndpoint");
+    expect(await rejectionOf(readConnectionFileWithLocalEndpoint(malformed))).toBeInstanceOf(ConnectionFileError);
+  });
+
+  test.if(process.platform !== "win32")("local metadata does not bypass owner or permission checks", async () => {
+    const path = tempFile(validInfo({ local_endpoint: { kind: "unix", path: "/run/subc.sock" } }));
+    const owner = statSync(path).uid;
+    expect(await rejectionOf(readConnectionFileForUid(path, owner === 0 ? 1 : 0, true))).toBeInstanceOf(ConnectionFileError);
+    chmodSync(path, 0o644);
+    expect(await throwerOf(readConnectionFileWithLocalEndpoint(path))).toThrow(/insecure permissions/);
+  });
+
   test("accepts a file without wire_version", async () => {
     const info = await readConnectionFile(tempFile(validInfo()));
     expect(info.schema).toBe(1);

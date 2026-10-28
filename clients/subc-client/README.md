@@ -1,7 +1,7 @@
 # @cortexkit/subc-client
 
 TypeScript client for the [subc](../../README.md) daemon. It speaks the same
-loopback-TCP transport as the Rust consumers (`subc-core`'s `subc-probe`),
+loopback-TCP transport by default, with an opt-in same-user local socket or pipe,
 wire-compatible **byte-for-byte** with `subc-transport` (the HMAC-SHA256
 handshake) and `subc-protocol` (the 21-byte v2 envelope and channel-0 control RPCs).
 
@@ -48,6 +48,20 @@ const usage = body.result; // ProviderUsage[] for the ai-provider-quota module
 await client.closeRoute(route);
 client.close();
 ```
+
+To use the daemon's Unix socket (macOS/Linux) or named pipe (Windows), opt in
+when connecting:
+
+```ts
+const client = await SubcClient.connect({ connectionFile, transport: "local" });
+```
+
+Every connection attempt, including each reconnect, reads `local_endpoint` from
+the current owner-checked connection file. An absent key gives
+`local_endpoint_absent`; a failed local connect preserves its error (as the
+`cause` of `DaemonUnavailableError` for connection-unavailable failures). Local
+mode never falls back to TCP. Both transports use the same handshake and frames.
+Providers registering modules still use TCP.
 
 ### v2 route-handle migration
 

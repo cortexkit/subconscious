@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 import { debuglog } from "node:util";
 
 import { AuthError, authenticateClient } from "./auth.js";
-import { ConnectionFileError, readConnectionFile, type ConnectionInfo } from "./connection-file.js";
+import { ConnectionFileError, readConnectionFile, readConnectionFileWithLocalEndpoint, type ConnectionInfo, type ConnectionInfoWithLocalEndpoint } from "./connection-file.js";
 import {
   AdmissionClass,
   buildFrame,
@@ -436,6 +436,8 @@ interface Pending {
 
 export interface ConnectOptions {
   connectionFile: string;
+  /** Defaults to TCP. Local uses only the file's current local_endpoint, never TCP fallback. */
+  transport?: "tcp" | "local";
   handshakeTimeoutMs?: number;
   /** Default route identity used by managed call(); can be overridden per call. */
   identity?: BindIdentity;
@@ -582,6 +584,7 @@ export function routeCloseReason(push: ControlPush): RouteCloseReason | undefine
 
 interface NormalizedConnectOptions {
   connectionFile: string;
+  transport: "tcp" | "local";
   handshakeTimeoutMs?: number;
   identity?: BindIdentity;
   targetKind: ManagedRouteKind;
@@ -1264,10 +1267,22 @@ export class SubcClient {
   }
 
   private static async openConnection(opts: NormalizedConnectOptions): Promise<OpenedConnection> {
-    const conn = await readConnectionFile(opts.connectionFile);
+    const conn: ConnectionInfoWithLocalEndpoint = opts.transport === "local"
+      ? await readConnectionFileWithLocalEndpoint(opts.connectionFile)
+      : await readConnectionFile(opts.connectionFile);
     const deadline = Date.now() + (opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
     const endpoint = conn.endpoints[0]!;
-    const sock = await SubcSocket.connect(endpoint.host, endpoint.port, deadline);
+    let sock: SubcSocket;
+    if (opts.transport === "local") {
+      const local = conn.localEndpoint;
+      if (!local) throw new SubcError("connection file has no local_endpoint", "local_endpoint_absent");
+      if ((local.kind === "unix") !== (process.platform !== "win32")) {
+        throw new SubcError("unsupported local endpoint kind on this platform", "local_endpoint_unsupported");
+      }
+      sock = await SubcSocket.connectLocal(local.kind === "unix" ? local.path : local.name, deadline);
+    } else {
+      sock = await SubcSocket.connect(endpoint.host, endpoint.port, deadline);
+    }
     try {
       await authenticateClient(sock, conn, deadline);
     } catch (err) {
@@ -2498,6 +2513,7 @@ export async function connectionFileExists(path: string): Promise<boolean> {
 function normalizeConnectOptions(opts: ConnectOptions): NormalizedConnectOptions {
   return {
     connectionFile: opts.connectionFile,
+    transport: opts.transport ?? "tcp",
     handshakeTimeoutMs: opts.handshakeTimeoutMs,
     identity: opts.identity,
     targetKind: opts.targetKind ?? DEFAULT_MANAGED_TARGET_KIND,

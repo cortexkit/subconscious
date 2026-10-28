@@ -498,10 +498,11 @@ async fn serve_unix_local(
             Err(source) => return Err(local_accept_error(&path, source)),
         };
         debug!(?path, "accepted a local-socket connection");
+        let peer = subc_os::local_peer::observe_unix_peer(&stream);
         let router = Arc::clone(&router);
         let auth = auth.clone();
         tokio::spawn(async move {
-            let _ = handle_accepted_local_connection(stream, router, auth).await;
+            let _ = handle_accepted_local_connection(stream, router, auth, peer).await;
         });
     }
 }
@@ -558,17 +559,15 @@ async fn serve_pipe_local(
         free = Some(create_pipe_instance(&pipe_name)?);
         let router = Arc::clone(&router);
         let auth = auth.clone();
+        // Refuse network clients before observing a process or reading a byte.
+        // The pipe's PIPE_REJECT_REMOTE_CLIENTS flag is the first gate.
+        if let Err(error) = subc_os::named_pipe::reject_remote_client(&server) {
+            warn!(%error, "refused a non-local named-pipe client on the local endpoint");
+            continue;
+        }
+        let peer = subc_os::local_peer::observe_pipe_client(&server);
         tokio::spawn(async move {
-            // A network client is refused before a byte is read. The pipe also
-            // carries PIPE_REJECT_REMOTE_CLIENTS, so this is the second gate.
-            match subc_os::named_pipe::reject_remote_client(&server) {
-                Err(error) => {
-                    warn!(%error, "refused a non-local named-pipe client on the local endpoint");
-                }
-                Ok(()) => {
-                    let _ = handle_accepted_local_connection(server, router, auth).await;
-                }
-            }
+            let _ = handle_accepted_local_connection(server, router, auth, peer).await;
         });
     }
 }
@@ -591,11 +590,13 @@ async fn handle_accepted_local_connection<S>(
     stream: S,
     router: Arc<Router>,
     auth: ServerAuth,
+    peer: subc_os::local_peer::ObservedPeer,
 ) -> Result<(), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let result = handle_connection_with_origin(stream, router, auth, LocalOrigin::Local).await;
+    let result =
+        handle_connection_with_peer(stream, router, auth, LocalOrigin::Local, Some(peer)).await;
     if let Err(error) = &result {
         debug!(error = %error, "local-endpoint connection ended");
     }
@@ -686,10 +687,23 @@ where
 /// [`handle_connection`] for one endpoint kind: `origin` decides whether a
 /// module HELLO is refused before it can register.
 pub(crate) async fn handle_connection_with_origin<S>(
+    stream: S,
+    router: Arc<Router>,
+    auth: ServerAuth,
+    origin: LocalOrigin,
+) -> Result<(), ConnectionError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_connection_with_peer(stream, router, auth, origin, None).await
+}
+
+async fn handle_connection_with_peer<S>(
     mut stream: S,
     router: Arc<Router>,
     auth: ServerAuth,
     origin: LocalOrigin,
+    peer: Option<subc_os::local_peer::ObservedPeer>,
 ) -> Result<(), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -743,6 +757,9 @@ where
     let mut connection = router.begin_connection();
     let connection_id = connection.id();
     router.record_caller_endpoints(connection_id, endpoints);
+    if let Some(peer) = peer {
+        router.record_observed_peer(connection_id, peer);
+    }
     // `authenticated.role` is CLIENT-SUPPLIED and unverified -- the handshake
     // proves possession of the connection key, nothing about who is calling. So
     // this exclusion is safe ONLY while the role decides a reporting question and

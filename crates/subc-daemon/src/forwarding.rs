@@ -74,6 +74,12 @@ pub(crate) struct RouteBinding {
     pub module_channel: u16,
     pub module_epoch: u32,
     pub principal: Principal,
+    /// Opener attributes captured at admission for daemon-side prompt policy.
+    #[allow(dead_code)]
+    pub harness: String,
+    /// Only Callosum's exact production claim is retained; never relayed.
+    #[allow(dead_code)]
+    pub build_class: Option<String>,
     pub project_root: Option<ProjectRootId>,
     pub bound_at: Instant,
     pub flow: Arc<ChannelFlow>,
@@ -454,6 +460,8 @@ struct PendingRouteBindRelayEntry {
     /// The scope admitted at `route.open`, with the tag captured then. Commit
     /// compares it with the published tag.
     scope: Option<BoundScope>,
+    harness: String,
+    build_class: Option<String>,
     deadline: Instant,
     /// Set once `route.open` has finished putting the route.bind on the
     /// module's egress queue. A path that drops this entry WITHOUT a module
@@ -1129,6 +1137,8 @@ impl ForwardingTable {
         principal: Principal,
         scope: Option<BoundScope>,
         project_root: Option<ProjectRootId>,
+        harness: String,
+        build_class: Option<String>,
         deadline: Instant,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         // Reserve egress capacity before taking the forwarding lock. The permit is
@@ -1150,6 +1160,8 @@ impl ForwardingTable {
             principal,
             scope,
             project_root,
+            harness,
+            build_class,
             deadline,
             client_permit,
         )
@@ -1177,6 +1189,8 @@ impl ForwardingTable {
             module_id,
             Principal::Direct,
             None,
+            None,
+            String::new(),
             None,
             Instant::now() + std::time::Duration::from_secs(60),
             permit,
@@ -1362,6 +1376,8 @@ impl ForwardingTable {
         principal: Principal,
         scope: Option<BoundScope>,
         project_root: Option<ProjectRootId>,
+        harness: String,
+        build_class: Option<String>,
         deadline: Instant,
         client_permit: crate::router::EgressPermit,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
@@ -1460,6 +1476,8 @@ impl ForwardingTable {
                 route_open_frame,
                 principal,
                 scope,
+                harness,
+                build_class,
                 deadline,
                 relay_enqueued: false,
                 sender,
@@ -3276,6 +3294,8 @@ fn commit_route_locked(
         module_channel: reservation.module_key.channel,
         module_epoch: reservation.module_epoch,
         principal: pending.principal,
+        harness: pending.harness,
+        build_class: pending.build_class,
         project_root: reservation.project_root.clone(),
         bound_at: Instant::now(),
         flow: Arc::new(ChannelFlow::new(window_for(&module.concurrency))),
@@ -4480,6 +4500,8 @@ mod tests {
                 "open-behind-data",
                 Principal::Direct,
                 None,
+                None,
+                "fixture".into(),
                 None,
                 Instant::now() + Duration::from_secs(60),
             ),

@@ -21,12 +21,13 @@ use subc_protocol::{
     call_mode::{derive_call_mode, CALL_MODES_CAPABILITY},
     error_codes,
     manifest::{
-        validate_hello_capability_grammar, validate_hello_event_declarations,
-        validate_hello_flow_operations, validate_hello_rich_ui_descriptor,
-        validate_hello_role_declarations, validate_hello_self_signal_declarations,
-        CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
-        ProviderRole,
+        validate_hello_capability_grammar, validate_hello_confirm_operations,
+        validate_hello_event_declarations, validate_hello_flow_operations,
+        validate_hello_rich_ui_descriptor, validate_hello_role_declarations,
+        validate_hello_self_signal_declarations, CapabilityDeclarations, CapabilityNeed,
+        Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
     },
+    peer::{encode_route_bind, ObservedPeer, RouteBindPeer, OBSERVED_PEER_CAPABILITY},
     scope::{
         ScopeEnd, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
         CAP_ROUTE_ROLE_VERSIONS_V1, CAP_SCOPES_V1, SCOPE_APPLY_OP, SCOPE_DESCRIBE_OP,
@@ -406,6 +407,8 @@ pub struct ControlHandler {
     /// The local and peer address of each accepted TCP client connection, read
     /// from the daemon's own socket, so a privileged request can name its caller.
     caller_endpoints: Arc<Mutex<HashMap<ConnectionId, (SocketAddr, SocketAddr)>>>,
+    build_class_warned: Arc<Mutex<HashSet<ConnectionId>>>,
+    observed_peers: Arc<Mutex<HashMap<ConnectionId, ObservedPeer>>>,
     #[cfg(test)]
     caller_lookup: Option<TestCallerLookup>,
     /// The launch nonce each module connection presented at HELLO, which is how
@@ -989,6 +992,8 @@ impl ControlHandler {
             scope_authority_owners: crate::daemon_config::default_scope_authority_owners(),
             privileged_operator_prompt: PrivilegedOperatorPrompt::default(),
             caller_endpoints: Arc::new(Mutex::new(HashMap::new())),
+            build_class_warned: Arc::new(Mutex::new(HashSet::new())),
+            observed_peers: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             caller_lookup: None,
             hello_launch_nonces: Arc::new(Mutex::new(HelloLaunchNonces::default())),
@@ -1760,6 +1765,33 @@ impl ControlHandler {
         self.handle_control_frame_timed(ctx, frame, None).await
     }
 
+    pub(crate) fn record_observed_peer(
+        &self,
+        connection: ConnectionId,
+        peer: subc_os::local_peer::ObservedPeer,
+    ) {
+        use subc_os::local_peer::{ObservedPeer as OsPeer, PeerUser};
+        let peer = match peer {
+            OsPeer::Unobserved => ObservedPeer::unobserved(),
+            OsPeer::Observed(peer) => {
+                let observed = match peer.user {
+                    PeerUser::Uid(uid) => ObservedPeer::observed_uid(uid),
+                    PeerUser::Sid(sid) => ObservedPeer::observed_sid(sid),
+                };
+                observed
+                    .with_exe(
+                        peer.exe
+                            .and_then(|path| path.into_os_string().into_string().ok()),
+                    )
+                    .with_signing_id(peer.signing_id)
+            }
+        };
+        self.observed_peers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(connection, peer);
+    }
+
     pub(crate) fn record_caller_endpoints(
         &self,
         connection: ConnectionId,
@@ -2007,6 +2039,14 @@ impl ControlHandler {
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
         self.caller_endpoints
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&connection_id);
+        self.build_class_warned
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&connection_id);
+        self.observed_peers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&connection_id);
@@ -2367,6 +2407,12 @@ impl ControlHandler {
                 .as_str()
                 .unwrap_or("<unknown>");
             warn!(module_id, %reason, "dropping flow_operations from HELLO");
+        }
+        if let Err(reason) = validate_hello_confirm_operations(&hello_value) {
+            let module_id = hello_value["manifest"]["module_id"]
+                .as_str()
+                .unwrap_or("<unknown>");
+            warn!(module_id, %reason, "dropping confirm_operations from HELLO");
         }
         let hello = match serde_json::from_value::<ModuleHelloBody>(hello_value) {
             Ok(hello) => hello,
@@ -4050,6 +4096,7 @@ impl ControlHandler {
                 .with_operation_delivery(registration.manifest.operation_delivery)
                 .with_operation_payload(registration.manifest.operation_payload)
                 .with_flow_operations(registration.manifest.flow_operations)
+                .with_confirm_operations(registration.manifest.confirm_operations)
                 .with_rich_ui(registration.manifest.rich_ui)
                 .with_role_declarations(registration.manifest.role_declarations)
                 .with_nonce_verified(nonce_verified)
@@ -4793,6 +4840,25 @@ impl ControlHandler {
             };
         timings.principal = principal_label(&principal);
 
+        // Only Callosum can attest a production phone build. Consume the claim
+        // here so it can be kept on the route without reaching any module.
+        let build_class = identity.build_class.take().filter(|build_class| {
+            if matches!(&principal, Principal::Reserved { module_id } if module_id == "callosum") {
+                build_class == subc_protocol::BUILD_CLASS_PRODUCTION
+            } else {
+                if self
+                    .build_class_warned
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(ctx.connection_id)
+                {
+                    warn!(connection_id = ctx.connection_id.get(), principal = %timings.principal,
+                        "ignoring build_class from a non-Callosum opener");
+                }
+                false
+            }
+        });
+
         // This is attested, control-plane policy for supervised module origins.
         // Keep it before route reservation and out of the opaque forwarding hot
         // path: data frames must never acquire a per-frame capability check.
@@ -5039,6 +5105,8 @@ impl ControlHandler {
                 principal.clone(),
                 bound_scope,
                 Some(project_root),
+                identity.harness.clone(),
+                build_class,
                 relay_deadline,
             )
             .await
@@ -5201,10 +5269,6 @@ impl ControlHandler {
         // Rendered BEFORE the move into the relay, because the accept arm below
         // is where it is logged and the principal is gone by then.
         let route_principal_label = principal_label(&principal);
-        // The opener's build class is an unattested claim meant only for the
-        // daemon's own prompt decision. A module must never see it, so that no
-        // module can come to rely on a claim any local process could make.
-        identity.build_class = None;
         let relay = ModuleControlRequest::RouteBind {
             route_channel: module_channel,
             epoch: module_epoch,
@@ -5217,7 +5281,23 @@ impl ControlHandler {
             scope: scope_stamp,
             call_mode,
         };
-        let relay_body = serde_json::to_vec(&relay).map_err(|err| {
+        let peer = RouteBindPeer::new().with_observed_peer(
+            relay_capabilities
+                .is_some_and(|caps| {
+                    caps.provides
+                        .iter()
+                        .any(|cap| cap == OBSERVED_PEER_CAPABILITY)
+                })
+                .then(|| {
+                    self.observed_peers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&ctx.connection_id)
+                        .cloned()
+                        .unwrap_or_else(ObservedPeer::unobserved)
+                }),
+        );
+        let relay_body = encode_route_bind(&relay, &peer).map_err(|err| {
             RouterError::backend(
                 0,
                 frame.header.corr,
@@ -8160,6 +8240,9 @@ pub(crate) fn send_route_control_pushes(
 
 #[cfg(test)]
 mod tests {
+    mod peer_manifest {
+        include!("peer_manifest_tests.rs");
+    }
     mod activity_read {
         include!("activity_read_tests.rs");
     }

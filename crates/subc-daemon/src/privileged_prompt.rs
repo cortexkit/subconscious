@@ -420,6 +420,8 @@ mod tests {
             module_channel: 1,
             module_epoch: 1,
             principal: Principal::Direct,
+            harness: "fixture".into(),
+            build_class: None,
             project_root: None,
             bound_at: tokio::time::Instant::now(),
             flow: Arc::new(ChannelFlow::new(64 * 1024)),

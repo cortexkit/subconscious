@@ -888,6 +888,14 @@ impl Router {
         self.control.route_open_target(frame)
     }
 
+    pub(crate) fn record_observed_peer(
+        &self,
+        connection: ConnectionId,
+        peer: subc_os::local_peer::ObservedPeer,
+    ) {
+        self.control.record_observed_peer(connection, peer);
+    }
+
     pub(crate) fn record_caller_endpoints(
         &self,
         connection: ConnectionId,

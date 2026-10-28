@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.22.11
+
+- Add `transport: "local"` to consumer connect options. TCP remains the default with unchanged bytes. Local mode re-reads the owner-checked connection file on every initial and reconnect attempt and connects only to its current Unix socket or Windows pipe. Missing metadata gives `local_endpoint_absent`; local connect errors retain their cause and never fall back to TCP. Export `LocalEndpoint` and `readConnectionFileWithLocalEndpoint` for endpoint-aware readers without changing the legacy reader's behavior.
+- Connection failures continue to use the existing string-valued `SubcError.code` and `SubcCallError.code` fields, including `local_endpoint_absent` for missing local metadata. The frame decoder's `DecodeErrorCode` union is unchanged.
+
 ## 0.22.10
 
 - Add optional opaque `role_declarations` objects to provider manifests and catalog entries. HELLO normalization preserves nonempty declarations without interpreting role-owned schemas and omits absent or empty maps, preserving legacy bytes. Older daemons silently drop the manifest field.

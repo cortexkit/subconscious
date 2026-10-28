@@ -55,8 +55,11 @@ export {
 } from "./route-handle.js";
 export {
   readConnectionFile,
+  readConnectionFileWithLocalEndpoint,
   ConnectionFileError,
   type ConnectionInfo,
+  type ConnectionInfoWithLocalEndpoint,
+  type LocalEndpoint,
   type Endpoint,
 } from "./connection-file.js";
 export {

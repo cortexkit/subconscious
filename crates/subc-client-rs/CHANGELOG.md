@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.32.13
+
+- Add `SubcConsumer::connect_local(path, options)` and `connect_default_local(options)`. Existing `connect` and `connect_default` stay on TCP with unchanged handshake and frames. Local constructors read the current `local_endpoint` from the owner-checked connection file on every initial or reconnect attempt, use the Unix socket or Windows pipe only, and never fall back to TCP. An absent key returns the existing `ConsumerError::NoEndpoint`; connect failures remain `Connect` with their local endpoint and I/O error. `NoEndpoint` now displays "has no endpoint for the requested transport" for either transport. Require subc-transport 0.14.1 for its endpoint-aware reader.
+- `ConsumerOptions` retains its existing fields and `ConsumerError` its existing variants, preserving full struct literals and exhaustive matches. The existing `confirm_operation` (since 0.32.8), `confirm_enrollment` (since 0.32.9) and `confirm_operator` APIs remain unchanged, including their shared deadline and withdrawal paths.
+
 ## 0.32.12
 
 - A `module_reloading`, `unknown_channel` or `stale_route_epoch` carrying `FLAG_DAEMON_ORIGIN` now proves non-delivery only when the connection's daemon is 0.37.15 or later, the first release that strips the flag from module frames. The version is the `daemon_ver` in the `ConnectionInfo` the handshake authenticated against: the handshake proves that file's `daemon_id` belongs to the connected daemon, though its proof does not cover `daemon_ver` itself. Before 0.37.15 the data-plane proof is never claimed: even marked refusals count as possibly forwarded, and final refusals remain `CallError::Module`. Unrecognized version strings (including pre-release and build suffixes) are also untrusted. The existing resend and eviction policy is unchanged.

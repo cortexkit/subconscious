@@ -28,6 +28,12 @@ export interface ConnectionInfo {
   daemonVer: string;
 }
 
+export type LocalEndpoint = { kind: "unix"; path: string } | { kind: "pipe"; name: string };
+
+export interface ConnectionInfoWithLocalEndpoint extends ConnectionInfo {
+  localEndpoint?: LocalEndpoint;
+}
+
 export class ConnectionFileError extends Error {}
 
 function toBytes(value: unknown, field: string): Uint8Array {
@@ -93,6 +99,11 @@ export async function readConnectionFile(path: string): Promise<ConnectionInfo> 
   return readConnectionFileForUid(path, process.geteuid?.());
 }
 
+/** Read local endpoint metadata and the transport key from one owner-checked file. */
+export async function readConnectionFileWithLocalEndpoint(path: string): Promise<ConnectionInfoWithLocalEndpoint> {
+  return readConnectionFileForUid(path, process.geteuid?.(), true);
+}
+
 /**
  * @internal `readConnectionFile` with the expected owner uid supplied by the
  * caller, so tests can present a foreign owner without changing the process uid.
@@ -100,7 +111,8 @@ export async function readConnectionFile(path: string): Promise<ConnectionInfo> 
 export async function readConnectionFileForUid(
   path: string,
   expectedUid: number | undefined,
-): Promise<ConnectionInfo> {
+  includeLocalEndpoint = false,
+): Promise<ConnectionInfoWithLocalEndpoint> {
   // Check the opened file, not a second lookup of the path: if the path were
   // replaced between a stat and the read, an unchecked key would get through.
   const handle = await fs.open(path, "r");
@@ -137,7 +149,7 @@ export async function readConnectionFileForUid(
     return { host: ep.host, port: ep.port };
   });
 
-  const info: ConnectionInfo = {
+  const info: ConnectionInfoWithLocalEndpoint = {
     schema: parsed.schema as number,
     endpoints,
     key: toBytes(parsed.key, "key"),
@@ -146,5 +158,15 @@ export async function readConnectionFileForUid(
     daemonVer: (parsed.daemon_ver as string) ?? "",
   };
   validate(info);
+  if (includeLocalEndpoint && parsed.local_endpoint != null) {
+    const endpoint = parsed.local_endpoint as Record<string, unknown>;
+    if (endpoint.kind === "unix" && typeof endpoint.path === "string" && endpoint.path.length > 0) {
+      info.localEndpoint = { kind: "unix", path: endpoint.path };
+    } else if (endpoint.kind === "pipe" && typeof endpoint.name === "string" && endpoint.name.length > 0) {
+      info.localEndpoint = { kind: "pipe", name: endpoint.name };
+    } else {
+      throw new ConnectionFileError("connection file local_endpoint must name a unix path or pipe name");
+    }
+  }
   return info;
 }

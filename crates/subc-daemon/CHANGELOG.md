@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.38.1
+
+- Send accept-time local peer observations in `route.bind` only to targets declaring `observed-peer/v1`. TCP and unavailable observations carry `unobserved`; targets without the capability keep their legacy bind bytes. Observations do not change the route's principal or stamp it as an operator app.
+- Validate advisory `confirm_operations` lists at HELLO like `flow_operations`: drop an invalid list with one warning naming the module while registration proceeds, and relay valid lists unchanged in `catalog.list` without enforcing them.
+- Require subc-protocol 0.33.5 and subc-control 0.33.4 for the peer metadata and confirmation-operation wire shapes.
+- Capture the opener's harness and Callosum's exact `production` build claim on the route for daemon-side prompt policy. Ignore other openers' build claims with one warning per connection, and never forward `build_class` to modules.
+
 ## 0.38.0
 
 - Serve a same-user local listener beside loopback TCP: a Unix-domain socket on macOS and Linux, a named pipe on Windows. The socket file is mode 0600 inside a directory only this user can reach, and a stale socket left by a dead daemon is replaced; the pipe name is fresh for every daemon start and its DACL admits only the current user's SID, and it is created with `PIPE_REJECT_REMOTE_CLIENTS` so a client from another machine is refused before the handshake. The connection file gains `local_endpoint` (`{"kind":"unix","path":…}` or `{"kind":"pipe","name":…}`), written through subc-transport's endpoint-aware writer; a daemon with no local listener writes the file exactly as before.

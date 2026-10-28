@@ -5,16 +5,12 @@ import XCTest
 
 final class DeviceApprovalActionKeyRestorationTests: XCTestCase {
     func testRestoringKeyDataPreservesPublicKeyAndRegistrationRequest() throws {
-        #if targetEnvironment(simulator)
-        throw XCTSkip("Secure Enclave keys cannot be created on a simulator")
-        #else
-        guard SecureEnclave.isAvailable else { throw XCTSkip("Secure Enclave unavailable") }
+        try SecureEnclaveTestSupport.requireKeyCreation()
         let original = try DeviceApprovalActionSigner.createKey()
         let restored = try DeviceApprovalActionKey(dataRepresentation: original.dataRepresentation)
         XCTAssertEqual(restored.p256PublicKeyHex, original.p256PublicKeyHex)
         XCTAssertEqual(DeviceApprovalRequests.registrationChallenge(for: restored).body,
                        DeviceApprovalRequests.registrationChallenge(for: original).body)
-        #endif
     }
 
     func testCorruptKeyDataRefusesByName() throws {

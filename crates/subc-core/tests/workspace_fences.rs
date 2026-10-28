@@ -86,6 +86,18 @@ fn test_sources_do_not_create_directories_from_temp_dir() {
     );
 }
 
+/// The one test function allowed to create a directory straight under
+/// `temp_dir()`: the daemon kit's data home holds the daemon's Unix socket,
+/// whose path is limited to about a hundred bytes, and every directory under
+/// the shared scratch root is too long for it. The kit removes the directory
+/// when it drops. Keyed by file and function name, so nothing else in the file
+/// or a new function of the same name elsewhere gains the exemption.
+const SHORT_SOCKET_ROOT: (&str, &str) = ("tests/common/kit.rs", "create_short_socket_root");
+
+fn is_short_socket_root(path: &Path, function: &str) -> bool {
+    path.ends_with(SHORT_SOCKET_ROOT.0) && function == SHORT_SOCKET_ROOT.1
+}
+
 fn scan_tree(dir: &Path, tests: bool, offenders: &mut Vec<String>) {
     for entry in fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
@@ -120,14 +132,18 @@ fn scan_tree(dir: &Path, tests: bool, offenders: &mut Vec<String>) {
                 .filter_map(|(index, (start, _))| {
                     let end = functions.get(index + 1).map_or(scope.len(), |next| next.0);
                     let body = &scope[*start..end];
-                    body.contains("temp_dir()")
-                        .then(|| body[3..].split('(').next().unwrap_or("").trim())
+                    let name = body[3..].split('(').next().unwrap_or("").trim();
+                    (body.contains("temp_dir()") && !is_short_socket_root(&path, name))
+                        .then_some(name)
                 })
                 .collect();
             for (index, (start, _)) in functions.iter().enumerate() {
                 let end = functions.get(index + 1).map_or(scope.len(), |next| next.0);
                 let body = &scope[*start..end];
                 if !(body.contains("create_dir") || body.contains("mkdir")) {
+                    continue;
+                }
+                if is_short_socket_root(&path, body[3..].split('(').next().unwrap_or("").trim()) {
                     continue;
                 }
                 if body.contains("temp_dir()")

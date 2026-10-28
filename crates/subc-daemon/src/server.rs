@@ -405,6 +405,16 @@ where
     }
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
+fn temporary_accept_failure(source: &io::Error) -> bool {
+    matches!(
+        source.kind(),
+        io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::Interrupted
+    ) || accept_resource_exhausted(source)
+}
+
 fn accept_resource_exhausted(error: &io::Error) -> bool {
     // ENFILE/EMFILE/ENOBUFS by name rather than number: the numbers differ by
     // platform (ENOBUFS is 55 on macOS and 105 on Linux, and each number means
@@ -427,6 +437,178 @@ fn accept_resource_exhausted(error: &io::Error) -> bool {
         let _ = error;
         false
     }
+}
+
+/// Serve this daemon's local endpoint (a Unix-domain socket, or a Windows named
+/// pipe) until its accept loop fails.
+///
+/// Every connection gets the same key handshake, frame format and router as a
+/// TCP client, so a client's bytes are identical either way. What differs is
+/// that this endpoint serves clients only: a HELLO that would register a module
+/// is refused with [`crate::local_listener::LOCAL_ENDPOINT_CLIENTS_ONLY`]. A
+/// peer read failure costs that one connection; a failure to accept at all ends
+/// the loop, because a local listener that cannot accept is no longer an
+/// endpoint.
+pub async fn serve_local_listener(
+    bound: crate::local_listener::BoundLocalListener,
+    router: Arc<Router>,
+    auth: ServerAuth,
+) -> Result<(), ServerError> {
+    match bound {
+        #[cfg(unix)]
+        crate::local_listener::BoundLocalListener::Unix { listener, path } => {
+            serve_unix_local(listener, path, router, auth).await
+        }
+        #[cfg(windows)]
+        crate::local_listener::BoundLocalListener::Windows {
+            pipe_name,
+            first_instance,
+        } => serve_pipe_local(pipe_name, first_instance, router, auth).await,
+        // The variants above exist only on their own platform.
+        #[allow(unreachable_patterns)]
+        _ => Err(ServerError::NoListeners),
+    }
+}
+
+#[cfg(unix)]
+async fn serve_unix_local(
+    listener: std::os::unix::net::UnixListener,
+    path: std::path::PathBuf,
+    router: Arc<Router>,
+    auth: ServerAuth,
+) -> Result<(), ServerError> {
+    // The socket file is removed when this future ends, whether it returns or is
+    // dropped during shutdown, so a later daemon start finds no leftover.
+    let _release = SocketFileRelease(path.clone());
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| local_accept_error(&path, source))?;
+    let listener = tokio::net::UnixListener::from_std(listener)
+        .map_err(|source| local_accept_error(&path, source))?;
+    loop {
+        let (stream, _addr) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(source) if temporary_accept_failure(&source) => {
+                warn!(error = %source, "temporary local-socket accept failure");
+                if accept_resource_exhausted(&source) {
+                    tokio::time::sleep(Duration::from_millis(75)).await;
+                }
+                continue;
+            }
+            Err(source) => return Err(local_accept_error(&path, source)),
+        };
+        debug!(?path, "accepted a local-socket connection");
+        let router = Arc::clone(&router);
+        let auth = auth.clone();
+        tokio::spawn(async move {
+            let _ = handle_accepted_local_connection(stream, router, auth).await;
+        });
+    }
+}
+
+#[cfg(unix)]
+fn local_accept_error(endpoint: &std::path::Path, source: io::Error) -> ServerError {
+    ServerError::LocalAccept {
+        endpoint: endpoint.display().to_string(),
+        source,
+    }
+}
+
+#[cfg(unix)]
+struct SocketFileRelease(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for SocketFileRelease {
+    fn drop(&mut self) {
+        crate::local_listener::remove_unix_socket(&self.0);
+    }
+}
+
+#[cfg(windows)]
+async fn serve_pipe_local(
+    pipe_name: String,
+    first_instance: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
+    router: Arc<Router>,
+    auth: ServerAuth,
+) -> Result<(), ServerError> {
+    // The end a client may connect to. An end exists whenever the loop is not
+    // accepting one, because Win32 refuses a client that finds none, and no
+    // other task accepts ends here.
+    let mut free = first_instance;
+    loop {
+        let server = match free.take() {
+            Some(server) => server,
+            None => create_pipe_instance(&pipe_name)?,
+        };
+        // Overlapped I/O: the accepted end is AsyncRead and AsyncWrite, so a
+        // connection's reader and writer never wait for each other. A
+        // synchronous handle would, and the daemon's reply would sit behind the
+        // reader's pending read while the client waited for that reply.
+        if let Err(source) = server.connect().await {
+            if temporary_accept_failure(&source) {
+                continue;
+            }
+            return Err(ServerError::LocalAccept {
+                endpoint: pipe_name.clone(),
+                source,
+            });
+        }
+        // The next end is made before this one is served, so a client that
+        // arrives while this one is being served still finds an end.
+        free = Some(create_pipe_instance(&pipe_name)?);
+        let router = Arc::clone(&router);
+        let auth = auth.clone();
+        tokio::spawn(async move {
+            // A network client is refused before a byte is read. The pipe also
+            // carries PIPE_REJECT_REMOTE_CLIENTS, so this is the second gate.
+            match subc_os::named_pipe::reject_remote_client(&server) {
+                Err(error) => {
+                    warn!(%error, "refused a non-local named-pipe client on the local endpoint");
+                }
+                Ok(()) => {
+                    let _ = handle_accepted_local_connection(server, router, auth).await;
+                }
+            }
+        });
+    }
+}
+
+#[cfg(windows)]
+fn create_pipe_instance(
+    pipe_name: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, ServerError> {
+    crate::local_listener::create_named_pipe_end(pipe_name).map_err(|source| {
+        ServerError::LocalAccept {
+            endpoint: pipe_name.to_owned(),
+            source,
+        }
+    })
+}
+
+/// Run one local-endpoint connection: the same handshake as TCP, with the
+/// clients-only rule attached after it.
+async fn handle_accepted_local_connection<S>(
+    stream: S,
+    router: Arc<Router>,
+    auth: ServerAuth,
+) -> Result<(), ConnectionError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let result = handle_connection_with_origin(stream, router, auth, LocalOrigin::Local).await;
+    if let Err(error) = &result {
+        debug!(error = %error, "local-endpoint connection ended");
+    }
+    result
+}
+
+/// Where a connection came in. The local endpoint serves clients only, because
+/// a module registers over TCP, where the daemon can tell a launched process
+/// apart by the launch nonce in its HELLO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalOrigin {
+    Tcp,
+    Local,
 }
 
 /// Serve all already-bound loopback TCP listeners until one accept loop fails.
@@ -491,9 +673,23 @@ enum ConnectionLoopExit {
 /// their bind, file and operator waits run in connection-owned tasks so
 /// unrelated frames can keep flowing.
 pub async fn handle_connection<S>(
+    stream: S,
+    router: Arc<Router>,
+    auth: ServerAuth,
+) -> Result<(), ConnectionError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    handle_connection_with_origin(stream, router, auth, LocalOrigin::Tcp).await
+}
+
+/// [`handle_connection`] for one endpoint kind: `origin` decides whether a
+/// module HELLO is refused before it can register.
+pub(crate) async fn handle_connection_with_origin<S>(
     mut stream: S,
     router: Arc<Router>,
     auth: ServerAuth,
+    origin: LocalOrigin,
 ) -> Result<(), ConnectionError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -592,6 +788,7 @@ where
         close_receiver,
         &mut route_open_tasks,
         &mut privileged_tasks,
+        origin,
     )
     .await;
 
@@ -723,6 +920,7 @@ async fn connection_loop<R>(
     mut close_receiver: ConnectionCloseReceiver,
     route_open_tasks: &mut JoinSet<Result<(), RouterError>>,
     privileged_tasks: &mut JoinSet<Result<(), RouterError>>,
+    origin: LocalOrigin,
 ) -> Result<ConnectionLoopExit, ConnectionError>
 where
     R: AsyncRead + Unpin,
@@ -767,6 +965,30 @@ where
                 }
             }
         };
+
+        if origin == LocalOrigin::Local && frame.header.ty == subc_protocol::FrameType::Hello {
+            // A module registers over TCP only. Refusing here, before the router
+            // sees the frame, is what guarantees the local endpoint leaves no
+            // registration, catalog entry or route behind, whatever the HELLO
+            // carries.
+            let refusal = crate::control::control_error_frame(
+                &frame,
+                crate::local_listener::LOCAL_ENDPOINT_CLIENTS_ONLY,
+                "the local endpoint serves clients only; modules register over TCP",
+            )
+            .map_err(ConnectionError::Router)?;
+            // The connection ends as soon as the refusal is sent, so the bytes
+            // must reach the socket first: a client that has not yet read its
+            // reply would otherwise see only the end of the stream.
+            let send_result = tokio::select! {
+                close = &mut close_receiver => {
+                    return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
+                }
+                result = send_refusal(&ctx.egress, refusal) => result,
+            };
+            send_result.map_err(ConnectionError::Router)?;
+            return Ok(ConnectionLoopExit::PeerClosed);
+        }
 
         if frame.header.channel == 0
             && frame.header.ty == subc_protocol::FrameType::Request
@@ -891,6 +1113,23 @@ where
                 return Err(ConnectionError::Router(err));
             }
         }
+    }
+}
+
+/// Send one frame so that a connection ending immediately afterwards still
+/// delivers it: on Unix, wait for the writer's flush acknowledgement; elsewhere
+/// queue it, because those writers carry no acknowledgement.
+async fn send_refusal(sink: &FrameSink, frame: crate::Frame) -> Result<(), RouterError> {
+    // The flush acknowledgement comes from the writer's `write_frame`, which
+    // only the Unix builds expose; on Windows the refusal is queued for the pipe
+    // writer instead.
+    #[cfg(unix)]
+    {
+        sink.send_flushed(frame).await
+    }
+    #[cfg(not(unix))]
+    {
+        sink.send(frame).await
     }
 }
 
@@ -1055,6 +1294,12 @@ pub enum ServerError {
         local_addr: Option<SocketAddr>,
         source: io::Error,
     },
+    /// The local endpoint (a Unix-domain socket or a named pipe) could not be
+    /// created or could not accept.
+    LocalAccept {
+        endpoint: String,
+        source: io::Error,
+    },
 }
 
 impl fmt::Display for ServerError {
@@ -1065,6 +1310,9 @@ impl fmt::Display for ServerError {
                 Some(addr) => write!(f, "failed to accept TCP connection on {addr}: {source}"),
                 None => write!(f, "failed to accept TCP connection: {source}"),
             },
+            Self::LocalAccept { endpoint, source } => {
+                write!(f, "local endpoint {endpoint} failed: {source}")
+            }
         }
     }
 }
@@ -1072,7 +1320,7 @@ impl fmt::Display for ServerError {
 impl Error for ServerError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Accept { source, .. } => Some(source),
+            Self::Accept { source, .. } | Self::LocalAccept { source, .. } => Some(source),
             Self::NoListeners => None,
         }
     }

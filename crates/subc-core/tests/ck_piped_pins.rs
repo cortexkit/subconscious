@@ -21,7 +21,11 @@
 
 #![cfg(target_os = "linux")]
 
-use std::{fs, path::PathBuf, process::Output};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Output,
+};
 
 use serde_json::{json, Map, Value};
 use subc_control::ClientControlRequest;
@@ -185,9 +189,18 @@ fn take(kit: &Kit) -> Result<Taken, String> {
     }
     no_crash(kit)?;
     Ok(Taken {
-        kit_root: kit.root().display().to_string(),
+        kit_root: normalized_kit_root(kit.root()),
         runs,
     })
+}
+
+/// The kit's scratch path as `ck` names it: the daemon prints the real path,
+/// with symlinks resolved, and the process's temporary directory may not be.
+fn normalized_kit_root(root: &Path) -> String {
+    std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .display()
+        .to_string()
 }
 
 /// Waits until the daemon has recorded the module's health as `ok`.

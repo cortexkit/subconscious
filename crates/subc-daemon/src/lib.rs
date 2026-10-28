@@ -21,6 +21,7 @@ pub mod fleet_lint;
 pub mod forwarding;
 pub mod identity;
 mod live_children;
+pub mod local_listener;
 pub mod machine_id;
 pub mod observability;
 pub mod operator_confirm;
@@ -61,8 +62,8 @@ pub use router::{
     RouterError,
 };
 pub use server::{
-    handle_connection, serve_listener, serve_listeners, ConnectionError, ServerAuth, ServerError,
-    DEFAULT_AUTH_DEADLINE, DEFAULT_MAX_UNAUTHENTICATED_CONNECTIONS,
+    handle_connection, serve_listener, serve_listeners, serve_local_listener, ConnectionError,
+    ServerAuth, ServerError, DEFAULT_AUTH_DEADLINE, DEFAULT_MAX_UNAUTHENTICATED_CONNECTIONS,
 };
 pub use subc_protocol::{Frame, FrameBuildError};
 pub use subc_transport::{read_frame, write_frame, FrameIoError, ReadStage};

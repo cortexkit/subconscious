@@ -61,6 +61,10 @@ pub fn isolate_client_fully(command: &mut Command, root: &Path) {
     for dir in [&runtime, &data, &config] {
         fs::create_dir_all(dir).unwrap();
     }
+    // A real `XDG_RUNTIME_DIR` is 0700, and the daemon places its local socket
+    // there only when no other user can reach it. A 0755 kit runtime would
+    // make every daemon refuse its local endpoint and report why.
+    runtime_dir(&runtime);
     command
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_DATA_HOME", &data)
@@ -74,10 +78,74 @@ pub fn isolate_client_fully(command: &mut Command, root: &Path) {
         .env_remove("SUBC_LAUNCH_NONCE");
 }
 
+/// A private directory under the system temporary directory, with a short
+/// name: `/tmp/ckk-<8 hex>`.
+///
+/// The kit daemon serves its local socket at `$XDG_DATA_HOME/cortexkit/run/`,
+/// and a Unix socket path is limited to just over a hundred bytes. The data
+/// home this kit chooses therefore has to be short, and the shared scratch
+/// root (which carries a PID and a kernel start identity) is not. Created
+/// `0700`, because the daemon refuses a data home other users can reach, and
+/// removed when the kit drops.
+struct ShortRoot(PathBuf);
+
+impl ShortRoot {
+    fn create_short_socket_root() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "{:08x}",
+            std::process::id() as u64 ^ NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = std::env::temp_dir().join(format!("ckk-{name}"));
+        fs::create_dir(&path).expect("create the kit's short directory");
+        make_private(&path);
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn join(&self, part: impl AsRef<Path>) -> PathBuf {
+        self.0.join(part)
+    }
+}
+
+impl Drop for ShortRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Give `dir` the 0700 of a real `XDG_RUNTIME_DIR`. Clients here use it for
+/// discovery only; the daemon's own local socket lives in its data home, which
+/// [`ShortRoot`] already creates `0700`.
+fn runtime_dir(dir: &Path) {
+    make_private(dir);
+}
+
+/// Mode 0700 on Unix, where the daemon refuses a run directory that another
+/// user can reach. Windows has no mode bits; its folders are already private
+/// to the user, so there is nothing to change.
+#[cfg(unix)]
+fn make_private(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        .expect("make the kit's directory private");
+}
+
+#[cfg(not(unix))]
+fn make_private(_dir: &Path) {}
+
 /// One private daemon and its scratch tree: `daemon/` holds the daemon's
 /// XDG folders and `client/` the folders every `ck` run here uses.
 pub struct Kit {
+    /// The tree's scratch root, where logs and module release files live.
     root: ScratchDir,
+    /// The daemon's data home, which holds the run directory and so the local
+    /// socket. Short on purpose: see [`ShortRoot`].
+    data_home: ShortRoot,
     child: Child,
     module_ids: Vec<String>,
 }
@@ -92,10 +160,16 @@ impl Kit {
     /// [`Kit::release_exit`].
     pub fn boot(name: &str, modules: &[(&str, Value)]) -> Kit {
         let root = ScratchDir::new(name);
+        let data_home = ShortRoot::create_short_socket_root();
         let daemon = root.join("daemon");
+        // Only the data home moves to a short path: its run directory holds the
+        // local socket, and a Unix socket path is limited to just over a hundred
+        // bytes. The rest of the tree stays where the test-support crate puts
+        // it, and the pinned `ck` bytes keep the paths they recorded.
         for dir in ["config/cortexkit", "runtime", "data/cortexkit/run"] {
             fs::create_dir_all(daemon.join(dir)).unwrap();
         }
+        runtime_dir(&daemon.join("runtime"));
         let mut entries = serde_json::Map::new();
         for (id, entry) in modules {
             let mut entry = entry.clone();
@@ -116,7 +190,8 @@ impl Kit {
         // The locations are set on the daemon's command only, so this test
         // process and every other test keep their own.
         let child = dev_command(super::ckdev_subc())
-            .env("XDG_DATA_HOME", daemon.join("data"))
+            .env("XDG_DATA_HOME", data_home.path())
+            .env("LOCALAPPDATA", data_home.path())
             .env("XDG_CONFIG_HOME", daemon.join("config"))
             .env("XDG_RUNTIME_DIR", daemon.join("runtime"))
             .env("SUBC_PORT", "0")
@@ -130,6 +205,7 @@ impl Kit {
             .unwrap();
         let mut kit = Kit {
             root,
+            data_home,
             child,
             module_ids: modules.iter().map(|(id, _)| (*id).to_string()).collect(),
         };
@@ -227,7 +303,7 @@ impl Kit {
     /// failure message.
     pub fn daemon_log(&self) -> String {
         let mut text = fs::read_to_string(self.root.join("daemon.log")).unwrap_or_default();
-        let mut directories = vec![self.root.join("daemon/data/cortexkit/run/logs")];
+        let mut directories = vec![self.data_home.join("cortexkit/run/logs")];
         while let Some(directory) = directories.pop() {
             let Ok(entries) = fs::read_dir(directory) else {
                 continue;

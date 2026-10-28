@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.145
+
+- Builds against subc-daemon 0.38.0, whose shipped daemon serves a same-user local socket or pipe beside loopback TCP.
+- Tests only: the daemon test kit gives each test a short private data home, so the run directory's local socket path fits the platform limit on every runner and `ck`'s pinned output is unchanged.
+
 ## 0.20.144
 
 - Formatting only: one test binding reflowed by `cargo fmt`; no behaviour change.

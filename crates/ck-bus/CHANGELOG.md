@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.15
+
+- Builds against subc-daemon 0.38.0. No change to the module itself.
+
 ## 0.4.14
 
 - Take `cortexkit-bus-naming` 0.2.8, whose reader table gives `astrocyte` the

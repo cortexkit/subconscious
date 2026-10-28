@@ -414,6 +414,9 @@ pub struct ControlHandler {
     rescan: Option<SupervisorRescanContext>,
     connected_clients: ConnectedClients,
     counters: DaemonCounters,
+    /// Why this daemon serves no local endpoint, when binding one failed. `None`
+    /// when the endpoint is served, and also on a handler that was never told.
+    local_endpoint_unavailable: Option<String>,
     capability_evaluator: Arc<CapabilityRequirementEvaluator>,
     /// The supervisor's daemon-shutdown flag. Once it is set, requirement
     /// changes are logged at INFO with `cause=daemon_shutdown` instead of at
@@ -991,6 +994,7 @@ impl ControlHandler {
             hello_launch_nonces: Arc::new(Mutex::new(HelloLaunchNonces::default())),
             rescan: None,
             connected_clients: ConnectedClients::new(),
+            local_endpoint_unavailable: None,
             counters,
             capability_evaluator: Arc::new(CapabilityRequirementEvaluator::new()),
             daemon_shutdown: DaemonShutdownFlag::default(),
@@ -1255,6 +1259,13 @@ impl ControlHandler {
 
     pub fn with_connected_clients(mut self, connected_clients: ConnectedClients) -> Self {
         self.connected_clients = connected_clients;
+        self
+    }
+
+    /// Report why this daemon serves no local endpoint, in `server.describe`, so
+    /// an operator can see a bind failure without reading the daemon log.
+    pub fn with_local_endpoint_unavailable(mut self, reason: Option<String>) -> Self {
+        self.local_endpoint_unavailable = reason;
         self
     }
 
@@ -3970,6 +3981,16 @@ impl ControlHandler {
             counters.as_object_mut(),
         ) {
             obj.insert("route_bind_breakers_open".into(), open_breakers);
+        }
+        // A daemon whose local endpoint could not be bound keeps serving TCP,
+        // and the connection file names no endpoint. Name the reason here, in
+        // the free-form counters object, so an operator reading daemon facts
+        // sees it without searching the log, and no wire field changes.
+        if let (Some(reason), Some(obj)) = (
+            self.local_endpoint_unavailable.clone(),
+            counters.as_object_mut(),
+        ) {
+            obj.insert("local_endpoint_unavailable".into(), reason.into());
         }
         let response = ClientControlResponse::ServerDescribe {
             protocol_ver: PROTOCOL_VERSION,

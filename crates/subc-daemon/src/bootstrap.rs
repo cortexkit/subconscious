@@ -14,8 +14,9 @@ use fs4::{FileExt, TryLockError};
 use subc_protocol::PROTOCOL_VERSION;
 pub use subc_transport::user_connection_token;
 use subc_transport::{
-    authenticate_client, connection_file, generate_daemon_id, generate_key, write_atomic,
-    AuthError, ConnectionFileError, ConnectionInfo, Endpoint, SCHEMA_VERSION,
+    authenticate_client, connection_file, generate_daemon_id, generate_key,
+    write_atomic_with_local_endpoint, AuthError, ConnectionFileError, ConnectionInfo, Endpoint,
+    LocalEndpoint, SCHEMA_VERSION,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -26,7 +27,8 @@ use tracing::{error, info, warn};
 
 use crate::{
     daemon_config::{self, ConfiguredModule, DaemonConfigError},
-    server::{serve_listeners, ServerAuth, ServerError},
+    local_listener::{self, BoundLocalListener, LocalListenerConfig},
+    server::{serve_listeners, serve_local_listener, ServerAuth, ServerError},
     supervise::HealthConfig,
     ConnectedClients, ControlHandler, DaemonSelfWatchdog, DaemonSelfWatchdogConfig,
     ForwardingTable, Registry, RestartPolicy, Router, Supervisor, SupervisorHandle,
@@ -144,6 +146,14 @@ pub struct BootstrapConfig {
     /// derive the operator's real data home and mint into it. The shipped binary
     /// supplies `<data home>/cortexkit/machine-id` explicitly.
     machine_id_path: Option<PathBuf>,
+
+    /// Where this daemon's same-user local listener lives (a Unix-domain socket
+    /// on macOS and Linux; nothing on Windows, where the pipe name is minted per
+    /// start). The default serves no local endpoint, so an in-process daemon
+    /// never touches the operator's run directory. The shipped binary names its
+    /// run directory; [`BootstrapConfig::with_local_listener_socket_dir`] names
+    /// any other, and an in-process daemon that wants the endpoint names one.
+    local_listener: LocalListenerConfig,
     /// The live-children record: every supervised process this daemon has
     /// running, kept so the next daemon can end the ones a crash left behind.
     /// At startup, before any module is spawned, the previous daemon's record
@@ -184,9 +194,23 @@ impl BootstrapConfig {
             capture_logs_dir: None,
             terminal_journal_path: None,
             machine_id_path: None,
+            local_listener: LocalListenerConfig { socket_dir: None },
             live_children_path: None,
             privacy_trampoline: None,
         }
+    }
+
+    /// Keep the local listener's socket in `dir`. Embedding daemons and tests
+    /// pass a path inside their own fixture tree.
+    pub fn with_local_listener_socket_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.local_listener = LocalListenerConfig::in_socket_dir(dir);
+        self
+    }
+
+    /// Set where the local listener lives, as [`LocalListenerConfig`] describes.
+    pub fn with_local_listener(mut self, config: LocalListenerConfig) -> Self {
+        self.local_listener = config;
+        self
     }
 
     /// Keep the live-children record at `path`, and at startup end the
@@ -250,6 +274,7 @@ impl BootstrapConfig {
         let machine_id_path =
             crate::machine_id::default_machine_id_path().map_err(BootstrapError::MachineId)?;
         let config = Self::from_env()?
+            .with_local_listener(LocalListenerConfig::in_socket_dir(&run_dir))
             .with_capture_logs_dir(run_dir.join("logs"))
             .with_terminal_journal_path(run_dir.join("terminals.jsonl"))
             .with_live_children_record(crate::live_children::record_path(&run_dir))
@@ -512,6 +537,16 @@ pub enum Outcome {
 #[derive(Debug)]
 pub struct BoundDaemon {
     pub listeners: Vec<TcpListener>,
+    /// The same-user local listener, bound and not yet served. `None` when
+    /// binding it failed, in which case `local_endpoint` is `None` and
+    /// `local_endpoint_unavailable` says why.
+    pub local_listener: Option<BoundLocalListener>,
+    /// Why the daemon serves no local endpoint, when binding it failed. Reported
+    /// by `server.describe` so an operator can see it.
+    pub local_endpoint_unavailable: Option<String>,
+    /// What the connection file publishes under `local_endpoint`, so a client can
+    /// find the local listener without knowing how it was bound.
+    pub local_endpoint: Option<LocalEndpoint>,
     pub connection_info: ConnectionInfo,
     pub connection_file_path: PathBuf,
     pub connection_file_source: ConnectionFileSource,
@@ -934,6 +969,7 @@ async fn serve_bound_daemon(
         // changes while modules exit during the shutdown log at INFO.
         .with_daemon_shutdown_flag(supervisor.daemon_shutdown_flag())
         .with_connected_clients(connected_clients.clone())
+        .with_local_endpoint_unavailable(bound.local_endpoint_unavailable.clone())
         .with_storage_config(storage_config)
         .with_machine_id(bound.machine_id.clone())
         .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets)
@@ -1014,6 +1050,19 @@ async fn serve_bound_daemon(
     }
     control.refresh_capability_requirements();
 
+    // The local endpoint is served beside TCP and answers the same handshake.
+    // It serves clients only, which the server enforces per connection.
+    let local_serve_task = bound.local_listener.map(|local_listener| {
+        AbortOnDrop::new(tokio::spawn(serve_local_listener(
+            local_listener,
+            Arc::clone(&router),
+            auth.clone(),
+        )))
+    });
+    // On Unix the task is dropped below to stop accepting at shutdown. Windows
+    // leaves it to the process exit; naming it keeps the binding uniform.
+    #[cfg(windows)]
+    let _local_serve_task = local_serve_task;
     let mut serve_task =
         AbortOnDrop::new(tokio::spawn(serve_listeners(bound.listeners, router, auth)));
     verify_serving(&bound.connection_info).await?;
@@ -1026,6 +1075,7 @@ async fn serve_bound_daemon(
     let (published, publication_lock) = publish_connection_file(
         &bound.connection_file_path,
         &bound.connection_info,
+        bound.local_endpoint.as_ref(),
         publication_lock,
     )
     .await;
@@ -1081,8 +1131,10 @@ async fn serve_bound_daemon(
         // a wedged daemon, once for every interval a planned stop lasts.
         drop(_watchdog_task);
         // Dropping the listener stops new accepts, not established connections:
-        // their detached tasks must remain live throughout notice and drain.
+        // their detached tasks must remain live throughout notice and drain. The
+        // local endpoint stops accepting the same way.
         drop(serve_task);
+        drop(local_serve_task);
         let second_sigterm = async {
             terminate.recv().await;
             std::time::Instant::now()
@@ -1227,6 +1279,30 @@ async fn ensure_singleton_inner(
     };
 
     let (listeners, endpoints) = bind_loopback(config.port).await?;
+    // The local endpoint is an addition to the daemon, not a condition for it:
+    // a bind failure leaves clients on TCP only, with the connection file naming
+    // no local endpoint, and the reason reported by `server.describe`. A daemon
+    // that refused to start would take every module down for a feature nothing
+    // has to use yet.
+    let (local_listener, local_endpoint, local_endpoint_unavailable) =
+        if config.local_listener.configured_dir().is_some() {
+            match local_listener::bind(&config.local_listener, &path) {
+                Ok(local_listener) => {
+                    let endpoint = local_listener.endpoint();
+                    (Some(local_listener), Some(endpoint), None)
+                }
+                Err(error) => {
+                    let reason = error.to_string();
+                    warn!(
+                        error = %reason,
+                        "the local endpoint is unavailable; serving loopback TCP only"
+                    );
+                    (None, None, Some(reason))
+                }
+            }
+        } else {
+            (None, None, None)
+        };
     let connection_info = ConnectionInfo {
         schema: SCHEMA_VERSION,
         wire_version: Some(PROTOCOL_VERSION),
@@ -1241,8 +1317,12 @@ async fn ensure_singleton_inner(
     // these listeners themselves. The daemon entry point defers publication
     // until its own authentication server is running.
     let publication_lock = if publish {
-        let (published, lock) = publish_connection_file(&path, &connection_info, lock).await;
+        let (published, lock) =
+            publish_connection_file(&path, &connection_info, local_endpoint.as_ref(), lock).await;
         if let Err(error) = published {
+            if let Some(local_listener) = local_listener.as_ref() {
+                local_listener::release(local_listener);
+            }
             drop(listeners);
             return Err(error);
         }
@@ -1254,6 +1334,9 @@ async fn ensure_singleton_inner(
 
     Ok(Outcome::Bound(BoundDaemon {
         listeners,
+        local_listener,
+        local_endpoint,
+        local_endpoint_unavailable,
         connection_info,
         connection_file_path: path,
         connection_file_source: config.connection_file_source,
@@ -1399,12 +1482,16 @@ fn describe_blocking_task_failure(work: &str, join_error: &JoinError) -> String 
 async fn publish_connection_file<G: Send + 'static>(
     path: &Path,
     info: &ConnectionInfo,
+    local_endpoint: Option<&LocalEndpoint>,
     guard: G,
 ) -> (Result<(), BootstrapError>, Option<G>) {
     let task_path = path.to_path_buf();
     let task_info = info.clone();
-    let outcome =
-        run_blocking_holding(guard, move || write_connection_file(&task_path, &task_info)).await;
+    let task_endpoint = local_endpoint.cloned();
+    let outcome = run_blocking_holding(guard, move || {
+        write_connection_file(&task_path, &task_info, task_endpoint.as_ref())
+    })
+    .await;
     match outcome {
         Ok((Ok(()), guard)) => (Ok(()), Some(guard)),
         Ok((Err(source), guard)) => (
@@ -1433,10 +1520,18 @@ async fn publish_connection_file<G: Send + 'static>(
 
 /// The synchronous connection-file write, including its fsync. Call it only
 /// through [`publish_connection_file`], which keeps it off the async workers.
-fn write_connection_file(path: &Path, info: &ConnectionInfo) -> Result<(), ConnectionFileError> {
+///
+/// `local_endpoint` is written through subc-transport's endpoint-aware writer,
+/// so the file carries `local_endpoint` when there is a local listener and is
+/// byte-identical to before when there is none.
+fn write_connection_file(
+    path: &Path,
+    info: &ConnectionInfo,
+    local_endpoint: Option<&LocalEndpoint>,
+) -> Result<(), ConnectionFileError> {
     #[cfg(test)]
     connection_file_write_hook::run(path);
-    write_atomic(path, info)
+    write_atomic_with_local_endpoint(path, info, local_endpoint)
 }
 
 /// Lets a test run code inside the connection-file write, on whichever thread
@@ -1786,6 +1881,12 @@ pub enum BootstrapError {
     ServeJoin(tokio::task::JoinError),
 }
 
+impl From<ServerError> for BootstrapError {
+    fn from(error: ServerError) -> Self {
+        Self::Serve(error)
+    }
+}
+
 impl fmt::Display for BootstrapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1906,7 +2007,7 @@ mod tests {
     use std::sync::Mutex;
     #[cfg(target_os = "linux")]
     use subc_control::ModuleProtocol;
-    use subc_transport::MIN_KEY_LEN;
+    use subc_transport::{write_atomic, MIN_KEY_LEN};
     use tokio::io::AsyncReadExt;
     use tokio::task::JoinHandle;
 
@@ -2002,7 +2103,7 @@ mod tests {
             route_bind_relay_timeout_ms: None,
             restart: RestartPolicy::default(),
         };
-        let config = BootstrapConfig::new(temp.join("connection.json"), 0)
+        let config = config_with_a_short_socket(BootstrapConfig::new(temp.join("c"), 0))
             .with_configured_modules([module])
             .with_capture_logs_dir(temp.join("logs"))
             .with_terminal_journal_path(temp.join("terminals.jsonl"));
@@ -2030,7 +2131,7 @@ mod tests {
         fs::create_dir(&cgroup_root).expect("create scratch cgroup root");
         fs::write(cgroup_root.join("cgroup.procs"), b"").expect("write scratch cgroup marker");
         let modules = cgroup_root.join("subc-modules");
-        let config = BootstrapConfig::new(temp.join("connection.json"), 0)
+        let config = config_with_a_short_socket(BootstrapConfig::new(temp.join("c"), 0))
             .with_cgroup_placement(CgroupPlacementConfig::Root(cgroup_root))
             .with_terminal_journal_path(temp.join("terminals.jsonl"));
         let task = tokio::spawn(run_with_config(config));
@@ -2328,9 +2429,10 @@ mod tests {
             r#"{"version":1,"privileged_operator_prompt":"enforce"}"#,
         )
         .unwrap();
-        let config = BootstrapConfig::new(&connection_path, 0)
+        let config = config_with_a_short_socket(BootstrapConfig::new(&connection_path, 0))
             .with_daemon_config_path(&config_path)
             .unwrap();
+        let connection_path = config.connection_file_path.clone();
         let daemon = AbortOnDrop::new(tokio::spawn(run_with_config(config)));
         tokio::time::timeout(Duration::from_secs(5), async {
             while !connection_path.exists() {
@@ -2424,7 +2526,7 @@ mod tests {
         let (_dir, path) = temp_connection_file_path("departing-peer");
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let info = make_connection_info(listener.local_addr().unwrap().port());
-        write_connection_file(&path, &info).unwrap();
+        write_connection_file(&path, &info, None).unwrap();
         let peer = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             subc_transport::authenticate_server(
@@ -2515,7 +2617,8 @@ mod tests {
         }];
         write_atomic(&path, &stale_info).unwrap();
 
-        let bound = expect_bound(ensure_singleton(&path, 0).await.unwrap());
+        let config = config_with_a_short_socket(BootstrapConfig::new(&path, 0));
+        let bound = expect_bound(ensure_singleton_with_config(config).await.unwrap());
         assert_ne!(bound.connection_info.key, stale_info.key);
         assert_ne!(bound.connection_info.daemon_id, stale_info.daemon_id);
         assert!(bound
@@ -2678,13 +2781,10 @@ mod tests {
 
     #[tokio::test]
     async fn unpublished_boot_holds_singleton_lock_until_publication() {
-        let dir = ScratchDir::new("unpublished-singleton-lock");
-        let path = dir.join("connection.json");
-        let bound = expect_bound(
-            ensure_singleton_inner(BootstrapConfig::new(&path, 0), false)
-                .await
-                .unwrap(),
-        );
+        let dir = ScratchDir::new("ul");
+        let path = dir.join("c");
+        let config = config_with_a_short_socket(BootstrapConfig::new(&path, 0));
+        let bound = expect_bound(ensure_singleton_inner(config, false).await.unwrap());
         assert!(!path.exists());
         let contender = open_owner_only_lock(&start_lock_path(&path)).unwrap();
         assert!(
@@ -2697,13 +2797,10 @@ mod tests {
 
     #[tokio::test]
     async fn start_lock_drop_releases_claim_with_a_shared_file_description() {
-        let dir = ScratchDir::new("shared-singleton-lock");
-        let path = dir.join("connection.json");
-        let bound = expect_bound(
-            ensure_singleton_inner(BootstrapConfig::new(&path, 0), false)
-                .await
-                .unwrap(),
-        );
+        let dir = ScratchDir::new("sl");
+        let path = dir.join("c");
+        let config = config_with_a_short_socket(BootstrapConfig::new(&path, 0));
+        let bound = expect_bound(ensure_singleton_inner(config, false).await.unwrap());
         // try_clone shares the open file description just as fork does,
         // without relying on the timing of another test's child spawn.
         let inherited = bound
@@ -2741,8 +2838,11 @@ mod tests {
     #[tokio::test]
     async fn orphan_sweep_finishes_before_connection_file_publication() {
         use crate::live_children::{ExecutableIdentity, LiveChild};
-        let dir = ScratchDir::new("publish-after-sweep");
-        let path = dir.join("connection.json");
+        let dir = ScratchDir::new("pas");
+        // A one-letter connection file name, and no long socket path: the sweep
+        // this test covers runs before the local endpoint is bound, so a longer
+        // name would only add a way for the test to fail on something else.
+        let path = dir.join("c");
         let record = dir.join("live-children.json");
         let ready = dir.join("ready");
         let mut child = std::process::Command::new("/bin/sh")
@@ -2781,7 +2881,8 @@ mod tests {
             }],
         )
         .unwrap();
-        let config = BootstrapConfig::new(&path, 0).with_live_children_record(&record);
+        let config = config_with_a_short_socket(BootstrapConfig::new(&path, 0))
+            .with_live_children_record(&record);
         let daemon = tokio::spawn(run_with_config(config));
         timeout(Duration::from_secs(5), async {
             while !path.exists() {
@@ -2965,5 +3066,250 @@ mod tests {
         assert_eq!(mode, 0o600);
 
         drop(bound.listeners);
+    }
+
+    /// A config with the socket in `dir`'s own short subdirectory.
+    ///
+    /// A Unix socket path is limited to just over a hundred bytes, and this
+    /// harness's temporary directories use nearly all of that, so a test that
+    /// boots a real daemon passes a short directory and a one-letter connection
+    /// file name; anything longer makes the bind refuse. On Windows there is no
+    /// socket path to keep short, so the config is returned unchanged.
+    fn config_with_a_short_socket(config: BootstrapConfig) -> BootstrapConfig {
+        let dir = config
+            .connection_file_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        #[cfg(unix)]
+        let config = BootstrapConfig {
+            connection_file_path: dir.join("c"),
+            local_listener: LocalListenerConfig::in_socket_dir(dir.join("s")),
+            ..config
+        };
+        #[cfg(not(unix))]
+        let _ = dir;
+        config
+    }
+
+    /// The shipped binary puts the socket in its own run directory. The file is
+    /// named from the connection file's path, so a restart finds it again.
+    #[cfg(unix)]
+    #[test]
+    fn the_daemon_binary_puts_its_socket_in_the_run_directory() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let root = ScratchDir::new("binary-local-socket");
+        let data_home = root.join("data");
+        let _data = EnvGuard::set("XDG_DATA_HOME", &data_home);
+        let _config = EnvGuard::set("XDG_CONFIG_HOME", &root.join("config"));
+        let _port = EnvGuard::unset(SUBC_PORT_ENV);
+
+        let config = BootstrapConfig::from_env_for_daemon_binary().unwrap();
+
+        let run_dir = data_home.join("cortexkit").join("run");
+        assert_eq!(
+            config.local_listener.configured_dir(),
+            Some(run_dir.as_path()),
+            "the binary serves from its run directory"
+        );
+        let socket = local_listener::socket_path_for(Some(&run_dir), &config.connection_file_path)
+            .expect("the binary config names a directory");
+        assert_eq!(socket.parent().unwrap(), run_dir);
+        assert_eq!(
+            socket.file_name().unwrap().to_string_lossy(),
+            "subc.sock",
+            "a fixed name: the run directory belongs to one data home"
+        );
+    }
+
+    /// An in-process daemon that names no directory serves TCP only: it publishes
+    /// no local endpoint, creates nothing under the data home, and says nothing is
+    /// unavailable, because nothing was asked for.
+    /// The environment lock covers only the setup: the daemon under test reads
+    /// its data home from the process environment while it boots, and holding
+    /// the lock across that await would block every other test that sets one.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_in_process_daemon_without_a_configured_directory_serves_no_local_endpoint() {
+        let root = ScratchDir::new("in-process-no-local-socket");
+        let data_home = root.join("data");
+        fs::create_dir_all(&data_home).unwrap();
+        let connection_path = root.join("c");
+        let _data;
+        let _config;
+        let _port;
+        {
+            let _env_lock = ENV_LOCK.lock().unwrap();
+            _data = EnvGuard::set("XDG_DATA_HOME", &data_home);
+            _config = EnvGuard::set("XDG_CONFIG_HOME", &root.join("config"));
+            _port = EnvGuard::unset(SUBC_PORT_ENV);
+        }
+
+        let bound = expect_bound(ensure_singleton(&connection_path, 0).await.unwrap());
+
+        assert!(bound.local_endpoint.is_none());
+        assert!(bound.local_endpoint_unavailable.is_none());
+        let published = connection_file::read_with_local_endpoint(&connection_path).unwrap();
+        assert!(published.local_endpoint.is_none());
+        assert!(
+            local_listener::socket_path_for(None, &connection_path).is_none(),
+            "no configured directory, no socket"
+        );
+        let mut leftovers = Vec::new();
+        let mut pending = vec![data_home.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(path.clone());
+                }
+                if entry.file_name().to_string_lossy().ends_with(".sock") {
+                    leftovers.push(path);
+                }
+            }
+        }
+        assert!(
+            leftovers.is_empty(),
+            "an in-process daemon must not create a socket in the data home: {leftovers:?}"
+        );
+    }
+
+    /// A local endpoint that cannot be bound does not stop the daemon: it keeps
+    /// serving TCP, publishes no local endpoint, and reports the reason where an
+    /// operator reads daemon facts. Every module stays up for a feature nothing
+    /// has to use.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_daemon_whose_socket_path_is_too_long_still_serves_tcp() {
+        let dir = ScratchDir::new("tcp-only");
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let connection_path = canonical.join("c");
+        // The socket directory is deep enough that the socket's path is over the
+        // Unix socket limit, so binding it must fail.
+        let deep = canonical.join("x".repeat(80));
+        fs::create_dir(&deep).unwrap();
+        fs::set_permissions(&deep, fs::Permissions::from_mode(0o700)).unwrap();
+        let config =
+            BootstrapConfig::new(&connection_path, 0).with_local_listener_socket_dir(&deep);
+        let bound = expect_bound(ensure_singleton_with_config(config).await.unwrap());
+        assert!(
+            bound.local_endpoint.is_none(),
+            "a socket that cannot be bound is not published"
+        );
+        assert!(
+            bound
+                .local_endpoint_unavailable
+                .as_deref()
+                .is_some_and(|reason| reason.contains("too long")),
+            "{:?}",
+            bound.local_endpoint_unavailable
+        );
+        let published = connection_file::read_with_local_endpoint(&connection_path).unwrap();
+        assert!(published.local_endpoint.is_none());
+        assert!(
+            !published.info.endpoints.is_empty(),
+            "TCP is still published"
+        );
+
+        // The daemon serves TCP as usual.
+        let server = start_server(bound);
+        let info = connection_file::read(&connection_path).unwrap();
+        let mut client = connect_from_info(&info).await.unwrap();
+        authenticate_client(&mut client, &info, PROBE_AUTH_DEADLINE)
+            .await
+            .expect("a TCP client still completes the handshake");
+        server.abort();
+        let _ = server.await;
+    }
+
+    /// The published file names the local endpoint the daemon actually serves,
+    /// and a client that trusts the file completes the handshake over it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn published_connection_file_names_the_served_local_endpoint() {
+        let (_dir, path) = temp_connection_file_path("local-endpoint");
+        // The socket goes in the system temporary directory rather than inside
+        // the harness's own directory, whose long lockdown-sandbox path leaves
+        // no room inside the Unix socket path limit.
+        let short_socket_dir = std::env::temp_dir().join(format!("subc-bt-{}", std::process::id()));
+        let config =
+            BootstrapConfig::new(&path, 0).with_local_listener_socket_dir(&short_socket_dir);
+        let bound = expect_bound(ensure_singleton_with_config(config).await.unwrap());
+        let endpoint = connection_file::read_with_local_endpoint(&path)
+            .unwrap()
+            .local_endpoint
+            .expect("the daemon serves a local endpoint, so the file names it");
+        assert_eq!(Some(&endpoint), bound.local_endpoint.as_ref());
+        let LocalEndpoint::Unix { path: socket_path } = &endpoint else {
+            panic!("a Unix daemon publishes a socket path");
+        };
+        assert_eq!(socket_path.parent().unwrap(), short_socket_dir);
+        assert_eq!(
+            fs::metadata(socket_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let router = Arc::new(Router::with_default_self_handler());
+        let auth = auth_for(&bound.connection_info);
+        let server = tokio::spawn(serve_local_listener(
+            bound.local_listener.expect("the local listener is bound"),
+            router,
+            auth,
+        ));
+        let mut client = tokio::net::UnixStream::connect(socket_path).await.unwrap();
+        authenticate_client(&mut client, &bound.connection_info, Duration::from_secs(5))
+            .await
+            .expect("a socket client completes the same handshake as a TCP client");
+
+        server.abort();
+        drop(bound.listeners);
+    }
+
+    /// A configured directory that is not a directory refuses at bind rather
+    /// than publishing an endpoint nothing serves.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_directory_that_is_a_file_refuses() {
+        let dir = ScratchDir::new("local-listener-file-as-dir");
+        let file = dir.join("not-a-directory");
+        fs::write(&file, b"x").unwrap();
+        let error = local_listener::bind(
+            &LocalListenerConfig::in_socket_dir(file),
+            &dir.join("connection.json"),
+        )
+        .expect_err("a path that is not a directory cannot hold the socket");
+        assert!(matches!(error, ServerError::LocalAccept { .. }), "{error}");
+    }
+
+    /// The socket sits directly in the configured directory under one fixed
+    /// name, and a directory that would put the path over the platform limit is
+    /// refused rather than shortened around.
+    #[cfg(unix)]
+    #[test]
+    fn the_socket_path_stays_within_the_unix_limit() {
+        let run_dir = PathBuf::from("/tmp/short-run");
+        assert!(
+            local_listener::socket_path_for(None, &run_dir.join("one.json")).is_none(),
+            "no configured directory means no socket"
+        );
+        let socket = local_listener::socket_path_for(Some(&run_dir), &run_dir.join("one.json"))
+            .expect("a configured directory gets a socket");
+        assert_eq!(socket, run_dir.join("subc.sock"));
+        assert_eq!(
+            socket,
+            local_listener::socket_path_for(Some(&run_dir), &run_dir.join("two.json")).unwrap(),
+            "the name does not come from the connection file"
+        );
+
+        let deep = PathBuf::from(format!("/tmp/{}", "x".repeat(60)));
+        let long = local_listener::socket_path_for(Some(&deep), &deep.join("conn.json"))
+            .expect("a configured directory gets a socket");
+        assert!(
+            long.as_os_str().len() < 104,
+            "{} is {} bytes",
+            long.display(),
+            long.as_os_str().len()
+        );
     }
 }

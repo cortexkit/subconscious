@@ -1,6 +1,6 @@
 [package]
 name = "subc-os"
-version = "0.1.21"
+version = "0.1.22"
 edition = "2021"
 license = "MIT"
 publish = true
@@ -33,7 +33,11 @@ rustix = { version = "1", default-features = false, features = ["event", "param"
 [target.'cfg(target_os = "macos")'.dependencies]
 rustix = { version = "1", default-features = false, features = ["process", "std"] }
 
+# The daemon's Windows local listener is tokio's named-pipe server, which needs
+# tokio's `net` feature. Optional like the main tokio entry, so `tokio` enables
+# both and crates that skip the feature build without tokio.
 [target.'cfg(windows)'.dependencies]
+tokio = { version = "1", optional = true, features = ["net"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

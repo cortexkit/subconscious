@@ -429,8 +429,12 @@ impl FrameSink {
 
     /// Shutdown notices must leave the socket writer before an idle daemon exits.
     /// Queue admission alone does not prove this; the writer acknowledges flush.
+    ///
+    /// The local endpoint uses it the same way for its clients-only refusal: the
+    /// connection closes right after the refusal is sent, so the writer must
+    /// flush it first.
     #[cfg(unix)]
-    pub(crate) async fn send_flushed(&self, frame: Frame) -> Result<(), RouterError> {
+    pub async fn send_flushed(&self, frame: Frame) -> Result<(), RouterError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let charge = self
             .charge_waiting(queued_frame_bytes(&frame))

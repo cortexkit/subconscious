@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.50
+
+- Builds against subc-daemon 0.38.0. No change to the gateway itself.
+
 ## 0.1.49
 
 - MCP tasks for 2026-07-28 hosts (the `io.modelcontextprotocol/tasks` extension). When a tools/call's request declares the extension in its `_meta` client capabilities and the module has not answered within 5 seconds (`SUBC_MCP_TASK_PROMOTION_DELAY_MS`), the tools/call is answered with a task handle (`resultType: "task"`) and the module call goes on. A module question turns the call into a task at once. Either needs a free task slot (see below). Quicker calls are answered inline as before. The host polls `tasks/get` (`pollIntervalMs` is 1000) for `working`, `input_required` (the module's question in `inputRequests`, under the same `in_reply_to` rules as a question returned in a tool call's answer (MRTR, multi-round-trip requests)), `completed` (the module's result, or the shared outage block) or `failed` (the JSON-RPC error the call would have returned, including a route that closed under the call). `tasks/update` passes the host's answer to the module, and an unanswered question is declined to the module after the reverse-relay TTL while the task keeps running. `tasks/cancel` cancels the module call exactly as cancelling the tools/call does. A task never sends the call again. A finished task is kept for 5 minutes (`SUBC_MCP_TASK_RESULT_TTL_MS`, reported in `ttlMs`; a running task reports `null`), and a session keeps at most 32 tasks: the oldest finished task makes room early, and when all 32 are running a further call stays inline. `tasks/*` on the exact id of a task the session handed out but no longer keeps is refused as expired (invalid params), and on any other id as unknown. Tasks end with the host's session, which cancels their module calls. Hosts that send `initialize` are not offered tasks: their `initialize` answer and their "method not found" for `tasks/*` are unchanged.

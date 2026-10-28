@@ -62,6 +62,7 @@ pub mod fork_exec_test;
 pub mod host;
 pub mod launch_nonce;
 pub mod local_peer;
+pub mod named_pipe;
 pub mod privacy_identity;
 pub mod process_identity;
 pub mod socket_peer;

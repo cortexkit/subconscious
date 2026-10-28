@@ -13,6 +13,9 @@ use tokio::process::Command;
 mod name;
 use name::module_directory_name;
 
+mod freeze;
+pub use freeze::{freeze_module, FreezeOutcome, FrozenModule, ProcsOutcome, ThawOutcome};
+
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const MODULES_DIR: &str = "subc-modules";
 static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);

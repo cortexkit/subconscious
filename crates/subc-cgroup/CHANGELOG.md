@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.7
+
+- Add a bounded module-subtree freeze with typed outcomes, a frozen guard that
+  attempts a thaw on drop, and recursive process enumeration that excludes PID 0
+  and init.
+  Callers can signal listed processes before thawing without risking PID reuse.
+
 ## 0.1.6
 
 - Test-only: the tests' helpers (temporary directories, process-liveness checks, and copies of test programs under `ckdev-` names) now come from the published `cortexkit-test-support` crate, which other CortexKit repositories also use, instead of a private copy in this repository. No runtime change.

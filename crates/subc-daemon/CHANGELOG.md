@@ -1,21 +1,33 @@
 # Changelog
 
+## 0.38.6
+
+- On Linux, give processes left in a module's cgroup after its parent exits
+  SIGTERM and up to two seconds to exit before `cgroup.kill`; the wait ends as
+  soon as the cgroup is empty. Freeze the subtree before collecting and
+  signalling PIDs, then thaw it; if freezing fails or is unavailable, skip
+  SIGTERM and attempt `cgroup.kill` at once. Empty cgroups are removed
+  without waiting. Forced teardown, spawn rejection, and shutdown races still
+  kill immediately; macOS and Windows behavior is unchanged.
+
 ## 0.38.5
 
-- Add audit-gated operator shortcuts for explicitly declared confirmation
-  operations and enforce-mode privileged requests. Eligible desktop stamps and
-  production Callosum phone routes still require their compiled switch; all
-  production switches remain off and no configuration enables them.
-- Commit an attempt record before any unprompted grant. Cancellation, route or
-  module removal, connection close and the original deadline can end a pending
-  attempt without waiting for the ledger. On an append error or a failed stamp
-  revalidation, the daemon tries to enqueue the same request for the ordinary
-  prompt without renewing its delivery budget; the queue's usual refusals and
-  every withdrawal condition still apply. Fixed-summary outcome records are
-  best effort.
-- Recheck route epochs and Windows launch incarnations at the authorization
-  commit point, excluding route release and launch retirement until the pending
-  request is removed. Replaced launches cannot authorize an older connection.
+- Add operator shortcuts that can answer a confirmation without a prompt, each
+  behind a compiled switch. They apply only to operations a module declares in
+  `confirm_operations`, and to privileged requests while privileged operations
+  are enforced rather than logged. They come only from a verified operator app
+  connection or a production phone build relayed by the federation module.
+  Every switch is off in this release, and no configuration enables one.
+- Before any shortcut grants, the daemon writes an attempt record to its
+  activity ledger. Cancellation, route or module removal, connection close and
+  the original deadline can end a pending attempt without waiting for that
+  write. If the write fails, or the operator app connection no longer verifies,
+  the daemon tries to queue the same request for the ordinary prompt without
+  extending its deadline; the queue's usual refusals and every withdrawal
+  condition still apply. The record of each attempt's outcome is best effort.
+- At the moment of granting, the daemon checks again that the route is still
+  the same one and, on Windows, that the app it launched is still the same
+  process, so a replaced app can't authorize an older connection.
 
 ## 0.38.4
 
@@ -78,7 +90,7 @@
 - Send accept-time local peer observations in `route.bind` only to targets declaring `observed-peer/v1`. TCP and unavailable observations carry `unobserved`; targets without the capability keep their legacy bind bytes. Observations do not change the route's principal or stamp it as an operator app.
 - Validate advisory `confirm_operations` lists at HELLO like `flow_operations`: drop an invalid list with one warning naming the module while registration proceeds, and relay valid lists unchanged in `catalog.list` without enforcing them.
 - Require subc-protocol 0.33.5 and subc-control 0.33.4 for the peer metadata and confirmation-operation wire shapes.
-- Capture the opener's harness and Callosum's exact `production` build claim on the route for daemon-side prompt policy. Ignore other openers' build claims with one warning per connection, and never forward `build_class` to modules.
+- Capture the opener's harness and the federation module's exact `production` build claim on the route for daemon-side prompt policy. Ignore other openers' build claims with one warning per connection, and never forward `build_class` to modules.
 
 ## 0.38.0
 
@@ -97,7 +109,7 @@
 
 ## 0.37.13
 
-- `route.bind` never carries the opener's `build_class`. The daemon clears it from the identity before relaying the bind, so no module can come to rely on a claim any local process can make. Callosum's production-build claim stays evidence for the daemon's own prompt decision only.
+- `route.bind` never carries the opener's `build_class`. The daemon clears it from the identity before relaying the bind, so no module can come to rely on a claim any local process can make. The federation module's production-build claim stays evidence for the daemon's own prompt decision only.
 
 ## 0.37.12
 

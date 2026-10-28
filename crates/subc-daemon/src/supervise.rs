@@ -9584,24 +9584,105 @@ fn remove_module_cgroup(placement: &subc_cgroup::Placement, module_id: &str) {
 }
 
 #[cfg(target_os = "linux")]
+const REAPED_CGROUP_TERM_GRACE: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const REAPED_CGROUP_FREEZE_TIMEOUT: Duration = Duration::from_millis(100);
+
+#[cfg(target_os = "linux")]
 async fn cleanup_reaped_cgroup(placement: &subc_cgroup::Placement, module_id: &str) {
-    // Reaping the direct child is not proof its descendants exited. End the
-    // residual tree and wait for the kernel's population fact before rmdir;
-    // otherwise a successful parent wait leaks a directory on each restart.
+    let path = placement.module_path(module_id).ok();
+    if path.as_ref().is_some_and(|path| {
+        std::fs::read_to_string(path.join("cgroup.events"))
+            .ok()
+            .is_some_and(|events| events.lines().any(|line| line == "populated 0"))
+    }) {
+        remove_module_cgroup(placement, module_id);
+        return;
+    }
+
+    // Freeze before enumerating: a frozen task cannot exit and release its PID
+    // for reuse by a process outside this module while SIGTERM is being sent.
+    if terminate_reaped_cgroup(placement, module_id).await {
+        if let Some(path) = &path {
+            let deadline = Instant::now() + REAPED_CGROUP_TERM_GRACE;
+            while cgroup_is_populated(path) && Instant::now() < deadline {
+                sleep_until((Instant::now() + Duration::from_millis(1)).min(deadline)).await;
+            }
+        }
+    }
+
+    // Reaping the direct child is not proof its descendants exited. Kill any
+    // survivors; when `cgroup.kill` succeeds, wait for the kernel to report the
+    // cgroup empty before rmdir.
     if matches!(
         subc_cgroup::kill_module(Some(placement), module_id),
         subc_cgroup::KillOutcome::Killed
     ) {
-        if let Ok(path) = placement.module_path(module_id) {
-            while std::fs::read_to_string(path.join("cgroup.events"))
-                .ok()
-                .is_some_and(|events| events.lines().any(|line| line == "populated 1"))
-            {
+        if let Some(path) = &path {
+            while cgroup_is_populated(path) {
                 sleep(Duration::from_millis(1)).await;
             }
         }
     }
     remove_module_cgroup(placement, module_id);
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_is_populated(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path.join("cgroup.events"))
+        .ok()
+        .is_some_and(|events| events.lines().any(|line| line == "populated 1"))
+}
+
+#[cfg(target_os = "linux")]
+async fn terminate_reaped_cgroup(placement: &subc_cgroup::Placement, module_id: &str) -> bool {
+    let frozen =
+        match subc_cgroup::freeze_module(Some(placement), module_id, REAPED_CGROUP_FREEZE_TIMEOUT)
+            .await
+        {
+            subc_cgroup::FreezeOutcome::Frozen(frozen) => frozen,
+            outcome => {
+                tracing::debug!(
+                    module_id,
+                    ?outcome,
+                    "cgroup freeze failed; skipping SIGTERM grace"
+                );
+                return false;
+            }
+        };
+    let listed = match frozen.processes() {
+        subc_cgroup::ProcsOutcome::Listed(pids) => {
+            for pid in pids.into_iter().filter(|pid| *pid > 1) {
+                if let Some(pid) = rustix::process::Pid::from_raw(pid) {
+                    if let Err(error) =
+                        rustix::process::kill_process(pid, rustix::process::Signal::TERM)
+                    {
+                        tracing::debug!(module_id, %pid, %error, "leftover cgroup SIGTERM failed");
+                    }
+                }
+            }
+            true
+        }
+        outcome => {
+            tracing::debug!(
+                module_id,
+                ?outcome,
+                "cgroup process listing failed; skipping SIGTERM grace"
+            );
+            false
+        }
+    };
+    match frozen.thaw() {
+        subc_cgroup::ThawOutcome::Thawed => listed,
+        outcome => {
+            tracing::debug!(
+                module_id,
+                ?outcome,
+                "cgroup thaw failed; proceeding to cgroup.kill"
+            );
+            false
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -17584,6 +17665,10 @@ mod launch_nonce_descriptor_tests {
         probe(super::SpawnRole::SwapCandidate).await;
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "supervise/cgroup_reap_tests.rs"]
+mod cgroup_reap_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 mod cgroup_containment_tests {

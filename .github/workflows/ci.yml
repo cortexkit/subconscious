@@ -294,6 +294,38 @@ jobs:
         timeout-minutes: 40
         run: cargo test --workspace --all-targets --locked --no-fail-fast
 
+      # Root can create cgroup v2 directories under /sys/fs/cgroup; require these tests so they cannot skip in CI.
+      - name: Kernel cgroup tests
+        if: ${{ !cancelled() && matrix.os == 'ubuntu' }}
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_binary="$(
+            cargo test -p subc-daemon --lib --no-run --locked --message-format=json |
+              jq -ers '
+                map(select(.reason == "compiler-artifact"
+                  and .target.name == "subc_daemon"
+                  and .target.kind == ["lib"]
+                  and .profile.test == true
+                  and .executable != null))
+                | if length == 1 then .[0].executable
+                  else error("expected exactly one subc-daemon lib test executable") end
+              '
+          )"
+          tests=(
+            supervise::cgroup_reap_tests::linux_reaped_cgroup_sigterm_then_exit
+            supervise::cgroup_reap_tests::linux_reaped_cgroup_ignored_sigterm_escalates_after_two_seconds
+            supervise::cgroup_reap_tests::linux_reaped_cgroup_empty_has_no_grace_wait
+            supervise::cgroup_placement_tests::unique_spawn_cgroups_clean_up_across_restarts_and_shutdown
+            supervise::cgroup_containment_tests::linux_teardown_reaps_the_grandchild
+            supervise::cgroup_containment_tests::linux_shutdown_straggler_reaps_the_grandchild
+          )
+          for test_name in "${tests[@]}"; do
+            "$test_binary" "$test_name" --exact --list | grep -Fx "$test_name: test" > /dev/null
+          done
+          sudo env SUBC_REQUIRE_CGROUP_TEST=1 "$test_binary" "${tests[@]}" --exact --nocapture --test-threads=1
+
       # --all-targets does NOT include doctests, despite the name: it expands to
       # --lib --bins --tests --benches --examples. So a doc example that stops
       # compiling leaves the gate green. The workspace has no runnable doc

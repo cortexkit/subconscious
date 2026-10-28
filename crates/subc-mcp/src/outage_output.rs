@@ -81,7 +81,7 @@ impl OutageOutput {
     }
 
     /// Marks the call as never having reached the provider. Only for a
-    /// refusal at route open, or `module_reloading` answered before the send;
+    /// refusal at route open, or a trusted daemon-labelled refusal before forwarding;
     /// never for a timeout or a lost reply, where the call may have run.
     pub(crate) fn with_nothing_sent(mut self) -> Self {
         self.nothing_sent = true;

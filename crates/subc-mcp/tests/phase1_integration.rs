@@ -67,7 +67,7 @@ use tokio::{
     time::{sleep, timeout, Instant},
 };
 
-const TEST_DAEMON_VER: &str = "test-subc-mcp";
+const TEST_DAEMON_VER: &str = "0.37.15";
 // These manual launches exercise the SDK's environment fallback (no nonce
 // descriptor is named). Record TEST_MCP_MODULE_ID and TEST_MCP_LAUNCH_NONCE in
 // the test supervisor so route.open can attest the manually launched module.
@@ -83,6 +83,9 @@ const TEST_MCP_LAUNCH_NONCE: &str = "test-mcp-launch-nonce";
 // The budget prices the HOST, not the code under test; the waits settle in
 // well under a second once the processes exist.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+// A cold provider may start through `cargo run`; concurrent tests on loaded
+// runners must allow both compilation and the child's handshake to finish.
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(120);
 const READ_TIMEOUT: Duration = SETUP_TIMEOUT;
 const QUIET_TIMEOUT: Duration = Duration::from_millis(750);
 const NO_HANG_TIMEOUT: Duration = Duration::from_secs(2);
@@ -377,7 +380,7 @@ impl RawProviderHarness {
             behavior,
         )
         .await;
-        wait_for_registration(&server.daemon.registry, "raw", READ_TIMEOUT).await;
+        wait_for_registration(&server, "raw").await;
 
         let user_config_home = server.daemon.temp_dir.join(format!("{label}-xdg-config"));
         fs::create_dir_all(&user_config_home).unwrap();
@@ -762,7 +765,7 @@ impl ReverseHarness {
         let server = TestServer::start().await;
         let provider =
             ScriptedProvider::start(&server.daemon.connection_file_path, "raw", "probe").await;
-        wait_for_registration(&server.daemon.registry, "raw", READ_TIMEOUT).await;
+        wait_for_registration(&server, "raw").await;
 
         let user_config_home = server.daemon.temp_dir.join(format!("{label}-xdg-config"));
         fs::create_dir_all(&user_config_home).unwrap();
@@ -1758,13 +1761,21 @@ impl McpHarness {
         user_config: Option<&str>,
         project_config: Option<&str>,
     ) -> Self {
-        Self::start_inner(label, provider_specs, user_config, project_config, false).await
+        Self::start_inner(
+            label,
+            provider_specs,
+            user_config,
+            project_config,
+            false,
+            &[],
+        )
+        .await
     }
 
     /// Starts the harness with the module's daemon connections running
     /// through a [`RelayProxy`].
     async fn start_proxied(label: &str, provider_specs: Vec<StubProvider<'_>>) -> Self {
-        Self::start_inner(label, provider_specs, None, None, true).await
+        Self::start_inner(label, provider_specs, None, None, true, &[]).await
     }
 
     fn proxy(&self) -> &RelayProxy {
@@ -1779,6 +1790,7 @@ impl McpHarness {
         user_config: Option<&str>,
         project_config: Option<&str>,
         proxied: bool,
+        module_env: &[(&str, &str)],
     ) -> Self {
         let server = TestServer::start().await;
         let mut providers = BTreeMap::new();
@@ -1796,12 +1808,7 @@ impl McpHarness {
                     &provider_spec.env,
                 ))
                 .unwrap();
-            wait_for_registration(
-                &server.daemon.registry,
-                provider_spec.module_id,
-                READ_TIMEOUT,
-            )
-            .await;
+            wait_for_registration(&server, provider_spec.module_id).await;
             provider_events.insert(provider_spec.module_id.to_owned(), events_path);
             providers.insert(provider_spec.module_id.to_owned(), provider);
         }
@@ -1833,10 +1840,11 @@ impl McpHarness {
             .map_or(server.daemon.connection_file_path.as_path(), |proxy| {
                 proxy.connection_file_path.as_path()
             });
-        let mut module = spawn_module(
+        let mut module = spawn_module_with_extra_env(
             subc_connection_file,
             &module_connection_file,
             &user_config_home,
+            module_env,
         );
         wait_for_module_connection_file(&mut module, &module_connection_file, READ_TIMEOUT).await;
 
@@ -1883,7 +1891,7 @@ impl McpHarness {
         let provider = supervisor(&self.server)
             .spawn(stub_spec(module_id, &events_path, provider_env))
             .unwrap();
-        wait_for_registration(&self.server.daemon.registry, module_id, READ_TIMEOUT).await;
+        wait_for_registration(&self.server, module_id).await;
         self.provider_events
             .insert(module_id.to_owned(), events_path);
         self.providers.insert(module_id.to_owned(), provider);
@@ -2401,14 +2409,9 @@ async fn mcp_tools_call_splits_tool_errors_from_subc_errors() {
         .call_tool(CallToolRequestParams::new("fake-aft_fake_read"))
         .await
         .unwrap_err();
-    // This stays a JSON-RPC error. A module outage that proves the call never
-    // reached the provider (a call-time route.open refusal, or
-    // `module_reloading` on the request) is waited out and then returned as a
-    // tool result with the shared outage block; see the
-    // `mcp_module_outage_*` tests. A `target_unavailable` Error answering the
-    // request itself carries no such proof: only `module_reloading` is
-    // guaranteed to be answered before the daemon forwards anything, so this
-    // call may have run and is reported exactly as before.
+    // A provider's error can follow execution, whatever code it uses. Only a
+    // local pre-send refusal or a trusted daemon-authored pre-forward refusal
+    // can enter the outage wait; provider errors remain JSON-RPC errors.
     match subc_error {
         ServiceError::McpError(error) => {
             assert!(
@@ -2452,80 +2455,184 @@ fn spawn_tool_call(
     })
 }
 
-fn route_request_body(frame: &Frame) -> Value {
-    serde_json::from_slice(&frame.body).unwrap()
+async fn draining_outage_harness(label: &str, wait_ms: &str) -> McpHarness {
+    McpHarness::start_inner(
+        label,
+        vec![StubProvider::new(
+            "provider",
+            &[("FAKE_AFT_TOOLCALL_RESULT", "back")],
+        )],
+        None,
+        None,
+        false,
+        &[("SUBC_MCP_OUTAGE_WAIT_MS", wait_ms)],
+    )
+    .await
 }
 
-/// A call refused with `module_reloading` (answered before the request is
-/// forwarded, so it never ran) is sent again once the module is back, and the
-/// host sees only the real result.
-#[tokio::test]
-async fn mcp_module_outage_reloading_call_waits_and_returns_the_real_result() {
-    let mut harness = outage_harness("mcp-outage-wait", "20000").await;
-    let call = spawn_tool_call(&harness);
+/// Close admission before the call, but hold route.closing so the gateway's
+/// established route receives a real daemon refusal rather than a module error.
+async fn hold_provider_drain(harness: &McpHarness) -> oneshot::Sender<()> {
+    let release = harness
+        .server
+        .daemon
+        .forwarding
+        .hold_route_closing_for_test();
+    let mut client =
+        wait_for_control_client(&harness.server.daemon.connection_file_path, SETUP_TIMEOUT).await;
+    let response = control_rpc_on_stream(
+        &mut client,
+        1,
+        ClientControlRequest::SupervisorRestart {
+            module_id: "provider".to_owned(),
+            drain_timeout_ms: Some(25),
+        },
+    )
+    .await;
+    assert!(matches!(
+        response,
+        ClientControlResponse::SupervisorAck { .. }
+    ));
+    wait_for_stub_event(&harness.events_path, READ_TIMEOUT, |event| {
+        event["kind"] == "draining"
+    })
+    .await;
+    release
+}
 
-    let first = harness.provider.wait_route_request().await;
-    harness
-        .provider
-        .send_route_error(&first, module_reloading_body())
-        .await;
-    let second = harness.provider.wait_route_request().await;
-    assert_ne!(first.header.corr, second.header.corr);
-    assert_eq!(
-        route_request_body(&second),
-        route_request_body(&first),
-        "the retried call carries the same request"
+fn spawn_draining_tool_call(
+    harness: &McpHarness,
+) -> JoinHandle<Result<rmcp::model::CallToolResult, ServiceError>> {
+    let peer = harness.client.peer().clone();
+    tokio::spawn(async move {
+        peer.call_tool(CallToolRequestParams::new("provider_fake_read"))
+            .await
+    })
+}
+
+#[tokio::test]
+async fn mcp_module_origin_reloading_is_not_retried_or_reported_unsent() {
+    let mut harness = outage_harness("mcp-provider-reloading", "1500").await;
+    let mut call = spawn_tool_call(&harness);
+    let mut received = 0;
+    let outcome = loop {
+        tokio::select! {
+            result = &mut call => break result.unwrap(),
+            request = harness.provider.wait_route_request() => {
+                received += 1;
+                harness.provider.send_route_error(&request, module_reloading_body()).await;
+            }
+        }
+    };
+
+    assert!(
+        !format!("{outcome:?}").contains("nothing was sent"),
+        "the provider received {received} calls; its error is not proof of non-delivery: {outcome:?}"
     );
+    assert_eq!(received, 1, "a provider error must never replay the call");
+    let Err(ServiceError::McpError(error)) = outcome else {
+        panic!("expected the provider's JSON-RPC error, got {outcome:?}");
+    };
+    assert_eq!(error.data, Some(json!({ "subc_code": "module_reloading" })));
+    assert!(
+        next_route_request_within(&mut harness.provider, QUIET_TIMEOUT)
+            .await
+            .is_none(),
+        "a call that reached the provider must not be retried later"
+    );
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_module_error_cannot_claim_not_sent() {
+    let mut harness = outage_harness("mcp-provider-send-outcome", "1500").await;
+    let call = spawn_tool_call(&harness);
+    let request = harness.provider.wait_route_request().await;
     harness
         .provider
-        .send_route_response(
-            &second,
-            json!({ "content": [{ "type": "text", "text": "back" }], "isError": false }),
+        .send_route_error(
+            &request,
+            json!({
+                "code": "handler_failed",
+                "message": "provider failed after executing the call",
+                "detail": { "send_outcome": "not_sent" },
+            }),
         )
         .await;
+
+    let error = timeout(READ_TIMEOUT, call)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    let ServiceError::McpError(error) = error else {
+        panic!("expected the provider's JSON-RPC error, got {error:?}");
+    };
+    assert_eq!(
+        error.message,
+        "subc route tool call failed: handler_failed: provider failed after executing the call"
+    );
+    assert_eq!(
+        error.data,
+        Some(json!({ "subc_code": "handler_failed" })),
+        "provider-controlled details must not become gateway send-outcome metadata",
+    );
+    assert!(
+        next_route_request_within(&mut harness.provider, QUIET_TIMEOUT)
+            .await
+            .is_none()
+    );
+    harness.shutdown().await;
+}
+
+/// A daemon refusing work during a drain must not expose the temporary error
+/// to the host; after restart the provider receives the call exactly once.
+#[tokio::test]
+async fn mcp_module_outage_reloading_call_waits_and_returns_the_real_result() {
+    let harness = draining_outage_harness("mcp-outage-wait", "20000").await;
+    let release = hold_provider_drain(&harness).await;
+    let mut call = spawn_draining_tool_call(&harness);
+    assert!(
+        timeout(QUIET_TIMEOUT, &mut call).await.is_err(),
+        "the daemon refusal should be waited out"
+    );
+    assert_no_stub_event_within(&harness.events_path, Duration::ZERO, |event| {
+        event["kind"] == "tool_call"
+    })
+    .await;
+    release.send(()).unwrap();
 
     let result = timeout(READ_TIMEOUT, call).await.unwrap().unwrap().unwrap();
     assert_eq!(
         serde_json::to_value(&result).unwrap(),
         json!({ "content": [{ "type": "text", "text": "back" }], "isError": false })
     );
+    let calls = stub_events(&harness.events_path)
+        .unwrap()
+        .into_iter()
+        .filter(|event| event["kind"] == "tool_call")
+        .count();
+    assert_eq!(calls, 1, "only the successful attempt reaches the provider");
     harness.shutdown().await;
 }
 
-/// A module still reloading when the wait is spent comes back as a tool
-/// result carrying exactly the shared outage block.
+/// A daemon still refusing work when the budget expires returns the shared
+/// outage block; no attempt reached the draining provider.
 #[tokio::test]
 async fn mcp_module_outage_past_the_budget_returns_the_shared_block() {
-    let mut harness = outage_harness("mcp-outage-budget", "1500").await;
+    let harness = draining_outage_harness("mcp-outage-budget", "1500").await;
+    let release = hold_provider_drain(&harness).await;
     let started = Instant::now();
-    let mut call = spawn_tool_call(&harness);
-
-    let mut refused = 0;
-    let result = loop {
-        tokio::select! {
-            result = &mut call => break result.unwrap().unwrap(),
-            request = harness.provider.wait_route_request() => {
-                refused += 1;
-                harness.provider.send_route_error(&request, module_reloading_body()).await;
-            }
-        }
-    };
-    assert!(
-        started.elapsed() >= Duration::from_millis(1500),
-        "the call should wait out the budget, ended after {:?}",
-        started.elapsed()
-    );
-    assert!(
-        refused >= 2,
-        "the call should be retried, sent {refused} times"
-    );
+    let call = spawn_draining_tool_call(&harness);
+    let result = timeout(READ_TIMEOUT, call).await.unwrap().unwrap().unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(1500));
     assert_eq!(
         serde_json::to_value(&result).unwrap(),
         json!({
             "content": [{
                 "type": "text",
                 "text": "The module that provides this tool is unavailable.\n\
-                         module: raw\n\
+                         module: provider\n\
                          code: module_reloading\n\
                          nothing was sent\n\
                          retry: the module was restarting or starting up; the call can be retried in a minute",
@@ -2533,28 +2640,29 @@ async fn mcp_module_outage_past_the_budget_returns_the_shared_block() {
             "isError": true,
         })
     );
+    assert_no_stub_event_within(&harness.events_path, Duration::ZERO, |event| {
+        event["kind"] == "tool_call"
+    })
+    .await;
+    release.send(()).unwrap();
     harness.shutdown().await;
 }
 
-/// A terminal refusal ends the wait at once instead of using up the budget:
-/// the provider answers `module_reloading` and then leaves for good, so the
-/// daemon refuses the reopened route with `unknown_module`.
+/// A terminal route-open refusal stops a call already waiting out a drain.
+/// Revoking the gateway's spawn identity makes the reopened route terminally
+/// refused once the provider has restarted.
 #[tokio::test]
 async fn mcp_module_outage_terminal_refusal_returns_the_block_without_waiting() {
-    let mut harness = outage_harness("mcp-outage-terminal", "30000").await;
+    let harness = draining_outage_harness("mcp-outage-terminal", "30000").await;
+    let release = hold_provider_drain(&harness).await;
     let started = Instant::now();
-    let call = spawn_tool_call(&harness);
-
-    let first = harness.provider.wait_route_request().await;
+    let mut call = spawn_draining_tool_call(&harness);
+    assert!(timeout(QUIET_TIMEOUT, &mut call).await.is_err());
     harness
-        .provider
-        .send_route_error(&first, module_reloading_body())
-        .await;
-    let _ = harness
-        .provider
-        .command_tx
-        .send(ScriptedProviderCommand::Shutdown)
-        .await;
+        .server
+        .supervisor_handle
+        .set_spawn_nonce(TEST_MCP_MODULE_ID, "replacement-launch-nonce".to_owned());
+    release.send(()).unwrap();
 
     let result = timeout(READ_TIMEOUT, call).await.unwrap().unwrap().unwrap();
     assert!(
@@ -2568,8 +2676,8 @@ async fn mcp_module_outage_terminal_refusal_returns_the_block_without_waiting() 
             "content": [{
                 "type": "text",
                 "text": "The module that provides this tool is unavailable.\n\
-                         module: raw\n\
-                         code: unknown_module\n\
+                         module: provider\n\
+                         code: bad_consumer_identity\n\
                          nothing was sent",
             }],
             "isError": true,
@@ -2578,27 +2686,24 @@ async fn mcp_module_outage_terminal_refusal_returns_the_block_without_waiting() 
     harness.shutdown().await;
 }
 
-/// The host cancelling the call while it waits out an outage ends the wait,
-/// and nothing more is sent to the provider.
+/// The host cancelling a call during a real daemon drain ends the wait and
+/// prevents delivery even after the provider becomes available again.
 #[tokio::test]
 async fn mcp_module_outage_host_cancellation_ends_the_wait() {
-    let mut harness = outage_harness("mcp-outage-cancel", "30000").await;
-    let peer = harness.client.as_ref().unwrap().peer().clone();
+    let harness = draining_outage_harness("mcp-outage-cancel", "30000").await;
+    let release = hold_provider_drain(&harness).await;
+    let peer = harness.client.peer().clone();
     let handle = peer
         .send_cancellable_request(
             ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(
-                harness.provider.exposed_tool_name(),
+                "provider_fake_read",
             ))),
             PeerRequestOptions::no_options(),
         )
         .await
         .unwrap();
-    let first = harness.provider.wait_route_request().await;
     let started = Instant::now();
-    harness
-        .provider
-        .send_route_error(&first, module_reloading_body())
-        .await;
+    sleep(QUIET_TIMEOUT).await;
     peer.notify_cancelled(CancelledNotificationParam::new(
         Some(handle.id.clone()),
         Some("test cancellation".to_owned()),
@@ -2616,21 +2721,20 @@ async fn mcp_module_outage_host_cancellation_ends_the_wait() {
         other => panic!("expected a cancelled call, got {other:?}"),
     }
     assert!(started.elapsed() < Duration::from_secs(15));
-    // Past the first retry pause: a wait that ignored the cancellation would
-    // have sent the call again by now.
-    assert!(
-        next_route_request_within(&mut harness.provider, Duration::from_millis(1500))
-            .await
-            .is_none(),
-        "no call may be sent after the host cancelled"
-    );
+    release.send(()).unwrap();
+    // Cover the first retry pause after the provider is available again.
+    assert_no_stub_event_within(&harness.events_path, Duration::from_millis(1500), |event| {
+        event["kind"] == "tool_call"
+    })
+    .await;
     harness.shutdown().await;
 }
 
 /// A failure after the call may have run is never waited out or retried and
-/// keeps its JSON-RPC error with the unknown outcome.
+/// keeps its JSON-RPC error. The provider's `detail.send_outcome` claim is
+/// omitted from the returned error data.
 #[tokio::test]
-async fn mcp_module_outage_outcome_unknown_failure_is_unchanged() {
+async fn mcp_module_outage_module_error_metadata_is_not_trusted() {
     let mut harness = outage_harness("mcp-outage-unknown", "30000").await;
     let call = spawn_tool_call(&harness);
     let first = harness.provider.wait_route_request().await;
@@ -2663,8 +2767,6 @@ async fn mcp_module_outage_outcome_unknown_failure_is_unchanged() {
         error.data,
         Some(json!({
             "subc_code": "route_closed",
-            "send_outcome": "outcome_unknown",
-            "request_dispatched": true,
         }))
     );
     assert!(
@@ -3139,7 +3241,7 @@ async fn mcp_project_attempts_to_grant_are_dropped_with_warning() {
             &[("FAKE_AFT_TOOLS", "read")],
         ))
         .unwrap();
-    wait_for_registration(&server.daemon.registry, "aft", READ_TIMEOUT).await;
+    wait_for_registration(&server, "aft").await;
 
     let user_config_home = server.daemon.temp_dir.join(format!("{label}-xdg-config"));
     fs::create_dir_all(&user_config_home).unwrap();
@@ -4184,7 +4286,7 @@ async fn mcp_catalog_reconciliation_failure_preserves_previous_snapshot_and_clea
             &[("FAKE_AFT_TOOLS", "read")],
         ))
         .unwrap();
-    wait_for_registration(&server.daemon.registry, "aft", READ_TIMEOUT).await;
+    wait_for_registration(&server, "aft").await;
     providers.insert("aft".to_owned(), aft);
     provider_events.insert("aft".to_owned(), aft_events_path.clone());
 
@@ -4220,7 +4322,7 @@ async fn mcp_catalog_reconciliation_failure_preserves_previous_snapshot_and_clea
             &[("FAKE_AFT_TOOLS", "memory")],
         ))
         .unwrap();
-    wait_for_registration(&server.daemon.registry, "bee", READ_TIMEOUT).await;
+    wait_for_registration(&server, "bee").await;
     providers.insert("bee".to_owned(), bee);
     provider_events.insert("bee".to_owned(), bee_events_path.clone());
 
@@ -4238,7 +4340,7 @@ async fn mcp_catalog_reconciliation_failure_preserves_previous_snapshot_and_clea
             ],
         ))
         .unwrap();
-    wait_for_registration(&server.daemon.registry, "zed", READ_TIMEOUT).await;
+    wait_for_registration(&server, "zed").await;
     providers.insert("zed".to_owned(), zed);
     provider_events.insert("zed".to_owned(), zed_events_path.clone());
 
@@ -4391,7 +4493,7 @@ async fn supervised_mcp_module_reports_live_non_routable_and_preserves_provider_
             &[("FAKE_AFT_TOOLS", "read")],
         ))
         .unwrap();
-    wait_for_registration(&server.daemon.registry, "aft", SETUP_TIMEOUT).await;
+    wait_for_registration(&server, "aft").await;
 
     let xdg_config_home = server.daemon.temp_dir.join("supervised-mcp-xdg-config");
     fs::create_dir_all(&xdg_config_home).unwrap();
@@ -4650,7 +4752,7 @@ async fn mcp_module_rejects_unsupported_shim_hello_schema_without_opening_routes
             &[("FAKE_AFT_TOOLS", "read")],
         ))
         .unwrap();
-    wait_for_registration(&server.daemon.registry, "aft", SETUP_TIMEOUT).await;
+    wait_for_registration(&server, "aft").await;
 
     let xdg_config_home = server.daemon.temp_dir.join("mcp-bad-shim-hello-xdg-config");
     fs::create_dir_all(&xdg_config_home).unwrap();
@@ -4749,12 +4851,7 @@ async fn expect_shim_attach_failure(
                 &provider_spec.env,
             ))
             .unwrap();
-        wait_for_registration(
-            &server.daemon.registry,
-            provider_spec.module_id,
-            READ_TIMEOUT,
-        )
-        .await;
+        wait_for_registration(&server, provider_spec.module_id).await;
         providers.push(provider);
     }
 
@@ -4914,6 +5011,7 @@ fn supervisor(server: &TestServer) -> Supervisor {
     #[cfg(target_os = "macos")]
     let supervisor = supervisor.with_privacy_trampoline(privacy_trampoline());
     supervisor
+        .with_capture_logs_dir(server.daemon.temp_dir.join("capture"))
         .with_process_liveness(Arc::clone(&server.process_liveness))
         .with_forwarding(Arc::clone(&server.daemon.forwarding))
         .with_handle(server.supervisor_handle.clone())
@@ -5149,16 +5247,28 @@ fn write_user_mcp_config(xdg_config_home: &Path, doc: &str) {
     fs::write(dir.join("mcp.jsonc"), doc).unwrap();
 }
 
-async fn wait_for_registration(registry: &Registry, module_id: &str, wait: Duration) {
-    let deadline = Instant::now() + wait;
+async fn wait_for_registration(server: &TestServer, module_id: &str) {
+    let deadline = Instant::now() + REGISTRATION_TIMEOUT;
     loop {
-        if registry.get_module(module_id).unwrap().is_some() {
+        if server
+            .daemon
+            .registry
+            .get_module(module_id)
+            .unwrap()
+            .is_some()
+        {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "module {module_id} did not register within {wait:?}"
-        );
+        if Instant::now() >= deadline {
+            let path = server
+                .daemon
+                .temp_dir
+                .join("capture")
+                .join(format!("{module_id}.stderr.log"));
+            let stderr = fs::read_to_string(&path)
+                .unwrap_or_else(|error| format!("could not read {}: {error}", path.display()));
+            panic!("module {module_id} did not register within {REGISTRATION_TIMEOUT:?}\nmodule stderr:\n{stderr}");
+        }
         sleep(Duration::from_millis(10)).await;
     }
 }

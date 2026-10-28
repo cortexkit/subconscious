@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.51
+
+- Use subc-client-rs 0.32.17's shared non-delivery proof before retrying a data-plane refusal or reporting `nothing was sent`. The refusal must carry `DAEMON_ORIGIN` from a daemon at least 0.37.15. Retain the version from the connection info passed to the successful handshake: authentication checks the daemon ID against that file, but its HMAC does not cover the version. Module-origin errors, absent labels and older or unknown daemon versions may have run and are never replayed or described as unsent. A locally refused route open still proves that no tool request was sent.
+- Do not copy `detail.send_outcome` from a module's error into host-facing send-outcome metadata. A module may send an error after executing the call, so its claim of non-delivery cannot make a host retry safe.
+- Integration tests share a loaded-runner registration budget and include the child process's stderr when registration fails, so slow starts are waited for and failed starts show their cause.
+
 ## 0.1.50
 
 - Builds against subc-daemon 0.38.0. No change to the gateway itself.

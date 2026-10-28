@@ -412,7 +412,7 @@ async fn add_provider_and_wait_listed(harness: &ReverseHarness) -> ScriptedProvi
         "probe",
     )
     .await;
-    wait_for_registration(&harness._server.daemon.registry, "late", READ_TIMEOUT).await;
+    wait_for_registration(&harness._server, "late").await;
     let peer = harness.client.as_ref().unwrap().peer().clone();
     let late_tool = late.exposed_tool_name();
     timeout(READ_TIMEOUT, async {

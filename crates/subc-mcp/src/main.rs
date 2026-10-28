@@ -184,7 +184,58 @@ const USAGE: &str = "usage:\n  subc-mcp shim [--module-connection-file <path>] [
 type BoxError = Box<dyn Error + Send + Sync>;
 type Result<T> = std::result::Result<T, BoxError>;
 type PendingKey = (u16, u32, u64);
-type PendingTx = mpsc::Sender<SubcFrame>;
+type PendingTx = mpsc::Sender<SubcReply>;
+
+/// A reply plus provenance that cannot be supplied by a module's error body.
+/// Only relay-generated failures carry an established unknown outcome; wire
+/// replies must earn any non-delivery proof through the shared classifier.
+#[derive(Debug)]
+struct SubcReply {
+    frame: SubcFrame,
+    gateway_outcome_unknown: bool,
+}
+
+impl From<SubcFrame> for SubcReply {
+    fn from(frame: SubcFrame) -> Self {
+        Self {
+            frame,
+            gateway_outcome_unknown: false,
+        }
+    }
+}
+
+impl std::ops::Deref for SubcReply {
+    type Target = SubcFrame;
+
+    fn deref(&self) -> &Self::Target {
+        &self.frame
+    }
+}
+
+impl SubcReply {
+    fn outcome_unknown(frame: SubcFrame) -> Self {
+        Self {
+            frame,
+            gateway_outcome_unknown: true,
+        }
+    }
+
+    fn tool_call_answer(
+        &self,
+        retrying: bool,
+        daemon_origin_trusted: bool,
+    ) -> std::result::Result<CallAttempt, ErrorData> {
+        let mut answer = tool_call_answer(&self.frame, retrying, daemon_origin_trusted);
+        if self.gateway_outcome_unknown {
+            if let Err(error) = &mut answer {
+                let data = error.data.get_or_insert_with(|| serde_json::json!({}));
+                data["send_outcome"] = serde_json::json!("outcome_unknown");
+                data["request_dispatched"] = serde_json::json!(true);
+            }
+        }
+        answer
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct RouteHandle {
@@ -1766,6 +1817,7 @@ struct SubcConnection {
     relay: Arc<ReverseRelay>,
     connection_token: u64,
     writer_shutdown: watch::Sender<bool>,
+    daemon_origin_trusted: bool,
 }
 
 impl SubcConnection {
@@ -1774,6 +1826,7 @@ impl SubcConnection {
     /// keeps so health metrics and ack-only bindings survive a reconnect.
     fn start(
         stream: TcpStream,
+        daemon_origin_trusted: bool,
         events: broadcast::Sender<SubcEvent>,
         predecessor: Option<&ReverseRelay>,
     ) -> (Arc<Self>, JoinHandle<()>) {
@@ -1806,6 +1859,7 @@ impl SubcConnection {
                 relay,
                 connection_token,
                 writer_shutdown,
+                daemon_origin_trusted,
             }),
             reader,
         )
@@ -1823,7 +1877,7 @@ impl SubcConnection {
         &self,
         frame: SubcFrame,
         route_session: Option<Arc<RelaySession>>,
-    ) -> Result<mpsc::Receiver<SubcFrame>> {
+    ) -> Result<mpsc::Receiver<SubcReply>> {
         let key = (frame.header.channel, frame.header.epoch, frame.header.corr);
         let (reply_tx, reply_rx) = mpsc::channel(PENDING_FRAME_BUFFER + 1);
         let pending_request = PendingRequest {
@@ -1915,7 +1969,7 @@ impl SubcClient {
     #[cfg(test)]
     fn start(stream: TcpStream) -> Self {
         let (events, _events_rx) = broadcast::channel(SUBC_EVENT_BUFFER);
-        let (connection, _reader) = SubcConnection::start(stream, events.clone(), None);
+        let (connection, _reader) = SubcConnection::start(stream, false, events.clone(), None);
         Self::with_connection(connection, events)
     }
 
@@ -1925,9 +1979,12 @@ impl SubcClient {
     /// that rewrote it is found. The module's lifetime is owned by its
     /// supervision connection, not by this one.
     async fn connect(connection_file_path: &Path) -> Result<Self> {
-        let stream = connect_authenticated(connection_file_path, ConnectionService::Daemon).await?;
+        let (stream, daemon_origin_trusted) =
+            connect_authenticated_with_origin(connection_file_path, ConnectionService::Daemon)
+                .await?;
         let (events, _events_rx) = broadcast::channel(SUBC_EVENT_BUFFER);
-        let (connection, reader) = SubcConnection::start(stream, events.clone(), None);
+        let (connection, reader) =
+            SubcConnection::start(stream, daemon_origin_trusted, events.clone(), None);
         let client = Self::with_connection(connection, events);
         tokio::spawn(maintain_subc_connection(
             client.clone(),
@@ -2132,7 +2189,7 @@ impl SubcClient {
         &self,
         handle: RouteHandle,
         frame: SubcFrame,
-    ) -> Result<mpsc::Receiver<SubcFrame>> {
+    ) -> Result<mpsc::Receiver<SubcReply>> {
         if frame.header.channel != handle.channel || frame.header.epoch != handle.epoch {
             return Err(other_error("route frame does not match its route handle"));
         }
@@ -2204,7 +2261,7 @@ async fn await_terminal(
                 )));
             };
             if is_terminal_frame_type(frame.header.ty) {
-                return Ok(frame);
+                return Ok(frame.frame);
             }
         }
     })
@@ -2244,9 +2301,14 @@ async fn maintain_subc_connection(
         };
 
         let mut backoff = SUBC_RECONNECT_BACKOFF_INITIAL;
-        let stream = loop {
+        let (stream, daemon_origin_trusted) = loop {
             client.outage().reconnect_attempts += 1;
-            match connect_authenticated(&connection_file_path, ConnectionService::Daemon).await {
+            match connect_authenticated_with_origin(
+                &connection_file_path,
+                ConnectionService::Daemon,
+            )
+            .await
+            {
                 Ok(stream) => break stream,
                 Err(error) => {
                     tracing::warn!("subc relay reconnect failed, retrying in {backoff:?}: {error}");
@@ -2255,8 +2317,12 @@ async fn maintain_subc_connection(
                 }
             }
         };
-        let (connection, next_reader) =
-            SubcConnection::start(stream, client.events.clone(), Some(&dead.relay));
+        let (connection, next_reader) = SubcConnection::start(
+            stream,
+            daemon_origin_trusted,
+            client.events.clone(),
+            Some(&dead.relay),
+        );
         client.current.send_replace(connection);
         *client.outage() = RelayOutage::default();
         tracing::info!("subc relay connection re-established");
@@ -6283,15 +6349,15 @@ impl SubcMcpServer {
         }
     }
 
-    /// Sends the call to its provider. When the daemon proves the call never
-    /// reached the provider (a call-time route.open refusal, or
-    /// `module_reloading` on the request) and marks the refusal retryable,
-    /// the call is sent again, with backoff, until it gets through or
-    /// `outage_wait.budget` is spent; the host can cancel the wait. A refusal
+    /// Sends the call to its provider. A call-time route.open refusal or a
+    /// trusted daemon-labelled refusal proves the current attempt never reached
+    /// the provider. If retryable, it is sent again with backoff until it gets
+    /// through or `outage_wait.budget` is spent; the host can cancel the wait. A refusal
     /// that is terminal, or still standing when the budget is spent, comes
     /// back as a tool result carrying the shared outage block. Every other
-    /// failure, including any where the call may have run, is returned as
-    /// before and never retried.
+    /// failure, including any where the call may have run, is returned
+    /// immediately and never retried. An outage result therefore has non-delivery
+    /// proof for every attempt, not just the last one.
     async fn call_bound_tool(
         &self,
         lookup: BindingLookup,
@@ -6498,6 +6564,13 @@ impl SubcMcpServer {
         // Listed before the request goes out: the module may ask its question
         // as soon as it receives the call.
         let input = self.input_waiter_for(route, corr, context);
+        // Keep the proof policy of the connection that carried this attempt,
+        // even if the relay reconnects while the call is held or becomes a task.
+        let daemon_origin_trusted = self
+            .subc
+            .connection_for_route(route)
+            .map_err(relay_error_to_mcp)?
+            .daemon_origin_trusted;
         let frames = self
             .subc
             .request_route_frames(route, frame)
@@ -6508,6 +6581,7 @@ impl SubcMcpServer {
             corr,
             binding.module_id.clone(),
             retrying,
+            daemon_origin_trusted,
             frames,
             input,
         );
@@ -6562,7 +6636,7 @@ impl SubcMcpServer {
                 }
                 continue;
             }
-            return tool_call_answer(&frame, retrying);
+            return frame.tool_call_answer(retrying, held.daemon_origin_trusted);
         }
     }
 
@@ -6633,6 +6707,7 @@ async fn send_module_cancel(subc: &SubcClient, route: RouteHandle, corr: u64) ->
 fn tool_call_answer(
     frame: &SubcFrame,
     retrying: bool,
+    daemon_origin_trusted: bool,
 ) -> std::result::Result<CallAttempt, ErrorData> {
     match frame.header.ty {
         FrameType::Response => {
@@ -6652,7 +6727,12 @@ fn tool_call_answer(
             Ok(CallAttempt::Answered(result))
         }
         FrameType::Error => {
-            if let Some(attempt) = unsent_call_attempt(frame.header.flags, &frame.body, retrying) {
+            if let Some(attempt) = unsent_call_attempt(
+                daemon_origin_trusted,
+                frame.header.flags,
+                &frame.body,
+                retrying,
+            ) {
                 return Ok(attempt);
             }
             Err(subc_error_to_mcp(
@@ -6866,8 +6946,10 @@ enum ToolCallOutcome {
 }
 
 /// A daemon refusal proving a tool call never reached its provider: a
-/// route.open refusal for a route the call needed, or `module_reloading` on
-/// the request itself.
+/// route.open refusal before the tool request, or a trusted daemon-labelled
+/// data-plane refusal. No attempt that may have run enters the outage wait;
+/// such an attempt returns its error immediately, so every prior attempt of
+/// an outage result is also proven unsent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OutageRefusal {
     /// The daemon's code, verbatim.
@@ -6981,13 +7063,25 @@ fn outage_pause(
 }
 
 /// Reads a route Error answering a tool call for the cases where the call
-/// provably never reached the provider. `module_reloading` is one: the daemon
-/// returns it only before forwarding the request
-/// (`subc_protocol::error_codes::MODULE_RELOADING`). On a retried attempt, a
-/// route the daemon no longer knows is another; on the first attempt it keeps
-/// its old JSON-RPC error. Anything else is `None` and stays as it was.
-fn unsent_call_attempt(flags: Flags, body: &[u8], retrying: bool) -> Option<CallAttempt> {
+/// provably never reached the provider. A code alone is not proof: modules can
+/// return the same error after running a call. The shared client classifier
+/// also requires the daemon's origin label and a version that strips forged
+/// labels. A proven dead route is reopened only during an existing outage wait;
+/// its first-attempt JSON-RPC error remains unchanged.
+fn unsent_call_attempt(
+    daemon_origin_trusted: bool,
+    flags: Flags,
+    body: &[u8],
+    retrying: bool,
+) -> Option<CallAttempt> {
     let error = serde_json::from_slice::<ErrorBody>(body).ok()?;
+    if !subc_client_rs::consumer::is_daemon_refusal_before_forward(
+        daemon_origin_trusted,
+        flags,
+        &error.code,
+    ) {
+        return None;
+    }
     if error.code == subc_protocol::error_codes::MODULE_RELOADING {
         return Some(CallAttempt::NothingSent(OutageRefusal {
             code: error.code,
@@ -7025,18 +7119,10 @@ async fn reconcile_session_now(
 fn subc_error_to_mcp(prefix: &str, body: &[u8]) -> ErrorData {
     match serde_json::from_slice::<ErrorBody>(body) {
         Ok(error) => {
-            let mut data = serde_json::json!({ "subc_code": error.code });
-            // A send outcome in the detail (set when the connection carrying
-            // the request was lost) tells the host whether a retry is safe.
-            if let Some(outcome) = error
-                .detail
-                .as_ref()
-                .and_then(|detail| detail.get("send_outcome"))
-                .and_then(serde_json::Value::as_str)
-            {
-                data["send_outcome"] = serde_json::Value::String(outcome.to_owned());
-                data["request_dispatched"] = serde_json::Value::Bool(outcome != "not_sent");
-            }
+            // A provider can return an error after executing the call. Its body
+            // cannot establish a send outcome, even if its code or detail looks
+            // like a relay-generated failure.
+            let data = serde_json::json!({ "subc_code": error.code });
             ErrorData::internal_error(
                 format!("{prefix}: {}: {}", error.code, error.message),
                 Some(data),
@@ -7274,7 +7360,7 @@ fn settle_connection_lost(reply: &PendingTx, channel: u16, epoch: u32, corr: u64
     match build_frame(FrameType::Error, data_flags(), channel, epoch, corr, body) {
         // Terminal, so it may take the queue's reserved slot; never waits.
         Ok(frame) => {
-            let _ = deliver_reply(reply, frame, true);
+            let _ = deliver_reply(reply, SubcReply::outcome_unknown(frame), true);
         }
         Err(error) => {
             tracing::error!("failed to build subc connection-lost error: {error}");
@@ -7325,7 +7411,7 @@ async fn fail_pending_on_route(
             }
         };
         // Terminal, so it may take the queue's reserved slot; never waits.
-        let _ = deliver_reply(&reply.reply, frame, true);
+        let _ = deliver_reply(&reply.reply, SubcReply::outcome_unknown(frame), true);
     }
 }
 
@@ -7344,14 +7430,14 @@ enum ReplyDelivery {
 /// race another sender. A non-terminal frame never takes the last free slot,
 /// which is how a terminal frame (the answer, a route failure, or the
 /// overflow Error) always fits.
-fn deliver_reply(reply: &PendingTx, frame: SubcFrame, terminal: bool) -> ReplyDelivery {
+fn deliver_reply(reply: &PendingTx, frame: impl Into<SubcReply>, terminal: bool) -> ReplyDelivery {
     if reply.is_closed() {
         return ReplyDelivery::Closed;
     }
     if !terminal && reply.capacity() <= 1 {
         return ReplyDelivery::Overflowed;
     }
-    match reply.try_send(frame) {
+    match reply.try_send(frame.into()) {
         Ok(()) => ReplyDelivery::Delivered,
         Err(mpsc::error::TrySendError::Closed(_)) => ReplyDelivery::Closed,
         Err(mpsc::error::TrySendError::Full(frame)) => {
@@ -7499,6 +7585,17 @@ async fn connect_authenticated(
     connection_file_path: &Path,
     service: ConnectionService,
 ) -> Result<TcpStream> {
+    Ok(
+        connect_authenticated_with_origin(connection_file_path, service)
+            .await?
+            .0,
+    )
+}
+
+async fn connect_authenticated_with_origin(
+    connection_file_path: &Path,
+    service: ConnectionService,
+) -> Result<(TcpStream, bool)> {
     let conn = connection_file::read_for_client(connection_file_path).map_err(|source| {
         let recovery = if matches!(&source, connection_file::ConnectionFileError::Io { source, .. } if source.kind() == stdio::ErrorKind::NotFound) {
             service.unavailable_diagnostic()
@@ -7552,7 +7649,10 @@ async fn connect_authenticated(
                 connection_file_path.display()
             ))
         })?;
-    Ok(stream)
+    // Authentication checked the connected daemon's id against this file.
+    // Retain its version now: a replacement file may name a different daemon.
+    let daemon_origin_trusted = subc_client_rs::consumer::trusts_daemon_origin(&conn.daemon_ver);
+    Ok((stream, daemon_origin_trusted))
 }
 
 fn resolve_project_root() -> Result<PathBuf> {
@@ -8725,6 +8825,33 @@ mod tests {
         (client.unwrap(), server)
     }
 
+    #[test]
+    fn subc_error_metadata_requires_gateway_provenance() {
+        for code in ["handler_failed", "route_closed", SUBC_CONNECTION_LOST_CODE] {
+            for outcome in ["not_sent", "outcome_unknown", "unrecognized"] {
+                for trusted in [false, true] {
+                    let frame = build_frame(
+                        FrameType::Error,
+                        data_flags().with_daemon_origin(),
+                        1,
+                        1,
+                        1,
+                        serde_json::to_vec(&ErrorBody {
+                            code: code.to_owned(),
+                            message: "failure".to_owned(),
+                            detail: Some(serde_json::json!({ "send_outcome": outcome })),
+                        })
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    let reply = SubcReply::from(frame);
+                    let error = reply.tool_call_answer(false, trusted).unwrap_err();
+                    assert_eq!(error.data, Some(serde_json::json!({ "subc_code": code })));
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn provider_goodbye_marks_dispatched_request_outcome_unknown() {
         let route = RouteHandle {
@@ -8742,7 +8869,7 @@ mod tests {
         )])));
         fail_pending_on_route(&pending, route, "provider ended").await;
         let frame = rx.recv().await.unwrap();
-        let error = subc_error_to_mcp("provider", &frame.body);
+        let error = frame.tool_call_answer(false, false).unwrap_err();
         let data = error.data.unwrap();
         assert_eq!(data["subc_code"], "route_closed");
         assert_eq!(data["send_outcome"], "outcome_unknown");
@@ -9831,7 +9958,7 @@ mod tests {
             error.detail,
             Some(serde_json::json!({ "send_outcome": "outcome_unknown" }))
         );
-        let mcp_error = subc_error_to_mcp("subc route tool call failed", &settled.body);
+        let mcp_error = settled.tool_call_answer(false, false).unwrap_err();
         assert_eq!(
             mcp_error.data,
             Some(serde_json::json!({
@@ -9876,7 +10003,7 @@ mod tests {
         let (second_client, _second_server) = connected_tcp_stream_pair().await;
         let dead = subc.connection();
         let (replacement, _reader) =
-            SubcConnection::start(second_client, subc.events.clone(), Some(&dead.relay));
+            SubcConnection::start(second_client, false, subc.events.clone(), Some(&dead.relay));
         subc.current.send_replace(replacement);
         assert_ne!(subc.connection_token(), old_route.connection_token);
 
@@ -9945,7 +10072,7 @@ mod tests {
         let replace = async {
             tokio::task::yield_now().await;
             let (replacement, _reader) =
-                SubcConnection::start(second_client, subc.events.clone(), None);
+                SubcConnection::start(second_client, false, subc.events.clone(), None);
             subc.current.send_replace(Arc::clone(&replacement));
             replacement
         };
@@ -11017,7 +11144,7 @@ mod tests {
     }
 
     #[test]
-    fn only_module_reloading_on_the_request_proves_nothing_was_sent() {
+    fn only_trusted_daemon_refusals_prove_nothing_was_sent() {
         let body = |code: &str, detail: Option<serde_json::Value>| {
             serde_json::to_vec(&ErrorBody {
                 code: code.to_owned(),
@@ -11026,9 +11153,9 @@ mod tests {
             })
             .unwrap()
         };
-        let flags = data_flags();
+        let flags = data_flags().with_daemon_origin();
         for retrying in [false, true] {
-            match unsent_call_attempt(flags, &body("module_reloading", None), retrying) {
+            match unsent_call_attempt(true, flags, &body("module_reloading", None), retrying) {
                 Some(CallAttempt::NothingSent(refusal)) => assert_eq!(
                     refusal,
                     OutageRefusal {
@@ -11048,7 +11175,7 @@ mod tests {
             ] {
                 let detail = Some(serde_json::json!({"send_outcome": "outcome_unknown"}));
                 assert!(
-                    unsent_call_attempt(flags, &body(code, detail), retrying).is_none(),
+                    unsent_call_attempt(true, flags, &body(code, detail), retrying).is_none(),
                     "{code}"
                 );
             }
@@ -11056,13 +11183,29 @@ mod tests {
         // A route the daemon no longer knows ends a retried attempt only; the
         // first attempt keeps its old error.
         for code in ["unknown_channel", "stale_route_epoch"] {
-            assert!(unsent_call_attempt(flags, &body(code, None), false).is_none());
+            assert!(unsent_call_attempt(true, flags, &body(code, None), false).is_none());
             assert!(matches!(
-                unsent_call_attempt(flags, &body(code, None), true),
+                unsent_call_attempt(true, flags, &body(code, None), true),
                 Some(CallAttempt::RouteGone)
             ));
         }
-        assert!(unsent_call_attempt(flags, b"not json", true).is_none());
+        assert!(unsent_call_attempt(true, flags, b"not json", true).is_none());
+        for trusted in [false, true] {
+            for flags in [data_flags(), data_flags().with_daemon_origin()] {
+                if trusted && flags.is_daemon_origin() {
+                    continue;
+                }
+                for retrying in [false, true] {
+                    for code in ["module_reloading", "unknown_channel", "stale_route_epoch"] {
+                        let frame = build_frame(FrameType::Error, flags, 1, 1, 1, body(code, None))
+                            .unwrap();
+                        let error = tool_call_answer(&frame, retrying, trusted).unwrap_err();
+                        assert_eq!(error.data.unwrap()["subc_code"], code);
+                        assert!(!error.message.contains(outage_output::NOTHING_SENT_LINE));
+                    }
+                }
+            }
+        }
     }
 
     /// A daemon refusing a conversation route's route.open is reported as the

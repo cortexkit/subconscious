@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.17
+
+- Expose `consumer::trusts_daemon_origin` and `consumer::is_daemon_refusal_before_forward` for clients with their own frame relay. The same classifier used by managed calls proves only a single attempt: `module_reloading`, `unknown_channel` or `stale_route_epoch`, labelled `DAEMON_ORIGIN` by an authenticated daemon at least 0.37.15. Unknown versions and unlabelled errors prove nothing. Callers must keep the authenticated connection's version and establish non-delivery for every attempt before replaying a whole call or reporting that nothing was sent.
+
 ## 0.32.16
 
 - Fix operator-app connections missing a running macOS daemon whose launchd plist sets `XDG_RUNTIME_DIR` to the production home-directory runtime location. The macOS resolver in 0.32.15 searched only Darwin's temporary directory, so it could not find that connection file. Add public `operator_app_candidates()`: macOS tries the password-database home's `.local/share/cortexkit/run/subc-connection.json` before the Darwin temporary file; Linux tries `/run/user/<uid>/subc-connection.json` before the password-home rung. This follows ordinary discovery without its environment rungs and requires subc-os 0.1.25; no environment variables are read, including `HOME`.

@@ -184,12 +184,12 @@ impl HeldInput {
 /// terminal frame is kept for the follow-up call.
 #[derive(Debug)]
 pub(super) struct HeldFrames {
-    rx: mpsc::Receiver<SubcFrame>,
-    stashed: Option<Option<SubcFrame>>,
+    rx: mpsc::Receiver<SubcReply>,
+    stashed: Option<Option<SubcReply>>,
 }
 
 impl HeldFrames {
-    pub(super) async fn next(&mut self) -> Option<SubcFrame> {
+    pub(super) async fn next(&mut self) -> Option<SubcReply> {
         if let Some(stashed) = self.stashed.take() {
             return stashed;
         }
@@ -206,6 +206,8 @@ pub(super) struct HeldCall {
     /// Whether this attempt was a retry after a module outage; see
     /// `unsent_call_attempt`.
     pub(super) retrying: bool,
+    /// Trust policy of the authenticated connection that sent this attempt.
+    pub(super) daemon_origin_trusted: bool,
     pub(super) frames: HeldFrames,
     pub(super) input: HeldInput,
 }
@@ -216,7 +218,8 @@ impl HeldCall {
         corr: u64,
         module_id: String,
         retrying: bool,
-        frames: mpsc::Receiver<SubcFrame>,
+        daemon_origin_trusted: bool,
+        frames: mpsc::Receiver<SubcReply>,
         input: Option<InputWaiterGuard>,
     ) -> Self {
         Self {
@@ -224,6 +227,7 @@ impl HeldCall {
             corr,
             module_id,
             retrying,
+            daemon_origin_trusted,
             frames: HeldFrames {
                 rx: frames,
                 stashed: None,
@@ -236,7 +240,7 @@ impl HeldCall {
 /// What ended one wait on a held call.
 pub(super) enum HeldCallEvent {
     Cancelled,
-    Frame(Option<SubcFrame>),
+    Frame(Option<SubcReply>),
     Input(Box<InputAsk>),
     /// The call has run past its task promotion delay. The caller hands it to
     /// a task if the session has room, and keeps it inline otherwise.
@@ -497,13 +501,13 @@ mod tests {
                 br#"{"content":[]}"#.to_vec(),
             )
             .unwrap();
-            tx.send(answer).await.unwrap();
+            tx.send(answer.into()).await.unwrap();
             let route = RouteHandle {
                 channel: 1,
                 epoch: 1,
                 connection_token: 1,
             };
-            let mut held = HeldCall::new(route, 7, "module".to_owned(), false, rx, None);
+            let mut held = HeldCall::new(route, 7, "module".to_owned(), false, false, rx, None);
             // Already past, so promotion is as ready as the queued answer.
             let promote_at = time::Instant::now().checked_sub(Duration::from_millis(50));
             assert!(promote_at.is_some());

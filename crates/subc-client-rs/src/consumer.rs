@@ -6761,14 +6761,15 @@ fn is_data_plane_drain_refusal(code: &str) -> bool {
 // 0.37.15 is the first daemon that marks its own errors and strips the bit from module frames.
 const DAEMON_ORIGIN_MIN_VERSION: (u64, u64, u64) = (0, 37, 15);
 
-/// Use the version from the same ConnectionInfo passed to authenticate_client,
-/// only after authentication succeeds. The handshake checks that the server's
-/// daemon_id equals conn.daemon_id, binding the connected daemon to the file it
-/// wrote at startup; daemon_ver itself is not covered by the server proof's HMAC.
-/// Never re-read the file for this decision. Fail closed on anything but three
-/// numeric version components, since an unfamiliar version cannot establish
-/// that the daemon strips forged origin flags.
-fn trusts_daemon_origin(daemon_ver: &str) -> bool {
+/// Whether a connected daemon strips forged `DAEMON_ORIGIN` flags from module
+/// frames: only exact numeric `major.minor.patch` versions at least 0.37.15.
+/// Unknown versions, including pre-release and build suffixes, fail closed.
+///
+/// Pass the version from the same `ConnectionInfo` used by a successful
+/// `authenticate_client` handshake. That handshake checks the daemon id against
+/// the file, but its HMAC does not cover the version itself. Do not re-read the
+/// file to classify a connection that is already authenticated.
+pub fn trusts_daemon_origin(daemon_ver: &str) -> bool {
     let mut components = daemon_ver.split('.');
     let mut next = || {
         let component = components.next()?;
@@ -6786,7 +6787,19 @@ fn trusts_daemon_origin(daemon_ver: &str) -> bool {
     }
 }
 
-fn is_daemon_refusal_before_forward(daemon_origin_trusted: bool, flags: Flags, code: &str) -> bool {
+/// Whether an Error frame proves that its request was never forwarded.
+///
+/// This covers only `module_reloading`, `unknown_channel` and
+/// `stale_route_epoch` with `DAEMON_ORIGIN`, when `daemon_origin_trusted` came
+/// from [`trusts_daemon_origin`] for this connection's authenticated daemon
+/// (0.37.15 or later). It proves only this attempt, not any earlier attempts of
+/// a call. For managed calls use [`CallError::never_forwarded`] instead.
+/// Unmarked errors and untrusted daemon versions never prove non-delivery.
+pub fn is_daemon_refusal_before_forward(
+    daemon_origin_trusted: bool,
+    flags: Flags,
+    code: &str,
+) -> bool {
     daemon_origin_trusted
         && flags.is_daemon_origin()
         && matches!(

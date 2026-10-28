@@ -468,7 +468,7 @@ async fn drive_task(
                     // There is no host request left to report progress on.
                     Some(frame) if frame.header.ty == FrameType::Push => continue,
                     Some(frame) => {
-                        task_state_for(tool_call_answer(&frame, held.retrying), &held.module_id)
+                        task_state_for(frame.tool_call_answer(held.retrying, held.daemon_origin_trusted), &held.module_id)
                     }
                     None => TaskState::Failed(error_object(&route_closed_error(
                         held.route, held.corr,

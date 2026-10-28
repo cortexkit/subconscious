@@ -133,8 +133,10 @@ pub fn account_pseudonym(entry: &Value) -> String {
 }
 
 /// The values `--redact` hides for one row: its email, its account id
-/// (whole, and shortened as [`account_name`] shows it) and its organization's
-/// name. Empty values are left out.
+/// (whole, and shortened as [`account_name`] shows it), its organization's
+/// name, and the label of the stored credential the reading came from
+/// (`credentialRef`). That label was chosen when the credential was saved, so
+/// it can read like a nickname. Empty values are left out.
 pub fn account_identifiers(entry: &Value) -> Vec<String> {
     let email = entry
         .get("accountInfo")
@@ -145,8 +147,13 @@ pub fn account_identifiers(entry: &Value) -> Vec<String> {
     let id = account_label(entry);
     let short = shorten_uuid_label(&id);
     let org = account_org(entry, false).unwrap_or_default();
+    let credential = entry
+        .get("credentialRef")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let mut out: Vec<String> = Vec::new();
-    for value in [email, id, short, org] {
+    for value in [email, id, short, org, credential] {
         if !value.is_empty() && !out.contains(&value) {
             out.push(value);
         }
@@ -699,6 +706,42 @@ mod tests {
             "upstream returned 500"
         );
         assert!(account_identifiers(&json!({ "source": "oauth" })).is_empty());
+    }
+
+    /// A stored credential's label can read like a nickname, so `--redact`
+    /// hides it like the other identifiers, including on an API-key row that
+    /// has no account at all.
+    #[test]
+    fn the_credential_label_is_hidden_under_redact() {
+        let labelled = json!({
+            "account": "0f1e2d3c-aaaa-bbbb-cccc-000000000002",
+            "credentialRef": "oauth:example:alexpersonal",
+        });
+        let ids = account_identifiers(&labelled);
+        assert!(
+            ids.contains(&"oauth:example:alexpersonal".to_string()),
+            "{ids:?}"
+        );
+        let pseudonym = account_name(&labelled, true);
+        assert_eq!(
+            mask_identifiers(
+                "refresh failed for oauth:example:alexpersonal",
+                &ids,
+                &pseudonym
+            ),
+            format!("refresh failed for {pseudonym}")
+        );
+
+        let api_key = json!({ "provider": "example", "credentialRef": "apikey:example" });
+        assert_eq!(account_identifiers(&api_key), ["apikey:example"]);
+        assert_eq!(
+            mask_identifiers(
+                "apikey:example was rejected",
+                &account_identifiers(&api_key),
+                "account"
+            ),
+            "account was rejected"
+        );
     }
 
     #[test]

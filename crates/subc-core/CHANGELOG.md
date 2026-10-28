@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.147
+
+- `ck quota --redact` also hides a reading's stored-credential label
+  (`credentialRef`), through ck-ui 0.2.11.
+
 ## 0.20.146
 
 - When the release index omits Magic Context, `ck setup` treats its module as unavailable without failing and prints how to install the Magic Context plugin, which works without the module. A module release published later still installs normally.

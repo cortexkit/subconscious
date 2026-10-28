@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.11
+
+- `ck quota --redact` also hides a reading's stored-credential label
+  (`credentialRef`), which can read like a nickname. It is masked wherever an
+  account's identifiers are masked, including on API-key rows with no account.
+
 ## 0.2.10
 
 - Add `Theme::foreground_text`, which colours inline command output with the

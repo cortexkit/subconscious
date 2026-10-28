@@ -268,7 +268,7 @@ impl<H: ModuleHandler> ModuleHandler for IssuanceHandler<H> {
         };
         HealthReport {
             status: HealthStatus::Failing,
-            detail: Some("bus.health.down".to_string()),
+            detail: Some("Message bus is down.".to_string()),
             metrics: Some(json!({
                 "class": "Unavailable",
                 "cause": HIGH_WATER_DAMAGED_CAUSE,

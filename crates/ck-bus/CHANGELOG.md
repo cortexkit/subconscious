@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.17
+
+- Test-only: prove that health answers while a broker call is still pending,
+  rather than asserting a 500 ms ceiling on health-response latency.
+- Test-only: give the reply-permission probe's healthy control its own round
+  budget, independent of the production probe's short failure-detection round.
+- Health summaries use plain sentences instead of untranslated detail keys.
+
 ## 0.4.16
 
 - Test-only: the activity-identity test's relay treats a reset or broken

@@ -1470,7 +1470,7 @@ async fn rows_wait_up(connection_file: &Path, run_root: &Path, ready: &Value, pe
     sentinel::wait_health(
         connection_file,
         period * 2 + Duration::from_secs(5),
-        "bus.health.up",
+        "Message bus is up.",
         sentinel::is_up,
     )
     .await;
@@ -1481,7 +1481,7 @@ async fn rows_wait_up(connection_file: &Path, run_root: &Path, ready: &Value, pe
     let took = at_ms(&up) - at_ms(ready);
     assert!(
         Duration::from_millis(took) <= period * 2,
-        "bus.health.up within two periods of the recovered bootstrap: {took} ms"
+        "message bus up within two periods of the recovered bootstrap: {took} ms"
     );
 }
 

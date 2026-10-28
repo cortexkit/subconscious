@@ -434,7 +434,7 @@ async fn a_damaged_high_water_entry_refuses_its_generation_and_a_later_one_issue
 
     let (status, detail, metrics) = bus::health(&run.run.connection_file).await;
     assert_eq!(status, "Failing");
-    assert_eq!(detail.as_deref(), Some("bus.health.down"));
+    assert_eq!(detail.as_deref(), Some("Message bus is down."));
     assert_eq!(metrics["class"], "Unavailable");
     assert_eq!(
         metrics["cause"],

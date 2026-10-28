@@ -78,7 +78,7 @@ impl ModuleHandler for BusHandler {
             Ok(report) => report,
             Err(refusal) => HealthReport {
                 status: HealthStatus::Failing,
-                detail: Some("bus.health.down".to_string()),
+                detail: Some("Message bus is down.".to_string()),
                 metrics: Some(json!({
                     "class": "Unavailable",
                     "runtime_refusal": refusal.to_string(),

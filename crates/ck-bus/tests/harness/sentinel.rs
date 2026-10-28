@@ -159,7 +159,7 @@ pub async fn wait_health(
 
 /// Whether a probe answer is up.
 pub fn is_up(status: &str, detail: Option<&str>, _metrics: &Value) -> bool {
-    status == "Ok" && detail == Some("bus.health.up")
+    status == "Ok" && detail == Some("Message bus is up.")
 }
 
 /// `ckbus`'s `supervisor.list` entry: its state, whether it is registered, and its

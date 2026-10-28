@@ -295,7 +295,7 @@ impl Monitor {
                 metrics["reply_subject"] = Value::String(reply_subject);
                 HealthReport {
                     status: HealthStatus::Ok,
-                    detail: Some("bus.health.up".to_string()),
+                    detail: Some("Message bus is up.".to_string()),
                     metrics: Some(metrics),
                 }
             }
@@ -309,7 +309,7 @@ impl Monitor {
                 metrics["message"] = Value::String(message);
                 HealthReport {
                     status: HealthStatus::Failing,
-                    detail: Some("bus.health.down".to_string()),
+                    detail: Some("Message bus is down.".to_string()),
                     metrics: Some(metrics),
                 }
             }
@@ -615,7 +615,7 @@ pub fn verdict_record(verdict: &Verdict, incarnation: &str) -> Value {
     match verdict {
         Verdict::Up { reply_subject } => {
             record["verdict"] = json!("up");
-            record["detail"] = json!("bus.health.up");
+            record["detail"] = json!("Message bus is up.");
             record["reply_subject"] = json!(reply_subject);
         }
         Verdict::Down {
@@ -624,7 +624,7 @@ pub fn verdict_record(verdict: &Verdict, incarnation: &str) -> Value {
             message,
         } => {
             record["verdict"] = json!("down");
-            record["detail"] = json!("bus.health.down");
+            record["detail"] = json!("Message bus is down.");
             record["class"] = json!(class.as_str());
             record["cause"] = json!(cause);
             record["message"] = json!(message);

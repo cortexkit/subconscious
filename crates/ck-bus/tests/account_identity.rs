@@ -425,7 +425,7 @@ async fn damaged_account_json_fails_closed_naming_the_file() {
     );
     let (status, detail, _) = bus::health(&plane.run.connection_file).await;
     assert_eq!(status, "Failing");
-    assert_eq!(detail.as_deref(), Some("bus.health.down"));
+    assert_eq!(detail.as_deref(), Some("Message bus is down."));
     assert_eq!(
         std::fs::read(&path).unwrap(),
         b"{\"machine_id\": ",

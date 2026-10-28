@@ -263,7 +263,7 @@ Both carry `metrics: Option<serde_json::Value>`.
   record). If the probe path starts truncating, that is a
   `health-class-carrier-unpinned` observation naming the leg.
 - The module writes the byte-exact `Unavailable` or `Denied` at `metrics.class`, with
-  `detail` carrying `bus.health.up` or `bus.health.down` and no class when up. Status is
+  `detail` carrying `Message bus is up.` or `Message bus is down.` and no class when up. Status is
   `Failing` when down (slice 0 record). No second encoding is invented.
 - The persisted verdict never answers for a process that did not write it. On start
   the verdict is down/`Unavailable` until this process's first probe answers.
@@ -542,7 +542,7 @@ Ownership of acts.
   module serves nothing and answers `sysaccount-absent`, per the foundation: revocation
   is never left silently unenforced.
 - Sentinel probe: hosted in the module process, requester and responder in one process
-  through the server, period 10 s, timeout 2 s. Three failures report `bus.health.down`.
+  through the server, period 10 s, timeout 2 s. Three failures report down (`Message bus is down.`).
   A permissions violation on its own sentinel or inbox subjects within the period wins
   over the requester's timeout. These are the shipped defaults, with no operator-facing
   key. The test seam is `CKBUS_SENTINEL_PERIOD_MS` and `CKBUS_SENTINEL_TIMEOUT_MS`,
@@ -1145,7 +1145,7 @@ Row contents.
   the harness sentinel values parsed from the log line, within the 120 s budget.
 - A8 sentinel probe. Every down transition is bounded by `3 * period + timeout` from the
   parsed log line.
-  - Server up: `bus.health.up` within two periods, with the reply on the module's own
+  - Server up: `Message bus is up.` within two periods, with the reply on the module's own
     inbox prefix.
   - Server stopped, reply publish permitted: down/`Unavailable` within the bound, read
     through the probe.

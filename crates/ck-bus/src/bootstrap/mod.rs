@@ -772,7 +772,7 @@ impl SentinelHealth for BootstrapHealth {
         };
         Ok(HealthReport {
             status: HealthStatus::Failing,
-            detail: Some("bus.health.down".to_string()),
+            detail: Some("Message bus is down.".to_string()),
             metrics: Some(metrics),
         })
     }

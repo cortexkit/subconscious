@@ -54,7 +54,7 @@ fn a_new_process_answers_down_unavailable_until_its_first_round() {
     let monitor = Monitor::new("1-1".to_string(), timing(1000, 200));
     let report = monitor.report();
     assert_eq!(report.status, HealthStatus::Failing);
-    assert_eq!(report.detail.as_deref(), Some("bus.health.down"));
+    assert_eq!(report.detail.as_deref(), Some("Message bus is down."));
     assert_eq!(class(&report), Some("Unavailable"));
     assert_eq!(cause_of(&report), Some(cause::NO_ANSWER_YET));
     assert_eq!(report.metrics.as_ref().unwrap()["incarnation"], "1-1");
@@ -69,7 +69,7 @@ fn up_takes_a_success_and_down_takes_three_consecutive_failures() {
     ));
     let report = monitor.report();
     assert_eq!(report.status, HealthStatus::Ok);
-    assert_eq!(report.detail.as_deref(), Some("bus.health.up"));
+    assert_eq!(report.detail.as_deref(), Some("Message bus is up."));
     assert_eq!(class(&report), None, "no class while up");
     assert_eq!(
         report.metrics.as_ref().unwrap()["reply_subject"],
@@ -197,7 +197,7 @@ impl SentinelHealth for FixedBootstrap {
     async fn report_health(&self) -> SeamResult<HealthReport> {
         Ok(HealthReport {
             status: HealthStatus::Failing,
-            detail: Some("bus.health.down".to_string()),
+            detail: Some("Message bus is down.".to_string()),
             metrics: Some(self.0.clone()),
         })
     }

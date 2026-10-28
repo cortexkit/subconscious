@@ -10,7 +10,7 @@
 //!
 //! The row owns the health half of the deferral controls: bootstrap's refusing signer,
 //! the failed census read and a damaged `account.json` each answer down, class
-//! `Unavailable`, with `metrics.cause` naming the cause. Up carries `bus.health.up` and
+//! `Unavailable`, with `metrics.cause` naming the cause. Up carries `Message bus is up.` and
 //! no class. Control: a supervised module that does not advertise `health.check` is
 //! `Unknown` in `supervisor.health` and is never probed (`health_not_advertised`).
 //! A broker that hangs (stopped with SIGSTOP, its socket still open) never slows the
@@ -42,6 +42,7 @@ use std::{
 
 use async_nats::jetstream;
 use cortexkit_bus_naming::AccountNames;
+use futures_util::StreamExt;
 use harness::{
     bus::{self, BusServer, TrustChain, LOOPBACK},
     report::{Row, RowReport, ServedBy},
@@ -149,7 +150,7 @@ async fn start(
     })
 }
 
-/// Asserts a down answer: `Failing`, `bus.health.down`, the byte-exact class
+/// Asserts a down answer: `Failing`, `Message bus is down.`, the byte-exact class
 /// `Unavailable` at `metrics.class`, and `cause` at `metrics.cause`.
 fn assert_down_unavailable(
     status: &str,
@@ -158,7 +159,7 @@ fn assert_down_unavailable(
     cause: &str,
 ) {
     assert_eq!(status, "Failing", "{metrics}");
-    assert_eq!(detail, Some("bus.health.down"), "{metrics}");
+    assert_eq!(detail, Some("Message bus is down."), "{metrics}");
     assert_eq!(
         serde_json::to_string(&metrics["class"]).unwrap(),
         "\"Unavailable\"",
@@ -245,12 +246,12 @@ async fn up_carries_no_class_and_a_failed_census_read_is_down_unavailable() {
     let (status, detail, metrics, _) = rows::wait_health(
         &plane.run.connection_file,
         Duration::from_secs(10),
-        "bus.health.up",
+        "Message bus is up.",
         rows::is_up,
     )
     .await;
     assert_eq!(status, "Ok");
-    assert_eq!(detail.as_deref(), Some("bus.health.up"));
+    assert_eq!(detail.as_deref(), Some("Message bus is up."));
     assert!(
         metrics.get("class").is_none(),
         "no class when up: {metrics}"
@@ -313,6 +314,33 @@ impl Drop for Resume {
     }
 }
 
+async fn stop_broker(pid: u32) -> Resume {
+    rows::signal(pid, "STOP");
+    let resume = Resume(pid);
+    // Sending SIGSTOP does not acknowledge its delivery. Wait for the stopped
+    // state so a fast broker cannot answer between the signal and suspension.
+    tokio::time::timeout(BOOT_LIMIT, async {
+        loop {
+            let output = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p"])
+                .arg(pid.to_string())
+                .output()
+                .expect("ps reads the broker's process state");
+            assert!(output.status.success(), "ps found the broker process");
+            if String::from_utf8_lossy(&output.stdout)
+                .trim_start()
+                .starts_with('T')
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the broker entered the stopped state");
+    resume
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hung_broker_never_slows_the_health_answer() {
     let _gate = harness::acceptance_gate().await;
@@ -324,43 +352,63 @@ async fn a_hung_broker_never_slows_the_health_answer() {
     rows::wait_health(
         &plane.run.connection_file,
         BOOT_LIMIT,
-        "bus.health.up",
+        "Message bus is up.",
         rows::is_up,
     )
     .await;
-    let pid = rows::nats_server_pid(&plane.server.dir);
-    rows::signal(pid, "STOP");
-    let resume = Resume(pid);
-    let hung = Instant::now();
-    let bound = plane.started.down_bound();
-    let mut slowest = Duration::ZERO;
-    let mut down = None;
-    while hung.elapsed() < bound + plane.started.period * 2 {
-        let asked = Instant::now();
-        let (status, _, metrics) = bus::health(&plane.run.connection_file).await;
-        slowest = slowest.max(asked.elapsed());
-        if status == "Failing" && down.is_none() {
-            down = Some((metrics, hung.elapsed()));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    drop(resume);
-    eprintln!("slowest health answer while the broker hung: {slowest:?}");
-    assert!(
-        slowest < Duration::from_millis(500),
-        "the health answer never waits on the hung broker: slowest {slowest:?}"
-    );
-    let (metrics, after) = down.expect("the hung broker is reported down");
+    let broker = bus::system_client(&plane.trust, &plane.server).await;
+    bus::lookup(&broker, &plane.trust.system_account)
+        .await
+        .expect("claims lookup before stopping the broker");
+    let inbox = broker.new_inbox();
+    let mut replies = broker.subscribe(inbox.clone()).await.unwrap();
+    let resume = stop_broker(plane.server.pid()).await;
+
+    // Await a real broker reply, not a local write-buffer flush. A fresh inbox
+    // cannot contain an earlier reply, and no request timeout can unblock it.
+    broker
+        .publish_with_reply(
+            format!(
+                "$SYS.REQ.ACCOUNT.{}.CLAIMS.LOOKUP",
+                plane.trust.system_account
+            ),
+            inbox,
+            Vec::new().into(),
+        )
+        .await
+        .unwrap();
+    let broker_call = replies.next();
+    tokio::pin!(broker_call);
+    assert!(futures_util::poll!(&mut broker_call).is_pending());
+    let (_, _, metrics, _) = tokio::select! {
+        biased;
+        result = &mut broker_call => panic!("the stopped broker answered a lookup: {result:?}"),
+        health = tokio::time::timeout(BOOT_LIMIT, rows::wait_health(
+            &plane.run.connection_file,
+            BOOT_LIMIT,
+            "the hung broker reported down while its lookup is pending",
+            |status, _, _| status == "Failing",
+        )) => health.expect("health must answer without resuming the broker"),
+    };
     assert_eq!(metrics["class"], "Unavailable", "{metrics}");
     assert!(
-        after <= bound + Duration::from_millis(500),
-        "down within the bound ({bound:?}) plus one poll: {after:?}"
+        futures_util::poll!(&mut broker_call).is_pending(),
+        "health answered while the broker lookup was still pending"
+    );
+    drop(resume);
+    let reply = tokio::time::timeout(BOOT_LIMIT, &mut broker_call)
+        .await
+        .expect("the lookup completes after the broker resumes")
+        .expect("the reply subscription stays open");
+    assert!(
+        !reply.payload.is_empty(),
+        "the broker returned the account JWT"
     );
     // Resumed, the bus answers again and the sentinel says so.
     rows::wait_health(
         &plane.run.connection_file,
         plane.started.period * 3,
-        "bus.health.up after the broker resumed",
+        "message bus up after the broker resumed",
         rows::is_up,
     )
     .await;

@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.38.4
+
+- Serve `app.open`: start a known operator app from its installed location
+  or report why it cannot. The decision is ordered: `app_open_not_used` on
+  macOS and on platforms without a launcher (neither launches through the
+  daemon), `app_open_disabled` when the platform switch is off,
+  `app_unknown` for an app the compiled table does not name,
+  `already_running` while a launch entry is live, `app_not_installed` when
+  the installed file is missing, and only then verification and launch. In
+  production every switch is off, so Windows and Linux answer
+  `app_open_disabled` and macOS answers `app_open_not_used`; with the
+  Windows or Linux switch forced on, the non-test table, which names no app,
+  answers `app_unknown`.
+- Track one launch entry per app in memory: a daemon-generated incarnation
+  id, the pid, and the platform liveness handle (pidfd on Linux, the owned
+  process handle on Windows). On Windows the entry is published before the
+  image is resumed, so a child that connects at once is matched; on Linux it
+  is published after spawn and tracking, so the image may run first, which is
+  safe because Linux connections are never stamped. Entries retire when the
+  handle reports exit, and die with the daemon, so a restarted daemon never
+  mistakes an older process for its launch and a reused pid confers nothing.
+  A pipe client is eligible only when its pid is that of a live launch
+  entry; Linux records entries but never stamps.
+- Launch on Windows from a read-sharing held handle. Before any process
+  exists, an injected check receives the held capture with the expected
+  publisher and floor, and the daemon enforces the floor on the version it
+  returns; production carries no verifier and fails closed, and no
+  production Windows binary is eligible while the publisher is unset. The
+  child starts suspended outside the daemon's root job and its image is
+  compared before resume. Every failure after the child exists stops it and
+  refuses `app_verification_failed`; a failure before that refuses with no
+  child to stop. `already_running` starts nothing: Windows calls an optional
+  best-effort attention hook (production only logs) and Linux does nothing.
+- Launch on Linux with a clean environment (no `LD_PRELOAD`,
+  `LD_LIBRARY_PATH` or `LD_AUDIT`). With `systemd-run` and a user bus it
+  starts in its own transient user scope, which a daemon or installed-service
+  restart does not reach; otherwise it gets its own process group, which
+  does not move it out of a service cgroup, so service cleanup can still
+  stop it. Either way it reconnects unstamped.
+- `app.open` is classified `None`: it never prompts in `enforce` mode and
+  never logs in `log` mode. Delivery of a Windows launch stamp on
+  `route.bind` is gated by the Windows switch, like the macOS stamp by its
+  own.
+
 ## 0.38.3
 
 - Test-only: each local-listener test gets its own socket directory. Two

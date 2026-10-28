@@ -21,9 +21,16 @@ fn release_floor_uses_numeric_semver_and_rejects_unknown_versions() {
 fn advisory_peer_facts_cannot_produce_a_stamp() {
     let policy: OperatorAppPolicy = TestOperatorAppPolicy {
         macos_enabled: true,
+        windows_enabled: false,
+        linux_enabled: false,
         app: "test-app",
         requirement: "always",
         floor: Version::new(1, 2, 10),
+        windows_publisher: None,
+        windows_path: None,
+        linux_path: None,
+        windows_breakaway: true,
+        linux_force_direct: false,
     }
     .into();
     let peer = ObservedPeer::Observed(subc_os::local_peer::PeerObservation {
@@ -50,9 +57,16 @@ mod macos {
     fn policy() -> OperatorAppPolicy {
         TestOperatorAppPolicy {
             macos_enabled: true,
+            windows_enabled: false,
+            linux_enabled: false,
             app: "test-app",
             requirement: REQUIREMENT,
             floor: Version::new(1, 2, 10),
+            windows_publisher: None,
+            windows_path: None,
+            linux_path: None,
+            windows_breakaway: true,
+            linux_force_direct: false,
         }
         .into()
     }

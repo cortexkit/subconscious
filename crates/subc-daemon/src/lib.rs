@@ -7,6 +7,10 @@
 #![forbid(unsafe_code)]
 
 mod activity;
+/// `app.open` starts a known operator app from its installed location. See
+/// the module for the ordered decision, the launch table, and the platform
+/// launchers.
+pub mod app_open;
 pub mod bootstrap;
 pub mod caller_identity;
 pub(crate) mod capability_requirements;

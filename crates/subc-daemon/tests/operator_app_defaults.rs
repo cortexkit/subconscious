@@ -22,6 +22,10 @@ fn operator_app_production_switches_and_identity_are_fail_closed() {
     );
     assert_eq!(app.windows_executable, "Alfonso.exe");
     assert_eq!(app.linux_executable, "alfonso");
+    // No platform launches or verifies in production: the publisher, the
+    // install locations and the Linux index identity are all unset, so
+    // `app.open` answers `app_unknown` on Windows and Linux and the pipe and
+    // peer paths stamp nothing.
     assert_eq!(app.windows_publisher, None);
     assert_eq!(app.windows_path, None);
     assert_eq!(app.linux_path, None);

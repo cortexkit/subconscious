@@ -239,9 +239,16 @@ async fn operator_app_bind_is_gated_independently_and_the_stamp_survives_route_c
                     let handler = ControlHandler::default().with_test_operator_app_policy(
                         crate::operator_apps::TestOperatorAppPolicy {
                             macos_enabled: enabled,
+                            windows_enabled: false,
+                            linux_enabled: false,
                             app: "fixture",
                             requirement: "always",
                             floor: semver::Version::new(1, 2, 10),
+                            windows_publisher: None,
+                            windows_path: None,
+                            linux_path: None,
+                            windows_breakaway: true,
+                            linux_force_direct: false,
                         },
                     );
                     let (target, mut rx) = route_ctx(ConnectionId::new(1));
@@ -330,9 +337,16 @@ async fn operator_app_native_connection_is_stamped_again_by_a_restarted_daemon()
         let handler = ControlHandler::default().with_test_operator_app_policy(
             crate::operator_apps::TestOperatorAppPolicy {
                 macos_enabled: true,
+                windows_enabled: false,
+                linux_enabled: false,
                 app: "fixture",
                 requirement: "identifier \"io.cortexkit.alfonso.fixture\"",
                 floor: semver::Version::new(1, 2, 10),
+                windows_publisher: None,
+                windows_path: None,
+                linux_path: None,
+                windows_breakaway: true,
+                linux_force_direct: false,
             },
         );
         let (target, mut rx) = route_ctx(ConnectionId::new(1));
@@ -565,4 +579,80 @@ async fn accepted_local_and_tcp_connections_relay_their_own_peer_snapshot() {
     let _ = tcp_server.await;
     let _ = local_server.await;
     std::fs::remove_dir(&socket_dir).unwrap();
+}
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_launch_stamp_is_relayed_only_with_the_windows_switch() {
+    use subc_os::local_peer::{ObservedPeer as OsPeer, PeerObservation, PeerUser};
+
+    for enabled in [false, true] {
+        let handler = ControlHandler::default().with_test_operator_app_policy(
+            crate::operator_apps::TestOperatorAppPolicy {
+                macos_enabled: false,
+                windows_enabled: enabled,
+                linux_enabled: false,
+                app: "fixture",
+                requirement: "always",
+                floor: semver::Version::new(1, 2, 10),
+                windows_publisher: None,
+                windows_path: None,
+                linux_path: None,
+                windows_breakaway: true,
+                linux_force_direct: false,
+            },
+        );
+        let (target, mut rx) = route_ctx(ConnectionId::new(1));
+        let mut hello: Value =
+            serde_json::from_slice(&hello_frame("target", PROTOCOL_VERSION, 1).body).unwrap();
+        hello["manifest"]["capabilities"] = json!({"provides":["operator-app/v1"]});
+        hello_via_sink(
+            &handler,
+            &target,
+            &mut rx,
+            Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                1,
+                serde_json::to_vec(&hello).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await;
+        // A pipe client whose pid matches a live launch entry is stamped with
+        // the entry's incarnation; the bind carries it only with the Windows
+        // switch on.
+        let own_pid = std::process::id();
+        let process = subc_os::Process::open(own_pid).unwrap().unwrap();
+        let incarnation = handler.launch_table.publish("fixture", own_pid, process, None);
+        let (client, _client_rx) = route_ctx(ConnectionId::new(2));
+        handler.record_captured_peer(
+            client.connection_id,
+            subc_os::local_peer::CapturedPeer::from(OsPeer::Observed(PeerObservation {
+                user: PeerUser::Sid("S-1-5-21-1".to_string()),
+                pid: own_pid,
+                exe: None,
+                signing_id: None,
+            })),
+        );
+        assert!(handler.launch_table.is_live_incarnation("fixture", incarnation));
+        let root = unique_project_root("windows-stamp-bind");
+        let identity = BindIdentity::new(root.path().to_path_buf(), "unit", "s");
+        let (bind, binding) =
+            bind_route(&handler, &target, &mut rx, &client, identity, None).await;
+        let raw: Value = serde_json::from_slice(&bind.body).unwrap();
+        assert_eq!(
+            raw.get("operator_app"),
+            enabled
+                .then(|| json!({"app": "fixture", "pid": own_pid}))
+                .as_ref(),
+            "enabled={enabled}"
+        );
+        // Without the switch no stamp is recorded at all, mirroring the
+        // macOS gate; with it the binding carries the stamp and only the
+        // relay is gated.
+        assert_eq!(binding.operator_app.is_some(), enabled, "enabled={enabled}");
+        handler.cleanup_connection(client.connection_id).unwrap();
+    }
 }

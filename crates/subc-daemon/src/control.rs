@@ -412,8 +412,39 @@ pub struct ControlHandler {
     caller_endpoints: Arc<Mutex<HashMap<ConnectionId, (SocketAddr, SocketAddr)>>>,
     build_class_warned: Arc<Mutex<HashSet<ConnectionId>>>,
     observed_peers: Arc<Mutex<HashMap<ConnectionId, ObservedPeer>>>,
-    operator_app_policy: crate::operator_apps::OperatorAppPolicy,
-    operator_apps: Arc<Mutex<HashMap<ConnectionId, crate::operator_apps::OperatorAppStamp>>>,
+    pub(crate) operator_app_policy: crate::operator_apps::OperatorAppPolicy,
+    pub(crate) operator_apps:
+        Arc<Mutex<HashMap<ConnectionId, crate::operator_apps::OperatorAppStamp>>>,
+    /// One launch entry per app, behind a leaf lock: no other lock is taken
+    /// while it is held. Entries are memory-only, so a daemon or
+    /// installed-service restart drops them and a relaunched daemon never
+    /// mistakes an older process for its own launch.
+    pub(crate) launch_table: std::sync::Arc<crate::app_open::LaunchTable>,
+    /// Serializes `app.open` launches: the liveness check in the decision and
+    /// the later publish must not interleave across concurrent calls, or two
+    /// calls could both launch and the second publish would orphan the first
+    /// process. Refusals and `already_running` answers share the same lock;
+    /// `app.open` is rare, so the cost is negligible.
+    pub(crate) app_open_launch_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Test-only Windows signature and flash hooks. Production builds carry
+    /// neither: with the publisher unset, the production table never reaches
+    /// verification, and the default attention hook only logs.
+    #[allow(dead_code)]
+    #[cfg(windows)]
+    pub(crate) windows_verify: Option<crate::app_open::WindowsVerifyFn>,
+    #[allow(dead_code)]
+    #[cfg(windows)]
+    pub(crate) windows_flash: Option<crate::app_open::WindowsFlashFn>,
+    /// Test-only tracking fault hook: makes opening the tracking handle on
+    /// the launched pid fail, so a test can prove an untrackable launch is
+    /// stopped rather than left running.
+    #[allow(dead_code)]
+    #[cfg(windows)]
+    pub(crate) windows_track: Option<crate::app_open::WindowsTrackFn>,
+    /// Test-only count of Windows spawn attempts, so a test can prove a
+    /// refused launch started no process. Unit tests only.
+    #[cfg(all(test, windows))]
+    pub(crate) windows_spawn_attempts: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     caller_lookup: Option<TestCallerLookup>,
     /// The launch nonce each module connection presented at HELLO, which is how
@@ -1001,6 +1032,16 @@ impl ControlHandler {
             observed_peers: Arc::new(Mutex::new(HashMap::new())),
             operator_app_policy: Default::default(),
             operator_apps: Arc::new(Mutex::new(HashMap::new())),
+            launch_table: std::sync::Arc::new(crate::app_open::LaunchTable::new()),
+            app_open_launch_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(windows)]
+            windows_verify: None,
+            #[cfg(windows)]
+            windows_flash: None,
+            #[cfg(windows)]
+            windows_track: None,
+            #[cfg(all(test, windows))]
+            windows_spawn_attempts: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(test)]
             caller_lookup: None,
             hello_launch_nonces: Arc::new(Mutex::new(HelloLaunchNonces::default())),
@@ -1781,12 +1822,44 @@ impl ControlHandler {
         self
     }
 
+    /// Inject the Windows signature check for tests. The injected check
+    /// answers the verified version string or the rejection reason; the
+    /// daemon enforces the floor itself on the returned version.
+    #[cfg(all(windows, any(test, feature = "test-support")))]
+    pub fn with_test_windows_verifier(mut self, verify: crate::app_open::WindowsVerifyFn) -> Self {
+        self.windows_verify = Some(verify);
+        self
+    }
+
+    /// Record which pids the daemon would flash for `already_running`.
+    #[cfg(all(windows, any(test, feature = "test-support")))]
+    pub fn with_test_windows_flash(mut self, flash: crate::app_open::WindowsFlashFn) -> Self {
+        self.windows_flash = Some(flash);
+        self
+    }
+
+    /// Inject a tracking failure for tests: makes `track_launched_process`
+    /// fail so a test can prove a launch that cannot be tracked is stopped,
+    /// never left running.
+    #[cfg(all(windows, any(test, feature = "test-support")))]
+    pub fn with_test_windows_track(mut self, track: crate::app_open::WindowsTrackFn) -> Self {
+        self.windows_track = Some(track);
+        self
+    }
+
     pub(crate) fn record_captured_peer(
         &self,
         connection: ConnectionId,
         peer: subc_os::local_peer::CapturedPeer,
     ) {
         self.record_observed_peer(connection, peer.observation().clone());
+        #[cfg(windows)]
+        if let Some(stamp) = self.stamp_windows_launch(&peer) {
+            self.operator_apps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(connection, stamp);
+        }
         if let Some(stamp) = self.operator_app_policy.stamp(peer) {
             self.operator_apps
                 .lock()
@@ -1933,6 +2006,9 @@ impl ControlHandler {
                     .is_some_and(|probe| probe.op == "operator.confirm")
                 {
                     return self.handle_operator_confirm(ctx, frame);
+                }
+                if op.as_ref().is_some_and(|probe| probe.op == ops::APP_OPEN) {
+                    return self.handle_app_open(ctx, frame).await;
                 }
                 if op
                     .as_ref()
@@ -5341,8 +5417,8 @@ impl ControlHandler {
             )
             .with_operator_app(
                 operator_app
-                    .filter(|_| {
-                        self.operator_app_policy.macos_enabled
+                    .filter(|stamp| {
+                        stamp.delivery_enabled(&self.operator_app_policy)
                             && relay_capabilities.is_some_and(|caps| {
                                 caps.provides
                                     .iter()
@@ -8086,7 +8162,7 @@ fn control_error_frame_with_flags(
     .map_err(RouterError::FrameBuild)
 }
 
-fn control_response_body_frame<T: Serialize>(
+pub(crate) fn control_response_body_frame<T: Serialize>(
     frame: &Frame,
     reply: &T,
     label: &'static str,

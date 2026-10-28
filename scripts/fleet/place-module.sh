@@ -70,7 +70,7 @@
 # Usage:
 #   place-module.sh --module <id> --staged <path> [--dest <path>] [--path-face <name>]
 #                   --marker <string> [--control <string>] [--old-control <string>]
-#                   --tool-defs <unchanged|additive|changed|none> [--host-restart-window]
+#                   --tool-defs <unchanged|additive|unregistered|changed|none> [--host-restart-window]
 #                   [--no-restart]
 #   place-module.sh --module <id> --rollback <stamp> [--dest <path>]
 #                   [--restore-store <path>] [--no-restart]
@@ -171,10 +171,17 @@ else
         # Changed property descriptions, types or required lists, and removed
         # properties, are not additive: those are --tool-defs changed.
         echo "tool definitions: additive (new optional properties or tool-level description only); running heads keep their registered tools" ;;
+      unregistered)
+        # Core checks each head's registered tools one by one, and only the
+        # tools that head was granted; a provider's catalog generation and
+        # digest are not compared on that path. So a changed definition on a
+        # tool that no head registers leaves every running head's tools valid.
+        # The person placing it must have checked that no head registers it.
+        echo "tool definitions: changed only on tools no head registers; running heads keep their registered tools" ;;
       changed)
         [ "$HOST_RESTART_WINDOW" -eq 1 ] || { echo "REFUSED: --tool-defs changed: a tool definition change is placed only just before a host restart; pass --host-restart-window when that restart is booked" >&2; exit 2; } ;;
-      "") echo "REFUSED: --tool-defs is required: compare the build's tool descriptions and schemas against the RUNNING build and pass unchanged, additive, changed or none (serves no tools)" >&2; exit 2 ;;
-      *) echo "REFUSED: --tool-defs must be unchanged, additive, changed or none, not '$TOOL_DEFS'" >&2; exit 2 ;;
+      "") echo "REFUSED: --tool-defs is required: compare the build's tool descriptions and schemas against the RUNNING build and pass unchanged, additive, unregistered, changed or none (serves no tools)" >&2; exit 2 ;;
+      *) echo "REFUSED: --tool-defs must be unchanged, additive, unregistered, changed or none, not '$TOOL_DEFS'" >&2; exit 2 ;;
     esac
   fi
 fi

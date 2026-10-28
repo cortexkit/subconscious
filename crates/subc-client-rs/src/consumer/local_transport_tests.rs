@@ -118,6 +118,239 @@ fn local_opts() -> ConsumerOptions {
     }
 }
 
+fn identity_query() -> ActivityQueryRequest {
+    serde_json::from_value(serde_json::json!({"op": "activity.query", "limit": 1})).unwrap()
+}
+
+async fn run_identity_round(
+    client: &SubcConsumer,
+    target: &RouteTarget,
+    identity: &BindIdentity,
+    explicit: &ConsumerIdentity,
+) {
+    for consumer_identity in [None, Some(explicit.clone())] {
+        let handle = client
+            .open_route(
+                target.clone(),
+                identity.clone(),
+                CallOptions {
+                    consumer_identity: consumer_identity.clone(),
+                    timeout: BUDGET,
+                    ..CallOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .close_route(
+                target.clone(),
+                identity.clone(),
+                CloseRouteOptions {
+                    consumer_identity,
+                    ..CloseRouteOptions::default()
+                },
+            )
+            .await;
+        assert!(
+            client.shared.route_state(handle).is_err(),
+            "close must find the same identity-keyed route"
+        );
+    }
+    let error = client.query_activity(identity_query()).await.unwrap_err();
+    assert_eq!(error.code(), Some("test_complete"));
+    let mut subscription = client.subscribe_activity(None).await.unwrap();
+    assert!(subscription.next().await.is_err());
+}
+
+fn spawn_identity_server(
+    listener: LocalListener,
+    info: ConnectionInfo,
+    identities: Vec<Option<ConsumerIdentity>>,
+    activity_identity: Option<ConsumerIdentity>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut stream = accept(listener).await;
+        authenticate_server(
+            &mut stream,
+            &info.key,
+            &info.daemon_id,
+            &info.daemon_ver,
+            BUDGET,
+        )
+        .await
+        .unwrap();
+        for (index, identity) in identities.into_iter().enumerate() {
+            let request = read_frame(&mut stream).await.unwrap().unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["op"], "route.open");
+            assert_eq!(
+                body.get("consumer_identity"),
+                identity
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .unwrap()
+                    .as_ref()
+            );
+            let channel = 7 + index as u16;
+            let reply = Frame::build(
+                FrameType::Response,
+                control_flags(),
+                0,
+                0,
+                request.header.corr,
+                serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                    route_channel: channel,
+                    route_epoch: 1,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut stream, &reply).await.unwrap();
+            stream.flush().await.unwrap();
+            // Closing is a one-way GOODBYE, not a JSON identity-bearing request.
+            // Seeing it proves close_route used the same identity-keyed route.
+            let goodbye = read_frame(&mut stream).await.unwrap().unwrap();
+            assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+            assert_eq!(goodbye.header.channel, channel);
+            assert!(goodbye.body.is_empty());
+        }
+        for op in ["activity.query", "activity.subscribe"] {
+            let request = read_frame(&mut stream).await.unwrap().unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["op"], op);
+            assert_eq!(
+                body.get("consumer_identity"),
+                activity_identity
+                    .as_ref()
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .unwrap()
+                    .as_ref()
+            );
+            let reply = Frame::build(
+                FrameType::Error,
+                control_flags(),
+                0,
+                0,
+                request.header.corr,
+                serde_json::to_vec(&ErrorBody::new("test_complete", "identity captured")).unwrap(),
+            )
+            .unwrap();
+            write_frame(&mut stream, &reply).await.unwrap();
+            stream.flush().await.unwrap();
+        }
+    })
+}
+
+#[tokio::test]
+async fn operator_app_omits_environment_identity_and_honours_explicit() {
+    const CHILD: &str = "SUBC_OPERATOR_IDENTITY_CHILD";
+    let inherited = ConsumerIdentity {
+        module_id: "untrusted-launcher".into(),
+        launch_nonce: "untrusted-environment-nonce".into(),
+    };
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "consumer::local_transport_tests::operator_app_omits_environment_identity_and_honours_explicit",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("SUBC_MODULE_ID", &inherited.module_id)
+            .env("SUBC_LAUNCH_NONCE", &inherited.launch_nonce)
+            .env_remove("SUBC_LAUNCH_NONCE_FD")
+            .env_remove("SUBC_LAUNCH_NONCE_HANDLE")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+
+    timeout(Duration::from_secs(20), async {
+        let dir = socket_dir();
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let info = info(&tcp);
+        let file = dir.join("connection.json");
+        let explicit = ConsumerIdentity {
+            module_id: "explicit-caller".into(),
+            launch_nonce: "explicit-nonce".into(),
+        };
+        let target = RouteTarget::ToolProvider {
+            module_id: "provider".into(),
+        };
+        let identity = BindIdentity::new(dir.to_path_buf(), "test", "operator");
+
+        let (endpoint, listener) = listen(&dir, "operator");
+        write_atomic_with_local_endpoint(&file, &info, Some(&endpoint)).unwrap();
+        let task = spawn_identity_server(
+            listener,
+            info.clone(),
+            vec![None, Some(explicit.clone())],
+            None,
+        );
+        // Inject only the resolved path so the real constructor's policy and
+        // local connection setup run without touching the installed daemon.
+        let client =
+            SubcConsumer::connect_operator_app_resolving(local_opts(), || Ok(file.clone()))
+                .await
+                .unwrap();
+
+        run_identity_round(&client, &target, &identity, &explicit).await;
+        timeout(BUDGET, task).await.unwrap().unwrap();
+        let (endpoint, listener) = listen(&dir, "reconnected");
+        write_atomic_with_local_endpoint(&file, &info, Some(&endpoint)).unwrap();
+        let next = spawn_identity_server(
+            listener,
+            info.clone(),
+            vec![None, Some(explicit.clone())],
+            None,
+        );
+        // The next call must reconnect using the new file endpoint,
+        // retaining the operator-app identity policy.
+        run_identity_round(&client, &target, &identity, &explicit).await;
+        timeout(BUDGET, next).await.unwrap().unwrap();
+        client.close().await;
+
+        // Legacy constructors still use the identity supplied through the launch environment.
+        let (endpoint, listener) = listen(&dir, "legacy");
+        write_atomic_with_local_endpoint(&file, &info, Some(&endpoint)).unwrap();
+        let task = spawn_identity_server(
+            listener,
+            info,
+            vec![Some(inherited.clone())],
+            Some(inherited),
+        );
+        let legacy = SubcConsumer::connect_local(&file, local_opts())
+            .await
+            .unwrap();
+        legacy
+            .open_route(target.clone(), identity.clone(), CallOptions::default())
+            .await
+            .unwrap();
+        legacy
+            .close_route(target, identity, CloseRouteOptions::default())
+            .await;
+        assert_eq!(
+            legacy
+                .query_activity(identity_query())
+                .await
+                .unwrap_err()
+                .code(),
+            Some("test_complete")
+        );
+        let mut subscription = legacy.subscribe_activity(None).await.unwrap();
+        assert!(subscription.next().await.is_err());
+        timeout(BUDGET, task).await.unwrap().unwrap();
+        legacy.close().await;
+        assert_no_tcp(&tcp).await;
+    })
+    .await
+    .expect("identity exercise must finish");
+}
+
 #[tokio::test]
 async fn default_transport_is_tcp_with_unchanged_frames() {
     let dir = socket_dir();

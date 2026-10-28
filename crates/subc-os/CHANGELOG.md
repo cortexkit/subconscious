@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.24
+
+- Add the safe macOS-only `darwin_user_temp_dir()` API. It reads `confstr(_CS_DARWIN_USER_TEMP_DIR)`, validates the complete, terminated absolute path, and never consults `TMPDIR` or any other environment variable. The platform FFI stays inside subc-os so callers can keep forbidding unsafe code.
+
 ## 0.1.23
 
 - Add `local_peer::capture_unix_peer` and `CapturedPeer::check_code_requirement`. macOS keeps the accept-time audit token private and uses it for `SecCodeCheckValidity`, requires hardened runtime, and returns the optional short version from the validated code's signing information. The result distinguishes satisfied, not satisfied and unverifiable; missing tokens and non-macOS platforms are unverifiable. No pid or executable path can stand in for a captured token. Existing advisory observation APIs are unchanged.

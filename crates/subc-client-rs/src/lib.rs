@@ -2,6 +2,7 @@
 
 pub mod activity;
 pub mod consumer;
+mod operator_app;
 pub mod policy_cache;
 #[cfg(any(test, feature = "test-support"))]
 mod stand_in;
@@ -22,6 +23,7 @@ pub use consumer::{
     DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH,
     SPAWN_CURSOR_TOO_OLD, SPAWN_SUBSCRIBER_LAGGED,
 };
+pub use operator_app::{operator_app_path, OperatorAppPathError};
 pub use policy_cache::{
     PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyResolverFootprint,
     PolicyVerdict, ProjectRef, Subject, DEFAULT_POLICY_RESOLVER_MODULE_ID,

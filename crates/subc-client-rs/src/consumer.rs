@@ -488,8 +488,8 @@ pub struct CloseRouteOptions {
     /// Upper bound on the drain wait (ignored when `drain` is false).
     pub drain_timeout: Duration,
     /// Override for the consumer identity used to locate the route being closed;
-    /// when absent, SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables
-    /// identify the route for a supervised consumer.
+    /// when absent, the supervised launch identity identifies the route, except
+    /// on connections created by [`SubcConsumer::connect_operator_app`].
     pub consumer_identity: Option<ConsumerIdentity>,
     /// Reverse-request handlers plus extra capability strings added through
     /// [`Self::with_consumer_capability`]. Together, they identify the route being closed.
@@ -551,7 +551,9 @@ pub struct CallOptions {
     pub route_retry: RetryBackoff,
     /// Maximum real-time limit for retrying route.open attempts when the target is temporarily absent.
     pub route_retry_deadline: Duration,
-    /// Explicit consumer identity for route.open; when absent, non-empty SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used.
+    /// Explicit consumer identity for route.open; when absent, the supervised
+    /// launch identity is used, except on [`SubcConsumer::connect_operator_app`]
+    /// connections, which omit implicit identity.
     pub consumer_identity: Option<ConsumerIdentity>,
     /// Reverse-request handlers plus extra capability strings added with
     /// [`Self::with_consumer_capability`]. For example, `tool-result/v1` declares
@@ -636,7 +638,9 @@ pub struct SubscribeOptions {
     /// Deadline for opening the managed route and queuing the held-open request.
     /// The subscription itself has no response timeout once the request is sent.
     pub route_open_timeout: Duration,
-    /// Explicit consumer identity for route.open; when absent, non-empty SUBC_MODULE_ID and SUBC_LAUNCH_NONCE environment variables are used.
+    /// Explicit consumer identity for route.open; when absent, the supervised
+    /// launch identity is used, except on [`SubcConsumer::connect_operator_app`]
+    /// connections, which omit implicit identity.
     pub consumer_identity: Option<ConsumerIdentity>,
     /// Reverse-request handlers plus extra capability strings added with
     /// [`Self::with_consumer_capability`]. For example, `tool-result/v1` declares
@@ -1163,7 +1167,7 @@ impl SubcConsumer {
         connection_file: &Path,
         opts: ConsumerOptions,
     ) -> Result<Self, ConsumerError> {
-        Self::connect_with_transport(connection_file, opts, ConsumerTransport::Tcp).await
+        Self::connect_with_transport(connection_file, opts, ConsumerTransport::Tcp, true).await
     }
 
     /// Connect only to the connection file's same-user Unix socket or Windows pipe.
@@ -1176,20 +1180,19 @@ impl SubcConsumer {
         connection_file: &Path,
         opts: ConsumerOptions,
     ) -> Result<Self, ConsumerError> {
-        Self::connect_with_transport(connection_file, opts, ConsumerTransport::Local).await
+        Self::connect_with_transport(connection_file, opts, ConsumerTransport::Local, true).await
     }
 
     async fn connect_with_transport(
         connection_file: &Path,
         opts: ConsumerOptions,
         transport: ConsumerTransport,
+        identity_from_environment: bool,
     ) -> Result<Self, ConsumerError> {
         let opened = open_connection(connection_file, opts.handshake_timeout, transport).await?;
-        let shared = Arc::new(Shared::with_transport(
-            connection_file.to_path_buf(),
-            opts,
-            transport,
-        ));
+        let mut shared = Shared::with_transport(connection_file.to_path_buf(), opts, transport);
+        shared.identity_from_environment = identity_from_environment;
+        let shared = Arc::new(shared);
         shared.install_initial(opened)?;
         Ok(Self { shared })
     }
@@ -1216,6 +1219,33 @@ impl SubcConsumer {
         Self::connect_local(&discovered.path, opts).await
     }
 
+    /// Connect the desktop operator app to the installed daemon without reading
+    /// environment variables for discovery or consumer identity.
+    ///
+    /// Resolves the path with [`crate::operator_app_path`] and uses the
+    /// same owner checks, per-attempt file reads and local-only transport as
+    /// [`Self::connect_local`], never falling back to TCP. Requests omit implicit
+    /// consumer identity, including after reconnect; explicit identities in
+    /// [`CallOptions`] and [`CloseRouteOptions`] are still honoured.
+    pub async fn connect_operator_app(opts: ConsumerOptions) -> Result<Self, ConsumerError> {
+        Self::connect_operator_app_resolving(opts, crate::operator_app_path).await
+    }
+
+    async fn connect_operator_app_resolving(
+        opts: ConsumerOptions,
+        resolve: impl FnOnce() -> Result<PathBuf, crate::OperatorAppPathError>,
+    ) -> Result<Self, ConsumerError> {
+        let path = resolve().map_err(|source| ConsumerError::ConnectionFile {
+            path: PathBuf::new(),
+            source: ConnectionFileError::Io {
+                op: "resolve installed daemon connection-file path",
+                path: PathBuf::new(),
+                source: io::Error::other(source),
+            },
+        })?;
+        Self::connect_with_transport(&path, opts, ConsumerTransport::Local, false).await
+    }
+
     /// Open or reuse a managed route and return its connection-fenced handle.
     pub async fn open_route(
         &self,
@@ -1224,7 +1254,7 @@ impl SubcConsumer {
         opts: CallOptions,
     ) -> Result<RouteHandle, CallError> {
         let deadline = Instant::now() + opts.timeout;
-        let consumer_identity = route_open_consumer_identity(&opts);
+        let consumer_identity = self.shared.route_open_consumer_identity(&opts);
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
         let role_versions = route_open_role_versions(opts.role_versions.as_ref());
         let key = RouteKey::new(
@@ -1288,7 +1318,7 @@ impl SubcConsumer {
         opts: CallOptions,
     ) -> Result<RouteHandle, CallError> {
         let deadline = Instant::now() + opts.timeout;
-        let consumer_identity = route_open_consumer_identity(&opts);
+        let consumer_identity = self.shared.route_open_consumer_identity(&opts);
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
         let role_versions = route_open_role_versions(opts.role_versions.as_ref());
         let key = RouteKey::new(
@@ -1395,7 +1425,7 @@ impl SubcConsumer {
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
             target,
             identity,
-            consumer_identity: route_open_consumer_identity(opts),
+            consumer_identity: self.shared.route_open_consumer_identity(opts),
             consumer_capabilities,
             role_versions: route_open_role_versions(opts.role_versions.as_ref()),
             admission_facts: Some(facts),
@@ -1652,15 +1682,16 @@ impl SubcConsumer {
 
     /// Query the newest-first activity ledger. The reply preserves entries, the
     /// continuation cursor and the head to subscribe from without a query/follow gap.
-    /// Identity is filled from the supervised launch environment, as for route.open;
-    /// without one the daemon treats the caller as Direct. Refusals retain their code
+    /// Except for operator-app connections, identity is filled from the supervised
+    /// launch environment, as for route.open; without one the daemon treats the
+    /// caller as Direct. Refusals retain their code
     /// through [`CallError::code`]. Transport retries are paced to the call deadline.
     pub async fn query_activity(
         &self,
         request: ActivityQueryRequest,
     ) -> Result<ActivityQueryResponse, CallError> {
         let deadline = Instant::now() + self.shared.opts.call_timeout;
-        let body = activity_read_body(request)?;
+        let body = self.shared.activity_read_body(request)?;
         let mut attempt = 0usize;
         loop {
             attempt = attempt.saturating_add(1);
@@ -1708,7 +1739,9 @@ impl SubcConsumer {
         since: Option<ActivityCursor>,
     ) -> Result<ActivitySubscription, CallError> {
         let deadline = Instant::now() + self.shared.opts.call_timeout;
-        let body = activity_read_body(ActivitySubscribeRequest { since })?;
+        let body = self
+            .shared
+            .activity_read_body(ActivitySubscribeRequest { since })?;
         loop {
             self.shared.ensure_connected_for_call(deadline).await?;
             let permit = Arc::new(Semaphore::new(1))
@@ -2263,7 +2296,7 @@ impl SubcConsumer {
         // Preserve the single resend policy even for older daemons whose
         // unmarked refusals cannot prove that the module never saw the request.
         let mut resent_after_unsent_refusal = false;
-        let consumer_identity = route_open_consumer_identity(&opts);
+        let consumer_identity = self.shared.route_open_consumer_identity(&opts);
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
         let role_versions = route_open_role_versions(opts.role_versions.as_ref());
         let route_key = RouteKey::new(
@@ -2435,7 +2468,7 @@ impl SubcConsumer {
             reverse_requests: opts.reverse_requests.clone(),
             role_versions: opts.role_versions.clone(),
         };
-        let consumer_identity = route_open_consumer_identity(&route_opts);
+        let consumer_identity = self.shared.route_open_consumer_identity(&route_opts);
         let consumer_capabilities = route_open_consumer_capabilities(&route_opts);
         let role_versions = route_open_role_versions(route_opts.role_versions.as_ref());
         let route_key = RouteKey::new(
@@ -2526,7 +2559,7 @@ impl SubcConsumer {
         identity: BindIdentity,
         opts: CloseRouteOptions,
     ) {
-        let consumer_identity = close_route_consumer_identity(&opts);
+        let consumer_identity = self.shared.close_route_consumer_identity(&opts);
         let consumer_capabilities = close_route_consumer_capabilities(&opts);
         let key = RouteKey::new(
             &target,
@@ -3140,6 +3173,7 @@ struct Shared {
     connection_file: PathBuf,
     opts: ConsumerOptions,
     transport: ConsumerTransport,
+    identity_from_environment: bool,
     inner: Mutex<Inner>,
     notify: Notify,
     #[cfg(test)]
@@ -3367,6 +3401,7 @@ impl Shared {
             connection_file,
             opts,
             transport,
+            identity_from_environment: true,
             inner: Mutex::new(Inner {
                 generation: 1,
                 daemon_origin_trusted: false,
@@ -6399,31 +6434,43 @@ async fn writer_loop<W>(
     }
 }
 
-fn activity_read_body(request: impl serde::Serialize) -> Result<Vec<u8>, CallError> {
-    #[derive(serde::Serialize)]
-    struct ReadRequest<T> {
-        #[serde(flatten)]
-        request: T,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        consumer_identity: Option<ConsumerIdentity>,
+impl Shared {
+    fn implicit_consumer_identity(&self) -> Option<ConsumerIdentity> {
+        // Operator-app connections must not even consult the launch environment:
+        // the nonce accessor can consume an inherited credential descriptor.
+        if self.identity_from_environment {
+            consumer_identity_from_env()
+        } else {
+            None
+        }
     }
-    serde_json::to_vec(&ReadRequest {
-        request,
-        consumer_identity: consumer_identity_from_env(),
-    })
-    .map_err(|err| CallError::not_sent(format!("failed to encode activity read: {err}")))
-}
 
-fn route_open_consumer_identity(opts: &CallOptions) -> Option<ConsumerIdentity> {
-    opts.consumer_identity
-        .clone()
-        .or_else(consumer_identity_from_env)
-}
+    fn activity_read_body(&self, request: impl serde::Serialize) -> Result<Vec<u8>, CallError> {
+        #[derive(serde::Serialize)]
+        struct ReadRequest<T> {
+            #[serde(flatten)]
+            request: T,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            consumer_identity: Option<ConsumerIdentity>,
+        }
+        serde_json::to_vec(&ReadRequest {
+            request,
+            consumer_identity: self.implicit_consumer_identity(),
+        })
+        .map_err(|err| CallError::not_sent(format!("failed to encode activity read: {err}")))
+    }
 
-fn close_route_consumer_identity(opts: &CloseRouteOptions) -> Option<ConsumerIdentity> {
-    opts.consumer_identity
-        .clone()
-        .or_else(consumer_identity_from_env)
+    fn route_open_consumer_identity(&self, opts: &CallOptions) -> Option<ConsumerIdentity> {
+        opts.consumer_identity
+            .clone()
+            .or_else(|| self.implicit_consumer_identity())
+    }
+
+    fn close_route_consumer_identity(&self, opts: &CloseRouteOptions) -> Option<ConsumerIdentity> {
+        opts.consumer_identity
+            .clone()
+            .or_else(|| self.implicit_consumer_identity())
+    }
 }
 
 fn route_open_consumer_capabilities(opts: &CallOptions) -> Option<Vec<String>> {

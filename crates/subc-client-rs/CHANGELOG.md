@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.32.15
+
+- Add `SubcConsumer::connect_operator_app(options)` for the desktop operator app. It resolves the standard installed daemon path from OS facts only, never reading `SUBC_CONNECTION_FILE`, `XDG_RUNTIME_DIR`, `HOME`, `TMPDIR` or other environment variables for discovery. It uses the same owner-checked connection-file reads on every attempt (including reconnects), Unix socket or Windows pipe transport and no-TCP-fallback policy as `connect_local`.
+- Operator-app consumers never consult `SUBC_MODULE_ID` or the launch-nonce accessor for implicit request identity: route opens, route closes and activity query/subscription reads omit it. Explicit `CallOptions`/`CloseRouteOptions` consumer identities remain honoured. The policy is private per-consumer state; no public struct fields or enum variants change. All existing connection constructors and discovery keep their existing environment-aware behavior.
+- Add the public `operator_app_path()` resolver and `OperatorAppPathError` in subc-client-rs. Require subc-os 0.1.24 for its safe macOS `darwin_user_temp_dir()` wrapper; subc-transport remains at 0.14.1, and both client and transport continue forbidding unsafe code. Standard installed paths come from Darwin's `confstr(_CS_DARWIN_USER_TEMP_DIR)` plus the kernel uid on macOS and systemd's `/run/user/<uid>/subc-connection.json` on Linux. Custom daemon environment overrides are not discovered. Windows returns an existing `ConsumerError::ConnectionFile` containing the typed `OperatorAppPathError`: the installed daemon's directory and filename are selected from environment variables, so a known-folder API cannot reproduce the path without guessing.
+
 ## 0.32.14
 
 - Add `ModuleHandle::set_ready(bool)`, using the existing `catalog.update` ACK, typed-error and timeout path. It resends the current provider roles and preserves the capability declaration; existing catalog methods still omit `ready`. The handle remembers registered roles and acknowledged replacements in send order. If roles cannot be known (an update is in flight, or a prior update was cancelled, timed out or had an invalid reply), readiness changes return the existing `CatalogUpdateError::Protocol` without sending; a successful explicit catalog replacement recovers from an uncertain result. No public struct fields or enum variants change.

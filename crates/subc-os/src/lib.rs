@@ -57,6 +57,11 @@
 
 #![deny(unsafe_code)]
 
+#[cfg(target_os = "macos")]
+mod darwin_user_temp;
+#[cfg(target_os = "macos")]
+pub use darwin_user_temp::darwin_user_temp_dir;
+
 #[cfg(all(unix, feature = "test-support"))]
 pub mod fork_exec_test;
 pub mod host;

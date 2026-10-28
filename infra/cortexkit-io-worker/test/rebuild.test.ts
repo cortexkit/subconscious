@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { canonicalize } from "../src/canonicalize";
 import type { ComponentEntry } from "../src/components";
@@ -33,6 +33,16 @@ const PREVIOUS_AFT: ComponentEntry = {
   },
 };
 
+const PREVIOUS_MC: ComponentEntry = {
+  repository: "cortexkit/magic-context",
+  release: "ck-mc-alpha.22464bf2",
+  published_at_ms: 1,
+  version: null,
+  train: "22464bf2",
+  requires_core: null,
+  assets: {},
+};
+
 function testEnv(): Env {
   return env as unknown as Env;
 }
@@ -42,6 +52,7 @@ interface ReleaseFixture {
   tag: string;
   binary: string;
   manifest?: unknown;
+  createdAt?: string;
 }
 
 async function rebuildFixtures(fixtures: ReleaseFixture[]) {
@@ -62,16 +73,16 @@ async function rebuildFixtures(fixtures: ReleaseFixture[]) {
         fixture.manifest,
       );
     }
-    repos[fixture.repository] = [
+    (repos[fixture.repository] ??= []).push(
       {
         tag_name: fixture.tag,
         draft: false,
         prerelease: false,
-        created_at: "2026-04-01T00:00:00Z",
+        created_at: fixture.createdAt ?? "2026-04-01T00:00:00Z",
         published_at: "2026-04-02T00:00:00Z",
         assets,
       },
-    ];
+    );
   }
   const result = await rebuild(
     e,
@@ -81,10 +92,12 @@ async function rebuildFixtures(fixtures: ReleaseFixture[]) {
   const bundle = parseIndexBundle((await e.RELEASE_INDEX.get(KV_BUNDLE))!);
   const doc = JSON.parse(bundle!.body) as { components: Record<string, ComponentEntry> };
   const refusals = JSON.parse((await e.RELEASE_INDEX.get(KV_REFUSALS)) ?? "[]") as Refusal[];
-  return { doc, refusals };
+  return { doc, refusals, body: bundle!.body };
 }
 
 describe("rebuild", () => {
+  afterEach(() => vi.restoreAllMocks());
+
   beforeEach(async () => {
     resetInstallationTokenCache();
     const kv = testEnv().RELEASE_INDEX;
@@ -263,6 +276,119 @@ describe("rebuild", () => {
     expect(aftRefusal?.asset).toBe("ck-aft-linux-x64.zip");
     expect(await e.RELEASE_INDEX.get("index.json")).toBeNull();
     expect(await e.RELEASE_INDEX.get("index.json.sig")).toBeNull();
+  });
+
+  it("skips a withheld-only release, omits the previous component, and logs once per rebuild", async () => {
+    const tag = PREVIOUS_MC.release;
+    await testEnv().RELEASE_INDEX.put(KV_BUNDLE, canonicalize({
+      body: canonicalize({
+        schema: 1,
+        channel: "alpha",
+        generated_at_ms: 1,
+        components: { mc: PREVIOUS_MC },
+      }),
+      sig: "placeholder-previous",
+    }));
+    const log = vi.spyOn(console, "info").mockImplementation(() => {});
+    const fixture = { repository: "cortexkit/magic-context", tag, binary: "ck-mc" };
+
+    for (let count = 1; count <= 2; count++) {
+      const { doc, refusals } = await rebuildFixtures([fixture, fixture]);
+      expect(doc.components.mc).toBeUndefined();
+      expect(refusals).toEqual([]);
+      expect(log).toHaveBeenCalledTimes(count);
+      expect(log).toHaveBeenLastCalledWith(
+        `withheld release: component=mc tag=${tag} reason=predates the module contracts the current plugin speaks; the plugin works without the module`,
+      );
+    }
+  });
+
+  it.each([
+    { state: "withheld", previous: PREVIOUS_MC, retained: false },
+    {
+      state: "non-withheld",
+      previous: { ...PREVIOUS_MC, release: "ck-mc-alpha.11223344", train: "11223344" },
+      retained: true,
+    },
+  ])("uses only non-withheld previous entries when a replacement is refused ($state previous entry)", async ({ previous, retained }) => {
+    await testEnv().RELEASE_INDEX.put(KV_BUNDLE, canonicalize({
+      body: canonicalize({
+        schema: 1,
+        channel: "alpha",
+        generated_at_ms: 1,
+        components: { mc: previous },
+      }),
+      sig: "placeholder-previous",
+    }));
+    const log = vi.spyOn(console, "info").mockImplementation(() => {});
+    const { doc, refusals } = await rebuildFixtures([
+      { repository: "cortexkit/magic-context", tag: PREVIOUS_MC.release, binary: "ck-mc" },
+      {
+        repository: "cortexkit/magic-context",
+        tag: "ck-mc-alpha.33445566",
+        binary: "ck-mc",
+        createdAt: "2026-09-02T00:00:00Z",
+        manifest: { requires_core: "v0.17.20" },
+      },
+    ]);
+
+    if (retained) {
+      expect(doc.components.mc).toEqual(previous);
+    } else {
+      expect(doc.components.mc).toBeUndefined();
+    }
+    expect(refusals).toEqual([
+      expect.objectContaining({ component: "mc", tag: "ck-mc-alpha.33445566", reason: "requires_core_malformed" }),
+    ]);
+    expect(log).toHaveBeenCalledExactlyOnceWith(
+      `withheld release: component=mc tag=${PREVIOUS_MC.release} reason=predates the module contracts the current plugin speaks; the plugin works without the module`,
+    );
+  });
+
+  it.each([
+    ["newer", "2026-09-02T00:00:00Z"],
+    ["older", "2026-08-31T00:00:00Z"],
+  ])("chooses the %s non-withheld release instead of the withheld preview", async (_, createdAt) => {
+    const { doc, refusals } = await rebuildFixtures([
+      {
+        repository: "cortexkit/magic-context",
+        tag: "ck-mc-alpha.22464bf2",
+        binary: "ck-mc",
+        createdAt: "2026-09-01T00:00:00Z",
+      },
+      {
+        repository: "cortexkit/magic-context",
+        tag: "ck-mc-alpha.33445566",
+        binary: "ck-mc",
+        createdAt,
+      },
+    ]);
+
+    expect(doc.components.mc.release).toBe("ck-mc-alpha.33445566");
+    expect(doc.components.mc.train).toBe("33445566");
+    expect(doc.components.mc.assets["linux-x64"]["ck-mc"].reports).toBe("33445566");
+    expect(refusals).toEqual([]);
+  });
+
+  it("keeps the canonical index bytes unchanged for components without withheld releases", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+    const { body } = await rebuildFixtures([
+      { repository: "cortexkit/subconscious", tag: "subc-core-v1.0.0", binary: "ck" },
+      { repository: "cortexkit/aft", tag: "v1.0.0", binary: "ck-aft" },
+      { repository: "cortexkit/insula", tag: "v1.0.0", binary: "ck-insula" },
+      { repository: "cortexkit/claustrum", tag: "v1.0.0", binary: "ck-claustrum" },
+      { repository: "cortexkit/synapse", tag: "v1.0.0", binary: "ck-synapse" },
+    ]);
+
+    expect(body).toBe(
+      '{"channel":"alpha","components":{' +
+      '"aft":{"assets":{"linux-x64":{"ck-aft":{"bytes":0,"reports":"1.0.0","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","url":"https://github.com/cortexkit/aft/releases/download/v1.0.0/ck-aft-linux-x64.zip"}}},"published_at_ms":1775088000000,"release":"v1.0.0","repository":"cortexkit/aft","requires_core":null,"train":null,"version":"1.0.0"},' +
+      '"claustrum":{"assets":{"linux-x64":{"ck-claustrum":{"bytes":0,"reports":"1.0.0","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","url":"https://github.com/cortexkit/claustrum/releases/download/v1.0.0/ck-claustrum-linux-x64.zip"}}},"published_at_ms":1775088000000,"release":"v1.0.0","repository":"cortexkit/claustrum","requires_core":null,"train":null,"version":"1.0.0"},' +
+      '"core":{"assets":{"linux-x64":{"ck":{"bytes":0,"reports":"1.0.0","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","url":"https://github.com/cortexkit/subconscious/releases/download/subc-core-v1.0.0/ck-linux-x64.zip"}}},"published_at_ms":1775088000000,"release":"subc-core-v1.0.0","repository":"cortexkit/subconscious","requires_core":null,"train":null,"version":"1.0.0"},' +
+      '"insula":{"assets":{"linux-x64":{"ck-insula":{"bytes":0,"reports":"1.0.0","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","url":"https://github.com/cortexkit/insula/releases/download/v1.0.0/ck-insula-linux-x64.zip"}}},"published_at_ms":1775088000000,"release":"v1.0.0","repository":"cortexkit/insula","requires_core":null,"train":null,"version":"1.0.0"},' +
+      '"synapse":{"assets":{"linux-x64":{"ck-synapse":{"bytes":0,"reports":"1.0.0","sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","url":"https://github.com/cortexkit/synapse/releases/download/v1.0.0/ck-synapse-linux-x64.zip"}}},"published_at_ms":1775088000000,"release":"v1.0.0","repository":"cortexkit/synapse","requires_core":null,"train":null,"version":"1.0.0"}' +
+      '},"generated_at_ms":1800000000000,"schema":1}',
+    );
   });
 
   it("copies a valid module requires_core and writes null when it is absent", async () => {

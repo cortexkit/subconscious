@@ -6,6 +6,7 @@ export interface ComponentSpec {
   id: ComponentId;
   repository: string;
   resolve: ResolveRule;
+  withheldReleases?: Readonly<Record<string, string>>;
 }
 
 export const COMPONENTS: readonly ComponentSpec[] = [
@@ -14,7 +15,14 @@ export const COMPONENTS: readonly ComponentSpec[] = [
   { id: "insula", repository: "cortexkit/insula", resolve: "latest-non-draft" },
   { id: "claustrum", repository: "cortexkit/claustrum", resolve: "latest-non-draft" },
   { id: "synapse", repository: "cortexkit/synapse", resolve: "latest-non-draft" },
-  { id: "mc", repository: "cortexkit/magic-context", resolve: "newest-ck-mc" },
+  {
+    id: "mc",
+    repository: "cortexkit/magic-context",
+    resolve: "newest-ck-mc",
+    withheldReleases: {
+      "ck-mc-alpha.22464bf2": "predates the module contracts the current plugin speaks; the plugin works without the module",
+    },
+  },
 ];
 
 export interface TagFields {

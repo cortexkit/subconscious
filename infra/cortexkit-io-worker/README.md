@@ -6,6 +6,13 @@ and its custom domain are unchanged.
 
 Do not deploy from this checkout; the operator deploys.
 
+The component table in `src/components.ts` accepts an optional `withheldReleases`
+map from exact release tags to one-line reasons. Use it to keep a known unsuitable
+release out of the public index without blocking future releases: rebuilds log
+each skipped tag and reason, choose from the remaining releases, and omit a
+component entirely when none remain. Withheld releases are also ineligible as
+last-known-good fallback entries when ingestion fails.
+
 ## Secrets
 
 ```bash

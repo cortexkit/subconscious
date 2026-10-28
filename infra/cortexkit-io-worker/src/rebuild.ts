@@ -60,8 +60,13 @@ export async function rebuild(env: Env, fetchFn: FetchFn = fetch): Promise<Rebui
   const components: Record<string, ComponentEntry> = {};
 
   for (const spec of COMPONENTS) {
-    const previous = previousDoc?.components[spec.id];
-    const result = await ingestComponent(env, fetchFn, spec, refusals);
+    const loggedTags = new Set<string>();
+    const previousEntry = previousDoc?.components[spec.id];
+    // An explicitly withheld release cannot serve as last-known-good fallback.
+    const previous = previousEntry && !isWithheldRelease(spec, previousEntry.release, loggedTags)
+      ? previousEntry
+      : undefined;
+    const result = await ingestComponent(env, fetchFn, spec, refusals, loggedTags);
     applyComponentResult(components, spec.id, previous, result);
   }
 
@@ -111,11 +116,21 @@ export async function rebuild(env: Env, fetchFn: FetchFn = fetch): Promise<Rebui
   return { ok: true };
 }
 
+function isWithheldRelease(spec: ComponentSpec, tag: string, loggedTags: Set<string>): boolean {
+  if (!spec.withheldReleases || !Object.hasOwn(spec.withheldReleases, tag)) return false;
+  if (!loggedTags.has(tag)) {
+    console.info(`withheld release: component=${spec.id} tag=${tag} reason=${spec.withheldReleases[tag]}`);
+    loggedTags.add(tag);
+  }
+  return true;
+}
+
 async function ingestComponent(
   env: Env,
   fetchFn: FetchFn,
   spec: ComponentSpec,
   refusals: Refusal[],
+  loggedTags: Set<string>,
 ): Promise<ComponentResult> {
   let releases: GitHubRelease[];
   try {
@@ -126,7 +141,8 @@ async function ingestComponent(
     return { kind: "refused" };
   }
 
-  const release = pickCurrentRelease(spec, releases);
+  const eligibleReleases = releases.filter(({ tag_name: tag }) => !isWithheldRelease(spec, tag, loggedTags));
+  const release = pickCurrentRelease(spec, eligibleReleases);
   if (!release) return { kind: "absent" };
 
   const fields = parseTag(spec.id, release.tag_name);

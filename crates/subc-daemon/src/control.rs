@@ -2999,10 +2999,30 @@ impl ControlHandler {
                 PrivilegedOperatorPrompt::Enforce => {
                     let key =
                         crate::operator_confirm::DeclineKey::for_caller(&caller, ctx.connection_id);
+                    let stamp = self
+                        .operator_apps
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&ctx.connection_id)
+                        .cloned();
+                    let shortcut = crate::operator_confirm::ShortcutContext::eligible_stamp(
+                        &self.operator_app_policy,
+                        &self.launch_table,
+                        stamp.as_ref(),
+                    )
+                    .then(|| self.shortcut_context(stamp, None, None));
                     let outcome = self
                         .forwarding
                         .operator_confirms()
-                        .approve_privileged(ctx, &frame, op, text, caller.description(), key)
+                        .approve_privileged_with_shortcut(
+                            ctx,
+                            &frame,
+                            op,
+                            text,
+                            caller.description(),
+                            key,
+                            shortcut,
+                        )
                         .await;
                     if outcome.code != "confirmed" {
                         return Ok(vec![outcome.frame(&frame)]);
@@ -3318,6 +3338,16 @@ impl ControlHandler {
                 return Ok(vec![outcome.frame(&frame)]);
             }
         };
+        let declared = matches!(
+            request.kind,
+            Some(subc_protocol::session::OperatorConfirmKind::Operation)
+        ) && request.operation.as_ref().is_some_and(|operation| {
+            registration
+                .manifest
+                .confirm_operations
+                .as_ref()
+                .is_some_and(|operations| operations.contains(operation))
+        });
         let module_id = registration.manifest.module_id;
         // Read the launch nonce (under its own lock) before taking the forwarding
         // table's lock below: holding forwarding while waiting on another daemon
@@ -3338,9 +3368,72 @@ impl ControlHandler {
                 ctx.connection_id,
                 request.route_channel,
                 request.route_epoch,
-                |binding| confirms.admit(ctx, frame, module_id, nonce_proven, request, binding),
+                |binding| {
+                    let shortcut = binding
+                        .filter(|binding| {
+                            nonce_proven
+                                && crate::operator_confirm::valid_summary(&request.summary)
+                                && declared
+                                && crate::operator_confirm::ShortcutContext::route_eligible(
+                                    &self.operator_app_policy,
+                                    &self.launch_table,
+                                    binding,
+                                )
+                        })
+                        .map(|binding| {
+                            let phone = crate::operator_confirm::ShortcutContext::phone_fingerprint(
+                                &self.operator_app_policy,
+                                binding,
+                            );
+                            let stamp = if phone.is_some() {
+                                None
+                            } else {
+                                binding.operator_app.clone()
+                            };
+                            self.shortcut_context(
+                                stamp,
+                                phone,
+                                Some((request.route_channel, request.route_epoch)),
+                            )
+                        });
+                    confirms.admit_with_shortcut(
+                        ctx,
+                        frame,
+                        module_id,
+                        nonce_proven,
+                        request,
+                        binding,
+                        shortcut,
+                    )
+                },
             )
             .map_err(RouterError::Forwarding)
+    }
+
+    fn shortcut_context(
+        &self,
+        stamp: Option<crate::operator_apps::OperatorAppStamp>,
+        phone_fingerprint: Option<String>,
+        route: Option<(u16, u32)>,
+    ) -> crate::operator_confirm::ShortcutContext {
+        crate::operator_confirm::ShortcutContext {
+            ledger: self.activity.clone(),
+            forwarding: self.forwarding.clone(),
+            launches: self.launch_table.clone(),
+            stamp,
+            phone_fingerprint,
+            route,
+            connections: self.operator_apps.clone(),
+            #[cfg(test)]
+            hooks: Default::default(),
+        }
+    }
+
+    /// Explicit test-only phone policy; daemon configuration cannot select it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_test_phone_shortcut(mut self, enabled: bool) -> Self {
+        self.operator_app_policy.phone_enabled = enabled;
+        self
     }
 
     /// Resolve folders before taking the scope-table lock: a slow filesystem

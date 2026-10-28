@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.38.5
+
+- Add audit-gated operator shortcuts for explicitly declared confirmation
+  operations and enforce-mode privileged requests. Eligible desktop stamps and
+  production Callosum phone routes still require their compiled switch; all
+  production switches remain off and no configuration enables them.
+- Commit an attempt record before any unprompted grant. Cancellation, route or
+  module removal, connection close and the original deadline can end a pending
+  attempt without waiting for the ledger. On an append error or a failed stamp
+  revalidation, the daemon tries to enqueue the same request for the ordinary
+  prompt without renewing its delivery budget; the queue's usual refusals and
+  every withdrawal condition still apply. Fixed-summary outcome records are
+  best effort.
+- Recheck route epochs and Windows launch incarnations at the authorization
+  commit point, excluding route release and launch retirement until the pending
+  request is removed. Replaced launches cannot authorize an older connection.
+
 ## 0.38.4
 
 - Serve `app.open`: start a known operator app from its installed location

@@ -708,6 +708,15 @@ impl ForwardingTable {
 
     #[cfg(test)]
     pub(crate) fn inject_operator_principal(&self, key: ModuleRouteKey, principal: Principal) {
+        self.alter_operator_binding_for_test(key, |binding| binding.principal = principal);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn alter_operator_binding_for_test(
+        &self,
+        key: ModuleRouteKey,
+        alter: impl FnOnce(&mut RouteBinding),
+    ) {
         let mut inner = self.write_inner().unwrap();
         let old = inner.module_to_client.remove(&key).unwrap();
         let client = ClientRouteKey {
@@ -716,10 +725,30 @@ impl ForwardingTable {
         };
         inner.client_to_module.remove(&client);
         let mut binding = Arc::try_unwrap(old).expect("test binding has no outstanding readers");
-        binding.principal = principal;
+        alter(&mut binding);
         let binding = Arc::new(binding);
         inner.client_to_module.insert(client, Arc::clone(&binding));
         inner.module_to_client.insert(key, binding);
+    }
+
+    /// Mutate the route without delivering its withdrawal notice, so tests can
+    /// exercise the commit-point route check rather than the withdrawal path.
+    #[cfg(test)]
+    pub(crate) fn invalidate_operator_route_for_test(&self, key: ModuleRouteKey, stale: bool) {
+        let mut inner = self.write_inner().unwrap();
+        let old = inner.module_to_client.remove(&key).unwrap();
+        let client = ClientRouteKey {
+            connection_id: old.client_connection_id,
+            channel: old.client_channel,
+        };
+        inner.client_to_module.remove(&client);
+        if stale {
+            let mut binding = Arc::try_unwrap(old).expect("no binding readers at the test pause");
+            binding.module_epoch += 1;
+            let binding = Arc::new(binding);
+            inner.client_to_module.insert(client, binding.clone());
+            inner.module_to_client.insert(key, binding);
+        }
     }
 
     /// Keep the binding protected through confirmation admission. Route release
@@ -732,6 +761,19 @@ impl ForwardingTable {
         epoch: u32,
         admit: impl FnOnce(Option<&RouteBinding>) -> T,
     ) -> Result<T, ForwardingError> {
+        self.with_operator_route_epoch(connection_id, channel, |binding| {
+            admit(binding.filter(|binding| binding.module_epoch == epoch))
+        })
+    }
+
+    /// Like admission, but retains a mismatched epoch so a shortcut can audit
+    /// a stale channel separately from a closed one, under the same read lock.
+    pub(crate) fn with_operator_route_epoch<T>(
+        &self,
+        connection_id: ConnectionId,
+        channel: u16,
+        decide: impl FnOnce(Option<&RouteBinding>) -> T,
+    ) -> Result<T, ForwardingError> {
         let inner = self.read_inner()?;
         let binding = inner
             .endpoint_by_connection
@@ -741,9 +783,8 @@ impl ForwardingTable {
                     endpoint: *endpoint,
                     channel,
                 })
-            })
-            .filter(|binding| binding.module_epoch == epoch);
-        Ok(admit(binding.map(Arc::as_ref)))
+            });
+        Ok(decide(binding.map(Arc::as_ref)))
     }
 
     pub(crate) fn counters(&self) -> DaemonCounters {

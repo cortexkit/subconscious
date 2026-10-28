@@ -173,8 +173,25 @@ impl LaunchTable {
     /// Whether `incarnation` is still the live entry for `app`. A later entry
     /// for the same app never revalidates an older stamp.
     pub fn is_live_incarnation(&self, app: &str, incarnation: u64) -> bool {
-        self.live_entry(app)
-            .is_some_and(|live| live.incarnation == incarnation)
+        self.with_live_incarnation(app, incarnation, || ())
+            .is_some()
+    }
+
+    /// Keep retirement and replacement excluded until the caller commits its
+    /// decision. The caller already holds every other lock it needs.
+    pub(crate) fn with_live_incarnation<T>(
+        &self,
+        app: &str,
+        incarnation: u64,
+        commit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let mut inner = self.lock();
+        let entry = inner.get(app)?;
+        if !entry.is_live() {
+            Self::retire_locked(&mut inner, app);
+            return None;
+        }
+        (entry.incarnation == incarnation).then(commit)
     }
 
     /// Publish a launch entry, replacing any entry for the app. Callers retire

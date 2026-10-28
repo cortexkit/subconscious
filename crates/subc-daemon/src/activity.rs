@@ -97,7 +97,13 @@ pub(crate) fn validate(module: &str, request: &ActivityRecordRequest) -> Result<
         .kind
         .strip_prefix(module)
         .and_then(|s| s.strip_prefix('.'));
-    if !name.is_some_and(|name| identifier(name, 64)) {
+    // These daemon-owned audit kinds are not module-authored activity names.
+    let shortcut = module == "subc"
+        && matches!(
+            request.kind.as_str(),
+            "operator_shortcut" | "operator_shortcut_outcome"
+        );
+    if !shortcut && !name.is_some_and(|name| identifier(name, 64)) {
         return Err(ACTIVITY_KIND_FORBIDDEN);
     }
     let summary_len = request.summary.chars().count();

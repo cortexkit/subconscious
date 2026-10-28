@@ -98,7 +98,7 @@ pub(crate) struct OperatorAppStamp {
     /// The launch entry incarnation this stamp matched, present only for
     /// stamps derived from a live Windows launch entry. macOS stamps carry
     /// `None` and check the captured audit token instead.
-    launch_incarnation: Option<u64>,
+    pub(crate) launch_incarnation: Option<u64>,
 }
 
 impl OperatorAppStamp {
@@ -138,10 +138,15 @@ impl OperatorAppStamp {
         }
     }
 
-    /// A bind-time stamp is not authority. This token check is macOS-only. A
-    /// Windows launch stamp records its launch entry's incarnation at
-    /// connection time, and nothing revalidates that incarnation yet.
-    #[allow(dead_code)]
+    /// A bind-time stamp is not authority: Windows must still name its own live
+    /// launch entry, while macOS checks the captured process token again.
+    pub(crate) fn revalidate_with_launches(&self, launches: &crate::app_open::LaunchTable) -> bool {
+        if let Some(incarnation) = self.launch_incarnation {
+            return launches.is_live_incarnation(&self.app.app, incarnation);
+        }
+        self.revalidate()
+    }
+
     pub(crate) fn revalidate(&self) -> bool {
         matches!(self.peer.check_code_requirement(self.requirement),
             CodeRequirementOutcome::Satisfied(code)
@@ -154,6 +159,7 @@ pub(crate) struct OperatorAppPolicy {
     pub macos_enabled: bool,
     pub windows_enabled: bool,
     pub linux_enabled: bool,
+    pub phone_enabled: bool,
     app: CompiledApp,
     requirement: &'static str,
     floor: Version,
@@ -183,6 +189,7 @@ impl Default for OperatorAppPolicy {
             macos_enabled: MACOS_OPERATOR_APP_ENABLED,
             windows_enabled: WINDOWS_OPERATOR_APP_ENABLED,
             linux_enabled: LINUX_OPERATOR_APP_ENABLED,
+            phone_enabled: PHONE_OPERATOR_ENABLED,
             app: COMPILED_APP,
             requirement: MACOS_REQUIREMENT,
             floor: RELEASE_FLOOR,
@@ -287,6 +294,7 @@ impl From<TestOperatorAppPolicy> for OperatorAppPolicy {
             macos_enabled: test.macos_enabled,
             windows_enabled: test.windows_enabled,
             linux_enabled: test.linux_enabled,
+            phone_enabled: PHONE_OPERATOR_ENABLED,
             app: CompiledApp {
                 id: Some(test.app),
                 windows_publisher: test.windows_publisher,

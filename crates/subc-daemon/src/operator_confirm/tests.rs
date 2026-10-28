@@ -11,6 +11,9 @@ use subc_protocol::{
 };
 use tokio::sync::mpsc;
 
+#[path = "shortcut_tests.rs"]
+mod shortcut_tests;
+
 fn frame(ty: FrameType, corr: u64, body: serde_json::Value) -> Frame {
     Frame::build(
         ty,
@@ -101,9 +104,19 @@ impl Fixture {
         }
     }
     async fn module(&self, name: &str, id: u64, nonce: &str) -> Module {
+        self.module_with_confirm_operations(name, id, nonce, None)
+            .await
+    }
+    async fn module_with_confirm_operations(
+        &self,
+        name: &str,
+        id: u64,
+        nonce: &str,
+        operations: Option<Vec<String>>,
+    ) -> Module {
         let (ctx, mut rx) = ctx(id, 8);
         self.supervisor.set_spawn_nonce(name, nonce.into());
-        let manifest = ModuleManifest::builder(name, "0.1.0")
+        let mut manifest = ModuleManifest::builder(name, "0.1.0")
             .protocol_ver(PROTOCOL_VERSION)
             .provides(vec![ProviderRole::ToolProvider {
                 tools: vec![Tool {
@@ -118,6 +131,16 @@ impl Fixture {
                 sub_supervises: false,
             }])
             .build();
+        if let Some(operations) = operations {
+            manifest.provides.push(
+                serde_json::from_value(serde_json::json!({
+                    "role":"management_surface", "operations":[{"name":"reset","kind":"mutate"}],
+                    "config_schema":{}, "observability":[], "identity_scope":[]
+                }))
+                .unwrap(),
+            );
+            manifest.confirm_operations = Some(operations);
+        }
         let hello = ModuleHelloBody {
             manifest,
             protocol_ver: PROTOCOL_VERSION,

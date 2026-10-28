@@ -26,6 +26,9 @@ use crate::{
     ConnectionId, Frame,
 };
 
+mod shortcut;
+pub(crate) use shortcut::ShortcutContext;
+
 /// Person declines of privileged client requests that start a cooldown when
 /// they all fall within `DECLINE_WINDOW` of the newest one.
 const DECLINE_LIMIT: usize = 3;
@@ -379,7 +382,7 @@ fn principal_label(principal: &Principal) -> String {
     }
 }
 
-fn valid_summary(summary: &str) -> bool {
+pub(crate) fn valid_summary(summary: &str) -> bool {
     let count = summary.chars().count();
     (1..=200).contains(&count)
         && !summary.starts_with(char::is_whitespace)
@@ -411,6 +414,9 @@ struct Request {
     frame: Frame,
     arrived: Instant,
     delivery_deadline: Instant,
+    // A handoff reserves its queue position before its outcome append finishes.
+    prompt_ready: std::sync::atomic::AtomicBool,
+    shortcut_audit: bool,
 }
 struct Active {
     request: Arc<Request>,
@@ -435,6 +441,7 @@ struct State {
     stuck: bool,
     running: bool,
     next_id: u64,
+    shortcuts: HashMap<u64, shortcut::Pending>,
     #[cfg(test)]
     deliveries: usize,
 }
@@ -476,6 +483,7 @@ impl Default for OperatorConfirms {
                 stuck: false,
                 running: false,
                 next_id: 0,
+                shortcuts: HashMap::new(),
                 #[cfg(test)]
                 deliveries: 0,
             }),
@@ -533,6 +541,7 @@ impl OperatorConfirms {
 
     /// Called while the forwarding read lock still protects this binding. All
     /// registration/nonce lookups must have finished before entering this method.
+    #[cfg(test)]
     pub(crate) fn admit(
         self: &Arc<Self>,
         ctx: &RouteCtx,
@@ -541,6 +550,20 @@ impl OperatorConfirms {
         nonce_proven: bool,
         request: OperatorConfirmRequest,
         binding: Option<&RouteBinding>,
+    ) -> Vec<Frame> {
+        self.admit_with_shortcut(ctx, frame, module_id, nonce_proven, request, binding, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_with_shortcut(
+        self: &Arc<Self>,
+        ctx: &RouteCtx,
+        frame: Frame,
+        module_id: String,
+        nonce_proven: bool,
+        request: OperatorConfirmRequest,
+        binding: Option<&RouteBinding>,
+        shortcut: Option<ShortcutContext>,
     ) -> Vec<Frame> {
         let principal = binding
             .map(|b| principal_label(&b.principal))
@@ -560,13 +583,14 @@ impl OperatorConfirms {
             .backoff
             .get(&(module_id.clone(), principal.clone()))
             .copied()
+            .filter(|_| shortcut.is_none())
         {
             Some(Outcome::declined("backoff").with_retry_after_ms(retry_after_ms(until - now)))
-        } else if state.stuck {
+        } else if shortcut.is_none() && state.stuck {
             Some(Outcome::unavailable("provider_stuck"))
         } else if state.modules.contains_key(&module_id) {
             Some(Outcome::unavailable("module_limit"))
-        } else if state.queue.len() >= 4 {
+        } else if shortcut.is_none() && state.queue.len() >= 4 {
             Some(Outcome::unavailable("queue_full"))
         } else {
             None
@@ -607,9 +631,15 @@ impl OperatorConfirms {
             frame,
             arrived: now,
             delivery_deadline: now + state.limits.delivery_budget(),
+            prompt_ready: true.into(),
+            shortcut_audit: shortcut.is_some(),
         });
         state.modules.insert(pending.module_id.clone(), pending.id);
-        self.enqueue(&mut state, pending);
+        if let Some(shortcut) = shortcut {
+            self.start_shortcut(&mut state, pending, shortcut);
+        } else {
+            self.enqueue(&mut state, pending);
+        }
         Vec::new()
     }
 
@@ -617,7 +647,8 @@ impl OperatorConfirms {
     /// but returns a decision to dispatch instead of sending an operator reply.
     /// A caller in its repeated-decline cooldown is refused before anything else
     /// is checked, without a prompt.
-    pub(crate) async fn approve_privileged(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn approve_privileged_with_shortcut(
         self: &Arc<Self>,
         ctx: &RouteCtx,
         frame: &Frame,
@@ -625,6 +656,7 @@ impl OperatorConfirms {
         text: String,
         caller: String,
         key: DeclineKey,
+        shortcut: Option<ShortcutContext>,
     ) -> Outcome {
         let (answer, receive) = oneshot::channel();
         let id = {
@@ -637,9 +669,9 @@ impl OperatorConfirms {
             });
             let refusal = if state.cooldowns.contains_key(&key) {
                 Some(Outcome::declined("backoff"))
-            } else if state.stuck {
+            } else if shortcut.is_none() && state.stuck {
                 Some(Outcome::unavailable("provider_stuck"))
-            } else if state.queue.len() >= 4 {
+            } else if shortcut.is_none() && state.queue.len() >= 4 {
                 Some(Outcome::unavailable("queue_full"))
             } else {
                 None
@@ -673,8 +705,14 @@ impl OperatorConfirms {
                 frame: frame.clone(),
                 arrived: now,
                 delivery_deadline: now + state.limits.delivery_budget(),
+                prompt_ready: true.into(),
+                shortcut_audit: shortcut.is_some(),
             });
-            self.enqueue(&mut state, pending);
+            if let Some(shortcut) = shortcut {
+                self.start_shortcut(&mut state, pending, shortcut);
+            } else {
+                self.enqueue(&mut state, pending);
+            }
             id
         };
         let _withdraw = WithdrawOnDrop {
@@ -725,7 +763,11 @@ impl OperatorConfirms {
         }
         audit(
             &request.module_id,
-            &request.summary,
+            if request.shortcut_audit {
+                "Operator shortcut request"
+            } else {
+                &request.summary
+            },
             &request.principal,
             &outcome,
             wait,
@@ -804,6 +846,16 @@ impl OperatorConfirms {
     ) -> bool {
         let mut state = self.lock();
         let mut matched = false;
+        let ids: Vec<_> = state
+            .shortcuts
+            .iter()
+            .filter(|(_, pending)| predicate(&pending.request))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.end_shortcut(&mut state, id, Outcome::declined(reason), "withdrawn");
+            matched = true;
+        }
         let mut index = 0;
         while index < state.queue.len() {
             if predicate(&state.queue[index]) {
@@ -892,10 +944,15 @@ impl OperatorConfirms {
             }
         }
         if !active.committed {
+            let outcome = if Instant::now() >= active.request.delivery_deadline {
+                Outcome::unavailable("timeout")
+            } else {
+                Outcome::from_provider(result)
+            };
             self.commit(
                 &mut state,
                 active.request,
-                Outcome::from_provider(result),
+                outcome,
                 active.started,
                 active.handle.is_some(),
             );
@@ -927,11 +984,11 @@ impl OperatorConfirms {
                     }
                 }
                 let timeout = state.limits.prompt_timeout;
-                if let Some(active) = state
-                    .prompt
-                    .as_mut()
-                    .filter(|a| !a.committed && a.started.is_some_and(|at| at + timeout <= now))
-                {
+                if let Some(active) = state.prompt.as_mut().filter(|a| {
+                    !a.committed
+                        && (a.request.delivery_deadline <= now
+                            || a.started.is_some_and(|at| at + timeout <= now))
+                }) {
                     active.committed = true;
                     active.withdrawn = Some((now, "timeout"));
                     let (request, started, shown) = (
@@ -995,7 +1052,13 @@ impl OperatorConfirms {
                         });
                     }
                 }
-                if let Some(active) = state.prompt.as_mut().filter(|a| a.started.is_none()) {
+                if let Some(active) = state.prompt.as_mut().filter(|a| {
+                    a.started.is_none()
+                        && !a.committed
+                        && a.request
+                            .prompt_ready
+                            .load(std::sync::atomic::Ordering::Acquire)
+                }) {
                     active.started = Some(now);
                     let request = Arc::clone(&active.request);
                     let provider = Arc::clone(&state.provider);
@@ -1025,7 +1088,13 @@ impl OperatorConfirms {
                     .min();
                 if let Some(active) = &state.prompt {
                     let next = if !active.committed {
-                        active.started.map(|at| at + timeout)
+                        Some(
+                            active
+                                .started
+                                .map_or(active.request.delivery_deadline, |at| {
+                                    (at + timeout).min(active.request.delivery_deadline)
+                                }),
+                        )
                     } else if !state.stuck {
                         active.withdrawn.map(|(at, _)| at + grace)
                     } else {

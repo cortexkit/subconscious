@@ -62,6 +62,11 @@ mod darwin_user_temp;
 #[cfg(target_os = "macos")]
 pub use darwin_user_temp::darwin_user_temp_dir;
 
+#[cfg(unix)]
+mod user_home;
+#[cfg(unix)]
+pub use user_home::{effective_uid, real_user_home_dir};
+
 #[cfg(all(unix, feature = "test-support"))]
 pub mod fork_exec_test;
 pub mod host;

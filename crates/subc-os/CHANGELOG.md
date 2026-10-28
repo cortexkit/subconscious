@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.25
+
+- The operator-app resolver missed macOS daemons writing to the production home-directory runtime location because it only knew the Darwin temporary directory. Add safe Unix `real_user_home_dir()` using `getpwuid_r(getuid())`, never `HOME`, so clients can include that location without reading environment variables. Password entries are read with a growable buffer and missing or non-absolute home directories return an error. Add `effective_uid()` for owner-based candidate selection; all FFI remains inside subc-os.
+
 ## 0.1.24
 
 - Add the safe macOS-only `darwin_user_temp_dir()` API. It reads `confstr(_CS_DARWIN_USER_TEMP_DIR)`, validates the complete, terminated absolute path, and never consults `TMPDIR` or any other environment variable. The platform FFI stays inside subc-os so callers can keep forbidding unsafe code.

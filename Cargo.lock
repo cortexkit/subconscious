@@ -2532,7 +2532,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.32.15"
+version = "0.32.16"
 dependencies = [
  "async-trait",
  "cortexkit-test-support",
@@ -2679,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.24"
+version = "0.1.25"
 dependencies = [
  "cortexkit-test-support",
  "libc",

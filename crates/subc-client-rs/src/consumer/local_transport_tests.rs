@@ -291,10 +291,10 @@ async fn operator_app_omits_environment_identity_and_honours_explicit() {
             vec![None, Some(explicit.clone())],
             None,
         );
-        // Inject only the resolved path so the real constructor's policy and
+        // Inject only the candidate paths so the real constructor's policy and
         // local connection setup run without touching the installed daemon.
         let client =
-            SubcConsumer::connect_operator_app_resolving(local_opts(), || Ok(file.clone()))
+            SubcConsumer::connect_operator_app_resolving(local_opts(), || Ok(vec![file.clone()]))
                 .await
                 .unwrap();
 
@@ -373,6 +373,76 @@ async fn default_transport_is_tcp_with_unchanged_frames() {
             .is_err(),
         "default dialed local endpoint"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn operator_app_connects_with_only_home_rung() {
+    let dir = socket_dir();
+    let candidates =
+        crate::operator_app::macos_candidates(&dir.join("home"), &dir.join("temp"), "501");
+    let home = dir.join("home/.local/share/cortexkit/run/subc-connection.json");
+    let temp = dir.join("temp/subc-501.connection.json");
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let info = info(&tcp);
+    let (endpoint, listener) = listen(&dir, "h.sock");
+    write_atomic_with_local_endpoint(&home, &info, Some(&endpoint)).unwrap();
+    assert!(!temp.exists());
+    let task = spawn_local(listener, info.clone());
+    let client =
+        SubcConsumer::connect_operator_app_resolving(local_opts(), || Ok(candidates.clone()))
+            .await
+            .unwrap();
+    assert!(client.catalog_list().await.unwrap().modules.is_empty());
+    timeout(BUDGET, task).await.unwrap().unwrap();
+
+    // A restart can move between the production home and temporary rungs.
+    // Reconnect must choose again instead of pinning the initial home file.
+    std::fs::remove_file(&home).unwrap();
+    let (endpoint, listener) = listen(&dir, "t.sock");
+    write_atomic_with_local_endpoint(&temp, &info, Some(&endpoint)).unwrap();
+    let task = spawn_local(listener, info);
+    assert!(client.catalog_list().await.unwrap().modules.is_empty());
+    timeout(BUDGET, task).await.unwrap().unwrap();
+    client.close().await;
+    assert_no_tcp(&tcp).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn operator_app_does_not_fall_through_owner_checked_home_file() {
+    for malformed in [true, false] {
+        let dir = socket_dir();
+        let candidates =
+            crate::operator_app::macos_candidates(&dir.join("home"), &dir.join("temp"), "501");
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let info = info(&tcp);
+        let (endpoint, listener) = listen(&dir, "not-selected");
+        write_atomic_with_local_endpoint(&candidates[1], &info, Some(&endpoint)).unwrap();
+        write_atomic_with_local_endpoint(&candidates[0], &info, None).unwrap();
+        if malformed {
+            std::fs::write(&candidates[0], b"not json").unwrap();
+        }
+        let error =
+            SubcConsumer::connect_operator_app_resolving(local_opts(), || Ok(candidates.clone()))
+                .await
+                .err()
+                .unwrap();
+        if malformed {
+            assert!(
+                matches!(error, ConsumerError::ConnectionFile { path, source: ConnectionFileError::JsonRead { .. } } if path == candidates[0])
+            );
+        } else {
+            assert!(matches!(error, ConsumerError::NoEndpoint { path } if path == candidates[0]));
+        }
+        assert!(
+            timeout(Duration::from_millis(20), accept(listener))
+                .await
+                .is_err(),
+            "fell through to the temporary rung"
+        );
+        assert_no_tcp(&tcp).await;
+    }
 }
 
 #[tokio::test]

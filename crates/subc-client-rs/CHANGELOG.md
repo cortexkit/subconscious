@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.32.16
+
+- Fix operator-app connections missing a running macOS daemon whose launchd plist sets `XDG_RUNTIME_DIR` to the production home-directory runtime location. The macOS resolver in 0.32.15 searched only Darwin's temporary directory, so it could not find that connection file. Add public `operator_app_candidates()`: macOS tries the password-database home's `.local/share/cortexkit/run/subc-connection.json` before the Darwin temporary file; Linux tries `/run/user/<uid>/subc-connection.json` before the password-home rung. This follows ordinary discovery without its environment rungs and requires subc-os 0.1.25; no environment variables are read, including `HOME`.
+- On every operator-app connection attempt, including reconnects, choose the first existing candidate passing the owner check and use only its local endpoint, without TCP fallback. Keep `operator_app_path()` source-compatible: return the first existing candidate, or the first candidate if none exists. Windows retains its typed `OperatorAppPathError`; implicit consumer identity remains disabled.
+
 ## 0.32.15
 
 - Add `SubcConsumer::connect_operator_app(options)` for the desktop operator app. It resolves the standard installed daemon path from OS facts only, never reading `SUBC_CONNECTION_FILE`, `XDG_RUNTIME_DIR`, `HOME`, `TMPDIR` or other environment variables for discovery. It uses the same owner-checked connection-file reads on every attempt (including reconnects), Unix socket or Windows pipe transport and no-TCP-fallback policy as `connect_local`.

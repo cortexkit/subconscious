@@ -1189,7 +1189,8 @@ impl SubcConsumer {
         transport: ConsumerTransport,
         identity_from_environment: bool,
     ) -> Result<Self, ConsumerError> {
-        let opened = open_connection(connection_file, opts.handshake_timeout, transport).await?;
+        let opened =
+            open_connection(connection_file, opts.handshake_timeout, transport, None).await?;
         let mut shared = Shared::with_transport(connection_file.to_path_buf(), opts, transport);
         shared.identity_from_environment = identity_from_environment;
         let shared = Arc::new(shared);
@@ -1222,20 +1223,21 @@ impl SubcConsumer {
     /// Connect the desktop operator app to the installed daemon without reading
     /// environment variables for discovery or consumer identity.
     ///
-    /// Resolves the path with [`crate::operator_app_path`] and uses the
-    /// same owner checks, per-attempt file reads and local-only transport as
+    /// Tries [`crate::operator_app_candidates`] in order on every attempt,
+    /// selecting the first existing owner-checked file. Uses the
+    /// same per-attempt file reads and local-only transport as
     /// [`Self::connect_local`], never falling back to TCP. Requests omit implicit
     /// consumer identity, including after reconnect; explicit identities in
     /// [`CallOptions`] and [`CloseRouteOptions`] are still honoured.
     pub async fn connect_operator_app(opts: ConsumerOptions) -> Result<Self, ConsumerError> {
-        Self::connect_operator_app_resolving(opts, crate::operator_app_path).await
+        Self::connect_operator_app_resolving(opts, crate::operator_app_candidates).await
     }
 
     async fn connect_operator_app_resolving(
         opts: ConsumerOptions,
-        resolve: impl FnOnce() -> Result<PathBuf, crate::OperatorAppPathError>,
+        resolve: impl FnOnce() -> Result<Vec<PathBuf>, crate::OperatorAppPathError>,
     ) -> Result<Self, ConsumerError> {
-        let path = resolve().map_err(|source| ConsumerError::ConnectionFile {
+        let candidates = resolve().map_err(|source| ConsumerError::ConnectionFile {
             path: PathBuf::new(),
             source: ConnectionFileError::Io {
                 op: "resolve installed daemon connection-file path",
@@ -1243,7 +1245,20 @@ impl SubcConsumer {
                 source: io::Error::other(source),
             },
         })?;
-        Self::connect_with_transport(&path, opts, ConsumerTransport::Local, false).await
+        let path = candidates[0].clone();
+        let opened = open_connection(
+            &path,
+            opts.handshake_timeout,
+            ConsumerTransport::Local,
+            Some(&candidates),
+        )
+        .await?;
+        let mut shared = Shared::with_transport(path, opts, ConsumerTransport::Local);
+        shared.operator_app_candidates = Some(candidates);
+        shared.identity_from_environment = false;
+        let shared = Arc::new(shared);
+        shared.install_initial(opened)?;
+        Ok(Self { shared })
     }
 
     /// Open or reuse a managed route and return its connection-fenced handle.
@@ -3171,6 +3186,7 @@ struct Opening {
 
 struct Shared {
     connection_file: PathBuf,
+    operator_app_candidates: Option<Vec<PathBuf>>,
     opts: ConsumerOptions,
     transport: ConsumerTransport,
     identity_from_environment: bool,
@@ -3399,6 +3415,7 @@ impl Shared {
     ) -> Self {
         Self {
             connection_file,
+            operator_app_candidates: None,
             opts,
             transport,
             identity_from_environment: true,
@@ -3720,6 +3737,7 @@ impl Shared {
                 &self.connection_file,
                 self.opts.handshake_timeout,
                 self.transport,
+                self.operator_app_candidates.as_deref(),
             )
             .await
             {
@@ -5907,7 +5925,11 @@ async fn open_connection(
     path: &Path,
     deadline: Duration,
     transport: ConsumerTransport,
+    operator_candidates: Option<&[PathBuf]>,
 ) -> Result<OpenedConnection, ConsumerError> {
+    let path = operator_candidates
+        .map(crate::operator_app::owned_candidate)
+        .unwrap_or(path);
     if transport == ConsumerTransport::Local {
         let read =
             connection_file::read_for_client_with_local_endpoint(path).map_err(|source| {

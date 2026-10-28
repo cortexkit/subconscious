@@ -3028,8 +3028,44 @@ fn binary_fixture_outlives_cargo_output_replacement() {
     assert_eq!(fs::read(&fixture.path).unwrap(), b"original executable");
 }
 
+/// Runs `body` in a fresh copy of this test binary that runs only `name`, and
+/// requires that copy to report the test as passed. Other tests here spawn
+/// child processes while they run; a child forked before its exec briefly
+/// holds a copy of every open descriptor, so an advisory lock can stay held
+/// for a moment after this process closes its own descriptor. A process
+/// running a single test has no such neighbours.
+fn in_isolated_process(name: &str, body: impl FnOnce()) {
+    const ISOLATED: &str = "SUBC_REAL_DAEMON_ISOLATED_TEST";
+    if std::env::var(ISOLATED).as_deref() == Ok(name) {
+        body();
+        return;
+    }
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--test-threads", "1"])
+        .env(ISOLATED, name)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // libtest exits 0 when the filter matches nothing, so require the line
+    // that names this test as passed, not only a clean exit.
+    assert!(
+        output.status.success()
+            && stdout.contains(&format!("test {name} ... ok"))
+            && stdout.contains("1 passed"),
+        "isolated run of {name} did not pass:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn binary_fixture_build_holds_the_cross_process_lock() {
+    in_isolated_process(
+        "binary_fixture_build_holds_the_cross_process_lock",
+        fixture_build_holds_the_cross_process_lock,
+    );
+}
+
+fn fixture_build_holds_the_cross_process_lock() {
     let workspace = unique_temp_dir("fixture-lock");
     let artifact = workspace.join("example");
     fs::write(&artifact, b"executable").unwrap();

@@ -8,6 +8,26 @@ struct Node {
 }
 
 fn frame_name(text: &str) -> String {
+    // A stripped binary gives `???  (in image)  load address A + 0xOFF  [..]`.
+    // Keep the image and its offset, so the owner can symbolize the frame
+    // against the build's own debug symbols, instead of reporting a bare `???`.
+    if text.starts_with("???") {
+        if let Some(image) = text
+            .split_once("(in ")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(image, _)| image.trim())
+        {
+            let offset = text
+                .split_once("load address ")
+                .and_then(|(_, rest)| rest.split_once(" + "))
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                .filter(|o| o.starts_with("0x") && o[2..].chars().all(|c| c.is_ascii_hexdigit()));
+            return match offset {
+                Some(offset) => format!("{image}+{offset}"),
+                None => format!("??? ({image})"),
+            };
+        }
+    }
     let text = text.split("  (in ").next().unwrap_or(text);
     let text = text.split(" + ").next().unwrap_or(text);
     let text = text.split("  [").next().unwrap_or(text).trim();
@@ -20,13 +40,31 @@ fn frame_name(text: &str) -> String {
     }
 }
 
+// Leaf frames where a thread is blocked in the kernel rather than running:
+// condition variables, mutexes and futex-style locks, event queues, Mach
+// messages, semaphores, sleeps, and blocking I/O waits.
 fn waiting(frame: &str) -> bool {
     [
         "__psynch_cvwait",
+        "__psynch_mutexwait",
+        "__ulock_wait",
+        "__ulock_wait2",
         "kevent",
+        "kevent64",
+        "kevent_id",
         "mach_msg",
+        "mach_msg2_trap",
         "__semwait_signal",
+        "semaphore_wait_trap",
+        "semaphore_timedwait_trap",
         "__workq_kernreturn",
+        "read",
+        "__read_nocancel",
+        "__select",
+        "poll",
+        "__poll_nocancel",
+        "__sigsuspend",
+        "__wait4",
     ]
     .iter()
     .any(|wait| frame == *wait || frame.starts_with(&format!("{wait}_")))
@@ -65,16 +103,18 @@ fn finish_thread(
     }
     let thread_cut = std::mem::take(cut);
     // Only sampled execution positions determine idleness. A waiting leaf has
-    // ordinary runtime ancestors; an active leaf in any branch keeps the thread.
-    if !thread.stacks.is_empty()
-        && thread
-            .stacks
-            .iter()
-            .all(|s| s.frames.first().is_some_and(|f| waiting(f)))
-    {
+    // ordinary runtime ancestors; an active leaf in any branch keeps the thread,
+    // and only its active stacks are reported, so waits never take the place
+    // of the code that was running.
+    thread
+        .stacks
+        .retain(|s| !s.frames.first().is_some_and(|f| waiting(f)));
+    let busy: u64 = thread.stacks.iter().map(|s| s.count).sum();
+    if busy == 0 {
         profile.idle_threads += 1;
         return;
     }
+    thread.busy_samples = Some(busy);
     profile.truncated |= thread_cut;
     // Different instruction offsets can resolve to the same named stack. Merge
     // them before ranking so the reply does not repeat one stack three times.
@@ -146,9 +186,13 @@ pub(crate) fn parse(text: &str, mut profile: Profile) -> Result<Profile, &'stati
     if profile.threads.is_empty() && profile.idle_threads == 0 {
         return Err("sample contained no call graph");
     }
-    profile
-        .threads
-        .sort_by(|a, b| b.samples.cmp(&a.samples).then(a.name.cmp(&b.name)));
+    // `sample` samples every thread at every tick, so total samples are equal
+    // across threads. Rank by samples spent running instead.
+    profile.threads.sort_by(|a, b| {
+        b.busy_samples
+            .cmp(&a.busy_samples)
+            .then(a.name.cmp(&b.name))
+    });
     profile.truncated |= profile.threads.len() > 8;
     profile.threads.truncate(8);
     Ok(profile)
@@ -237,6 +281,68 @@ mod tests {
         assert_eq!(result.threads.len(), 8);
         assert_eq!(result.threads[0].samples, Some(10));
         assert!(result.truncated);
+        assert_eq!(result.threads[0].busy_samples, Some(9));
+        assert!(result.threads[0]
+            .stacks
+            .iter()
+            .all(|s| s.frames[0] != "kevent"));
         assert!(parse("garbage", profile()).is_err());
+    }
+
+    #[test]
+    fn threads_rank_by_busy_samples_not_by_equal_totals_or_name() {
+        // `sample` reports the same total for every thread. A mostly waiting
+        // thread whose name sorts first must not push the busy one out.
+        let graph = "Call graph:\n\
+            \x20 100 Thread_1: aaa-mostly-waiting\n\
+            \x20   100 root\n\
+            \x20     98 __psynch_cvwait\n\
+            \x20     2 tick\n\
+            \x20 100 Thread_2: zzz-hot\n\
+            \x20   100 root\n\
+            \x20     95 hot_loop\n\
+            \x20     5 kevent\n";
+        let result = parse(graph, profile()).unwrap();
+        let ranked: Vec<_> = result
+            .threads
+            .iter()
+            .map(|t| (t.name.as_str(), t.busy_samples))
+            .collect();
+        assert_eq!(
+            ranked,
+            [
+                ("Thread_2: zzz-hot", Some(95)),
+                ("Thread_1: aaa-mostly-waiting", Some(2)),
+            ]
+        );
+        assert_eq!(result.threads[0].stacks[0].frames[0], "hot_loop");
+    }
+
+    #[test]
+    fn blocking_reads_locks_and_mach_traps_are_waits() {
+        let mut graph = "Call graph:\n".to_string();
+        for (i, leaf) in [
+            "read",
+            "__ulock_wait2",
+            "mach_msg2_trap",
+            "__psynch_mutexwait",
+        ]
+        .iter()
+        .enumerate()
+        {
+            graph.push_str(&format!("  10 Thread_{i}\n    10 root\n      10 {leaf}\n"));
+        }
+        let result = parse(&graph, profile()).unwrap();
+        assert_eq!(result.idle_threads, 4);
+        assert!(result.threads.is_empty());
+    }
+
+    #[test]
+    fn stripped_frames_keep_their_image_and_offset() {
+        assert_eq!(
+            frame_name("???  (in ck-aft)  load address 0x100f8c000 + 0x4dd5f4  [0x1014695f4]"),
+            "ck-aft+0x4dd5f4"
+        );
+        assert_eq!(frame_name("???  (in ck-aft)"), "??? (ck-aft)");
     }
 }

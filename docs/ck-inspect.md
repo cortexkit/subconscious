@@ -41,7 +41,7 @@ entry; a mismatch omits PID rather than pairing unrelated observations.
 window is one second. The profile value, inside `{"result": ...}`, is:
 
 ```json
-{"module_id":"worker","pid":123,"seconds":1,"method":"sample","threads":[{"name":"worker","samples":90,"stacks":[{"count":50,"frames":["work","main"]}]}],"idle_threads":2,"truncated":false}
+{"module_id":"worker","pid":123,"seconds":1,"method":"sample","threads":[{"name":"worker","samples":90,"busy_samples":50,"stacks":[{"count":50,"frames":["work","main"]}]}],"idle_threads":2,"truncated":false}
 ```
 
 `method` is an open string. New public Rust result structs are non-exhaustive and
@@ -63,14 +63,21 @@ add an installer component; manual configuration is sufficient.
 - macOS runs `/usr/bin/sample <pid> <seconds> 10 -file <output>` without a shell,
   using a fresh private 0700 temporary directory, removed after parsing. The
   interval is 10 ms. Counts describe sampled positions, not CPU milliseconds.
-  For each thread it returns the top three exclusive stacks, at most 12 frames,
-  leaf first. Addresses, binary offsets and source locations are stripped. Rust
-  legacy and v0 names are demangled without hash suffixes. Thread labels are
-  retained as `sample` prints them.
-- A macOS thread is idle if **all sampled leaves** are known waits:
-  `__psynch_cvwait`, `kevent`, `mach_msg`, `__semwait_signal`, or
-  `__workq_kernreturn` (including suffixed variants). Runtime ancestors of a
-  sleeping leaf do not make it busy. Any active leaf keeps the thread.
+  For each thread it returns the top three exclusive stacks whose leaf is not a
+  known wait, at most 12 frames, leaf first, and `busy_samples`, the number of
+  samples whose leaf was not a wait. Addresses and source locations are
+  stripped. Rust legacy and v0 names are demangled without hash suffixes. A
+  frame in a stripped binary, which `sample` prints as `???`, is reported as
+  `image+0xOFFSET`, the offset from the image's load address, so its owner can
+  symbolize it against that build's debug symbols. Thread labels are retained
+  as `sample` prints them.
+- A known wait is a leaf blocked in the kernel: `__psynch_cvwait`,
+  `__psynch_mutexwait`, `__ulock_wait`, `kevent`, `mach_msg`,
+  `__semwait_signal`, `semaphore_wait_trap`, `__workq_kernreturn`, `read`,
+  `__select`, `poll`, `__sigsuspend` or `__wait4`, including suffixed variants.
+  A macOS thread whose every sampled leaf is a wait is idle: it's counted in
+  `idle_threads` and not listed. Runtime ancestors of a sleeping leaf do not
+  make it busy.
 - Linux reports `method: "proc_threads"`: thread CPU milliseconds from differences
   in `/proc/<pid>/task/*/stat` user+system ticks, with names from `comm`. Threads
   present at both endpoints with the same start time are compared; exited, newly
@@ -84,8 +91,8 @@ add an installer component; manual configuration is sufficient.
 - The sampler deadline is `seconds + 5` seconds. On macOS, timeout/cancellation
   kills the **sampler's** process group, never the inspected process; Linux
   reads `/proc` in-process. At most 8 MiB of sampler output is read for parsing.
-  Replies keep at most eight threads, ordered by sample count
-  on macOS or CPU on Linux. The serialized profile body is at most 16 KiB;
+  Replies keep at most eight threads, ordered by `busy_samples` on macOS or CPU
+  on Linux, so the busiest threads survive the limits. The serialized profile body is at most 16 KiB;
   `truncated` is true when data is omitted, including stack/thread limits.
 
 Inspection never signals, restarts, or changes the target process. On macOS,

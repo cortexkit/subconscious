@@ -52,6 +52,11 @@ pub struct Thread {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub samples: Option<u64>,
+    /// macOS only: samples whose leaf frame was not a known wait. `sample`
+    /// samples every thread at every tick, so `samples` is the same for all
+    /// threads and this is the number that says how busy one was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_samples: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_ms: Option<u64>,
     pub stacks: Vec<Stack>,
@@ -62,6 +67,7 @@ impl Thread {
         Self {
             name,
             samples: None,
+            busy_samples: None,
             cpu_ms: None,
             stacks: Vec::new(),
         }

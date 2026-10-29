@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.5
+
+- macOS profiles rank threads by `busy_samples`, the samples whose leaf frame was not a known wait, and list only those running stacks. `sample` samples every thread at every tick, so 0.1.4 ranked by equal totals and then by name, and idle threads filled the eight-thread and 16 KiB limits before the busy ones.
+- More kernel waits count as idle: mutex and `__ulock` waits, `kevent64`, `mach_msg2_trap`, semaphore traps, blocking `read`, `select`, `poll`, `sigsuspend` and `wait4`.
+- A frame in a stripped binary is reported as `image+0xOFFSET` instead of `???`, so its owner can symbolize it against that build's debug symbols.
+
 ## 0.1.4
 
 - Wrap successful replies in the standard management envelope, `{"result": <value>}`. 0.1.3 returned the bare value, which management callers such as flows through Basal refuse as unreadable. Refusals still go out as Error frames. The profile is trimmed so the whole reply, envelope included, stays within 16 KiB.

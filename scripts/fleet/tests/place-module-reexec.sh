@@ -36,12 +36,12 @@ run_case reexec-module-with-restart-passes-the-guard \
 run_case other-module-no-restart-passes-the-guard \
   "REFUSED: staged artifact not found" \
   --module basal --no-restart
-run_case second-listed-module-refuses-no-restart \
-  "REFUSED: --no-restart: cerebellum re-executes its own binary path" \
-  --module cerebellum --no-restart
-# The harness pins its own executable, so it is no longer listed.
+# The harness and cerebellum pin their own executables, so neither is listed.
 run_case pinned-harness-no-restart-passes-the-guard \
   "REFUSED: staged artifact not found" \
   --module thalamus-harness --no-restart
+run_case pinned-cerebellum-no-restart-passes-the-guard \
+  "REFUSED: staged artifact not found" \
+  --module cerebellum --no-restart
 
 [ "$failures" -eq 0 ] || exit 1

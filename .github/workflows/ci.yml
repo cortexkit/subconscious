@@ -150,15 +150,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python3 -m venv target/gate-python
           for directory in vectors/*/; do
-            # Sets generated in this repository are regenerated and compared.
-            # Sets vendored from another repository (no generate.py) are
-            # checked against their published SHA256SUMS only.
             if [ -f "${directory}generate.py" ]; then
-              python3 -m pip install -r "${directory}requirements.txt"
-              python3 "${directory}generate.py" --check
+              target/gate-python/bin/pip install -r "${directory}requirements.txt"
             fi
-            (cd "$directory" && sha256sum --check --strict SHA256SUMS)
+            bash scripts/gate.sh fast vector "$directory"
           done
 
   path-dependencies:
@@ -170,12 +167,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cargo metadata
-        run: cargo metadata --format-version 1 --locked >/dev/null
+        run: bash scripts/gate.sh fast metadata-online
 
       - name: Check path dependencies
-        run: |
-          bash scripts/checks/no-external-path-deps.sh
-          bash scripts/checks/no-external-path-deps.test.sh
+        run: bash scripts/gate.sh fast paths
 
   # Linux + Windows matrix. subc's transport (loopback TCP + key auth) and the
   # cortexkit-paths-backed canonicalization must behave identically across
@@ -241,18 +236,18 @@ jobs:
 
       - name: Check CortexKit layout
         if: ${{ matrix.os == 'ubuntu' }}
-        run: bash scripts/check-cortexkit-layout.sh
+        run: bash scripts/gate.sh fast layout
 
       - name: Check Markdown links
         if: ${{ matrix.os == 'ubuntu' }}
-        run: python3 scripts/checks/check-md-links.py
+        run: bash scripts/gate.sh fast links
 
       - name: Check test citations in docs
         if: ${{ matrix.os == 'ubuntu' }}
-        run: python3 scripts/checks/check-doc-test-citations.py
+        run: bash scripts/gate.sh fast citations
 
       - name: Format check
-        run: cargo fmt --all -- --check
+        run: bash scripts/gate.sh fast fmt
 
       # Guarded for the same reason the test step is, one gate earlier. The
       # format check is the cheapest and most easily tripped check in this file,
@@ -266,14 +261,14 @@ jobs:
       # a check that follows another CHECK.
       - name: Clippy
         if: ${{ !cancelled() }}
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: bash scripts/gate.sh lint workspace
 
       # --all-targets lints the dev profile only, so warnings inside
       # #[cfg(not(debug_assertions))] (or release-only dead code) never fail the
       # gate above. Lint the release profile too so those surface in CI.
       - name: Clippy (release profile)
         if: ${{ !cancelled() }}
-        run: cargo clippy --workspace --release --locked -- -D warnings
+        run: bash scripts/gate.sh lint release
 
       # Runs even when a lint step above failed, because a lint failure must not
       # silently suppress the test signal. A sibling repo lost twenty commits of
@@ -292,7 +287,7 @@ jobs:
       - name: Test
         if: ${{ !cancelled() }}
         timeout-minutes: 40
-        run: cargo test --workspace --all-targets --locked --no-fail-fast
+        run: bash scripts/gate.sh test workspace
 
       # Root can create cgroup v2 directories under /sys/fs/cgroup; require these tests so they cannot skip in CI.
       - name: Kernel cgroup tests
@@ -334,7 +329,7 @@ jobs:
       # would be looking for a gap whose current cost is zero.
       - name: Doc tests
         if: ${{ !cancelled() }}
-        run: cargo test --workspace --doc --locked
+        run: bash scripts/gate.sh test docs
 
       # A generated file edited by hand is invisible to every test: the suite
       # passes, and the only symptom is that the generator rewrites the file on
@@ -396,7 +391,7 @@ jobs:
           if ! git merge-base "$BASE" HEAD >/dev/null 2>&1; then
             git fetch --unshallow origin 2>/dev/null || git fetch --depth=2147483647 origin || true
           fi
-          bash scripts/fleet/check-wire-crate-versions.sh "$BASE"
+          GATE_BASE="$BASE" bash scripts/gate.sh fast versions
         shell: bash
 
   # The TypeScript packages ship from this repo and are wire-compatible with the
@@ -466,12 +461,12 @@ jobs:
       # the Test step below must not lose its answer to a type error.
       - name: Typecheck
         if: ${{ !cancelled() }}
-        run: bun run typecheck
+        run: bash ../../scripts/gate.sh ts typecheck '${{ matrix.pkg }}'
       # Same reasoning as the Rust leg: a typecheck failure must not decide
       # whether the tests get to report.
       - name: Test
         if: ${{ !cancelled() }}
-        run: bun test
+        run: bash ../../scripts/gate.sh ts unit '${{ matrix.pkg }}'
 
       # THE LIVE SUITE IS THE ONLY CROSS-LANGUAGE PROOF AND IT HAD NEVER RUN HERE.
       #
@@ -513,22 +508,4 @@ jobs:
         if: ${{ !cancelled() && matrix.pkg == 'subc-client' && matrix.os == 'ubuntu-latest' }}
         env:
           RUN_SUBC_LIVE: "1"
-        run: |
-          set -o pipefail
-          bun test tests/live-handshake.test.ts tests/live-provider.test.ts \
-            tests/live-streaming.test.ts 2>&1 | tee /tmp/live.log
-          # FAIL LOUDLY ON A VACUOUS PASS. With the gate shut every block is
-          # skipped and bun still exits 0 -- which is exactly the state this job
-          # was in before today, reporting green while proving nothing.
-          #
-          # Measured both outputs rather than assuming the shape: skipped prints
-          # "4 skip" and NO pass line at all; a real run prints "2 pass". So a
-          # guard looking for the literal "0 pass" could never fire -- it was my
-          # first version, and the closed-gate control is what caught it. Reading
-          # the count and defaulting an ABSENT line to zero covers both.
-          passed=$(sed -nE 's/^[[:space:]]*([0-9]+) pass.*/\1/p' /tmp/live.log | head -1)
-          if [ "${passed:-0}" -eq 0 ]; then
-            echo "live suite executed no tests -- RUN_SUBC_LIVE did not open the gate"
-            exit 1
-          fi
-          echo "live suite executed ${passed} tests against a real daemon"
+        run: bash ../../scripts/gate.sh ts live

@@ -73,18 +73,8 @@ message, on a line starting `CONSUMER-IMPACT:`;
 - One logical change per commit, with a subject that names the crate or area
   and says what changed, for example
   `subc-daemon 0.36.2: refuse a swap of an exclusive module before spawning`.
-- Run the checks before pushing:
-
-  ```sh
-  cargo fmt --all -- --check
-  cargo clippy --workspace --all-targets --locked -- -D warnings
-  cargo test --workspace --all-targets --locked
-  bash scripts/check-cortexkit-layout.sh
-  python3 scripts/checks/check-md-links.py
-  ```
-
-  For a TypeScript package, also `bun run typecheck` and `bun test` in its
-  directory.
+- Before pushing, run `scripts/gate.sh fast` and `scripts/gate.sh lint`; run the full Rust `scripts/gate.sh test` on a Linux build server when changing Rust.
+  See `scripts/gate.sh --help` for Swift and TypeScript stages, prerequisites and CI-only checks.
 - Commit `Cargo.lock` changes with the `Cargo.toml` change that caused them.
   The pre-push hook in `.githooks/` refuses a push whose lockfile disagrees
   with its manifests; enable it with `git config core.hooksPath .githooks`.

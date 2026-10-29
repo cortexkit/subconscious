@@ -2,9 +2,9 @@ name: Windows private-files qualification
 on:
   push:
     branches: [master, 'train/**']
-    paths: ['clients/private-files/**', '.github/workflows/private-files.yml']
+    paths: ['clients/private-files/**', '.github/workflows/private-files.yml', 'scripts/gate.sh']
   pull_request:
-    paths: ['clients/private-files/**', '.github/workflows/private-files.yml']
+    paths: ['clients/private-files/**', '.github/workflows/private-files.yml', 'scripts/gate.sh']
   workflow_dispatch:
 permissions:
   contents: read
@@ -25,8 +25,8 @@ jobs:
       - run: |
           bun --version
           bun install --frozen-lockfile
-          bun run typecheck
-          bun run test
+          bash ../../scripts/gate.sh ts typecheck private-files
+          bash ../../scripts/gate.sh ts unit private-files
       - name: Real foreign-owner fixture with root permissions
         run: sudo "$(command -v bun)" test test/private-files.test.ts --test-name-pattern 'POSIX refuses foreign-owned'
   private-files-prebuilds:

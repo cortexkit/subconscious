@@ -8,10 +8,12 @@ on:
     paths:
       - "clients/subc-client-swift/**"
       - ".github/workflows/subc-fed.yml"
+      - "scripts/gate.sh"
   pull_request:
     paths:
       - "clients/subc-client-swift/**"
       - ".github/workflows/subc-fed.yml"
+      - "scripts/gate.sh"
   workflow_call:
 
 concurrency:
@@ -34,12 +36,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Resolve package dependencies
-        run: swift package resolve
-
-      - name: Run package tests
-        run: |
-          swift test
+      - name: Resolve dependencies and run package tests
+        run: bash ../../scripts/gate.sh swift test
 
   # Build the SubcFed scheme for generic iOS with the package's declared iOS 16
   # deployment floor. Code signing is disabled because the CI runner has no
@@ -54,16 +52,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Resolve package dependencies
-        run: swift package resolve
-
-      - name: Build SubcFed for generic iOS
-        run: |
-          xcodebuild -scheme SubcFed \
-              -destination 'generic/platform=iOS' \
-              -derivedDataPath .build/xcode-derived \
-              CODE_SIGNING_ALLOWED=NO \
-              build
+      - name: Resolve dependencies and build SubcFed for generic iOS
+        run: bash ../../scripts/gate.sh swift ios
 
   # Build the SubcFed scheme for generic macOS with an explicit macOS 13
   # deployment target. Together with the package declaration, unavailable
@@ -77,14 +67,5 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Resolve package dependencies
-        run: swift package resolve
-
-      - name: Build SubcFed for generic macOS
-        run: |
-          xcodebuild -scheme SubcFed \
-              -destination 'generic/platform=macOS' \
-              -derivedDataPath .build/xcode-derived-macos \
-              MACOSX_DEPLOYMENT_TARGET=13.0 \
-              CODE_SIGNING_ALLOWED=NO \
-              build
+      - name: Resolve dependencies and build SubcFed for generic macOS
+        run: bash ../../scripts/gate.sh swift macos

@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "app_unknown",
+    "message": "no compiled app named \"unknown-app\" on this platform"
+  },
+  "request": {
+    "app": "unknown-app",
+    "op": "app.open"
+  }
+}

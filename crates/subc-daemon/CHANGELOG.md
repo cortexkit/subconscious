@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.38.8
+
+- Answer unprivileged `connection.describe` calls with the caller's local-listener status and the same current operator-app recognition used by `route.bind`. Recognition is a snapshot and may change on revalidation; no build is admitted by the production app floor today. Requires subc-control 0.33.5.
+- Add byte-checked `app-open-v1` samples generated through the real `app.open` handler's platform and policy test seams, covering both success statuses and all five refusals with a fixed fixture pid.
+
 ## 0.38.7
 
 - WARN when a data-plane frame cannot be forwarded because of an unknown channel, stale epoch, missing binding or vanished endpoint. Limit these diagnostics to one per connection, channel and reason per 60 seconds, reporting the suppressed count on the next warning. Include the route epoch and direction, never the body; existing egress-budget and GOODBYE delivery warnings remain in place.

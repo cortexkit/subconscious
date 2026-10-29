@@ -757,6 +757,9 @@ where
     let mut connection = router.begin_connection();
     let connection_id = connection.id();
     router.record_caller_endpoints(connection_id, endpoints);
+    if matches!(origin, LocalOrigin::Local) {
+        router.record_local_connection(connection_id);
+    }
     if let Some(peer) = peer {
         router.record_captured_peer(connection_id, peer);
     }

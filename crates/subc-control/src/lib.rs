@@ -85,6 +85,9 @@ pub use rescan_checked::*;
 mod app_open;
 pub use app_open::*;
 
+mod connection_describe;
+pub use connection_describe::*;
+
 /// Daemon-spawned consumer identity presented on route.open.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ConsumerIdentity {
@@ -151,6 +154,7 @@ pub mod ops {
     pub const ACTIVITY_QUERY: &str = "activity.query";
     pub const ACTIVITY_SUBSCRIBE: &str = "activity.subscribe";
     pub const APP_OPEN: &str = "app.open";
+    pub const CONNECTION_DESCRIBE: &str = "connection.describe";
 }
 
 /// Client-originated channel-0 control RPC body.

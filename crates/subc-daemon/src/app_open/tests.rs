@@ -30,6 +30,124 @@ fn test_handler() -> ControlHandler {
     ControlHandler::default().with_test_operator_app_policy(test_policy())
 }
 
+// Workspace builds turn on serde_json's preserve_order through another crate,
+// so a Value's key order differs between `-p subc-daemon` and workspace test
+// runs. Sort keys explicitly so the sample bytes are the same in both.
+fn sorted_keys(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, sorted_keys(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sorted_keys).collect()),
+        other => other,
+    }
+}
+
+#[tokio::test]
+async fn app_open_vectors_match_real_handler_bytes() {
+    use sha2::{Digest, Sha256};
+
+    const PID: u32 = 4242;
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vectors/app-open-v1");
+    let update = std::env::var_os("UPDATE_GOLDEN").is_some();
+    let mut sums = String::new();
+    for case in [
+        "already_running",
+        "app_not_installed",
+        "app_open_disabled",
+        "app_open_not_used",
+        "app_unknown",
+        "app_verification_failed",
+        "launched",
+    ] {
+        let mut policy = test_policy();
+        if case == "app_open_disabled" {
+            policy.linux_enabled = false;
+        }
+        if matches!(case, "launched" | "app_verification_failed") {
+            // Only existence is checked before the injected launcher. The path
+            // never reaches a frame, and no executable is run by this test.
+            policy.linux_path = Some(std::env::current_exe().unwrap());
+        }
+        let mut handler = ControlHandler::default().with_test_operator_app_policy(policy);
+        handler.app_open_test_platform = Some(if case == "app_open_not_used" {
+            AppOpenPlatform::MacOS
+        } else {
+            AppOpenPlatform::Linux
+        });
+        handler.app_open_test_launch = Some(if case == "app_verification_failed" {
+            || {
+                Err(AppOpenRefusal {
+                    code: subc_control::APP_VERIFICATION_FAILED,
+                    message: "installed app failed verification".to_string(),
+                })
+            }
+        } else {
+            || Ok(PID)
+        });
+        if case == "already_running" {
+            handler
+                .launch_table
+                .publish(TEST_APP, PID, live_process(), None);
+        }
+        let app = if case == "app_unknown" {
+            "unknown-app"
+        } else {
+            TEST_APP
+        };
+        let request = app_open_frame(11, app);
+        let (ctx, _rx) = route_ctx(7);
+        let replies = handler
+            .handle_control_frame(&ctx, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(replies.len(), 1);
+        let reply: Value = serde_json::from_slice(&replies[0].body).unwrap();
+        let request: Value = serde_json::from_slice(&request.body).unwrap();
+        let sample = match replies[0].header.ty {
+            FrameType::Response => {
+                assert_eq!(reply["status"], case);
+                assert_eq!(reply["pid"], PID);
+                json!({"request":request, "reply":reply})
+            }
+            FrameType::Error => {
+                assert_eq!(reply["code"], case);
+                assert_eq!(reply.as_object().unwrap().len(), 2);
+                json!({"request":request, "error":reply})
+            }
+            ty => panic!("unexpected app.open reply: {ty:?}"),
+        };
+        let mut bytes = serde_json::to_vec_pretty(&sorted_keys(sample)).unwrap();
+        bytes.push(b'\n');
+        let name = format!("{case}.json");
+        if update {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(directory.join(&name), &bytes).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(directory.join(&name)).unwrap(),
+            bytes,
+            "{name}; regenerate with UPDATE_GOLDEN=1"
+        );
+        sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(&bytes)));
+    }
+    if update {
+        std::fs::write(directory.join("SHA256SUMS"), &sums).unwrap();
+    }
+    assert_eq!(
+        std::fs::read(directory.join("SHA256SUMS")).unwrap(),
+        sums.as_bytes()
+    );
+}
+
 fn route_ctx(
     connection: u64,
 ) -> (

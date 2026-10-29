@@ -86,16 +86,24 @@ fn test_sources_do_not_create_directories_from_temp_dir() {
     );
 }
 
-/// The one test function allowed to create a directory straight under
-/// `temp_dir()`: the daemon kit's data home holds the daemon's Unix socket,
-/// whose path is limited to about a hundred bytes, and every directory under
-/// the shared scratch root is too long for it. The kit removes the directory
-/// when it drops. Keyed by file and function name, so nothing else in the file
-/// or a new function of the same name elsewhere gains the exemption.
-const SHORT_SOCKET_ROOT: (&str, &str) = ("tests/common/kit.rs", "create_short_socket_root");
+/// The only test functions allowed to create a directory straight under
+/// `temp_dir()`. Each builds a data home for a real daemon, whose Unix socket
+/// path is limited to about a hundred bytes, and every directory under the
+/// shared scratch root is too long for it. Each removes its directory when
+/// dropped. Keyed by crate file and function name, so nothing else in those
+/// files, and no function of the same name elsewhere, gains the exemption.
+const SHORT_SOCKET_ROOTS: [(&str, &str); 2] = [
+    ("subc-core/tests/common/kit.rs", "create_short_socket_root"),
+    (
+        "subc-client-rs/tests/real_daemon.rs",
+        "create_short_socket_root",
+    ),
+];
 
 fn is_short_socket_root(path: &Path, function: &str) -> bool {
-    path.ends_with(SHORT_SOCKET_ROOT.0) && function == SHORT_SOCKET_ROOT.1
+    SHORT_SOCKET_ROOTS
+        .iter()
+        .any(|(file, name)| path.ends_with(file) && function == *name)
 }
 
 fn scan_tree(dir: &Path, tests: bool, offenders: &mut Vec<String>) {

@@ -10,24 +10,26 @@ mod stand_in;
 pub mod test_support;
 pub use activity::*;
 pub use consumer::{
-    is_retryable_route_open_code, CallError, CallOptions, CallReply, CancelHandle, CancelOutcome,
-    CatalogList, CloseRouteOptions, ConnectionState, ConsumerCapabilityError, ConsumerError,
-    ConsumerOptions, ControlPush, CorrelationId, HealthProbeResponse, NotSentCause,
-    OutcomeUnknownCause, PendingReply, PushEvent, RequestBody, RequestReservation, RetryBackoff,
-    ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
-    ReverseRequestRegistry, RouteCloseDisposition, RouteCloseReason, RouteEndReason,
-    RoutePollResult, ScopeBindProofRefusal, ScopeSelector, ServerDescription, SpawnStreamError,
-    SpawnSubscription, StderrTailResponse, SubcConsumer, SubscribeOptions, Subscription,
-    SubscriptionClosed, SubscriptionEnd, SupervisorAck, SupervisorEntry, SupervisorHealthResponse,
-    SupervisorListResponse, SupervisorProvenanceResponse, DEFAULT_CALL_TIMEOUT,
-    DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH,
-    SPAWN_CURSOR_TOO_OLD, SPAWN_SUBSCRIBER_LAGGED,
+    is_retryable_route_open_code, AppOpenError, CallError, CallOptions, CallReply, CancelHandle,
+    CancelOutcome, CatalogList, CloseRouteOptions, ConnectionFacts, ConnectionState,
+    ConsumerCapabilityError, ConsumerError, ConsumerOptions, ControlPush, CorrelationId,
+    HealthProbeResponse, NotSentCause, OutcomeUnknownCause, PendingReply, PushEvent, RequestBody,
+    RequestReservation, RetryBackoff, ReverseRequestContext, ReverseRequestError,
+    ReverseRequestRegistrationError, ReverseRequestRegistry, RouteCloseDisposition,
+    RouteCloseReason, RouteEndReason, RoutePollResult, ScopeBindProofRefusal, ScopeSelector,
+    ServerDescription, SpawnStreamError, SpawnSubscription, StderrTailResponse, SubcConsumer,
+    SubscribeOptions, Subscription, SubscriptionClosed, SubscriptionEnd, SupervisorAck,
+    SupervisorEntry, SupervisorHealthResponse, SupervisorListResponse,
+    SupervisorProvenanceResponse, DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW,
+    DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH, SPAWN_CURSOR_TOO_OLD,
+    SPAWN_SUBSCRIBER_LAGGED,
 };
 pub use operator_app::{operator_app_candidates, operator_app_path, OperatorAppPathError};
 pub use policy_cache::{
     PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyResolverFootprint,
     PolicyVerdict, ProjectRef, Subject, DEFAULT_POLICY_RESOLVER_MODULE_ID,
 };
+pub use subc_control::{AppOpenReply, AppOpenStatus};
 
 use std::{
     collections::{HashMap, VecDeque},

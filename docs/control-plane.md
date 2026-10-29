@@ -51,7 +51,8 @@ checked by `protocol_wire_shapes_match_golden_json_and_round_trip` (`crates/subc
 
 Any authenticated connection that has not registered as a module may send
 these; `ck` is such a client. A connection that has sent `HELLO` may send only
-the operations in section 5 and the `activity.*` operations; any other request
+the operations in section 5, the `activity.*` operations, `app.open`, and
+`connection.describe`; any other request
 from it is refused `unsupported_control_frame` (`handle_control_frame_timed` in
 `crates/subc-daemon/src/control.rs`). A module that calls other modules does
 so over a second, client connection. Test:
@@ -60,6 +61,8 @@ so over a second, client connection. Test:
 | Op | Purpose | Notes |
 | --- | --- | --- |
 | `server.describe` | Protocol version, advertised ops and capabilities, connected client count, counters, build commit and lock digest, capability-requirement status, machine id. | `build_git_sha`, `build_lock_digest` and `machine_id` are absent from daemons that predate them. The daemon's version is in the connection file and the handshake, not here. |
+| `app.open` | Ask the daemon to start a known installed operator app. | Unprivileged; starting an app grants nothing. Standalone request/reply bodies, not variants of the exhaustive control enums. |
+| `connection.describe` | Read the daemon's facts about the caller's own connection. | Unprivileged, never prompts, and cannot inspect another connection. Standalone request/reply bodies. |
 | `catalog.list` | Registered modules with their manifests' roles, capabilities, readiness and optional `rich_ui` descriptor. Optional `module_id` narrows the list. | An unregistered id gives an empty list, not an error. This is the wire registry, not the supervised roster. `rich_ui` is opaque and fixed for the registration's lifetime; `nonce_verified: true` appears only when HELLO passes the launch-nonce check required for a reserved module or swap candidate. Both fields are omitted when absent/unverified, preserving legacy entry bytes. |
 | `route.open` | Open a route to a target (section 2.1). | Reply: `route_channel`, `route_epoch`. |
 | `route.poll` | Read a bound route's last status (`kind: "status"`) or whether its module process is live (`kind: "liveness"`). | Answered from the daemon's own state; the module is never asked. |
@@ -90,6 +93,42 @@ daemon loaded, not a fresh disk read. The field is absent when there is no
 configured entry (for example, a daemon without a config file), and on older
 daemons. Absent values are omitted rather than serialized as `null`, preserving
 older list-entry bytes.
+
+### `app.open` and `connection.describe`
+
+`{"op":"app.open","app":"<id>"}` replies with
+`{"op":"app.open","status":"launched","pid":4242}` or
+`{"op":"app.open","status":"already_running","pid":4242}`.
+The refusal checks are, in order: `app_open_not_used` (macOS),
+`app_open_disabled`, `app_unknown`, `app_not_installed`, and
+`app_verification_failed`. The already-running success check precedes the
+installation check. The Rust client's `SubcConsumer::app_open` returns the open
+`AppOpenReply` status, or `AppOpenError::Refused { code, message }` for any
+daemon error frame; other failures are `AppOpenError::Call`. Future status
+strings and refusal codes are preserved. Handler-produced examples and the
+regeneration command are in [`app-open-v1`](../vectors/app-open-v1/README.md).
+Test: `app_open_vectors_match_real_handler_bytes` (`crates/subc-daemon/src/app_open/tests.rs`).
+
+`{"op":"connection.describe"}` replies with
+`{"op":"connection.describe","local":false}` for loopback TCP, or
+`{"op":"connection.describe","local":true}` for the daemon's local listener
+(Unix socket or Windows named pipe). When recognised, the reply also includes
+`"operator_app":{"app":"<id>","pid":4242}`. That value is computed by the
+same function as `route.bind`'s operator-app delivery decision; bind delivery
+additionally requires the target's `operator-app/v1` capability. The field is
+omitted when no app would be stamped. The production app floor currently
+admits no build, so every production connection omits it.
+
+These are facts at the call, not a lifetime promise. Revalidation can withdraw
+recognition, and a reconnect establishes a different connection. No request
+field can select another connection. `SubcConsumer::describe_connection`
+returns `Some(ConnectionFacts)` on a supporting daemon; only the client
+dispatcher's `unknown_control_op` refusal returns `None` for an older daemon.
+An absent result means the daemon doesn't support this query; it says nothing about whether the connection was recognised. All other failures remain errors.
+Tests: `connection_describe_wire_shapes` (`crates/subc-control/src/connection_describe.rs`),
+`operator_app_bind_is_gated_independently_and_the_stamp_survives_route_commit` (`crates/subc-daemon/src/peer_manifest_tests.rs`),
+`describe_connection_decodes_facts_and_only_unknown_control_op_is_older` (`crates/subc-client-rs/src/consumer/connection_ops_tests.rs`), and
+`describe_connection_reports_tcp_and_local_listener_on_real_daemon` (`crates/subc-client-rs/tests/real_daemon.rs`).
 
 ### 2.1 `route.open`
 

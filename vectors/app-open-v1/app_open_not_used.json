@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "app_open_not_used",
+    "message": "this platform never launches apps through the daemon"
+  },
+  "request": {
+    "app": "test-app",
+    "op": "app.open"
+  }
+}

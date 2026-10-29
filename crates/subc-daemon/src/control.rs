@@ -412,6 +412,7 @@ pub struct ControlHandler {
     caller_endpoints: Arc<Mutex<HashMap<ConnectionId, (SocketAddr, SocketAddr)>>>,
     build_class_warned: Arc<Mutex<HashSet<ConnectionId>>>,
     observed_peers: Arc<Mutex<HashMap<ConnectionId, ObservedPeer>>>,
+    local_connections: Arc<Mutex<HashSet<ConnectionId>>>,
     pub(crate) operator_app_policy: crate::operator_apps::OperatorAppPolicy,
     pub(crate) operator_apps:
         Arc<Mutex<HashMap<ConnectionId, crate::operator_apps::OperatorAppStamp>>>,
@@ -426,6 +427,11 @@ pub struct ControlHandler {
     /// process. Refusals and `already_running` answers share the same lock;
     /// `app.open` is rare, so the cost is negligible.
     pub(crate) app_open_launch_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    // Portable wire samples exercise dispatch without starting an OS process.
+    #[cfg(test)]
+    pub(crate) app_open_test_platform: Option<crate::operator_apps::AppOpenPlatform>,
+    #[cfg(test)]
+    pub(crate) app_open_test_launch: Option<fn() -> Result<u32, crate::app_open::AppOpenRefusal>>,
     /// Test-only Windows signature and flash hooks. Production builds carry
     /// neither: with the publisher unset, the production table never reaches
     /// verification, and the default attention hook only logs.
@@ -1030,10 +1036,15 @@ impl ControlHandler {
             caller_endpoints: Arc::new(Mutex::new(HashMap::new())),
             build_class_warned: Arc::new(Mutex::new(HashSet::new())),
             observed_peers: Arc::new(Mutex::new(HashMap::new())),
+            local_connections: Arc::new(Mutex::new(HashSet::new())),
             operator_app_policy: Default::default(),
             operator_apps: Arc::new(Mutex::new(HashMap::new())),
             launch_table: std::sync::Arc::new(crate::app_open::LaunchTable::new()),
             app_open_launch_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            app_open_test_platform: None,
+            #[cfg(test)]
+            app_open_test_launch: None,
             #[cfg(windows)]
             windows_verify: None,
             #[cfg(windows)]
@@ -1868,6 +1879,50 @@ impl ControlHandler {
         }
     }
 
+    pub(crate) fn record_local_connection(&self, connection: ConnectionId) {
+        self.local_connections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(connection);
+    }
+
+    // Keep the connection-level delivery decision shared with route.bind. The
+    // target's capability opt-in is separate from recognition of the caller.
+    fn connection_operator_app(
+        &self,
+        stamp: Option<&crate::operator_apps::OperatorAppStamp>,
+    ) -> Option<subc_protocol::peer::OperatorApp> {
+        stamp
+            .filter(|stamp| stamp.delivery_enabled(&self.operator_app_policy))
+            .map(|stamp| stamp.app.clone())
+    }
+
+    fn handle_connection_describe(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        if serde_json::from_slice::<subc_control::ConnectionDescribeRequest>(&frame.body).is_err() {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_control_body",
+                "malformed connection.describe body",
+            )?]);
+        }
+        let local = self
+            .local_connections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&ctx.connection_id);
+        let stamps = self.operator_apps.lock().unwrap_or_else(|p| p.into_inner());
+        let operator_app = self.connection_operator_app(stamps.get(&ctx.connection_id));
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &subc_control::ConnectionDescribeReply::new(local, operator_app),
+            ops::CONNECTION_DESCRIBE,
+        )?])
+    }
+
     pub(crate) fn record_observed_peer(
         &self,
         connection: ConnectionId,
@@ -2012,6 +2067,12 @@ impl ControlHandler {
                 }
                 if op
                     .as_ref()
+                    .is_some_and(|probe| probe.op == ops::CONNECTION_DESCRIBE)
+                {
+                    return self.handle_connection_describe(ctx, frame);
+                }
+                if op
+                    .as_ref()
                     .is_some_and(|probe| probe.op == subc_control::SCOPE_SERVED_BY_OP)
                 {
                     return self.handle_scope_served_by(ctx.connection_id, frame);
@@ -2144,6 +2205,10 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        self.local_connections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&connection_id);
         self.caller_endpoints
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -5509,16 +5574,14 @@ impl ControlHandler {
                     }),
             )
             .with_operator_app(
-                operator_app
-                    .filter(|stamp| {
-                        stamp.delivery_enabled(&self.operator_app_policy)
-                            && relay_capabilities.is_some_and(|caps| {
-                                caps.provides
-                                    .iter()
-                                    .any(|cap| cap == OPERATOR_APP_CAPABILITY)
-                            })
-                    })
-                    .map(|stamp| stamp.app),
+                self.connection_operator_app(operator_app.as_ref())
+                    .filter(|_| {
+                        relay_capabilities.is_some_and(|caps| {
+                            caps.provides
+                                .iter()
+                                .any(|cap| cap == OPERATOR_APP_CAPABILITY)
+                        })
+                    }),
             );
         let relay_body = encode_route_bind(&relay, &peer).map_err(|err| {
             RouterError::backend(

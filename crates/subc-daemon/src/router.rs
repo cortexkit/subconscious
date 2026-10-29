@@ -901,6 +901,10 @@ impl Router {
         self.control.route_open_target(frame)
     }
 
+    pub(crate) fn record_local_connection(&self, connection: ConnectionId) {
+        self.control.record_local_connection(connection);
+    }
+
     pub(crate) fn record_captured_peer(
         &self,
         connection: ConnectionId,

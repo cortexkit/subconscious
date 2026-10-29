@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "app_verification_failed",
+    "message": "installed app failed verification"
+  },
+  "request": {
+    "app": "test-app",
+    "op": "app.open"
+  }
+}

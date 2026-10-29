@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "app_open_disabled",
+    "message": "app.open is switched off on this platform"
+  },
+  "request": {
+    "app": "test-app",
+    "op": "app.open"
+  }
+}

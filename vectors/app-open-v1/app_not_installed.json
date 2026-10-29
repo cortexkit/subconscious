@@ -1,0 +1,10 @@
+{
+  "error": {
+    "code": "app_not_installed",
+    "message": "no install location is compiled in for \"test-app\""
+  },
+  "request": {
+    "app": "test-app",
+    "op": "app.open"
+  }
+}

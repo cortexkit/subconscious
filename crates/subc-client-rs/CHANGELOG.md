@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.32.19
+
+- Add `SubcConsumer::describe_connection` and non-exhaustive `ConnectionFacts` with local transport and operator-app accessors. Only the older daemon's unknown-operation refusal maps to `Ok(None)`; other errors propagate. Requires subc-control 0.33.5.
+- Add typed `SubcConsumer::app_open`, returning `AppOpenReply` (including future statuses) or non-exhaustive `AppOpenError` with open-string daemon refusals and transport errors. The `app-open-v1` samples are generated from the daemon handler for desktop launchers.
+
 ## 0.32.18
 
 - Retire a cached route when an accepted managed call reaches its response deadline. Return the same outcome-unknown error without resending; the next call opens a fresh route even if the connection's Ping still succeeds. Calls already pending on that route still receive their replies and settle normally. Queue a best-effort route GOODBYE when the retired route drains or the consumer closes, and WARN once with target, channel, epoch and pending count, never request bodies. Caller cancellation and unsent flow-control deadlines do not retire routes. A module slower than a call's deadline still makes that call return outcome-unknown, and the next call opens a fresh route.

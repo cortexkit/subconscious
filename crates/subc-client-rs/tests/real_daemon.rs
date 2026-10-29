@@ -53,6 +53,85 @@ const CATALOG_FAKE_AFT_MODULE_ID: &str = "subc-client-rs-catalog-fake-aft";
 const PUSH_MODULE_ID: &str = "subc-client-rs-push";
 const POLICY_MODULE_ID: &str = "subc-client-rs-policy-resolver";
 
+// Socket-bearing data homes need a shorter path than the shared scratch root:
+// Unix socket names have a roughly hundred-byte limit, including parent paths.
+struct ShortSocketRoot(PathBuf);
+
+// Exempted by name in subc-core's workspace_fences.rs, which otherwise forbids
+// test directories created straight under temp_dir().
+fn create_short_socket_root() -> ShortSocketRoot {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let id = u64::from(std::process::id()) ^ NEXT.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("ckcd-{id:08x}"));
+    let builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    let builder = {
+        let mut builder = builder;
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+        use std::os::unix::ffi::OsStrExt;
+        assert!(
+            path.join("data/cortexkit/run/subc.sock")
+                .as_os_str()
+                .as_bytes()
+                .len()
+                < 104
+        );
+        builder
+    };
+    builder
+        .create(&path)
+        .expect("create private short socket root");
+    ShortSocketRoot(path)
+}
+
+impl Drop for ShortSocketRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn describe_connection_reports_tcp_and_local_listener_on_real_daemon() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
+    );
+    let temp_dir = create_short_socket_root();
+    let runtime_dir = temp_dir.0.join("runtime");
+    let config_dir = temp_dir.0.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    for local in [false, true] {
+        let consumer = if local {
+            SubcConsumer::connect_local(&daemon.connection_file, fast_consumer_options()).await
+        } else {
+            SubcConsumer::connect(&daemon.connection_file, fast_consumer_options()).await
+        }
+        .unwrap();
+        let facts = consumer
+            .describe_connection()
+            .await
+            .unwrap()
+            .expect("current daemon supports connection.describe");
+        assert_eq!(facts.local(), local);
+        assert!(facts.operator_app().is_none());
+        consumer.close().await;
+    }
+    daemon.kill_and_wait();
+}
+
 #[test]
 fn route_option_legacy_struct_literals_and_default_updates_still_compile() {
     let _full_call = CallOptions {

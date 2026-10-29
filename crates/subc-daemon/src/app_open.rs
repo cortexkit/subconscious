@@ -368,10 +368,13 @@ impl ControlHandler {
             }
         };
         let app = request.app.clone();
+        let platform = AppOpenPlatform::current();
+        #[cfg(test)]
+        let platform = self.app_open_test_platform.unwrap_or(platform);
         match decide_app_open(
             &self.operator_app_policy,
             &self.launch_table,
-            AppOpenPlatform::current(),
+            platform,
             &app,
         ) {
             AppOpenDecision::Refuse(refusal) => Ok(vec![crate::control::control_error_frame(
@@ -392,20 +395,7 @@ impl ControlHandler {
                 )?])
             }
             AppOpenDecision::Launch { path } => {
-                #[cfg(windows)]
-                let outcome = self.windows_launch_app(&app, &path).await;
-                #[cfg(target_os = "linux")]
-                let outcome = self.linux_launch_app(&app, &path).await;
-                #[cfg(not(any(windows, target_os = "linux")))]
-                let outcome: Result<u32, AppOpenRefusal> = {
-                    // The ordered checks never produce `Launch` here (macOS
-                    // and other platforms refuse first); the binding is only
-                    // dropped so the arm stays total.
-                    let _ = path;
-                    Err(AppOpenRefusal::not_used(
-                        "this platform has no app launcher",
-                    ))
-                };
+                let outcome = self.launch_app(&app, &path).await;
                 match outcome {
                     Ok(pid) => Ok(vec![crate::control::control_response_body_frame(
                         &frame,
@@ -419,6 +409,29 @@ impl ControlHandler {
                     )?]),
                 }
             }
+        }
+    }
+
+    async fn launch_app(&self, app: &str, path: &std::path::Path) -> Result<u32, AppOpenRefusal> {
+        #[cfg(test)]
+        if let Some(launch) = self.app_open_test_launch {
+            return launch();
+        }
+        #[cfg(windows)]
+        {
+            self.windows_launch_app(app, path).await
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.linux_launch_app(app, path).await
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            // The ordered platform check refuses before launching on these hosts.
+            let _ = (app, path);
+            Err(AppOpenRefusal::not_used(
+                "this platform has no app launcher",
+            ))
         }
     }
 }

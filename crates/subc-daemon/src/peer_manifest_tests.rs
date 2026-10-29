@@ -279,6 +279,7 @@ async fn operator_app_bind_is_gated_independently_and_the_stamp_survives_route_c
                     )
                     .await;
                     let (client, _client_rx) = route_ctx(ConnectionId::new(2));
+                    handler.record_local_connection(client.connection_id);
                     if stamped {
                         handler.operator_apps.lock().unwrap().insert(
                             client.connection_id,
@@ -290,6 +291,39 @@ async fn operator_app_bind_is_gated_independently_and_the_stamp_survives_route_c
                     let (bind, binding) =
                         bind_route(&handler, &target, &mut rx, &client, identity, None).await;
                     let raw: Value = serde_json::from_slice(&bind.body).unwrap();
+                    let describe = Frame::build(
+                        FrameType::Request,
+                        control_flags(),
+                        0,
+                        0,
+                        99,
+                        serde_json::to_vec(&subc_control::ConnectionDescribeRequest::new())
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let described = handler
+                        .handle_control_frame(&client, describe)
+                        .await
+                        .unwrap();
+                    assert_eq!(described[0].header.ty, FrameType::Response);
+                    let facts: subc_control::ConnectionDescribeReply =
+                        serde_json::from_slice(&described[0].body).unwrap();
+                    assert!(facts.local);
+                    assert_eq!(
+                        facts.operator_app,
+                        (enabled && stamped)
+                            .then(|| subc_protocol::peer::OperatorApp::new("fixture", 42))
+                    );
+                    if operator {
+                        assert_eq!(
+                            raw.get("operator_app"),
+                            facts
+                                .operator_app
+                                .as_ref()
+                                .map(|app| serde_json::to_value(app).unwrap())
+                                .as_ref()
+                        );
+                    }
                     assert_eq!(
                         raw.get("operator_app"),
                         (operator && enabled && stamped)
@@ -309,6 +343,11 @@ async fn operator_app_bind_is_gated_independently_and_the_stamp_survives_route_c
                         assert_eq!(bind.body, serde_json::to_vec(&legacy).unwrap());
                     }
                     handler.cleanup_connection(client.connection_id).unwrap();
+                    assert!(!handler
+                        .local_connections
+                        .lock()
+                        .unwrap()
+                        .contains(&client.connection_id));
                     assert!(!handler
                         .operator_apps
                         .lock()
@@ -625,7 +664,9 @@ async fn windows_launch_stamp_is_relayed_only_with_the_windows_switch() {
         // switch on.
         let own_pid = std::process::id();
         let process = subc_os::Process::open(own_pid).unwrap().unwrap();
-        let incarnation = handler.launch_table.publish("fixture", own_pid, process, None);
+        let incarnation = handler
+            .launch_table
+            .publish("fixture", own_pid, process, None);
         let (client, _client_rx) = route_ctx(ConnectionId::new(2));
         handler.record_captured_peer(
             client.connection_id,
@@ -636,11 +677,12 @@ async fn windows_launch_stamp_is_relayed_only_with_the_windows_switch() {
                 signing_id: None,
             })),
         );
-        assert!(handler.launch_table.is_live_incarnation("fixture", incarnation));
+        assert!(handler
+            .launch_table
+            .is_live_incarnation("fixture", incarnation));
         let root = unique_project_root("windows-stamp-bind");
         let identity = BindIdentity::new(root.path().to_path_buf(), "unit", "s");
-        let (bind, binding) =
-            bind_route(&handler, &target, &mut rx, &client, identity, None).await;
+        let (bind, binding) = bind_route(&handler, &target, &mut rx, &client, identity, None).await;
         let raw: Value = serde_json::from_slice(&bind.body).unwrap();
         assert_eq!(
             raw.get("operator_app"),

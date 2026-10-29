@@ -89,6 +89,9 @@ mod cancellation;
 mod reservation;
 pub use reservation::{CorrelationId, PendingReply, RequestBody, RequestReservation};
 mod supervisor_ops;
+
+#[cfg(test)]
+mod connection_ops_tests;
 pub use cancellation::{CancelHandle, CancelOutcome};
 use cancellation::{CancelRegistration, UnaryCancel};
 pub use supervisor_ops::{
@@ -846,6 +849,66 @@ pub struct SubcConsumer {
     shared: Arc<Shared>,
 }
 
+/// The daemon's view of this connection at the time of the query.
+/// Recognition may change after revalidation or a reconnect.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionFacts {
+    local: bool,
+    operator_app: Option<subc_protocol::peer::OperatorApp>,
+}
+
+impl ConnectionFacts {
+    /// Whether this connection arrived on the Unix socket or Windows named pipe.
+    pub fn local(&self) -> bool {
+        self.local
+    }
+
+    /// The operator app currently recognised for this connection. `route.bind`
+    /// sends it only to targets that advertise `operator-app/v1`.
+    pub fn operator_app(&self) -> Option<&subc_protocol::peer::OperatorApp> {
+        self.operator_app.as_ref()
+    }
+}
+
+/// Failure to ask the daemon to open an installed operator app.
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum AppOpenError {
+    /// A daemon error frame. Codes are open strings so future refusals survive.
+    /// The current checks, in order, are `app_open_not_used`,
+    /// `app_open_disabled`, `app_unknown`, `app_not_installed`, and
+    /// `app_verification_failed` (see `subc_control::APP_OPEN_ERROR_CODES`).
+    /// An already-running app succeeds between the unknown and installed checks.
+    Refused { code: String, message: String },
+    /// A transport or protocol failure rather than a daemon refusal.
+    Call(CallError),
+}
+
+impl fmt::Display for AppOpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused { code, message } => write!(f, "{code}: {message}"),
+            Self::Call(err) => err.fmt(f),
+        }
+    }
+}
+
+impl Error for AppOpenError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Call(err) => Some(err),
+            Self::Refused { .. } => None,
+        }
+    }
+}
+
+impl From<CallError> for AppOpenError {
+    fn from(err: CallError) -> Self {
+        Self::Call(err)
+    }
+}
+
 /// A managed unary reply with the module's raw-body declaration preserved.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1506,6 +1569,65 @@ impl SubcConsumer {
         };
         self.shared.install_one_shot_route(route.clone())?;
         Ok(route.handle)
+    }
+
+    /// Describe this connection without prompting or granting any privilege.
+    /// An older daemon's `unknown_control_op` refusal returns `None`: that daemon
+    /// doesn't support this query, which says nothing about recognition.
+    pub async fn describe_connection(&self) -> Result<Option<ConnectionFacts>, CallError> {
+        let body =
+            serde_json::to_vec(&subc_control::ConnectionDescribeRequest::new()).map_err(|err| {
+                CallError::not_sent(format!("failed to encode connection.describe: {err}"))
+            })?;
+        let deadline = Instant::now() + self.shared.opts.call_timeout;
+        match self
+            .shared
+            .control_call(body, deadline, false, None)
+            .await?
+        {
+            TerminalFrame::Response { body, .. } => {
+                let reply: subc_control::ConnectionDescribeReply = serde_json::from_slice(&body)
+                    .map_err(|err| {
+                        CallError::invalid_response(format!(
+                            "failed to decode connection.describe: {err}"
+                        ))
+                    })?;
+                Ok(Some(ConnectionFacts {
+                    local: reply.local,
+                    operator_app: reply.operator_app,
+                }))
+            }
+            // The client-control dispatcher uses this exact code for unknown ops.
+            TerminalFrame::Error { body, .. } if body.code == "unknown_control_op" => Ok(None),
+            TerminalFrame::Error { body, .. } => Err(CallError::Module(body)),
+            TerminalFrame::StreamEnd => Err(CallError::invalid_response(
+                "connection.describe returned StreamEnd",
+            )),
+        }
+    }
+
+    /// Ask the daemon to open a known installed app. Starting it grants nothing.
+    /// Future success statuses and refusal codes are preserved for the caller.
+    pub async fn app_open(&self, app: &str) -> Result<subc_control::AppOpenReply, AppOpenError> {
+        let body = serde_json::to_vec(&subc_control::AppOpenRequest::new(app))
+            .map_err(|err| CallError::not_sent(format!("failed to encode app.open: {err}")))?;
+        let deadline = Instant::now() + self.shared.opts.call_timeout;
+        match self
+            .shared
+            .control_call(body, deadline, false, None)
+            .await?
+        {
+            TerminalFrame::Response { body, .. } => serde_json::from_slice(&body).map_err(|err| {
+                CallError::invalid_response(format!("failed to decode app.open: {err}")).into()
+            }),
+            TerminalFrame::Error { body, .. } => Err(AppOpenError::Refused {
+                code: body.code,
+                message: body.message,
+            }),
+            TerminalFrame::StreamEnd => {
+                Err(CallError::invalid_response("app.open returned StreamEnd").into())
+            }
+        }
     }
 
     /// Fetch the daemon's module catalog over channel 0.

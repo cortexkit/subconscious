@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.33.5
+
+- Add standalone, non-exhaustive `ConnectionDescribeRequest` and `ConnectionDescribeReply` bodies for `connection.describe`, without changing the exhaustive control enums. The reply describes the caller's local transport and currently recognised operator app.
+- Document the typed Rust client's `app.open` call and daemon-produced `app-open-v1` samples alongside the control operations.
+
 ## 0.33.4
 
 - Add `CatalogEntry::confirm_operations` and `with_confirm_operations`, mirroring the manifest's list of management operations guarded with `operator.confirm`. Absent means unknown; absence is omitted and keeps existing catalog bytes. The daemon relays it and refuses nothing on its basis.

@@ -1,0 +1,11 @@
+{
+  "reply": {
+    "op": "app.open",
+    "pid": 4242,
+    "status": "already_running"
+  },
+  "request": {
+    "app": "test-app",
+    "op": "app.open"
+  }
+}

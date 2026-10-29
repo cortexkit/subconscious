@@ -16,3 +16,4 @@ crates/agent-token-vectors/vectors/** -text
 crates/*/tests/golden/** -text
 crates/*/tests/fixtures/** -text
 clients/*/tests/golden/** -text
+vectors/app-open-v1/** -text

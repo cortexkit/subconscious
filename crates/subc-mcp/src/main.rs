@@ -6406,6 +6406,12 @@ impl SubcMcpServer {
                     &module_id, &refusal,
                 )));
             };
+            if delay == self.outage_wait.initial_delay {
+                tracing::info!(
+                    "tool call to '{module_id}' not sent: waiting out daemon refusal ({})",
+                    refusal.code
+                );
+            }
             tokio::select! {
                 _ = context.ct.cancelled() => return Err(tool_call_cancelled_error()),
                 _ = time::sleep(pause) => {}

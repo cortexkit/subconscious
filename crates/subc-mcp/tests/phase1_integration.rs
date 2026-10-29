@@ -1736,6 +1736,7 @@ struct McpHarness {
     server: TestServer,
     _project: TestProject,
     providers: BTreeMap<String, SupervisedModule>,
+    module_home: PathBuf,
     module: Child,
     shim: ShimProcess,
     client: RunningService<RoleClient, TestMcpClient>,
@@ -1867,6 +1868,7 @@ impl McpHarness {
             server,
             _project: project,
             providers,
+            module_home: user_config_home,
             module,
             shim,
             client,
@@ -2500,6 +2502,17 @@ async fn hold_provider_drain(harness: &McpHarness) -> oneshot::Sender<()> {
     release
 }
 
+/// Keep route closing held until the gateway has proved the call was not
+/// delivered. A quiet period alone also admits a call that has not been sent yet.
+async fn wait_for_drain_refusal(harness: &McpHarness) {
+    wait_for_module_log_contains(
+        &harness.module_home,
+        "tool call to 'provider' not sent: waiting out daemon refusal (module_reloading)",
+        READ_TIMEOUT,
+    )
+    .await;
+}
+
 fn spawn_draining_tool_call(
     harness: &McpHarness,
 ) -> JoinHandle<Result<rmcp::model::CallToolResult, ServiceError>> {
@@ -2591,9 +2604,10 @@ async fn mcp_module_error_cannot_claim_not_sent() {
 async fn mcp_module_outage_reloading_call_waits_and_returns_the_real_result() {
     let harness = draining_outage_harness("mcp-outage-wait", "20000").await;
     let release = hold_provider_drain(&harness).await;
-    let mut call = spawn_draining_tool_call(&harness);
+    let call = spawn_draining_tool_call(&harness);
+    wait_for_drain_refusal(&harness).await;
     assert!(
-        timeout(QUIET_TIMEOUT, &mut call).await.is_err(),
+        !call.is_finished(),
         "the daemon refusal should be waited out"
     );
     assert_no_stub_event_within(&harness.events_path, Duration::ZERO, |event| {
@@ -2613,6 +2627,45 @@ async fn mcp_module_outage_reloading_call_waits_and_returns_the_real_result() {
         .filter(|event| event["kind"] == "tool_call")
         .count();
     assert_eq!(calls, 1, "only the successful attempt reaches the provider");
+    harness.shutdown().await;
+}
+
+/// Delay sending the call until after a quiet period. A pending host request
+/// alone cannot prove that the gateway has received a daemon refusal.
+#[tokio::test]
+async fn mcp_module_outage_drain_waits_for_refusal_before_release() {
+    let harness = draining_outage_harness("mcp-outage-delayed-call", "20000").await;
+    let release = hold_provider_drain(&harness).await;
+    let (send_call, ready) = oneshot::channel();
+    let peer = harness.client.peer().clone();
+    let call = tokio::spawn(async move {
+        ready.await.unwrap();
+        peer.call_tool(CallToolRequestParams::new("provider_fake_read"))
+            .await
+    });
+
+    {
+        let refusal = wait_for_drain_refusal(&harness);
+        tokio::pin!(refusal);
+        assert!(
+            timeout(QUIET_TIMEOUT * 2, &mut refusal).await.is_err(),
+            "a quiet period must not release the drain before the call is sent"
+        );
+        send_call.send(()).unwrap();
+        refusal.await;
+    }
+    assert!(!call.is_finished());
+    assert_no_stub_event_within(&harness.events_path, Duration::ZERO, |event| {
+        event["kind"] == "tool_call"
+    })
+    .await;
+    release.send(()).unwrap();
+
+    let result = timeout(READ_TIMEOUT, call).await.unwrap().unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(&result).unwrap(),
+        json!({ "content": [{ "type": "text", "text": "back" }], "isError": false })
+    );
     harness.shutdown().await;
 }
 
@@ -2656,8 +2709,9 @@ async fn mcp_module_outage_terminal_refusal_returns_the_block_without_waiting() 
     let harness = draining_outage_harness("mcp-outage-terminal", "30000").await;
     let release = hold_provider_drain(&harness).await;
     let started = Instant::now();
-    let mut call = spawn_draining_tool_call(&harness);
-    assert!(timeout(QUIET_TIMEOUT, &mut call).await.is_err());
+    let call = spawn_draining_tool_call(&harness);
+    wait_for_drain_refusal(&harness).await;
+    assert!(!call.is_finished());
     harness
         .server
         .supervisor_handle
@@ -2703,7 +2757,7 @@ async fn mcp_module_outage_host_cancellation_ends_the_wait() {
         .await
         .unwrap();
     let started = Instant::now();
-    sleep(QUIET_TIMEOUT).await;
+    wait_for_drain_refusal(&harness).await;
     peer.notify_cancelled(CancelledNotificationParam::new(
         Some(handle.id.clone()),
         Some("test cancellation".to_owned()),
@@ -4351,6 +4405,7 @@ async fn mcp_catalog_reconciliation_failure_preserves_previous_snapshot_and_clea
         server,
         _project: project,
         providers,
+        module_home: user_config_home,
         module,
         shim,
         client,

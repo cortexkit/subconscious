@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.52
+
+- Log the module and daemon code when a tool call starts waiting out a refusal
+  that proves the call was not delivered; no request content is logged.
+- Outage integration tests wait for that classification before releasing a held
+  drain or cancelling the call, rather than assuming a quiet period means the
+  first refusal has arrived. A delayed-call regression covers that distinction.
+
 ## 0.1.51
 
 - Use subc-client-rs 0.32.17's shared non-delivery proof before retrying a data-plane refusal or reporting `nothing was sent`. The refusal must carry `DAEMON_ORIGIN` from a daemon at least 0.37.15. Retain the version from the connection info passed to the successful handshake: authentication checks the daemon ID against that file, but its HMAC does not cover the version. Module-origin errors, absent labels and older or unknown daemon versions may have run and are never replayed or described as unsent. A locally refused route open still proves that no tool request was sent.

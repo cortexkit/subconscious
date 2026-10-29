@@ -1,6 +1,6 @@
 # Working in subconscious
 
-Standing rules for every worker in this repository. A brief can tighten them but never loosens them.
+Standing rules for every worker in this repository. Where your brief names a narrower check, the brief wins.
 
 ## Build and test remotely
 
@@ -8,8 +8,9 @@ Standing rules for every worker in this repository. A brief can tighten them but
 
 ## Gate before you deliver
 
-- Run `scripts/gate.sh fast` and `scripts/gate.sh lint` before delivering. Whenever you touch Rust, also run `scripts/gate.sh test` on the build server with `runon: "linux,16c"`.
-- Filtered tests alone are never a gate. Adding a dependency can change features for the whole workspace, so whole-workspace tests are the gate, even when only one crate changed.
+- Before delivering, run `scripts/gate.sh fast`, then the full test suite and clippy of every crate you changed (`cargo test -p <crate>` and `cargo clippy -p <crate> --all-targets -- -D warnings`, plus the same clippy with `--target x86_64-pc-windows-gnu`). Filtered tests alone are never a gate.
+- If you add or change a dependency or a feature, also run the whole-workspace `scripts/gate.sh test` on the build server with `runon: "linux,16c"`. Workspace builds unify features across crates, and twice a dependency that passed its own crate's tests turned master red elsewhere.
+- Otherwise don't run `scripts/gate.sh lint` or `scripts/gate.sh test` unless your brief asks. The head runs the workspace gates once when it lands a batch.
 - Report each stage's verdict, counts and every failing test name. If a failure is not yours, show that it fails the same way on your base commit.
 - Run the Swift and TypeScript stages when changing those clients. See `scripts/gate.sh --help` for prerequisites and CI-only checks.
 

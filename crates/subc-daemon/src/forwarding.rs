@@ -607,6 +607,7 @@ pub(crate) type ConnectionCloseReceiver = oneshot::Receiver<CloseReason>;
 #[derive(Debug, Default)]
 pub struct ForwardingTable {
     inner: Arc<RwLock<ForwardingInner>>,
+    frame_drop_warnings: Mutex<HashMap<ConnectionId, ChannelDropWarnings>>,
     #[cfg(feature = "test-support")]
     route_closing_hold: Mutex<Option<oneshot::Receiver<()>>>,
     close_registry: Mutex<HashMap<ConnectionId, oneshot::Sender<CloseReason>>>,
@@ -625,7 +626,58 @@ pub struct ForwardingTable {
     route_outages: Arc<crate::route_outage::RouteOutageTracker>,
 }
 
+#[derive(Debug)]
+struct FrameDropWarning {
+    last_warned: tokio::time::Instant,
+    suppressed: u64,
+}
+
+type ChannelDropWarnings = HashMap<(u16, &'static str), FrameDropWarning>;
+
 impl ForwardingTable {
+    /// Keep a silent route diagnosable without letting a broken peer flood logs.
+    /// Epoch and direction describe the dropped frame, but do not split its limit.
+    pub(crate) fn warn_frame_drop(
+        &self,
+        connection_id: ConnectionId,
+        channel: u16,
+        epoch: u32,
+        direction: &'static str,
+        reason: &'static str,
+    ) {
+        let now = tokio::time::Instant::now();
+        let mut warnings = self
+            .frame_drop_warnings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = warnings
+            .entry(connection_id)
+            .or_default()
+            .entry((channel, reason));
+        let suppressed = match entry {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                let state = entry.get_mut();
+                if now.saturating_duration_since(state.last_warned) < Duration::from_secs(60) {
+                    state.suppressed = state.suppressed.saturating_add(1);
+                    return;
+                }
+                state.last_warned = now;
+                std::mem::take(&mut state.suppressed)
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(FrameDropWarning {
+                    last_warned: now,
+                    suppressed: 0,
+                });
+                0
+            }
+        };
+        warn!(
+            connection_id = connection_id.get(),
+            channel, epoch, direction, reason, suppressed, "dropping data-plane frame"
+        );
+    }
+
     /// Install scripted operator confirmation for an in-process integration harness,
     /// without bootstrapping a daemon process. Only available with `test-support`.
     ///
@@ -2714,6 +2766,10 @@ impl ForwardingTable {
         &self,
         connection_id: ConnectionId,
     ) -> Result<ConnectionCleanup, ForwardingError> {
+        self.frame_drop_warnings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&connection_id);
         let mut inner = self.write_inner()?;
         inner.closing_connections.insert(connection_id);
         let cleanup = if let Some(endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
@@ -2857,6 +2913,18 @@ impl ForwardingTable {
             }
         };
         let Some(principals) = principals else {
+            // A concurrent release can remove the epoch before escalation.
+            // The frame was still lost, even though this route can no longer
+            // authorize closing the shared client connection.
+            self.warn_frame_drop(
+                connection_id,
+                channel,
+                expected_epoch,
+                "module_to_client",
+                diagnosis
+                    .map(|failure| failure.cause)
+                    .unwrap_or("delivery_failed"),
+            );
             return Ok(false);
         };
         let backlog = undelivered.sink.backlog();

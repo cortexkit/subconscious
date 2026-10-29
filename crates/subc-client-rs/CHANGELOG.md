@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.18
+
+- Retire a cached route when an accepted managed call reaches its response deadline. Return the same outcome-unknown error without resending; the next call opens a fresh route even if the connection's Ping still succeeds. Calls already pending on that route still receive their replies and settle normally. Queue a best-effort route GOODBYE when the retired route drains or the consumer closes, and WARN once with target, channel, epoch and pending count, never request bodies. Caller cancellation and unsent flow-control deadlines do not retire routes. A module slower than a call's deadline still makes that call return outcome-unknown, and the next call opens a fresh route.
+
 ## 0.32.17
 
 - Expose `consumer::trusts_daemon_origin` and `consumer::is_daemon_refusal_before_forward` for clients with their own frame relay. The same classifier used by managed calls proves only a single attempt: `module_reloading`, `unknown_channel` or `stale_route_epoch`, labelled `DAEMON_ORIGIN` by an authenticated daemon at least 0.37.15. Unknown versions and unlabelled errors prove nothing. Callers must keep the authenticated connection's version and establish non-delivery for every attempt before replaying a whole call or reporting that nothing was sent.

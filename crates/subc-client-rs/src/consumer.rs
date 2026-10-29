@@ -2450,6 +2450,17 @@ impl SubcConsumer {
                     self.shared.ensure_connected_for_call(call_deadline).await?;
                     continue;
                 }
+                Err(err)
+                    if err.outcome_cause() == Some(OutcomeUnknownCause::Deadline)
+                        && !cancel.as_ref().is_some_and(|cancel| cancel.requested()) =>
+                {
+                    self.shared.invalidate_route_with_deadline(
+                        &route_key,
+                        Some(route.handle),
+                        true,
+                    );
+                    return Err(err);
+                }
                 Err(err) => return Err(err),
             }
         }
@@ -3235,6 +3246,7 @@ struct Inner {
     one_shot_routes: HashMap<u16, RouteState>,
     route_epochs: HashMap<u16, RouteHandle>,
     retired_routes: HashSet<RouteHandle>,
+    retirement_goodbyes: HashSet<RouteHandle>,
     route_modules: HashMap<u16, String>,
     route_end_reasons: HashMap<u16, (RouteEndReason, bool)>,
     legacy_channel_reasons: HashMap<u16, RouteCloseReason>,
@@ -3342,11 +3354,38 @@ impl Inner {
             .retired_routes
             .take(&handle)
             .expect("retired route exists");
+        if self.retirement_goodbyes.remove(&handle) {
+            self.queue_retirement_goodbye(handle);
+        }
         if self.route_epochs.get(&handle.channel) == Some(&handle) {
             self.route_epochs.remove(&handle.channel);
             self.push_event_receivers.remove(&handle);
         }
         release_reverse_request_registry(handle);
+    }
+
+    fn queue_retirement_goodbye(&self, handle: RouteHandle) {
+        if self.generation != handle.connection_token()
+            || self.route_epochs.get(&handle.channel) != Some(&handle)
+        {
+            return;
+        }
+        if let (Some(writer), Ok(frame)) = (
+            &self.writer,
+            Frame::build(
+                FrameType::Goodbye,
+                Flags::new(false, Priority::Interactive, false),
+                handle.channel,
+                handle.epoch,
+                0,
+                Vec::new(),
+            ),
+        ) {
+            let _ = writer.try_send(WriteCommand {
+                frame,
+                pending: None,
+            });
+        }
     }
 
     fn remove_pending(&mut self, key: &PendingKey) -> Option<PendingEntry> {
@@ -3379,6 +3418,7 @@ impl Inner {
     }
 
     fn drain_routes(&mut self) -> Vec<RouteState> {
+        self.retirement_goodbyes.clear();
         for handle in self.retired_routes.drain() {
             release_reverse_request_registry(handle);
         }
@@ -3431,6 +3471,7 @@ impl Shared {
                 one_shot_routes: HashMap::new(),
                 route_epochs: HashMap::new(),
                 retired_routes: HashSet::new(),
+                retirement_goodbyes: HashSet::new(),
                 route_modules: HashMap::new(),
                 route_end_reasons: HashMap::new(),
                 legacy_channel_reasons: HashMap::new(),
@@ -4901,6 +4942,9 @@ impl Shared {
                 return;
             }
             inner.closed = true;
+            for handle in &inner.retirement_goodbyes {
+                inner.queue_retirement_goodbye(*handle);
+            }
             inner.writer = None;
             inner.route_epochs.clear();
             inner.route_modules.clear();
@@ -4935,8 +4979,21 @@ impl Shared {
         if let Some(handle) = reader {
             handle.abort();
         }
-        if let Some(handle) = writer {
-            handle.abort();
+        if let Some(mut handle) = writer {
+            // Let queued retirement GOODBYEs reach the socket, but never leave
+            // a writer blocked on an unresponsive peer alive after close.
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    if tokio::time::timeout(Duration::from_millis(250), &mut handle)
+                        .await
+                        .is_err()
+                    {
+                        handle.abort();
+                    }
+                });
+            } else {
+                handle.abort();
+            }
         }
         if let Some(handle) = reconnect {
             handle.abort();
@@ -4995,6 +5052,21 @@ impl Shared {
     }
 
     fn invalidate_route(&self, key: &RouteKey, expected_handle: Option<RouteHandle>) {
+        self.invalidate_route_with_deadline(key, expected_handle, false);
+    }
+
+    /// An accepted call's response deadline cannot prove non-delivery, so it
+    /// must not trigger a resend. Retiring its route instead lets the next call
+    /// recover even when the connection-wide Ping still succeeds. A module that
+    /// is merely slower than the deadline makes the next call open a fresh
+    /// route. Calls already pending on the retired route still receive their
+    /// replies until they settle.
+    fn invalidate_route_with_deadline(
+        &self,
+        key: &RouteKey,
+        expected_handle: Option<RouteHandle>,
+        response_deadline_expired: bool,
+    ) {
         let removed = {
             let mut inner = self.lock_inner();
             match inner.routes.get(key) {
@@ -5006,6 +5078,25 @@ impl Shared {
                         // until those pending entries settle; never resend them
                         // merely because another call was refused.
                         inner.retired_routes.insert(route.handle);
+                        if response_deadline_expired {
+                            inner.retirement_goodbyes.insert(route.handle);
+                            let pending_calls = inner
+                                .pending
+                                .keys()
+                                .filter(|pending| {
+                                    pending.generation == route.handle.connection_token()
+                                        && pending.channel == route.handle.channel
+                                        && pending.epoch == route.handle.epoch
+                                })
+                                .count();
+                            tracing::warn!(
+                                target_module = %key.target_label(),
+                                channel = route.handle.channel,
+                                epoch = route.handle.epoch,
+                                pending_calls,
+                                "retiring route after call response deadline"
+                            );
+                        }
                         inner.reap_retired_route(route.handle);
                     }
                     removed
@@ -5107,6 +5198,7 @@ impl Shared {
     fn uninstall_route_handle(&self, handle: RouteHandle) {
         let mut inner = self.lock_inner();
         inner.retired_routes.remove(&handle);
+        inner.retirement_goodbyes.remove(&handle);
         if inner.route_epochs.get(&handle.channel) == Some(&handle) {
             let installed = inner.route_epochs.remove(&handle.channel).unwrap();
             inner.push_event_receivers.remove(&handle);
@@ -6394,6 +6486,7 @@ impl Shared {
             }
             let installed = inner.route_epochs.remove(&handle.channel).unwrap();
             inner.retired_routes.remove(&handle);
+            inner.retirement_goodbyes.remove(&handle);
             inner.push_event_receivers.remove(&handle);
             release_reverse_request_registry(installed);
             inner
@@ -6866,6 +6959,7 @@ mod tests {
     use super::*;
 
     mod not_sent_tests;
+    mod route_deadline_tests;
 
     #[derive(Clone)]
     struct InstrumentedWriter {

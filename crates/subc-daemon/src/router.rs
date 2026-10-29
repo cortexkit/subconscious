@@ -859,14 +859,27 @@ impl Router {
                     "answered module frame on a route the daemon does not hold with a route GOODBYE"
                 );
             }
-            Err(err) => debug!(
+            Err(err) => {
+                self.forwarding.warn_frame_drop(
+                    ctx.connection_id,
+                    channel,
+                    epoch,
+                    "daemon_to_module",
+                    if ctx.egress.is_closed() {
+                        "endpoint_gone"
+                    } else {
+                        "egress_budget"
+                    },
+                );
+                debug!(
                 connection_id = ctx.connection_id.get(),
                 module_id = module_id.as_deref().unwrap_or("unknown"),
                 channel,
                 epoch,
                 error = %err,
                 "could not enqueue route GOODBYE for module frame on a route the daemon does not hold; the next such frame retries"
-            ),
+                );
+            }
         }
         Ok(())
     }
@@ -968,6 +981,13 @@ impl Router {
 
         match data_route {
             DataRoute::Module(DataRouteState::EpochMismatch) => {
+                self.forwarding.warn_frame_drop(
+                    ctx.connection_id,
+                    channel,
+                    epoch,
+                    "module_to_client",
+                    "stale_epoch",
+                );
                 if frame.header.ty == FrameType::Request {
                     self.counters
                         .increment_module_requests_dropped_stale_route();
@@ -989,6 +1009,13 @@ impl Router {
                 return Ok(());
             }
             DataRoute::Module(DataRouteState::Reserved) => {
+                self.forwarding.warn_frame_drop(
+                    ctx.connection_id,
+                    channel,
+                    epoch,
+                    "module_to_client",
+                    "missing_binding",
+                );
                 if frame.header.ty == FrameType::Request {
                     self.counters
                         .increment_module_requests_dropped_stale_route();
@@ -1010,6 +1037,13 @@ impl Router {
                 return Ok(());
             }
             DataRoute::Module(DataRouteState::Absent) => {
+                self.forwarding.warn_frame_drop(
+                    ctx.connection_id,
+                    channel,
+                    epoch,
+                    "module_to_client",
+                    "unknown_channel",
+                );
                 if frame.header.ty == FrameType::Request {
                     self.counters
                         .increment_module_requests_dropped_stale_route();
@@ -1045,6 +1079,15 @@ impl Router {
                         // every module frame relayed to a client.
                         goodbye.header.flags = goodbye.header.flags.without_daemon_origin();
                         if let Err(err) = target.sink.send_to_client(goodbye).await {
+                            if !target.close_on_delivery_failure() {
+                                self.forwarding.warn_frame_drop(
+                                    target.connection_id,
+                                    target.channel,
+                                    target.epoch,
+                                    "module_to_client",
+                                    err.diagnosis.cause,
+                                );
+                            }
                             if target.close_on_delivery_failure()
                                 && self
                                     .forwarding
@@ -1070,6 +1113,14 @@ impl Router {
                                 self.counters.increment_goodbye_relay_client_failed();
                             }
                         }
+                    } else {
+                        self.forwarding.warn_frame_drop(
+                            ctx.connection_id,
+                            channel,
+                            epoch,
+                            "module_to_client",
+                            "missing_binding",
+                        );
                     }
                     return Ok(());
                 }
@@ -1136,6 +1187,13 @@ impl Router {
                 return Ok(());
             }
             DataRoute::Client(DataRouteState::EpochMismatch) => {
+                self.forwarding.warn_frame_drop(
+                    ctx.connection_id,
+                    channel,
+                    epoch,
+                    "client_to_module",
+                    "stale_epoch",
+                );
                 if frame.header.ty == FrameType::Request {
                     self.counters.increment_client_frames_dropped_stale_route();
                     // Dropped before forwarding; a re-bind retry cannot double-execute this request.
@@ -1155,6 +1213,13 @@ impl Router {
                 return Ok(());
             }
             DataRoute::Client(DataRouteState::Reserved) => {
+                self.forwarding.warn_frame_drop(
+                    ctx.connection_id,
+                    channel,
+                    epoch,
+                    "client_to_module",
+                    "missing_binding",
+                );
                 if frame.header.ty == FrameType::Request {
                     let err = RouterError::UnknownChannel {
                         channel,
@@ -1180,8 +1245,23 @@ impl Router {
         }
 
         if let Some(backend) = self.backends.get(&channel) {
-            return backend.handle(ctx.clone(), frame).await;
+            return backend.handle(ctx.clone(), frame).await.inspect_err(|_| {
+                self.forwarding.warn_frame_drop(
+                    ctx.connection_id,
+                    channel,
+                    epoch,
+                    "client_to_backend",
+                    "endpoint_gone",
+                );
+            });
         }
+        self.forwarding.warn_frame_drop(
+            ctx.connection_id,
+            channel,
+            epoch,
+            "client_to_module",
+            "unknown_channel",
+        );
         if frame.header.ty == FrameType::Request {
             let err = RouterError::UnknownChannel {
                 channel,
@@ -1386,6 +1466,13 @@ impl ForwardBackend {
         {
             DataRoute::Client(DataRouteState::Bound(route)) => route,
             DataRoute::Client(_) | DataRoute::Module(_) => {
+                self.forwarding.warn_frame_drop(
+                    ctx.connection_id,
+                    channel,
+                    frame.header.epoch,
+                    "client_to_module",
+                    "missing_binding",
+                );
                 return Err(RouterError::UnknownChannel {
                     channel,
                     epoch: frame.header.epoch,
@@ -1414,6 +1501,13 @@ impl ForwardBackend {
                 .acquire_tagged(corr, frame.header.flags.is_subscription())
                 .await
             {
+                self.forwarding.warn_frame_drop(
+                    route.client_connection_id,
+                    channel,
+                    frame.header.epoch,
+                    "client_to_module",
+                    "endpoint_gone",
+                );
                 // `module_reloading` here is answered BEFORE the frame is
                 // forwarded, so the module never sees the request and callers
                 // may re-dispatch it after reopening the route. That is a wire
@@ -1450,6 +1544,13 @@ impl ForwardBackend {
         // so it is cleared here; every other flag bit travels unchanged.
         frame.header.flags = frame.header.flags.without_daemon_origin();
         let result = route.module_sink.send(frame).await.map_err(|err| {
+            self.forwarding.warn_frame_drop(
+                route.client_connection_id,
+                channel,
+                route.client_epoch,
+                "client_to_module",
+                "endpoint_gone",
+            );
             RouterError::backend_with_epoch(channel, route.client_epoch, corr, err.to_string())
         });
         if acquired_credit && result.is_err() {
@@ -3810,6 +3911,83 @@ mod tests {
         let counters = router.counters.snapshot();
         assert_eq!(counters["module_requests_dropped_stale_route"], 1);
         assert_eq!(counters["module_frames_dropped_no_route"], 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_epoch_drop_warns_once_per_minute_with_suppressed_count() {
+        let (output, _guard) = test_log::log_capture(tracing::Level::WARN);
+        let (
+            router,
+            _forwarding,
+            client_ctx,
+            mut client_rx,
+            _module_ctx,
+            _module_egress_rx,
+            mut module_rx,
+            pending,
+        ) = dynamic_route_fixture(true);
+        let _ = client_rx.recv().await;
+        for corr in 1..=3 {
+            router
+                .route_for_connection(
+                    &client_ctx,
+                    route_frame(
+                        FrameType::Request,
+                        pending.client_channel,
+                        pending.client_epoch + 1,
+                        corr,
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(client_rx.recv().await.unwrap().header.ty, FrameType::Error);
+        }
+        assert!(module_rx.try_recv().is_err());
+        let logs = test_log::captured_logs(&output);
+        assert_eq!(
+            logs.matches("dropping data-plane frame").count(),
+            1,
+            "{logs}"
+        );
+        assert!(logs.contains("WARN"), "{logs}");
+        assert!(
+            logs.contains(&format!("connection_id={}", client_ctx.connection_id.get())),
+            "{logs}"
+        );
+        assert!(
+            logs.contains(&format!("channel={}", pending.client_channel)),
+            "{logs}"
+        );
+        assert!(
+            logs.contains(&format!("epoch={}", pending.client_epoch + 1)),
+            "{logs}"
+        );
+        assert!(
+            logs.contains("client_to_module") && logs.contains("stale_epoch"),
+            "{logs}"
+        );
+        assert!(logs.contains("suppressed=0"), "{logs}");
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        router
+            .route_for_connection(
+                &client_ctx,
+                route_frame(
+                    FrameType::Request,
+                    pending.client_channel,
+                    pending.client_epoch + 2,
+                    4,
+                ),
+            )
+            .await
+            .unwrap();
+        let logs = test_log::captured_logs(&output);
+        assert_eq!(
+            logs.matches("dropping data-plane frame").count(),
+            2,
+            "{logs}"
+        );
+        assert!(logs.contains("suppressed=2"), "{logs}");
     }
 
     #[tokio::test]

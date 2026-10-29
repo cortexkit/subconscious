@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.38.7
+
+- WARN when a data-plane frame cannot be forwarded because of an unknown channel, stale epoch, missing binding or vanished endpoint. Limit these diagnostics to one per connection, channel and reason per 60 seconds, reporting the suppressed count on the next warning. Include the route epoch and direction, never the body; existing egress-budget and GOODBYE delivery warnings remain in place.
+
 ## 0.38.6
 
 - On Linux, give processes left in a module's cgroup after its parent exits

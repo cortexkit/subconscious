@@ -13,7 +13,8 @@ use std::{
 };
 
 use subc_client_rs::{
-    CallError, CallOptions, ConsumerOptions, OutcomeUnknownCause, RetryBackoff, SubcConsumer,
+    CallError, CallOptions, ConsumerOptions, NotSentCause, OutcomeUnknownCause, RetryBackoff,
+    SubcConsumer,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_protocol::{BindIdentity, Flags, Frame, FrameType, Priority, RouteTarget};
@@ -103,8 +104,9 @@ async fn liveness_probe_convicts_half_open_socket_and_next_call_recovers() {
 /// own control op, not by a dead socket. The fake parks catalog.list forever
 /// (it answers only RouteOpen) and goes deaf on data, so even the Ping is
 /// unanswered — the worst case — and the gate must still withhold conviction:
-/// the second deadline error rides the ORIGINAL connection (count stays 1)
-/// instead of a reconnect's fresh one.
+/// the second call attempts route.open on the ORIGINAL connection (count stays
+/// 1), not a reconnect's fresh one. The first deadline retired the data route,
+/// so the unanswered replacement open makes the second call NotSent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn liveness_probe_withholds_conviction_while_a_control_request_is_pending() {
     let daemon = start_fake_daemon(DataMode::HalfOpen).await;
@@ -137,7 +139,8 @@ async fn liveness_probe_withholds_conviction_while_a_control_request_is_pending(
     assert!(matches!(first, CallError::OutcomeUnknown(_)));
 
     // Give a (wrong) conviction ample time to fire, then prove it did not: the
-    // second call must ride the SAME connection into the same deadline class.
+    // second call must try its replacement route on the SAME connection. The
+    // deaf daemon cannot answer that open, so its data request is never sent.
     sleep(PROBE_WINDOW + PROBE_WINDOW + Duration::from_millis(100)).await;
     let second = consumer
         .call(
@@ -148,7 +151,11 @@ async fn liveness_probe_withholds_conviction_while_a_control_request_is_pending(
         )
         .await
         .expect_err("the corpse is deliberately kept while the control op explains the silence");
-    assert!(matches!(second, CallError::OutcomeUnknown(_)));
+    assert!(matches!(second, CallError::NotSent(_)));
+    assert_eq!(
+        second.not_sent_cause(),
+        Some(NotSentCause::RouteOpenAbandoned)
+    );
     assert_eq!(
         daemon.connection_count(),
         1,

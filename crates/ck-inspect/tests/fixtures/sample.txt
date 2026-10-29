@@ -1,0 +1,42 @@
+Call graph:
+    90 Thread_319321222   DispatchQueue_1: com.apple.main-thread  (serial)
+    + 90 start  (in dyld) + 6688  [0x1980a7e80]
+    +   90 main  (in sample-helper) + 36  [0x104291820]
+    +     90 _RINvNtCs1SSuMAdGM58_3std2rt10lang_startuECs4PIziRMrnCK_13sample_helper  (in sample-helper) + 84  [0x10428ca38]  rt.rs:205
+    +       90 _RNvNtCs1SSuMAdGM58_3std2rt19lang_start_internal  (in sample-helper) + 936  [0x1042aa9f0]  rt.rs:171
+    +         90 _RNCINvNtCs1SSuMAdGM58_3std2rt10lang_startuE0Cs4PIziRMrnCK_13sample_helper  (in sample-helper) + 28  [0x10428e478]  rt.rs:206
+    +           90 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceFEuuECs4PIziRMrnCK_13sample_helper  (in sample-helper) + 24  [0x10428d4d8]  backtrace.rs:166
+    +             90 _RNvYFEuINtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_onceCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 20  [0x104291448]  function.rs:250
+    +               90 _RNvCs4PIziRMrnCK_13sample_helper4main  (in sample-helper) + 340  [0x10428eba8]  sample-helper.rs:8
+    +                 90 _RNvNtNtCs1SSuMAdGM58_3std6thread9functions5sleep  (in sample-helper) + 100  [0x1042abc20]  functions.rs:293
+    +                   90 nanosleep  (in libsystem_c.dylib) + 220  [0x198313054]
+    +                     90 __semwait_signal  (in libsystem_kernel.dylib) + 8  [0x19843c308]
+    90 Thread_319321230: profile-worker
+      90 thread_start  (in libsystem_pthread.dylib) + 8  [0x198478cec]
+        90 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x19847dd00]
+          90 _RNvNvMs0_NtNtNtCs1SSuMAdGM58_3std3sys6thread4unixNtB7_6Thread3new12thread_start  (in sample-helper) + 392  [0x1042b02c8]  unix.rs:123
+            90 _RNSNvYNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvCs4PIziRMrnCK_13sample_helper4main0uEs_0INtNtNtCsjIpoRzUjyHQ_4core3ops8function6FnOnceuE9call_once6vtableB17_  (in sample-helper) + 24  [0x10428ea48]  function.rs:250
+              90 _RNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvCs4PIziRMrnCK_13sample_helper4main0uEs_0B12_  (in sample-helper) + 132  [0x10428e648]  lifecycle.rs:68
+                90 __rust_try  (in sample-helper) + 32  [0x1042917c0]
+                  90 _RINvNvNtCs1SSuMAdGM58_3std9panicking12catch_unwind7do_callINtNtNtCsjIpoRzUjyHQ_4core5panic11unwind_safe16AssertUnwindSafeNCNCINvNtNtB6_6thread9lifecycle15spawn_uncheckedNCNvCs4PIziRMrnCK_13sample_helper4main0uEs_00EuEB2L_  (in sample-helper) + 48  [0x10428e1b0]  panicking.rs:576
+                    90 _RNvXsn_NtNtCsjIpoRzUjyHQ_4core5panic11unwind_safeINtB5_16AssertUnwindSafeNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvCs4PIziRMrnCK_13sample_helper4main0uEs_00EINtNtNtB9_3ops8function6FnOnceuE9call_onceB2e_  (in sample-helper) + 40  [0x1042913c4]  unwind_safe.rs:275
+                      90 _RNCNCINvNtNtCs1SSuMAdGM58_3std6thread9lifecycle15spawn_uncheckedNCNvCs4PIziRMrnCK_13sample_helper4main0uEs_00B14_  (in sample-helper) + 60  [0x10428e8c0]  lifecycle.rs:70
+                        90 _RINvNtNtCs1SSuMAdGM58_3std3sys9backtrace28___rust_begin_short_backtraceNCNvCs4PIziRMrnCK_13sample_helper4main0uEB1b_  (in sample-helper) + 16  [0x10428d510]  backtrace.rs:166
+                          90 _RNCNvCs4PIziRMrnCK_13sample_helper4main0B3_  (in sample-helper) + 40  [0x10428e92c]  sample-helper.rs:5
+                            66 _RINvYINtNtNtCsjIpoRzUjyHQ_4core3ops5range5RangeyENtNtNtNtBa_4iter6traits8iterator8Iterator4foldyNvMs7_NtBa_3numy12wrapping_addECs4PIziRMrnCK_13sample_helper  (in sample-helper) + 48  [0x10428e3f4]  iterator.rs:2666
+                            ! 64 _RNvXs4_NtNtCsjIpoRzUjyHQ_4core4iter5rangeINtNtNtB9_3ops5range5RangeyENtNtNtB7_6traits8iterator8Iterator4nextCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 24  [0x104290c04]  range.rs:1185
+                            ! : 33 _RNvXs3_NtNtCsjIpoRzUjyHQ_4core4iter5rangeINtNtNtB9_3ops5range5RangeyENtB5_17RangeIteratorImpl9spec_nextCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 100  [0x104290bbc]  range.rs:1103
+                            ! : | 19 _RNvXsJ_NtNtCsjIpoRzUjyHQ_4core4iter5rangeyNtB5_4Step17forward_uncheckedCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 56  [0x104290fc0]  range.rs:265
+                            ! : | + 16 _RNvNvMs7_NtCsjIpoRzUjyHQ_4core3numy13unchecked_add18precondition_checkCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 20,12  [0x1042901a0,0x104290198]  ub_checks.rs:68
+                            ! : | + 3 _RNvNvMs7_NtCsjIpoRzUjyHQ_4core3numy13unchecked_add18precondition_checkCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 40  [0x1042901b4]  ub_checks.rs:75
+                            ! : | 10 _RNvXsJ_NtNtCsjIpoRzUjyHQ_4core4iter5rangeyNtB5_4Step17forward_uncheckedCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 72  [0x104290fd0]  range.rs:266
+                            ! : | 3 _RNvXsJ_NtNtCsjIpoRzUjyHQ_4core4iter5rangeyNtB5_4Step17forward_uncheckedCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 32,28  [0x104290fa8,0x104290fa4]  range.rs:265
+                            ! : | 1 _RNvXsJ_NtNtCsjIpoRzUjyHQ_4core4iter5rangeyNtB5_4Step17forward_uncheckedCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 16  [0x104290f98]  range.rs:263
+                            ! : 19 _RNvXs3_NtNtCsjIpoRzUjyHQ_4core4iter5rangeINtNtNtB9_3ops5range5RangeyENtB5_17RangeIteratorImpl9spec_nextCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 44  [0x104290b84]  range.rs:1100
+                            ! : 8 _RNvXs3_NtNtCsjIpoRzUjyHQ_4core4iter5rangeINtNtNtB9_3ops5range5RangeyENtB5_17RangeIteratorImpl9spec_nextCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 136  [0x104290be0]  range.rs:1108
+                            ! : 4 _RNvXs3_NtNtCsjIpoRzUjyHQ_4core4iter5rangeINtNtNtB9_3ops5range5RangeyENtB5_17RangeIteratorImpl9spec_nextCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 0,28  [0x104290b58,0x104290b74]  range.rs:1099
+                            ! 1 _RNvXs4_NtNtCsjIpoRzUjyHQ_4core4iter5rangeINtNtNtB9_3ops5range5RangeyENtNtNtB7_6traits8iterator8Iterator4nextCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 16  [0x104290bfc]  range.rs:1184
+                            ! 1 _RNvXs4_NtNtCsjIpoRzUjyHQ_4core4iter5rangeINtNtNtB9_3ops5range5RangeyENtNtNtB7_6traits8iterator8Iterator4nextCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 24  [0x104290c04]  range.rs:1186
+                            13 _RINvYINtNtNtCsjIpoRzUjyHQ_4core3ops5range5RangeyENtNtNtNtBa_4iter6traits8iterator8Iterator4foldyNvMs7_NtBa_3numy12wrapping_addECs4PIziRMrnCK_13sample_helper  (in sample-helper) + 96  [0x10428e424]  iterator.rs:2667
+                            ! 13 _RNvYNvMs7_NtCsjIpoRzUjyHQ_4core3numy12wrapping_addINtNtNtBa_3ops8function5FnMutTyyEE8call_mutCs4PIziRMrnCK_13sample_helper  (in sample-helper) + 28,12,...  [0x104291790,0x104291780,...]  function.rs:166
+                            11 _RINvYINtNtNtCsjIpoRzUjyHQ_4core3ops5range5RangeyENtNtNtNtBa_4iter6traits8iterator8Iterator4foldyNvMs7_NtBa_3numy12wrapping_addECs4PIziRMrnCK_13sample_helper  (in sample-helper) + 60  [0x10428e400]  iterator.rs:2666

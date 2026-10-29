@@ -43,6 +43,140 @@ mod inline_views;
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
+struct InspectReply {
+    expected: Value,
+    reply: Value,
+}
+
+#[async_trait::async_trait]
+impl subc_client_rs::ModuleHandler for InspectReply {
+    async fn handle(
+        &self,
+        _ctx: subc_client_rs::RequestCtx,
+        body: Vec<u8>,
+    ) -> subc_client_rs::HandlerOutcome {
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            self.expected
+        );
+        subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&self.reply).unwrap())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inspect_queries_use_routes_print_full_values_and_version_ckni_json() {
+    use subc_protocol::manifest::{
+        Concurrency, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
+    };
+    let long_name = "worker-".repeat(30);
+    let cases = [
+        (
+            vec!["module", "resources"],
+            json!({"op":"module.resources"}),
+            json!({"modules":[{"module_id":"fixture","state":"running","pid":72,"spawn_generation":3,"resources":{"status":"unavailable","reason":"read_failed"}}]}),
+            "ck.module.resources/v1",
+        ),
+        (
+            vec!["module", "profile", "fixture", "--seconds", "7"],
+            json!({"op":"module.profile","module_id":"fixture","seconds":7}),
+            json!({"module_id":"fixture","pid":72,"seconds":7,"method":"sample","threads":[{"name":long_name,"samples":90,"stacks":[{"count":45,"frames":["leaf","root"]}]}],"idle_threads":1,"truncated":true}),
+            "ck.module.profile/v1",
+        ),
+        (
+            vec!["module", "profile", "fixture"],
+            json!({"op":"module.profile","module_id":"fixture","seconds":1}),
+            json!({"module_id":"fixture","pid":72,"seconds":1,"method":"proc_threads","threads":[{"name":long_name,"cpu_ms":900,"stacks":[]}],"idle_threads":1,"truncated":false}),
+            "ck.module.profile/v1",
+        ),
+    ];
+    for (args, expected, reply, schema) in cases {
+        let server = TestServer::start().await;
+        let manifest = ModuleManifest::builder("inspect", "0.1.0")
+            .provides(vec![ProviderRole::ManagementSurface {
+                operations: ["module.resources", "module.profile"]
+                    .into_iter()
+                    .map(|name| ManagementOperation {
+                        name: name.into(),
+                        kind: ManagementOperationKind::Query,
+                        description: None,
+                    })
+                    .collect(),
+                config_schema: json!({}),
+                observability: vec![],
+                identity_scope: vec![],
+                concurrency: Concurrency::StatelessParallel,
+            }])
+            .build();
+        let (_handle, serving) = subc_client_rs::serve_with_handle(
+            &server.connection_file_path,
+            manifest,
+            InspectReply {
+                expected,
+                reply: reply.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let serving = tokio::spawn(serving);
+        let plain = inspect_ck_output(&server.connection_file_path, &args);
+        assert_exit(&plain, 0);
+        let stdout = text(&plain.stdout);
+        if args[1] == "profile" {
+            assert!(stdout.contains(&long_name), "{stdout}");
+        } else {
+            assert!(stdout.contains("generation=3"), "{stdout}");
+        }
+        let mut json_args = args.clone();
+        json_args.push("--json");
+        assert_eq!(
+            assert_json_success(inspect_ck_output(&server.connection_file_path, &json_args)),
+            reply
+        );
+        let (_link, mut command) = ckni_command(if cfg!(windows) { "ckni.exe" } else { "ckni" });
+        let output = command
+            .arg("--subc")
+            .arg(&server.connection_file_path)
+            .arg("--json")
+            .args(&args)
+            .output()
+            .unwrap();
+        let mut versioned = reply;
+        versioned["schema"] = schema.into();
+        assert_eq!(assert_json_success(output), versioned);
+        serving.abort();
+        assert!(serving.await.unwrap_err().is_cancelled());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inspect_missing_module_is_a_single_actionable_refusal() {
+    let server = TestServer::start().await;
+    for args in [
+        vec!["module", "resources"],
+        vec!["module", "profile", "fixture"],
+    ] {
+        let output = inspect_ck_output(&server.connection_file_path, &args);
+        assert_exit(&output, 1);
+        let stderr = text(&output.stderr);
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        assert!(
+            stderr.contains("inspect is not installed or running")
+                && stderr.contains("ck setup")
+                && stderr.contains("config"),
+            "{stderr}"
+        );
+    }
+}
+
+fn inspect_ck_output(connection: &Path, args: &[&str]) -> Output {
+    ck_command()
+        .args(args)
+        .arg("--subc")
+        .arg(connection)
+        .output()
+        .unwrap()
+}
+
 struct TestServer {
     daemon: TestDaemon,
     process_liveness: Arc<SupervisorProcessLiveness>,
@@ -153,7 +287,7 @@ fn bare_json_prints_the_one_top_help() {
     assert_exit(&output, 0);
     assert_eq!(
         text(&output.stdout),
-        "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint\n  machine   this machine's id: show it, or adopt a restored one\n  activity  consequential agent and module events\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands\n"
+        "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, resources, profile, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint\n  machine   this machine's id: show it, or adopt a restored one\n  activity  consequential agent and module events\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands\n"
     );
 }
 

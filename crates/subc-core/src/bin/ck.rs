@@ -114,7 +114,7 @@ const CK_BUILD_SHAPE: &str = "test-support: off";
 // production baseline data; then calibrate whether every window minute is needed.
 const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, resources, profile, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)
   routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint
   machine   this machine's id: show it, or adopt a restored one
   activity  consequential agent and module events";
@@ -419,6 +419,8 @@ fn write_domain_probe_cache(path: &Path, cache: &DomainProbeCache) -> Result<(),
 }
 
 const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] [--verbose] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
+  ck module resources      process counters via the inspect module
+  ck module profile <id>    sample one process via inspect (--seconds 1..10, default 1)
   ck module logs [<id>]     merged module, plugin, stderr, and daemon logs
     -n <lines>              show the newest lines (default 200)
     -f                      follow all sources across rotation
@@ -664,6 +666,17 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         }
         Command::Module(ModuleCommand::Status { module_id }) => {
             module_status(&mut client, &module_id, json_output, args.verbose).await
+        }
+        Command::Module(ModuleCommand::Resources) => {
+            module_inspect(&mut client, json!({"op": "module.resources"}), json_output).await
+        }
+        Command::Module(ModuleCommand::Profile { module_id, seconds }) => {
+            module_inspect(
+                &mut client,
+                json!({"op": "module.profile", "module_id": module_id, "seconds": seconds}),
+                json_output,
+            )
+            .await
         }
         Command::Module(ModuleCommand::Logs { module_id, options }) => {
             module_logs(&mut client, module_id.as_deref(), &options, json_output).await
@@ -1559,6 +1572,11 @@ struct ModuleLogsOptions {
 
 enum ModuleCommand {
     List,
+    Resources,
+    Profile {
+        module_id: String,
+        seconds: u64,
+    },
     Status {
         module_id: String,
     },
@@ -1744,17 +1762,6 @@ impl CkClient {
         })?
     }
 
-    async fn next_frame(&mut self) -> Result<Frame, CkError> {
-        match time::timeout(CONTROL_RESPONSE_TIMEOUT, read_frame(&mut self.stream)).await {
-            Ok(Ok(Some(frame))) => Ok(frame),
-            Ok(Ok(None)) => Err(CkError::Message("subc closed the connection".into())),
-            Ok(Err(source)) => Err(CkError::Message(format!("read frame: {source}"))),
-            Err(_) => Err(CkError::ResponseTimeout {
-                timeout: CONTROL_RESPONSE_TIMEOUT,
-            }),
-        }
-    }
-
     async fn catalog_list(&mut self) -> Result<Vec<CatalogEntry>, CkError> {
         let value = self
             .rpc_value(ClientControlRequest::CatalogList { module_id: None })
@@ -1803,6 +1810,16 @@ impl CkClient {
         route: RouteHandle,
         body: Value,
     ) -> Result<Value, CkError> {
+        self.route_request_value_with_timeout(route, body, CONTROL_RESPONSE_TIMEOUT)
+            .await
+    }
+
+    async fn route_request_value_with_timeout(
+        &mut self,
+        route: RouteHandle,
+        body: Value,
+        timeout: Duration,
+    ) -> Result<Value, CkError> {
         let corr = self.next_corr;
         self.next_corr = self.next_corr.saturating_add(1);
         let body = serde_json::to_vec(&body)?;
@@ -1819,22 +1836,29 @@ impl CkClient {
             .await
             .map_err(|source| CkError::Message(source.to_string()))?;
 
-        loop {
-            let reply = self.next_frame().await?;
-            if reply.header.channel != route.channel
-                || reply.header.epoch != route.epoch
-                || reply.header.corr != corr
-            {
-                continue;
+        time::timeout(timeout, async {
+            loop {
+                let reply = read_frame(&mut self.stream)
+                    .await
+                    .map_err(|e| CkError::Message(e.to_string()))?
+                    .ok_or_else(|| CkError::Message("subc closed the connection".into()))?;
+                if reply.header.channel != route.channel
+                    || reply.header.epoch != route.epoch
+                    || reply.header.corr != corr
+                {
+                    continue;
+                }
+                return match reply.header.ty {
+                    FrameType::Response => Ok(serde_json::from_slice(&reply.body)?),
+                    FrameType::Error => Err(CkError::rejected_frame(&reply.body)),
+                    ty => Err(CkError::Message(format!(
+                        "unexpected route response frame {ty:?}"
+                    ))),
+                };
             }
-            return match reply.header.ty {
-                FrameType::Response => Ok(serde_json::from_slice(&reply.body)?),
-                FrameType::Error => Err(CkError::rejected_frame(&reply.body)),
-                ty => Err(CkError::Message(format!(
-                    "unexpected route response frame {ty:?}"
-                ))),
-            };
-        }
+        })
+        .await
+        .map_err(|_| CkError::ResponseTimeout { timeout })?
     }
 
     async fn route_goodbye(&mut self, route: RouteHandle) {
@@ -1869,6 +1893,93 @@ async fn module_drain_response_timeout(
         .map(Duration::from_millis)
         .unwrap_or(DEFAULT_DRAIN_TIMEOUT);
     Ok(drain_timeout.saturating_add(DRAIN_RESPONSE_MARGIN))
+}
+
+async fn module_inspect(
+    client: &mut CkClient,
+    body: Value,
+    json_output: JsonOutput,
+) -> Result<(), CkError> {
+    let root = env::current_dir().map_err(|e| CkError::Message(e.to_string()))?;
+    let route = client.route_open_management("inspect", root).await.map_err(|error| {
+        match &error {
+            CkError::Rejected { code: Some(code), .. } if matches!(code.as_str(), "unknown_module" | "target_unavailable" | "module_warming" | "module_removed") =>
+                CkError::Message("inspect is not installed or running; use ck setup or configure the inspect module in daemon config".into()),
+            _ => error,
+        }
+    })?;
+    let seconds = body.get("seconds").and_then(Value::as_u64).unwrap_or(0);
+    let result = client
+        .route_request_value_with_timeout(route, body, Duration::from_secs(seconds + 10))
+        .await;
+    client.route_goodbye(route).await;
+    let value = result?;
+    if json_output.enabled {
+        return json_output.print(&value);
+    }
+    let value = terminal_safe_json(&value);
+    if let Some(modules) = value.get("modules").and_then(Value::as_array) {
+        for module in modules {
+            println!(
+                "{}  {}  pid={}  generation={}  {}",
+                display_field(module, "module_id"),
+                display_field(module, "state"),
+                display_field(module, "pid"),
+                display_field(module, "spawn_generation"),
+                terminal_safe_json(module.get("resources").unwrap_or(&Value::Null))
+            );
+        }
+    } else {
+        println!(
+            "{} pid={} · {} s · {} · {} idle threads{}",
+            display_field(&value, "module_id"),
+            display_field(&value, "pid"),
+            display_field(&value, "seconds"),
+            display_field(&value, "method"),
+            display_field(&value, "idle_threads"),
+            if value.get("truncated") == Some(&Value::Bool(true)) {
+                " · truncated"
+            } else {
+                ""
+            }
+        );
+        for thread in value
+            .get("threads")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            println!(
+                "  {} · {}",
+                display_field(thread, "name"),
+                thread
+                    .get("cpu_ms")
+                    .map(|v| format!("{v} ms CPU"))
+                    .unwrap_or_else(|| format!("{} samples", display_field(thread, "samples")))
+            );
+            for stack in thread
+                .get("stacks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let frames: Vec<_> = stack
+                    .get("frames")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(terminal_safe_string)
+                    .collect();
+                println!(
+                    "    {}  {}",
+                    display_field(stack, "count"),
+                    frames.join(" ← ")
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn module_list(
@@ -8139,6 +8250,26 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             };
             let command = match verb.as_str() {
                 "list" => ModuleCommand::List,
+                "resources" if tail.len() == 1 => ModuleCommand::Resources,
+                "profile" => {
+                    let module_id = id(1)?;
+                    let seconds = match &tail[2..] {
+                        [] => 1,
+                        [flag, value] if flag == "--seconds" => value
+                            .to_str()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .filter(|s| (1..=10).contains(s))
+                            .ok_or_else(|| {
+                                CkError::Usage("--seconds must be an integer from 1 to 10".into())
+                            })?,
+                        _ => {
+                            return Err(CkError::Usage(
+                                "usage: ck module profile <id> [--seconds N]".into(),
+                            ))
+                        }
+                    };
+                    ModuleCommand::Profile { module_id, seconds }
+                }
                 // --dry-run computes the reconciliation daemon-side and returns
                 // it without applying it. The flag is read from the verb's own
                 // tail rather than the global argument set, so it cannot silently
@@ -12240,5 +12371,40 @@ mod tests {
         let secs = time.duration_since(UNIX_EPOCH).unwrap().as_secs();
         let parts = utc_parts_from_epoch_secs(secs);
         format!("{:04}-{:02}-{:02}", parts.year, parts.month, parts.day)
+    }
+}
+
+#[cfg(test)]
+mod inspect_cli_tests {
+    use super::*;
+    fn parse(tail: &[&str]) -> Result<Command, CkError> {
+        parse_command(
+            "module",
+            &tail.iter().map(OsString::from).collect::<Vec<_>>(),
+        )
+    }
+    #[test]
+    fn profile_seconds_are_bounded_and_extra_arguments_are_refused() {
+        assert!(matches!(
+            parse(&["profile", "worker"]),
+            Ok(Command::Module(ModuleCommand::Profile { seconds: 1, .. }))
+        ));
+        assert!(matches!(
+            parse(&["profile", "worker", "--seconds", "10"]),
+            Ok(Command::Module(ModuleCommand::Profile { seconds: 10, .. }))
+        ));
+        for seconds in ["0", "11", "-1", "1.5", "no"] {
+            assert!(matches!(
+                parse(&["profile", "worker", "--seconds", seconds]),
+                Err(CkError::Usage(_))
+            ));
+        }
+        for tail in [
+            vec!["profile"],
+            vec!["profile", "worker", "--seconds"],
+            vec!["resources", "extra"],
+        ] {
+            assert!(matches!(parse(&tail), Err(CkError::Usage(_))));
+        }
     }
 }

@@ -88,6 +88,24 @@ drain budget, exit/retry/resource data, and pending-reload evidence when the
 daemon supplies them. The JSON is the roster, not the joined ckni plain table;
 it does not invent PID, uptime or build fields from other sources.
 
+### `ck.module.resources/v1`
+
+`module resources`: `{schema, modules:[{module_id, state, spawn_generation?,
+resources?, pid?}]}`. Read through the `inspect` module. Fields are copied from
+the daemon roster; `pid` comes from a fresh spawn snapshot only when its
+generation matches that roster entry. Missing data is omitted, never zero-filled.
+The outer reply is always an object, never a bare array.
+
+### `ck.module.profile/v1`
+
+`module profile <id> [--seconds N]`: `{schema, module_id, pid, seconds, method,
+threads:[{name, samples?, cpu_ms?, stacks:[{count, frames:[string]}]}],
+idle_threads, truncated}`. `method` is an open string, currently `sample` on
+macOS and `proc_threads` on Linux. Frames are leaf first. See
+[ck-inspect](ck-inspect.md) for bounds and refusals. Plain output retains all
+values in the bounded reply; `ck --json` returns the module's raw object, while
+`ckni --json` adds the schema discriminator.
+
 ### `ck.health/v1`
 
 `health`: `{schema, op:"supervisor.health", generation:number, modules:[Health]}`.

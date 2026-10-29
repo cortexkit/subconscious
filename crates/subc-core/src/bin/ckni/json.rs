@@ -18,6 +18,8 @@ pub(crate) fn json_form(command: &Command) -> JsonForm {
         Command::Activity(_) => JsonForm::Schema("ck.activity/v1"),
         Command::Module(module) => match module {
             ModuleCommand::List => JsonForm::Schema("ck.module.list/v1"),
+            ModuleCommand::Resources => JsonForm::Schema("ck.module.resources/v1"),
+            ModuleCommand::Profile { .. } => JsonForm::Schema("ck.module.profile/v1"),
             ModuleCommand::Status { .. } => JsonForm::Schema("ck.module.status/v1"),
             ModuleCommand::Logs { .. } => JsonForm::Schema("ck.module.logs/v1"),
             ModuleCommand::StderrTail { .. } => JsonForm::Schema("ck.module.stderr/v1"),
@@ -147,6 +149,16 @@ mod tests {
     #[test]
     fn every_builtin_variant_has_one_plain_and_one_documented_json_classification() {
         let cases = [
+            (
+                "module resources",
+                PlainOutput::PipedText,
+                JsonForm::Schema("ck.module.resources/v1"),
+            ),
+            (
+                "module profile alpha",
+                PlainOutput::PipedText,
+                JsonForm::Schema("ck.module.profile/v1"),
+            ),
             (
                 "health",
                 PlainOutput::Table(Table::Health),

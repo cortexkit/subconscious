@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.149
+
+- Add `ck module resources` and `ck module profile <id> [--seconds N]` through
+  the optional `inspect` module, with plain summaries and versioned ckni JSON.
+
 ## 0.20.148
 
 - `ck` and `ckni` setup and upgrade output now uses the same checked stdout writes as other commands, exiting quietly with status 0 when a reader closes the pipe early on Unix or Windows.

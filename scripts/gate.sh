@@ -20,7 +20,7 @@ Usage: scripts/gate.sh {fast|lint|test|swift|ts|all} [check]
          The untargeted checks use the host: run on Linux for CI's Linux verdict.
          Install the Windows Rust target beforehand; cross-checking is not a
          substitute for CI's native Windows/MSVC lint and execution.
-  test   SLOW. Run on the build server with runon: "linux,16c", not on this Mac.
+  test   SLOW. Linux only; best on a machine with many cores.
          Build subc-core helper binaries first, then ONE whole-workspace
          --all-targets --locked --no-fail-fast test invocation, workspace doc
          tests, and CK alpha's setup, CLI and Unix inode selections with their
@@ -358,7 +358,7 @@ case "$STAGE" in
   test)
     if [ -n "$CHECK" ]; then test_check "$CHECK"; else
       CURRENT_STEP='Linux build-server prerequisite'
-      if [ "$(uname -s)" != Linux ]; then echo 'Run test on the Linux build server (runon: "linux,16c").' >&2; exit 2; fi
+      if [ "$(uname -s)" != Linux ]; then echo 'The test stage runs on Linux only; use a Linux machine with many cores.' >&2; exit 2; fi
       scratch
       git status --porcelain | sort > "$SCRATCH/tree-before.txt"
       collect workspace docs alpha-setup alpha-cli alpha-inode

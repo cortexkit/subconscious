@@ -1,6 +1,6 @@
 [package]
 name = "ck-inspect"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT"
 description = "Read-only supervised process inspection over subc routes."

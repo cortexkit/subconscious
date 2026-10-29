@@ -47,13 +47,23 @@ fn finish_node(path: &mut Vec<Node>, stacks: &mut Vec<Stack>) -> bool {
     own > 0 && path.len() >= 12
 }
 
-fn finish_thread(profile: &mut Profile, thread: &mut Option<Thread>, path: &mut Vec<Node>) {
+// `cut` collects frame-depth truncation for the thread being finished. It only
+// marks the reply truncated if that thread is reported: an idle thread is
+// dropped whole, so cutting its deep wait stacks removes nothing from the reply.
+fn finish_thread(
+    profile: &mut Profile,
+    thread: &mut Option<Thread>,
+    path: &mut Vec<Node>,
+    cut: &mut bool,
+) {
     let Some(mut thread) = thread.take() else {
+        *cut = false;
         return;
     };
     while !path.is_empty() {
-        profile.truncated |= finish_node(path, &mut thread.stacks);
+        *cut |= finish_node(path, &mut thread.stacks);
     }
+    let thread_cut = std::mem::take(cut);
     // Only sampled execution positions determine idleness. A waiting leaf has
     // ordinary runtime ancestors; an active leaf in any branch keeps the thread.
     if !thread.stacks.is_empty()
@@ -65,6 +75,7 @@ fn finish_thread(profile: &mut Profile, thread: &mut Option<Thread>, path: &mut 
         profile.idle_threads += 1;
         return;
     }
+    profile.truncated |= thread_cut;
     // Different instruction offsets can resolve to the same named stack. Merge
     // them before ranking so the reply does not repeat one stack three times.
     let mut counts = std::collections::BTreeMap::<Vec<String>, u64>::new();
@@ -87,6 +98,7 @@ pub(crate) fn parse(text: &str, mut profile: Profile) -> Result<Profile, &'stati
     let mut in_graph = false;
     let mut thread = None;
     let mut path: Vec<Node> = Vec::new();
+    let mut cut = false;
     for line in text.lines() {
         if line.trim() == "Call graph:" {
             in_graph = true;
@@ -110,13 +122,13 @@ pub(crate) fn parse(text: &str, mut profile: Profile) -> Result<Profile, &'stati
         };
         let label = label.trim();
         if label.starts_with("Thread_") {
-            finish_thread(&mut profile, &mut thread, &mut path);
+            finish_thread(&mut profile, &mut thread, &mut path, &mut cut);
             let mut next = Thread::new(label.into());
             next.samples = Some(count);
             thread = Some(next);
         } else if let Some(thread) = thread.as_mut() {
             while path.last().is_some_and(|n| n.depth >= start) {
-                profile.truncated |= finish_node(&mut path, &mut thread.stacks);
+                cut |= finish_node(&mut path, &mut thread.stacks);
             }
             if let Some(parent) = path.last_mut() {
                 parent.children = parent.children.saturating_add(count);
@@ -130,7 +142,7 @@ pub(crate) fn parse(text: &str, mut profile: Profile) -> Result<Profile, &'stati
             });
         }
     }
-    finish_thread(&mut profile, &mut thread, &mut path);
+    finish_thread(&mut profile, &mut thread, &mut path, &mut cut);
     if profile.threads.is_empty() && profile.idle_threads == 0 {
         return Err("sample contained no call graph");
     }
@@ -196,6 +208,19 @@ mod tests {
         assert_eq!(stack.frames.len(), 12);
         assert_eq!(stack.frames[0], "frame_14");
         assert_eq!(stack.frames[11], "frame_3");
+    }
+
+    #[test]
+    fn an_idle_thread_with_a_deep_wait_stack_does_not_mark_the_reply_truncated() {
+        let mut graph = "Call graph:\n  1 Thread_1\n".to_string();
+        for depth in 0..14 {
+            graph.push_str(&format!("{}1 frame_{depth}\n", " ".repeat(4 + depth * 2)));
+        }
+        graph.push_str(&format!("{}1 __psynch_cvwait\n", " ".repeat(4 + 14 * 2)));
+        let result = parse(&graph, profile()).unwrap();
+        assert_eq!(result.idle_threads, 1);
+        assert!(result.threads.is_empty());
+        assert!(!result.truncated);
     }
 
     #[test]

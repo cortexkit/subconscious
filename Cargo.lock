@@ -2729,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.33.5"
+version = "0.33.6"
 dependencies = [
  "serde",
  "serde_json",

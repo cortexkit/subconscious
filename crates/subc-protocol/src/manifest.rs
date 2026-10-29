@@ -768,7 +768,9 @@ pub struct EventDeclaration {
     pub name: String,
     /// Event schema version, at least 1.
     pub version: u32,
-    /// Header names every notice carries, for filtering only, never authority.
+    /// Header names a notice of this event may carry, for filtering only, never
+    /// authority. A notice omits a header it has no value for, and never sends
+    /// one empty or invented, so a filter on a missing header does not match.
     /// Names match `[a-z][a-z0-9_]{0,31}` and are unique within the declaration.
     pub headers: Vec<String>,
     /// Short human line for consent cards, at most 200 characters without controls.
@@ -788,7 +790,7 @@ impl EventDeclaration {
         }
     }
 
-    /// Sets the header names carried by every notice of this event.
+    /// Sets the header names a notice of this event may carry.
     pub fn with_headers(mut self, headers: Vec<String>) -> Self {
         self.headers = headers;
         self

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.33.6
+
+- Documentation only: an event declaration's `headers` name the headers a notice may carry. A notice omits a header it has no value for and never sends one empty or invented, so a filter on that header does not match it. Nothing on the wire changes.
+
 ## 0.33.5
 
 - Add optional `session::OperatorConfirmRequest::{kind, operation}` with `with_kind` and `with_operation`, and the open string enum `session::OperatorConfirmKind` (`operation`, `enrollment`, or a preserved `Unknown(String)`). An unknown kind decodes rather than refusing the request. Only `operation`, with an `operation` the asking module lists in `confirm_operations`, can be answered without a prompt; `enrollment`, an absent kind and any unknown kind prompt. `OperatorConfirmRequest::new` sets neither, so existing request bytes are unchanged.

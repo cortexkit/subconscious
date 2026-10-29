@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2
+
+- `module.profile` accepts `seconds` sent as a whole-valued float such as `8.0`, which callers in JavaScript (flows through Basal) can send for 8. Fractions, strings and values outside 1 to 10 are still refused.
+- A refused request now names what was wrong: missing `op`, an unknown op, an unexpected field, `module_id` not a string, or `seconds` out of range. The reasons are fixed text and never echo the caller's input.
+
 ## 0.1.1
 
 - A profile no longer reports `truncated: true` because an idle thread's deep wait stack was cut. Idle threads are dropped from the reply whole, so cutting their stacks removes nothing the reply would have shown. `truncated` now means a reported thread, stack or frame list was shortened.

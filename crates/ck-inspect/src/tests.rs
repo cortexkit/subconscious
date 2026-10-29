@@ -120,6 +120,57 @@ async fn resources_is_an_object_and_copies_only_observations_with_matching_pid()
     assert!(result["modules"][0].get("pid").is_none());
 }
 
+#[test]
+fn whole_number_seconds_are_accepted_as_floats_and_each_refusal_names_its_field() {
+    let profile = |seconds| Request::Profile {
+        module_id: "fixture".into(),
+        seconds,
+    };
+    for (body, expected) in [
+        (
+            &br#"{"op":"module.profile","module_id":"fixture","seconds":8}"#[..],
+            profile(8),
+        ),
+        (
+            br#"{"op":"module.profile","module_id":"fixture","seconds":8.0}"#,
+            profile(8),
+        ),
+        (br#"{"op":"module.resources"}"#, Request::Resources),
+    ] {
+        assert_eq!(parse_request(body).unwrap(), expected);
+    }
+    for (body, reason) in [
+        (&b"[1]"[..], "request body must be a JSON object"),
+        (
+            br#"{"module_id":"fixture","seconds":8}"#,
+            "request needs an op string",
+        ),
+        (
+            br#"{"op":"module.top"}"#,
+            "unknown op; expected module.resources or module.profile",
+        ),
+        (
+            br#"{"op":"module.resources","x":1}"#,
+            "module.resources takes no fields besides op",
+        ),
+        (
+            br#"{"op":"module.profile","seconds":8}"#,
+            "module_id must be a string",
+        ),
+        (
+            br#"{"op":"module.profile","module_id":"f","seconds":"8"}"#,
+            "seconds must be a whole number from 1 to 10",
+        ),
+        (
+            br#"{"op":"module.profile","module_id":"f","seconds":8.5}"#,
+            "seconds must be a whole number from 1 to 10",
+        ),
+    ] {
+        let refusal = parse_request(body).unwrap_err();
+        assert_eq!((refusal.code, refusal.reason), ("invalid_request", reason));
+    }
+}
+
 #[tokio::test]
 async fn invalid_seconds_and_caller_pid_are_refused_without_sampling() {
     let (service, sampler) = service(vec![entry()], vec![], true, false);

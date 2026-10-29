@@ -10,7 +10,6 @@ mod sampler;
 pub use profile::{Profile, Stack, Thread};
 
 use async_trait::async_trait;
-use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -59,13 +58,67 @@ impl Refusal {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(tag = "op", deny_unknown_fields)]
+#[derive(Debug, PartialEq)]
 enum Request {
-    #[serde(rename = "module.resources")]
-    Resources {},
-    #[serde(rename = "module.profile")]
+    Resources,
     Profile { module_id: String, seconds: u64 },
+}
+
+/// Parse a request body by hand, so each refusal names what was wrong without
+/// echoing the caller's input. `seconds` accepts any JSON number with a whole
+/// value, because callers in JavaScript (flows through Basal) hold numbers as
+/// doubles and may send 8 as 8.0.
+fn parse_request(body: &[u8]) -> Result<Request, Refusal> {
+    let invalid = |reason| Refusal::new("invalid_request", reason);
+    let value: Value =
+        serde_json::from_slice(body).map_err(|_| invalid("request body is not JSON"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("request body must be a JSON object"))?;
+    let op = object
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("request needs an op string"))?;
+    let only = |allowed: &[&str]| object.keys().all(|key| allowed.contains(&key.as_str()));
+    match op {
+        "module.resources" => {
+            if !only(&["op"]) {
+                return Err(invalid("module.resources takes no fields besides op"));
+            }
+            Ok(Request::Resources)
+        }
+        "module.profile" => {
+            if !only(&["op", "module_id", "seconds"]) {
+                return Err(invalid(
+                    "module.profile takes only op, module_id and seconds",
+                ));
+            }
+            let module_id = object
+                .get("module_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("module_id must be a string"))?;
+            let seconds = object
+                .get("seconds")
+                .and_then(whole_number)
+                .filter(|seconds| (1..=10).contains(seconds))
+                .ok_or_else(|| invalid("seconds must be a whole number from 1 to 10"))?;
+            Ok(Request::Profile {
+                module_id: module_id.to_owned(),
+                seconds,
+            })
+        }
+        _ => Err(invalid(
+            "unknown op; expected module.resources or module.profile",
+        )),
+    }
+}
+
+fn whole_number(value: &Value) -> Option<u64> {
+    if let Some(n) = value.as_u64() {
+        return Some(n);
+    }
+    let f = value.as_f64()?;
+    (f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= u64::MAX as f64).then_some(f as u64)
 }
 
 #[async_trait]
@@ -196,14 +249,8 @@ fn target(entries: &[LiveSpawn], id: &str) -> Result<(u32, u64), Refusal> {
 
 impl Inspect {
     async fn query(&self, body: &[u8]) -> Result<Value, Refusal> {
-        let request: Request = serde_json::from_slice(body).map_err(|_| {
-            Refusal::new(
-                "invalid_request",
-                "expected a query with module_id and integer seconds from 1 to 10",
-            )
-        })?;
-        match request {
-            Request::Resources {} => {
+        match parse_request(body)? {
+            Request::Resources => {
                 let entries = self.roster.list().await?;
                 let live = self.roster.snapshot().await?;
                 let modules = entries
@@ -227,12 +274,6 @@ impl Inspect {
                 Ok(json!({"modules": modules}))
             }
             Request::Profile { module_id, seconds } => {
-                if !(1..=10).contains(&seconds) {
-                    return Err(Refusal::new(
-                        "invalid_request",
-                        "seconds must be from 1 to 10",
-                    ));
-                }
                 let entries = self.roster.list().await?;
                 if !entries.iter().any(|e| e.module_id == module_id) {
                     return Err(Refusal::new("unknown_module", "module is not supervised"));

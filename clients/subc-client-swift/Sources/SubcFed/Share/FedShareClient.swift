@@ -71,8 +71,10 @@ public struct FedShareClient: Sendable {
     /// Storage failure throws rather than returning an unsafe fallback outcome.
     public func send(_ requests: [FedShareRequest], to computer: FedShareDirectoryEntry) async throws -> FedShareSessionReport {
         guard Set(requests.map(\.shareID)).count == requests.count else { throw FedShareError.invalidRequest }
-        let expired = try ledger.withLedgerLock { transaction in
-            try Set(requests.filter { try transaction.isExpired($0.shareID) }.map(\.shareID))
+        let expired = try await FedShareFiles.perform {
+            try ledger.withLedgerLock { transaction in
+                try Set(requests.filter { try transaction.isExpired($0.shareID) }.map(\.shareID))
+            }
         }
         let report = try await sendRecent(requests.filter { !expired.contains($0.shareID) }, to: computer)
         let recent = Dictionary(uniqueKeysWithValues: report.calls.map { ($0.shareID, $0) })
@@ -86,9 +88,9 @@ public struct FedShareClient: Sendable {
         let privateKey = try await keyStore.staticPrivateKey()
         let ownKey = try FedNoiseKeyPair(privateKey: privateKey).publicKey
         guard computer.advertisedShareV1, ownKey == computer.ownPublicKey else {
-            return FedShareSessionReport(calls: try requests.map {
-                try unattempted($0, code: nil, bindingChanged: ownKey != computer.ownPublicKey)
-            }, byeCode: nil, notSupportedByComputer: !computer.advertisedShareV1)
+            return FedShareSessionReport(calls: try await unattempted(requests, code: nil,
+                bindingChanged: ownKey != computer.ownPublicKey),
+                byeCode: nil, notSupportedByComputer: !computer.advertisedShareV1)
         }
         // There is no relay candidate in the directory's schema. LAN always
         // precedes public, and a failed dial never opens a rendezvous socket.
@@ -102,7 +104,7 @@ public struct FedShareClient: Sendable {
             catch { continue }
         }
         guard let transport else {
-            return FedShareSessionReport(calls: try requests.map { try unattempted($0, code: nil) }, byeCode: nil)
+            return FedShareSessionReport(calls: try await unattempted(requests, code: nil), byeCode: nil)
         }
         let connection = FedShareConnection(transport: transport, maximumBodyBytes: UInt32(policy.maxBodyBytes), clock: clock)
         return try await withTaskCancellationHandler {
@@ -115,6 +117,12 @@ public struct FedShareClient: Sendable {
                 throw error
             }
         } onCancel: { Task { await connection.close() } }
+    }
+
+    private func unattempted(_ requests: [FedShareRequest], code: String?, bindingChanged: Bool = false) async throws -> [FedShareCallResult] {
+        try await FedShareFiles.perform {
+            try requests.map { try unattempted($0, code: code, bindingChanged: bindingChanged) }
+        }
     }
 
     private func unattempted(_ request: FedShareRequest, code: String?, bindingChanged: Bool = false) throws -> FedShareCallResult {
@@ -159,7 +167,7 @@ public struct FedShareClient: Sendable {
             if byeCode == "fed_protocol_violation" {
                 try? await connection.send(FedFrame(type: "bye", fields: ["code": .string("fed_protocol_violation")]), maximum: UInt32(policy.maxBodyBytes))
             }
-            return FedShareSessionReport(calls: try requests.map { try unattempted($0, code: byeCode) }, byeCode: byeCode)
+            return FedShareSessionReport(calls: try await unattempted(requests, code: byeCode), byeCode: byeCode)
         }
         let readyAt = remote.readyAt
         for request in requests {
@@ -171,19 +179,21 @@ public struct FedShareClient: Sendable {
                                                   negotiatedFeatures: [FedShareCodec.feature])
             let mark = FedShareMark(destinationKey: computer.publicKey, ownKey: ownKey,
                                     requestBytes: bytes, epoch: remote.epoch)
-            let prepared: (UInt64?, FedShareOutcome?) = try ledger.withLedgerLock { transaction in
-                if try transaction.isExpired(request.shareID) { return (nil, FedShareOutcome(.unknown)) }
-                if try transaction.entry(shareID: request.shareID)?.moved == true { return (nil, FedShareOutcome(.discarded)) }
-                let claim = try transaction.claim(request.shareID)
-                if try transaction.entry(shareID: request.shareID)?.retriesBlocked == true {
-                    return (claim, try transaction.record(FedShareOutcome(.unknown), shareID: request.shareID, claim: claim))
+            let prepared: (UInt64?, FedShareOutcome?) = try await FedShareFiles.perform {
+                try ledger.withLedgerLock { transaction in
+                    if try transaction.isExpired(request.shareID) { return (nil, FedShareOutcome(.unknown)) }
+                    if try transaction.entry(shareID: request.shareID)?.moved == true { return (nil, FedShareOutcome(.discarded)) }
+                    let claim = try transaction.claim(request.shareID)
+                    if try transaction.entry(shareID: request.shareID)?.retriesBlocked == true {
+                        return (claim, try transaction.record(FedShareOutcome(.unknown), shareID: request.shareID, claim: claim))
+                    }
+                    if let previous = try transaction.entry(shareID: request.shareID)?.mark, previous != mark {
+                        try transaction.blockRetries(request.shareID)
+                        return (claim, try transaction.record(FedShareOutcome(.unknown), shareID: request.shareID, claim: claim))
+                    }
+                    try transaction.markIfAbsent(request.shareID, mark: mark)
+                    return (claim, nil)
                 }
-                if let previous = try transaction.entry(shareID: request.shareID)?.mark, previous != mark {
-                    try transaction.blockRetries(request.shareID)
-                    return (claim, try transaction.record(FedShareOutcome(.unknown), shareID: request.shareID, claim: claim))
-                }
-                try transaction.markIfAbsent(request.shareID, mark: mark)
-                return (claim, nil)
             }
             if let outcome = prepared.1 {
                 calls.append(FedShareCallResult(shareID: request.shareID, claim: prepared.0, outcome: outcome))
@@ -212,15 +222,20 @@ public struct FedShareClient: Sendable {
                 if byeCode == "fed_protocol_violation" {
                     try? await connection.send(FedFrame(type: "bye", fields: ["code": .string("fed_protocol_violation")]), maximum: remote.maximum)
                 }
-                let unknown = try ledger.record(FedShareOutcome(.unknown, code: byeCode), shareID: request.shareID, claim: claim)
+                let failed = FedShareOutcome(.unknown, code: byeCode)
+                let unknown = try await FedShareFiles.perform {
+                    try ledger.record(failed, shareID: request.shareID, claim: claim)
+                }
                 calls.append(FedShareCallResult(shareID: request.shareID, claim: claim, outcome: unknown))
-                for rest in requests.dropFirst(calls.count) { calls.append(try unattempted(rest, code: byeCode)) }
+                calls.append(contentsOf: try await unattempted(Array(requests.dropFirst(calls.count)), code: byeCode))
                 return FedShareSessionReport(calls: calls, byeCode: byeCode)
             }
-            calls.append(FedShareCallResult(shareID: request.shareID, claim: claim,
-                                            outcome: try ledger.record(outcome, shareID: request.shareID, claim: claim)))
+            let recorded = try await FedShareFiles.perform {
+                try ledger.record(outcome, shareID: request.shareID, claim: claim)
+            }
+            calls.append(FedShareCallResult(shareID: request.shareID, claim: claim, outcome: recorded))
         }
-        for rest in requests.dropFirst(calls.count) { calls.append(try unattempted(rest, code: nil)) }
+        calls.append(contentsOf: try await unattempted(Array(requests.dropFirst(calls.count)), code: nil))
         try? await connection.send(FedFrame(type: "bye", fields: ["code": .string(FedShareByeCode.done.rawValue)]), maximum: remote.maximum)
         return FedShareSessionReport(calls: calls, byeCode: FedShareByeCode.done.rawValue)
     }

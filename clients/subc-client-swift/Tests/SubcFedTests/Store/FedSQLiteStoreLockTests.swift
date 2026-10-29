@@ -288,10 +288,10 @@ final class FedSQLiteStoreLockTests: XCTestCase {
         defer { try? handle.close() }
         child.standardOutput = handle
         child.standardError = handle
-        try child.run()
-        defer {
+        let helper = try FedTestProcess(child)
+        addTeardownBlock {
             if child.isRunning { child.terminate() }
-            child.waitUntilExit()
+            _ = try await helper.waitForExit()
         }
         let ready = dir.appendingPathComponent("helper-ready")
         try await waitForFile(ready, child: child, output: output)
@@ -321,9 +321,9 @@ final class FedSQLiteStoreLockTests: XCTestCase {
         XCTAssertGreaterThan(reserved.value, expected.global.nextEffectSequence - 1)
         try await second.close()
         try Data().write(to: dir.appendingPathComponent("parent-reopened"))
-        child.waitUntilExit()
+        let status = try await helper.waitForExit()
         let diagnostics = String(decoding: try Data(contentsOf: output), as: UTF8.self)
-        XCTAssertEqual(child.terminationStatus, 0, diagnostics)
+        XCTAssertEqual(status, 0, diagnostics)
     }
 
     private func waitForFile(_ file: URL, child: Process, output: URL) async throws {

@@ -63,10 +63,12 @@ public struct FedShareDirectory: Sendable {
                                    originLedgerEpoch: state.global.localLedgerEpoch)
         }.sorted { $0.publicKey.lexicographicallyPrecedes($1.publicKey) }
         let data = try FedShareFiles.encode(FedShareDirectoryDocument(computers: entries))
-        return try FedShareFiles.locked(at: fileURL.appendingPathExtension("lock")) {
-            if FileManager.default.fileExists(atPath: fileURL.path), try Data(contentsOf: fileURL) == data { return false }
-            try FedShareFiles.replace(data, at: fileURL)
-            return true
+        return try await FedShareFiles.perform {
+            try FedShareFiles.locked(at: fileURL.appendingPathExtension("lock")) {
+                if FileManager.default.fileExists(atPath: fileURL.path), try Data(contentsOf: fileURL) == data { return false }
+                try FedShareFiles.replace(data, at: fileURL)
+                return true
+            }
         }
     }
 

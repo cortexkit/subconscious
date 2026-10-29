@@ -177,6 +177,60 @@ final class FedShareTests: XCTestCase {
         XCTAssertEqual(restored.calls.first?.outcome.disposition, .unknown)
     }
 
+    private func assertCooperativeProgress(contendingAt lockURL: URL,
+                                           operation: @escaping @Sendable () async throws -> Void) async throws {
+        let locked = expectation(description: "lock holder ready")
+        let release = DispatchSemaphore(value: 0)
+        let holder = Task {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                DispatchQueue(label: "share-lock-holder").async {
+                    continuation.resume(with: Result {
+                        try FedShareFiles.locked(at: lockURL) {
+                            locked.fulfill()
+                            // A native worker bounds a broken implementation's wait;
+                            // the cooperative test task must release the lock first.
+                            XCTAssertEqual(release.wait(timeout: .now() + 2), .success,
+                                           "async share I/O prevented the cooperative task from releasing the lock")
+                        }
+                    })
+                }
+            }
+        }
+        await fulfillment(of: [locked], timeout: 2)
+        let started = expectation(description: "async operation started")
+        let contender = Task {
+            started.fulfill()
+            try await operation()
+        }
+        await fulfillment(of: [started], timeout: 2)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        release.signal()
+        try await contender.value
+        try await holder.value
+    }
+
+    func testSendYieldsWhileLedgerLockIsContended() async throws {
+        let dir = try directory(), ledger = shareTestLedger(directoryURL: dir)
+        let target = try await entry(at: dir, support: false)
+        let client = try client(ledger: ledger, server: ShareTestServer())
+        let request = try request()
+        try await assertCooperativeProgress(contendingAt: ledger.lockURL) {
+            let report = try await client.send([request], to: target)
+            XCTAssertEqual(report.calls.first?.outcome.disposition, .outbox)
+        }
+    }
+
+    func testDirectoryUpdateYieldsWhileFileLockIsContended() async throws {
+        let dir = try directory(), store = FedMemoryStateStore()
+        let own = try await FedMemoryPrivateKeyStore(noisePrivateKey: ownPrivate).staticPublicKey()
+        _ = try await store.open(localPublicKey: own)
+        let file = FedShareDirectory(directoryURL: dir)
+        try await assertCooperativeProgress(contendingAt: file.fileURL.appendingPathExtension("lock")) {
+            let changed = try await file.update(computers: [], ownPublicKey: own, stateStore: store)
+            XCTAssertTrue(changed)
+        }
+    }
+
     func testDirectoryUnchangedSkipsReplaceAndUsesOriginValues() async throws {
         let dir = try directory(), store = FedMemoryStateStore()
         let own = try await FedMemoryPrivateKeyStore(noisePrivateKey: ownPrivate).staticPublicKey()

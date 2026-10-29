@@ -33,7 +33,7 @@ final class FedShareLedgerProcessTests: XCTestCase {
         }
     }
 
-    private func launch(_ dir: URL) throws -> Process {
+    private func launch(_ dir: URL) throws -> FedTestProcess {
         let child = Process()
         child.executableURL = URL(fileURLWithPath: "/usr/bin/xcrun")
         child.arguments = ["xctest", "-XCTest", "SubcFedTests.FedShareLedgerProcessTests/testProcessHelper",
@@ -45,23 +45,13 @@ final class FedShareLedgerProcessTests: XCTestCase {
         FileManager.default.createFile(atPath: log.path, contents: nil)
         let handle = try FileHandle(forWritingTo: log)
         child.standardOutput = handle; child.standardError = handle
-        try child.run()
+        let helper = try FedTestProcess(child)
         try handle.close()
         addTeardownBlock {
             if child.isRunning { kill(child.processIdentifier, SIGKILL) }
-            try await self.waitForExit(child)
+            _ = try await helper.waitForExit()
         }
-        return child
-    }
-
-    // Yield while Foundation observes child exit so the async test executor can
-    // keep making progress, and a stuck helper fails within a bounded time.
-    private func waitForExit(_ child: Process) async throws {
-        let deadline = Date().addingTimeInterval(10)
-        while child.isRunning {
-            guard Date() < deadline else { XCTFail("share helper did not exit"); throw FedShareError.storage }
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
+        return helper
     }
 
     private func waitReady(_ dir: URL, child: Process) async throws {
@@ -77,21 +67,32 @@ final class FedShareLedgerProcessTests: XCTestCase {
 
     func testTwoProcessesContendingClaimsNewestWins() async throws {
         let dir = try directory(), ledger = shareTestLedger(directoryURL: dir)
-        let child = try launch(dir)
+        let helper = try launch(dir), child = helper.process
         try await waitReady(dir, child: child)
-        let started = DispatchSemaphore(value: 0), finished = DispatchSemaphore(value: 0)
-        let worker = Task.detached {
-            started.signal()
-            defer { finished.signal() }
-            let claim = try ledger.claim(self.id)
-            try ledger.record(FedShareOutcome(.sent), shareID: self.id, claim: claim)
-            return claim
+        let started = expectation(description: "contender started")
+        let finished = expectation(description: "contender finished")
+        finished.isInverted = true
+        let shareID = id
+        let worker = Task {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<UInt64, Error>) in
+                // Run blocking flock on a separate worker so the async test can
+                // write the release file and let the child unlock its transaction.
+                DispatchQueue(label: "share-ledger-contender").async {
+                    started.fulfill()
+                    defer { finished.fulfill() }
+                    continuation.resume(with: Result {
+                        let claim = try ledger.claim(shareID)
+                        try ledger.record(FedShareOutcome(.sent), shareID: shareID, claim: claim)
+                        return claim
+                    })
+                }
+            }
         }
-        XCTAssertEqual(started.wait(timeout: .now() + 2), .success)
-        XCTAssertEqual(finished.wait(timeout: .now() + 0.2), .timedOut, "contender entered a transaction while the other process held the lock")
+        await fulfillment(of: [started], timeout: 2)
+        await fulfillment(of: [finished], timeout: 0.2)
         try Data().write(to: dir.appendingPathComponent("release"))
-        try await waitForExit(child)
-        XCTAssertEqual(child.terminationStatus, 0)
+        let status = try await helper.waitForExit()
+        XCTAssertEqual(status, 0)
         let claim = try await worker.value
         XCTAssertEqual(claim, 2)
         XCTAssertEqual(try ledger.entry(shareID: id)?.claim, 2)
@@ -100,10 +101,10 @@ final class FedShareLedgerProcessTests: XCTestCase {
 
     func testKilledLockHolderReleasesImmediately() async throws {
         let dir = try directory(), ledger = shareTestLedger(directoryURL: dir)
-        let child = try launch(dir)
+        let helper = try launch(dir), child = helper.process
         try await waitReady(dir, child: child)
         XCTAssertEqual(kill(child.processIdentifier, SIGKILL), 0)
-        try await waitForExit(child)
+        _ = try await helper.waitForExit()
         let start = DispatchTime.now().uptimeNanoseconds
         let claim = try ledger.claim(id)
         XCTAssertEqual(claim, 1, "the killed transaction never committed")

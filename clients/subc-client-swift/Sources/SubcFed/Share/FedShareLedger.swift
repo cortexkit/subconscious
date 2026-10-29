@@ -255,6 +255,9 @@ public final class FedShareLedger: @unchecked Sendable {
         self.nowMilliseconds = nowMilliseconds
     }
 
+    /// This synchronous operation can wait for another process's lock and for
+    /// durable disk writes. Async callers must offload the entire transaction
+    /// to a blocking-I/O worker rather than occupy a cooperative executor thread.
     public func withLedgerLock<T>(_ body: (FedShareLedgerTransaction) throws -> T) throws -> T {
         try FedShareFiles.locked(at: lockURL) {
             let document: FedShareLedgerDocument

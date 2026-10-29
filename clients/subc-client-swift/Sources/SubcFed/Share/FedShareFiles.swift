@@ -19,6 +19,17 @@ public enum FedShareError: Error, Equatable, Sendable {
 // The lock inode is permanent. Each transaction opens its own description so
 // threads and processes contend alike; the kernel releases it on process death.
 enum FedShareFiles {
+    private static let ioQueue = DispatchQueue(label: "share-file-io", attributes: .concurrent)
+
+    // flock can wait indefinitely for another process, and fsync can block too.
+    // Keep the whole transaction off Swift's cooperative executor and resume
+    // only after the lock is released and any durable replacement completes.
+    static func perform<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            ioQueue.async { continuation.resume(with: Result(catching: body)) }
+        }
+    }
+
     static func locked<T>(at url: URL, _ body: () throws -> T) throws -> T {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let fd = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)

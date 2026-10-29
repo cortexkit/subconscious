@@ -668,12 +668,12 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             module_status(&mut client, &module_id, json_output, args.verbose).await
         }
         Command::Module(ModuleCommand::Resources) => {
-            module_inspect(&mut client, json!({"op": "module.resources"}), json_output).await
+            module_inspect(&mut client, json!({"method": "module.resources", "params": {}}), json_output).await
         }
         Command::Module(ModuleCommand::Profile { module_id, seconds }) => {
             module_inspect(
                 &mut client,
-                json!({"op": "module.profile", "module_id": module_id, "seconds": seconds}),
+                json!({"method": "module.profile", "params": {"module_id": module_id, "seconds": seconds}}),
                 json_output,
             )
             .await

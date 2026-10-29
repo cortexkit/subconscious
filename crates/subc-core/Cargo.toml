@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.20.149"
+version = "0.20.150"
 edition = "2021"
 license = "MIT"
 publish = false

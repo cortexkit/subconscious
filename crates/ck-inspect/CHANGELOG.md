@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+- Read requests in the fleet's management envelope, `{"method": "<operation>", "params": {...}}`, which flows through Basal, the phone and other management callers send. 0.1.2 and earlier expected `{"op": ...}` with fields at the top level, so every routed caller except `ck` was refused. `params` may be omitted for `module.resources`. `ck module resources` and `ck module profile` now send the same envelope.
+
 ## 0.1.2
 
 - `module.profile` accepts `seconds` sent as a whole-valued float such as `8.0`, which callers in JavaScript (flows through Basal) can send for 8. Fractions, strings and values outside 1 to 10 are still refused.

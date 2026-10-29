@@ -22,7 +22,7 @@ not relay arbitrary control operations.
 
 ## Queries and CLI
 
-`ck module resources` sends `{"op":"module.resources"}` over a management route
+`ck module resources` sends `{"method":"module.resources","params":{}}` over a management route
 to `inspect`. The reply is always an object:
 
 ```json
@@ -35,7 +35,7 @@ joined from `supervisor.spawn_snapshot` only when its generation matches the lis
 entry; a mismatch omits PID rather than pairing unrelated observations.
 
 `ck module profile <id> [--seconds N]` sends
-`{"op":"module.profile","module_id":"worker","seconds":1}`. The default CLI
+`{"method":"module.profile","params":{"module_id":"worker","seconds":1}}`. The default CLI
 window is one second. The reply shape is:
 
 ```json

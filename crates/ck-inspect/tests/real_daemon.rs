@@ -126,7 +126,7 @@ async fn routed_resources_and_profile_observe_supervised_process_and_exit_on_eof
         .call(
             target.clone(),
             identity.clone(),
-            serde_json::to_vec(&json!({"op":"module.resources"})).unwrap(),
+            serde_json::to_vec(&json!({"method":"module.resources","params":{}})).unwrap(),
             CallOptions::default(),
         )
         .await
@@ -145,8 +145,10 @@ async fn routed_resources_and_profile_observe_supervised_process_and_exit_on_eof
         .call(
             target,
             identity,
-            serde_json::to_vec(&json!({"op":"module.profile","module_id":"load","seconds":1}))
-                .unwrap(),
+            serde_json::to_vec(
+                &json!({"method":"module.profile","params":{"module_id":"load","seconds":1}}),
+            )
+            .unwrap(),
             CallOptions::default(),
         )
         .await

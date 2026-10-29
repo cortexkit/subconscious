@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.150
+
+- `ck module resources` and `ck module profile` send the standard management envelope, `{"method": ..., "params": {...}}`, matching inspect 0.1.3.
+
 ## 0.20.149
 
 - Add `ck module resources` and `ck module profile <id> [--seconds N]` through

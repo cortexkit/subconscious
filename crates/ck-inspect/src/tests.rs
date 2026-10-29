@@ -86,8 +86,10 @@ fn service(
     )
 }
 fn request(seconds: u64) -> Vec<u8> {
-    serde_json::to_vec(&json!({"op":"module.profile", "module_id":"fixture", "seconds": seconds}))
-        .unwrap()
+    serde_json::to_vec(
+        &json!({"method":"module.profile", "params":{"module_id":"fixture", "seconds": seconds}}),
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -97,7 +99,7 @@ async fn resources_is_an_object_and_copies_only_observations_with_matching_pid()
     }));
     let (service, _) = service(vec![e.clone()], vec![vec![spawn(72, 3)]], true, false);
     let result = service
-        .query(br#"{"op":"module.resources"}"#)
+        .query(br#"{"method":"module.resources","params":{}}"#)
         .await
         .unwrap();
     assert!(result.is_object());
@@ -114,59 +116,75 @@ async fn resources_is_an_object_and_copies_only_observations_with_matching_pid()
     altered.spawn_generation = Some(4);
     let (service, _) = self::service(vec![altered], vec![vec![spawn(72, 3)]], true, false);
     let result = service
-        .query(br#"{"op":"module.resources"}"#)
+        .query(br#"{"method":"module.resources","params":{}}"#)
         .await
         .unwrap();
     assert!(result["modules"][0].get("pid").is_none());
 }
 
 #[test]
-fn whole_number_seconds_are_accepted_as_floats_and_each_refusal_names_its_field() {
+fn management_envelope_with_whole_number_seconds_parses_and_each_refusal_names_its_field() {
     let profile = |seconds| Request::Profile {
         module_id: "fixture".into(),
         seconds,
     };
     for (body, expected) in [
         (
-            &br#"{"op":"module.profile","module_id":"fixture","seconds":8}"#[..],
+            &br#"{"method":"module.profile","params":{"module_id":"fixture","seconds":8}}"#[..],
             profile(8),
         ),
         (
-            br#"{"op":"module.profile","module_id":"fixture","seconds":8.0}"#,
+            br#"{"method":"module.profile","params":{"module_id":"fixture","seconds":8.0}}"#,
             profile(8),
         ),
-        (br#"{"op":"module.resources"}"#, Request::Resources),
+        (
+            br#"{"method":"module.resources","params":{}}"#,
+            Request::Resources,
+        ),
+        (br#"{"method":"module.resources"}"#, Request::Resources),
     ] {
         assert_eq!(parse_request(body).unwrap(), expected);
     }
     for (body, reason) in [
         (&b"[1]"[..], "request body must be a JSON object"),
         (
-            br#"{"module_id":"fixture","seconds":8}"#,
-            "request needs an op string",
+            br#"{"op":"module.resources"}"#,
+            "request takes only method and params",
         ),
         (
-            br#"{"op":"module.top"}"#,
-            "unknown op; expected module.resources or module.profile",
+            br#"{"params":{"module_id":"fixture","seconds":8}}"#,
+            "request needs a method string",
         ),
         (
-            br#"{"op":"module.resources","x":1}"#,
-            "module.resources takes no fields besides op",
+            br#"{"method":"module.resources","params":[]}"#,
+            "params must be a JSON object",
         ),
         (
-            br#"{"op":"module.profile","seconds":8}"#,
+            br#"{"method":"module.top","params":{}}"#,
+            "unknown method; expected module.resources or module.profile",
+        ),
+        (
+            br#"{"method":"module.resources","params":{"x":1}}"#,
+            "module.resources takes no params",
+        ),
+        (
+            br#"{"method":"module.profile","params":{"seconds":8}}"#,
             "module_id must be a string",
         ),
         (
-            br#"{"op":"module.profile","module_id":"f","seconds":"8"}"#,
+            br#"{"method":"module.profile","params":{"module_id":"f","seconds":"8"}}"#,
             "seconds must be a whole number from 1 to 10",
         ),
         (
-            br#"{"op":"module.profile","module_id":"f","seconds":8.5}"#,
+            br#"{"method":"module.profile","params":{"module_id":"f","seconds":8.5}}"#,
             "seconds must be a whole number from 1 to 10",
         ),
+        (
+            br#"{"method":"module.profile","params":{"module_id":"f","seconds":1,"pid":1}}"#,
+            "module.profile params take only module_id and seconds",
+        ),
     ] {
-        let refusal = parse_request(body).unwrap_err();
+        let refusal = parse_request(body).expect_err(std::str::from_utf8(body).unwrap());
         assert_eq!((refusal.code, refusal.reason), ("invalid_request", reason));
     }
 }
@@ -177,9 +195,10 @@ async fn invalid_seconds_and_caller_pid_are_refused_without_sampling() {
     for body in [
         request(0),
         request(11),
-        br#"{"op":"module.profile","module_id":"fixture","seconds":1.5}"#.to_vec(),
-        br#"{"op":"module.profile","module_id":"fixture","seconds":-1}"#.to_vec(),
-        br#"{"op":"module.profile","module_id":"fixture","seconds":1,"pid":1}"#.to_vec(),
+        br#"{"method":"module.profile","params":{"module_id":"fixture","seconds":1.5}}"#.to_vec(),
+        br#"{"method":"module.profile","params":{"module_id":"fixture","seconds":-1}}"#.to_vec(),
+        br#"{"method":"module.profile","params":{"module_id":"fixture","seconds":1,"pid":1}}"#
+            .to_vec(),
     ] {
         assert_eq!(
             service.query(&body).await.unwrap_err().code,
@@ -251,7 +270,7 @@ async fn unavailable_daemon_refusal() {
     service.roster = Arc::new(MissingRoster);
     assert_eq!(
         service
-            .query(br#"{"op":"module.resources"}"#)
+            .query(br#"{"method":"module.resources","params":{}}"#)
             .await
             .unwrap_err()
             .code,

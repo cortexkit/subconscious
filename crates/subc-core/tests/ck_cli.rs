@@ -72,19 +72,19 @@ async fn inspect_queries_use_routes_print_full_values_and_version_ckni_json() {
     let cases = [
         (
             vec!["module", "resources"],
-            json!({"op":"module.resources"}),
+            json!({"method":"module.resources","params":{}}),
             json!({"modules":[{"module_id":"fixture","state":"running","pid":72,"spawn_generation":3,"resources":{"status":"unavailable","reason":"read_failed"}}]}),
             "ck.module.resources/v1",
         ),
         (
             vec!["module", "profile", "fixture", "--seconds", "7"],
-            json!({"op":"module.profile","module_id":"fixture","seconds":7}),
+            json!({"method":"module.profile","params":{"module_id":"fixture","seconds":7}}),
             json!({"module_id":"fixture","pid":72,"seconds":7,"method":"sample","threads":[{"name":long_name,"samples":90,"stacks":[{"count":45,"frames":["leaf","root"]}]}],"idle_threads":1,"truncated":true}),
             "ck.module.profile/v1",
         ),
         (
             vec!["module", "profile", "fixture"],
-            json!({"op":"module.profile","module_id":"fixture","seconds":1}),
+            json!({"method":"module.profile","params":{"module_id":"fixture","seconds":1}}),
             json!({"module_id":"fixture","pid":72,"seconds":1,"method":"proc_threads","threads":[{"name":long_name,"cpu_ms":900,"stacks":[]}],"idle_threads":1,"truncated":false}),
             "ck.module.profile/v1",
         ),

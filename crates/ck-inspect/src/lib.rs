@@ -65,32 +65,48 @@ enum Request {
 }
 
 /// Parse a request body by hand, so each refusal names what was wrong without
-/// echoing the caller's input. `seconds` accepts any JSON number with a whole
-/// value, because callers in JavaScript (flows through Basal) hold numbers as
-/// doubles and may send 8 as 8.0.
+/// echoing the caller's input. The body is the fleet's management envelope,
+/// `{"method": "<operation>", "params": {...}}`, which every management caller
+/// sends (flows through Basal, the phone, `ck`). `params` may be left out when
+/// the operation takes none. `seconds` accepts any JSON number with a whole
+/// value, because callers in JavaScript hold numbers as doubles and may send 8
+/// as 8.0.
 fn parse_request(body: &[u8]) -> Result<Request, Refusal> {
     let invalid = |reason| Refusal::new("invalid_request", reason);
     let value: Value =
         serde_json::from_slice(body).map_err(|_| invalid("request body is not JSON"))?;
-    let object = value
+    let envelope = value
         .as_object()
         .ok_or_else(|| invalid("request body must be a JSON object"))?;
-    let op = object
-        .get("op")
+    if !envelope
+        .keys()
+        .all(|key| key == "method" || key == "params")
+    {
+        return Err(invalid("request takes only method and params"));
+    }
+    let method = envelope
+        .get("method")
         .and_then(Value::as_str)
-        .ok_or_else(|| invalid("request needs an op string"))?;
+        .ok_or_else(|| invalid("request needs a method string"))?;
+    let empty = serde_json::Map::new();
+    let object = match envelope.get("params") {
+        None => &empty,
+        Some(params) => params
+            .as_object()
+            .ok_or_else(|| invalid("params must be a JSON object"))?,
+    };
     let only = |allowed: &[&str]| object.keys().all(|key| allowed.contains(&key.as_str()));
-    match op {
+    match method {
         "module.resources" => {
-            if !only(&["op"]) {
-                return Err(invalid("module.resources takes no fields besides op"));
+            if !object.is_empty() {
+                return Err(invalid("module.resources takes no params"));
             }
             Ok(Request::Resources)
         }
         "module.profile" => {
-            if !only(&["op", "module_id", "seconds"]) {
+            if !only(&["module_id", "seconds"]) {
                 return Err(invalid(
-                    "module.profile takes only op, module_id and seconds",
+                    "module.profile params take only module_id and seconds",
                 ));
             }
             let module_id = object
@@ -108,7 +124,7 @@ fn parse_request(body: &[u8]) -> Result<Request, Refusal> {
             })
         }
         _ => Err(invalid(
-            "unknown op; expected module.resources or module.profile",
+            "unknown method; expected module.resources or module.profile",
         )),
     }
 }

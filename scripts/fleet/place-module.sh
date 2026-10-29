@@ -71,7 +71,7 @@
 #   place-module.sh --module <id> --staged <path> [--dest <path>] [--path-face <name>]
 #                   --marker <string> [--control <string>] [--old-control <string>]
 #                   --tool-defs <unchanged|additive|unregistered|changed|none> [--host-restart-window]
-#                   [--no-restart]
+#                   [--no-restart [--reexec-safe]]
 #   place-module.sh --module <id> --rollback <stamp> [--dest <path>]
 #                   [--restore-store <path>] [--no-restart]
 #   place-module.sh --module <id> --staged <path> [--dest <path>] --marker <string> --install
@@ -87,7 +87,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; ALLOW_UNSTAMPED=0; INSTALL=0; ROLLBACK=""; RESTORE_STORE=""; TOOL_DEFS=""; HOST_RESTART_WINDOW=0
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; REEXEC_SAFE=0; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; ALLOW_UNSTAMPED=0; INSTALL=0; ROLLBACK=""; RESTORE_STORE=""; TOOL_DEFS=""; HOST_RESTART_WINDOW=0
 
 while (($# > 0)); do
   case "$1" in
@@ -128,6 +128,14 @@ while (($# > 0)); do
     --migrates) MIGRATES="$2"; shift 2 ;;
     --check-only) shift ;;  # now the default; accepted so older call sites keep working
     --no-restart) RESTART=0; shift ;;
+    # Some modules start helper processes by re-executing their own binary path
+    # while they run, and check that the helper is the same build. Swapping that
+    # binary without a restart makes every later helper start fail the check
+    # until the module restarts: on 2026-10-29 the harness refused every host
+    # launch with host_supervisor_version_skew for that reason. Such modules
+    # are listed in REEXECS_OWN_PATH below and refuse --no-restart unless the
+    # module's owner has confirmed the running build no longer reads that path.
+    --reexec-safe) REEXEC_SAFE=1; shift ;;
     # A FIRST INSTALL has no running binary to compare against, so the arms that
     # read the live image (signing posture against running, marker staged/live,
     # control, rollback snapshot) cannot run. --install replaces them with checks
@@ -152,6 +160,12 @@ while (($# > 0)); do
 done
 
 [ -n "$MODULE" ] || { echo "REFUSED: --module is required" >&2; exit 2; }
+REEXECS_OWN_PATH="thalamus-harness"
+if [ "$RESTART" -eq 0 ] && [ "$INSTALL" -eq 0 ] && [ "$REEXEC_SAFE" -eq 0 ]; then
+  for m in $REEXECS_OWN_PATH; do
+    [ "$m" != "$MODULE" ] || { echo "REFUSED: --no-restart: $MODULE re-executes its own binary path while it runs, so a swapped binary breaks its helper starts until it restarts; place with a restart, or pass --reexec-safe once its owner confirms the running build pins its own executable" >&2; exit 2; }
+  done
+fi
 if [ -n "$ROLLBACK" ]; then
   [[ "$ROLLBACK" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || { echo "REFUSED: --rollback must be a UTC stamp in YYYYMMDDTHHMMSSZ form" >&2; exit 2; }
   [ "$INSTALL" -eq 0 ] || { echo "REFUSED: --rollback cannot be combined with --install" >&2; exit 2; }

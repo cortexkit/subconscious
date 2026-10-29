@@ -163,8 +163,10 @@ done
 
 [ -n "$MODULE" ] || { echo "REFUSED: --module is required" >&2; exit 2; }
 # aft re-executes current_exe() for sandboxed shell commands and its GitHub CLI
-# wrapper on macOS and Linux.
-REEXECS_OWN_PATH="aft"
+# wrapper on macOS and Linux. cerebellum re-executes current_exe() on macOS to
+# start its agent-cursor helper, whose line protocol with the module is strict,
+# so a helper from a swapped binary can't talk to the running module.
+REEXECS_OWN_PATH="aft cerebellum"
 if [ "$RESTART" -eq 0 ] && [ "$INSTALL" -eq 0 ] && [ "$REEXEC_SAFE" -eq 0 ]; then
   for m in $REEXECS_OWN_PATH; do
     [ "$m" != "$MODULE" ] || { echo "REFUSED: --no-restart: $MODULE re-executes its own binary path while it runs, so a swapped binary breaks its helper starts until it restarts; place with a restart, or pass --reexec-safe once its owner confirms the running build pins its own executable" >&2; exit 2; }

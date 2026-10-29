@@ -349,12 +349,17 @@ impl ModuleHandler for Inspect {
     }
     async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         match self.query(&body).await {
-            Ok(value) => {
-                HandlerOutcome::Response(serde_json::to_vec(&value).expect("query result is JSON"))
-            }
+            Ok(value) => HandlerOutcome::Response(result_envelope(&value)),
             Err(error) => error.outcome(),
         }
     }
+}
+
+/// A successful management reply is `{"result": <value>}`, the envelope every
+/// management caller unwraps (Basal refuses a reply without it as unreadable).
+/// Refusals go out as Error frames instead, carrying their code and reason.
+fn result_envelope(value: &Value) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({ "result": value })).expect("query result is JSON")
 }
 
 pub fn manifest() -> ModuleManifest {

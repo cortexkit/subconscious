@@ -23,7 +23,9 @@ not relay arbitrary control operations.
 ## Queries and CLI
 
 `ck module resources` sends `{"method":"module.resources","params":{}}` over a management route
-to `inspect`. The reply is always an object:
+to `inspect`. A successful reply is the standard management envelope,
+`{"result": <value>}`, and a refusal is an Error frame carrying its code and
+reason. The resources value is always an object:
 
 ```json
 {"modules":[{"module_id":"worker","state":"running","spawn_generation":3,"pid":123,"resources":{"status":"measured","memory_bytes":4096,"memory_kind":"resident_set","cpu_user_ms":100,"cpu_system_ms":20}}]}
@@ -36,14 +38,15 @@ entry; a mismatch omits PID rather than pairing unrelated observations.
 
 `ck module profile <id> [--seconds N]` sends
 `{"method":"module.profile","params":{"module_id":"worker","seconds":1}}`. The default CLI
-window is one second. The reply shape is:
+window is one second. The profile value, inside `{"result": ...}`, is:
 
 ```json
 {"module_id":"worker","pid":123,"seconds":1,"method":"sample","threads":[{"name":"worker","samples":90,"stacks":[{"count":50,"frames":["work","main"]}]}],"idle_threads":2,"truncated":false}
 ```
 
 `method` is an open string. New public Rust result structs are non-exhaustive and
-have constructors. `--json` prints raw module JSON; `ckni --json` adds the
+have constructors. The whole reply, envelope included, stays within 16 KiB.
+`--json` prints the value inside `result`; `ckni --json` adds the
 `ck.module.resources/v1` or `ck.module.profile/v1` schema. Plain output prints all
 values from the bounded result. Missing or stopped `inspect` is a one-line CLI
 refusal (exit 1) pointing to `ck setup` or daemon config. This workspace does not

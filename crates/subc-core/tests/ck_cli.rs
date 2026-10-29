@@ -59,7 +59,9 @@ impl subc_client_rs::ModuleHandler for InspectReply {
             serde_json::from_slice::<Value>(&body).unwrap(),
             self.expected
         );
-        subc_client_rs::HandlerOutcome::Response(serde_json::to_vec(&self.reply).unwrap())
+        subc_client_rs::HandlerOutcome::Response(
+            serde_json::to_vec(&json!({ "result": self.reply })).unwrap(),
+        )
     }
 }
 

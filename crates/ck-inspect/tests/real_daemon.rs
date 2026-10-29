@@ -131,7 +131,8 @@ async fn routed_resources_and_profile_observe_supervised_process_and_exit_on_eof
         )
         .await
         .unwrap();
-    let resources: Value = serde_json::from_slice(&resources).unwrap();
+    let mut resources: Value = serde_json::from_slice(&resources).unwrap();
+    let resources = resources["result"].take();
     assert!(resources.is_object());
     let load = resources["modules"]
         .as_array()
@@ -154,7 +155,8 @@ async fn routed_resources_and_profile_observe_supervised_process_and_exit_on_eof
         .await
         .unwrap();
     assert!(result.len() <= 16 * 1024);
-    let profile: Value = serde_json::from_slice(&result).unwrap();
+    let mut profile: Value = serde_json::from_slice(&result).unwrap();
+    let profile = profile["result"].take();
     assert_eq!(profile["pid"], load["pid"]);
     let threads = profile["threads"].as_array().unwrap();
     #[cfg(target_os = "macos")]

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.4
+
+- Wrap successful replies in the standard management envelope, `{"result": <value>}`. 0.1.3 returned the bare value, which management callers such as flows through Basal refuse as unreadable. Refusals still go out as Error frames. The profile is trimmed so the whole reply, envelope included, stays within 16 KiB.
+
 ## 0.1.3
 
 - Read requests in the fleet's management envelope, `{"method": "<operation>", "params": {...}}`, which flows through Basal, the phone and other management callers send. 0.1.2 and earlier expected `{"op": ...}` with fields at the top level, so every routed caller except `ck` was refused. `params` may be omitted for `module.resources`. `ck module resources` and `ck module profile` now send the same envelope.

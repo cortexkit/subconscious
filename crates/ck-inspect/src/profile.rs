@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
 
+/// The whole profile reply stays within 16 KiB. The profile itself gets that
+/// budget less the `{"result":...}` envelope the module wraps it in.
+pub(crate) const PROFILE_BUDGET: usize = 16 * 1024 - br#"{"result":}"#.len();
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Profile {
@@ -26,7 +30,7 @@ impl Profile {
     }
 
     pub(crate) fn cap(&mut self) -> Result<(), &'static str> {
-        while serde_json::to_vec(self).expect("profile is JSON").len() > 16 * 1024 {
+        while serde_json::to_vec(self).expect("profile is JSON").len() > PROFILE_BUDGET {
             self.truncated = true;
             // Keep the heaviest threads and stacks when symbol names fill the budget.
             if let Some(thread) = self.threads.last_mut() {

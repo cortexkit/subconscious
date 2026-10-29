@@ -428,3 +428,18 @@ fn every_refusal_is_terminal_with_detail() {
         assert_eq!(detail["class"], "terminal");
     }
 }
+
+#[test]
+fn successful_replies_use_the_management_result_envelope_within_16_kib() {
+    let reply: Value = serde_json::from_slice(&result_envelope(&json!({"modules": []}))).unwrap();
+    assert_eq!(reply, json!({"result": {"modules": []}}));
+    let mut profile = Profile::new("fixture".into(), 1, 1, "sample".into());
+    let mut thread = Thread::new("x".repeat(64));
+    thread.stacks = (0..2000)
+        .map(|count| Stack::new(count, vec!["frame".repeat(8)]))
+        .collect();
+    profile.threads.push(thread);
+    profile.cap().unwrap();
+    let whole = result_envelope(&serde_json::to_value(&profile).unwrap());
+    assert!(whole.len() <= 16 * 1024, "{}", whole.len());
+}

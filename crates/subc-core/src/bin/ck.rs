@@ -1908,12 +1908,21 @@ async fn module_inspect(
             _ => error,
         }
     })?;
-    let seconds = body.get("seconds").and_then(Value::as_u64).unwrap_or(0);
+    let seconds = body["params"]
+        .get("seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let result = client
         .route_request_value_with_timeout(route, body, Duration::from_secs(seconds + 10))
         .await;
     client.route_goodbye(route).await;
-    let value = result?;
+    // A successful management reply is `{"result": <value>}`.
+    let value = match result? {
+        Value::Object(mut reply) => reply
+            .remove("result")
+            .ok_or_else(|| CkError::Message("unexpected reply from inspect".into()))?,
+        _ => return Err(CkError::Message("unexpected reply from inspect".into())),
+    };
     if json_output.enabled {
         return json_output.print(&value);
     }

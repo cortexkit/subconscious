@@ -135,6 +135,8 @@ while (($# > 0)); do
     # launch with host_supervisor_version_skew for that reason. Such modules
     # are listed in REEXECS_OWN_PATH below and refuse --no-restart unless the
     # module's owner has confirmed the running build no longer reads that path.
+    # A module comes off the list once a build that pins its own executable is
+    # running everywhere: the harness did so from 2026-10-29.
     --reexec-safe) REEXEC_SAFE=1; shift ;;
     # A FIRST INSTALL has no running binary to compare against, so the arms that
     # read the live image (signing posture against running, marker staged/live,
@@ -160,7 +162,9 @@ while (($# > 0)); do
 done
 
 [ -n "$MODULE" ] || { echo "REFUSED: --module is required" >&2; exit 2; }
-REEXECS_OWN_PATH="thalamus-harness"
+# aft re-executes current_exe() for sandboxed shell commands and its GitHub CLI
+# wrapper on macOS and Linux.
+REEXECS_OWN_PATH="aft"
 if [ "$RESTART" -eq 0 ] && [ "$INSTALL" -eq 0 ] && [ "$REEXEC_SAFE" -eq 0 ]; then
   for m in $REEXECS_OWN_PATH; do
     [ "$m" != "$MODULE" ] || { echo "REFUSED: --no-restart: $MODULE re-executes its own binary path while it runs, so a swapped binary breaks its helper starts until it restarts; place with a restart, or pass --reexec-safe once its owner confirms the running build pins its own executable" >&2; exit 2; }

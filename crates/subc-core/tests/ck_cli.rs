@@ -5168,6 +5168,31 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     } else {
         assert_eq!(resources, "unavailable (unsupported platform)");
     }
+    let (subtree, rest) = rest
+        .strip_prefix("  memory including child processes: ")
+        .expect("status labels memory including child processes separately")
+        .split_once('\n')
+        .expect("subtree reading is followed by more status");
+    if cfg!(windows) {
+        assert!(subtree.ends_with("[source: process_sum]"), "{subtree:?}");
+        assert!(subtree.contains(" processes"), "{subtree:?}");
+        assert!(
+            !subtree.contains("swap"),
+            "Windows does not report swap: {subtree:?}"
+        );
+        assert_eq!(status_json["module"]["subtree"]["source"], "process_sum");
+    } else {
+        let reason = if cfg!(target_os = "linux") {
+            "no_cgroup"
+        } else {
+            "unsupported_platform"
+        };
+        assert_eq!(
+            subtree,
+            format!("unavailable ({reason}) [source: unavailable]")
+        );
+        assert_eq!(status_json["module"]["subtree"]["reason"], reason);
+    }
     let rest = format!("{policy}\n{rest}");
     // The budget renders with the window it is counted over (`in 10m`), because
     // the count alone reads as a lifetime total and stopped being one.

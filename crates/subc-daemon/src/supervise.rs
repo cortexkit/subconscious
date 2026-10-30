@@ -309,6 +309,7 @@ fn privacy_command(
 }
 
 struct SupervisedChild {
+    subtree_target: crate::subtree_resources::Target,
     child: Child,
     exec: crate::activity::ExecOwner,
     #[cfg(windows)]
@@ -362,7 +363,7 @@ struct SupervisedChild {
     /// exits, the twin of the Unix SIGTERM handler. Once it exists, this limit
     /// reaches only what the drain left behind, which is what it should reach.
     #[cfg(windows)]
-    job: Option<subc_jobobject::JobObject>,
+    job: Option<Arc<Mutex<subc_jobobject::JobObject>>>,
     stdout_pump: Option<JoinHandle<()>>,
     stderr_pump: Option<StderrPump>,
     stderr_ring: Arc<Mutex<StderrRing>>,
@@ -598,7 +599,7 @@ impl SupervisedChild {
     fn start_kill(&mut self) -> io::Result<()> {
         #[cfg(windows)]
         if let Some(job) = &self.job {
-            if let Err(error) = job.terminate() {
+            if let Err(error) = job.lock().unwrap_or_else(|p| p.into_inner()).terminate() {
                 debug!(
                     error = %error,
                     "job termination failed; the direct-child kill still owns the outcome"
@@ -1244,6 +1245,7 @@ struct ActorSelectCheckpoint {
 
 #[derive(Debug, Clone, PartialEq)]
 struct SupervisorSnapshot {
+    subtree_target: crate::subtree_resources::Target,
     failed_retry: FailedRetry,
     exec_outcome: Option<Arc<crate::activity::ExecOutcome>>,
     #[cfg(windows)]
@@ -1398,6 +1400,7 @@ impl SupervisorSnapshot {
 
     fn new(state: ModuleState, enabled: bool) -> Self {
         Self {
+            subtree_target: crate::subtree_resources::Target::Unavailable("not_running"),
             failed_retry: FailedRetry::default(),
             exec_outcome: None,
             #[cfg(test)]
@@ -3960,6 +3963,19 @@ impl SupervisedModule {
             };
             crate::child_resources::read(pid, start_time)
         }
+    }
+
+    pub(crate) fn subtree_target(&self) -> crate::subtree_resources::Target {
+        self.inner
+            .snapshot
+            .try_lock()
+            .map(|snapshot| snapshot.subtree_target.clone())
+            .unwrap_or(crate::subtree_resources::Target::Unavailable("read_failed"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_subtree_target_for_test(&self, target: crate::subtree_resources::Target) {
+        self.inner.snapshot.lock().unwrap().subtree_target = target;
     }
 
     pub(crate) fn will_recover_after_connection_loss(&self) -> Result<bool, SuperviseError> {
@@ -9257,7 +9273,21 @@ fn spawn_child_in_slot(
     if !pending_exec {
         exec.finish(crate::activity::ExecState::CommittedExec);
     }
+    #[cfg(windows)]
+    let job = job.map(|job| Arc::new(Mutex::new(job)));
+    #[cfg(windows)]
+    let subtree_target = job
+        .as_ref()
+        .map(|job| crate::subtree_resources::Target::Job(Arc::downgrade(job)))
+        .unwrap_or(crate::subtree_resources::Target::Unavailable("no_job"));
+    #[cfg(target_os = "linux")]
+    let subtree_target = cgroup_path
+        .map(crate::subtree_resources::Target::Cgroup)
+        .unwrap_or(crate::subtree_resources::Target::Unavailable("no_cgroup"));
+    #[cfg(not(any(target_os = "linux", windows)))]
+    let subtree_target = crate::subtree_resources::Target::Unavailable("unsupported_platform");
     Ok(SupervisedChild {
+        subtree_target,
         child,
         exec: crate::activity::ExecOwner(exec),
         #[cfg(windows)]
@@ -11914,6 +11944,7 @@ fn set_running(
     state.enabled = true;
     state.process_alive = true;
     state.pid = child.id();
+    state.subtree_target = child.subtree_target.clone();
     // Probe samples belong to one process. Keep module-level escalation and
     // late-answer history, but never charge a new child for its predecessor's misses.
     state.health.status = SupervisorHealthStatus::Unknown;
@@ -11945,6 +11976,7 @@ fn set_running(
 }
 
 fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
+    state.subtree_target = crate::subtree_resources::Target::Unavailable("not_running");
     state.failed_retry.healthy_since = None;
     state.failed_retry.running_since = None;
     state.waiting_for_previous_pid = None;
@@ -16612,6 +16644,7 @@ mod cgroup_placement_tests {
             .expect("spawn short-lived child");
         let pid = child.id().expect("spawned child has pid");
         let mut child = SupervisedChild {
+            subtree_target: crate::subtree_resources::Target::Unavailable("not_running"),
             child,
             exec: crate::activity::ExecOwner(Arc::new(crate::activity::ExecOutcome::new())),
             protocol: ModuleProtocol::Subc,
@@ -17759,6 +17792,76 @@ mod cgroup_reap_tests;
 mod cgroup_containment_tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
+
+    #[tokio::test]
+    async fn linux_subtree_memory_covers_module_children() {
+        let dir = ScratchDir::new("subtree-memory");
+        let root = PathBuf::from(format!(
+            "/sys/fs/cgroup/subc-memory-test-{}-{}",
+            std::process::id(),
+            unix_ms_now()
+        ));
+        if let Err(error) = std::fs::create_dir(&root) {
+            assert!(
+                std::env::var_os("SUBC_REQUIRE_CGROUP_TEST").is_none(),
+                "required cgroup test cannot execute: {error}"
+            );
+            eprintln!("SKIP linux_subtree_memory_covers_module_children: {error}");
+            return;
+        }
+        let placement = subc_cgroup::prepare_at(&root)
+            .unwrap()
+            .expect("delegated cgroup");
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(3, Duration::ZERO),
+        )
+        .with_cgroup_placement(Some(placement));
+        let ready = dir.join("ready");
+        let module = supervisor
+            .spawn(ModuleSpec {
+                module_id: "memory-tree".into(),
+                program: PathBuf::from("/bin/sh"),
+                args: vec![
+                    "-c".into(),
+                    "sleep 600 & sleep 600 & sleep 600 & echo ready > \"$1\"; wait".into(),
+                    "fixture".into(),
+                    ready.display().to_string(),
+                ],
+                env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                    .into_iter()
+                    .map(|key| (key.into(), dir.display().to_string()))
+                    .collect(),
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::None,
+                overlap: Default::default(),
+            })
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "children never started"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let readings = crate::subtree_resources::read(vec![module.subtree_target()]).await;
+        let reading = &readings[0];
+        assert!(
+            reading.process_count.is_some_and(|count| count >= 4),
+            "{reading:?}"
+        );
+        assert!(
+            reading.memory_bytes.is_some_and(|bytes| bytes > 0),
+            "{reading:?}"
+        );
+        module.stop().await.unwrap();
+        drop(module);
+        std::fs::remove_dir(root.join("subc-modules")).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        eprintln!("EXECUTED linux_subtree_memory_covers_module_children: {reading:?}");
+    }
 
     fn running(pid: u32) -> bool {
         // An orphan can remain a zombie until the container init reaps it.

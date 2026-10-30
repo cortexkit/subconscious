@@ -62,7 +62,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub use sys::{JobObject, CONTAINMENT_CREATION_FLAGS, CREATE_SUSPENDED_FLAG};
+pub use sys::{
+    JobMemory, JobMemoryError, JobObject, JobQuery, CONTAINMENT_CREATION_FLAGS,
+    CREATE_SUSPENDED_FLAG,
+};
 
 /// Install process-lifetime containment before creating any module.
 ///

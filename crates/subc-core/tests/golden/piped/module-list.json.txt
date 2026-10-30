@@ -44,7 +44,11 @@ exit: Some(0)
       "restart_max_backoff_ms": 30000,
       "restart_window_secs": 600,
       "spawn_generation": 1,
-      "state": "running"
+      "state": "running",
+      "subtree": {
+        "reason": "no_cgroup",
+        "source": "unavailable"
+      }
     }
   ],
   "op": "supervisor.list"

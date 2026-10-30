@@ -6651,6 +6651,10 @@ fn print_status_table(
         );
     }
     println!("  resources: {}", format_child_resources(module));
+    println!(
+        "  memory including child processes: {}",
+        format_subtree_memory(module)
+    );
     println!("  last exit: {}", format_last_exit(module));
     println!(
         "  {}",
@@ -7004,6 +7008,43 @@ fn format_child_resources(module: &Value) -> String {
         Some(other) => format!("unknown ({})", terminal_safe_string(other)),
         None => "unknown (missing status)".to_string(),
     }
+}
+
+fn format_subtree_memory(module: &Value) -> String {
+    let Some(reading) = module.get("subtree") else {
+        return "not reported by this daemon".into();
+    };
+    let source = reading
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let source_label = terminal_safe_string(source);
+    let count = reading
+        .get("process_count")
+        .and_then(Value::as_u64)
+        .map(|count| format!(" · {count} processes"))
+        .unwrap_or_default();
+    if source == "unavailable" {
+        let reason = reading
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("reason unavailable");
+        return format!(
+            "unavailable ({}){count} [source: {source_label}]",
+            terminal_safe_string(reason)
+        );
+    }
+    let memory = reading
+        .get("memory_bytes")
+        .and_then(Value::as_u64)
+        .map(format_bytes)
+        .unwrap_or_else(|| "unknown".into());
+    let swap = reading
+        .get("swap_bytes")
+        .and_then(Value::as_u64)
+        .map(|bytes| format!(", swap {}", format_bytes(bytes)))
+        .unwrap_or_default();
+    format!("{memory}{swap}{count} [source: {source_label}]")
 }
 
 /// The memory column of `ck module list --verbose`: the figure alone, `n/a`
@@ -10065,6 +10106,34 @@ mod tests {
         assert!(rendered.contains(r#"\u001b"#));
         assert!(rendered.contains(r#"\u0007"#));
         assert!(!rendered.bytes().any(|byte| byte < 0x20));
+    }
+
+    #[test]
+    fn subtree_memory_status_labels_source_and_counts_children() {
+        let module = serde_json::json!({"subtree": {
+            "source": "process_sum", "memory_bytes": 2_097_152,
+            "swap_bytes": 1024, "process_count": 35
+        }});
+        assert_eq!(
+            format_subtree_memory(&module),
+            "2.0 MiB, swap 1.0 KiB · 35 processes [source: process_sum]"
+        );
+        assert_eq!(
+            format_subtree_memory(
+                &serde_json::json!({"subtree": {"source":"unavailable","reason":"timeout"}})
+            ),
+            "unavailable (timeout) [source: unavailable]"
+        );
+        assert_eq!(
+            format_subtree_memory(&serde_json::json!({"subtree": {
+                "source":"unavailable", "reason":"timeout", "process_count":35
+            }})),
+            "unavailable (timeout) · 35 processes [source: unavailable]"
+        );
+        assert_eq!(
+            format_subtree_memory(&serde_json::json!({})),
+            "not reported by this daemon"
+        );
     }
 
     #[test]

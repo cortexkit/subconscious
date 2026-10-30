@@ -16,6 +16,9 @@ use name::module_directory_name;
 mod freeze;
 pub use freeze::{freeze_module, FreezeOutcome, FrozenModule, ProcsOutcome, ThawOutcome};
 
+mod memory;
+pub use memory::{read_memory, read_memory_counted, MemoryReadError, MemoryReading, MemorySource};
+
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const MODULES_DIR: &str = "subc-modules";
 static PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);

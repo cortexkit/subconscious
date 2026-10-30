@@ -46,7 +46,7 @@ use subc_protocol::{
     Priority, RouteTarget, PROTOCOL_VERSION,
 };
 use tokio::time::{timeout_at, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument::WithSubscriber, warn};
 
 use crate::{
     caller_identity::CallerIdentity,
@@ -3149,7 +3149,31 @@ impl ControlHandler {
                 route_epoch,
                 kind,
             } => self.handle_route_poll(ctx, frame, route_channel, route_epoch, kind),
-            ClientControlRequest::SupervisorList {} => self.handle_supervisor_list(frame).await,
+            ClientControlRequest::SupervisorList {} => {
+                // Filesystem-backed diagnostics must not hold up this connection's reader.
+                let handler = self.clone();
+                let sink = ctx.egress.clone();
+                tokio::spawn(
+                    async move {
+                        let result = handler.handle_supervisor_list(frame.clone()).await;
+                        let replies = match result {
+                            Ok(replies) => replies,
+                            Err(error) => {
+                                control_error_frame(&frame, "backend_error", error.to_string())
+                                    .into_iter()
+                                    .collect()
+                            }
+                        };
+                        for reply in replies {
+                            if sink.send(reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    .with_current_subscriber(),
+                );
+                Ok(Vec::new())
+            }
             ClientControlRequest::SupervisorSpawnSnapshot {} => {
                 self.handle_supervisor_spawn_snapshot(frame)
             }
@@ -5838,8 +5862,14 @@ impl ControlHandler {
             .registry
             .generation()
             .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let supervised = self.supervisor.list();
+        let targets = supervised
+            .iter()
+            .map(|module| module.subtree_target())
+            .collect();
+        let subtree = tokio::spawn(crate::subtree_resources::read(targets));
         let mut modules = Vec::new();
-        for module in self.supervisor.list() {
+        for module in supervised {
             let status = module.status_for_control("list").map_err(|err| {
                 RouterError::backend(
                     0,
@@ -5865,7 +5895,7 @@ impl ControlHandler {
             let image = module.running_image_agreement().await;
             // Read per request so the figure is current when the operator asks;
             // the daemon samples nothing in between.
-            let resources = Some(module.child_resource_usage());
+            let resources = Some(crate::subtree_resources::read_process(module.clone()).await);
             let mut verdict =
                 reload_verdict(&configured.program, status.spawned_from.as_deref(), image);
             verdict.spec = Some(launch_spec_agreement(
@@ -5909,6 +5939,15 @@ impl ControlHandler {
                 .with_restart_max_backoff_ms(Some(status.restart_max_backoff.as_millis() as u64))
                 .with_resources(resources),
             );
+        }
+        let readings = subtree
+            .await
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        for (module, reading) in modules.iter_mut().zip(readings) {
+            if reading.reason.as_deref() == Some("timeout") {
+                crate::subtree_resources::log_timeout(&module.module_id, "subtree");
+            }
+            module.subtree = Some(reading);
         }
         let response = ClientControlResponse::SupervisorList {
             generation,
@@ -13636,6 +13675,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slow_step_before_pid_read_does_not_spend_its_budget() {
+        let _guard = crate::subtree_resources::fault_read_guard().await;
+        let dir = cortexkit_test_support::ScratchDir::new("pid-read-budget");
+        let supervisor =
+            Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
+        let module = supervisor
+            .spawn(crate::ModuleSpec {
+                module_id: "pid-read-budget".into(),
+                program: std::env::current_exe().unwrap(),
+                args: vec![
+                    "--exact".into(),
+                    "control::tests::pid_resource_read_fixture".into(),
+                ],
+                env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                    .into_iter()
+                    .map(|key| (key.into(), dir.display().to_string()))
+                    .chain(std::iter::once((
+                        "SUBC_SUBTREE_PID_FIXTURE".into(),
+                        "1".into(),
+                    )))
+                    .collect(),
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::None,
+                overlap: Default::default(),
+            })
+            .unwrap();
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !matches!(
+            module.child_resource_usage(),
+            subc_control::ChildResourceUsage::Measured(_)
+        ) {
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "fixture process was not measurable"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(crate::subtree_resources::READ_TIMEOUT * 2).await;
+        let reading = crate::subtree_resources::read_process(module.clone()).await;
+        module.stop().await.unwrap();
+        assert!(
+            matches!(reading, subc_control::ChildResourceUsage::Measured(_)),
+            "{reading:?}"
+        );
+    }
+
+    #[test]
+    fn pid_resource_read_fixture() {
+        if std::env::var_os("SUBC_SUBTREE_PID_FIXTURE").is_some() {
+            loop {
+                std::thread::park_timeout(Duration::from_secs(600));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_list_slow_subtree_does_not_hold_connection_reader() {
+        let _guard = crate::subtree_resources::fault_read_guard().await;
+        let registry = Arc::new(Registry::default());
+        let handle = SupervisorHandle::new();
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone());
+        let module = supervisor
+            .supervise_configured(
+                crate::ModuleSpec {
+                    module_id: "memory-read".into(),
+                    program: PathBuf::from("disabled-module"),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    reserved: false,
+                    reserved_prefixes: Vec::new(),
+                    protocol: ModuleProtocol::Subc,
+                    overlap: Default::default(),
+                },
+                false,
+            )
+            .unwrap();
+        let (target, release, began) = crate::subtree_resources::held();
+        module.set_subtree_target_for_test(target);
+        let handler = ControlHandler::new(registry).with_supervisor(handle);
+        let (ctx, mut rx) = route_ctx(ConnectionId::new(112));
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+        let replies = handler
+            .handle_client_control_request(
+                &ctx,
+                frame,
+                ClientControlRequest::SupervisorList {},
+                &mut None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            replies.is_empty(),
+            "list reply must be detached from the connection reader"
+        );
+        began.await.unwrap();
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 2, Vec::new()).unwrap();
+        let replies = handler
+            .handle_client_control_request(
+                &ctx,
+                frame,
+                ClientControlRequest::SupervisorSpawnSnapshot {},
+                &mut None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            replies.len(),
+            1,
+            "another request must complete while the subtree read stalls"
+        );
+        let reply = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        release.send(()).unwrap();
+        drop(release);
+        let body: Value = serde_json::from_slice(&reply.frame.body).unwrap();
+        assert_eq!(body["modules"][0]["subtree"]["source"], "unavailable");
+        assert_eq!(body["modules"][0]["subtree"]["reason"], "timeout");
+        assert_eq!(
+            body["modules"][0]["subtree"]["process_count"], 1,
+            "a count obtained before the stalled read must survive timeout"
+        );
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 3, Vec::new()).unwrap();
+        let replies = handler.handle_supervisor_list(frame).await.unwrap();
+        let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
+        assert_eq!(
+            body["modules"][0]["subtree"]["source"], "process_sum",
+            "the next request must read afresh"
+        );
+    }
+
+    #[tokio::test]
     async fn supervisor_list_reports_loaded_config_and_omits_unconfigured() {
         let registry = Arc::new(Registry::default());
         let handle = SupervisorHandle::new();
@@ -13679,6 +13853,8 @@ mod tests {
                 body["modules"][0].get("configured_enabled"),
                 configured.map(Value::Bool).as_ref()
             );
+            assert_eq!(body["modules"][0]["subtree"]["source"], "unavailable");
+            assert_eq!(body["modules"][0]["subtree"]["reason"], "not_running");
         }
     }
 

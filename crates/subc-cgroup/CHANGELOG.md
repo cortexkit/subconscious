@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.8
+
+- Read memory charged to a module cgroup (`memory.current`), or, only when that file doesn't exist, sum resident and swapped memory across its processes and child cgroups. A malformed value or other read error fails the reading rather than falling back. Reads accept a deadline and never change controller settings.
+- In a process sum, count a zombie's absent memory fields as zero while it still counts as a process, and skip and uncount a PID whose status read finds it gone. Cgroup memory is kept when swap accounting is absent. Present malformed counters and other read errors still fail the reading.
+
 ## 0.1.7
 
 - Add a bounded module-subtree freeze with typed outcomes, a frozen guard that

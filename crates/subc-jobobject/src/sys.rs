@@ -9,23 +9,37 @@
 
 #![allow(unsafe_code)]
 
-use std::{io, mem::size_of, os::windows::process::CommandExt, process::Command};
+use std::{
+    io,
+    mem::size_of,
+    os::windows::{
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        process::CommandExt,
+    },
+    process::Command,
+    time::Instant,
+};
 
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
+    Foundation::{
+        CloseHandle, DuplicateHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    },
     System::{
         Diagnostics::ToolHelp::{
             CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
         },
         JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectBasicProcessIdList,
-            JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-            TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+            JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
+            QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+            JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         },
+        ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
         Threading::{
-            GetCurrentProcess, OpenProcess, OpenThread, ResumeThread, WaitForSingleObject,
-            CREATE_NO_WINDOW, CREATE_SUSPENDED, PROCESS_SYNCHRONIZE, THREAD_SUSPEND_RESUME,
+            GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenThread, ResumeThread,
+            WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, THREAD_SUSPEND_RESUME,
         },
     },
 };
@@ -56,7 +70,10 @@ const ERROR_NO_MORE_FILES: u32 = 18;
 /// enumerate reports this while still filling in the assigned count.
 const ERROR_MORE_DATA: u32 = 234;
 
-/// How many pids one [`job_process_count`] query can enumerate.
+// JOB_OBJECT_QUERY from winnt.h; windows-sys does not expose this access mask.
+const JOB_OBJECT_QUERY: u32 = 0x0004;
+
+/// How many pids one [`JobObject::process_count`] query can enumerate.
 ///
 /// The count of *assigned* processes is reported by the kernel regardless of what
 /// the buffer can hold; only the enumerated subset is bounded. Far past any
@@ -90,6 +107,32 @@ pub struct JobObject {
 unsafe impl Send for JobObject {}
 
 impl JobObject {
+    /// Duplicate only query access, for report-only reads. The handle stays
+    /// open until the returned `JobQuery` is dropped.
+    pub fn query(&self) -> io::Result<JobQuery> {
+        let mut handle = std::ptr::null_mut();
+        // SAFETY: the source handle is owned and live, both process arguments
+        // are this process, and `handle` is a valid output slot. No mutation
+        // rights or inheritance are granted to the duplicate.
+        if unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                self.handle,
+                GetCurrentProcess(),
+                &mut handle,
+                JOB_OBJECT_QUERY,
+                0,
+                0,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: DuplicateHandle returned a new owned handle.
+        Ok(JobQuery {
+            handle: unsafe { OwnedHandle::from_raw_handle(handle) },
+        })
+    }
     /// Contain this process and all subsequently created children, including
     /// suspended children not yet assigned to a narrower per-module job.
     pub(crate) fn assign_current_process(&self) -> io::Result<()> {
@@ -195,11 +238,201 @@ impl JobObject {
 
 impl Drop for JobObject {
     fn drop(&mut self) {
+        // These owners are created with KILL_ON_JOB_CLOSE. A query duplicate
+        // must not defer the owner's teardown until the last reader closes.
+        // Zero preserves the kernel's kill-on-close process exit status.
+        unsafe { TerminateJobObject(self.handle, 0) };
         // Close-on-drop is the crash-durability guarantee, not merely cleanup: if
         // the daemon is killed, this handle closes with it and the kernel reaps
         // the tree that no supervisor code is left alive to kill.
         unsafe { CloseHandle(self.handle) };
     }
+}
+
+/// A query-only duplicate of a job handle, closed when this value is dropped.
+#[derive(Debug)]
+pub struct JobQuery {
+    handle: OwnedHandle,
+}
+
+/// Working sets of confirmed live job members; Windows swap is not reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct JobMemory {
+    pub memory_bytes: u64,
+    pub process_count: u64,
+}
+
+/// A failed job reading retains the number of live processes already counted.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct JobMemoryError {
+    pub error: io::Error,
+    pub process_count: Option<u64>,
+}
+
+impl std::fmt::Display for JobMemoryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for JobMemoryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl JobQuery {
+    fn check(deadline: Instant) -> io::Result<()> {
+        if Instant::now() >= deadline {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "job memory deadline",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn members(&self, deadline: Instant) -> io::Result<Vec<usize>> {
+        let header = 8 / size_of::<usize>();
+        let mut capacity = PROCESS_ID_LIST_WIDTH;
+        for _ in 0..3 {
+            Self::check(deadline)?;
+            if capacity > 1_000_000 {
+                break;
+            }
+            let mut buffer = vec![0_usize; header + capacity];
+            // SAFETY: the usize allocation has the alignment of the variable
+            // PID array and space for both DWORD counts and every PID.
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.handle.as_raw_handle(),
+                    JobObjectBasicProcessIdList,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * size_of::<usize>()) as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            let list = buffer.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
+            // SAFETY: both fixed header fields fit even in an empty PID list.
+            let (assigned, listed) = unsafe {
+                (
+                    (*list).NumberOfAssignedProcesses as usize,
+                    (*list).NumberOfProcessIdsInList as usize,
+                )
+            };
+            if queried != 0 && assigned == listed && listed <= capacity {
+                return Ok(buffer[header..header + listed].to_vec());
+            }
+            if queried == 0 && unsafe { GetLastError() } != ERROR_MORE_DATA {
+                return Err(io::Error::last_os_error());
+            }
+            capacity = assigned.max(capacity.saturating_mul(2));
+        }
+        Err(io::Error::other(
+            "job membership changed during enumeration",
+        ))
+    }
+
+    /// Sum live members with PID-reuse protection, never a truncated PID list.
+    pub fn memory(&self, deadline: Instant) -> Result<JobMemory, JobMemoryError> {
+        self.memory_counted(deadline, |_| {})
+    }
+
+    /// Publish confirmed process counts so a bounded caller can retain them
+    /// even if a later process query stalls.
+    pub fn memory_counted(
+        &self,
+        deadline: Instant,
+        mut counted: impl FnMut(u64),
+    ) -> Result<JobMemory, JobMemoryError> {
+        let mut process_count = None;
+        let result = (|| -> io::Result<JobMemory> {
+            let mut reading = JobMemory {
+                memory_bytes: 0,
+                process_count: 0,
+            };
+            let members = self.members(deadline)?;
+            process_count = Some(0);
+            counted(0);
+            for pid in members {
+                Self::check(deadline)?;
+                // SAFETY: no inheritance; the PID is only a candidate until its
+                // membership is confirmed through the returned handle.
+                let process =
+                    unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32) };
+                if process.is_null() {
+                    let error = io::Error::last_os_error();
+                    if matches!(error.raw_os_error(), Some(87 | 1168)) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                // SAFETY: OpenProcess returned a new owned handle.
+                let process = unsafe { OwnedHandle::from_raw_handle(process) };
+                let mut member = 0;
+                // SAFETY: both handles remain owned throughout this read and the
+                // membership output slot is valid.
+                if unsafe {
+                    IsProcessInJob(
+                        process.as_raw_handle(),
+                        self.handle.as_raw_handle(),
+                        &mut member,
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if member == 0 || exited(&process)? {
+                    continue;
+                }
+                let mut counters = PROCESS_MEMORY_COUNTERS::default();
+                // SAFETY: the same confirmed process handle and a correctly sized
+                // output buffer are retained; no second PID lookup is performed.
+                if unsafe {
+                    GetProcessMemoryInfo(
+                        process.as_raw_handle(),
+                        &mut counters,
+                        size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+                    )
+                } == 0
+                {
+                    let error = io::Error::last_os_error();
+                    if exited(&process)? {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                if exited(&process)? {
+                    continue;
+                }
+                reading.memory_bytes = reading
+                    .memory_bytes
+                    .checked_add(counters.WorkingSetSize as u64)
+                    .ok_or_else(|| io::Error::other("working set sum overflow"))?;
+                reading.process_count += 1;
+                process_count = Some(reading.process_count);
+                counted(reading.process_count);
+            }
+            Self::check(deadline)?;
+            Ok(reading)
+        })();
+        result.map_err(|error| JobMemoryError {
+            error,
+            process_count,
+        })
+    }
+}
+
+fn exited(process: &OwnedHandle) -> io::Result<bool> {
+    let mut code = 0;
+    // SAFETY: the owned process handle has query access and the output is valid.
+    if unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(code != 259) // STILL_ACTIVE
 }
 
 /// The kernel's variable-length pid list, sized for a single query.
@@ -344,4 +577,55 @@ pub fn process_exists(pid: u32) -> bool {
     let alive = unsafe { WaitForSingleObject(handle, 0) } == WAIT_TIMEOUT;
     unsafe { CloseHandle(handle) };
     alive
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_owner_drop_preserves_kernel_close_exit_status() {
+        fn spawn() -> crate::ContainedChild<std::process::Child> {
+            let mut command = Command::new("powershell.exe");
+            command
+                .args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "Start-Sleep -Seconds 600",
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            crate::spawn_contained(&mut command).unwrap()
+        }
+        let control = spawn();
+        let pid = control.child.id();
+        let job = std::mem::ManuallyDrop::new(control.job);
+        // SAFETY: close the uniquely owned control handle exactly once to
+        // measure the kernel path, without the owner's explicit termination.
+        assert_ne!(unsafe { CloseHandle(job.handle) }, 0);
+        assert!(crate::wait_for_process_exit(
+            pid,
+            std::time::Duration::from_secs(10)
+        ));
+        let mut child = control.child;
+        let kernel_code = child.wait().unwrap().code();
+        eprintln!("WINDOWS_KERNEL_JOB_CLOSE_EXIT_CODE={kernel_code:?}");
+        assert_eq!(kernel_code, Some(0));
+
+        let owner = spawn();
+        let pid = owner.child.id();
+        let query = owner.job.query().unwrap();
+        drop(owner.job);
+        assert!(crate::wait_for_process_exit(
+            pid,
+            std::time::Duration::from_secs(10)
+        ));
+        assert_eq!(
+            owner.child.wait_with_output().unwrap().status.code(),
+            kernel_code
+        );
+        drop(query);
+    }
 }

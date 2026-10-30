@@ -2548,7 +2548,7 @@ dependencies = [
 
 [[package]]
 name = "subc-cgroup"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "cortexkit-test-support",
  "tokio",
@@ -2576,7 +2576,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.33.6"
+version = "0.33.7"
 dependencies = [
  "serde",
  "serde_json",
@@ -2585,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.152"
+version = "0.20.153"
 dependencies = [
  "async-trait",
  "base64",
@@ -2621,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.38.9"
+version = "0.38.10"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -2666,7 +2666,7 @@ dependencies = [
 
 [[package]]
 name = "subc-jobobject"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "cortexkit-test-support",
  "tokio",

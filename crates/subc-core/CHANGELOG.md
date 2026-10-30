@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.153
+
+- Show memory including child processes and its source in `ck module status`. Versioned `ckni` JSON retains the optional subtree reading without changing the existing process counters.
+
 ## 0.20.152
 
 - Announce daemon restarts immediately before setup and upgrade stop the runtime,

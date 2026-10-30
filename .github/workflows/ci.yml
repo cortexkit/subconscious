@@ -315,6 +315,7 @@ jobs:
             supervise::cgroup_placement_tests::unique_spawn_cgroups_clean_up_across_restarts_and_shutdown
             supervise::cgroup_containment_tests::linux_teardown_reaps_the_grandchild
             supervise::cgroup_containment_tests::linux_shutdown_straggler_reaps_the_grandchild
+            supervise::cgroup_containment_tests::linux_subtree_memory_covers_module_children
           )
           for test_name in "${tests[@]}"; do
             "$test_binary" "$test_name" --exact --list | grep -Fx "$test_name: test" > /dev/null

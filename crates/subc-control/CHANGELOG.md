@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.33.7
+
+- Add an optional `subtree` memory reading beside the single-process resources in supervisor lists. The reading names its source and process count, or explains why it is unavailable. Existing reading types and absent-field bytes stay unchanged.
+- Cgroup swap is optional: an absent `swap_bytes` means swap is not accounted, not that its usage is zero.
+
 ## 0.33.6
 
 - Add `daemon.shutdown_intent` request and reply variants. Only `intent: "restart"`

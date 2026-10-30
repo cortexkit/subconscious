@@ -150,8 +150,13 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     #[test]
     fn a_confirmed_read_is_reported_in_wire_units() {
+        let actual = read_with(Some(42), Some(100), |_| Some(usage()), |_| Some(100));
         assert_eq!(
-            read_with(Some(42), Some(100), |_| Some(usage()), |_| Some(100)),
+            serde_json::to_string(&actual).unwrap(),
+            r#"{"status":"measured","memory_bytes":7340032,"memory_kind":"resident_set","swap_bytes":4096,"cpu_user_ms":1250,"cpu_system_ms":310}"#
+        );
+        assert_eq!(
+            actual,
             ChildResourceUsage::Measured(ChildResourceReading {
                 memory_bytes: 7 * 1024 * 1024,
                 memory_kind: ChildMemoryKind::ResidentSet,

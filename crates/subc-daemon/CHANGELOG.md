@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.38.10
+
+- Report memory including child processes in `supervisor.list`, with a source, process count, or unavailability reason. Linux uses cgroup charges or a process sum, Windows sums job working sets, and macOS reports unavailable. Each process and subtree target gets its own 200 ms budget, off the connection reader and supervisor, with at most two blocking workers globally. The budget bounds how long the reply waits for a target, not how long a stuck read runs, and a stuck read keeps its worker slot until it returns. Completed targets are kept when another times out, and earlier status/image work cannot consume a later PID read's budget. No limits or restart rules use the figures.
+- A slow process table now reports the existing process resources as unreadable rather than waiting indefinitely. Successful process reading bytes stay unchanged, timeouts are not cached, and debug timeout logs are limited to once a minute per module.
+
 ## 0.38.9
 
 - Accept `daemon.shutdown_intent` without an operator prompt, keeping a restart

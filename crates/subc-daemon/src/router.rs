@@ -2245,6 +2245,9 @@ mod tests {
         ));
         let (ctx, mut rx) = route_ctx();
         let (acquired, ready) = std_mpsc::channel();
+        // Park the disabled supervisor actor before holding its snapshot. The
+        // detached list reader, not actor startup, must be the lock contender.
+        tokio::task::yield_now().await;
         let holder = module.hold_snapshot_for_test(acquired, Duration::from_millis(400));
         ready.recv().expect("holder acquired snapshot lock");
         let (output, guard) = log_capture(tracing::Level::WARN);

@@ -88,6 +88,9 @@ pub use app_open::*;
 mod connection_describe;
 pub use connection_describe::*;
 
+mod subtree;
+pub use subtree::*;
+
 /// Daemon-spawned consumer identity presented on route.open.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct ConsumerIdentity {
@@ -2510,6 +2513,10 @@ pub struct SupervisorEntry {
     /// mistaken for a process using nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ChildResourceUsage>,
+    /// Memory including child processes, with its measurement source. Report
+    /// only; absence means the daemon does not report one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtree: Option<SubtreeReading>,
 }
 
 impl SupervisorEntry {
@@ -2556,6 +2563,7 @@ impl SupervisorEntry {
             restart_backoff_ms: None,
             restart_max_backoff_ms: None,
             resources: None,
+            subtree: None,
         }
     }
 
@@ -2693,6 +2701,13 @@ impl SupervisorEntry {
     #[must_use]
     pub fn with_resources(mut self, resources: Option<ChildResourceUsage>) -> Self {
         self.resources = resources;
+        self
+    }
+
+    /// Attach a report-only reading covering the module's process container.
+    #[must_use]
+    pub fn with_subtree(mut self, subtree: Option<SubtreeReading>) -> Self {
+        self.subtree = subtree;
         self
     }
 }

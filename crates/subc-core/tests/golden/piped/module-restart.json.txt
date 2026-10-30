@@ -47,7 +47,11 @@ exit: Some(0)
     "restart_max_backoff_ms": 30000,
     "restart_window_secs": 600,
     "spawn_generation": 2,
-    "state": "draining"
+    "state": "draining",
+    "subtree": {
+      "reason": "no_cgroup",
+      "source": "unavailable"
+    }
   },
   "module_id": "pin-alpha",
   "op": "supervisor.ack",

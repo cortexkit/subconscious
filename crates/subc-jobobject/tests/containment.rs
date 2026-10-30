@@ -28,6 +28,50 @@ use subc_jobobject::{process_exists, wait_for_process_exit, JobObject};
 const EXIT_DEADLINE: Duration = Duration::from_secs(10);
 
 #[test]
+fn job_memory_counts_multiple_trees_and_query_does_not_defer_owner_drop() {
+    let dir = TempDir::new("job-memory");
+    let job = JobObject::new().unwrap();
+    let mut children = Vec::new();
+    let mut pids = Vec::new();
+    for index in 0..3 {
+        let path = dir.join(&format!("grandchild-{index}.pid"));
+        let mut command = Command::new(fixture_path());
+        command
+            .env("SUBC_JOBOBJECT_FIXTURE_MODE", "parent")
+            .env("SUBC_JOBOBJECT_GRANDCHILD_PID_FILE", &path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        subc_jobobject::suspend_on_create(&mut command);
+        let child = command.spawn().unwrap();
+        job.assign(&child).unwrap();
+        subc_jobobject::resume_main_thread(child.id()).unwrap();
+        pids.push(child.id());
+        pids.push(wait_for_pid_file(&path).expect("grandchild started"));
+        children.push(child);
+    }
+    let query = job.query().unwrap();
+    let reading = query
+        .memory(std::time::Instant::now() + EXIT_DEADLINE)
+        .unwrap();
+    // Windows can add console-host processes to the job as descendants start.
+    // All six independently witnessed fixture processes must be covered too.
+    assert!(reading.process_count >= pids.len() as u64, "{reading:?}");
+    assert!(reading.memory_bytes > 0);
+    drop(job);
+    for pid in pids {
+        assert!(
+            wait_for_process_exit(pid, EXIT_DEADLINE),
+            "query clone kept pid {pid} alive"
+        );
+    }
+    for mut child in children {
+        assert_eq!(child.wait().unwrap().code(), Some(0));
+    }
+    drop(query);
+}
+
+#[test]
 fn failed_containment_reaps_a_real_suspended_child() {
     struct ChildWithRefusedHandle(std::process::Child, bool);
     impl subc_jobobject::ProcessHandle for ChildWithRefusedHandle {
@@ -189,19 +233,15 @@ fn terminating_the_job_kills_the_grandchild() {
     let _ = fixture.child.wait();
 }
 
-/// The crash-durability guarantee: the tree dies when the handle closes, with no
-/// code running to ask it to.
-///
-/// This is the case `taskkill /T` cannot cover at all — a daemon that dies
-/// cannot call anything, so containment has to be a kernel property of the
-/// handle rather than a teardown step.
+/// Dropping the owner ends the tree. `JobObject`'s drop terminates the job and
+/// then closes its handle; the kernel-only path, where the handle closes with
+/// no code running, is covered by the unit test that closes the raw handle.
 #[test]
 fn dropping_the_job_kills_the_grandchild() {
     let (mut fixture, job) = spawn_contained_fixture("drop");
 
     assert!(process_exists(fixture.grandchild_pid));
 
-    // No `terminate` call: closing the last handle is the whole mechanism.
     drop(job);
 
     assert!(

@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.38.9"
+version = "0.38.10"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -30,7 +30,7 @@ serde_json = "1"
 semver = "1.0.28"
 sha2 = "0.10"
 subtle = "2"
-subc-control = { path = "../subc-control", version = "0.33.6" }
+subc-control = { path = "../subc-control", version = "0.33.7" }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.0" }
 subc-os = { path = "../subc-os", version = "0.1.23", features = ["tokio"] }
 subc-protocol = { path = "../subc-protocol", version = "0.33.5" }
@@ -40,12 +40,12 @@ tokio = { version = "1", features = ["fs", "net", "rt-multi-thread", "macros", "
 tracing = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-subc-cgroup = { path = "../subc-cgroup", version = "0.1.7" }
+subc-cgroup = { path = "../subc-cgroup", version = "0.1.8" }
 
 [target.'cfg(windows)'.dependencies]
 # Job-object containment for module grandchildren (issue #109). A leaf crate
 # because this crate forbids unsafe code and the Win32 calls need it.
-subc-jobobject = { path = "../subc-jobobject", version = "0.2.2" }
+subc-jobobject = { path = "../subc-jobobject", version = "0.2.3" }
 
 [target.'cfg(any(target_os = "macos", windows))'.dependencies]
 # The OS authentication prompts live only in the daemon. Keeping them in their

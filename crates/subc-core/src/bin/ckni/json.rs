@@ -148,6 +148,19 @@ mod tests {
     use crate::ckni::{plain_output, PlainOutput, Table};
 
     #[test]
+    fn versioned_module_json_retains_subtree_verbatim() {
+        let reading = json!({"source":"process_sum","memory_bytes":8192,"process_count":4});
+        let output =
+            JsonOutput::for_command(&Command::Module(ModuleCommand::List), true, true).unwrap();
+        let rendered = output.value(&json!({"modules":[{"module_id":"m", "subtree":reading}]}));
+        assert_eq!(rendered["schema"], "ck.module.list/v1");
+        assert_eq!(rendered["modules"][0]["subtree"], reading);
+        assert!(rendered["modules"][0]["subtree"]
+            .get("swap_bytes")
+            .is_none());
+    }
+
+    #[test]
     fn every_builtin_variant_has_one_plain_and_one_documented_json_classification() {
         let cases = [
             (

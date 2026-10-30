@@ -40,6 +40,7 @@ mod run_dir_lock;
 mod scopes;
 pub mod server;
 pub mod stderr_tail;
+mod subtree_resources;
 pub mod supervise;
 mod systemd_kill_mode;
 mod terminal_journal;

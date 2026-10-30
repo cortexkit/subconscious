@@ -162,14 +162,14 @@ while (($# > 0)); do
 done
 
 [ -n "$MODULE" ] || { echo "REFUSED: --module is required" >&2; exit 2; }
-# aft re-executes current_exe() for sandboxed shell commands and its GitHub CLI
-# wrapper on macOS and Linux. cerebellum starts its agent-cursor helper from its
+# cerebellum starts its agent-cursor helper from its
 # installed path on macOS, because macOS ties the helper's Screen Recording grant
 # to that path, and refuses the start once the path names a different file. So a
 # swap without a restart leaves its helper unavailable until it restarts. The
 # thalamus harness hard-links its executable at startup and starts hosts from
-# that pinned copy, so a swapped file no longer reaches it.
-REEXECS_OWN_PATH="aft cerebellum"
+# that pinned copy, so a swapped file no longer reaches it. aft does the same for
+# its sandbox launcher and GitHub CLI wrapper since aft 0.63.3.
+REEXECS_OWN_PATH="cerebellum"
 if [ "$RESTART" -eq 0 ] && [ "$INSTALL" -eq 0 ] && [ "$REEXEC_SAFE" -eq 0 ]; then
   for m in $REEXECS_OWN_PATH; do
     [ "$m" != "$MODULE" ] || { echo "REFUSED: --no-restart: $MODULE re-executes its own binary path while it runs, so a swapped binary breaks its helper starts until it restarts; place with a restart, or pass --reexec-safe once its owner confirms the running build pins its own executable" >&2; exit 2; }

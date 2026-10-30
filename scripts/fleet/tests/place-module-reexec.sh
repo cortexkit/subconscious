@@ -25,23 +25,23 @@ run_case() {
 }
 
 run_case reexec-module-refuses-no-restart \
-  "REFUSED: --no-restart: aft re-executes its own binary path" \
-  --module aft --no-restart
+  "REFUSED: --no-restart: cerebellum re-executes its own binary path" \
+  --module cerebellum --no-restart
 run_case reexec-safe-passes-the-guard \
   "REFUSED: staged artifact not found" \
-  --module aft --no-restart --reexec-safe
+  --module cerebellum --no-restart --reexec-safe
 run_case reexec-module-with-restart-passes-the-guard \
   "REFUSED: staged artifact not found" \
-  --module aft
+  --module cerebellum
 run_case other-module-no-restart-passes-the-guard \
   "REFUSED: staged artifact not found" \
   --module basal --no-restart
-run_case second-listed-module-refuses-no-restart \
-  "REFUSED: --no-restart: cerebellum re-executes its own binary path" \
-  --module cerebellum --no-restart
-# The harness pins its own executable, so it is no longer listed.
+# The harness and aft pin their own executables, so they are no longer listed.
 run_case pinned-harness-no-restart-passes-the-guard \
   "REFUSED: staged artifact not found" \
   --module thalamus-harness --no-restart
+run_case pinned-aft-no-restart-passes-the-guard \
+  "REFUSED: staged artifact not found" \
+  --module aft --no-restart
 
 [ "$failures" -eq 0 ] || exit 1

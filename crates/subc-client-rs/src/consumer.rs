@@ -4488,6 +4488,9 @@ impl Shared {
     ) -> Result<TerminalFrame, CallError> {
         let key = registration.key;
         let channel = key.channel;
+        // After writer handoff, settle_pending, a connection drop or close_sync may already
+        // have removed the entry and still be settling it. Its absence cannot prove that the
+        // request was not written, so a missing entry is classified as possibly written.
         tokio::select! {
             result = timeout_at(deadline, rx) => match result {
                 Ok(Ok(result)) => {
@@ -4503,9 +4506,9 @@ impl Shared {
                 Err(_) => {
                     let accepted = if registration.retain_on_drop {
                         registration.disarm();
-                        self.pending_accepted(key).unwrap_or(false)
+                        self.pending_accepted(key).unwrap_or(true)
                     } else {
-                        registration.remove_pending().unwrap_or(false)
+                        registration.remove_pending().unwrap_or(true)
                     };
                     if accepted {
                         self.spawn_liveness_probe();
@@ -4518,7 +4521,7 @@ impl Shared {
                 }
             },
             () = self.close_token.cancelled() => {
-                let accepted = registration.remove_pending().unwrap_or(false);
+                let accepted = registration.remove_pending().unwrap_or(true);
                 Err(classify_failure(accepted, "consumer closed while request was pending", OutcomeUnknownCause::ConsumerClosed))
             }
         }

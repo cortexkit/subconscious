@@ -438,6 +438,98 @@ async fn dropped_open_leader_gives_waiters_a_typed_abandoned_cause() {
     assert!(shared.lock_inner().openings.is_empty());
 }
 
+async fn removed_accepted_pending_error(retain_late_route_open: bool, close: bool) -> CallError {
+    let shared = writer_test_shared();
+    let (writer, mut receiver) = mpsc::channel(1);
+    shared.lock_inner().writer = Some(writer);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut request = Box::pin(shared.send_request(RequestSend {
+        expected_handle: None,
+        channel: 0,
+        epoch: 0,
+        body: b"ask".to_vec(),
+        binary: false,
+        priority: Priority::Interactive,
+        admission_class: AdmissionClass::Normal,
+        deadline,
+        retain_late_route_open,
+        route_open_reverse_requests: None,
+    }));
+    assert_pending(request.as_mut()).await;
+    let key = receiver.recv().await.unwrap().pending.unwrap();
+    assert!(shared.mark_pending_accepted(key));
+    // Hold the completion sender in the gap where settle_pending or close_sync has removed
+    // the entry under the lock but not yet settled it.
+    let entry = shared.lock_inner().remove_pending(&key).unwrap();
+    assert!(!entry.completion_is_closed());
+    if close {
+        shared.close_token.cancel();
+        assert!(Instant::now() < deadline);
+    } else {
+        tokio::time::advance(Duration::from_secs(5)).await;
+    }
+    let err = request.await.unwrap_err();
+    assert!(entry.completion_is_closed());
+    entry.settle_failure("settlement resumed after caller completed".to_string());
+    shared.close_sync("test complete");
+    err
+}
+
+#[tokio::test(start_paused = true)]
+async fn removed_accepted_pending_deadline_is_outcome_unknown() {
+    for retain_late_route_open in [false, true] {
+        let err = removed_accepted_pending_error(retain_late_route_open, false).await;
+        assert_eq!(
+            err.outcome_cause(),
+            Some(OutcomeUnknownCause::Deadline),
+            "{err:?}"
+        );
+        assert_ne!(err.never_forwarded(), Some(true));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn removed_accepted_pending_close_is_outcome_unknown() {
+    for retain_late_route_open in [false, true] {
+        let err = removed_accepted_pending_error(retain_late_route_open, true).await;
+        assert_eq!(
+            err.outcome_cause(),
+            Some(OutcomeUnknownCause::ConsumerClosed),
+            "{err:?}"
+        );
+        assert_ne!(err.never_forwarded(), Some(true));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn removed_accepted_pending_close_does_not_retry_whole_call() {
+    let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));
+    let (_, handle) =
+        open_answered(&shared, &consumer, &mut receiver, None, 41, "close race").await;
+    let started = Instant::now();
+    let mut call = Box::pin(drain_call(&consumer, b"mutation"));
+    assert_pending(call.as_mut()).await;
+    let command = receiver.recv().await.unwrap();
+    let key = command.pending.unwrap();
+    assert_eq!(key.channel, handle.channel);
+    assert!(shared.mark_pending_accepted(key));
+    // Leave the accepted entry unsettled while close wakes the whole call's reply waiter.
+    let entry = shared.lock_inner().remove_pending(&key).unwrap();
+    shared.close_sync("consumer closed during accepted request settlement");
+    let err = call.await.unwrap_err();
+    assert_eq!(Instant::now(), started);
+    // A retry would lose the original close cause by failing before queueing on the closed consumer.
+    assert_eq!(
+        err.outcome_cause(),
+        Some(OutcomeUnknownCause::ConsumerClosed),
+        "{err:?}"
+    );
+    assert_eq!(err.not_sent_cause(), None);
+    assert_ne!(err.never_forwarded(), Some(true));
+    assert!(receiver.try_recv().is_err());
+    entry.settle_failure("consumer closed".to_string());
+}
+
 #[tokio::test(start_paused = true)]
 async fn prequeue_validation_and_closed_consumer_are_typed() {
     let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(1));

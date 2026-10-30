@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.32.20
+
+- Once a request has been handed to the writer, a missing pending entry is not proof that it was never written: a reply (`settle_pending`), a connection drop or `close_sync` may have removed it and still be settling it. At the reply deadline or consumer close in that gap, the call now returns outcome-unknown instead of not-sent with `never_forwarded`, so the SDK no longer retries a request the writer may have written, and callers no longer see it reported as never forwarded. If the waiter finds the entry still present and not written, the call keeps its not-sent result. On close this is conservative: an unwritten entry that `close_sync` already drained also reports outcome-unknown.
+
 ## 0.32.19
 
 - Add `SubcConsumer::describe_connection` and non-exhaustive `ConnectionFacts` with local transport and operator-app accessors. Only the older daemon's unknown-operation refusal maps to `Ok(None)`; other errors propagate. Requires subc-control 0.33.5.

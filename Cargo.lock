@@ -2576,7 +2576,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.33.5"
+version = "0.33.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -2585,7 +2585,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.151"
+version = "0.20.152"
 dependencies = [
  "async-trait",
  "base64",
@@ -2621,7 +2621,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.38.8"
+version = "0.38.9"
 dependencies = [
  "base64",
  "cortexkit-log",

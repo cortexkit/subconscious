@@ -50,6 +50,7 @@ pub(crate) fn json_form(command: &Command) -> JsonForm {
             })
         }
         Command::BuildShape
+        | Command::DaemonAnnounceRestart
         | Command::CliFaceReservedNames
         | Command::Dashboard
         | Command::External { .. } => JsonForm::Exempt,
@@ -270,6 +271,7 @@ mod tests {
         // is refused, external faces own their output, and action acknowledgements
         // retain piped ck's plain and JSON forms for existing automation.
         let exemptions = [
+            ("daemon announce-restart", "script-only raw acknowledgement"),
             ("--ck-build-shape", "machine probe read by setup"),
             (
                 "--ck-cli-face-reserved-names",

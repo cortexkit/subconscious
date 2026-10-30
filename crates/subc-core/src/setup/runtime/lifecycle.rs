@@ -1,6 +1,77 @@
 use super::*;
 use subc_transport::connection_file;
 
+pub(super) fn announce_restart(connection: Option<&Path>) -> Result<(), String> {
+    let discovered = connection_file::discover(connection).map_err(|error| error.to_string())?;
+    // Setup is synchronous and can be called from a Tokio runtime. Keep its
+    // bounded control exchange on a separate runtime rather than nesting one.
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                use subc_protocol::{Flags, Frame, FrameType, Priority};
+                use subc_transport::{
+                    authenticate_client,
+                    frame_io::{read_frame, write_frame},
+                };
+                let endpoint = discovered
+                    .info
+                    .endpoints
+                    .first()
+                    .ok_or("no daemon endpoint")?;
+                let address = std::net::SocketAddr::new(
+                    endpoint
+                        .host
+                        .parse()
+                        .map_err(|error: std::net::AddrParseError| error.to_string())?,
+                    endpoint.port,
+                );
+                let mut stream = tokio::net::TcpStream::connect(address)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                authenticate_client(&mut stream, &discovered.info, Duration::from_secs(2))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let body =
+                    serde_json::to_vec(&subc_control::ClientControlRequest::DaemonShutdownIntent {
+                        intent: Value::String("restart".into()),
+                    })
+                    .map_err(|error| error.to_string())?;
+                let frame = Frame::build(
+                    FrameType::Request,
+                    Flags::new(false, Priority::Interactive, false),
+                    0,
+                    0,
+                    1,
+                    body,
+                )
+                .map_err(|error| error.to_string())?;
+                write_frame(&mut stream, &frame)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let reply = read_frame(&mut stream)
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .ok_or("daemon disconnected")?;
+                if reply.header.ty != FrameType::Response {
+                    return Err(format!(
+                        "daemon refused restart announcement: {}",
+                        String::from_utf8_lossy(&reply.body)
+                    ));
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        })
+    })
+    .join()
+    .map_err(|_| "restart announcement thread failed".to_owned())?
+}
+
 fn image_matches(image: &Path, daemon: &Path) -> bool {
     let normalize = |path: &Path| {
         path.to_string_lossy()
@@ -243,6 +314,80 @@ pub(crate) fn wait_for_service_ready<R: CommandRunner>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_announcement_sends_control_request_and_reports_old_daemon_refusal() {
+        use subc_protocol::{Flags, Frame, FrameType, Priority, PROTOCOL_VERSION};
+        use subc_transport::{
+            authenticate_server,
+            frame_io::{read_frame, write_frame},
+            ConnectionInfo, Endpoint, SCHEMA_VERSION,
+        };
+        for refused in [false, true] {
+            let root = cortexkit_test_support::ScratchDir::new("restart-announcement");
+            let connection = root.join("connection.json");
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let info = ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: Some(PROTOCOL_VERSION),
+                endpoints: vec![Endpoint {
+                    host: "127.0.0.1".into(),
+                    port: listener.local_addr().unwrap().port(),
+                }],
+                key: subc_transport::generate_key().unwrap(),
+                daemon_id: subc_transport::generate_daemon_id().unwrap(),
+                pid: std::process::id(),
+                daemon_ver: "test".into(),
+            };
+            subc_transport::write_atomic(&connection, &info).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                authenticate_server(
+                    &mut stream,
+                    &info.key,
+                    &info.daemon_id,
+                    &info.daemon_ver,
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
+                let request = read_frame(&mut stream).await.unwrap().unwrap();
+                assert_eq!(request.header.channel, 0);
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&request.body).unwrap(),
+                    serde_json::json!({"op":"daemon.shutdown_intent", "intent":"restart"})
+                );
+                let (ty, body) = if refused {
+                    (
+                        FrameType::Error,
+                        serde_json::json!({"code":"unknown_control_op", "message":"old daemon"}),
+                    )
+                } else {
+                    (
+                        FrameType::Response,
+                        serde_json::json!({"op":"daemon.shutdown_intent", "intent":"restart", "expires_at_ms":120_000}),
+                    )
+                };
+                let reply = Frame::build(
+                    ty,
+                    Flags::new(false, Priority::Interactive, false),
+                    0,
+                    0,
+                    request.header.corr,
+                    serde_json::to_vec(&body).unwrap(),
+                )
+                .unwrap();
+                write_frame(&mut stream, &reply).await.unwrap();
+            });
+            let result =
+                tokio::task::spawn_blocking(move || super::announce_restart(Some(&connection)))
+                    .await
+                    .unwrap();
+            assert_eq!(result.is_err(), refused, "{result:?}");
+            server.await.unwrap();
+        }
+    }
     use super::*;
 
     #[derive(Default)]

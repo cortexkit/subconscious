@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.33.6
+
+- Add `daemon.shutdown_intent` request and reply variants. Only `intent: "restart"`
+  is accepted; the reply reports `expires_at_ms` for the 120-second announcement.
+
 ## 0.33.5
 
 - Add standalone, non-exhaustive `ConnectionDescribeRequest` and `ConnectionDescribeReply` bodies for `connection.describe`, without changing the exhaustive control enums. The reply describes the caller's local transport and currently recognised operator app.

@@ -95,6 +95,7 @@ const CAP_SESSION_ATTACH: &str = "session_attach_v1";
 const CAP_ADMISSION_FACTS_RELAY: &str = "admission_facts_relay_v1";
 
 const SUBC_CONTROL_OPS: &[&str] = &[
+    ops::DAEMON_SHUTDOWN_INTENT,
     ops::ACTIVITY_RECORD,
     ops::ACTIVITY_QUERY,
     ops::ACTIVITY_SUBSCRIBE,
@@ -3096,6 +3097,24 @@ impl ControlHandler {
             }
         }
         match request {
+            ClientControlRequest::DaemonShutdownIntent { intent } => {
+                if intent.as_str() != Some("restart") {
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        "invalid_params",
+                        "intent must be 'restart'",
+                    )?]);
+                }
+                let response = ClientControlResponse::DaemonShutdownIntent {
+                    intent: "restart".to_owned(),
+                    expires_at_ms: self.supervisor.announce_daemon_restart(),
+                };
+                Ok(vec![control_response_body_frame(
+                    &frame,
+                    &response,
+                    "ClientControlResponse::DaemonShutdownIntent",
+                )?])
+            }
             ClientControlRequest::ServerDescribe {} => self.handle_server_describe(frame),
             ClientControlRequest::CatalogList { module_id } => {
                 self.handle_catalog_list(frame, module_id)
@@ -7817,6 +7836,9 @@ fn privileged_operation(request: &ClientControlRequest) -> Option<PrivilegedOper
             Some(PrivilegedOperation::ReleaseReserved { module_id })
         }
         ClientControlRequest::ServerDescribe {}
+        // The announcement uses the same client admission as supervisor.restart,
+        // but cannot stop anything itself and needs no operator confirmation.
+        | ClientControlRequest::DaemonShutdownIntent { .. }
         | ClientControlRequest::CatalogList { .. }
         | ClientControlRequest::RouteOpen { .. }
         | ClientControlRequest::RoutePoll { .. }
@@ -7834,6 +7856,7 @@ fn privileged_operation(request: &ClientControlRequest) -> Option<PrivilegedOper
 
 fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
     match request {
+        ClientControlRequest::DaemonShutdownIntent { .. } => ops::DAEMON_SHUTDOWN_INTENT,
         ClientControlRequest::ServerDescribe {} => ops::SERVER_DESCRIBE,
         ClientControlRequest::SupervisorProvenance { .. } => ops::SUPERVISOR_PROVENANCE,
         ClientControlRequest::CatalogList { .. } => ops::CATALOG_LIST,
@@ -15546,7 +15569,7 @@ mod tests {
                     )
                     .unwrap(),
                     subc_protocol::session::ModuleControlCommand::Draining {
-                        reason: RouteCloseReason::Restart,
+                        reason: RouteCloseReason::Disable,
                         ..
                     }
                 ));

@@ -731,6 +731,12 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
             health_detail(&mut client, &module_id, json_output, args.verbose).await
         }
         Command::Daemon => daemon(&mut client, json_output, args.verbose).await,
+        Command::DaemonAnnounceRestart => {
+            let reply = client.rpc_value(ClientControlRequest::DaemonShutdownIntent {
+                intent: json!("restart"),
+            }).await?;
+            print_json(&reply)
+        }
         Command::DaemonTriage | Command::MachineShow | Command::MachineAdopt { .. } => {
             unreachable!("handled before connecting")
         }
@@ -1503,6 +1509,7 @@ struct CkArgs {
 }
 
 enum Command {
+    DaemonAnnounceRestart,
     /// Prints the compile-time test-support state so integration tests reject a
     /// binary that cannot verify their fixture-signed release index.
     BuildShape,
@@ -8413,6 +8420,9 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 .collect::<Vec<_>>();
             match positional.as_slice() {
                 [] => Ok(Command::Daemon),
+                [verb] if verb.as_os_str() == "announce-restart" => {
+                    Ok(Command::DaemonAnnounceRestart)
+                }
                 [verb] if verb.as_os_str() == "triage" => Ok(Command::DaemonTriage),
                 _ => Ok(Command::Help(DAEMON_HELP.into())),
             }

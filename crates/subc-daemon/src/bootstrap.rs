@@ -99,6 +99,8 @@ pub enum CgroupPlacementConfig {
 
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
+    #[cfg(feature = "test-support")]
+    shutdown_intent_window: Duration,
     pub operator_queue_wait: Duration,
     pub operator_timeout: Duration,
     pub operator_stuck_grace: Duration,
@@ -166,8 +168,17 @@ pub struct BootstrapConfig {
 }
 
 impl BootstrapConfig {
+    /// Shorten restart intent validity in daemon integration fixtures.
+    #[cfg(feature = "test-support")]
+    pub fn with_shutdown_intent_window(mut self, window: Duration) -> Self {
+        self.shutdown_intent_window = window;
+        self
+    }
+
     pub fn new(connection_file_path: impl Into<PathBuf>, port: u16) -> Self {
         Self {
+            #[cfg(feature = "test-support")]
+            shutdown_intent_window: Duration::from_secs(120),
             connection_file_path: connection_file_path.into(),
             operator_queue_wait: Duration::from_secs(150),
             operator_timeout: Duration::from_secs(120),
@@ -630,6 +641,8 @@ pub async fn run() -> Result<(), BootstrapError> {
 /// (they measured 236 daemon lines with the subscriber installed, 0 with the
 /// call commented out) -- otherwise the fix is itself unverified.
 pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapError> {
+    #[cfg(feature = "test-support")]
+    let shutdown_intent_window = config.shutdown_intent_window;
     let forwarding = Arc::new(ForwardingTable::default());
     forwarding.operator_confirms().configure_bootstrap(&config);
     let configured_modules = config.configured_modules.clone();
@@ -676,6 +689,8 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 terminal_journal_path,
                 live_children_path,
                 privacy_trampoline,
+                #[cfg(feature = "test-support")]
+                shutdown_intent_window,
                 #[cfg(target_os = "linux")]
                 cgroup_placement,
             )
@@ -827,6 +842,7 @@ async fn serve_bound_daemon(
     terminal_journal_path: Option<PathBuf>,
     live_children_path: Option<PathBuf>,
     privacy_trampoline: Option<PathBuf>,
+    #[cfg(feature = "test-support")] shutdown_intent_window: Duration,
     #[cfg(target_os = "linux")] cgroup_placement: Option<subc_cgroup::Placement>,
 ) -> Result<(), BootstrapError> {
     #[cfg(unix)]
@@ -876,6 +892,8 @@ async fn serve_bound_daemon(
     let registry = Arc::new(Registry::default());
     let process_liveness = Arc::new(SupervisorProcessLiveness::new());
     let supervisor_handle = SupervisorHandle::new();
+    #[cfg(feature = "test-support")]
+    supervisor_handle.set_shutdown_intent_window(shutdown_intent_window);
     let connected_clients = ConnectedClients::new();
     let daemon_incarnation = format!(
         "{:032x}",

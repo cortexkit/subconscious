@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.38.9
+
+- Accept `daemon.shutdown_intent` without an operator prompt, keeping a restart
+  announcement for 120 seconds on a suspend-inclusive elapsed clock. On macOS and
+  Linux, graceful shutdown now sends every module connection `module.draining`
+  with reason `disable`, unless an unexpired restart was announced, in which case
+  the reason is `restart`; previously every daemon shutdown said `restart`.
+  Delivery is attempted within the shutdown's notice budget, not guaranteed.
+  Clients' `route.closing` and `route.closed` still carry `restart`, and the
+  drain, GOODBYE and EOF sequence is unchanged. Windows sends no shutdown notice,
+  as before. Requires subc-control 0.33.6.
+
 ## 0.38.8
 
 - Answer unprivileged `connection.describe` calls with the caller's local-listener status and the same current operator-app recognition used by `route.bind`. Recognition is a snapshot and may change on revalidation; no build is admitted by the production app floor today. Requires subc-control 0.33.5.

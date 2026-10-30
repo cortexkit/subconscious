@@ -32,6 +32,7 @@ exit: Some(0)
   "op": "server.describe",
   "protocol_ver": 2,
   "subc_ops": [
+    "daemon.shutdown_intent",
     "activity.record",
     "activity.query",
     "activity.subscribe",

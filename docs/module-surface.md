@@ -227,6 +227,30 @@ spawning new ones ([`data-model.md`](data-model.md) section 3).
 
 ## 7. Stopping, draining and swapping
 
+### Daemon shutdown
+
+On macOS and Linux, a graceful daemon shutdown tries to send every module
+connection `module.draining` with the shutdown's absolute `deadline_ms`, before
+GOODBYE and EOF. Delivery is best effort within a short notice budget. On Windows
+the daemon sends no shutdown notice; the module's connection just ends.
+
+The reason is `restart` when a planned restart was announced within the last 120
+seconds, measured on a clock that keeps counting while the computer sleeps. `ck
+upgrade` and `ck setup` announce before they restart the daemon, and scripts can
+announce with the script-only command `ck daemon announce-restart`. A later
+announcement replaces an earlier one. Without a live announcement the reason is
+`disable`: the daemon cannot promise that the module is coming back.
+
+Modules should stop accepting work and seal for shutdown on either notice, but
+may preserve long-running work across `restart` as they do for a module restart.
+Treat `disable` as a stop. A connection that ends without `module.draining`,
+because the notice failed, the platform sends none, or the daemon died, must
+also be treated as a stop. Only the module's notice reason depends on the
+announcement: clients' `route.closing` and `route.closed` still carry `restart`,
+and the shutdown drain, GOODBYE and EOF sequence is unchanged.
+
+### Module lifecycle
+
 - **Drain.** Before a restart, reload or disable, the daemon sends
   `module.draining` with an absolute `deadline_ms`, sends clients
   `route.closing`, refuses new requests with `module_reloading`, and waits up to

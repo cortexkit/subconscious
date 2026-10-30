@@ -28,6 +28,8 @@ old_pid=$(job_pid)
 echo "$(stamp) outgoing daemon pid: ${old_pid:-none}"
 cut_at=$(date -u +%Y-%m-%dT%H:%M:%S)
 
+# An older daemon may not recognize the announcement; the cut must still run.
+ck daemon announce-restart || true
 launchctl bootout "$DOMAIN/$LABEL" 2>&1 | sed "s/^/$(stamp) bootout: /"
 
 # Wait for the old process AND the job registration to be gone. The daemon's

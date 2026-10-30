@@ -58,6 +58,7 @@ pub(super) fn plain_output(command: &Command) -> PlainOutput {
         // Probes print the same bytes under ckni as under ck. The dashboard
         // is refused; external ck-<domain> commands use their own output.
         Command::BuildShape
+        | Command::DaemonAnnounceRestart
         | Command::CliFaceReservedNames
         | Command::Dashboard
         | Command::External { .. } => PlainOutput::Exempt,

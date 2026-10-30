@@ -129,6 +129,7 @@ pub mod ops {
     pub const CONFIG: &str = "config.";
 
     pub const SERVER_DESCRIBE: &str = "server.describe";
+    pub const DAEMON_SHUTDOWN_INTENT: &str = "daemon.shutdown_intent";
     pub const CATALOG_LIST: &str = "catalog.list";
     pub const ROUTE_OPEN: &str = "route.open";
     pub const ROUTE_POLL: &str = "route.poll";
@@ -164,6 +165,13 @@ pub mod ops {
 // are markers; retain the direct public wire shape instead of boxing its fields.
 #[allow(clippy::large_enum_variant)]
 pub enum ClientControlRequest {
+    /// Announce a planned daemon restart. Other values, including an absent
+    /// intent, are refused by the daemon with `invalid_params`.
+    #[serde(rename = "daemon.shutdown_intent")]
+    DaemonShutdownIntent {
+        #[serde(default)]
+        intent: serde_json::Value,
+    },
     #[serde(rename = "server.describe")]
     ServerDescribe {},
     #[serde(rename = "catalog.list")]
@@ -417,6 +425,8 @@ pub enum ClientControlRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op")]
 pub enum ClientControlResponse {
+    #[serde(rename = "daemon.shutdown_intent")]
+    DaemonShutdownIntent { intent: String, expires_at_ms: u64 },
     #[serde(rename = "server.describe")]
     ServerDescribe {
         protocol_ver: u8,

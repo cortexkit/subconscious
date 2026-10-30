@@ -130,6 +130,15 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
         let config = subc_daemon::bootstrap::BootstrapConfig::from_env_for_daemon_binary()?
             .with_cgroup_placement(placement);
         let config = config.with_privacy_trampoline(privacy_trampoline);
+        #[cfg(feature = "test-support")]
+        let config = match std::env::var("SUBC_TEST_SHUTDOWN_INTENT_WINDOW_MS") {
+            Ok(ms) if env!("CARGO_BIN_NAME") == "ck-subc-under-test" => config
+                .with_shutdown_intent_window(std::time::Duration::from_millis(
+                    ms.parse()
+                        .expect("test shutdown intent window must be milliseconds"),
+                )),
+            _ => config,
+        };
         subc_daemon::bootstrap::run_with_config(config).await
     };
     if let Err(err) = daemon.await {

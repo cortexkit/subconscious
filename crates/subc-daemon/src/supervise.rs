@@ -2013,6 +2013,7 @@ struct SupervisedConfiguration {
 /// launch nonces recorded at spawn are checked by the same daemon instance.
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
+    restart_intent: Arc<Mutex<DaemonRestartIntent>>,
     activity: Arc<Mutex<Option<crate::activity::ActivityLedger>>>,
     activity_images: Arc<Mutex<HashMap<String, activity::ActivityImage>>>,
     modules: Arc<Mutex<HashMap<String, SupervisedModule>>>,
@@ -2138,7 +2139,54 @@ pub(crate) enum ReservedHelloRejection {
     },
 }
 
+#[derive(Debug)]
+struct DaemonRestartIntent {
+    expires: Option<Duration>,
+    window: Duration,
+}
+
+impl Default for DaemonRestartIntent {
+    fn default() -> Self {
+        Self {
+            expires: None,
+            window: Duration::from_secs(120),
+        }
+    }
+}
+
 impl SupervisorHandle {
+    pub(crate) fn announce_daemon_restart(&self) -> u64 {
+        let mut intent = self
+            .restart_intent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        intent.expires = Some(subc_uptime::suspend_inclusive_now() + intent.window);
+        unix_ms_now().saturating_add(intent.window.as_millis() as u64)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn set_shutdown_intent_window(&self, window: Duration) {
+        self.restart_intent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .window = window;
+    }
+
+    #[cfg(unix)]
+    fn take_daemon_shutdown_reason(&self) -> RouteCloseReason {
+        let expiry = self
+            .restart_intent
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .expires
+            .take();
+        if expiry.is_some_and(|expiry| subc_uptime::suspend_inclusive_now() < expiry) {
+            RouteCloseReason::Restart
+        } else {
+            RouteCloseReason::Disable
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -2823,7 +2871,8 @@ impl Supervisor {
     }
 
     /// Announce a cut while established connections can still carry replies.
-    /// These budgets promise notice and a bounded wait, not child completion;
+    /// These budgets bound the attempt to deliver notices and the wait for
+    /// routes to drain; neither guarantees delivery or child completion, and
     /// they are local policy, not an estimate of launchd's unknown kill ceiling.
     #[cfg(unix)]
     pub(crate) async fn drain_for_daemon_shutdown(&self) -> Result<(), SuperviseError> {
@@ -2838,8 +2887,39 @@ impl Supervisor {
             .map_err(SuperviseError::Forwarding)?;
         let deadline_ms =
             unix_ms_now().saturating_add((NOTICE_BUDGET + DRAIN_BUDGET).as_millis() as u64);
+        let shutdown_reason = self
+            .supervisor_handle
+            .as_ref()
+            .map(SupervisorHandle::take_daemon_shutdown_reason)
+            .unwrap_or(RouteCloseReason::Disable);
+        let mut modules_told = 0;
         let mut notices = tokio::task::JoinSet::new();
         let mut drains = Vec::new();
+        for connection in forwarding
+            .module_connections()
+            .map_err(SuperviseError::Forwarding)?
+        {
+            let target = ModuleDrainTarget {
+                endpoint: connection.endpoint,
+                sink: connection.sink,
+                negotiated_ver: connection.negotiated_ver,
+                abandoned_bindings: Vec::new(),
+                excluded_subscriptions: 0,
+            };
+            notices.spawn(async move {
+                (
+                    true,
+                    send_module_draining(
+                        &connection.module_id,
+                        shutdown_reason,
+                        deadline_ms,
+                        &target,
+                        true,
+                    )
+                    .await,
+                )
+            });
+        }
         for (module_id, endpoint) in modules {
             let Some(target) = forwarding
                 .begin_endpoint_drain(endpoint, RouteCloseReason::Restart)
@@ -2850,17 +2930,9 @@ impl Supervisor {
             let routes = forwarding
                 .endpoint_routes(target.endpoint)
                 .map_err(SuperviseError::Forwarding)?;
-            // Restart allows deployed consumers to reopen after the new daemon
-            // appears. The wire reason stays `restart`; what tells a daemon cut
-            // apart from a module restart afterwards is the terminal record
-            // itself, whose disposition is `daemon_shutdown` for every exit
-            // observed once `begin_daemon_shutdown` has run.
-            let command = serde_json::to_vec(&ModuleControlCommand::Draining {
-                reason: RouteCloseReason::Restart,
-                deadline_ms,
-            })
-            .expect("module draining serializes");
-            let mut recipients = vec![(target.sink.clone(), target.negotiated_ver, command)];
+            // Only an announced restart promises that modules are coming back.
+            // Client route notices retain their existing reconnect semantics.
+            let mut recipients = Vec::new();
             let mut clients: Vec<(crate::forwarding::GoodbyeTarget, Vec<u16>)> = Vec::new();
             for route in routes {
                 let client = route.goodbye_target;
@@ -2897,7 +2969,7 @@ impl Supervisor {
                         body,
                     )
                     .expect("bounded lifecycle notice frame builds");
-                    sink.send_flushed(frame).await
+                    (false, sink.send_flushed(frame).await.is_ok())
                 });
             }
             let gauges = declared_busy_gauges(&self.registry, &module_id)?;
@@ -2907,11 +2979,17 @@ impl Supervisor {
         // socket. Wait for writer flush acknowledgements before testing quiescence.
         let notice_deadline = Instant::now() + NOTICE_BUDGET;
         while let Ok(Some(result)) = timeout_at(notice_deadline, notices.join_next()).await {
-            if !matches!(result, Ok(Ok(()))) {
-                warn!(?result, "daemon shutdown notice delivery failed");
+            match result {
+                Ok((true, true)) => modules_told += 1,
+                Ok((false, true)) => {}
+                result => warn!(?result, "daemon shutdown notice delivery failed"),
             }
         }
         notices.abort_all();
+        info!(
+            ?shutdown_reason,
+            modules_told, "daemon shutdown module notices delivered"
+        );
         let notice_elapsed = notice_started.elapsed();
         let drain_started = Instant::now();
         let deadline = drain_started + DRAIN_BUDGET;
@@ -2959,7 +3037,7 @@ impl Supervisor {
         Ok(())
     }
 
-    /// The last step of an announced daemon shutdown, after the notice and the
+    /// The last step of a graceful daemon shutdown, after the notice and the
     /// drain: send every registered module a module GOODBYE, the same planned
     /// stop signal `ck module stop` gives, then close every connection so each
     /// subc module sees EOF and starts its own teardown, then end every
@@ -10549,12 +10627,13 @@ fn send_route_goodbyes(forwarding: &ForwardingTable, released_routes: Vec<Goodby
     }
 }
 
-fn send_module_draining(
+async fn send_module_draining(
     module_id: &str,
     reason: RouteCloseReason,
     deadline_ms: u64,
     target: &ModuleDrainTarget,
-) {
+    _wait_for_flush: bool,
+) -> bool {
     let body = match serde_json::to_vec(&ModuleControlCommand::Draining {
         reason,
         deadline_ms,
@@ -10566,7 +10645,7 @@ fn send_module_draining(
                 error = %err,
                 "failed to encode module draining command"
             );
-            return;
+            return false;
         }
     };
     let frame = match Frame::build_with_version(
@@ -10585,9 +10664,13 @@ fn send_module_draining(
                 error = %err,
                 "failed to build module draining command frame"
             );
-            return;
+            return false;
         }
     };
+    #[cfg(unix)]
+    if _wait_for_flush {
+        return target.sink.send_flushed(frame).await.is_ok();
+    }
     if let Err(err) = target.sink.try_send(frame) {
         warn!(
             module_id,
@@ -10595,7 +10678,9 @@ fn send_module_draining(
             error = %err,
             "module draining command was not delivered to peer"
         );
+        return false;
     }
+    true
 }
 
 /// The channel-0 GOODBYE that tells a module its stop is planned.
@@ -10898,7 +10983,7 @@ async fn begin_forwarding_drain_with(
         return Ok(StopNotice::NoConnection);
     };
     {
-        send_module_draining(&spec.module_id, reason, deadline_ms, target);
+        send_module_draining(&spec.module_id, reason, deadline_ms, target, false).await;
         #[cfg(feature = "test-support")]
         forwarding.wait_before_route_closing_for_test().await;
         let routes = forwarding

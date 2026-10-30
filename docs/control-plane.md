@@ -191,6 +191,15 @@ section 5.1.
 
 What a module does with these is in [`module-surface.md`](module-surface.md).
 
+`daemon.shutdown_intent` is a client-originated channel-0 request with
+`{"intent":"restart"}`. It uses the same client admission as `supervisor.restart`
+without an operator prompt. Other or missing intents are refused with
+`invalid_params`. The reply contains `intent: "restart"` and a wall-clock
+`expires_at_ms` for display. The daemon itself measures the 120 seconds on a
+clock that keeps counting while the computer sleeps, and each accepted
+announcement replaces the previous one. It does not
+stop the daemon itself.
+
 ## 5. Module requests to the daemon
 
 A module sends these on the connection it registered with `HELLO`; the same

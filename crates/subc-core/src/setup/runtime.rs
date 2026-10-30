@@ -94,6 +94,12 @@ impl CommandResult {
 pub trait CommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String>;
 
+    /// Best-effort daemon restart announcement, separate from service commands
+    /// so dry-run runners do not contact a live daemon.
+    fn announce_restart(&mut self, _connection: Option<&Path>) -> Result<(), String> {
+        Ok(())
+    }
+
     fn daemon_processes(&mut self, daemon: &Path) -> Result<Vec<DaemonProcess>, String> {
         daemon_processes(self, daemon)
     }
@@ -110,6 +116,9 @@ pub struct DaemonProcess {
 }
 
 impl<R: CommandRunner + ?Sized> CommandRunner for Box<R> {
+    fn announce_restart(&mut self, connection: Option<&Path>) -> Result<(), String> {
+        (**self).announce_restart(connection)
+    }
     fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String> {
         (**self).run(program, args)
     }
@@ -179,6 +188,9 @@ pub fn linger_hint<R: CommandRunner>(
 pub struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
+    fn announce_restart(&mut self, connection: Option<&Path>) -> Result<(), String> {
+        lifecycle::announce_restart(connection)
+    }
     fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String> {
         let output = Command::new(program)
             .args(args)
@@ -939,6 +951,10 @@ pub(crate) fn restart_with_definition_at<R: CommandRunner>(
                 }
             }
         }
+        if index == 0 {
+            // Older daemons refuse the additive request; a restart must still run.
+            let _ = runner.announce_restart(connection);
+        }
         let result = runner.run(&program, &args)?;
         if !result.success {
             let is_stop = index == 0 && platform != RuntimePlatform::Linux;
@@ -1216,6 +1232,9 @@ fn restart_via_service_manager_on<R: CommandRunner>(
         .into_iter()
         .enumerate()
     {
+        if index == 0 {
+            let _ = runner.announce_restart(None);
+        }
         let output = runner.run(&program, &args)?;
         // A Windows task that is already stopped still needs /Run, and an
         // unloaded macOS agent still needs bootstrap. Only the stop command
@@ -2246,12 +2265,25 @@ mod reconciliation_tests {
 
     struct Manager {
         calls: Vec<String>,
+        announcement_error: Option<&'static str>,
         paths: RuntimePaths,
         task_xml: String,
         old: Option<DaemonProcess>,
         exit_polls: usize,
     }
     impl CommandRunner for Manager {
+        fn announce_restart(&mut self, connection: Option<&Path>) -> Result<(), String> {
+            if let Some(error) = self.announcement_error {
+                self.calls.push(format!(
+                    "announce restart {}",
+                    connection
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                ));
+                return Err(error.into());
+            }
+            Ok(())
+        }
         fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String> {
             let command = format!("{program} {}", args.join(" "));
             self.calls.push(command.clone());
@@ -2311,6 +2343,7 @@ mod reconciliation_tests {
         }
         let manager = Manager {
             calls: vec![],
+            announcement_error: None,
             paths: paths.clone(),
             task_xml: text,
             old: None,
@@ -2331,6 +2364,66 @@ mod reconciliation_tests {
         registered: true,
         live: true,
     };
+
+    #[test]
+    fn upgrade_and_setup_restart_even_when_restart_announcement_is_refused() {
+        for platform in [
+            RuntimePlatform::Macos,
+            RuntimePlatform::Linux,
+            RuntimePlatform::Windows,
+        ] {
+            for error in ["unknown_control_op", "connection refused"] {
+                let (root, paths, mut inventory, mut manager) = fixture(platform, true, true);
+                manager.announcement_error = Some(error);
+                let connection = root.join("missing-connection.json");
+                restart_with_definition_at(
+                    platform,
+                    &paths,
+                    &mut manager,
+                    &mut inventory,
+                    Some(&connection),
+                )
+                .unwrap();
+                assert_announcement_immediately_precedes_stop(&manager.calls);
+                assert!(manager
+                    .calls
+                    .iter()
+                    .any(|call| call == &format!("announce restart {}", connection.display())));
+                manager.calls.clear();
+                restart_via_service_manager_on(platform, &paths.definition, &mut manager, None)
+                    .unwrap();
+                assert_announcement_immediately_precedes_stop(&manager.calls);
+            }
+        }
+    }
+
+    fn assert_announcement_immediately_precedes_stop(calls: &[String]) {
+        let stop = calls
+            .iter()
+            .position(|call| {
+                call.contains(" bootout ")
+                    || call.contains(" /End ")
+                    || call.contains("--user restart ")
+            })
+            .expect("restart must stop the service");
+        assert!(
+            stop > 0 && calls[stop - 1].starts_with("announce restart "),
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("announce restart "))
+                .count(),
+            1
+        );
+        assert!(
+            calls[stop..].iter().any(|call| call.contains(" bootstrap ")
+                || call.contains(" /Run ")
+                || call.contains("--user restart ")),
+            "restart must still start the service: {calls:?}"
+        );
+    }
 
     #[test]
     fn materialized_legacy_task_upgrades_to_current_desired_definition() {

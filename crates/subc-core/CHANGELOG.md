@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.20.152
+
+- Announce daemon restarts immediately before setup and upgrade stop the runtime,
+  tolerating old daemons and connection errors. Add the script-only command
+  `ck daemon announce-restart`, which is left out of `ck daemon --help`. Requires subc-control 0.33.6 and subc-daemon 0.38.9.
+
 ## 0.20.151
 
 - `ck module resources` and `ck module profile` read the value inside inspect 0.1.4's `{"result": ...}` reply, and `ck module profile` waits for the requested `seconds`, which now sits inside `params`.

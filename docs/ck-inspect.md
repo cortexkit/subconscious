@@ -68,13 +68,17 @@ add an installer component; manual configuration is sufficient.
   samples whose leaf was not a wait. Addresses and source locations are
   stripped. Rust legacy and v0 names are demangled without hash suffixes. A
   frame in a stripped binary, which `sample` prints as `???`, is reported as
-  `image+0xOFFSET`, the offset from the image's load address, so its owner can
-  symbolize it against that build's debug symbols. Thread labels are retained
+  `image+0xOFFSET`, the offset from the image's load address, unless a matching
+  separate dSYM supplies its name (see below). Thread labels are retained
   as `sample` prints them.
 - A known wait is a leaf blocked in the kernel: `__psynch_cvwait`,
-  `__psynch_mutexwait`, `__ulock_wait`, `kevent`, `mach_msg`,
-  `__semwait_signal`, `semaphore_wait_trap`, `__workq_kernreturn`, `read`,
-  `__select`, `poll`, `__sigsuspend` or `__wait4`, including suffixed variants.
+  `__psynch_mutexwait`, `__ulock_wait`, `__ulock_wait2`, `kevent`, `kevent64`,
+  `kevent_id`, `mach_msg`, `mach_msg2_trap`, `__semwait_signal`,
+  `semaphore_wait_trap`, `semaphore_timedwait_trap`, `__workq_kernreturn`,
+  `read`, `__read_nocancel`, `recvfrom`, `__recvfrom`, `recvmsg`, `__recvmsg`,
+  `accept`, `__accept`, `connect`, `__connect`, `select`, `__select`, `pselect`,
+  `__pselect`, `poll`, `__poll_nocancel`, `__sigsuspend`, `__wait4` or `__waitid`,
+  including `_suffix` variants such as `_nocancel`.
   A macOS thread whose every sampled leaf is a wait is idle: it's counted in
   `idle_threads` and not listed. Runtime ancestors of a sleeping leaf do not
   make it busy.
@@ -102,6 +106,36 @@ deadline passes or the call is cancelled, the module kills the sampler's own
 process group, never the target.
 It records no history and sets no high-CPU policy. A flow may periodically read
 resources and request a bounded profile when its own policy requires one.
+
+### Separate debug symbols on macOS
+
+A module can keep named frames in profiles of stripped binaries by retaining each
+build's debug symbols at:
+
+```text
+<data home>/cortexkit/<module_id>/dsym/<UUID>/<anything>.dSYM/Contents/Resources/DWARF/<debug file>
+```
+
+The data home is the same resolved data home used for the module's other paths.
+Use the module id from the profile request (for example, `aft`, not the executable
+name). The UUID is the image's Mach-O `LC_UUID`, written as uppercase hexadecimal
+with no dashes. The UUID directory must contain exactly one `*.dSYM` bundle, and
+its `Contents/Resources/DWARF/` directory must contain exactly one file. The DWARF
+file's name need not match the executable. Lowercase or dashed UUID directory
+names are not recognized.
+
+The profiler reads image load addresses and UUIDs from `sample`'s `Binary Images:`
+section. For unresolved `image+0xOFFSET` frames with a matching bundle, it invokes
+`/usr/bin/atos` without a shell, at most once per image and with at most 256
+distinct addresses per image. Symbolization uses only the time remaining in the
+existing `seconds + 5` deadline; an overrun kills only the symbolizer process.
+Names lose image/source suffixes and Rust symbol hashes, just like other sampled
+frames. Stacks that become identical are merged before stack ranking and limits,
+then the existing 16 KiB reply budget is applied.
+
+Missing or ambiguous debug files, a missing or failed symbolizer, timeouts, and
+addresses the symbolizer cannot resolve leave `image+0xOFFSET` intact. None of
+these conditions fails a profile. Linux `proc_threads` profiles are unchanged.
 
 ## Typed refusals
 

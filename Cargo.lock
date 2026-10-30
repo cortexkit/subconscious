@@ -351,10 +351,11 @@ dependencies = [
 
 [[package]]
 name = "ck-inspect"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "ck-inspect",
+ "cortexkit-store-types",
  "rustc-demangle",
  "rustix",
  "serde",

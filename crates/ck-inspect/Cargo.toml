@@ -1,6 +1,6 @@
 [package]
 name = "ck-inspect"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 license = "MIT"
 description = "Read-only supervised process inspection over subc routes."
@@ -26,6 +26,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "ti
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process", "param"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cortexkit-store-types = "0.2.2"
 
 [dev-dependencies]
 ck-inspect = { path = ".", version = "0.1.0", features = ["test-support"] }

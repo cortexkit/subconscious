@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6
+
+- Name stripped macOS profile frames using a module's UUID-indexed dSYM bundles. Symbolization shares the sampling deadline, is bounded to 256 addresses per image, and preserves image offsets when symbols are unavailable. Merge named stacks before ranking and applying reply limits.
+- Treat blocking socket reads, accepts, connects, select/pselect, and waitid calls as idle leaves so blocked threads do not outrank running code.
+
 ## 0.1.5
 
 - macOS profiles rank threads by `busy_samples`, the samples whose leaf frame was not a known wait, and list only those running stacks. `sample` samples every thread at every tick, so 0.1.4 ranked by equal totals and then by name, and idle threads filled the eight-thread and 16 KiB limits before the busy ones.

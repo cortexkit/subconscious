@@ -2,7 +2,7 @@ use crate::profile::Profile;
 
 #[cfg(any(target_os = "macos", test))]
 #[cfg(unix)]
-use std::{io::Read, path::Path, process::Stdio, time::Duration};
+use std::{io::Read, path::Path, process::Stdio};
 
 /// The sampler's own process group, which it leads. The group may be signalled
 /// only while its leader is still this process's unreaped child: once the leader
@@ -33,7 +33,13 @@ impl Drop for ProcessGroup {
 
 #[cfg(any(target_os = "macos", test))]
 #[cfg(unix)]
-pub(crate) async fn sample_with(path: &Path, profile: Profile) -> Result<Profile, &'static str> {
+async fn sample_with(
+    path: &Path,
+    profile: Profile,
+    deadline: tokio::time::Instant,
+    dsym_root: &Path,
+    atos_path: &Path,
+) -> Result<Profile, &'static str> {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::Builder::new()
         .prefix("ck-inspect-")
@@ -64,7 +70,7 @@ pub(crate) async fn sample_with(path: &Path, profile: Profile) -> Result<Profile
     // Declared after `child`, so on cancellation it drops first: the group is
     // killed before kill_on_drop releases the unreaped leader.
     let mut group = ProcessGroup(Some(pid));
-    let status = tokio::time::timeout(Duration::from_secs(profile.seconds + 5), child.wait()).await;
+    let status = tokio::time::timeout_at(deadline, child.wait()).await;
     match status {
         Err(_) => {
             // The leader is still unreaped, so its group id is still ours.
@@ -91,18 +97,91 @@ pub(crate) async fn sample_with(path: &Path, profile: Profile) -> Result<Profile
         .read_to_string(&mut text)
         .map_err(|_| "cannot read sampler output")?;
     let cut = text.len() == 8 * 1024 * 1024;
-    let mut profile = crate::sample::parse(&text, profile)?;
+    let mut sample = crate::sample::parse(&text, profile)?;
+    sample
+        .symbolize_with(dsym_root, |dwarf, load, addresses| {
+            atos_with(atos_path, dwarf, load, addresses, deadline)
+        })
+        .await;
+    let mut profile = sample.finish();
     profile.truncated |= cut;
     Ok(profile)
 }
 
-pub(crate) async fn capture(profile: Profile) -> Result<Profile, &'static str> {
+#[cfg(all(unix, any(target_os = "macos", test)))]
+async fn atos_with(
+    path: &Path,
+    dwarf: std::path::PathBuf,
+    load: u64,
+    addresses: Vec<u64>,
+    deadline: tokio::time::Instant,
+) -> Option<String> {
+    if tokio::time::Instant::now() >= deadline {
+        return None;
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("ck-inspect-atos-")
+        .tempdir()
+        .ok()?;
+    let output_path = dir.path().join("symbols.txt");
+    let output = std::fs::File::create(&output_path).ok()?;
+    let mut child = tokio::process::Command::new(path)
+        .arg("-o")
+        .arg(dwarf)
+        .arg("-l")
+        .arg(format!("0x{load:x}"))
+        .args(
+            addresses
+                .into_iter()
+                .take(256)
+                .map(|address| format!("0x{address:x}")),
+        )
+        .stdin(Stdio::null())
+        .stdout(output)
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    match tokio::time::timeout_at(deadline, child.wait()).await {
+        Ok(Ok(status)) if status.success() => {}
+        _ => {
+            // Only the symbolizer is ours to kill, never the inspected process.
+            // Do not await reaping after the deadline: the outer profile timeout
+            // must still receive the successfully sampled, unresolved stacks.
+            let _ = child.start_kill();
+            return None;
+        }
+    }
+    let mut text = String::new();
+    std::fs::File::open(output_path)
+        .ok()?
+        .take(1024 * 1024)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
+}
+
+pub(crate) async fn capture(
+    profile: Profile,
+    deadline: tokio::time::Instant,
+) -> Result<Profile, &'static str> {
     #[cfg(target_os = "macos")]
     {
-        sample_with(std::path::Path::new("/usr/bin/sample"), profile).await
+        let dsym_root =
+            std::path::PathBuf::from(cortexkit_store_types::module_data_dir(&profile.module_id))
+                .join("dsym");
+        sample_with(
+            Path::new("/usr/bin/sample"),
+            profile,
+            deadline,
+            &dsym_root,
+            Path::new("/usr/bin/atos"),
+        )
+        .await
     }
     #[cfg(target_os = "linux")]
     {
+        let _ = deadline;
         let tasks = std::path::PathBuf::from(format!("/proc/{}/task", profile.pid));
         let start = crate::proc_threads::read_tasks(&tasks)?;
         tokio::time::sleep(std::time::Duration::from_secs(profile.seconds)).await;
@@ -116,7 +195,7 @@ pub(crate) async fn capture(profile: Profile) -> Result<Profile, &'static str> {
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        let _ = profile;
+        let _ = (profile, deadline);
         Err("unsupported platform")
     }
 }
@@ -125,6 +204,90 @@ pub(crate) async fn capture(profile: Profile) -> Result<Profile, &'static str> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    async fn sample_with(path: &Path, profile: Profile) -> Result<Profile, &'static str> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(profile.seconds + 5);
+        super::sample_with(
+            path,
+            profile,
+            deadline,
+            Path::new("/does/not/exist"),
+            Path::new("/usr/bin/atos"),
+        )
+        .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn symbolizer_deadline_returns_a_successful_profile_with_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let sampler = dir.path().join("sampler");
+        let atos = dir.path().join("atos");
+        let pid_file = dir.path().join("atos.pid");
+        let uuid = "D9F36BE8D4E23E7AA29C8B8BA9E6219A";
+        let dwarf = dir
+            .path()
+            .join(uuid)
+            .join("helper.dSYM/Contents/Resources/DWARF/debug");
+        std::fs::create_dir_all(dwarf.parent().unwrap()).unwrap();
+        std::fs::write(dwarf, b"debug info").unwrap();
+        std::fs::write(&sampler, format!("#!/bin/sh\ncat > \"$5\" <<'END'\nCall graph:\n  1 Thread_1\n    1 ???  (in helper)  load address 0x1000 + 0x10  [0x1010]\nBinary Images:\n0x1000 - 0x2000 +helper (1) <{uuid}> /helper\nEND\n")).unwrap();
+        std::fs::write(
+            &atos,
+            format!(
+                "#!/bin/sh\necho $$ > '{}'\nexec sleep 600\n",
+                pid_file.display()
+            ),
+        )
+        .unwrap();
+        for path in [&sampler, &atos] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let root = dir.path().to_path_buf();
+        let task = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+            // The handler uses the same outer deadline as the two subprocesses.
+            tokio::time::timeout_at(
+                deadline,
+                super::sample_with(
+                    &sampler,
+                    Profile::new("fixture".into(), 1, 1, "sample".into()),
+                    deadline,
+                    &root,
+                    &atos,
+                ),
+            )
+            .await
+        });
+        while !pid_file.exists() {
+            assert!(
+                !task.is_finished(),
+                "symbolizer exited before publishing its pid"
+            );
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let profile = task
+            .await
+            .unwrap()
+            .expect("symbolization must not exhaust the outer deadline")
+            .unwrap();
+        assert_eq!(profile.threads[0].stacks[0].frames, ["helper+0x10"]);
+        let pid = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while rustix::process::test_kill_process(pid).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "symbolizer survived its deadline"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn deadline_kills_hanging_sampler_process_group() {

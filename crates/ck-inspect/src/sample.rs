@@ -1,4 +1,71 @@
 use crate::profile::{Profile, Stack, Thread};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, PartialEq)]
+struct BinaryImage {
+    load_address: u64,
+    uuid: String,
+}
+
+fn binary_image(line: &str) -> Option<(String, BinaryImage)> {
+    let (range, rest) = line.split_once('<')?;
+    let (uuid, _) = rest.split_once('>')?;
+    let uuid: String = uuid.chars().filter(|c| *c != '-').collect();
+    if uuid.len() != 32 || !uuid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut fields = range.split_whitespace();
+    let load_address = u64::from_str_radix(fields.next()?.strip_prefix("0x")?, 16).ok()?;
+    if fields.next()? != "-" {
+        return None;
+    }
+    u64::from_str_radix(fields.next()?.strip_prefix("0x")?, 16).ok()?;
+    let name = fields.next()?.trim_start_matches('+');
+    if name.is_empty() {
+        return None;
+    }
+    Some((
+        name.into(),
+        BinaryImage {
+            load_address,
+            uuid: uuid.to_ascii_uppercase(),
+        },
+    ))
+}
+
+fn dwarf_file(dsym_root: &Path, uuid: &str) -> Option<PathBuf> {
+    // Compare the spelling even on case-insensitive filesystems.
+    let uuid_dir = std::fs::read_dir(dsym_root)
+        .ok()?
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?
+        .into_iter()
+        .find(|entry| entry.file_name() == uuid)?;
+    // Enumerate names rather than guessing the DWARF name from the image: build
+    // tools can give the debug file a different name from the installed binary.
+    let bundles: Vec<_> = std::fs::read_dir(uuid_dir.path())
+        .ok()?
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?
+        .into_iter()
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "dSYM"))
+        .collect();
+    let [bundle] = bundles.as_slice() else {
+        return None;
+    };
+    if !bundle.path().is_dir() {
+        return None;
+    }
+    let files: Vec<_> = std::fs::read_dir(bundle.path().join("Contents/Resources/DWARF"))
+        .ok()?
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let [file] = files.as_slice() else {
+        return None;
+    };
+    file.path().is_file().then(|| file.path())
+}
 
 struct Node {
     depth: usize,
@@ -60,11 +127,23 @@ fn waiting(frame: &str) -> bool {
         "__workq_kernreturn",
         "read",
         "__read_nocancel",
+        "recvfrom",
+        "__recvfrom",
+        "recvmsg",
+        "__recvmsg",
+        "accept",
+        "__accept",
+        "connect",
+        "__connect",
+        "select",
         "__select",
+        "pselect",
+        "__pselect",
         "poll",
         "__poll_nocancel",
         "__sigsuspend",
         "__wait4",
+        "__waitid",
     ]
     .iter()
     .any(|wait| frame == *wait || frame.starts_with(&format!("{wait}_")))
@@ -116,30 +195,140 @@ fn finish_thread(
     }
     thread.busy_samples = Some(busy);
     profile.truncated |= thread_cut;
-    // Different instruction offsets can resolve to the same named stack. Merge
-    // them before ranking so the reply does not repeat one stack three times.
-    let mut counts = std::collections::BTreeMap::<Vec<String>, u64>::new();
-    for stack in thread.stacks.drain(..) {
-        *counts.entry(stack.frames).or_default() += stack.count;
-    }
-    thread.stacks = counts
-        .into_iter()
-        .map(|(frames, count)| Stack::new(count, frames))
-        .collect();
-    thread
-        .stacks
-        .sort_by(|a, b| b.count.cmp(&a.count).then(a.frames.cmp(&b.frames)));
-    profile.truncated |= thread.stacks.len() > 3;
-    thread.stacks.truncate(3);
     profile.threads.push(thread);
 }
 
-pub(crate) fn parse(text: &str, mut profile: Profile) -> Result<Profile, &'static str> {
+fn rank_stacks(profile: &mut Profile) {
+    for thread in &mut profile.threads {
+        // Different instruction offsets can resolve to the same named stack. Merge
+        // them before ranking so the reply does not repeat one stack three times.
+        let mut counts = BTreeMap::<Vec<String>, u64>::new();
+        for stack in thread.stacks.drain(..) {
+            *counts.entry(stack.frames).or_default() += stack.count;
+        }
+        thread.stacks = counts
+            .into_iter()
+            .map(|(frames, count)| Stack::new(count, frames))
+            .collect();
+        thread
+            .stacks
+            .sort_by(|a, b| b.count.cmp(&a.count).then(a.frames.cmp(&b.frames)));
+        profile.truncated |= thread.stacks.len() > 3;
+        thread.stacks.truncate(3);
+    }
+}
+
+pub(crate) struct Sample {
+    profile: Profile,
+    images: BTreeMap<String, BinaryImage>,
+}
+
+impl Sample {
+    pub(crate) async fn symbolize_with<F, Fut>(&mut self, dsym_root: &Path, mut atos: F)
+    where
+        F: FnMut(PathBuf, u64, Vec<u64>) -> Fut,
+        Fut: std::future::Future<Output = Option<String>>,
+    {
+        let mut unresolved = BTreeMap::<String, BTreeMap<String, u64>>::new();
+        for frame in self
+            .profile
+            .threads
+            .iter()
+            .flat_map(|t| &t.stacks)
+            .flat_map(|s| &s.frames)
+        {
+            let Some((name, offset)) = frame.rsplit_once("+0x") else {
+                continue;
+            };
+            let Some(image) = self.images.get(name) else {
+                continue;
+            };
+            let Some(address) = u64::from_str_radix(offset, 16)
+                .ok()
+                .and_then(|offset| image.load_address.checked_add(offset))
+            else {
+                continue;
+            };
+            let frames = unresolved.entry(name.into()).or_default();
+            if frames.len() < 256 {
+                frames.insert(frame.clone(), address);
+            }
+        }
+        let mut replacements = BTreeMap::new();
+        for (name, frames) in unresolved {
+            let image = &self.images[&name];
+            let Some(dwarf) = dwarf_file(dsym_root, &image.uuid) else {
+                continue;
+            };
+            let addresses = frames.values().copied().collect();
+            let Some(output) = atos(dwarf, image.load_address, addresses).await else {
+                continue;
+            };
+            for ((frame, address), line) in frames.into_iter().zip(output.lines()) {
+                let symbol = line.split(" (in ").next().unwrap_or(line).trim();
+                // atos echoes unresolved addresses rather than reporting an error.
+                if symbol.is_empty()
+                    || symbol.starts_with("???")
+                    || symbol
+                        .strip_prefix("0x")
+                        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                        == Some(address)
+                {
+                    continue;
+                }
+                let symbol = frame_name(symbol);
+                if symbol != "<unknown>" {
+                    replacements.insert(frame, symbol);
+                }
+            }
+        }
+        for frame in self
+            .profile
+            .threads
+            .iter_mut()
+            .flat_map(|t| &mut t.stacks)
+            .flat_map(|s| &mut s.frames)
+        {
+            if let Some(symbol) = replacements.get(frame) {
+                *frame = symbol.clone();
+            }
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Profile {
+        rank_stacks(&mut self.profile);
+        // `sample` samples every thread at every tick, so total samples are equal
+        // across threads. Rank by samples spent running instead.
+        self.profile.threads.sort_by(|a, b| {
+            b.busy_samples
+                .cmp(&a.busy_samples)
+                .then(a.name.cmp(&b.name))
+        });
+        self.profile.truncated |= self.profile.threads.len() > 8;
+        self.profile.threads.truncate(8);
+        self.profile
+    }
+}
+
+pub(crate) fn parse(text: &str, mut profile: Profile) -> Result<Sample, &'static str> {
     let mut in_graph = false;
+    let mut in_images = false;
+    let mut images = BTreeMap::new();
     let mut thread = None;
     let mut path: Vec<Node> = Vec::new();
     let mut cut = false;
     for line in text.lines() {
+        if line.starts_with("Binary Images:") {
+            in_graph = false;
+            in_images = true;
+            continue;
+        }
+        if in_images {
+            if let Some((name, image)) = binary_image(line) {
+                images.insert(name, image);
+            }
+            continue;
+        }
         if line.trim() == "Call graph:" {
             in_graph = true;
             continue;
@@ -147,8 +336,9 @@ pub(crate) fn parse(text: &str, mut profile: Profile) -> Result<Profile, &'stati
         if !in_graph {
             continue;
         }
-        if line.starts_with("Total number") || line.starts_with("Binary Images:") {
-            break;
+        if line.starts_with("Total number") {
+            in_graph = false;
+            continue;
         }
         let Some(start) = line.find(|c: char| c.is_ascii_digit()) else {
             continue;
@@ -186,23 +376,145 @@ pub(crate) fn parse(text: &str, mut profile: Profile) -> Result<Profile, &'stati
     if profile.threads.is_empty() && profile.idle_threads == 0 {
         return Err("sample contained no call graph");
     }
-    // `sample` samples every thread at every tick, so total samples are equal
-    // across threads. Rank by samples spent running instead.
-    profile.threads.sort_by(|a, b| {
-        b.busy_samples
-            .cmp(&a.busy_samples)
-            .then(a.name.cmp(&b.name))
-    });
-    profile.truncated |= profile.threads.len() > 8;
-    profile.threads.truncate(8);
-    Ok(profile)
+    Ok(Sample { profile, images })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const UUID: &str = "D9F36BE8D4E23E7AA29C8B8BA9E6219A";
+
+    #[test]
+    fn binary_images_parse_a_captured_sample_line() {
+        let line = "       0x10489c000 -        0x10489ca03 +sleep (334) <D9F36BE8-D4E2-3E7A-A29C-8B8BA9E6219A> /bin/sleep";
+        assert_eq!(
+            binary_image(line),
+            Some((
+                "sleep".into(),
+                BinaryImage {
+                    load_address: 0x10489c000,
+                    uuid: UUID.into(),
+                }
+            ))
+        );
+        assert_eq!(binary_image(&line.to_lowercase()).unwrap().1.uuid, UUID);
+        for invalid in ["garbage", "0x1 - 0x2 helper <../bad> /helper"] {
+            assert!(binary_image(invalid).is_none());
+        }
+    }
+
+    fn make_dwarf(root: &Path, uuid: &str, bundle: &str) -> PathBuf {
+        let folder = root
+            .join(uuid)
+            .join(bundle)
+            .join("Contents/Resources/DWARF");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("different-build-name");
+        std::fs::write(&file, b"debug info").unwrap();
+        file
+    }
+
+    #[test]
+    fn dwarf_lookup_requires_one_bundle_and_one_file() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(dwarf_file(root.path(), UUID).is_none());
+        std::fs::create_dir(root.path().join(UUID)).unwrap();
+        assert!(dwarf_file(root.path(), UUID).is_none());
+        let file = make_dwarf(root.path(), UUID, "helper.dSYM");
+        assert_eq!(dwarf_file(root.path(), UUID), Some(file.clone()));
+        std::fs::remove_file(&file).unwrap();
+        assert!(dwarf_file(root.path(), UUID).is_none());
+        std::fs::write(&file, b"debug info").unwrap();
+        let second = file.with_file_name("another");
+        std::fs::write(&second, b"debug info").unwrap();
+        assert!(dwarf_file(root.path(), UUID).is_none());
+        std::fs::remove_file(second).unwrap();
+        make_dwarf(root.path(), UUID, "second.dSYM");
+        assert!(dwarf_file(root.path(), UUID).is_none());
+    }
+
+    #[test]
+    fn dwarf_lookup_rejects_lowercase_and_dashed_uuid_folders() {
+        for folder in [
+            UUID.to_ascii_lowercase(),
+            "D9F36BE8-D4E2-3E7A-A29C-8B8BA9E6219A".into(),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            make_dwarf(root.path(), &folder, "helper.dSYM");
+            assert!(dwarf_file(root.path(), UUID).is_none());
+        }
+    }
+
     fn profile() -> Profile {
         Profile::new("fixture".into(), 1, 1, "sample".into())
+    }
+
+    fn parse(text: &str, profile: Profile) -> Result<Profile, &'static str> {
+        super::parse(text, profile).map(Sample::finish)
+    }
+
+    #[tokio::test]
+    async fn atos_names_frames_then_merges_before_stack_limits() {
+        let root = tempfile::tempdir().unwrap();
+        let dwarf = make_dwarf(root.path(), UUID, "symbols.dSYM");
+        let mut graph = "Call graph:\n  15 Thread_1\n    15 root\n".to_string();
+        for (offset, count) in [(0x10, 5), (0x20, 4), (0x30, 3), (0x40, 2), (0x50, 1)] {
+            graph.push_str(&format!(
+                "      {count} ???  (in helper)  load address 0x1000 + 0x{offset:x}  [0x0]\n"
+            ));
+        }
+        graph.push_str(&format!("Total number in stack:\nignored\nBinary Images:\n0x1000 - 0x2000 +helper (1) <{UUID}> /helper\n"));
+        let mut sample = super::parse(&graph, profile()).unwrap();
+        let mut calls = 0;
+        sample.symbolize_with(root.path(), |file, load, addresses| {
+            calls += 1;
+            assert_eq!(file, dwarf);
+            assert_eq!(load, 0x1000);
+            assert_eq!(addresses, [0x1010, 0x1020, 0x1030, 0x1040, 0x1050]);
+            std::future::ready(Some("_ZN4test4main17h0123456789abcdefE (in helper) (file.rs:1)\n_RNvC6_123foo3bar (in helper) (file.rs:2)\ntest::main (in helper) (file.rs:3)\n0x1040\nother (in helper) (file.rs:4)\n".into()))
+        }).await;
+        assert_eq!(calls, 1);
+        let result = sample.finish();
+        assert!(result.truncated);
+        assert_eq!(
+            result.threads[0].stacks,
+            [
+                Stack::new(8, vec!["test::main".into(), "root".into()]),
+                Stack::new(4, vec!["123foo::bar".into(), "root".into()]),
+                Stack::new(2, vec!["helper+0x40".into(), "root".into()]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn atos_is_bounded_and_failure_preserves_offsets() {
+        let root = tempfile::tempdir().unwrap();
+        make_dwarf(root.path(), UUID, "symbols.dSYM");
+        let mut graph = "Call graph:\n  300 Thread_1\n    300 root\n".to_string();
+        for offset in 0..300 {
+            graph.push_str(&format!(
+                "      1 ???  (in helper)  load address 0x1000 + 0x{offset:x}  [0x0]\n"
+            ));
+        }
+        graph.push_str(&format!(
+            "Binary Images:\n0x1000 - 0x2000 helper (1) <{UUID}> /helper\n"
+        ));
+        let mut sample = super::parse(&graph, profile()).unwrap();
+        let mut calls = 0;
+        sample
+            .symbolize_with(root.path(), |_, _, addresses| {
+                calls += 1;
+                assert_eq!(addresses.len(), 256);
+                std::future::ready(None)
+            })
+            .await;
+        assert_eq!(calls, 1);
+        let result = sample.finish();
+        assert!(result.threads[0]
+            .stacks
+            .iter()
+            .all(|s| s.frames[0].starts_with("helper+0x")));
     }
 
     #[test]
@@ -326,6 +638,8 @@ mod tests {
             "__ulock_wait2",
             "mach_msg2_trap",
             "__psynch_mutexwait",
+            "__recvfrom",
+            "__accept",
         ]
         .iter()
         .enumerate()
@@ -333,7 +647,7 @@ mod tests {
             graph.push_str(&format!("  10 Thread_{i}\n    10 root\n      10 {leaf}\n"));
         }
         let result = parse(&graph, profile()).unwrap();
-        assert_eq!(result.idle_threads, 4);
+        assert_eq!(result.idle_threads, 6);
         assert!(result.threads.is_empty());
     }
 

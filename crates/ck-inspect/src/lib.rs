@@ -172,7 +172,11 @@ impl Roster for SubcConsumer {
 #[async_trait]
 trait Sampler: Send + Sync {
     fn supported(&self) -> bool;
-    async fn capture(&self, profile: Profile) -> Result<Profile, &'static str>;
+    async fn capture(
+        &self,
+        profile: Profile,
+        deadline: tokio::time::Instant,
+    ) -> Result<Profile, &'static str>;
 }
 struct OsSampler;
 #[async_trait]
@@ -180,8 +184,12 @@ impl Sampler for OsSampler {
     fn supported(&self) -> bool {
         cfg!(any(target_os = "macos", target_os = "linux"))
     }
-    async fn capture(&self, profile: Profile) -> Result<Profile, &'static str> {
-        sampler::capture(profile).await
+    async fn capture(
+        &self,
+        profile: Profile,
+        deadline: tokio::time::Instant,
+    ) -> Result<Profile, &'static str> {
+        sampler::capture(profile, deadline).await
     }
 }
 
@@ -309,11 +317,10 @@ impl Inspect {
                     "proc_threads"
                 };
                 let profile = Profile::new(module_id.clone(), pid, seconds, method.into());
-                let captured = tokio::time::timeout(
-                    Duration::from_secs(seconds + 5),
-                    self.sampler.capture(profile),
-                )
-                .await;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds + 5);
+                let captured =
+                    tokio::time::timeout_at(deadline, self.sampler.capture(profile, deadline))
+                        .await;
                 // Check identity even after a sampler failure: a process that exited
                 // during capture must never produce a result for its successor.
                 let after = self.roster.snapshot().await?;

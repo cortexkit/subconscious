@@ -35,7 +35,11 @@ impl Sampler for FakeSampler {
     fn supported(&self) -> bool {
         self.supported
     }
-    async fn capture(&self, mut profile: Profile) -> Result<Profile, &'static str> {
+    async fn capture(
+        &self,
+        mut profile: Profile,
+        _deadline: tokio::time::Instant,
+    ) -> Result<Profile, &'static str> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.failure {
             return Err("fixture sampler failure");

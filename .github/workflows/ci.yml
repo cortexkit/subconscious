@@ -495,11 +495,12 @@ jobs:
       # missing, so this step is not what makes the suite work -- it moves the
       # build OUT of the first test, where a cold compile would run against bun's
       # per-test timeout and fail as a daemon defect rather than a slow build.
-      # Path and target must stay in step with DAEMON in that helper.
+      # Path and target must stay in step with DAEMON in that helper. The live
+      # scope-ownership test also spawns fake-aft-stub as its routed target.
       - name: Pre-build ck-subc for the live suite
         if: ${{ !cancelled() && matrix.pkg == 'subc-client' && matrix.os == 'ubuntu-latest' }}
         working-directory: .
-        run: cargo build --locked -p subc-core --bin ck-subc
+        run: cargo build --locked -p subc-core --bin ck-subc --bin fake-aft-stub
       # RUN_SUBC_LIVE only OPENS the gate; it cannot prove the blocks executed.
       # A skipped describe and a passing one both report success, so the step
       # asserts the live tests actually ran -- see the guard in the run body.

@@ -114,6 +114,12 @@ pub mod error_codes {
     /// the module's bind committed. Nothing was sent on the route, so the caller
     /// may re-open against the current record: RETRYABLE.
     pub const SCOPE_CHANGED: &str = "scope_changed";
+    /// A target module refused the bind because it can't yet resolve where
+    /// the session's state lives, for example while it repairs its session
+    /// index after a first start or a rollback. The target answers this from
+    /// its own bind, so the daemon relays it unchanged. Nothing was sent on
+    /// the route, so the caller may re-open within its deadline: RETRYABLE.
+    pub const SESSION_ADDRESS_UNAVAILABLE: &str = "session_address_unavailable";
     /// A scoped `route.open` named no `scope_epoch`. Every opener names one,
     /// the owner included, so an old call can never be carried into a newer
     /// session that reused the ref. TERMINAL.
@@ -261,6 +267,7 @@ pub mod error_codes {
                 | MODULE_TIMEOUT
                 | SCOPE_NOT_SYNCED
                 | SCOPE_CHANGED
+                | SESSION_ADDRESS_UNAVAILABLE
         )
     }
 

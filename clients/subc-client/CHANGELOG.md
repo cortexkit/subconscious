@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.22.12
+
+- `isRetryableRouteOpenCode` treats `session_address_unavailable` as
+  retryable, matching subc-protocol 0.34.1. A target module answers it from
+  its own bind while it can't yet resolve a session's state.
+
 ## 0.22.11
 
 - Add `transport: "local"` to consumer connect options. TCP remains the default with unchanged bytes. Local mode re-reads the owner-checked connection file on every initial and reconnect attempt and connects only to its current Unix socket or Windows pipe. Missing metadata gives `local_endpoint_absent`; local connect errors retain their cause and never fall back to TCP. Export `LocalEndpoint` and `readConnectionFileWithLocalEndpoint` for endpoint-aware readers without changing the legacy reader's behavior.

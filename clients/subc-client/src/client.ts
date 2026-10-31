@@ -2413,7 +2413,10 @@ export function isRetryableRouteOpenCode(code: string | undefined): boolean {
     // scope changed between admission and commit: nothing was sent, and a
     // re-open can succeed.
     code === "scope_not_synced" ||
-    code === "scope_changed"
+    code === "scope_changed" ||
+    // A target module that can't yet resolve where the session's state lives
+    // refuses the bind; nothing was sent, so a re-open can succeed.
+    code === "session_address_unavailable"
   );
 }
 

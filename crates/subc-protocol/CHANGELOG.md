@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.34.1
+
+- Add `error_codes::SESSION_ADDRESS_UNAVAILABLE` and make it retryable in
+  `is_retryable_route_open`. A target module answers it from its own bind
+  while it can't yet resolve a session's state, so nothing was sent and a
+  re-open within the caller's deadline can succeed. The golden
+  `decision_tables.json` gains the row.
+
 ## 0.34.0
 
 - Breaking: remove `project_root` and `project_id` from `BindIdentity`. Migrate to `BindIdentity::new(harness, session)`. For project-free openers, project attribution comes from the admitted session scope's `workdir` and optional `project_id`; without those fields there is no project attribution. During migration, daemon 0.39 also accepts legacy opener project fields and prefers the legacy root for internal root attribution and compatibility binds. Decoding still ignores unknown legacy fields.

@@ -319,7 +319,8 @@ ts_check() {
       if bash "$ROOT/scripts/gate.sh" ts typecheck "$pkg"; then :; else rc=1; fi
       if bash "$ROOT/scripts/gate.sh" ts unit "$pkg"; then :; else rc=1; fi
       if [ "$pkg" = subc-client ] && [ "$(uname -s)" = Linux ]; then
-        step 'Prebuild live daemon' cargo build --locked -p subc-core --bin ck-subc
+        # The live scope-ownership test also spawns fake-aft-stub as its routed target.
+        step 'Prebuild live daemon' cargo build --locked -p subc-core --bin ck-subc --bin fake-aft-stub
         if bash "$ROOT/scripts/gate.sh" ts live; then :; else rc=1; fi
       fi
       CURRENT_STEP="${pkg} checks (see named failures above)"

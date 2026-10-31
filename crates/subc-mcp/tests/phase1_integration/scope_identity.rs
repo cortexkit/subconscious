@@ -320,7 +320,7 @@ async fn scope_identity_roots_stamp_has_workdir_and_project() {
     );
     assert_eq!(
         bind.pointer("/identity/project_root"),
-        Some(&json!(daemon_canonical(h.project.path.as_ref())))
+        Some(&json!(daemon_canonical(&h.root)))
     );
     assert_eq!(
         *h.entorhinal.requests.lock().await,
@@ -359,22 +359,20 @@ async fn scope_identity_entorhinal_refusal_leaves_project_unset() {
 }
 
 #[tokio::test]
-async fn scope_identity_legacy_bind_bytes_are_unchanged() {
+async fn scope_identity_legacy_provider_gets_host_folder_from_scope_without_stamp_workdir() {
     let mut h = IdentityHarness::start(false, RootsMode::Folder, explicit(), false).await;
-    let (bind, bytes) = h.provider.bound_raw().await;
-    let expected = json!({"op":"route.bind", "route_channel":bind["route_channel"], "epoch":bind["epoch"],
-        "identity":{"project_root":daemon_canonical(h.project.path.as_ref()), "harness":"mcp:generic", "session":bind["identity"]["session"]},
-        "principal":{"kind":"reserved","module_id":"subc-mcp"},
-        "target":{"kind":"tool_provider", "module_id":"scope-probe"}});
-    // Compare the complete bind object, not a projection of its legacy keys.
-    assert_eq!(bind, expected);
-    let expected_bytes = format!(
-        "{{\"op\":\"route.bind\",\"route_channel\":{},\"epoch\":{},\"target\":{{\"kind\":\"tool_provider\",\"module_id\":\"scope-probe\"}},\"identity\":{{\"project_root\":{},\"harness\":\"mcp:generic\",\"session\":{}}},\"principal\":{{\"kind\":\"reserved\",\"module_id\":\"subc-mcp\"}}}}",
-        bind["route_channel"], bind["epoch"],
-        serde_json::to_string(&daemon_canonical(h.project.path.as_ref())).unwrap(),
-        bind["identity"]["session"],
+    let bind = h.provider.bound().await;
+    assert_eq!(
+        bind["identity"]["project_root"],
+        json!(daemon_canonical(&h.root))
     );
-    assert_eq!(bytes, expected_bytes.as_bytes());
+    assert_eq!(bind["identity"]["project_id"], "project-test");
+    assert_eq!(
+        bind["scope"]["owner"],
+        json!({"kind": "reserved", "module_id": "subc-mcp"})
+    );
+    assert!(bind["scope"].get("workdir").is_none());
+    assert!(bind["scope"].get("project_id").is_none());
     h.shutdown().await;
 }
 
@@ -456,6 +454,7 @@ async fn scope_identity_gateway_down_never_creates_local_record() {
     let mut h = IdentityHarness::start(true, RootsMode::Folder, explicit(), true).await;
     let bind = h.provider.bound().await;
     assert!(bind.get("scope").is_none());
+    assert_eq!(bind["identity"]["project_root"], "/");
     assert!(h.entorhinal.requests.lock().await.is_empty());
     let request: ClientRequest = serde_json::from_value(json!({
         "method":"tools/call", "params":{"name":"scope-probe_probe", "arguments":{}, "_meta":{"claudecode/toolUseId":"tool-without-gateway"}}
@@ -538,6 +537,7 @@ async fn scope_fallback_stale_launch_nonce_keeps_unscoped_tools() {
     assert_session_tools_work(&h).await;
     let bind = h.provider.bound().await;
     assert!(bind.get("scope").is_none());
+    assert_eq!(bind["identity"]["project_root"], "/");
     assert!(
         h.proxy.scope_requests.load(Ordering::SeqCst) > 0,
         "the daemon's scope authority refusal must execute"
@@ -592,6 +592,7 @@ async fn scope_fallback_old_daemon_gets_no_record_attempt() {
     assert_session_tools_work(&h).await;
     let bind = h.provider.bound().await;
     assert!(bind.get("scope").is_none());
+    assert_eq!(bind["identity"]["project_root"], "/");
     assert!(
         h.proxy.describes.load(Ordering::SeqCst) > 0,
         "capability discovery must use server.describe"
@@ -619,6 +620,7 @@ async fn scope_fallback_refusal_keeps_tools_and_catalog_lifecycle() {
     assert_session_tools_work(&h).await;
     let bind = h.provider.bound().await;
     assert!(bind.get("scope").is_none());
+    assert_eq!(bind["identity"]["project_root"], "/");
     assert!(
         h.proxy.scope_requests.load(Ordering::SeqCst) >= 2,
         "the scope refusal must actually execute"

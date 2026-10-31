@@ -351,7 +351,7 @@ impl StderrRing {
     /// `line` must not contain a trailing newline; the reader strips it so the
     /// stored text and the byte accounting agree. The line carries no capture
     /// time: only the pipe reader knows when a line arrived, and it records
-    /// that through [`Self::push_line_from_at`].
+    /// that through `Self::push_line_from_at`.
     pub fn push_line(&mut self, line: &str) {
         self.push_line_from(self.generation, line);
     }

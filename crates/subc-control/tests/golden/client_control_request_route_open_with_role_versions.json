@@ -1,7 +1,6 @@
 {
   "identity": {
     "harness": "opencode",
-    "project_root": "/tmp/subc/project",
     "session": "session-0001"
   },
   "op": "route.open",

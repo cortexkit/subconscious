@@ -14,7 +14,9 @@
 //!              [--args <json-object>] [--list-only]
 //!              [--supervisor-restart <module-id>]
 //!
-//! Defaults: module-id = first tool_provider in the catalog; root = cwd;
+//! Defaults: module-id = first tool_provider in the catalog;
+//! `--root` is accepted for compatibility but ignored. Session scopes carry
+//! project information; this probe opens unscoped routes and has no project.
 //! harness = "probe"; tool = first tool of the selected provider; args = {}.
 
 use std::{
@@ -56,7 +58,6 @@ async fn main() {
 struct ProbeArgs {
     connection_file: PathBuf,
     module_id: Option<String>,
-    root: PathBuf,
     harness: String,
     session: String,
     tool: Option<String>,
@@ -318,11 +319,7 @@ async fn route_open(
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
         },
-        identity: BindIdentity::new(
-            args.root.clone(),
-            args.harness.clone(),
-            args.session.clone(),
-        ),
+        identity: BindIdentity::new(args.harness.clone(), args.session.clone()),
         consumer_identity: None,
         consumer_capabilities: None,
         role_versions: None,
@@ -516,7 +513,6 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
 
     let mut connection_file = None;
     let mut module_id = None;
-    let mut root = None;
     let mut harness = String::from("probe");
     let mut session = String::from("probe-session-1");
     let mut tool = None;
@@ -534,7 +530,7 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
         } else if arg == OsStr::new("--module-id") {
             module_id = Some(take_str(&mut args, "--module-id")?);
         } else if arg == OsStr::new("--root") {
-            root = Some(PathBuf::from(take_value(&mut args, "--root")?));
+            let _ = take_value(&mut args, "--root")?;
         } else if arg == OsStr::new("--harness") {
             harness = take_str(&mut args, "--harness")?;
         } else if arg == OsStr::new("--session") {
@@ -571,16 +567,10 @@ fn parse_args(argv: impl IntoIterator<Item = OsString>) -> Result<ProbeArgs, Pro
 
     let connection_file = connection_file
         .ok_or_else(|| ProbeError::Message(format!("--subc is required\n{USAGE}")))?;
-    let root = match root {
-        Some(r) => r,
-        None => env::current_dir()
-            .map_err(|e| ProbeError::Message(format!("cannot read cwd for --root: {e}")))?,
-    };
 
     Ok(ProbeArgs {
         connection_file,
         module_id,
-        root,
         harness,
         session,
         tool,

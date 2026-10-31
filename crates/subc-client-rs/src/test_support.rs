@@ -55,7 +55,7 @@
 //!     let route = module.bind_route(RouteBindRequest::new(
 //!         RouteHandle::detached(7, 3),
 //!         RouteTarget::ToolProvider { module_id: "writer".into() },
-//!         BindIdentity::new("/tmp/project", "test", "writer"),
+//!         BindIdentity::new("test", "writer"),
 //!     )).await;
 //!     let corr = module.send_request(route, b"replace".to_vec()).await;
 //!     let reply = module.read_reply(route, corr).await;

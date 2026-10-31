@@ -29,9 +29,7 @@ fn refusal_open_frame(
         target: RouteTarget::ToolProvider {
             module_id: target.to_string(),
         },
-        identity: BindIdentity::new(
-            root.path().to_path_buf(),
-            harness.to_string(),
+        identity: BindIdentity::new(harness.to_string(),
             "session".to_string(),
         ),
         consumer_identity: opener.map(|(module_id, launch_nonce)| ConsumerIdentity {

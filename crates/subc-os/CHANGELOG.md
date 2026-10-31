@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.26
+
+- Patch release of the operating-system helper alongside the coordinated route-identity release. No operating-system behavior changes.
+
 ## 0.1.25
 
 - The operator-app resolver missed macOS daemons writing to the production home-directory runtime location because it only knew the Darwin temporary directory. Add safe Unix `real_user_home_dir()` using `getpwuid_r(getuid())`, never `HOME`, so clients can include that location without reading environment variables. Password entries are read with a growable buffer and missing or non-absolute home directories return an error. Add `effective_uid()` for owner-based candidate selection; all FFI remains inside subc-os.

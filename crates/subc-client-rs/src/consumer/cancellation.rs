@@ -202,6 +202,7 @@ mod tests {
             let mut inner = shared.lock_inner();
             inner.generation = key.generation;
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.route_epochs.insert(
                 key.channel,
                 RouteHandle::new(key.channel, key.epoch, key.generation),

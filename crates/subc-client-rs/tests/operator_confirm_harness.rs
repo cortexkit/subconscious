@@ -72,7 +72,7 @@ async fn start(
             RouteTarget::ToolProvider {
                 module_id: "writer".into(),
             },
-            BindIdentity::new("/tmp/project", "test", "writer"),
+            BindIdentity::new("test", "writer"),
         ))
         .await;
     (module, route, state)

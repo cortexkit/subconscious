@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.0
+
+- Breaking: upgrade public frame and decoding types to protocol 0.34. Upgrade transport and protocol together so consumers do not mix incompatible Rust types. Handshake, connection-file and frame-envelope encodings are unchanged.
+
 ## 0.14.1
 
 - Additive. The connection file may carry an optional `local_endpoint` key naming the daemon's same-user local listener: `{"kind":"unix","path":"…"}` or `{"kind":"pipe","name":"…"}`. New `LocalEndpoint` type; `read_with_local_endpoint` and `read_for_client_with_local_endpoint` return it beside `ConnectionInfo` from the same owner-checked read (absent key is `None`, a malformed one is an error); `write_atomic_with_local_endpoint` writes it, and with `None` writes bytes identical to `write_atomic`. `ConnectionInfo` and its fields are unchanged, and `read`/`read_for_client` still parse files with or without the key.

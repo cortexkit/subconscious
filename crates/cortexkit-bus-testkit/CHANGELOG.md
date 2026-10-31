@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0
+
+- Breaking: upgrade the protocol types exposed by signer manifests and observed principals to protocol 0.34, with Rust client 0.33 and transport 0.15. Example route opens no longer put a folder in the identity.
+
 ## 0.2.1
 
 - Take subc-client-rs 0.32 with typed handler-panic failures, transport exit classification, IPv6 connections, bounded terminal replies and cooperative module stops. Public harness APIs are unchanged.

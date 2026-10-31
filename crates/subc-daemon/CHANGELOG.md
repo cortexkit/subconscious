@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.39.0
+
+- Accept project-free protocol 0.34 route opens and retain transitional decoding of legacy opener project fields. Internal root attribution prefers the canonical opener root, else the admitted scope workdir, else no internal project root.
+- Targets declaring `bind-no-project/v1` receive no project fields in their bind identity. Targets without `bind-no-project/v1` receive compatibility JSON fields: `project_root` is the canonical opener root, else the admitted stamp workdir, else `/`, even if `scope-workdir/v1` stamp members are stripped. The `/` compatibility fallback does not supply an internal project root. An opener-supplied root preserves its `project_id`, including absence, without adding a stamp ID. For rootless openers the ID is the opener ID, else the stamp ID, else absent.
+- For targets without `bind-no-project/v1`, opener-root binds with otherwise identical bind metadata preserve the pre-0.34 bytes after root canonicalization.
+
 ## 0.38.10
 
 - Report memory including child processes in `supervisor.list`, with a source, process count, or unavailability reason. Linux uses cgroup charges or a process sum, Windows sums job working sets, and macOS reports unavailable. Each process and subtree target gets its own 200 ms budget, off the connection reader and supervisor, with at most two blocking workers globally. The budget bounds how long the reply waits for a target, not how long a stuck read runs, and a stuck read keeps its worker slot until it returns. Completed targets are kept when another times out, and earlier status/image work cannot consume a later PID read's budget. No limits or restart rules use the figures.

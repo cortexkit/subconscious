@@ -1512,7 +1512,7 @@ async fn handle_control_request(
             route_channel,
             epoch,
             target,
-            identity,
+            identity: _,
             principal,
             consumer_capabilities,
             role_versions,
@@ -1521,6 +1521,10 @@ async fn handle_control_request(
             call_mode: _,
         } => {
             state.tentative_channels.insert(route_channel, epoch);
+            // Keep the wire identity in events: the current protocol reader
+            // intentionally drops retired fields sent for legacy targets.
+            let wire: serde_json::Value =
+                serde_json::from_slice(&frame.body).map_err(StubError::Json)?;
             record_event(
                 config,
                 json!({
@@ -1529,7 +1533,7 @@ async fn handle_control_request(
                     "corr": frame.header.corr,
                     "reject": config.reject_attach,
                     "target": target,
-                    "identity": identity,
+                    "identity": wire["identity"],
                     "principal": principal,
                     "consumer_capabilities": consumer_capabilities,
                     "role_versions": role_versions,

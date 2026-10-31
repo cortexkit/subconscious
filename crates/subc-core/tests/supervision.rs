@@ -52,8 +52,7 @@ async fn delayed_call_receipt_precedes_crash_and_client_survives_respawn() {
             .unwrap(),
     );
     let call_client = Arc::clone(&client);
-    let identity =
-        subc_protocol::BindIdentity::new(server.temp_dir.path(), "kill-regression", "receipt");
+    let identity = subc_protocol::BindIdentity::new("kill-regression", "receipt");
     let call_identity = identity.clone();
     let target = subc_protocol::RouteTarget::ToolProvider {
         module_id: module_id.to_owned(),

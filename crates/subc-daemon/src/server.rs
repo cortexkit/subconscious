@@ -2540,7 +2540,7 @@ mod tests {
                 target: RouteTarget::ToolProvider {
                     module_id: "frame-test".into(),
                 },
-                identity: BindIdentity::new(std::env::current_dir().unwrap(), "unit", "session"),
+                identity: BindIdentity::new("unit", "session"),
                 consumer_identity: None,
                 consumer_capabilities: None,
                 role_versions: None,
@@ -2705,11 +2705,7 @@ mod tests {
                     target: RouteTarget::ToolProvider {
                         module_id: "healthy".into(),
                     },
-                    identity: BindIdentity::new(
-                        std::env::current_dir().unwrap(),
-                        "unit",
-                        "session",
-                    ),
+                    identity: BindIdentity::new("unit", "session"),
                     consumer_identity: None,
                     consumer_capabilities: None,
                     role_versions: None,

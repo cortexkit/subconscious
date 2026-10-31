@@ -44,7 +44,7 @@ impl ModuleHandler for Idle {
 async fn ckbus_call(
     consumer: &SubcConsumer,
     identity: &ConsumerIdentity,
-    connection: &Path,
+    _connection: &Path,
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
@@ -53,11 +53,7 @@ async fn ckbus_call(
             RouteTarget::ManagementSurface {
                 module_id: "ckbus".into(),
             },
-            BindIdentity::new(
-                connection.parent().unwrap().to_path_buf(),
-                "testkit",
-                "publisher",
-            ),
+            BindIdentity::new("testkit", "publisher"),
             serde_json::to_vec(&json!({"method": method, "params": params})).unwrap(),
             CallOptions {
                 timeout: Duration::from_secs(5),

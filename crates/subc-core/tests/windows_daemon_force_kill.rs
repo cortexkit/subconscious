@@ -444,7 +444,7 @@ async fn daemon_crash_respawn_kills_descendants_and_closes_pipes() {
                 .unwrap(),
         );
         let call_client = Arc::clone(&client);
-        let identity = BindIdentity::new(fixture.root.path(), "kill-regression", "crash-window");
+        let identity = BindIdentity::new("kill-regression", "crash-window");
         let call = tokio::spawn(async move {
             call_client
                 .call(

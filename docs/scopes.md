@@ -56,11 +56,12 @@ Fields:
   changes it at the same epoch refuses that record `scope_kind_changed`; the owner uses a higher
   epoch, which ends the old scope.
 - `workdir`: optional absolute session folder (the checkout or worktree root for git).
-  The daemon canonicalizes it like `route.open`'s `project_root`, resolving symlinks
+  The daemon canonicalizes it like a legacy `route.open`'s `project_root`, resolving symlinks
   and allowing a missing tail. Relative or unresolvable paths refuse that record
   as `invalid_workdir`.
-- `project_id`: optional opaque Entorhinal project id, 1–128 printable non-space ASCII
-  bytes (`0x21`–`0x7E`). Malformed ids refuse the whole sync or apply as
+- `project_id`: optional opaque ID from the project-registry module (`entorhinal`),
+  1–128 printable non-space ASCII bytes (`0x21`–`0x7E`). Malformed ids refuse the
+  whole sync or apply as
   `invalid_control_body`. A folder with no registered project needs only `workdir`.
   Both fields are fixed for the epoch: adding, changing or removing either is
   `scope_workdir_changed` or `scope_project_changed`, respectively. Canonical spellings
@@ -119,18 +120,44 @@ no live route keeps an `owner_authorized` stamp its owner has lost. Providers re
 `owner_authorized` alone and keep no copy of the list (section 7).
 
 `workdir` and `project_id` are attribution, never authority. Owners send them after
-the daemon advertises `scope-workdir/v1` in `server.describe`. An owner sets
-`project_id` only to the `projectId` that Entorhinal's `resolve {path: workdir}`
-returns for the same folder, and leaves it out when Entorhinal has no project for
-that folder. It never invents an id or copies one from another session, because
-every reader groups the session under that project. The daemon can't check this:
-it treats the id as opaque and never calls Entorhinal, which it supervises. A reader
-that needs certainty resolves the `workdir` itself. The daemon includes
+the daemon advertises `scope-workdir/v1` in `server.describe`. The project-registry
+module (`entorhinal`) resolves a folder with
+`{"method":"resolve","params":{"canonicalRoot":"<workdir>"}}`. An owner sets
+`project_id` only to the `projectId` returned for the same folder, and leaves it
+out when the registry has no project for that folder. It never invents an id or
+copies one from another session, because every reader groups the session under
+that project. The daemon can't check this: it treats the id as opaque and never
+calls the project-registry module, which it supervises. A reader that needs
+certainty resolves the `workdir` itself. The daemon includes
 them in a `route.bind` scope stamp only when the target manifest's
-`capabilities.provides` declares `scope-workdir/v1`; all other targets receive the
-same bind bytes as before. Bound scoped routes contribute their workdir to
+`capabilities.provides` declares `scope-workdir/v1`; other targets receive scope
+stamps without those members. Bound scoped routes contribute their workdir to
 `supervisor.live_roots` alongside the legacy bind roots. Their activity entries
 carry the scope's `workdir` and `project_id`; existing activity fields are unchanged.
+
+Protocol 0.34 identities carry no project fields. For project-free openers,
+project attribution comes from the admitted session scope's `workdir` and optional
+`project_id`; without those fields there is no project attribution. During
+migration, daemon 0.39 also accepts legacy opener project fields and prefers the
+canonical opener root over the scope workdir for internal root attribution.
+
+Targets that no longer read project fields from `route.bind.identity` declare
+`bind-no-project/v1` in `capabilities.provides`. Daemon 0.39 omits those identity
+fields for declaring targets. For targets without `bind-no-project/v1`, it fills
+`project_root` from the opener's canonical root, else the admitted stamp's
+`workdir` (even when the target does not receive that stamp member), else `/`.
+The compatibility fallback is sent as `project_root: "/"`; the daemon does not use
+it as an internal project root. A route with neither an opener root nor a scope
+workdir has no internal project root.
+
+When the opener supplies a root, its project fields pass through unchanged after
+root canonicalization, including an absent `project_id`; adding an id could fork
+an existing consumer's session state. For targets without `bind-no-project/v1`
+and otherwise identical bind metadata, these opener-root binds preserve the
+legacy bytes after canonicalization. Only rootless openers get `project_id` from
+the opener, else the stamp, else absent. The independent `scope-workdir/v1` gate
+on both stamp members is unchanged; declaring `bind-no-project/v1` does not enable
+those stamp members.
 
 `on_behalf_of_agent` uses the agent token rule: 1–256 printable, non-space ASCII bytes
 (`0x21`–`0x7E`). Malformed tokens refuse the whole sync or apply as `invalid_control_body`.

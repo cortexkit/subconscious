@@ -107,14 +107,7 @@ pub struct ClaustrumRoute {
 
 impl ClaustrumRoute {
     pub fn new(connection_file: PathBuf, consumer_identity: Option<ConsumerIdentity>) -> Self {
-        let bind = BindIdentity::new(
-            connection_file
-                .parent()
-                .map(PathBuf::from)
-                .unwrap_or_default(),
-            "ck-bus",
-            "credentials",
-        );
+        let bind = BindIdentity::new("ck-bus", "credentials");
         Self {
             connection_file,
             consumer_identity,

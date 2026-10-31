@@ -420,7 +420,7 @@ fn control_frame(corr: u64, request: ClientControlRequest) -> Frame {
 #[cfg(unix)]
 async fn route_open_error(
     client: &mut tokio::net::TcpStream,
-    project: &Path,
+    _project: &Path,
     corr: u64,
     module_id: &str,
 ) -> ErrorBody {
@@ -428,11 +428,7 @@ async fn route_open_error(
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
         },
-        identity: BindIdentity::new(
-            project.to_path_buf(),
-            "opencode".to_string(),
-            "ses-drain-before-hello".to_string(),
-        ),
+        identity: BindIdentity::new("opencode".to_string(), "ses-drain-before-hello".to_string()),
         consumer_identity: None,
         consumer_capabilities: None,
         role_versions: None,

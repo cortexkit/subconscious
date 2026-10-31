@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.0
+
+- Breaking: use protocol 0.34 identities in route opens. Construct them with `BindIdentity::new(harness, session)`. For project attribution, register or select a session scope carrying `workdir` and optional `project_id`, then pass its `ScopeSelector` in `route.open.scope`; the daemon supplies the scope stamp. Upgrade the protocol and control crates together.
+
 ## 0.33.7
 
 - Add an optional `subtree` memory reading beside the single-process resources in supervisor lists. The reading names its source and process count, or explains why it is unavailable. Existing reading types and absent-field bytes stay unchanged.

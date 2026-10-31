@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.53
+
+- Upgrade to project-free protocol 0.34 route identities. Keep the shim folder separately for gateway configuration, and keep project attribution in the local session scope's selected workdir.
+- During reconciliation, pass the available local session selector to every desired tool provider opened there, regardless of `scope-workdir/v1`. The daemon fills compatibility identity fields from the selected session workdir for targets without `bind-no-project/v1`. Independently, targets without `scope-workdir/v1` do not receive stamp `workdir` or `project_id` members.
+- After local attribution fails, warn once when reconciling a nonempty provider set, including the reason, session ID and sorted currently desired provider IDs before opening their routes. Later-discovered providers do not trigger another warning. These project-free routes remain unscoped with no internal project root; targets without `bind-no-project/v1` receive `/` as the compatibility identity root fallback.
+
 ## 0.1.52
 
 - Log the module and daemon code when a tool call starts waiting out a refusal

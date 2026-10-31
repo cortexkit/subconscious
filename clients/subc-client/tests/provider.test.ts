@@ -751,9 +751,10 @@ describe("SubcProvider serve loop", () => {
       const request = bindRequests[0]!;
       expect(request.handle).toBe(provider.liveRoutes.get(42)!);
       expect(request.target).toEqual({ kind: "tool_provider", module_id: "aft-tools" });
+      // The goldens are protocol 0.34 binds, which carry no project fields.
+      // The provider passes the identity through as received.
       expect(request.identity).toEqual({
         harness: "opencode",
-        project_root: "/tmp/subc/project",
         session: "session-0001",
       });
       expect(request.principal).toEqual(

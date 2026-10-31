@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.34.2
+
+- Add an optional `schema_pin` to `CallOrigin`, with `with_schema_pin` and
+  the field name `ORIGIN_SCHEMA_PIN_FIELD` (`origin.schema_pin`). A module
+  that relays a call can now pass on the pin the original caller recorded, so
+  a provider keying its own records on the original call can report that pin.
+  It is checked with the shared opaque-field rule, omitted when absent, and,
+  like the rest of the origin, a claim, never authority. Bodies without it
+  keep their exact bytes.
+
 ## 0.34.1
 
 - Add `error_codes::SESSION_ADDRESS_UNAVAILABLE` and make it retryable in

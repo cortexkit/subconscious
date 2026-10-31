@@ -51,6 +51,14 @@ pub struct CallOrigin {
     /// forwarder knows. `None` means unknown, never "first" or "alone".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_position: Option<MessagePosition>,
+    /// The schema pin the original caller recorded for this call, when the
+    /// forwarder knows it, with the same bounds as
+    /// [`ToolCallRequest::schema_pin`]. A provider that keys records on the
+    /// original caller's call reports this pin as the one it served, so a
+    /// reader can check that pin against the views the provider published.
+    /// Like the rest of the origin, it is a claim, never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_pin: Option<String>,
 }
 
 impl CallOrigin {
@@ -61,12 +69,19 @@ impl CallOrigin {
             carrier,
             call_key: call_key.into(),
             message_position: None,
+            schema_pin: None,
         }
     }
 
     /// Set where the call sits in the model message that asked for it.
     pub fn with_message_position(mut self, position: MessagePosition) -> Self {
         self.message_position = Some(position);
+        self
+    }
+
+    /// Set the schema pin the original caller recorded for this call.
+    pub fn with_schema_pin(mut self, pin: impl Into<String>) -> Self {
+        self.schema_pin = Some(pin.into());
         self
     }
 }
@@ -261,6 +276,11 @@ pub const ORIGIN_CALL_KEY_FIELD: &str = "origin.call_key";
 /// malformed.
 pub const ORIGIN_MESSAGE_ID_FIELD: &str = "origin.message_position.message_id";
 
+/// The wire path of [`CallOrigin::schema_pin`] inside a request, for the
+/// `field` of the `invalid_request` error a provider returns when it is
+/// malformed.
+pub const ORIGIN_SCHEMA_PIN_FIELD: &str = "origin.schema_pin";
+
 /// The longest opaque token field accepted, in bytes (every accepted byte is
 /// one ASCII character). Shared by `call_key`, `schema_pin` and scope `flow_id`.
 pub const OPAQUE_FIELD_MAX_LEN: usize = 256;
@@ -381,14 +401,18 @@ pub fn validate_preset(preset: &str) -> Result<(), PresetError> {
     Ok(())
 }
 
-/// Check a [`CallOrigin`]: its `call_key`, and its message position's
-/// `message_id` when present, must pass the shared opaque-field rule. Errors
-/// name [`ORIGIN_CALL_KEY_FIELD`] or [`ORIGIN_MESSAGE_ID_FIELD`]. Every
+/// Check a [`CallOrigin`]: its `call_key`, its message position's
+/// `message_id` when present, and its `schema_pin` when present, must pass the
+/// shared opaque-field rule. Errors name [`ORIGIN_CALL_KEY_FIELD`],
+/// [`ORIGIN_MESSAGE_ID_FIELD`] or [`ORIGIN_SCHEMA_PIN_FIELD`]. Every
 /// [`Principal`] is accepted as the carrier, and every `u32` as the index.
 pub fn validate_call_origin(origin: &CallOrigin) -> Result<(), OpaqueFieldError> {
     validate_opaque_field(ORIGIN_CALL_KEY_FIELD, &origin.call_key)?;
     if let Some(position) = &origin.message_position {
         validate_opaque_field(ORIGIN_MESSAGE_ID_FIELD, &position.message_id)?;
+    }
+    if let Some(pin) = &origin.schema_pin {
+        validate_opaque_field(ORIGIN_SCHEMA_PIN_FIELD, pin)?;
     }
     Ok(())
 }
@@ -854,6 +878,32 @@ mod tests {
                 .expect_err("malformed origin key is refused");
             assert_eq!(error, expected, "{key:?}");
             assert_eq!(error.field(), "origin.call_key", "{key:?}");
+        }
+    }
+
+    #[test]
+    fn call_origin_schema_pin_is_optional_checked_and_omitted_when_absent() {
+        let plain = CallOrigin::new(Principal::Direct, "k");
+        let encoded = serde_json::to_value(&plain).expect("encode");
+        assert!(encoded.get("schema_pin").is_none(), "{encoded}");
+
+        let pinned = CallOrigin::new(Principal::Direct, "k").with_schema_pin("sha256:0f1e2d/1");
+        let encoded = serde_json::to_value(&pinned).expect("encode");
+        assert_eq!(encoded["schema_pin"], "sha256:0f1e2d/1");
+        let decoded: CallOrigin = serde_json::from_value(encoded).expect("decode");
+        assert_eq!(decoded, pinned);
+        assert_eq!(validate_call_origin(&pinned), Ok(()));
+
+        for bad in [
+            String::new(),
+            "has space".to_string(),
+            "x".repeat(OPAQUE_FIELD_MAX_LEN + 1),
+        ] {
+            let error = validate_call_origin(
+                &CallOrigin::new(Principal::Direct, "k").with_schema_pin(bad.clone()),
+            )
+            .expect_err(&bad);
+            assert_eq!(error.field(), ORIGIN_SCHEMA_PIN_FIELD, "{bad:?}");
         }
     }
 

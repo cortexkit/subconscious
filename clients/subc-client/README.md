@@ -146,6 +146,66 @@ within the caller's deadline. A scope-revocation close (such as `scope_ended` or
 reconnect automatically reopens that cache entry. Use a new selector for a new
 session; reload and restart close reasons still permit reopens.
 
+### Owning scopes
+
+A supervised, registered provider can publish scopes for its current launch.
+Configure the owner as a reserved module in the daemon and run this with Bun:
+
+```ts
+import { managementSurfaceManifest, SubcProvider } from "@cortexkit/subc-client";
+
+const provider = await SubcProvider.connect({
+  connectionFile: process.env.SUBC_CONNECTION_FILE!,
+  manifest: managementSurfaceManifest({
+    moduleId: process.env.SUBC_MODULE_ID!,
+    operations: [],
+  }),
+  handler: async (_route, body) => body,
+});
+const reply = await provider.scopeSync(1, [{
+  scope_ref: "rig-session",
+  scope_epoch: 1,
+  kind: "head",
+  workdir: process.cwd(),
+  carriers: [{ principal: { kind: "reserved", module_id: "test-client" } }],
+}]);
+if (reply.results.some((result) => result.outcome === "refused")) {
+  throw new Error(JSON.stringify(reply.results));
+}
+await provider.closed;
+```
+
+Set `SUBC_CONNECTION_FILE` to the daemon's connection file in the owner's
+configured environment. The daemon supplies `SUBC_MODULE_ID` and its launch nonce.
+
+`scopeSync(generation, scopes): Promise<ScopeSyncReply>` replaces the owner's
+whole set, ending omitted scopes. `scopeApply(generation, upsert, end):
+Promise<ScopeApplyReply>` changes only named scopes, after a successful full
+sync on the same connection. Both operations share a strictly increasing
+generation sequence. After reconnect, sync the full set again before applying
+deltas. To end one scope, use
+`await provider.scopeApply(2, [], [{ scope_ref: "rig-session", scope_epoch: 1 }])`.
+
+`ScopeRecord` uses Rust input names: `scope_ref` (sent as `ref`), `scope_epoch`,
+`kind`, `parent`, `child_owners`, `carriers`, `expires_at_ms`, `workdir`,
+`project_id`, `bind_proof_sha256`, `replace_only_if_idle`, and `attributes`.
+Parents and end inputs also use `scope_ref`. Attributes include `agent_id`,
+`on_behalf_of_agent`, `delegates`, the flow identity fields and `run_id`; only
+owners in `scope_authority_owners` may set nonempty attribution. Unknown nested
+input fields are rejected, not silently dropped. Numeric inputs must be safe
+non-negative integers. Optional null values, empty default lists, false flags
+and empty attributes are omitted exactly as in Rust.
+
+Replies retain the daemon's `ref` field names. Inspect `results` for each
+upsert's outcome and refusal `code`/`message`, `end_results` for explicit ends,
+and `ended` for ended scopes (normalized to `[]` when absent). Whole-call
+refusals throw `SubcProviderError` with the daemon's code; unsupported operations
+fail locally with `not_supported`. Calls time out after ten seconds; a timeout
+does not prove the mutation was unapplied. Workdirs must be absolute and are
+canonicalized by the daemon. A target providing `scope-workdir/v1` receives the
+directory as `workdir` in the bind's `scope`. A carrier uses the selector shown above
+with its own supervised consumer identity; the selector alone grants nothing.
+
 ### Launch nonce
 
 A module the daemon spawns proves who it is with a launch nonce. On macOS and

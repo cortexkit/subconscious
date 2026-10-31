@@ -15,6 +15,10 @@ import {
 } from "./client.js";
 import { ConnectionFileError, readConnectionFile, type ConnectionInfo } from "./connection-file.js";
 import {
+  scopeEndWire, scopeInteger, scopeRecordWire,
+  type ScopeApplyReply, type ScopeEnd, type ScopeEndResult, type ScopeRecord, type ScopeSyncReply,
+} from "./scope.js";
+import {
   AdmissionClass,
   buildFlags,
   buildFrame,
@@ -50,6 +54,7 @@ import {
 } from "./socket.js";
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
+const CONTROL_REQUEST_TIMEOUT_MS = 10_000;
 const BODY_READ_TIMEOUT_MS = 30_000;
 const WRITE_TIMEOUT_MS = 30_000;
 const DEFAULT_RESTORED_DEBOUNCE_MS = 250;
@@ -551,7 +556,8 @@ export class SubcProvider {
   private readonly pending = new Map<string, { resolve: (frame: Frame) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private readonly liveRoutes = new Map<number, RouteHandle>();
   private connectionToken = newConnectionToken();
-  private nextCorr = 1n;
+  private nextCorr = HELLO_CORR + 1n;
+  private subcOps: string[];
   private ingressEpochDropCount = 0;
   private readonly requestGate = new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY);
   private reconnecting: ReconnectCycle | null = null;
@@ -583,6 +589,7 @@ export class SubcProvider {
     private readonly opts: NormalizedSubcProviderConnectOptions,
     ack: ModuleHelloAckBody,
   ) {
+    this.subcOps = ack.subc_ops;
     this.storage = ack.storage;
     this.machineId = machineIdFromHelloAck(ack);
     this.closed = new Promise<void>((resolve) => {
@@ -603,6 +610,59 @@ export class SubcProvider {
 
   currentEpoch(): number {
     return this.connectionEpoch;
+  }
+
+  /** Replace this owner's scope set. Omitted scopes end; per-record refusals remain reply data. */
+  async scopeSync(generation: number, scopes: readonly ScopeRecord[]): Promise<ScopeSyncReply> {
+    const reply = await this.scopeControl("scope.sync", () => ({
+      op: "scope.sync", generation: scopeInteger(generation), scopes: scopes.map(scopeRecordWire),
+    }));
+    return { generation: reply.generation, results: reply.results, ended: reply.ended ?? [] };
+  }
+
+  /** Apply a delta after scopeSync on this connection; unnamed scopes remain live. */
+  async scopeApply(generation: number, upsert: readonly ScopeRecord[], end: readonly ScopeEnd[]): Promise<ScopeApplyReply> {
+    const reply = await this.scopeControl("scope.apply", () => ({
+      op: "scope.apply", generation: scopeInteger(generation), upsert: upsert.map(scopeRecordWire), end: end.map(scopeEndWire),
+    }));
+    return { generation: reply.generation, results: reply.results, end_results: reply.end_results!, ended: reply.ended ?? [] };
+  }
+
+  private async scopeControl(op: "scope.sync" | "scope.apply", body: () => object): Promise<ScopeSyncReply & { end_results?: ScopeEndResult[] }> {
+    if (this.closedErr) throw this.closedErr;
+    if (this.reconnecting) throw new SubcProviderError("provider is reconnecting", "connection_lost", "not_sent");
+    if (!this.subcOps.includes(op)) throw new SubcProviderError(`${op} is not supported by the daemon`, "not_supported", "not_sent");
+    let bytes: Uint8Array;
+    try {
+      bytes = encodeJson(body());
+    } catch (error) {
+      throw new SubcProviderError(String(error), "invalid_control_body", "not_sent");
+    }
+    const corr = this.allocateCorr();
+    const key = `0:0:${corr}`;
+    const frame = buildFrame(FrameType.Request, controlFlags(), 0, 0, corr, bytes);
+    const response = await new Promise<Frame>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(key)) reject(new SubcProviderError(`${op} timed out; the mutation may have applied`, "request_timeout"));
+      }, CONTROL_REQUEST_TIMEOUT_MS);
+      this.pending.set(key, { resolve, reject, timer });
+      this.sendOn(this.sock, this.generation, frame).catch((error) => {
+        const pending = this.pending.get(key);
+        if (!pending) return;
+        this.pending.delete(key);
+        clearTimeout(pending.timer);
+        reject(error instanceof Error ? error : new SubcProviderError(String(error)));
+      });
+    });
+    try {
+      const reply = parseJson(response.body) as ScopeSyncReply & { op: string; end_results?: ScopeEndResult[] };
+      if (reply.op !== op || !Number.isSafeInteger(reply.generation) || !Array.isArray(reply.results)
+        || (op === "scope.apply" && !Array.isArray(reply.end_results))
+        || (reply.ended !== undefined && !Array.isArray(reply.ended))) throw new Error("unexpected scope reply");
+      return reply;
+    } catch {
+      throw new SubcProviderError(`invalid ${op} reply`, "protocol_error");
+    }
   }
 
   /** Send a reverse request on exactly one installed route generation. */
@@ -774,8 +834,8 @@ export class SubcProvider {
       }
     }
 
-    if (handle) {
-      const pendingKey = routeKey(handle, frame.header.corr);
+    {
+      const pendingKey = handle ? routeKey(handle, frame.header.corr) : `0:${frame.header.epoch}:${frame.header.corr}`;
       const pending = this.pending.get(pendingKey);
       if (pending) {
         if (frame.header.ty === FrameType.Push || frame.header.ty === FrameType.StreamData) return true;
@@ -1340,11 +1400,12 @@ export class SubcProvider {
     this.currentConn = opened.conn;
     this.storage = opened.ack.storage;
     this.machineId = machineIdFromHelloAck(opened.ack);
+    this.subcOps = opened.ack.subc_ops;
     this.closedErr = null;
     this.connectionEpoch += 1;
     this.connectionToken = newConnectionToken();
     this.liveRoutes.clear();
-    this.nextCorr = 1n;
+    this.nextCorr = HELLO_CORR + 1n;
     void this.readLoop(opened.sock, generation);
     return this.connectionEpoch;
   }

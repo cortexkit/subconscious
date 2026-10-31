@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.23.0
+
+- Registered providers can own session scopes with `scopeSync` and `scopeApply`.
+  Owners can attach a working directory and name the modules allowed to carry
+  the scope. Replies preserve per-record refusals and explicit end results;
+  whole-call refusals use `SubcProviderError` with the daemon's code.
+- Export the scope record, attribution, parent, carrier, end and reply types.
+  Scope requests follow the Rust client's field names and default omissions.
+
 ## 0.22.12
 
 - `isRetryableRouteOpenCode` treats `session_address_unavailable` as

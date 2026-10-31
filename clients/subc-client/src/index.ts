@@ -94,6 +94,10 @@ export {
   CLIENT_AUTH_DOMAIN,
 } from "./auth.js";
 export { SubcSocket, SocketClosedError, SocketTimeoutError } from "./socket.js";
+export type {
+  ScopeAttributes, ScopeParent, ScopeCarrier, ScopeRecord, ScopeEnd,
+  ScopeRecordResult, ScopeEndResult, ScopeEnded, ScopeSyncReply, ScopeApplyReply,
+} from "./scope.js";
 export {
   launchNonce,
   launchNonceOrUndefined,

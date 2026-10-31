@@ -202,7 +202,10 @@ jobs:
     name: Signed and notarized subconscious archives (darwin-arm64)
     if: startsWith(github.ref_name, 'subc-core-v')
     needs: create-subconscious-release
-    runs-on: macos-14
+    # GitHub retires each pinned macOS image (macos-14 on 2 November 2026,
+    # with brownouts that fail every job before then), so float on the
+    # current image. Nothing here depends on a particular macOS or Xcode.
+    runs-on: macos-latest
     permissions:
       contents: write
     steps:

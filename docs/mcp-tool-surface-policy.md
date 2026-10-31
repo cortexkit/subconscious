@@ -60,8 +60,11 @@ project) share one schema. This EXTENDS the existing `RawGatewayConfig`
           "<other_name>": {
             "enabled": false,        // absent = inherit defaultEnabled; null INVALID inside object
                                      // (delete the whole entry with the null shorthand instead)
-            "description": "…"       // NEW: model-facing description override; absent = provider
+            "description": "…",      // NEW: model-facing description override; absent = provider
                                      // manifest description; null INVALID (omit instead)
+            "mode": "forward",       // forward calls to the provider; "ack_only" acknowledges
+                                     // success without calling the provider
+            "upfront": true          // load directly; absent = inherit; null INVALID (omit instead)
           }
         }
       }
@@ -122,6 +125,13 @@ global baseline is fully composed:
   An in-repo file rewriting model-facing tool descriptions is a prompt-injection
   channel (the same restriction applies when AFT drops privileged fields from
   project config).
+- `tools.overrides.<t>.upfront`: allowed at both tiers, with the project value
+  overriding the user value. It controls discovery, not permission, so either
+  `true` or `false` is allowed without changing the callable set. An omitted
+  field preserves the inherited choice, including in boolean shorthand
+  overrides. As with `enabled`, `upfront: null` inside an object is invalid;
+  a whole-override `null` follows the existing deletion rules, including the
+  project protections for inherited denies, descriptions and ack-only modes.
 - `namespace`: DROPPED at project tier (renaming affects collision handling and
   model-facing names — identity-adjacent, global-only).
 - `surfaceMode`: project may set `"search"` (strictly narrowing exposure);
@@ -135,15 +145,34 @@ global baseline is fully composed:
 The result is monotone over the PROVIDER-CALLABLE SET: for every provider
 tool, callable(project applied) ⊆ callable(global baseline), and no
 model-facing string is project-controlled. (`surfaceMode: "search"` changes
-the literal MCP tool list to the two meta-tools; monotonicity is stated over
-what is invokable through whatever surface is exposed, not over literal
-`tools/list` names.)
+the literal MCP tool list to meta-tools plus upfront tools; monotonicity is
+stated over what is invokable through whatever surface is exposed, not over
+literal `tools/list` names.)
 
 ### 4.3 Description overrides
 
 Global/harness tiers only (§4.2). Applied to the MCP `Tool.description` served
 to the host. The schema is never overridable (schema comes from the provider
 manifest verbatim — existing behavior).
+
+### 4.4 Upfront tool discovery
+
+`upfront` is a per-tool boolean beside `enabled`, `description` and `mode` in
+an override object. Without an explicit choice, it is `true` only for provider
+`magic-context`'s five tools: `ctx_reduce`, `ctx_expand`, `ctx_search`,
+`ctx_memory` and `ctx_note`. Every other provider/tool pair defaults to `false`,
+regardless of its exposed namespace. An explicit `upfront: false` opts out of
+the built-in default. This does not enable a disabled provider or tool; normal
+enablement policy always applies first.
+
+For each listed upfront tool, the gateway merges
+`"anthropic/alwaysLoad": true` into the tool's `_meta` object, creating the
+object if absent. Other metadata entries, including nested values, are
+preserved; an existing `anthropic/alwaysLoad` value is set to `true`. Resolving
+`upfront` to `false` leaves metadata untouched and adds no `_meta` key, preserving
+the previous JSON bytes for deferred tools. Claude Code uses this vendor key to
+[load a tool without tool search](https://code.claude.com/docs/en/mcp#mark-a-tool-to-load-upfront-or-stay-deferred);
+other hosts can ignore it.
 
 ## 5. Stickiness, refresh, and the liveness exception
 
@@ -187,11 +216,14 @@ they become a PENDING change applied per the session's `refresh` mode:
 
 When the resolved mode is `search`:
 
-- `tools/list` returns EXACTLY two tools: `tools_search` and `tools_invoke`.
-- **The outer `tools/call` dispatch accepts ONLY those two names**.
-  The resolved per-tool bindings move to a PRIVATE table reachable only through
-  `tools_invoke` — a direct `tools/call` on a resolved tool name returns the
-  same error as a nonexistent tool. No bypass.
+- `tools/list` returns `tools_search` and `tools_invoke`, plus every enabled,
+  live tool resolving to `upfront: true`, listed directly with the `_meta` key
+  described in §4.4.
+- **The outer `tools/call` dispatch accepts those meta-tool names and the
+  listed upfront tool names**. Other resolved per-tool bindings remain PRIVATE,
+  reachable only through `tools_invoke`; a direct call on a deferred tool name
+  returns the same error as a nonexistent tool. Upfront tools remain reachable
+  through both `tools_search` and `tools_invoke` as well.
 - `tools_search { query: string, limit?: number }` → ranked matches over the
   resolved enabled set: `[{ name, description, input_schema, execution_mode }]`.
   Lexical matching (name + description substring/token). Deterministic order
@@ -206,6 +238,8 @@ When the resolved mode is `search`:
 ### 6.1 Meta-tool name reservation
 
 `tools_search` and `tools_invoke` are RESERVED exposed names in every mode.
+Upfront tools pass the same reserved-name check as deferred tools, so no
+upfront tool can shadow a search meta tool.
 The collision pass treats a provider tool resolving to either name as a
 collision, and collisions keep the SHIPPED semantics: the ATTACH FAILS CLOSED
 with an error naming the colliding exposed name (the existing machinery aborts

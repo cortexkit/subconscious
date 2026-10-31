@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.54
+
+- Tool override objects accept `upfront` in user and project MCP config. Enabled upfront tools carry `_meta["anthropic/alwaysLoad"]: true` for Claude Code, preserving other metadata, and appear directly beside the search meta tools in search mode while remaining searchable and invokable through them. Magic Context's `ctx_reduce`, `ctx_expand`, `ctx_search`, `ctx_memory` and `ctx_note` default to upfront; an explicit `false` opts out. Upfront never enables a disabled provider or tool.
+
 ## 0.1.53
 
 - Upgrade to project-free protocol 0.34 route identities. Keep the shim folder separately for gateway configuration, and keep project attribution in the local session scope's selected workdir.

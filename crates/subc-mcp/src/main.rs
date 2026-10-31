@@ -1545,6 +1545,7 @@ impl<'de> Deserialize<'de> for RefreshMode {
 struct ExposedTool {
     manifest: ManifestTool,
     description: String,
+    upfront: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1573,6 +1574,7 @@ struct ToolOverride {
     enabled: Option<bool>,
     description: Option<String>,
     mode: Option<ToolMode>,
+    upfront: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1819,6 +1821,8 @@ struct RawToolOverrideObject {
     description: MaybeSet<String>,
     #[serde(default, deserialize_with = "deserialize_maybe_set")]
     mode: MaybeSet<ToolMode>,
+    #[serde(default, deserialize_with = "deserialize_maybe_set")]
+    upfront: MaybeSet<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3431,12 +3435,14 @@ fn desired_session_from_catalog(
                 .unwrap_or_else(|| default_tool_description(&exposed_name));
             let mut exposed_manifest = tool.clone();
             exposed_manifest.name = exposed_name;
+            let upfront = config.tool_upfront(&entry.module_id, &tool.name);
             tools.push(DesiredTool {
                 mode: config.tool_mode(&entry.module_id, &tool.name),
                 bare_tool: tool,
                 exposed_tool: ExposedTool {
                     manifest: exposed_manifest,
                     description,
+                    upfront,
                 },
             });
         }
@@ -3558,7 +3564,11 @@ impl SessionState {
         let inner = self.read_inner();
         match inner.surface_mode {
             SurfaceMode::Full => inner.tools.clone(),
-            SurfaceMode::Search => search_meta_tools(),
+            SurfaceMode::Search => {
+                let mut tools = search_meta_tools();
+                tools.extend(inner.tools.iter().filter(|tool| tool.upfront).cloned());
+                tools
+            }
         }
     }
 
@@ -3574,7 +3584,13 @@ impl SessionState {
                 .iter()
                 .find(|tool| tool.manifest.name == name)
                 .cloned(),
-            SurfaceMode::Search => meta_tool(name),
+            SurfaceMode::Search => meta_tool(name).or_else(|| {
+                inner
+                    .tools
+                    .iter()
+                    .find(|tool| tool.upfront && tool.manifest.name == name)
+                    .cloned()
+            }),
         }
     }
 
@@ -3582,7 +3598,11 @@ impl SessionState {
         let inner = self.read_inner();
         match inner.surface_mode {
             SurfaceMode::Full => inner.bindings.get(name).cloned(),
-            SurfaceMode::Search => None,
+            SurfaceMode::Search => inner
+                .tools
+                .iter()
+                .find(|tool| tool.upfront && tool.manifest.name == name)
+                .and_then(|_| inner.bindings.get(name).cloned()),
         }
     }
 
@@ -3673,6 +3693,16 @@ impl PromptConfig {
     }
 }
 
+// Magic Context's everyday context tools should not cost Claude Code a tool-search
+// round trip; other providers and tools remain deferred unless configured upfront.
+const DEFAULT_UPFRONT_TOOLS: &[(&str, &str)] = &[
+    ("magic-context", "ctx_reduce"),
+    ("magic-context", "ctx_expand"),
+    ("magic-context", "ctx_search"),
+    ("magic-context", "ctx_memory"),
+    ("magic-context", "ctx_note"),
+];
+
 impl GatewayConfig {
     fn facade_default() -> Self {
         let mut config = Self::default();
@@ -3740,6 +3770,14 @@ impl GatewayConfig {
             .and_then(|override_config| override_config.mode)
             .unwrap_or_default()
     }
+
+    fn tool_upfront(&self, module_id: &str, tool_name: &str) -> bool {
+        self.providers
+            .get(module_id)
+            .and_then(|provider| provider.tools.overrides.get(tool_name))
+            .and_then(|override_config| override_config.upfront)
+            .unwrap_or_else(|| DEFAULT_UPFRONT_TOOLS.contains(&(module_id, tool_name)))
+    }
 }
 
 fn default_tool_description(name: &str) -> String {
@@ -3768,6 +3806,7 @@ fn search_meta_tools() -> Vec<ExposedTool> {
                 }),
             },
             description: "Search the policy-enabled live subc tool catalog".to_owned(),
+            upfront: false,
         },
         ExposedTool {
             manifest: ManifestTool {
@@ -3785,6 +3824,7 @@ fn search_meta_tools() -> Vec<ExposedTool> {
                 }),
             },
             description: "Invoke a policy-enabled live subc tool by name".to_owned(),
+            upfront: false,
         },
     ]
 }
@@ -3999,6 +4039,12 @@ fn validate_raw_tool_config(tools: &RawToolConfig, path: &Path, prefix: &str) ->
             if matches!(object.mode, MaybeSet::Null) {
                 return Err(other_error(format!(
                     "invalid MCP config {}: {prefix}.overrides.{tool_name}.mode must be omitted instead of null",
+                    path.display()
+                )));
+            }
+            if matches!(object.upfront, MaybeSet::Null) {
+                return Err(other_error(format!(
+                    "invalid MCP config {}: {prefix}.overrides.{tool_name}.upfront must be omitted instead of null; use null for the whole override entry to delete it",
                     path.display()
                 )));
             }
@@ -4297,6 +4343,11 @@ fn merge_tool_config(effective: &mut ToolConfig, raw: RawToolConfig) {
                     MaybeSet::Null => unreachable!("validated object override mode null"),
                     MaybeSet::Value(mode) => override_config.mode = Some(mode),
                 }
+                match object.upfront {
+                    MaybeSet::Missing => {}
+                    MaybeSet::Null => unreachable!("validated object override upfront null"),
+                    MaybeSet::Value(upfront) => override_config.upfront = Some(upfront),
+                }
             }
         }
     }
@@ -4396,6 +4447,18 @@ fn merge_project_tool_config(
                         mode,
                         baseline_mode,
                     ),
+                }
+                match object.upfront {
+                    MaybeSet::Missing => {}
+                    MaybeSet::Null => unreachable!("validated object override upfront null"),
+                    MaybeSet::Value(upfront) => {
+                        provider
+                            .tools
+                            .overrides
+                            .entry(tool_name)
+                            .or_default()
+                            .upfront = Some(upfront);
+                    }
                 }
             }
         }
@@ -6278,7 +6341,7 @@ impl SubcMcpServer {
                 .await
                 .map(ToolCallOutcome::Done),
             TOOLS_INVOKE_NAME => self.handle_tools_invoke(request.arguments, context).await,
-            other => Err(unknown_tool_error(other)),
+            _ => self.call_tool_over_route(request, context).await,
         }
     }
 
@@ -6856,7 +6919,7 @@ where
 }
 
 fn mcp_tool_from_exposed(tool: &ExposedTool) -> McpTool {
-    McpTool::new(
+    let rendered = McpTool::new(
         tool.manifest.name.clone(),
         tool.description.clone(),
         Arc::new(schema_value_to_object(&tool.manifest.schema)),
@@ -6865,7 +6928,17 @@ fn mcp_tool_from_exposed(tool: &ExposedTool) -> McpTool {
         ToolAnnotations::new()
             .read_only(tool.manifest.execution_mode == ExecutionMode::Pure)
             .destructive(tool.manifest.execution_mode != ExecutionMode::Pure),
-    )
+    );
+    with_upfront_metadata(rendered, tool.upfront)
+}
+
+fn with_upfront_metadata(mut tool: McpTool, upfront: bool) -> McpTool {
+    if upfront {
+        tool.meta
+            .get_or_insert_with(Default::default)
+            .insert("anthropic/alwaysLoad".to_owned(), serde_json::json!(true));
+    }
+    tool
 }
 
 fn schema_value_to_object(value: &serde_json::Value) -> JsonObject {
@@ -8749,6 +8822,7 @@ mod tests {
                         schema: serde_json::json!({ "type": "object" }),
                     },
                     description: format!("test tool {name}"),
+                    upfront: false,
                 })
                 .collect(),
             bindings,
@@ -9127,6 +9201,187 @@ mod tests {
     }
 
     #[test]
+    fn upfront_defaults_are_scoped_to_magic_contexts_five_tools() {
+        let config = GatewayConfig::facade_default();
+        let expected = [
+            "ctx_reduce",
+            "ctx_expand",
+            "ctx_search",
+            "ctx_memory",
+            "ctx_note",
+        ];
+        assert_eq!(DEFAULT_UPFRONT_TOOLS.len(), expected.len());
+        for name in expected {
+            assert!(config.tool_upfront("magic-context", name), "{name}");
+            assert!(!config.tool_upfront("other-provider", name), "{name}");
+        }
+        for name in [
+            "ctx_status",
+            "ctx_reduce_extra",
+            "reduce",
+            "tools_search",
+            "",
+        ] {
+            assert!(!config.tool_upfront("magic-context", name), "{name}");
+        }
+    }
+
+    #[test]
+    fn upfront_tools_cannot_shadow_reserved_search_meta_tools() {
+        let config = compose_test_config(
+            Some(
+                r#"{"version":1,"providers":{"example":{"namespace":"tools","tools":{"overrides":{
+                "search":{"upfront":true},"invoke":{"upfront":true},"read":{"upfront":true}
+            }}}}}"#,
+            ),
+            None,
+            DEFAULT_HARNESS,
+        );
+        let entry = CatalogEntry::new(
+            "example",
+            vec![ProviderRole::ToolProvider {
+                tools: ["search", "invoke", "read"]
+                    .into_iter()
+                    .map(|name| ManifestTool {
+                        name: name.to_owned(),
+                        description: None,
+                        execution_mode: ExecutionMode::Pure,
+                        schema: serde_json::json!({"type": "object"}),
+                    })
+                    .collect(),
+                identity_scope: Vec::new(),
+                concurrency: subc_protocol::manifest::Concurrency::Serial,
+                emits_push: false,
+                sub_supervises: false,
+            }],
+            Vec::new(),
+        );
+        let desired = desired_session_from_catalog(&config, &[entry]).unwrap();
+        let tools = &desired.providers[0].tools;
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].exposed_tool.manifest.name, "tools_read");
+        assert!(tools[0].exposed_tool.upfront);
+    }
+
+    #[test]
+    fn upfront_overrides_compose_across_user_project_and_harness_layers() {
+        let user = r#"{
+            "version": 1,
+            "providers": {"magic-context": {"enabled": true, "tools": {"overrides": {
+                "ctx_reduce": {"upfront": false},
+                "ctx_expand": {"upfront": false},
+                "custom": {"upfront": true}
+            }}}},
+            "harness": {"mcp:generic": {"providers": {"magic-context": {"tools": {"overrides": {
+                "custom": {"upfront": false}
+            }}}}}}
+        }"#;
+        let baseline = compose_test_config(Some(user), None, DEFAULT_HARNESS);
+        assert!(!baseline.tool_upfront("magic-context", "ctx_reduce"));
+        assert!(!baseline.tool_upfront("magic-context", "custom"));
+        let config = compose_test_config(
+            Some(user),
+            Some(
+                r#"{
+                "version": 1,
+                "providers": {"magic-context": {"tools": {"overrides": {
+                    "ctx_reduce": {"upfront": true},
+                    "ctx_expand": {"enabled": true},
+                    "ctx_search": {"upfront": false},
+                    "custom": {"upfront": true}
+                }}}},
+                "harness": {"mcp:generic": {"providers": {"magic-context": {"tools": {"overrides": {
+                    "custom": {"upfront": false}
+                }}}}}}
+            }"#,
+            ),
+            DEFAULT_HARNESS,
+        );
+        assert!(config.tool_upfront("magic-context", "ctx_reduce"));
+        assert!(!config.tool_upfront("magic-context", "ctx_expand"));
+        assert!(!config.tool_upfront("magic-context", "ctx_search"));
+        assert!(!config.tool_upfront("magic-context", "custom"));
+    }
+
+    #[test]
+    fn upfront_null_uses_whole_override_deletion_not_field_reset() {
+        let err = parse_gateway_config_doc(
+            r#"{"version":1,"providers":{"magic-context":{"tools":{"overrides":{
+                "ctx_reduce":{"upfront":null}
+            }}}}}"#,
+            Path::new("upfront-null.jsonc"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("upfront must be omitted instead of null"),
+            "{err}"
+        );
+
+        let user = r#"{"version":1,"providers":{"magic-context":{"enabled":true,"tools":{"overrides":{
+            "ctx_reduce":{"upfront":false},"custom":{"upfront":true}
+        }}}}}"#;
+        let deletion = r#"{"version":1,"providers":{"magic-context":{"tools":{"overrides":{
+            "ctx_reduce":null,"custom":null
+        }}}}}"#;
+        let config = compose_test_config(Some(user), Some(deletion), DEFAULT_HARNESS);
+        assert!(config.tool_upfront("magic-context", "ctx_reduce"));
+        assert!(!config.tool_upfront("magic-context", "custom"));
+
+        let user_with_harness = r#"{"version":1,"providers":{"magic-context":{"tools":{"overrides":{
+            "ctx_reduce":{"upfront":false}
+        }}}},"harness":{"mcp:generic":{"providers":{"magic-context":{"tools":{"overrides":{
+            "ctx_reduce":null
+        }}}}}}}"#;
+        let config = compose_test_config(Some(user_with_harness), None, DEFAULT_HARNESS);
+        assert!(config.tool_upfront("magic-context", "ctx_reduce"));
+    }
+
+    #[test]
+    fn upfront_rendering_adds_metadata_without_changing_deferred_tool_bytes() {
+        let mut exposed = ExposedTool {
+            manifest: ManifestTool {
+                name: "example_read".to_owned(),
+                description: None,
+                execution_mode: ExecutionMode::Pure,
+                schema: serde_json::json!({"type": "object"}),
+            },
+            description: "Read an example".to_owned(),
+            upfront: false,
+        };
+        let legacy_bytes = r#"{"name":"example_read","description":"Read an example","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true,"destructiveHint":false}}"#;
+        assert_eq!(
+            serde_json::to_string(&mcp_tool_from_exposed(&exposed)).unwrap(),
+            legacy_bytes
+        );
+        exposed.upfront = true;
+        let rendered = mcp_tool_from_exposed(&exposed);
+        assert_eq!(
+            serde_json::to_value(&rendered).unwrap()["_meta"],
+            serde_json::json!({"anthropic/alwaysLoad": true})
+        );
+
+        let existing = rendered.with_meta(
+            serde_json::from_value(serde_json::json!({
+                "vendor/extra": {"nested": [1, 2]}, "anthropic/alwaysLoad": false
+            }))
+            .unwrap(),
+        );
+        let untouched = serde_json::to_vec(&existing).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&with_upfront_metadata(existing.clone(), false)).unwrap(),
+            untouched
+        );
+        let merged = with_upfront_metadata(existing, true);
+        assert_eq!(
+            serde_json::to_value(merged).unwrap()["_meta"],
+            serde_json::json!({
+                "vendor/extra": {"nested": [1, 2]}, "anthropic/alwaysLoad": true
+            })
+        );
+    }
+
+    #[test]
     fn schema_rejects_reserved_refresh_values_unknown_fields_and_object_nulls() {
         let reserved = parse_gateway_config_doc(
             r#"{ "version": 1, "refresh": "on-hard" }"#,
@@ -9145,6 +9400,7 @@ mod tests {
             r#"{ "version": 1, "providers": { "aft": { "unknown": true } } }"#,
             r#"{ "version": 1, "providers": { "aft": { "tools": { "unknown": true } } } }"#,
             r#"{ "version": 1, "providers": { "aft": { "tools": { "overrides": { "read": { "unknown": true } } } } } }"#,
+            r#"{ "version": 1, "providers": { "aft": { "tools": { "overrides": { "read": { "upfront": true, "unknown": true } } } } } }"#,
         ];
         for doc in unknown_field_docs {
             let err = parse_gateway_config_doc(doc, Path::new("unknown.jsonc"))
@@ -9625,6 +9881,7 @@ mod tests {
                         exposed_tool: ExposedTool {
                             manifest,
                             description: format!("test tool {name}"),
+                            upfront: false,
                         },
                         mode: ToolMode::Forward,
                     }

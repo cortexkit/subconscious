@@ -2161,6 +2161,107 @@ async fn mcp_tools_list_returns_stub_manifest_tools() {
 }
 
 #[tokio::test]
+async fn mcp_upfront_tools_are_listed_and_callable_in_full_and_search_modes() {
+    for mode in ["full", "search"] {
+        let user_config = json!({
+            "version": 1,
+            "surfaceMode": mode,
+            "providers": {
+                "magic-context": {"enabled": true, "namespace": "ctx"},
+                "aft": {"tools": {"overrides": {
+                    "read": {"upfront": false},
+                    "bash": {"enabled": false, "upfront": true}
+                }}}
+            }
+        })
+        .to_string();
+        let project_config = r#"{
+            "version": 1,
+            "providers": {"aft": {"tools": {"overrides": {"read": {"upfront": true}}}}}
+        }"#;
+        let harness = McpHarness::start_configured(
+            &format!("mcp-upfront-{mode}"),
+            vec![
+                StubProvider::new("aft", &[("FAKE_AFT_TOOLS", "read,write,bash")]),
+                StubProvider::new(
+                    "magic-context",
+                    &[(
+                        "FAKE_AFT_TOOLS",
+                        "ctx_reduce,ctx_expand,ctx_search,ctx_memory,ctx_note,ctx_status",
+                    )],
+                ),
+            ],
+            Some(&user_config),
+            Some(project_config),
+        )
+        .await;
+        let listed = harness.client.peer().list_tools(None).await.unwrap();
+        let upfront_names = [
+            "aft_read",
+            "ctx_ctx_reduce",
+            "ctx_ctx_expand",
+            "ctx_ctx_search",
+            "ctx_ctx_memory",
+            "ctx_ctx_note",
+        ];
+        for name in upfront_names {
+            let tool = listed
+                .tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("missing upfront tool {name} in {mode} mode"));
+            assert_eq!(
+                serde_json::to_value(tool).unwrap()["_meta"],
+                json!({"anthropic/alwaysLoad": true})
+            );
+        }
+        assert!(!listed.tools.iter().any(|tool| tool.name == "aft_bash"));
+        if mode == "full" {
+            assert_eq!(listed.tools.len(), upfront_names.len() + 2);
+            for name in ["aft_write", "ctx_ctx_status"] {
+                let tool = listed.tools.iter().find(|tool| tool.name == name).unwrap();
+                assert!(tool.meta.is_none());
+            }
+        } else {
+            assert_eq!(listed.tools.len(), upfront_names.len() + 2);
+            for name in ["tools_search", "tools_invoke"] {
+                assert!(listed
+                    .tools
+                    .iter()
+                    .any(|tool| tool.name == name && tool.meta.is_none()));
+            }
+            let mut search_args = JsonObject::new();
+            search_args.insert("query".to_owned(), json!("aft_read"));
+            let found = harness
+                .client
+                .peer()
+                .call_tool(CallToolRequestParams::new("tools_search").with_arguments(search_args))
+                .await
+                .unwrap();
+            assert_eq!(result_json(&found)[0]["name"], "aft_read");
+            let mut invoke_args = JsonObject::new();
+            invoke_args.insert("name".to_owned(), json!("aft_read"));
+            let invoked = harness
+                .client
+                .peer()
+                .call_tool(CallToolRequestParams::new("tools_invoke").with_arguments(invoke_args))
+                .await
+                .unwrap();
+            assert_eq!(invoked.is_error, Some(false));
+        }
+        let direct = harness
+            .client
+            .peer()
+            .call_tool(CallToolRequestParams::new("aft_read"))
+            .await
+            .unwrap();
+        assert_eq!(direct.is_error, Some(false));
+        assert_eq!(result_text(&direct), "fake-aft tool read called with {}");
+        harness.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn mcp_tools_call_returns_result_and_stub_receives_route_body() {
     let harness = McpHarness::start("mcp-call", &[]).await;
 

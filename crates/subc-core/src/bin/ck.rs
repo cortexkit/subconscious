@@ -1781,16 +1781,12 @@ impl CkClient {
         }
     }
 
-    async fn route_open_management(
-        &mut self,
-        module_id: &str,
-        project_root: PathBuf,
-    ) -> Result<RouteHandle, CkError> {
+    async fn route_open_management(&mut self, module_id: &str) -> Result<RouteHandle, CkError> {
         let request = ClientControlRequest::RouteOpen {
             target: RouteTarget::ManagementSurface {
                 module_id: module_id.to_string(),
             },
-            identity: BindIdentity::new(project_root, CK_HARNESS, "quota"),
+            identity: BindIdentity::new(CK_HARNESS, "quota"),
             consumer_identity: None,
             consumer_capabilities: None,
             role_versions: None,
@@ -1907,8 +1903,7 @@ async fn module_inspect(
     body: Value,
     json_output: JsonOutput,
 ) -> Result<(), CkError> {
-    let root = env::current_dir().map_err(|e| CkError::Message(e.to_string()))?;
-    let route = client.route_open_management("inspect", root).await.map_err(|error| {
+    let route = client.route_open_management("inspect").await.map_err(|error| {
         match &error {
             CkError::Rejected { code: Some(code), .. } if matches!(code.as_str(), "unknown_module" | "target_unavailable" | "module_warming" | "module_removed") =>
                 CkError::Message("inspect is not installed or running; use ck setup or configure the inspect module in daemon config".into()),
@@ -5150,11 +5145,7 @@ async fn quota(
     subc: Option<&Path>,
 ) -> Result<(), CkError> {
     ensure_quota_module_registered(client).await?;
-    let project_root = env::current_dir()
-        .map_err(|source| CkError::Message(format!("current directory: {source}")))?;
-    let route = client
-        .route_open_management(USAGE_MODULE, project_root)
-        .await?;
+    let route = client.route_open_management(USAGE_MODULE).await?;
     let body = client
         .route_request_value(route, json!({ "method": USAGE_METHOD, "params": {} }))
         .await?;
@@ -5189,10 +5180,7 @@ async fn quota(
         json_output.print(&body)?;
     } else {
         print_quota_table(&providers, provider_filter, verbose, redact, subc);
-        let project_root = env::current_dir()
-            .map_err(|source| CkError::Message(format!("current directory: {source}")))?;
-        let value_lines =
-            subscription_value_lines(client, project_root, provider_filter, verbose).await;
+        let value_lines = subscription_value_lines(client, provider_filter, verbose).await;
         if !value_lines.is_empty() {
             // A blank line sets the section apart from the quota table's last row.
             println!();
@@ -5226,16 +5214,12 @@ enum SubscriptionValueFetch {
 /// other failure becomes one `unavailable (...)` line.
 async fn subscription_value_lines(
     client: &mut CkClient,
-    project_root: PathBuf,
     provider_filter: Option<&str>,
     verbose: bool,
 ) -> Vec<String> {
-    let fetch = time::timeout(
-        SUBSCRIPTION_VALUE_TIMEOUT,
-        fetch_subscription_value(client, project_root),
-    )
-    .await
-    .unwrap_or_else(|_| SubscriptionValueFetch::Failed("timed out".to_string()));
+    let fetch = time::timeout(SUBSCRIPTION_VALUE_TIMEOUT, fetch_subscription_value(client))
+        .await
+        .unwrap_or_else(|_| SubscriptionValueFetch::Failed("timed out".to_string()));
     match fetch {
         SubscriptionValueFetch::NotRegistered => Vec::new(),
         SubscriptionValueFetch::Failed(reason) => {
@@ -5250,10 +5234,7 @@ async fn subscription_value_lines(
     }
 }
 
-async fn fetch_subscription_value(
-    client: &mut CkClient,
-    project_root: PathBuf,
-) -> SubscriptionValueFetch {
+async fn fetch_subscription_value(client: &mut CkClient) -> SubscriptionValueFetch {
     let catalog = match client.catalog_list().await {
         Ok(catalog) => catalog,
         Err(error) => return SubscriptionValueFetch::Failed(subscription_value_error(&error)),
@@ -5272,7 +5253,7 @@ async fn fetch_subscription_value(
         .saturating_sub(SUBSCRIPTION_VALUE_WINDOW.as_millis() as i64)
         .max(0);
     let route = match client
-        .route_open_management(SUBSCRIPTION_VALUE_MODULE_ID, project_root)
+        .route_open_management(SUBSCRIPTION_VALUE_MODULE_ID)
         .await
     {
         Ok(route) => route,

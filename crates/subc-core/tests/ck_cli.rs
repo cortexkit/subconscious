@@ -237,7 +237,8 @@ async fn daemon_reports_and_renders_route_counters() {
         format!(
             // The in-process test daemon is built without a machine id, so the
             // line says the id is not reported rather than omitting it.
-            "daemon test-subc · pid {} · up {uptime} · 1 clients · no frame drops in the last 10 minutes\nmachine id: not reported by this daemon\n",
+            "daemon {} · pid {} · up {uptime} · 1 clients · no frame drops in the last 10 minutes\nmachine id: not reported by this daemon\n",
+            common::TEST_DAEMON_VER,
             std::process::id()
         )
     });
@@ -6550,11 +6551,7 @@ where
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
-            identity: BindIdentity::new(
-                std::env::current_dir().unwrap(),
-                "ck-deadline-test".to_string(),
-                format!("session-{corr}"),
-            ),
+            identity: BindIdentity::new("ck-deadline-test".to_string(), format!("session-{corr}")),
             consumer_identity: None,
             consumer_capabilities: None,
             role_versions: None,

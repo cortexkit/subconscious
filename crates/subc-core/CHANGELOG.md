@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.154
+
+- Upgrade the daemon to 0.39 and Rust wire crates to their project-free identity releases. CLI management routes no longer claim the current directory as a project. For project-free openers, project attribution comes from an admitted session scope stamp.
+- `subc-probe` no longer sends a project root. Its old `--root` flag is accepted but ignored; the probe opens unscoped routes with no project.
+
 ## 0.20.153
 
 - Show memory including child processes and its source in `ck module status`. Versioned `ckni` JSON retains the optional subtree reading without changing the existing process counters.

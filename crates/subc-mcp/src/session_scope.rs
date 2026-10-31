@@ -256,9 +256,7 @@ impl LocalSessionScope {
             .get_or_init(|| async {
                 let _guard = gate.lock().await;
                 if let Err(error) = self.initialize(subc, state, session, peer).await {
-                    tracing::warn!(
-                        "session attribution failed; using unscoped provider routes: {error}"
-                    );
+                    let _ = session.unscoped_reason.set(error.to_string());
                 }
             })
             .await;
@@ -276,7 +274,9 @@ impl LocalSessionScope {
             .get()
             .ok_or_else(|| other_error("no registered session scope owner"))?;
         if !daemon_supports_workdir(subc).await? || !owner.supported {
-            tracing::warn!("session attribution skipped; using unscoped provider routes: daemon lacks scope-workdir/v1 or scope.apply support");
+            let _ = session
+                .unscoped_reason
+                .set("daemon lacks scope-workdir/v1 or scope.apply support".into());
             return Ok(());
         }
         let workdir = session_workdir(peer, &self.fallback).await?;
@@ -407,23 +407,14 @@ async fn session_workdir(peer: &Peer<RoleServer>, fallback: &Path) -> Result<Str
         .ok_or_else(|| other_error("session workdir is not UTF-8"))
 }
 
-// Legacy providers must receive the same bind body as before scope attribution
-// existed. Only a provider that opted into folder attribution gets our selector.
-pub(super) fn provider_scope(
-    selector: Option<&ScopeSelector>,
-    entry: Option<&CatalogEntry>,
-) -> Option<ScopeSelector> {
-    entry
-        .filter(|entry| {
-            entry.capabilities.as_ref().is_some_and(|capabilities| {
-                capabilities
-                    .provides
-                    .iter()
-                    .any(|capability| capability == "scope-workdir/v1")
-            })
-        })
-        .and(selector)
-        .cloned()
+// Pass the available local session selector to every desired tool provider
+// opened during reconciliation, regardless of scope-workdir/v1. The daemon uses
+// the admitted stamp to fill compatibility identity fields for targets without
+// bind-no-project/v1, before stripping stamp workdir/project_id for targets
+// without scope-workdir/v1. A rootless, unscoped opener gets `/` only in that
+// compatibility encoding.
+pub(super) fn provider_scope(selector: Option<&ScopeSelector>) -> Option<ScopeSelector> {
+    selector.cloned()
 }
 
 fn file_uri_path(uri: &str) -> Result<PathBuf> {
@@ -684,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn local_selector_requires_provider_workdir_opt_in() {
+    fn local_selector_is_used_for_all_providers() {
         let selector = ScopeSelector::new(
             Principal::Reserved {
                 module_id: "subc-mcp".into(),
@@ -692,25 +683,8 @@ mod tests {
             "mcp-session",
             Some(1),
         );
-        let mut entry = CatalogEntry::new("provider", vec![], vec![]);
-        assert_eq!(provider_scope(Some(&selector), Some(&entry)), None);
-        entry.capabilities = Some(subc_protocol::manifest::CapabilityDeclarations {
-            provides: vec!["scopes/v1".into()],
-            requires: vec![],
-            must_never_reach: vec![],
-        });
-        assert_eq!(provider_scope(Some(&selector), Some(&entry)), None);
-        entry
-            .capabilities
-            .as_mut()
-            .unwrap()
-            .provides
-            .push("scope-workdir/v1".into());
-        assert_eq!(
-            provider_scope(Some(&selector), Some(&entry)),
-            Some(selector)
-        );
-        assert_eq!(provider_scope(None, Some(&entry)), None);
+        assert_eq!(provider_scope(Some(&selector)), Some(selector));
+        assert_eq!(provider_scope(None), None);
     }
 
     #[test]

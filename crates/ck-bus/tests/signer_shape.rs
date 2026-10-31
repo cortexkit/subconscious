@@ -202,7 +202,7 @@ async fn signer_shape_harness_half_matches_the_golden_pair() {
                 RouteTarget::ManagementSurface {
                     module_id: "claustrum".to_string(),
                 },
-                BindIdentity::new(run.root.path(), "ck-bus-acceptance", "signer-shape"),
+                BindIdentity::new("ck-bus-acceptance", "signer-shape"),
                 request,
                 CallOptions::default(),
             )

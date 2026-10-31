@@ -207,7 +207,7 @@ async fn declared_consumer_capabilities_reach_provider_bind_on_real_daemon() {
     consumer
         .open_route(
             tool_target("subc-client-rs-capability-provider"),
-            BindIdentity::new(PathBuf::from("/tmp/project"), "tests", "capabilities"),
+            BindIdentity::new("tests", "capabilities"),
             opts,
         )
         .await
@@ -1343,11 +1343,10 @@ async fn module_handle_set_ready_controls_new_binds_without_interrupting_health_
     let mut client = connect_authed_client(&daemon.connection_file)
         .await
         .unwrap();
-    let project = unique_temp_dir("subc-client-rs-readiness-project");
     let open = json!({
         "op": "route.open",
         "target": tool_target(module_id),
-        "identity": BindIdentity::new(project.keep(), "readiness-client", "warmup"),
+        "identity": BindIdentity::new("readiness-client", "warmup"),
     });
     let mut route = None;
 
@@ -2813,8 +2812,7 @@ fn fast_subscribe_options() -> SubscribeOptions {
 }
 
 fn consumer_identity(session: &str) -> BindIdentity {
-    let project_root = unique_temp_dir("subc-client-rs-consumer-project");
-    BindIdentity::new(project_root.keep(), "subc-client-rs-consumer-test", session)
+    BindIdentity::new("subc-client-rs-consumer-test", session)
 }
 
 fn tool_target(module_id: &str) -> RouteTarget {
@@ -3041,7 +3039,6 @@ async fn open_route<S>(stream: &mut S, module_id: &str, corr: u64) -> (u16, u32)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let project_root = unique_temp_dir("subc-client-rs-project");
     let response = control_rpc_on_stream(
         stream,
         corr,
@@ -3050,7 +3047,7 @@ where
             "target": RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
-            "identity": BindIdentity::new(project_root.keep(), "subc-client-rs-test", "clean-api"),
+            "identity": BindIdentity::new("subc-client-rs-test", "clean-api"),
         }),
     )
     .await;
@@ -4456,6 +4453,44 @@ async fn a_carriers_scoped_open_is_admitted_and_the_provider_bind_carries_the_sc
         "the bind names the carrier as the opener"
     );
 
+    consumer.close().await;
+    harness.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rootless_scoped_open_fills_legacy_target_root_from_stripped_stamp_workdir() {
+    let mut harness = start_scope_harness().await;
+    // The daemon stores a scope's workdir in its canonical project-root form,
+    // which on Windows is not `std::fs::canonicalize`'s `\\?\` form.
+    let workdir = cortexkit_paths::ProjectRootId::from_path_allowing_missing(&harness._temp_dir)
+        .unwrap()
+        .into_path_buf();
+    let mut record = scope_record("project-session", 1);
+    record["workdir"] = json!(workdir);
+    record["project_id"] = json!("pj-scoped-project");
+    harness.sync(json!([record])).await;
+    let consumer = harness.connect().await;
+    let identity = consumer_identity("project-session");
+    let opener = serde_json::to_value(&identity).unwrap();
+    assert!(opener.get("project_root").is_none());
+    assert!(opener.get("project_id").is_none());
+    consumer
+        .open_route_scoped(
+            tool_target(SCOPE_PROVIDER),
+            identity,
+            scope_selector("project-session", 1),
+            harness.carrier_options(),
+        )
+        .await
+        .unwrap();
+    let attach = wait_for_event(&harness.provider_events, EVENT_TIMEOUT, |event| {
+        event["kind"] == "attach"
+    })
+    .await;
+    assert_eq!(attach["identity"]["project_root"], json!(workdir));
+    assert_eq!(attach["identity"]["project_id"], "pj-scoped-project");
+    assert!(attach["scope"].get("workdir").is_none());
+    assert!(attach["scope"].get("project_id").is_none());
     consumer.close().await;
     harness.stop();
 }
@@ -6072,7 +6107,7 @@ fn a_route_bind_request_is_built_through_its_constructor_and_setters() {
     let target = RouteTarget::ToolProvider {
         module_id: "aft".to_string(),
     };
-    let identity = BindIdentity::new("/tmp/project", "opencode", "session-1");
+    let identity = BindIdentity::new("opencode", "session-1");
 
     let bare = RouteBindRequest::new(handle, target.clone(), identity.clone());
     assert_eq!(bare.handle, handle);
@@ -6163,7 +6198,7 @@ async fn every_operation_on_a_detached_route_handle_fails_as_a_stale_route() {
             RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
-            BindIdentity::new(temp_dir.join("project"), "test", "detached"),
+            BindIdentity::new("test", "detached"),
             fast_call_options(),
         )
         .await
@@ -6469,8 +6504,7 @@ async fn a_served_modules_on_bind_receives_the_daemons_scope_stamp() {
     let target = RouteTarget::ToolProvider {
         module_id: SDK_SCOPE_PROVIDER.to_string(),
     };
-    let identity =
-        |session: &str| BindIdentity::new(run._temp_dir.join("project"), "test", session);
+    let identity = |session: &str| BindIdentity::new("test", session);
     fs::create_dir_all(run._temp_dir.join("project")).unwrap();
     consumer
         .open_route_scoped(

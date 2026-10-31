@@ -751,9 +751,12 @@ describe("SubcProvider serve loop", () => {
       const request = bindRequests[0]!;
       expect(request.handle).toBe(provider.liveRoutes.get(42)!);
       expect(request.target).toEqual({ kind: "tool_provider", module_id: "aft-tools" });
-      expect(request.identity).toEqual({
+      // The goldens are protocol 0.34 binds, which carry no project fields.
+      // The provider passes the identity through as received. This SDK never
+      // declares `bind-no-project/v1`, so a real daemon 0.39 always fills
+      // `project_root` for it, which is why `BindIdentity` still requires it.
+      expect(request.identity as unknown).toEqual({
         harness: "opencode",
-        project_root: "/tmp/subc/project",
         session: "session-0001",
       });
       expect(request.principal).toEqual(

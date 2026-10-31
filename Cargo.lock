@@ -318,7 +318,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.4.17"
+version = "0.4.18"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "ck-inspect"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "ck-inspect",
@@ -369,7 +369,7 @@ dependencies = [
 
 [[package]]
 name = "ck-ui"
-version = "0.2.11"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "ck-ui",
@@ -518,7 +518,7 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-testkit"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -874,7 +874,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1511,7 +1511,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-stdio-adapter"
-version = "0.1.18"
+version = "0.2.0"
 dependencies = [
  "cortexkit-log",
  "cortexkit-test-support",
@@ -2157,7 +2157,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2556,9 +2556,10 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.32.20"
+version = "0.33.0"
 dependencies = [
  "async-trait",
+ "cortexkit-paths",
  "cortexkit-test-support",
  "serde",
  "serde_json",
@@ -2576,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.33.7"
+version = "0.34.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2585,7 +2586,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.153"
+version = "0.20.154"
 dependencies = [
  "async-trait",
  "base64",
@@ -2621,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.38.10"
+version = "0.39.0"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -2683,7 +2684,7 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.52"
+version = "0.1.53"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -2705,7 +2706,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.25"
+version = "0.1.26"
 dependencies = [
  "cortexkit-test-support",
  "libc",
@@ -2730,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.33.6"
+version = "0.34.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2738,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.14.1"
+version = "0.15.0"
 dependencies = [
  "cortexkit-test-support",
  "getrandom 0.2.17",
@@ -2810,7 +2811,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

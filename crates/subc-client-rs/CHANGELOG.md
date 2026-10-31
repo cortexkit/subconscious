@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.33.0
+
+- Breaking: route opens send project-free protocol 0.34 identities. For these openers, project attribution comes from the admitted session scope stamp.
+- The local version policy refuses route opens with `CallError::DaemonTooOld` (`daemon_too_old`) unless the connection-file version is an exact numeric `major.minor.patch` version at least 0.39.0. Older and unrecognized versions, including prerelease and build suffixes, are refused before the attempt is queued for writing. The version is retained from the connection-file information used for the authenticated connection; the handshake authenticates the daemon ID, not the version metadata.
+- Bind readers ignore legacy project fields. The serve helper does not declare `bind-no-project/v1` for modules; each module opts in after migrating its project reads.
+
 ## 0.32.20
 
 - Once a request has been handed to the writer, a missing pending entry is not proof that it was never written: a reply (`settle_pending`), a connection drop or `close_sync` may have removed it and still be settling it. At the reply deadline or consumer close in that gap, the call now returns outcome-unknown instead of not-sent with `never_forwarded`, so the SDK no longer retries a request the writer may have written, and callers no longer see it reported as never forwarded. If the waiter finds the entry still present and not written, the call keeps its not-sent result. On close this is conservative: an unwritten entry that `close_sync` already drained also reports outcome-unknown.

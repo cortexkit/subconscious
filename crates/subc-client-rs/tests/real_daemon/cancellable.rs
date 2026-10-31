@@ -69,7 +69,7 @@ impl HeldCall {
             .unwrap();
         let project = temp.join("project");
         fs::create_dir_all(&project).unwrap();
-        let identity = BindIdentity::new(project, "cancellable", "test");
+        let identity = BindIdentity::new("cancellable", "test");
         let opening = consumer.open_route(target(), identity.clone(), CallOptions::default());
         let binding = async {
             let bind = read_frame_timeout(&mut provider).await;

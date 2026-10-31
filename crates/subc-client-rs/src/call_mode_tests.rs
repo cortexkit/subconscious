@@ -36,7 +36,7 @@ async fn decoded_bind(scope: Option<serde_json::Value>, mode: Option<&str>) -> R
         "route_channel": 7,
         "epoch": 1,
         "target": RouteTarget::ToolProvider { module_id: "provider".to_string() },
-        "identity": BindIdentity::new("/tmp/project", "test", "mode"),
+        "identity": BindIdentity::new("test", "mode"),
     });
     if let Some(scope) = scope {
         body["scope"] = scope;
@@ -142,7 +142,7 @@ fn bind_builders_derive_scope_modes_and_allow_explicit_override() {
             RouteTarget::ToolProvider {
                 module_id: "provider".to_string(),
             },
-            BindIdentity::new("/tmp/project", "test", "mode"),
+            BindIdentity::new("test", "mode"),
         )
     };
     assert_eq!(bind().call_mode, CallMode::Classic);
@@ -172,7 +172,7 @@ async fn module_harness_preserves_explicit_call_mode() {
         RouteTarget::ToolProvider {
             module_id: "provider".to_string(),
         },
-        BindIdentity::new("/tmp/project", "test", "mode"),
+        BindIdentity::new("test", "mode"),
     )
     .with_scope(serde_json::from_value(scope(json!({ "run_id": "run-a" }))).unwrap())
     .with_call_mode(CallMode::Flow);

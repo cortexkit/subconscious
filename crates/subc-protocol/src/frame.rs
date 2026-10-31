@@ -1,6 +1,6 @@
 //! The complete wire frame: the decoded envelope header plus its opaque body.
 //!
-//! `Frame` is the natural companion to [`EnvelopeHeader`](crate::EnvelopeHeader)
+//! `Frame` is the natural companion to [`EnvelopeHeader`]
 //! — a header and the `len` opaque body bytes that follow it. It is pure data
 //! (no async, no tokio); the async read/write loop lives in `subc-transport`,
 //! the crate that owns the authenticated stream.

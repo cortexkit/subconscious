@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.0
+
+- Breaking: `manifest()` now returns the protocol 0.34 `ModuleManifest`; the internal module handler uses Rust client 0.33. Test openers use project-free identities. Inspection admission remains based on the daemon-stamped principal or an owner-authorized flow scope, not a caller-supplied folder.
+
 ## 0.1.6
 
 - Name stripped macOS profile frames using a module's UUID-indexed dSYM bundles. Symbolization shares the sampling deadline, is bounded to 256 addresses per image, and preserves image offsets when symbols are unavailable. Merge named stacks before ranking and applying reply limits.

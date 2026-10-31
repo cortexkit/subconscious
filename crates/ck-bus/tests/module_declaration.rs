@@ -531,7 +531,7 @@ async fn assert_stub_principal_controls(run: &AcceptanceRun) {
         target: RouteTarget::ManagementSurface {
             module_id: "claustrum".to_string(),
         },
-        identity: BindIdentity::new(&*run.root, "ck-bus-acceptance", "principal-control"),
+        identity: BindIdentity::new("ck-bus-acceptance", "principal-control"),
         consumer_identity,
         consumer_capabilities: None,
         role_versions: None,

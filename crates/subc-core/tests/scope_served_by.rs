@@ -182,7 +182,7 @@ impl Fixture {
                 RouteTarget::ToolProvider {
                     module_id: PROVIDER.into(),
                 },
-                BindIdentity::new(self.root.path(), "served-test", "session"),
+                BindIdentity::new("served-test", "session"),
                 ScopeSelector::new(
                     Principal::Reserved {
                         module_id: OWNER.into(),

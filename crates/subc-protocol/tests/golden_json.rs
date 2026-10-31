@@ -682,8 +682,9 @@ fn bind_identity_build_class_matches_golden_json_and_older_readers_drop_it() {
         .get("build_class")
         .is_none());
 
-    // A reader built before the field, which like BindIdentity has no
-    // deny_unknown_fields, decodes the identity and drops the claim.
+    // A reader predating build_class still ignores it on a legacy-shaped
+    // identity. Protocol 0.34 itself is breaking: these readers require the
+    // project root supplied by the daemon's transitional projection.
     #[derive(Deserialize, Debug, PartialEq)]
     struct OlderBindIdentity {
         project_root: PathBuf,
@@ -692,11 +693,12 @@ fn bind_identity_build_class_matches_golden_json_and_older_readers_drop_it() {
         #[serde(default)]
         project_id: Option<String>,
     }
-    let wire: Value = serde_json::from_str(
+    let mut wire: Value = serde_json::from_str(
         &fs::read_to_string(golden_path("bind_identity_with_build_class")).unwrap(),
     )
     .unwrap();
     assert_eq!(wire["build_class"], "production");
+    wire["project_root"] = serde_json::json!("/tmp/subc/project");
     let older: OlderBindIdentity = serde_json::from_value(wire).unwrap();
     assert_eq!(older.harness, "opencode");
 
@@ -923,16 +925,17 @@ fn principal_outside_scope_records_remains_forward_compatible() {
 }
 
 #[test]
-fn legacy_bind_identity_golden_without_project_id_decodes() {
+fn bind_identity_golden_has_no_project_fields() {
     let value: Value = serde_json::from_str(
         &fs::read_to_string(golden_path("bind_identity")).expect("golden identity is readable"),
     )
     .expect("golden identity is JSON");
     assert!(value.get("project_id").is_none());
+    assert!(value.get("project_root").is_none());
 
     let identity: BindIdentity =
-        serde_json::from_value(value).expect("legacy identity without project_id decodes");
-    assert_eq!(identity.project_id, None);
+        serde_json::from_value(value).expect("project-free identity decodes");
+    assert_eq!(identity, bind_identity());
 }
 
 #[derive(Deserialize)]
@@ -1375,11 +1378,7 @@ fn golden_path(name: &str) -> PathBuf {
 }
 
 fn bind_identity() -> BindIdentity {
-    BindIdentity::new(
-        PathBuf::from("/tmp/subc/project"),
-        "opencode".to_string(),
-        "session-0001".to_string(),
-    )
+    BindIdentity::new("opencode".to_string(), "session-0001".to_string())
 }
 
 fn error_body() -> ErrorBody {

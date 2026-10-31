@@ -1910,7 +1910,6 @@ async fn open_route_with_identity<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let project_root = unique_temp_dir("daemon-config-project");
     match control_rpc_result_on_stream(
         stream,
         corr,
@@ -1919,7 +1918,6 @@ where
                 module_id: module_id.to_string(),
             },
             identity: BindIdentity::new(
-                project_root.path().to_path_buf(),
                 "daemon-config-test".to_string(),
                 format!("session-{corr}"),
             ),

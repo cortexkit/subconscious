@@ -117,7 +117,7 @@ impl ModuleHandler for Harness {
             let target = RouteTarget::ToolProvider {
                 module_id: request["peer"].as_str().unwrap().into(),
             };
-            let reply = consumer.call(target, BindIdentity::new(std::env::temp_dir(), "operator-harness", "forward"), serde_json::to_vec(&json!({"summary":summary, "mode":request["peer_mode"].as_str().unwrap_or("confirm")})).unwrap(), options).await;
+            let reply = consumer.call(target, BindIdentity::new("operator-harness", "forward"), serde_json::to_vec(&json!({"summary":summary, "mode":request["peer_mode"].as_str().unwrap_or("confirm")})).unwrap(), options).await;
             consumer.close().await;
             return match reply {
                 Ok(reply) => HandlerOutcome::Response(reply),

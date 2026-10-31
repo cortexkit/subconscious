@@ -30,7 +30,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{error::Error, fmt, path::PathBuf};
+use std::{error::Error, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -312,61 +312,38 @@ pub enum RouteCloseReason {
 
 /// Per-route bind identity shared by client-facing and module-facing control.
 ///
-/// EVERY FIELD HERE IS CLIENT-SUPPLIED AND UNATTESTED. The daemon canonicalizes
-/// `project_root` as a path but does not verify that the caller has any relation
-/// to it, and `harness`, `session`, and `project_id` are strings the caller chose.
-/// A client holding the connection key can present any values it likes.
+/// Every field here is client-supplied and unattested. Use these claims for
+/// attribution, never authorization; gate on the daemon-stamped [`Principal`]
+/// instead.
 ///
-/// This sits directly above `Principal`, which is the opposite: stamped BY the
-/// daemon from a launch nonce it minted. The two travel together on every
-/// `route.bind`, so a module reading them side by side is reading one fact it can
-/// trust and four it cannot. THE DISTINCTION IS INVISIBLE FROM THE TYPES, which
-/// is why it is written here.
-///
-/// So these fields are for SCOPING AND ATTRIBUTION -- which project's state to
-/// open, which session to thread, what to log -- and never for authorization. A
-/// module that grants capability on `harness` or trusts `project_root` to bound
-/// what a caller may reach has built an authorization check on a value the caller
-/// controls. Gate on `Principal` instead, and where a module needs a caller fact
-/// subc does not stamp, it must establish that fact itself rather than believe
-/// this struct.
+/// Protocol 0.34 identities carry no project fields. For project-free openers,
+/// project attribution comes from the admitted session [`scope::ScopeStamp`]'s
+/// `workdir` and optional `project_id`; without these fields there is no project
+/// attribution. During migration, daemon 0.39 also accepts legacy opener project
+/// fields and prefers the legacy root over the scope workdir for internal root
+/// attribution and compatibility bind fields. Decoding remains lenient so
+/// readers can ignore project fields sent by older daemons during migration.
+/// See [`scope::BIND_NO_PROJECT_CAPABILITY`] for target opt-in to project-free
+/// bind identities.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BindIdentity {
-    pub project_root: PathBuf,
     pub harness: String,
     pub session: String,
-    /// The entorhinal-registered project id (`pj-…`) for `project_root`, when
-    /// the root is a registered project. Aliases count as registered projects;
-    /// implicit roots do not. Absent means "no stable id, key on the triple",
-    /// not "unknown".
-    ///
-    /// A producer sends the id on every bind of a session or on none. A producer
-    /// that alternates between `Some(id)` and `None` across binds silently forks
-    /// the consumer's lineage into separate stores, with no error at either end.
-    /// Therefore, a producer that cannot answer consistently must answer `None`
-    /// consistently.
-    ///
-    /// Resolve this at most once per session, before its first bind, and persist
-    /// the outcome with the session. ALF's resolver has real `Resolved`, `Unavailable`,
-    /// and `Disabled` outcomes: if unavailable at cold start is re-resolved on a
-    /// later bind, the session can alternate from `None` to `Some(id)`. Send only
-    /// registered or alias resolutions, never implicit, unavailable, or disabled
-    /// fallback ids.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
     /// The opener's claim about the kind of build it is, sent on `route.open`.
     /// [`BUILD_CLASS_PRODUCTION`] marks a production build whose integrity the
     /// opener has verified.
     ///
-    /// Like every other field here it is unattested. The daemon honours it only
-    /// when the opener's principal is `Reserved { module_id: "callosum" }`, and
-    /// only the exact value [`BUILD_CLASS_PRODUCTION`]; any other value counts
-    /// as absent. From any other opener it is ignored. The daemon never relays
-    /// it to the target module: the identity on `route.bind` never carries it.
+    /// Like every other field here it is unattested. The daemon recognizes
+    /// `callosum` as the caller module ID eligible for this claim. It honours
+    /// the claim only when the opener's principal is
+    /// `Reserved { module_id: "callosum" }`, and only the exact value
+    /// [`BUILD_CLASS_PRODUCTION`]; any other value counts as absent. From any
+    /// other opener it is ignored. The daemon never relays it to the target
+    /// module: the identity on `route.bind` never carries it.
     ///
-    /// Absent is omitted from the wire, so existing identities keep their bytes,
-    /// and a reader that predates the field drops it, which grants nothing.
+    /// An absent build-class claim is omitted from the wire. A reader that
+    /// predates this field drops it, which grants nothing.
     /// Set it on the public field after [`BindIdentity::new`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_class: Option<String>,
@@ -376,20 +353,14 @@ pub struct BindIdentity {
 pub const BUILD_CLASS_PRODUCTION: &str = "production";
 
 impl BindIdentity {
-    /// Constructs an identity with no registered project id.
+    /// Constructs a project-free attribution identity.
     ///
     /// Use this instead of a struct literal so future additive identity fields do
     /// not force construction-site migrations across the fleet.
-    pub fn new(
-        project_root: impl Into<PathBuf>,
-        harness: impl Into<String>,
-        session: impl Into<String>,
-    ) -> Self {
+    pub fn new(harness: impl Into<String>, session: impl Into<String>) -> Self {
         Self {
-            project_root: project_root.into(),
             harness: harness.into(),
             session: session.into(),
-            project_id: None,
             build_class: None,
         }
     }
@@ -959,9 +930,8 @@ mod tests {
     }
 
     #[test]
-    fn bind_identity_with_project_id_round_trips_json() {
-        let mut identity = BindIdentity::new("/tmp/project", "opencode", "session-1");
-        identity.project_id = Some("pj-a1b2c3d4".to_string());
+    fn bind_identity_round_trips_json() {
+        let identity = BindIdentity::new("opencode", "session-1");
 
         let encoded = serde_json::to_vec(&identity).unwrap();
         let decoded: BindIdentity = serde_json::from_slice(&encoded).unwrap();
@@ -970,34 +940,24 @@ mod tests {
     }
 
     #[test]
-    fn bind_identity_without_project_id_round_trips_json() {
-        let identity = BindIdentity::new("/tmp/project", "opencode", "session-1");
-
-        let encoded = serde_json::to_vec(&identity).unwrap();
-        let decoded: BindIdentity = serde_json::from_slice(&encoded).unwrap();
-
-        assert_eq!(decoded, identity);
-    }
-
-    #[test]
-    fn legacy_bind_identity_without_project_id_decodes() {
+    fn legacy_bind_identity_project_fields_are_ignored() {
         let decoded: BindIdentity = serde_json::from_value(serde_json::json!({
             "project_root": "/tmp/project",
+            "project_id": "pj-a1b2c3d4",
             "harness": "opencode",
             "session": "session-1"
         }))
         .unwrap();
 
-        assert_eq!(decoded.project_id, None);
+        assert_eq!(decoded, BindIdentity::new("opencode", "session-1"));
     }
 
     #[test]
-    fn bind_identity_none_omits_project_id_instead_of_serializing_null() {
-        let encoded =
-            serde_json::to_value(BindIdentity::new("/tmp/project", "opencode", "session-1"))
-                .unwrap();
+    fn bind_identity_omits_both_project_fields() {
+        let encoded = serde_json::to_value(BindIdentity::new("opencode", "session-1")).unwrap();
 
         assert!(encoded.get("project_id").is_none());
+        assert!(encoded.get("project_root").is_none());
     }
 
     #[test]

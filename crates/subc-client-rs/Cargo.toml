@@ -1,6 +1,6 @@
 [package]
 name = "subc-client-rs"
-version = "0.32.20"
+version = "0.33.0"
 edition = "2021"
 publish = true
 description = "Shared serve + consume client for Rust subc modules."
@@ -19,15 +19,16 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-subc-control = { path = "../subc-control", version = "0.33.5" }
-subc-os = { path = "../subc-os", version = "0.1.25" }
-subc-protocol = { path = "../subc-protocol", version = "0.33.5" }
-subc-transport = { path = "../subc-transport", version = "0.14.1" }
+subc-control = { path = "../subc-control", version = "0.34.0" }
+subc-os = { path = "../subc-os", version = "0.1.26" }
+subc-protocol = { path = "../subc-protocol", version = "0.34.0" }
+subc-transport = { path = "../subc-transport", version = "0.15.0" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+cortexkit-paths = "0.1.1"
 socket2 = "0.6"
 syn = { version = "2", features = ["full", "visit"] }
 cortexkit-test-support = "0.1.3"

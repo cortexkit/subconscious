@@ -367,10 +367,13 @@ describe("Rust golden fixtures", () => {
   test("bind identity keeps the snake_case field the client sends", () => {
     // The client serializes this object by hand, so a casing change in Rust
     // would be accepted by TypeScript's types and rejected by the daemon.
+    // Since protocol 0.34 the Rust identity carries no project fields. This
+    // client still sends the retired `project_root`, which daemon 0.39 reads
+    // from the raw route.open body under that same snake_case name.
     const identity = loadGolden("bind_identity");
-    expect(typeof identity.project_root).toBe("string");
     expect(typeof identity.harness).toBe("string");
     expect(typeof identity.session).toBe("string");
+    expect("project_root" in identity).toBe(false);
   });
 
   test("catalog self-signal declarations decode from the Rust manifest vector", () => {

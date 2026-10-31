@@ -189,7 +189,7 @@ impl Fixture {
                 RouteTarget::ToolProvider {
                     module_id: PROVIDER.to_string(),
                 },
-                BindIdentity::new(self.root.path(), "proof-test", "session"),
+                BindIdentity::new("proof-test", "session"),
                 ScopeSelector::new(
                     Principal::Reserved {
                         module_id: OWNER.to_string(),

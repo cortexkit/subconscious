@@ -41,7 +41,9 @@ pub fn copy_executable(src: &Path, dst: &Path) {
     std::fs::copy(src, dst).expect("copy executable fixture");
 }
 
-const TEST_DAEMON_VER: &str = "test-subc";
+/// The version the in-process test daemon reports. Clients refuse route opens
+/// below 0.39.0, so it names that release rather than a non-numeric label.
+pub const TEST_DAEMON_VER: &str = "0.39.0";
 const TEST_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 
 /// The daemon binary (`ck-subc`) published as `ckdev-subc` (see

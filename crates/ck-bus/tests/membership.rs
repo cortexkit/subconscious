@@ -573,14 +573,7 @@ async fn relay_raw(
             RouteTarget::ManagementSurface {
                 module_id: module_id.to_string(),
             },
-            BindIdentity::new(
-                connection_file
-                    .parent()
-                    .map(PathBuf::from)
-                    .unwrap_or_default(),
-                "ck-bus-membership-row",
-                "relay",
-            ),
+            BindIdentity::new("ck-bus-membership-row", "relay"),
             body,
             CallOptions {
                 timeout: Duration::from_secs(20),

@@ -5,6 +5,7 @@ fn fake_consumer() -> (Arc<SubcConsumer>, mpsc::Receiver<WriteCommand>) {
     let shared = Arc::new(Shared::new(PathBuf::new(), ConsumerOptions::default()));
     let (writer, rx) = mpsc::channel(1);
     shared.lock_inner().writer = Some(writer);
+    shared.lock_inner().daemon_ver = "0.39.0".into();
     (Arc::new(SubcConsumer { shared }), rx)
 }
 

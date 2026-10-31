@@ -705,7 +705,7 @@ fn scrub_app_environment_std(command: &mut tokio::process::Command) {
 /// held capture and must read that, never reopen `path`, which is for
 /// messages only. Production carries no verifier yet and fails closed.
 ///
-/// Public like [`crate::operator_apps::TestOperatorAppPolicy`]: it crosses
+/// Public like `crate::operator_apps::TestOperatorAppPolicy`: it crosses
 /// the test-support boundary in `with_test_windows_verifier`.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]

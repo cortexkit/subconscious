@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.18
+
+- Upgrade to protocol 0.34 and Rust client 0.33. Credential routes use project-free identities instead of attributing the connection-file directory as a project.
+
 ## 0.4.17
 
 - Test-only: prove that health answers while a broker call is still pending,

@@ -83,6 +83,12 @@ pub const CAP_SCOPES_V1: &str = "scopes/v1";
 /// the provider seeing its role versions checks for this first.
 pub const CAP_ROUTE_ROLE_VERSIONS_V1: &str = "route-role-versions/v1";
 
+/// A target declares this in `capabilities.provides` once it no longer reads
+/// project fields from `route.bind` identities. Declaring it makes the daemon
+/// omit those identity fields, independently of [`SCOPE_WORKDIR_CAPABILITY`],
+/// which gates both `workdir` and `project_id` in the admitted [`ScopeStamp`].
+pub const BIND_NO_PROJECT_CAPABILITY: &str = "bind-no-project/v1";
+
 /// Module-to-subc op that registers an owner's full scope set.
 pub const SCOPE_SYNC_OP: &str = "scope.sync";
 /// Module-to-subc op that upserts or ends scopes without replacing the owner's

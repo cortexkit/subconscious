@@ -2140,6 +2140,26 @@ pub struct RouteBindRequest {
     /// The daemon's call mode, or the mode derived from `scope` when an older
     /// daemon omits it. Providers must refuse [`CallMode::Unknown`].
     pub call_mode: CallMode,
+    /// The daemon's facts about the connection that opened this route, read
+    /// from the same bind. Like the scope stamp, they are the daemon's, never
+    /// the opener's.
+    ///
+    /// - `observed_peer` is sent only when this module's manifest lists
+    ///   `observed-peer/v1` in `capabilities.provides`. It is then always
+    ///   present, possibly with status `unobserved`; only an `observed` status
+    ///   carries the peer's identity.
+    /// - `operator_app` is sent only when the manifest lists `operator-app/v1`,
+    ///   the daemon's operator-app policy for this platform is switched on,
+    ///   and the daemon recognised the connection as an operator app when it
+    ///   was made. It records that recognition at connection time. It is not
+    ///   authority: a write on the person's behalf still asks the daemon with
+    ///   `operator.confirm`. Released daemons switch this policy off, so they
+    ///   never send it yet.
+    ///
+    /// The two keys decode together. If they don't decode, the bind still
+    /// reaches [`ModuleHandler::on_bind`] with both absent and a warning is
+    /// logged, so a handler that admits only on `operator_app` refuses it.
+    pub peer: subc_protocol::peer::RouteBindPeer,
 }
 
 impl RouteBindRequest {
@@ -2158,7 +2178,15 @@ impl RouteBindRequest {
             admission_facts: None,
             scope: None,
             call_mode: derive_call_mode(None),
+            peer: subc_protocol::peer::RouteBindPeer::new(),
         }
+    }
+
+    /// Set [`Self::peer`] to synthetic daemon facts, for testing a handler.
+    /// It checks nothing: a real bind's facts come only from the daemon.
+    pub fn with_peer(mut self, peer: subc_protocol::peer::RouteBindPeer) -> Self {
+        self.peer = peer;
+        self
     }
 
     /// Set [`Self::principal`].
@@ -3244,6 +3272,22 @@ where
                 }
             }
             let handle = module_handle.route_handle(route_channel, epoch);
+            // The peer keys sit beside the bind's members in the same body.
+            // They decode as one value: if either is malformed both read as
+            // absent, and the bind still goes to `on_bind`, which decides.
+            let peer =
+                match serde_json::from_slice::<subc_protocol::peer::RouteBindPeer>(&frame.body) {
+                    Ok(peer) => peer,
+                    Err(error) => {
+                        tracing::warn!(
+                            channel = route_channel,
+                            epoch,
+                            %error,
+                            "route.bind peer keys did not decode; treating them as absent"
+                        );
+                        subc_protocol::peer::RouteBindPeer::new()
+                    }
+                };
             let req = RouteBindRequest {
                 handle,
                 target,
@@ -3254,6 +3298,7 @@ where
                 admission_facts,
                 call_mode: call_mode.unwrap_or_else(|| derive_call_mode(scope.as_ref())),
                 scope,
+                peer,
             };
             let decision = handler.on_bind(&req).await;
             match decision.kind {

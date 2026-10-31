@@ -28,6 +28,16 @@ fn scope(attributes: serde_json::Value) -> serde_json::Value {
 }
 
 async fn decoded_bind(scope: Option<serde_json::Value>, mode: Option<&str>) -> RouteBindRequest {
+    decoded_bind_with(scope, mode, json!({})).await
+}
+
+/// A bind carrying synthetic `extra` keys beside its members, where the
+/// daemon writes the peer keys.
+async fn decoded_bind_with(
+    scope: Option<serde_json::Value>,
+    mode: Option<&str>,
+    extra: serde_json::Value,
+) -> RouteBindRequest {
     let recorder = BindRecorder::default();
     let handler = recorder.clone();
     let mut served = stand_in::serve_against_stand_in_with_ops(|_| handler, &[]).await;
@@ -43,6 +53,9 @@ async fn decoded_bind(scope: Option<serde_json::Value>, mode: Option<&str>) -> R
     }
     if let Some(mode) = mode {
         body["call_mode"] = json!(mode);
+    }
+    for (key, value) in extra.as_object().expect("extra keys are an object") {
+        body[key] = value.clone();
     }
     let frame = Frame::build(
         FrameType::Request,
@@ -94,6 +107,31 @@ async fn on_behalf_of_agent_is_exposed_to_bind_handlers_without_agent_authority(
     assert_eq!(attributes.on_behalf_of_agent.as_deref(), Some("head-agent"));
     assert_eq!(attributes.agent_id, None);
     assert!(!attributes.delegates);
+}
+
+#[tokio::test]
+async fn the_operator_app_stamp_reaches_bind_handlers() {
+    let request = decoded_bind_with(
+        None,
+        None,
+        json!({"operator_app": {"app": "alfonso-desktop", "pid": 4242}}),
+    )
+    .await;
+    assert_eq!(
+        request.peer.operator_app,
+        Some(subc_protocol::peer::OperatorApp::new(
+            "alfonso-desktop",
+            4242
+        ))
+    );
+}
+
+#[tokio::test]
+async fn a_bind_without_peer_keys_or_with_malformed_ones_has_none() {
+    assert!(decoded_bind(None, None).await.peer.is_empty());
+    // An invalid `operator_app` wire shape yields no peer facts.
+    let request = decoded_bind_with(None, None, json!({"operator_app": "alfonso-desktop"})).await;
+    assert!(request.peer.is_empty());
 }
 
 #[tokio::test]

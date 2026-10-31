@@ -205,6 +205,15 @@ impl ModuleHarness {
             scope: request.scope,
             call_mode: Some(request.call_mode),
         };
+        // The daemon writes the peer keys beside the bind's members, so the
+        // stand-in puts them in the same place. It sends whatever the request
+        // carries: unlike the daemon it applies no capability or policy gate.
+        let mut body = serde_json::to_value(&body).unwrap();
+        if let (serde_json::Value::Object(body), serde_json::Value::Object(peer)) =
+            (&mut body, serde_json::to_value(&request.peer).unwrap())
+        {
+            body.extend(peer);
+        }
         let corr = self.allocate_corr();
         self.send(
             Frame::build(

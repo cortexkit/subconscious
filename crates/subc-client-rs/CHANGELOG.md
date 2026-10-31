@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.33.1
+
+- `RouteBindRequest` gains `peer`, the daemon's facts about the connection
+  that opened the route, decoded from the same bind body. A module served
+  through `serve` couldn't see them before.
+  - `observed_peer` arrives when the module's manifest lists
+    `observed-peer/v1`, possibly as `unobserved`.
+  - `operator_app` arrives when the manifest lists `operator-app/v1`, the
+    daemon's operator-app policy for the platform is on, and the daemon
+    recognised the connection as an operator app. It records recognition,
+    not authority. Released daemons keep that policy off, so they don't send
+    it yet.
+  - If the peer keys don't decode, both read as absent, a warning is logged,
+    and the bind still reaches `on_bind`.
+
+  `RouteBindRequest::with_peer` sets synthetic facts for handler tests, and
+  the test stand-in's `bind_route` writes them where the daemon does, without
+  the daemon's gates.
+
 ## 0.33.0
 
 - Breaking: route opens send project-free protocol 0.34 identities. For these openers, project attribution comes from the admitted session scope stamp.

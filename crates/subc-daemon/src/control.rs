@@ -27,10 +27,7 @@ use subc_protocol::{
         validate_hello_self_signal_declarations, CapabilityDeclarations, CapabilityNeed,
         Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
     },
-    peer::{
-        encode_route_bind, ObservedPeer, RouteBindPeer, OBSERVED_PEER_CAPABILITY,
-        OPERATOR_APP_CAPABILITY,
-    },
+    peer::{ObservedPeer, RouteBindPeer, OBSERVED_PEER_CAPABILITY, OPERATOR_APP_CAPABILITY},
     scope::{
         ScopeEnd, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
         CAP_ROUTE_ROLE_VERSIONS_V1, CAP_SCOPES_V1, SCOPE_APPLY_OP, SCOPE_DESCRIBE_OP,
@@ -5307,30 +5304,21 @@ impl ControlHandler {
             caller.scope = route_open_scope_label(stamp);
         }
 
-        // Bind admits a root that no longer exists on disk, because refusing here
-        // closes the only exit from a paused run: cancel needs a bound route, and a
-        // renamed or reclaimed directory makes that route unopenable forever. The
-        // run itself is intact and still addressable by its recorded identity.
+        // Allow resolvable missing-tail paths so a vanished directory does not
+        // prevent reopening an existing session for cleanup. Binding does not
+        // authorize creation of durable provider state.
         //
-        // This does NOT relax the rule the strict constructor protects. That rule is
-        // that no root is ever aliased into NEW durable state -- a missing component
-        // can reappear as a symlink elsewhere, which would move the identity and
-        // split a session's history across two of them. The engine now refuses the
-        // two operations that create such state (send and import) at admission,
-        // which is a narrower way to hold the same invariant: reads and terminations
-        // are admitted, writes are not. That refusal had to ship before this line
-        // changed, or there is an interval where a send commits under a provisional
-        // identity -- the exact failure the original policy existed to prevent.
-        //
-        // Resolution follows realpath rather than lexical cleanup: the longest
-        // existing ancestor is canonicalized and the missing tail re-appended, so a
-        // live root is unchanged and a vanished leaf keeps the identity it was
-        // admitted under. Lexical cleanup would mint a DIFFERENT identity for the
-        // same caller the moment the directory vanished, which strands the run more
-        // quietly than refusing it.
+        // Resolve real paths rather than lexical cleanup: canonicalize the
+        // longest existing ancestor and append the missing tail, retaining the
+        // path's real existing ancestry even when a leaf is missing.
         timings.enter(RouteOpenPhase::ProjectRoot);
-        let project_root = match ProjectRootId::from_path_allowing_missing(&identity.project_root) {
-            Ok(project_root) => project_root,
+        let legacy_project = match crate::bind_compat::LegacyProject::from_open(&frame.body) {
+            Ok(project) => project,
+            Err((code, message)) => return Ok(vec![control_error_frame(&frame, code, message)?]),
+        };
+        timings.enter(RouteOpenPhase::Admission);
+        let project_root = match legacy_project.effective_root(scope_stamp.as_ref()) {
+            Ok(root) => root,
             Err(err) => {
                 return Ok(vec![control_error_frame(
                     &frame,
@@ -5339,8 +5327,12 @@ impl ControlHandler {
                 )?])
             }
         };
-        timings.enter(RouteOpenPhase::Admission);
-        identity.project_root = project_root.as_path().to_path_buf();
+        // Compute compatibility project fields before stripping optional stamp
+        // members. Preserve the canonical opener root and its project ID,
+        // including absence. For rootless openers, use stamp workdir or `/`, and
+        // opener ID, else stamp ID, else no ID. Emit these identity fields only
+        // to targets without bind-no-project/v1.
+        let legacy_bind_project = legacy_project.for_target(scope_stamp.as_ref());
 
         // Last gate before any relay work, and deliberately after the cheap
         // registry and availability checks above: those name a more precise
@@ -5421,7 +5413,7 @@ impl ControlHandler {
                 &target_module_id,
                 principal.clone(),
                 bound_scope,
-                Some(project_root),
+                project_root,
                 identity.harness.clone(),
                 build_class,
                 operator_app.clone(),
@@ -5626,7 +5618,13 @@ impl ControlHandler {
                         })
                     }),
             );
-        let relay_body = encode_route_bind(&relay, &peer).map_err(|err| {
+        let relay_body = crate::bind_compat::encode_bind(
+            &relay,
+            &peer,
+            &legacy_bind_project,
+            relay_capabilities,
+        )
+        .map_err(|err| {
             RouterError::backend(
                 0,
                 frame.header.corr,
@@ -9126,21 +9124,27 @@ mod tests {
         route_open_frame_with_consumer_capabilities(corr, module_id, project_root, None)
     }
 
+    // Exercise retired opener fields without putting them back in BindIdentity.
+    fn legacy_route_open_frame(corr: u64, module_id: &str, root: ScratchDir) -> Frame {
+        let path = ProjectRootId::from_path_allowing_missing(root.path()).unwrap();
+        let mut frame = route_open_frame(corr, module_id, root);
+        let mut body: Value = serde_json::from_slice(&frame.body).unwrap();
+        body["identity"]["project_root"] = serde_json::json!(path.as_path());
+        frame.body = serde_json::to_vec(&body).unwrap();
+        frame
+    }
+
     fn route_open_frame_with_consumer_capabilities(
         corr: u64,
         module_id: &str,
-        project_root: ScratchDir,
+        _project_root: ScratchDir,
         consumer_capabilities: Option<Vec<String>>,
     ) -> Frame {
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
-            identity: BindIdentity::new(
-                project_root.path().to_path_buf(),
-                "unit".to_string(),
-                "session".to_string(),
-            ),
+            identity: BindIdentity::new("unit".to_string(), "session".to_string()),
             consumer_identity: None,
             consumer_capabilities,
             role_versions: None,
@@ -9154,18 +9158,14 @@ mod tests {
     fn route_open_frame_with_role_versions(
         corr: u64,
         module_id: &str,
-        project_root: ScratchDir,
+        _project_root: ScratchDir,
         role_versions: Option<BTreeMap<String, String>>,
     ) -> Frame {
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
-            identity: BindIdentity::new(
-                project_root.path().to_path_buf(),
-                "unit".to_string(),
-                format!("session-{corr}"),
-            ),
+            identity: BindIdentity::new("unit".to_string(), format!("session-{corr}")),
             consumer_identity: None,
             consumer_capabilities: None,
             role_versions,
@@ -9186,7 +9186,7 @@ mod tests {
     fn route_open_frame_with_admission_facts(
         corr: u64,
         module_id: &str,
-        project_root: ScratchDir,
+        _project_root: ScratchDir,
         consumer_identity: Option<subc_control::ConsumerIdentity>,
         facts: Option<Value>,
     ) -> Frame {
@@ -9194,11 +9194,7 @@ mod tests {
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
-            identity: BindIdentity::new(
-                project_root.path().to_path_buf(),
-                "unit".to_string(),
-                format!("session-{corr}"),
-            ),
+            identity: BindIdentity::new("unit".to_string(), format!("session-{corr}")),
             consumer_identity,
             consumer_capabilities: None,
             role_versions: None,
@@ -12171,7 +12167,7 @@ mod tests {
         let open_handler = handler.clone();
         let opened = tokio::spawn(async move {
             open_handler
-                .handle_control_frame(&client_ctx, route_open_frame(2, "target", root))
+                .handle_control_frame(&client_ctx, legacy_route_open_frame(2, "target", root))
                 .await
                 .unwrap()
         });
@@ -12195,7 +12191,7 @@ mod tests {
         let open_handler = handler.clone();
         let pending = tokio::spawn(async move {
             open_handler
-                .handle_control_frame(&client_ctx, route_open_frame(3, "target", root))
+                .handle_control_frame(&client_ctx, legacy_route_open_frame(3, "target", root))
                 .await
                 .unwrap()
         });
@@ -12612,12 +12608,7 @@ mod tests {
         )
         .await;
 
-        let root = unique_project_root("build-class");
-        let mut identity = BindIdentity::new(
-            root.path().to_path_buf(),
-            "unit".to_string(),
-            "s".to_string(),
-        );
+        let mut identity = BindIdentity::new("unit".to_string(), "s".to_string());
         identity.build_class = Some(subc_protocol::BUILD_CLASS_PRODUCTION.to_string());
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
             target: RouteTarget::ToolProvider {
@@ -17730,16 +17721,11 @@ mod tests {
             ) {
                 self.next_connection += 1;
                 let (ctx, rx) = wide_ctx(self.next_connection);
-                let root = unique_project_root("scoped-open");
                 let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
                     target: RouteTarget::ToolProvider {
                         module_id: target.to_string(),
                     },
-                    identity: BindIdentity::new(
-                        root.path().to_path_buf(),
-                        "unit".to_string(),
-                        "session".to_string(),
-                    ),
+                    identity: BindIdentity::new("unit".to_string(), "session".to_string()),
                     consumer_identity: opener.map(|module_id| ConsumerIdentity {
                         module_id: module_id.to_string(),
                         launch_nonce: nonce(module_id),
@@ -17807,7 +17793,23 @@ mod tests {
                 target: &str,
                 scope: Option<ScopeSelector>,
             ) -> Relayed {
-                let (ctx, rx, frame) = self.open_frame(opener, target, scope);
+                self.relayed_with_legacy_root(opener, target, scope, None)
+                    .await
+            }
+
+            async fn relayed_with_legacy_root(
+                &mut self,
+                opener: Option<&str>,
+                target: &str,
+                scope: Option<ScopeSelector>,
+                legacy_root: Option<&std::path::Path>,
+            ) -> Relayed {
+                let (ctx, rx, mut frame) = self.open_frame(opener, target, scope);
+                if let Some(root) = legacy_root {
+                    let mut body: Value = serde_json::from_slice(&frame.body).unwrap();
+                    body["identity"]["project_root"] = serde_json::json!(root);
+                    frame.body = serde_json::to_vec(&body).unwrap();
+                }
                 let handler = self.handler.clone();
                 let task_ctx = ctx.clone();
                 let task = tokio::spawn(async move {
@@ -17847,6 +17849,23 @@ mod tests {
                 scope: Option<ScopeSelector>,
             ) -> Bound {
                 let relayed = self.relayed(opener, target, scope).await;
+                self.commit_relayed(relayed).await
+            }
+
+            async fn bound_with_legacy_root(
+                &mut self,
+                opener: Option<&str>,
+                target: &str,
+                scope: Option<ScopeSelector>,
+                root: &std::path::Path,
+            ) -> Bound {
+                let relayed = self
+                    .relayed_with_legacy_root(opener, target, scope, Some(root))
+                    .await;
+                self.commit_relayed(relayed).await
+            }
+
+            async fn commit_relayed(&self, relayed: Relayed) -> Bound {
                 self.ack(&relayed).await;
                 let Relayed {
                     target,

@@ -1,11 +1,5 @@
 use cortexkit_test_support::ScratchDir;
-use std::{
-    collections::BTreeSet,
-    ops::Deref,
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeSet, ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
 use subc_control::{ops, ClientControlRequest, ClientControlResponse, ModuleProtocol, PollKind};
 use subc_daemon::{
@@ -535,7 +529,7 @@ struct RouteOpenAck {
 
 async fn open_route<S>(
     client: &mut S,
-    project: &TestProject,
+    _project: &TestProject,
     corr: u64,
     target: RouteTarget,
 ) -> RouteOpenAck
@@ -544,11 +538,7 @@ where
 {
     let request = ClientControlRequest::RouteOpen {
         target,
-        identity: BindIdentity::new(
-            project.path().to_path_buf(),
-            "opencode".to_string(),
-            format!("closure-{}", corr),
-        ),
+        identity: BindIdentity::new("opencode".to_string(), format!("closure-{}", corr)),
         consumer_identity: None,
         consumer_capabilities: None,
         role_versions: None,
@@ -819,17 +809,13 @@ fn embedding_payload() -> Vec<u8> {
 }
 
 struct TestProject {
-    temp: ScratchDir,
+    _temp: ScratchDir,
 }
 
 impl TestProject {
     fn new(label: &str) -> Self {
         Self {
-            temp: ScratchDir::new(label),
+            _temp: ScratchDir::new(label),
         }
-    }
-
-    fn path(&self) -> &Path {
-        self.temp.path()
     }
 }

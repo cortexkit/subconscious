@@ -91,8 +91,106 @@ async fn installed_generation_uses_authenticated_connection_file_version() {
         assert_eq!(inner.generation, generation);
         assert_eq!(generation, index as u64 + 1);
         assert_eq!(inner.daemon_origin_trusted, trusted, "{daemon_ver}");
+        assert_eq!(inner.daemon_ver, daemon_ver);
     }
     shared.close_sync("test complete");
+}
+
+#[tokio::test]
+async fn old_authenticated_daemon_refuses_route_opens_locally_without_sending() {
+    use subc_transport::{
+        authenticate_server, generate_daemon_id, generate_key, ConnectionInfo, Endpoint,
+        SCHEMA_VERSION,
+    };
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let conn = ConnectionInfo {
+        schema: SCHEMA_VERSION,
+        wire_version: None,
+        endpoints: vec![Endpoint {
+            host: "127.0.0.1".into(),
+            port: listener.local_addr().unwrap().port(),
+        }],
+        key: generate_key().unwrap(),
+        daemon_id: generate_daemon_id().unwrap(),
+        pid: std::process::id(),
+        daemon_ver: "0.38.10".into(),
+    };
+    let server_conn = conn.clone();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        // Use the connection-file version only after the handshake proves
+        // that file's daemon id.
+        authenticate_server(
+            &mut stream,
+            &server_conn.key,
+            &server_conn.daemon_id,
+            "99.0.0",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        stream
+    });
+    let opened = open_connection_with_info(Path::new("unused"), &conn, Duration::from_secs(5))
+        .await
+        .unwrap();
+    let mut server_stream = server.await.unwrap();
+    let shared = writer_test_shared();
+    shared.install_initial(opened).unwrap();
+    let consumer = SubcConsumer {
+        shared: Arc::clone(&shared),
+    };
+    let opts = CallOptions {
+        timeout: Duration::from_millis(200),
+        ..CallOptions::default()
+    };
+    let ordinary = consumer
+        .open_route(restart_target("provider"), restart_identity(), opts.clone())
+        .await;
+    let admitted = consumer
+        .open_route_with_admission_facts_and_options(
+            restart_target("provider"),
+            restart_identity(),
+            serde_json::json!({}),
+            opts,
+        )
+        .await;
+    for err in [ordinary.unwrap_err(), admitted.unwrap_err()] {
+        assert!(
+            matches!(&err, CallError::DaemonTooOld { daemon_ver } if daemon_ver == "0.38.10"),
+            "{err:?}"
+        );
+        assert_eq!(err.code(), Some("daemon_too_old"));
+        assert!(err.to_string().contains("0.39.0 or newer"));
+    }
+    assert!(shared.lock_inner().pending.is_empty());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), read_frame(&mut server_stream))
+            .await
+            .is_err(),
+        "a locally refused route.open must never reach the daemon"
+    );
+    consumer.close().await;
+}
+
+#[test]
+fn project_free_identity_version_gate_fails_closed() {
+    for version in ["0.39.0", "0.39.1", "1.0.0"] {
+        assert!(daemon_version_at_least(version, (0, 39, 0)), "{version}");
+    }
+    for version in [
+        "0.38.10",
+        "0.39.0-rc1",
+        "0.39.0+build",
+        "test",
+        "",
+        "0.39",
+        "0.39.0.1",
+    ] {
+        assert!(!daemon_version_at_least(version, (0, 39, 0)), "{version}");
+    }
 }
 
 fn assert_not_sent(err: &CallError, cause: NotSentCause, never_forwarded: bool) {
@@ -131,6 +229,7 @@ fn fill_writer(shared: &Arc<Shared>) -> mpsc::Receiver<WriteCommand> {
         })
         .unwrap();
     shared.lock_inner().writer = Some(writer);
+    shared.lock_inner().daemon_ver = "0.39.0".into();
     receiver
 }
 
@@ -442,6 +541,7 @@ async fn removed_accepted_pending_error(retain_late_route_open: bool, close: boo
     let shared = writer_test_shared();
     let (writer, mut receiver) = mpsc::channel(1);
     shared.lock_inner().writer = Some(writer);
+    shared.lock_inner().daemon_ver = "0.39.0".into();
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut request = Box::pin(shared.send_request(RequestSend {
         expected_handle: None,

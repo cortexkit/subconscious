@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0
+
+- Breaking: upgrade the control types in the public UI mapping API to control 0.34. Management and pairing routes use project-free identities; their unscoped routes no longer attribute the current directory as a project.
+
 ## 0.2.11
 
 - `ck quota --redact` also hides a reading's stored-credential label

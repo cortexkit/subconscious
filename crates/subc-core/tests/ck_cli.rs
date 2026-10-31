@@ -6550,11 +6550,7 @@ where
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
-            identity: BindIdentity::new(
-                std::env::current_dir().unwrap(),
-                "ck-deadline-test".to_string(),
-                format!("session-{corr}"),
-            ),
+            identity: BindIdentity::new("ck-deadline-test".to_string(), format!("session-{corr}")),
             consumer_identity: None,
             consumer_capabilities: None,
             role_versions: None,

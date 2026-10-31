@@ -3730,7 +3730,7 @@ impl SupervisedModule {
     /// Retained observations from the current ring and all journal generations.
     ///
     /// Blocking: this reads the journal files. Async callers use
-    /// [`Self::read_durable_terminal_history`].
+    /// `Self::read_durable_terminal_history`.
     pub fn durable_terminal_history(&self) -> subc_control::TerminalHistory {
         durable_terminal_history_of(&self.inner.terminal_ring, &self.inner.module_id)
     }
@@ -4134,7 +4134,7 @@ impl SupervisedModule {
         })?
     }
 
-    /// Blue/green restart: see [`SupervisorCommand::Swap`] and the
+    /// Blue/green restart: see `SupervisorCommand::Swap` and the
     /// `supervisor_swap` module. Returns once the swap has cut over (the old
     /// process then drains in the background of the supervise loop) or has
     /// failed, leaving the old process serving.

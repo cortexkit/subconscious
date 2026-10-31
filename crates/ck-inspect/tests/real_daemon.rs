@@ -178,7 +178,7 @@ async fn stripped_helper_profile_uses_module_dsym_symbols() {
             RouteTarget::ManagementSurface {
                 module_id: "inspect".into(),
             },
-            BindIdentity::new(daemon.root.path(), "inspect-test", "symbols"),
+            BindIdentity::new("inspect-test", "symbols"),
             serde_json::to_vec(
                 &json!({"method":"module.profile", "params":{"module_id":"load", "seconds":1}}),
             )
@@ -295,7 +295,7 @@ async fn routed_resources_and_profile_observe_supervised_process_and_exit_on_eof
         inspect.pid.to_string(),
     )
     .unwrap();
-    let identity = BindIdentity::new(daemon.root.path(), "inspect-test", "profile");
+    let identity = BindIdentity::new("inspect-test", "profile");
     let resources = consumer
         .call(
             target.clone(),

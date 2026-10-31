@@ -240,7 +240,6 @@ fn target() -> RouteTarget {
 
 fn identity() -> BindIdentity {
     BindIdentity::new(
-        PathBuf::from("/tmp/subc-client-rs-liveness-probe"),
         "subc-client-rs-test".to_string(),
         "liveness-probe".to_string(),
     )
@@ -261,7 +260,7 @@ async fn start_fake_daemon(mode: DataMode) -> FakeDaemon {
         key: generate_key().expect("generate fake daemon key"),
         daemon_id: generate_daemon_id().expect("generate fake daemon id"),
         pid: process::id(),
-        daemon_ver: "subc-client-rs-liveness-fake".to_string(),
+        daemon_ver: "0.39.0".to_string(),
     };
     let connection_file = temp_dir.join("subc-conn.json");
     write_atomic(&connection_file, &connection).expect("write fake connection file");

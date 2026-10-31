@@ -5062,11 +5062,7 @@ mod tests {
             target: RouteTarget::ToolProvider {
                 module_id: "provider".to_string(),
             },
-            identity: BindIdentity::new(
-                PathBuf::from("/tmp/project"),
-                "test".to_string(),
-                "bind".to_string(),
-            ),
+            identity: BindIdentity::new("test".to_string(), "bind".to_string()),
             principal: None,
             consumer_capabilities: None,
             role_versions: None,
@@ -5364,11 +5360,7 @@ mod module_close_tests {
             target: RouteTarget::ToolProvider {
                 module_id: "close-test".to_string(),
             },
-            identity: BindIdentity::new(
-                PathBuf::from("/tmp/project"),
-                "test".to_string(),
-                "close".to_string(),
-            ),
+            identity: BindIdentity::new("test".to_string(), "close".to_string()),
             principal: None,
             consumer_capabilities: None,
             role_versions: None,

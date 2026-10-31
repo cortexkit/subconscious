@@ -1178,13 +1178,12 @@ async fn adjacent_check_pairs_keep_the_first_refusal() {
 }
 
 async fn open_route_while_provider_runs(f: &Fixture, module: &mut Module, name: &str) {
-    let dir = cortexkit_test_support::ScratchDir::new("operator-concurrent-route");
     let (client, mut rx) = ctx_fn(9000);
     let request = subc_control::ClientControlRequest::RouteOpen {
         target: subc_protocol::RouteTarget::ToolProvider {
             module_id: name.into(),
         },
-        identity: subc_protocol::BindIdentity::new(dir.path().to_path_buf(), "test", "session"),
+        identity: subc_protocol::BindIdentity::new("test", "session"),
         consumer_identity: None,
         consumer_capabilities: None,
         role_versions: None,
@@ -1422,7 +1421,7 @@ async fn privileged_reads_route_open_health_probe_and_preview_never_prompt_or_lo
         serde_json::json!({"op":"supervisor.health_probe","module_id":"missing"}),
         serde_json::json!({"op":"supervisor.rescan","preview":true}),
         serde_json::json!({"op":"route.poll","route_channel":1,"route_epoch":1,"kind":"status"}),
-        serde_json::json!({"op":"route.open","target":{"kind":"tool_provider","module_id":"missing"},"identity":{"project_root":"/test","harness":"test","session":"test"}}),
+        serde_json::json!({"op":"route.open","target":{"kind":"tool_provider","module_id":"missing"},"identity":{"harness":"test","session":"test"}}),
     ] {
         // Decode first so a malformed fixture cannot masquerade as a no-prompt read.
         let _: subc_control::ClientControlRequest =

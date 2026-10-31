@@ -582,10 +582,10 @@ async fn scope_workdir_bind_is_exactly_opt_in() {
             .await;
         let body: Value = serde_json::from_slice(&bound.bind.body).unwrap();
         let identity = format!(
-            "{{\"project_root\":{},\"harness\":\"unit\",\"session\":\"session\"}}",
-            body["identity"]["project_root"]
+            "{{\"project_root\":{},\"harness\":\"unit\",\"session\":\"session\",\"project_id\":\"project:1\"}}",
+            serde_json::to_string(&workdir).unwrap()
         );
-        // Only the temporary identity path and allocated handles vary between runs.
+        // Legacy identity fields are filled even when stamp members are stripped.
         let project_fields = if declares {
             format!(
                 ",\"workdir\":{},\"project_id\":\"project:1\"",
@@ -609,8 +609,9 @@ async fn scope_workdir_live_roots_include_bound_scope_and_keep_legacy_roots() {
         session(1).with_workdir(Some(workdir.to_str().unwrap().into()))
     ])
     .await;
+    let legacy_root = ScratchDir::new("legacy-bind-root");
     let bound = rig
-        .bound(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+        .bound_with_legacy_root(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))), legacy_root.path())
         .await;
     let legacy: Value = serde_json::from_slice(&bound.bind.body).unwrap();
     let legacy = PathBuf::from(legacy["identity"]["project_root"].as_str().unwrap());
@@ -633,8 +634,9 @@ async fn scope_workdir_live_roots_include_bound_scope_and_keep_legacy_roots() {
         assert_eq!((root.bound, root.pending), (1, 0));
     }
     assert!(bound.stamp().unwrap().workdir.is_none());
+    let pending_root = ScratchDir::new("legacy-pending-root");
     let pending = rig
-        .relayed(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))))
+        .relayed_with_legacy_root(Some(AFT), PLEXUS, Some(rig_selector("s", Some(1))), Some(pending_root.path()))
         .await;
     let ModuleControlResponseToModule::LiveRoots {
         roots,

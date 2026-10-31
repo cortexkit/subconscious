@@ -1,5 +1,5 @@
 use cortexkit_test_support::ScratchDir;
-use std::{collections::VecDeque, ops::Deref, path::Path, time::Duration};
+use std::{collections::VecDeque, ops::Deref, time::Duration};
 
 use subc_control::{ClientControlRequest, ClientControlResponse};
 use subc_daemon::{read_frame, write_frame, ForwardingTable, Frame, Registry};
@@ -839,7 +839,7 @@ async fn register_module(
 async fn open_route(
     client: &mut Endpoint,
     module: &mut Endpoint,
-    project: &TestProject,
+    _project: &TestProject,
     module_id: &str,
     corr: u64,
     session: &str,
@@ -851,11 +851,7 @@ async fn open_route(
                 target: RouteTarget::ToolProvider {
                     module_id: module_id.to_string(),
                 },
-                identity: BindIdentity::new(
-                    project.path().to_path_buf(),
-                    "opencode".to_string(),
-                    session.to_string(),
-                ),
+                identity: BindIdentity::new("opencode".to_string(), session.to_string()),
                 consumer_identity: None,
                 consumer_capabilities: None,
                 role_versions: None,
@@ -1045,17 +1041,13 @@ async fn wait_for_binding_count(forwarding: &ForwardingTable, expected: usize, w
 }
 
 struct TestProject {
-    temp: ScratchDir,
+    _temp: ScratchDir,
 }
 
 impl TestProject {
     fn new(label: &str) -> Self {
         Self {
-            temp: ScratchDir::new(label),
+            _temp: ScratchDir::new(label),
         }
-    }
-
-    fn path(&self) -> &Path {
-        self.temp.path()
     }
 }

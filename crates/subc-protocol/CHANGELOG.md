@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.34.0
+
+- Breaking: remove `project_root` and `project_id` from `BindIdentity`. Migrate to `BindIdentity::new(harness, session)`. For project-free openers, project attribution comes from the admitted session scope's `workdir` and optional `project_id`; without those fields there is no project attribution. During migration, daemon 0.39 also accepts legacy opener project fields and prefers the legacy root for internal root attribution and compatibility binds. Decoding still ignores unknown legacy fields.
+- Add `scope::BIND_NO_PROJECT_CAPABILITY` (`bind-no-project/v1`). Targets declare it themselves once they no longer read project fields from bind identities.
+
 ## 0.33.6
 
 - Documentation only: an event declaration's `headers` name the headers a notice may carry. A notice omits a header it has no value for and never sends one empty or invented, so a filter on that header does not match it. Nothing on the wire changes.

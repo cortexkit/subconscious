@@ -1188,11 +1188,7 @@ fn thin_core_ops() -> Vec<String> {
 }
 
 fn bind_identity() -> BindIdentity {
-    BindIdentity::new(
-        PathBuf::from("/tmp/subc/project"),
-        "opencode".to_string(),
-        "session-0001".to_string(),
-    )
+    BindIdentity::new("opencode".to_string(), "session-0001".to_string())
 }
 
 fn catalog_entry() -> CatalogEntry {

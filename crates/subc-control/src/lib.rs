@@ -2986,7 +2986,7 @@ mod tests {
             target: RouteTarget::ToolProvider {
                 module_id: "aft".to_string(),
             },
-            identity: BindIdentity::new("/tmp/project", "opencode", "session-1"),
+            identity: BindIdentity::new("opencode", "session-1"),
             consumer_identity: None,
             consumer_capabilities: None,
             role_versions: None,
@@ -3558,11 +3558,7 @@ mod launch_nonce_redaction_tests {
             target: subc_protocol::RouteTarget::ToolProvider {
                 module_id: "broca".to_string(),
             },
-            identity: subc_protocol::BindIdentity::new(
-                PathBuf::from("/tmp/project"),
-                "test".to_string(),
-                "session".to_string(),
-            ),
+            identity: subc_protocol::BindIdentity::new("test".to_string(), "session".to_string()),
             consumer_identity: Some(identity()),
             consumer_capabilities: None,
             role_versions: None,

@@ -51,6 +51,7 @@ async fn activity_route_stamps_verified_opener_project_and_scope_attributes() {
         .with_activity_ledger(scratch.path(), "daemon".into());
     let mut scope = session(1);
     scope.attributes.flow_id = Some("flow-1".into());
+    scope.workdir = Some(daemon_canonical(scratch.path()).to_str().unwrap().into());
     rig.sync(vec![scope]).await;
     let bound = rig
         .bound(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))))
@@ -79,7 +80,7 @@ async fn activity_route_stamps_verified_opener_project_and_scope_attributes() {
     assert_eq!(entry.actor.agent_id.as_deref(), Some("agent-1"));
     assert!(entry.actor.run_id.is_none());
     assert_eq!(entry.actor.flow_id.as_deref(), Some("flow-1"));
-    assert!(entry.actor.project_root.as_ref().unwrap().is_absolute());
+    assert_eq!(entry.actor.project_root, Some(daemon_canonical(scratch.path())));
     let uncited = record_on(&rig, PLEXUS, Value::Null).await;
     assert_eq!(uncited.header.ty, FrameType::Response);
     let last: ActivityEntry = serde_json::from_str(
@@ -838,6 +839,7 @@ async fn activity_real_daemon_restart_head_and_query_do_not_block_reader() {
 #[tokio::test]
 async fn activity_route_project_fields_come_from_scope_even_for_legacy_target() {
     let scratch = ScratchDir::new("activity-scope-project");
+    let legacy_root = ScratchDir::new("activity-legacy-root");
     let workdir = daemon_canonical(scratch.path());
     let mut rig = rig_with_target_capabilities(&[]).await;
     rig.handler = rig
@@ -848,25 +850,27 @@ async fn activity_route_project_fields_come_from_scope_even_for_legacy_target() 
         .with_project_id(Some("project:scope".into()))])
         .await;
     let bound = rig
-        .bound(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))))
+        .bound_with_legacy_root(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))), legacy_root.path())
         .await;
     assert!(bound.stamp().unwrap().project_id.is_none());
     assert_eq!(
         record_on(&rig, PLEXUS, citation(&bound)).await.header.ty,
         FrameType::Response
     );
-    let unscoped = rig.bound(Some(AFT), PLEXUS, None).await;
+    let unscoped = rig.bound_with_legacy_root(Some(AFT), PLEXUS, None, legacy_root.path()).await;
     assert_eq!(
         record_on(&rig, PLEXUS, citation(&unscoped)).await.header.ty,
         FrameType::Response
     );
+    let rootless = rig.bound(Some(AFT), PLEXUS, None).await;
+    assert_eq!(record_on(&rig, PLEXUS, citation(&rootless)).await.header.ty, FrameType::Response);
     let entries: Vec<ActivityEntry> =
         std::fs::read_to_string(scratch.path().join("activity.jsonl"))
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.len(), 3);
     assert_eq!(entries[0].actor.workdir.as_ref(), Some(&workdir));
     assert_eq!(
         entries[0].actor.project_id.as_deref(),
@@ -876,6 +880,9 @@ async fn activity_route_project_fields_come_from_scope_even_for_legacy_target() 
     assert!(entries[1].actor.workdir.is_none());
     assert!(entries[1].actor.project_id.is_none());
     assert!(entries[1].actor.project_root.is_some());
+    assert!(entries[2].actor.project_root.is_none());
+    assert!(entries[2].actor.workdir.is_none());
+    assert!(entries[2].actor.project_id.is_none());
 }
 
 /// A folder as the daemon stores it: canonical, and on Windows in the plain

@@ -1141,18 +1141,14 @@ fn capability_manifest(
     manifest
 }
 
-fn route_open_frame(project: &TestProject, module_id: &str, corr: u64) -> Frame {
+fn route_open_frame(_project: &TestProject, module_id: &str, corr: u64) -> Frame {
     control_request_frame(
         corr,
         ClientControlRequest::RouteOpen {
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
-            identity: BindIdentity::new(
-                project.path().to_path_buf(),
-                "opencode".to_string(),
-                format!("reqcap-{corr}"),
-            ),
+            identity: BindIdentity::new("opencode".to_string(), format!("reqcap-{corr}")),
             consumer_identity: None,
             consumer_capabilities: None,
             role_versions: None,
@@ -1308,7 +1304,7 @@ async fn catalog_list(
 async fn open_route(
     client: &mut Endpoint,
     module: &mut Endpoint,
-    project: &TestProject,
+    _project: &TestProject,
     module_id: &str,
     corr: u64,
 ) -> RoutePair {
@@ -1320,7 +1316,6 @@ async fn open_route(
                     module_id: module_id.to_string(),
                 },
                 identity: BindIdentity::new(
-                    project.path().to_path_buf(),
                     "opencode".to_string(),
                     "catalog-update-session".to_string(),
                 ),
@@ -1524,7 +1519,7 @@ async fn spawn_ready_stub(
 
 async fn route_open_terminal(
     client: &mut Endpoint,
-    project: &TestProject,
+    _project: &TestProject,
     module_id: &str,
     corr: u64,
 ) -> Frame {
@@ -1535,11 +1530,7 @@ async fn route_open_terminal(
                 target: RouteTarget::ToolProvider {
                     module_id: module_id.to_string(),
                 },
-                identity: BindIdentity::new(
-                    project.path().to_path_buf(),
-                    "opencode".to_string(),
-                    format!("readiness-{corr}"),
-                ),
+                identity: BindIdentity::new("opencode".to_string(), format!("readiness-{corr}")),
                 consumer_identity: None,
                 consumer_capabilities: None,
                 role_versions: None,
@@ -1791,17 +1782,13 @@ impl Drop for FrameInbox {
 }
 
 struct TestProject {
-    temp: ScratchDir,
+    _temp: ScratchDir,
 }
 
 impl TestProject {
     fn new(name: &str) -> Self {
         Self {
-            temp: ScratchDir::new(name),
+            _temp: ScratchDir::new(name),
         }
-    }
-
-    fn path(&self) -> &Path {
-        self.temp.path()
     }
 }

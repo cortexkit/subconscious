@@ -683,8 +683,8 @@ pub struct RouteCtx {
 
 /// Closed set of data-plane backends for non-zero channels.
 ///
-/// Channel 0 is structurally special and remains [`Router::control`], not an
-/// enum variant. Static/test backends live in [`Router::backends`]; the forwarding
+/// Channel 0 is structurally special and remains `Router::control`, not an
+/// enum variant. Static/test backends live in `Router::backends`; the forwarding
 /// backend is selected dynamically only when a per-connection forwarding binding exists.
 #[derive(Debug, Clone)]
 pub enum Backend {

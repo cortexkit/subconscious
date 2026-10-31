@@ -24,7 +24,7 @@ fn info(tcp: &TcpListener) -> ConnectionInfo {
         key: vec![0x42; 32],
         daemon_id: [0x21; 16],
         pid: std::process::id(),
-        daemon_ver: "0.38.0".into(),
+        daemon_ver: "0.39.0".into(),
     }
 }
 
@@ -281,7 +281,7 @@ async fn operator_app_omits_environment_identity_and_honours_explicit() {
         let target = RouteTarget::ToolProvider {
             module_id: "provider".into(),
         };
-        let identity = BindIdentity::new(dir.to_path_buf(), "test", "operator");
+        let identity = BindIdentity::new("test", "operator");
 
         let (endpoint, listener) = listen(&dir, "operator");
         write_atomic_with_local_endpoint(&file, &info, Some(&endpoint)).unwrap();

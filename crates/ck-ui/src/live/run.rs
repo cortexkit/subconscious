@@ -815,14 +815,13 @@ async fn module_request(
             match routes.get(module) {
                 Some(h) => *h,
                 None => {
-                    let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
                     let h = conn
                         .consumer
                         .open_route(
                             RouteTarget::ManagementSurface {
                                 module_id: module.to_string(),
                             },
-                            BindIdentity::new(root, "ck", "app"),
+                            BindIdentity::new("ck", "app"),
                             call_options(),
                         )
                         .await
@@ -1677,7 +1676,6 @@ impl pairing::Callosum for DaemonCallosum {
             let Some(conn) = shared.conn() else {
                 return Err(CallFailure::Lost);
             };
-            let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
             // A session name of its own gives the watch a route of its own,
             // apart from the shared route opens and confirms use.
             let session = format!(
@@ -1690,7 +1688,7 @@ impl pairing::Callosum for DaemonCallosum {
                     RouteTarget::ManagementSurface {
                         module_id: modules::DEVICES.to_string(),
                     },
-                    BindIdentity::new(root, "ck", session),
+                    BindIdentity::new("ck", session),
                     call_options(),
                 )
                 .await

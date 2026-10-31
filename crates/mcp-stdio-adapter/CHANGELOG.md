@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.0
+
+- Breaking: upgrade public resolver and module handler types to Rust client 0.33 and protocol 0.34. Credential routes no longer claim the current directory as a project; this resolver's credential request uses the credential handle, not a project.
+
 ## 0.1.18
 
 - Tests only: removed a duplicate manifest unit test; the executable manifest test still checks `runtime_computed`. No behaviour change.

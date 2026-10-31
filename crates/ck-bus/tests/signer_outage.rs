@@ -204,14 +204,7 @@ async fn relay_to(
             RouteTarget::ManagementSurface {
                 module_id: module_id.to_string(),
             },
-            BindIdentity::new(
-                connection_file
-                    .parent()
-                    .map(PathBuf::from)
-                    .unwrap_or_default(),
-                "ck-bus-outage-row",
-                "relay",
-            ),
+            BindIdentity::new("ck-bus-outage-row", "relay"),
             serde_json::to_vec(&body).unwrap(),
             CallOptions {
                 timeout: Duration::from_secs(20),

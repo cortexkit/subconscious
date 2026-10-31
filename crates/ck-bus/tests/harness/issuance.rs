@@ -196,14 +196,7 @@ pub async fn relay_at(
             RouteTarget::ManagementSurface {
                 module_id: module_id.to_string(),
             },
-            BindIdentity::new(
-                connection_file
-                    .parent()
-                    .map(PathBuf::from)
-                    .unwrap_or_default(),
-                "ck-bus-issuance-rows",
-                "relay",
-            ),
+            BindIdentity::new("ck-bus-issuance-rows", "relay"),
             body,
             CallOptions {
                 timeout: Duration::from_secs(20),
@@ -317,11 +310,7 @@ impl ModuleHandler for Relay {
                 RouteTarget::ManagementSurface {
                     module_id: self.target.clone(),
                 },
-                BindIdentity::new(
-                    self.bind_dir.clone(),
-                    "participant",
-                    if attest { "attested" } else { "direct" },
-                ),
+                BindIdentity::new("participant", if attest { "attested" } else { "direct" }),
                 serde_json::to_vec(&params["body"]).unwrap(),
                 options,
             )

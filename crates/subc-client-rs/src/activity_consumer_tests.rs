@@ -9,6 +9,7 @@ fn consumer() -> (SubcConsumer, mpsc::Receiver<WriteCommand>) {
     ));
     let (writer, wire) = mpsc::channel(16);
     shared.lock_inner().writer = Some(writer);
+    shared.lock_inner().daemon_ver = "0.39.0".into();
     (SubcConsumer { shared }, wire)
 }
 

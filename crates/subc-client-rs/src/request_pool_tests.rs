@@ -660,11 +660,7 @@ async fn a_served_module_dispatches_through_the_pools_its_handler_declares() {
         target: RouteTarget::ToolProvider {
             module_id: "pool-test".to_string(),
         },
-        identity: BindIdentity::new(
-            PathBuf::from("/tmp/project"),
-            "test".to_string(),
-            "pools".to_string(),
-        ),
+        identity: BindIdentity::new("test".to_string(), "pools".to_string()),
         principal: None,
         consumer_capabilities: None,
         role_versions: None,

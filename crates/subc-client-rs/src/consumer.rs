@@ -2907,6 +2907,13 @@ impl Error for NotSentSource {}
 /// Managed call or subscription failure.
 #[derive(Debug)]
 pub enum CallError {
+    /// Local compatibility policy refusal: the version retained from the
+    /// connection file for this connection is not an exact numeric
+    /// `major.minor.patch` version at least 0.39.0. Unrecognized strings,
+    /// including prereleases and build suffixes, are refused too. This
+    /// route-open attempt was refused before being queued for writing.
+    /// The handshake authenticates the daemon ID, not this version metadata.
+    DaemonTooOld { daemon_ver: String },
     /// A pre-send failure, proven non-delivery, or unusable reply or internal completion.
     /// Check [`CallError::never_forwarded`] before treating the whole call as safe to resend.
     NotSent(Box<dyn Error + Send + Sync>),
@@ -3000,6 +3007,7 @@ impl CallError {
     pub fn code(&self) -> Option<&str> {
         match self {
             Self::Module(body) => Some(&body.code),
+            Self::DaemonTooOld { .. } => Some("daemon_too_old"),
             Self::CapabilityUnprovided { .. } => Some("capability_unprovided"),
             Self::CapabilityAmbiguous { .. } => Some("capability_ambiguous"),
             Self::InvalidCapabilityIdentifier { .. } => Some("invalid_capability_identifier"),
@@ -3083,6 +3091,10 @@ impl CallError {
 impl fmt::Display for CallError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::DaemonTooOld { daemon_ver } => write!(
+                f,
+                "daemon_too_old: route.open requires daemon 0.39.0 or newer (connected version: {daemon_ver})"
+            ),
             Self::NotSent(err) => write!(f, "request not sent: {err}"),
             Self::OutcomeUnknown(err) => write!(f, "request outcome unknown: {err}"),
             Self::Module(body) => write!(f, "module error {}: {}", body.code, body.message),
@@ -3118,6 +3130,7 @@ impl Error for CallError {
             | Self::OutcomeUnknown(err)
             | Self::SubscriptionBackpressure(err) => Some(err.as_ref()),
             Self::Module(_)
+            | Self::DaemonTooOld { .. }
             | Self::StaleRouteHandle(_)
             | Self::CapabilityUnprovided { .. }
             | Self::CapabilityAmbiguous { .. }
@@ -3359,6 +3372,7 @@ struct Shared {
 struct Inner {
     generation: u64,
     daemon_origin_trusted: bool,
+    daemon_ver: String,
     epoch: u64,
     next_corr: Option<u64>,
     writer: Option<mpsc::Sender<WriteCommand>>,
@@ -3584,6 +3598,7 @@ impl Shared {
             inner: Mutex::new(Inner {
                 generation: 1,
                 daemon_origin_trusted: false,
+                daemon_ver: String::new(),
                 epoch: 1,
                 next_corr: Some(1),
                 writer: None,
@@ -3713,6 +3728,7 @@ impl Shared {
             inner.next_corr = Some(1);
             inner.writer = Some(tx);
             inner.daemon_origin_trusted = opened.daemon_origin_trusted;
+            inner.daemon_ver = opened.daemon_ver;
             self.last_inbound_ms.store(0, Ordering::Release);
             (
                 generation,
@@ -4406,6 +4422,14 @@ impl Shared {
                 return Err(CallError::not_sent(
                     "connection changed before request registration",
                 ));
+            }
+            // Check the version retained for the authenticated connection under
+            // the same lock as registration, so reconnecting cannot send a
+            // rootless identity after a check on a different connection.
+            if retain_late_route_open && !daemon_version_at_least(&inner.daemon_ver, (0, 39, 0)) {
+                return Err(CallError::DaemonTooOld {
+                    daemon_ver: inner.daemon_ver.clone(),
+                });
             }
             if let Some(expected) = expected_handle {
                 if inner.route_epochs.get(&expected.channel) != Some(&expected)
@@ -5596,7 +5620,6 @@ struct RouteState {
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct RouteKey {
     target: RouteTargetKey,
-    project_root: PathBuf,
     harness: String,
     session: String,
     consumer_identity: Option<ConsumerIdentityKey>,
@@ -5621,7 +5644,6 @@ impl RouteKey {
     ) -> Self {
         Self {
             target: RouteTargetKey::from(target),
-            project_root: identity.project_root.clone(),
             harness: identity.harness.clone(),
             session: identity.session.clone(),
             consumer_identity: consumer_identity.map(ConsumerIdentityKey::from),
@@ -5775,6 +5797,7 @@ impl SharedCallFailure {
         match self.kind {
             FailureKind::NotSent(source) => CallError::NotSent(Box::new(source)),
             FailureKind::OutcomeUnknown(source) => CallError::outcome_unknown_source(source),
+            FailureKind::DaemonTooOld(daemon_ver) => CallError::DaemonTooOld { daemon_ver },
         }
     }
 }
@@ -5782,6 +5805,9 @@ impl SharedCallFailure {
 impl From<CallError> for SharedCallFailure {
     fn from(value: CallError) -> Self {
         match value {
+            CallError::DaemonTooOld { daemon_ver } => Self {
+                kind: FailureKind::DaemonTooOld(daemon_ver),
+            },
             CallError::NotSent(err) => Self {
                 kind: FailureKind::NotSent(
                     err.downcast_ref::<NotSentSource>()
@@ -5833,6 +5859,7 @@ impl From<CallError> for SharedCallFailure {
 enum FailureKind {
     NotSent(NotSentSource),
     OutcomeUnknown(OutcomeUnknownSource),
+    DaemonTooOld(String),
 }
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
@@ -6136,6 +6163,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> ConsumerStream for T {}
 struct OpenedConnection {
     stream: Box<dyn ConsumerStream>,
     daemon_origin_trusted: bool,
+    daemon_ver: String,
 }
 
 async fn open_connection(
@@ -6183,6 +6211,7 @@ async fn open_connection(
         return Ok(OpenedConnection {
             stream,
             daemon_origin_trusted: trusts_daemon_origin(&read.info.daemon_ver),
+            daemon_ver: read.info.daemon_ver,
         });
     }
     let conn =
@@ -6249,6 +6278,7 @@ async fn open_connection_with_info(
     Ok(OpenedConnection {
         stream: Box::new(stream),
         daemon_origin_trusted: trusts_daemon_origin(&conn.daemon_ver),
+        daemon_ver: conn.daemon_ver.clone(),
     })
 }
 
@@ -6988,6 +7018,10 @@ const DAEMON_ORIGIN_MIN_VERSION: (u64, u64, u64) = (0, 37, 15);
 /// the file, but its HMAC does not cover the version itself. Do not re-read the
 /// file to classify a connection that is already authenticated.
 pub fn trusts_daemon_origin(daemon_ver: &str) -> bool {
+    daemon_version_at_least(daemon_ver, DAEMON_ORIGIN_MIN_VERSION)
+}
+
+fn daemon_version_at_least(daemon_ver: &str, minimum: (u64, u64, u64)) -> bool {
     let mut components = daemon_ver.split('.');
     let mut next = || {
         let component = components.next()?;
@@ -6999,7 +7033,7 @@ pub fn trusts_daemon_origin(daemon_ver: &str) -> bool {
     let version = (next(), next(), next());
     match version {
         (Some(major), Some(minor), Some(patch)) if components.next().is_none() => {
-            (major, minor, patch) >= DAEMON_ORIGIN_MIN_VERSION
+            (major, minor, patch) >= minimum
         }
         _ => false,
     }
@@ -7172,6 +7206,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.route_epochs.insert(handle.channel, handle);
         }
         (shared, receiver, handle)
@@ -7237,6 +7272,7 @@ mod tests {
         let shared = writer_test_shared();
         let (writer, mut receiver) = mpsc::channel(4);
         shared.lock_inner().writer = Some(writer);
+        shared.lock_inner().daemon_ver = "0.39.0".into();
         let consumer = SubcConsumer {
             shared: Arc::clone(&shared),
         };
@@ -7246,11 +7282,7 @@ mod tests {
                     RouteTarget::ToolProvider {
                         module_id: "reverse-provider".to_string(),
                     },
-                    BindIdentity::new(
-                        PathBuf::from("/tmp/project"),
-                        "test".to_string(),
-                        "reverse".to_string(),
-                    ),
+                    BindIdentity::new("test".to_string(), "reverse".to_string()),
                     opts,
                 )
                 .await
@@ -7382,6 +7414,7 @@ mod tests {
             let shared = writer_test_shared();
             let (writer, receiver) = mpsc::channel(4);
             shared.lock_inner().writer = Some(writer);
+            shared.lock_inner().daemon_ver = "0.39.0".into();
             (shared, receiver)
         };
         let too_long = "x".repeat(65);
@@ -7581,6 +7614,7 @@ mod tests {
         let shared = writer_test_shared();
         let (writer, rx) = mpsc::channel(capacity);
         shared.lock_inner().writer = Some(writer);
+        shared.lock_inner().daemon_ver = "0.39.0".into();
         let handle = RouteHandle::new(5, 3, 1);
         let sem = Arc::new(Semaphore::new(credit));
         shared
@@ -7911,6 +7945,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(live_writer);
+            inner.daemon_ver = "0.39.0".into();
             for index in 0..FRAME_COUNT {
                 let corr = index as u64 + 1;
                 let frame = response_frame(7, 1, corr, vec![index as u8; index + 1]);
@@ -8002,6 +8037,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(live_writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.pending.insert(
                 accepted_key,
                 PendingEntry::unary(accepted_tx, false, None, None),
@@ -8052,6 +8088,7 @@ mod tests {
         let shared = writer_test_shared();
         let (writer, _writer_rx) = mpsc::channel(1);
         shared.lock_inner().writer = Some(writer);
+        shared.lock_inner().daemon_ver = "0.39.0".into();
         let (tx, rx) = oneshot::channel();
         let mut entry = PendingEntry::unary(tx, false, None, None);
         entry.accepted = true;
@@ -8179,6 +8216,7 @@ mod tests {
         let shared = Arc::new(Shared::new(PathBuf::new(), ConsumerOptions::default()));
         let (writer, _rx) = mpsc::channel(8);
         shared.lock_inner().writer = Some(writer);
+        shared.lock_inner().daemon_ver = "0.39.0".into();
         shared.install_ingress_handle(RouteHandle::new(7, 1, 1));
         shared.install_ingress_handle(RouteHandle::new(9, 1, 1));
         {
@@ -8248,6 +8286,7 @@ mod tests {
             let shared = Arc::new(Shared::new(PathBuf::new(), ConsumerOptions::default()));
             let (writer, _writer_rx) = mpsc::channel(8);
             shared.lock_inner().writer = Some(writer);
+            shared.lock_inner().daemon_ver = "0.39.0".into();
             let handle = RouteHandle::new(7, 1, 1);
             shared.install_ingress_handle(handle);
             let (tx, rx) = oneshot::channel();
@@ -8355,6 +8394,7 @@ mod tests {
             {
                 let mut inner = shared.lock_inner();
                 inner.writer = Some(writer);
+                inner.daemon_ver = "0.39.0".into();
             }
             let consumer = SubcConsumer {
                 shared: Arc::clone(&shared),
@@ -8362,11 +8402,7 @@ mod tests {
             let target = RouteTarget::ToolProvider {
                 module_id: "retry-polarity".to_string(),
             };
-            let identity = BindIdentity::new(
-                PathBuf::from("/tmp/project"),
-                "test".to_string(),
-                code.to_string(),
-            );
+            let identity = BindIdentity::new("test".to_string(), code.to_string());
             let options = CallOptions {
                 timeout: Duration::from_secs(2),
                 route_retry: RetryBackoff {
@@ -8471,6 +8507,7 @@ mod tests {
         let shared = Arc::new(shared);
         let (writer, receiver) = mpsc::channel(64);
         shared.lock_inner().writer = Some(writer);
+        shared.lock_inner().daemon_ver = "0.39.0".into();
         let consumer = Arc::new(SubcConsumer {
             shared: Arc::clone(&shared),
         });
@@ -8484,11 +8521,7 @@ mod tests {
     }
 
     fn restart_identity() -> BindIdentity {
-        BindIdentity::new(
-            PathBuf::from("/tmp/project"),
-            "test".to_string(),
-            "restart".to_string(),
-        )
+        BindIdentity::new("test".to_string(), "restart".to_string())
     }
 
     /// The daemon's answer to one route.open: accept it on `channel`, or refuse
@@ -9088,7 +9121,7 @@ mod tests {
             &RouteTarget::ToolProvider {
                 module_id: "m".into(),
             },
-            &BindIdentity::new(PathBuf::from("/tmp/p"), "h", "s"),
+            &BindIdentity::new("h", "s"),
             None,
             None,
         );
@@ -9121,7 +9154,7 @@ mod tests {
             &RouteTarget::ToolProvider {
                 module_id: "absent".into(),
             },
-            &BindIdentity::new(PathBuf::from("/tmp/p"), "h", "s"),
+            &BindIdentity::new("h", "s"),
             None,
             None,
         );
@@ -9136,9 +9169,8 @@ mod tests {
             module_id: "a\0b".into(),
             service_id: "svc".into(),
         };
-        let identity = BindIdentity::new(PathBuf::from("/tmp/project"), "h", "s");
+        let identity = BindIdentity::new("h", "s");
         let key = RouteKey::new(&target, &identity, None, None);
-        assert_eq!(key.project_root, PathBuf::from("/tmp/project"));
         assert!(matches!(key.target, RouteTargetKey::InternalService { .. }));
     }
 
@@ -9160,6 +9192,7 @@ mod tests {
         inner.epoch += 1;
         inner.next_corr = Some(1);
         inner.writer = Some(writer);
+        inner.daemon_ver = "0.39.0".into();
         inner.reconnect = ReconnectState::Idle;
         receiver
     }
@@ -9279,16 +9312,13 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             for channel in 1..=8 {
                 let key = RouteKey::new(
                     &RouteTarget::ToolProvider {
                         module_id: format!("module-{channel}"),
                     },
-                    &BindIdentity::new(
-                        PathBuf::from("/tmp/project"),
-                        "test",
-                        format!("session-{channel}"),
-                    ),
+                    &BindIdentity::new("test", format!("session-{channel}")),
                     None,
                     None,
                 );
@@ -9360,6 +9390,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.route_epochs.insert(old_handle.channel, old_handle);
         }
         let mut pushes = shared
@@ -9389,7 +9420,7 @@ mod tests {
         let target = RouteTarget::ToolProvider {
             module_id: "aft".into(),
         };
-        let identity = BindIdentity::new(PathBuf::from("/tmp/project"), "h", "s");
+        let identity = BindIdentity::new("h", "s");
         let left = RouteKey::new(
             &target,
             &identity,
@@ -9483,7 +9514,7 @@ mod tests {
         let target = RouteTarget::ToolProvider {
             module_id: "plexus".into(),
         };
-        let identity = BindIdentity::new(PathBuf::from("/tmp/project"), "h", "s");
+        let identity = BindIdentity::new("h", "s");
         let key = |scope: Option<ScopeSelector>| {
             RouteKey::new(&target, &identity, None, None).with_scope(scope.as_ref())
         };
@@ -10286,6 +10317,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.route_epochs.insert(9, current);
             inner
                 .pending
@@ -10336,6 +10368,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.route_epochs.insert(handle.channel, handle);
             inner
                 .pending
@@ -10382,6 +10415,7 @@ mod tests {
             let mut inner = shared.lock_inner();
             inner.generation = 2;
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.route_epochs.insert(4, current);
         }
 
@@ -10466,6 +10500,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner
                 .pending
                 .insert(key, PendingEntry::unary(tx, true, None, None));
@@ -10509,6 +10544,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner
                 .pending
                 .insert(key, PendingEntry::unary(tx, true, None, None));
@@ -10538,6 +10574,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.next_corr = Some(u64::MAX);
         }
         let request_shared = Arc::clone(&shared);
@@ -10592,11 +10629,7 @@ mod tests {
         let target = RouteTarget::ToolProvider {
             module_id: "flow-controlled".to_string(),
         };
-        let identity = BindIdentity::new(
-            PathBuf::from("/tmp/project"),
-            "test".to_string(),
-            "deadline".to_string(),
-        );
+        let identity = BindIdentity::new("test".to_string(), "deadline".to_string());
         let consumer_identity = Some(ConsumerIdentity {
             module_id: "caller".to_string(),
             launch_nonce: "nonce".to_string(),
@@ -10621,6 +10654,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.cache_route(
                 key,
                 RouteState {
@@ -10687,6 +10721,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
         }
 
         let consumer = SubcConsumer {
@@ -10695,11 +10730,7 @@ mod tests {
         let target = RouteTarget::ToolProvider {
             module_id: "admitted-target".to_string(),
         };
-        let identity = BindIdentity::new(
-            PathBuf::from("/tmp/project"),
-            "test".to_string(),
-            "admitted".to_string(),
-        );
+        let identity = BindIdentity::new("test".to_string(), "admitted".to_string());
         let task = tokio::spawn(async move {
             consumer
                 .open_route_with_admission_facts(
@@ -10766,6 +10797,7 @@ mod tests {
         let generation = {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.generation
         };
         let consumer = SubcConsumer {
@@ -10774,11 +10806,7 @@ mod tests {
         let target = RouteTarget::ToolProvider {
             module_id: "cerebellum".to_string(),
         };
-        let identity = BindIdentity::new(
-            PathBuf::from("/tmp/project"),
-            "test".to_string(),
-            "admitted".to_string(),
-        );
+        let identity = BindIdentity::new("test".to_string(), "admitted".to_string());
         let facts = serde_json::json!({"schema": 1, "verified_class": "member"});
         // The consumer is returned from the task and kept alive by the caller:
         // dropping it closes the connection, after which no frame is dispatched.
@@ -10834,6 +10862,7 @@ mod tests {
         let generation = {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.generation
         };
         let consumer = SubcConsumer {
@@ -10845,11 +10874,7 @@ mod tests {
                     RouteTarget::ToolProvider {
                         module_id: "cerebellum".to_string(),
                     },
-                    BindIdentity::new(
-                        PathBuf::from("/tmp/project"),
-                        "test".to_string(),
-                        "admitted".to_string(),
-                    ),
+                    BindIdentity::new("test".to_string(), "admitted".to_string()),
                     serde_json::json!({"schema": 1, "verified_class": "member"}),
                 )
                 .await;
@@ -10992,11 +11017,7 @@ mod tests {
         let target = RouteTarget::ToolProvider {
             module_id: "single-flight".to_string(),
         };
-        let identity = BindIdentity::new(
-            PathBuf::from("/tmp/project"),
-            "test".to_string(),
-            "route-open".to_string(),
-        );
+        let identity = BindIdentity::new("test".to_string(), "route-open".to_string());
         let opts = CallOptions {
             timeout: Duration::from_millis(25),
             consumer_identity: Some(ConsumerIdentity {
@@ -11009,6 +11030,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.openings.insert(
                 key,
                 Opening {
@@ -11047,6 +11069,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
         }
         let consumer = SubcConsumer {
             shared: Arc::clone(&shared),
@@ -11054,11 +11077,7 @@ mod tests {
         let target = RouteTarget::ToolProvider {
             module_id: "slow-route-open".to_string(),
         };
-        let identity = BindIdentity::new(
-            PathBuf::from("/tmp/project"),
-            "test".to_string(),
-            "slow-route-open".to_string(),
-        );
+        let identity = BindIdentity::new("test".to_string(), "slow-route-open".to_string());
         let task = tokio::spawn(async move {
             if subscribe {
                 consumer
@@ -11149,6 +11168,7 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.route_epochs.insert(handle.channel, handle);
         }
 
@@ -11194,16 +11214,13 @@ mod tests {
         {
             let mut inner = shared.lock_inner();
             inner.writer = Some(writer);
+            inner.daemon_ver = "0.39.0".into();
             inner.cache_route(
                 RouteKey::new(
                     &RouteTarget::ToolProvider {
                         module_id: "subscriptions".to_string(),
                     },
-                    &BindIdentity::new(
-                        PathBuf::from("/tmp/project"),
-                        "test".to_string(),
-                        "subscription".to_string(),
-                    ),
+                    &BindIdentity::new("test".to_string(), "subscription".to_string()),
                     None,
                     None,
                 ),
@@ -11297,6 +11314,7 @@ mod tests {
         ));
         let (writer, mut rx) = mpsc::channel(1);
         shared.lock_inner().writer = Some(writer);
+        shared.lock_inner().daemon_ver = "0.39.0".into();
 
         let consumer = SubcConsumer {
             shared: Arc::clone(&shared),
@@ -11341,6 +11359,7 @@ mod tests {
         ));
         let (writer, mut rx) = mpsc::channel(1);
         shared.lock_inner().writer = Some(writer);
+        shared.lock_inner().daemon_ver = "0.39.0".into();
 
         let consumer = SubcConsumer {
             shared: Arc::clone(&shared),
@@ -11390,6 +11409,7 @@ mod tests {
         ));
         let (writer, mut rx) = mpsc::channel(1);
         shared.lock_inner().writer = Some(writer);
+        shared.lock_inner().daemon_ver = "0.39.0".into();
 
         let consumer = SubcConsumer {
             shared: Arc::clone(&shared),
@@ -11476,6 +11496,7 @@ mod tests {
         let shared = writer_test_shared();
         let (writer, mut rx) = mpsc::channel(8);
         shared.lock_inner().writer = Some(writer);
+        shared.lock_inner().daemon_ver = "0.39.0".into();
         let consumer = SubcConsumer {
             shared: Arc::clone(&shared),
         };
@@ -11660,6 +11681,7 @@ mod tests {
         let completing = Arc::clone(&shared);
         *shared.before_wait.lock().unwrap() = Some(Box::new(move || {
             completing.lock_inner().writer = Some(sender);
+            completing.lock_inner().daemon_ver = "0.39.0".into();
             completing.notify.notify_waiters();
         }));
 

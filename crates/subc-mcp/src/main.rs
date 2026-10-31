@@ -362,6 +362,8 @@ struct RelaySession {
     peer_state: RwLock<RelayPeerState>,
     local_scope: Option<LocalSessionScope>,
     scope: OnceLock<ScopeSelector>,
+    unscoped_reason: OnceLock<String>,
+    unscoped_warning_logged: AtomicBool,
     /// Set when the host started the session without `initialize`, as MCP
     /// 2026-07-28 hosts do. Such a host is never sent a server-to-client
     /// request; its module questions travel through `input_waiters`.
@@ -393,6 +395,8 @@ impl RelaySession {
             peer_state: RwLock::new(RelayPeerState::default()),
             local_scope: None,
             scope: OnceLock::new(),
+            unscoped_reason: OnceLock::new(),
+            unscoped_warning_logged: AtomicBool::new(false),
             inline_host: OnceLock::new(),
             initialize_host: OnceLock::new(),
             input_waiters: std::sync::Mutex::new(Vec::new()),
@@ -403,6 +407,29 @@ impl RelaySession {
 
     fn id(&self) -> &str {
         &self.id
+    }
+
+    /// After local attribution fails, warn once when reconciling a nonempty
+    /// provider set, with the reason, session ID and sorted currently desired
+    /// provider IDs before opening their routes. Later providers do not trigger
+    /// another warning.
+    fn warn_unscoped_providers(&self, providers: &[DesiredProvider]) {
+        let Some(reason) = self.unscoped_reason.get() else {
+            return;
+        };
+        if self.scope.get().is_some()
+            || providers.is_empty()
+            || self.unscoped_warning_logged.swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        let mut providers = providers
+            .iter()
+            .map(|provider| provider.module_id.as_str())
+            .collect::<Vec<_>>();
+        providers.sort_unstable();
+        tracing::warn!(session = %self.id, ?providers, %reason,
+            "session attribution unavailable; using unscoped provider routes with no project (legacy project_root is /)");
     }
 
     /// Records that the host started this session without `initialize`. The
@@ -1574,6 +1601,7 @@ struct ConfigFileSnapshot {
 
 #[derive(Debug, Clone)]
 struct ConfigSnapshot {
+    project_root: PathBuf,
     effective: GatewayConfig,
     files: ConfigFileSnapshot,
 }
@@ -2979,11 +3007,7 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
     let config = read_gateway_config(&hello.project_root, &hello.harness)?;
     let catalog = catalog_list(subc).await?;
     let desired = desired_session_from_catalog(&config.effective, &catalog.modules)?;
-    let identity = BindIdentity::new(
-        hello.project_root.clone(),
-        hello.harness.clone(),
-        bind_session_from_hello(hello)?,
-    );
+    let identity = BindIdentity::new(hello.harness.clone(), bind_session_from_hello(hello)?);
 
     let gateway_owned = hello
         .instance_token
@@ -2995,7 +3019,7 @@ async fn attach_session(subc: &SubcClient, hello: &ShimHello) -> Result<Attached
         match LocalSessionScope::new(hello.project_root.clone()) {
             Ok(local) => relay_session.local_scope = Some(local),
             Err(error) => {
-                tracing::warn!("session attribution unavailable; using unscoped routes: {error}")
+                let _ = relay_session.unscoped_reason.set(error.to_string());
             }
         }
     }
@@ -3809,6 +3833,7 @@ fn read_gateway_config(project_root: &Path, harness_name: &str) -> Result<Config
     }
 
     Ok(ConfigSnapshot {
+        project_root: project_root.to_path_buf(),
         effective,
         files: gateway_config_file_snapshot(user_path, project_path)?,
     })
@@ -4457,6 +4482,7 @@ async fn reconcile_session_reporting_refusals(
     config: &GatewayConfig,
 ) -> Result<(bool, HashMap<String, OutageRefusal>)> {
     let desired = desired_session_from_catalog(config, &catalog.modules)?;
+    relay_session.warn_unscoped_providers(&desired.providers);
     // A route minted on an earlier relay connection died with it (the daemon
     // closes a connection's routes when the connection ends), so it is treated
     // as absent: its provider gets a fresh route, and no GOODBYE is sent for
@@ -4499,13 +4525,7 @@ async fn reconcile_session_reporting_refusals(
                 relay_session.consumer_capabilities()
             },
             Arc::clone(relay_session),
-            session_scope::provider_scope(
-                relay_session.scope.get(),
-                catalog
-                    .modules
-                    .iter()
-                    .find(|entry| entry.module_id == provider.module_id),
-            ),
+            session_scope::provider_scope(relay_session.scope.get()),
         )
         .await
         {
@@ -4600,7 +4620,7 @@ async fn refresh_policy_if_changed(
         return Ok(None);
     }
 
-    let next_config = read_gateway_config(&state.identity.project_root, &state.identity.harness)?;
+    let next_config = read_gateway_config(&snapshot.project_root, &state.identity.harness)?;
     let prompts_changed =
         snapshot.effective.visible_prompt_names() != next_config.effective.visible_prompt_names();
     let catalog = catalog_list(subc).await?;
@@ -8688,6 +8708,7 @@ mod tests {
     fn test_session_state(inner: SessionInner) -> SessionState {
         SessionState::new(
             ConfigSnapshot {
+                project_root: PathBuf::from("/tmp/project"),
                 effective: GatewayConfig::default(),
                 files: ConfigFileSnapshot {
                     user: ConfigFileState {
@@ -8703,7 +8724,6 @@ mod tests {
                 },
             },
             BindIdentity::new(
-                PathBuf::from("/tmp/subc-mcp-tombstone-test"),
                 DEFAULT_HARNESS.to_owned(),
                 "tombstone-test-session".to_owned(),
             ),
@@ -8767,11 +8787,8 @@ mod tests {
         async fn open_against_error_body(error_body: Vec<u8>) -> BoxError {
             let (client_stream, mut server_stream) = connected_tcp_stream_pair().await;
             let subc = SubcClient::start(client_stream);
-            let identity = BindIdentity::new(
-                PathBuf::from("/tmp/subc-mcp-refusal"),
-                DEFAULT_HARNESS.to_string(),
-                "shim-session".to_string(),
-            );
+            let identity =
+                BindIdentity::new(DEFAULT_HARNESS.to_string(), "shim-session".to_string());
             let server = tokio::spawn(async move {
                 let frame = read_frame(&mut server_stream).await.unwrap().unwrap();
                 let response = build_frame(
@@ -8968,11 +8985,7 @@ mod tests {
             });
             let routes = SubcPromptRouteClient::new(
                 subc.clone(),
-                BindIdentity::new(
-                    PathBuf::from("/tmp/prompt-relay"),
-                    DEFAULT_HARNESS.to_owned(),
-                    "prompt".to_owned(),
-                ),
+                BindIdentity::new(DEFAULT_HARNESS.to_owned(), "prompt".to_owned()),
                 Arc::new(RelaySession::new("prompt".to_owned())),
             );
             let result = routes
@@ -9002,11 +9015,7 @@ mod tests {
     ) {
         let (client_stream, mut server_stream) = connected_tcp_stream_pair().await;
         let subc = SubcClient::start(client_stream);
-        let identity = BindIdentity::new(
-            PathBuf::from("/tmp/subc-mcp-route-open"),
-            DEFAULT_HARNESS.to_string(),
-            "shim-session".to_string(),
-        );
+        let identity = BindIdentity::new(DEFAULT_HARNESS.to_string(), "shim-session".to_string());
         let expected_for_server = expected.clone();
         let (close_tx, close_rx) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
@@ -10471,11 +10480,7 @@ mod tests {
     }
 
     fn conversation_test_identity() -> BindIdentity {
-        BindIdentity::new(
-            PathBuf::from("/tmp/subc-mcp-conversation"),
-            "mcp:claude-code".to_owned(),
-            TEST_INSTANCE_TOKEN.to_owned(),
-        )
+        BindIdentity::new("mcp:claude-code".to_owned(), TEST_INSTANCE_TOKEN.to_owned())
     }
 
     async fn conversation_router_with(
@@ -10695,11 +10700,7 @@ mod tests {
         assert_eq!(attach.harness, "mcp:claude-code");
         let opened = |session: &str, channel: u16| FakeDaemonEvent::RouteOpen {
             target: magic_context_target(),
-            identity: BindIdentity::new(
-                attach.project_root.clone(),
-                attach.harness.clone(),
-                session.to_owned(),
-            ),
+            identity: BindIdentity::new(attach.harness.clone(), session.to_owned()),
             channel,
         };
         assert_eq!(

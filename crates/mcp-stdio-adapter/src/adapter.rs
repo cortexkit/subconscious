@@ -149,7 +149,6 @@ impl CredentialResolver for ClaustrumCredentialResolver {
         }))
         .map_err(|_| CredentialResolutionError)?;
         let identity = BindIdentity::new(
-            env::current_dir().map_err(|_| CredentialResolutionError)?,
             "mcp-stdio-adapter".to_string(),
             "credential-resolution".to_string(),
         );

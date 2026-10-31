@@ -949,17 +949,10 @@ async fn route_open_round_trip_via_tagged_shape_forwards_through_stub() {
         Some(module_id)
     );
     assert_eq!(attach_event["principal"]["kind"].as_str(), Some("direct"));
-    // subc canonicalizes project_root via cortexkit-paths (ProjectRootId) before
-    // relaying — NOT raw fs::canonicalize, which keeps Windows' verbatim \\?\ prefix.
-    // Assert against the same canonicalization subc uses so this holds on every OS.
-    let canonical_project = subc_daemon::ProjectRootId::from_path(project.path())
-        .unwrap()
-        .as_path()
-        .to_path_buf();
-    assert_eq!(
-        attach_event["identity"]["project_root"].as_str(),
-        canonical_project.to_str()
-    );
+    // A project-free, unscoped opener gets only the older-reader placeholder;
+    // the daemon must not attribute that placeholder as a real project.
+    assert_eq!(attach_event["identity"]["project_root"].as_str(), Some("/"));
+    assert!(attach_event["scope"].is_null());
     assert_eq!(
         attach_event["identity"]["session"].as_str(),
         Some("ses-forwarding")
@@ -4026,12 +4019,8 @@ async fn module_frame_after_client_detach_is_dropped_and_connection_survives() {
     module.stop().await.unwrap();
 }
 
-// A vanished root must ADMIT. This test asserted the opposite until the bind
-// relaxation landed, and the inversion is deliberate rather than a weakening:
-// refusing here closed the only exit from a paused run, because cancel needs a
-// bound route and a renamed directory made that route unopenable forever. The
-// aliasing guarantee the old refusal protected now lives in the engine, which
-// refuses the two operations that create durable state.
+// A resolvable vanished root still admits a legacy open so cleanup can reopen
+// an existing session. Binding does not authorize new durable provider state.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_open_vanished_project_root_attaches_under_its_recorded_identity() {
     let server = TestServer::start().await;
@@ -4040,9 +4029,8 @@ async fn route_open_vanished_project_root_attaches_under_its_recorded_identity()
     let (module, events_path) =
         spawn_stub_with_events_path(&server, &supervisor, module_id, "vanished-project-root").await;
 
-    // Create the root, mint the identity a run would have been recorded under,
-    // then delete it. Minting BEFORE deletion is the whole point: the assertion
-    // below is that a cancel arriving afterwards addresses that same identity.
+    // Canonicalize the live folder, then delete it. The legacy open must retain
+    // that canonical root rather than rejecting the missing leaf.
     let project = TestProject::new();
     let vanished_root = project.path().join("worktree");
     std::fs::create_dir(&vanished_root).unwrap();
@@ -4060,7 +4048,6 @@ async fn route_open_vanished_project_root_attaches_under_its_recorded_identity()
             module_id: module_id.to_string(),
         },
         identity: BindIdentity::new(
-            vanished_root,
             "opencode".to_string(),
             "ses-vanished-project-root".to_string(),
         ),
@@ -4070,9 +4057,12 @@ async fn route_open_vanished_project_root_attaches_under_its_recorded_identity()
         admission_facts: None,
         scope: None,
     };
-    write_frame(&mut client, &control_request_frame(481, request))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &legacy_project_frame(481, request, &vanished_root),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
 
     let frame = read_frame_timeout(&mut client).await;
@@ -4086,10 +4076,8 @@ async fn route_open_vanished_project_root_attaches_under_its_recorded_identity()
         event["kind"] == "attach"
     })
     .await;
-    // The identity must equal the one minted while the directory existed. A
-    // lexically-normalized path would differ here on any host where the root is
-    // reached through a symlink, and the caller would address an empty lineage
-    // and be told, confidently, that the run does not exist.
+    // The relayed root must equal the canonical root from before deletion,
+    // including on hosts whose temporary directory is reached through a symlink.
     assert_eq!(
         attach_event["identity"]["project_root"].as_str(),
         identity_while_present.to_str(),
@@ -4121,7 +4109,6 @@ async fn route_open_unreconstructable_project_root_returns_error_without_provide
             module_id: module_id.to_string(),
         },
         identity: BindIdentity::new(
-            unreconstructable,
             "opencode".to_string(),
             "ses-invalid-project-root".to_string(),
         ),
@@ -4131,9 +4118,12 @@ async fn route_open_unreconstructable_project_root_returns_error_without_provide
         admission_facts: None,
         scope: None,
     };
-    write_frame(&mut client, &control_request_frame(481, request))
-        .await
-        .unwrap();
+    write_frame(
+        &mut client,
+        &legacy_project_frame(481, request, &unreconstructable),
+    )
+    .await
+    .unwrap();
     client.flush().await.unwrap();
 
     let error = read_control_error_on_stream(&mut client, 481, "invalid_project_root").await;
@@ -7506,7 +7496,7 @@ fn attach_request(project: &TestProject, session: &str, module_id: &str) -> Clie
 }
 
 fn attach_request_with_consumer_identity(
-    project: &TestProject,
+    _project: &TestProject,
     session: &str,
     module_id: &str,
     consumer_identity: Option<ConsumerIdentity>,
@@ -7515,11 +7505,7 @@ fn attach_request_with_consumer_identity(
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
         },
-        identity: BindIdentity::new(
-            project.path().to_path_buf(),
-            "opencode".to_string(),
-            session.to_string(),
-        ),
+        identity: BindIdentity::new("opencode".to_string(), session.to_string()),
         consumer_identity,
         consumer_capabilities: None,
         role_versions: None,
@@ -7618,6 +7604,22 @@ fn control_request_frame(corr: u64, request: ClientControlRequest) -> Frame {
         0,
         corr,
         body,
+    )
+    .unwrap()
+}
+
+// Retain coverage of pre-0.34 openers, whose retired fields are accepted only
+// by the daemon's transitional decoder rather than the public identity type.
+fn legacy_project_frame(corr: u64, request: ClientControlRequest, root: &Path) -> Frame {
+    let mut body = serde_json::to_value(request).unwrap();
+    body["identity"]["project_root"] = serde_json::json!(root);
+    Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        corr,
+        serde_json::to_vec(&body).unwrap(),
     )
     .unwrap()
 }

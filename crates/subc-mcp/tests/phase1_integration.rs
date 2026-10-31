@@ -5535,13 +5535,8 @@ where
     .expect("timed out waiting for frame")
 }
 
-fn route_identity(label: &str, corr: u64) -> BindIdentity {
-    let project_root = unique_temp_dir(&format!("mcp-route-{label}-{corr}"));
-    BindIdentity::new(
-        project_root.keep(),
-        "subc-mcp-test",
-        format!("session-{corr}"),
-    )
+fn route_identity(_label: &str, corr: u64) -> BindIdentity {
+    BindIdentity::new("subc-mcp-test", format!("session-{corr}"))
 }
 
 async fn wait_for_stub_event<F>(path: &Path, wait: Duration, matches: F) -> Value

@@ -354,7 +354,7 @@ fn bind(principal: Option<Principal>, flow: Option<(bool, bool)>) -> RouteBindRe
         RouteTarget::ManagementSurface {
             module_id: "inspect".into(),
         },
-        BindIdentity::new("/project", "test", "inspect"),
+        BindIdentity::new("test", "inspect"),
     );
     req.principal = principal;
     if let Some((authorized, has_flow)) = flow {

@@ -632,7 +632,7 @@ mod tests {
             target: crate::RouteTarget::ToolProvider {
                 module_id: "aft".to_string(),
             },
-            identity: crate::BindIdentity::new("/tmp/p", "h", "s"),
+            identity: crate::BindIdentity::new("h", "s"),
             principal: None,
             consumer_capabilities: None,
             role_versions,

@@ -1,5 +1,24 @@
 use super::*;
 
+// Model the old reader explicitly: the current identity decoder drops project
+// fields, so re-encoding it cannot check legacy byte preservation.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyBind {
+    op: String,
+    route_channel: u16,
+    epoch: u32,
+    target: RouteTarget,
+    identity: LegacyIdentity,
+    principal: Principal,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct LegacyIdentity {
+    project_root: std::path::PathBuf,
+    harness: String,
+    session: String,
+}
+
 fn hello_operations(field: &str, operations: Option<Value>) -> Frame {
     let hello = hello_with_flow_operations(json!(["flow-scopes/v1"]), None);
     let mut body: Value = serde_json::from_slice(&hello.body).unwrap();
@@ -198,8 +217,7 @@ async fn observed_peer_is_opt_in_tcp_is_unobserved_and_legacy_bytes_are_unchange
             if let Some(peer) = peer {
                 handler.record_observed_peer(client.connection_id, peer);
             }
-            let root = unique_project_root("peer-gate");
-            let identity = BindIdentity::new(root.path().to_path_buf(), "unit", "s");
+            let identity = BindIdentity::new("unit", "s");
             let (bind, binding) =
                 bind_route(&handler, &target, &mut target_rx, &client, identity, None).await;
             let raw: Value = serde_json::from_slice(&bind.body).unwrap();
@@ -217,7 +235,7 @@ async fn observed_peer_is_opt_in_tcp_is_unobserved_and_legacy_bytes_are_unchange
                 assert_eq!(raw["observed_peer"], expected);
             } else {
                 assert!(raw.get("observed_peer").is_none());
-                let legacy: ModuleControlRequest = serde_json::from_slice(&bind.body).unwrap();
+                let legacy: LegacyBind = serde_json::from_slice(&bind.body).unwrap();
                 assert_eq!(bind.body, serde_json::to_vec(&legacy).unwrap());
             }
             handler.cleanup_connection(client.connection_id).unwrap();
@@ -286,8 +304,7 @@ async fn operator_app_bind_is_gated_independently_and_the_stamp_survives_route_c
                             crate::operator_apps::OperatorAppStamp::fixture("fixture", 42),
                         );
                     }
-                    let root = unique_project_root("operator-app-bind");
-                    let identity = BindIdentity::new(root.path().to_path_buf(), "unit", "s");
+                    let identity = BindIdentity::new("unit", "s");
                     let (bind, binding) =
                         bind_route(&handler, &target, &mut rx, &client, identity, None).await;
                     let raw: Value = serde_json::from_slice(&bind.body).unwrap();
@@ -338,7 +355,7 @@ async fn operator_app_bind_is_gated_independently_and_the_stamp_survives_route_c
                     assert_eq!(binding.principal, Principal::Direct);
                     assert_eq!(binding.operator_app.is_some(), stamped);
                     if !observed && !(operator && enabled && stamped) {
-                        let legacy: ModuleControlRequest =
+                        let legacy: LegacyBind =
                             serde_json::from_slice(&bind.body).unwrap();
                         assert_eq!(bind.body, serde_json::to_vec(&legacy).unwrap());
                     }
@@ -410,7 +427,7 @@ async fn operator_app_native_connection_is_stamped_again_by_a_restarted_daemon()
         let (client, _rx) = route_ctx(ConnectionId::new(2));
         let (stream, peer) = fixture.connect();
         handler.record_captured_peer(client.connection_id, peer);
-        let identity = BindIdentity::new(root.to_path_buf(), "unit", "s");
+        let identity = BindIdentity::new("unit", "s");
         let (bind, binding) = bind_route(&handler, &target, &mut rx, &client, identity, None).await;
         assert_eq!(binding.principal, Principal::Direct);
         assert!(binding.operator_app.as_ref().unwrap().revalidate());
@@ -443,7 +460,6 @@ async fn build_class_is_callosum_production_only_captured_not_relayed_and_warned
         )
         .await;
         let (client, mut client_rx) = route_ctx(ConnectionId::new(2));
-        let root = unique_project_root("build-capture");
         let harness = "fed-phone:0123456789abcdef0123456789abcdef";
         let capture = EventCapture::default();
         let _subscriber =
@@ -456,7 +472,7 @@ async fn build_class_is_callosum_production_only_captured_not_relayed_and_warned
             Some("Production"),
             Some("production"),
         ] {
-            let mut identity = BindIdentity::new(root.path().to_path_buf(), harness, "s");
+            let mut identity = BindIdentity::new(harness, "s");
             identity.build_class = build_class.map(str::to_owned);
             let consumer = opener.map(|module_id| subc_control::ConsumerIdentity {
                 module_id: module_id.into(),
@@ -680,8 +696,7 @@ async fn windows_launch_stamp_is_relayed_only_with_the_windows_switch() {
         assert!(handler
             .launch_table
             .is_live_incarnation("fixture", incarnation));
-        let root = unique_project_root("windows-stamp-bind");
-        let identity = BindIdentity::new(root.path().to_path_buf(), "unit", "s");
+        let identity = BindIdentity::new("unit", "s");
         let (bind, binding) = bind_route(&handler, &target, &mut rx, &client, identity, None).await;
         let raw: Value = serde_json::from_slice(&bind.body).unwrap();
         assert_eq!(

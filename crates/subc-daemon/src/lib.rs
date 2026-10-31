@@ -11,6 +11,7 @@ mod activity;
 /// the module for the ordered decision, the launch table, and the platform
 /// launchers.
 pub mod app_open;
+mod bind_compat;
 pub mod bootstrap;
 pub mod caller_identity;
 pub(crate) mod capability_requirements;

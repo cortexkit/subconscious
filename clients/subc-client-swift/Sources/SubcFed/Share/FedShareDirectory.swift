@@ -1,5 +1,27 @@
 import Foundation
 
+/// A payload declaration learned from an authenticated ordinary-session catalog.
+public struct FedSharePayloadDeclaration: Sendable, Equatable, Codable {
+    public let module: String
+    public let method: String
+    public let maxBytes: Int
+
+    public init(module: String, method: String, maxBytes: Int) throws {
+        guard FedCatalogCodec.isValidIdentifier(module), !module.contains("."), !method.isEmpty,
+              (1...FedFramedBodyCodec.maximumDeclaredPayloadBytes).contains(maxBytes)
+        else { throw FedShareError.invalidRequest }
+        self.module = module; self.method = method; self.maxBytes = maxBytes
+    }
+
+    enum CodingKeys: String, CodingKey { case module, method; case maxBytes = "max_bytes" }
+
+    public init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(module: fields.decode(String.self, forKey: .module), method: fields.decode(String.self, forKey: .method),
+                      maxBytes: fields.decode(Int.self, forKey: .maxBytes))
+    }
+}
+
 /// The app supplies paired computers and facts learned from authenticated
 /// ordinary sessions. Relay credentials are deliberately not accepted.
 public struct FedShareComputer: Sendable {
@@ -7,13 +29,22 @@ public struct FedShareComputer: Sendable {
     public let lanCandidates: [FedLANDirectCandidate]
     public let publicCandidates: [FedPublicDirectCandidate]
     public let advertisedShareV1: Bool
+    public let payloadDeclarations: [FedSharePayloadDeclaration]
 
     public init(publicKey: Data, lanCandidates: [FedLANDirectCandidate] = [],
                 publicCandidates: [FedPublicDirectCandidate] = [], advertisedShareV1: Bool) {
+        self.init(publicKey: publicKey, lanCandidates: lanCandidates, publicCandidates: publicCandidates,
+                  advertisedShareV1: advertisedShareV1, payloadDeclarations: [])
+    }
+
+    public init(publicKey: Data, lanCandidates: [FedLANDirectCandidate] = [],
+                publicCandidates: [FedPublicDirectCandidate] = [], advertisedShareV1: Bool,
+                payloadDeclarations: [FedSharePayloadDeclaration]) {
         self.publicKey = publicKey
         self.lanCandidates = lanCandidates
         self.publicCandidates = publicCandidates
         self.advertisedShareV1 = advertisedShareV1
+        self.payloadDeclarations = payloadDeclarations
     }
 }
 
@@ -29,6 +60,7 @@ public struct FedShareDirectoryEntry: Sendable, Equatable, Codable {
     public let advertisedShareV1: Bool
     public let originIncarnation: String
     public let originLedgerEpoch: String
+    public var payloadDeclarations: [FedSharePayloadDeclaration]? = nil
 }
 
 private struct FedShareDirectoryDocument: Codable {
@@ -58,9 +90,10 @@ public struct FedShareDirectory: Sendable {
         let entries = computers.map {
             FedShareDirectoryEntry(publicKey: $0.publicKey, ownPublicKey: ownPublicKey,
                                    lanCandidates: $0.lanCandidates, publicCandidates: $0.publicCandidates,
-                                   advertisedShareV1: $0.advertisedShareV1,
-                                   originIncarnation: state.global.localIncarnation,
-                                   originLedgerEpoch: state.global.localLedgerEpoch)
+                                    advertisedShareV1: $0.advertisedShareV1,
+                                    originIncarnation: state.global.localIncarnation,
+                                    originLedgerEpoch: state.global.localLedgerEpoch,
+                                    payloadDeclarations: $0.payloadDeclarations)
         }.sorted { $0.publicKey.lexicographicallyPrecedes($1.publicKey) }
         let data = try FedShareFiles.encode(FedShareDirectoryDocument(computers: entries))
         return try await FedShareFiles.perform {

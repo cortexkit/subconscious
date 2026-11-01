@@ -1,5 +1,17 @@
 # SubcFed exact-byte fixture provenance
 
+## Share-v2 release conformance
+
+`Share/FedShareV2VectorTests.swift` reads the six checksum-covered share-v2
+release files plus `SHA256SUMS` from `Fixtures/share-v2/`, beside `fed-wire/`.
+Vendoring awaits a release corpus whose examples use only invented public module
+names, without private module names, hostnames or filesystem paths (including
+inside hex-encoded headers).
+Until then the tests explicitly skip with the missing path; set
+`SUBCFED_SHARE_V2_VECTORS` to an external release directory to run them.
+The initial conformance run used the share-v2 vector corpus from ignored
+scratch storage; its fixture bytes are not included here.
+
 Every fixture in this directory is an exact-byte golden vector for the
 SubcFed wire layer. Except for the upstream vectors identified below, fixtures
 are generated deterministically from the

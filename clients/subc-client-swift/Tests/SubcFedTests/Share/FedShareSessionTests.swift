@@ -6,7 +6,7 @@ extension FedShareTests {
     func testShareHelloAddsSessionKindWithoutAttemptID() throws {
         let hello = FedShareCodec.hello(policy: try FedHelloPolicy(deviceName: "Phone", features: []),
             incarnation: "11111111-1111-4111-8111-111111111111", ledgerEpoch: "phone-epoch")
-        XCTAssertEqual(try hello.header.jsonData(), Data(#"{"device_name":"Phone","features":[],"incarnation":"11111111-1111-4111-8111-111111111111","keepalive_interval_ms":15000,"ledger_epoch":"phone-epoch","max_body_bytes":16777216,"max_in_flight":64,"session_kind":"share","type":"hello","versions":[1]}"#.utf8))
+        XCTAssertEqual(try hello.header.jsonData(), Data(#"{"device_name":"Phone","features":["share-v1","share-v2"],"incarnation":"11111111-1111-4111-8111-111111111111","keepalive_interval_ms":15000,"ledger_epoch":"phone-epoch","max_body_bytes":16777216,"max_in_flight":64,"session_kind":"share","type":"hello","versions":[1]}"#.utf8))
     }
 
     func testSessionReadyHelloSerialEightAndDone() async throws {

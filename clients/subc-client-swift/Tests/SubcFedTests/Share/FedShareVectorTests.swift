@@ -72,7 +72,7 @@ extension FedShareTests {
                 let epoch = try ShareVectors.string(header, "ledger_epoch")
                 let built: FedFrame
                 if row["session_kind"] as? String == "share" {
-                    built = FedShareCodec.hello(policy: try ShareVectors.policy(header), incarnation: incarnation, ledgerEpoch: epoch)
+                    built = FedShareCodec.hello(policy: try ShareVectors.policy(header), incarnation: incarnation, ledgerEpoch: epoch, requestV2: false)
                     XCTAssertNil(built.header["connection_attempt_id"], label)
                 } else {
                     built = FedHelloCodec.buildLocalHello(policy: try ShareVectors.policy(header), incarnation: incarnation,

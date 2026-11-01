@@ -26,12 +26,12 @@ public struct FedShareSessionReport: Sendable, Equatable {
 /// Both processes use the same Keychain identity and App Group share ledger.
 public struct FedShareClient: Sendable {
     typealias Dial = @Sendable (FedPeerCandidate, Data, Data) async throws -> any FedSessionByteTransport
-    private let keyStore: any FedPrivateKeyStore
-    private let ledger: FedShareLedger
-    private let policy: FedHelloPolicy
-    private let dialPolicy: FedDialPolicy
-    private let clock: any FedMonotonicClock
-    private let dial: Dial
+    let keyStore: any FedPrivateKeyStore
+    let ledger: FedShareLedger
+    let policy: FedHelloPolicy
+    let dialPolicy: FedDialPolicy
+    let clock: any FedMonotonicClock
+    let dial: Dial
 
     public init(keyStore: any FedPrivateKeyStore, ledger: FedShareLedger,
                 helloPolicy: FedHelloPolicy, dialPolicy: FedDialPolicy = FedDialPolicy(),
@@ -66,14 +66,20 @@ public struct FedShareClient: Sendable {
         self.dialPolicy = dialPolicy; self.clock = clock; self.dial = dial
     }
 
-    /// Requests beyond eight are left unattempted. A marked id always remains
-    /// share-only, even if discovery is stale or this connection never gets ready.
+    /// Requests beyond the negotiated session budget are left unattempted. Once
+    /// an id has a durable ledger mark binding its request, keys and epoch, it
+    /// remains share-only even if discovery is stale or a connection never gets ready.
     /// Storage failure throws rather than returning an unsafe fallback outcome.
     public func send(_ requests: [FedShareRequest], to computer: FedShareDirectoryEntry) async throws -> FedShareSessionReport {
         guard Set(requests.map(\.shareID)).count == requests.count else { throw FedShareError.invalidRequest }
         let expired = try await FedShareFiles.perform {
             try ledger.withLedgerLock { transaction in
-                try Set(requests.filter { try transaction.isExpired($0.shareID) }.map(\.shareID))
+                guard try requests.allSatisfy({ try transaction.uploadOwner(of: $0.shareID) == nil }) else {
+                    throw FedShareError.invalidRequest
+                }
+                return try Set(requests.filter {
+                    try transaction.isExpired($0.shareID) || ($0.framed && transaction.uploadHorizonPassed($0.shareID))
+                }.map(\.shareID))
             }
         }
         let report = try await sendRecent(requests.filter { !expired.contains($0.shareID) }, to: computer)
@@ -127,11 +133,15 @@ public struct FedShareClient: Sendable {
 
     private func unattempted(_ request: FedShareRequest, code: String?, bindingChanged: Bool = false) throws -> FedShareCallResult {
         try ledger.withLedgerLock { transaction in
-            if try transaction.isExpired(request.shareID) {
+            if try transaction.isExpired(request.shareID) || (request.framed && transaction.uploadHorizonPassed(request.shareID)) {
                 return FedShareCallResult(shareID: request.shareID, claim: nil, outcome: FedShareOutcome(.unknown))
             }
             if try transaction.entry(shareID: request.shareID)?.moved == true {
                 return FedShareCallResult(shareID: request.shareID, claim: nil, outcome: FedShareOutcome(.discarded))
+            }
+            if try !transaction.mayReplay(request.shareID, nowNanoseconds: clock.nowNanoseconds()) {
+                if bindingChanged { try transaction.blockRetries(request.shareID) }
+                return FedShareCallResult(shareID: request.shareID, claim: nil, outcome: FedShareOutcome(.unknown))
             }
             let claim = try transaction.claim(request.shareID)
             let marked = try transaction.entry(shareID: request.shareID)?.mark != nil
@@ -147,21 +157,9 @@ public struct FedShareClient: Sendable {
         let runner = FedStageDeadlineRunner(clock: clock)
         var calls: [FedShareCallResult] = []
         var byeCode: String?
-        let remote: (epoch: String, maximum: UInt32, readyAt: UInt64)
+        let remote: FedShareRemote
         do {
-            remote = try await runner.run(stage: .fedNegotiation, duration: dialPolicy.fedNegotiation) {
-                let hello = FedShareCodec.hello(policy: policy, incarnation: computer.originIncarnation,
-                                                ledgerEpoch: computer.originLedgerEpoch)
-                try await connection.send(hello, maximum: UInt32(policy.maxBodyBytes), negotiating: true)
-                let frame = try await connection.next()
-                let parsed = try FedHelloCodec.parseRemoteHello(frame)
-                guard parsed.versions.contains(1), parsed.features.contains(FedShareCodec.feature) else {
-                    throw ShareClose(code: nil)
-                }
-                guard try await connection.next().typeName == "share_ready" else { throw FedShareError.invalidFrame }
-                await connection.startTimers(localIntervalMs: policy.keepaliveIntervalMs, peerIntervalMs: parsed.keepaliveIntervalMs)
-                return (parsed.ledgerEpoch, UInt32(min(parsed.maxBodyBytes, policy.maxBodyBytes)), clock.nowNanoseconds())
-            }
+            remote = try await negotiate(computer: computer, connection: connection)
         } catch {
             byeCode = shareCloseCode(error)
             if byeCode == "fed_protocol_violation" {
@@ -169,21 +167,38 @@ public struct FedShareClient: Sendable {
             }
             return FedShareSessionReport(calls: try await unattempted(requests, code: byeCode), byeCode: byeCode)
         }
-        let readyAt = remote.readyAt
+        var budget = FedShareBudget(remote: remote)
         for request in requests {
-            if calls.count >= 8 || clock.nowNanoseconds() - readyAt >= 60_000_000_000 {
+            if !budget.canSend(bodyBytes: request.body.count, now: clock.nowNanoseconds()) {
                 break
             }
             try Task.checkCancellation()
+            if request.framed && !remote.v2 {
+                calls.append(try await unattempted([request], code: nil)[0])
+                continue
+            }
+            try request.checkLimits(computer: computer, maximumBodyBytes: remote.maximum, requireDeclaration: false)
             let bytes = try FedFrameCodec.encode(request.frame, negotiatedMaximumBodyLength: remote.maximum,
-                                                  negotiatedFeatures: [FedShareCodec.feature])
-            let mark = FedShareMark(destinationKey: computer.publicKey, ownKey: ownKey,
-                                    requestBytes: bytes, epoch: remote.epoch)
+                                                  negotiatedFeatures: remote.features)
             let prepared: (UInt64?, FedShareOutcome?) = try await FedShareFiles.perform {
                 try ledger.withLedgerLock { transaction in
                     if try transaction.isExpired(request.shareID) { return (nil, FedShareOutcome(.unknown)) }
                     if try transaction.entry(shareID: request.shareID)?.moved == true { return (nil, FedShareOutcome(.discarded)) }
+                    if try !transaction.mayReplay(request.shareID, nowNanoseconds: clock.nowNanoseconds()) {
+                        return (nil, FedShareOutcome(.unknown))
+                    }
+                    try request.checkLimits(computer: computer, maximumBodyBytes: remote.maximum,
+                        requireDeclaration: transaction.entry(shareID: request.shareID)?.mark == nil)
                     let claim = try transaction.claim(request.shareID)
+                    let mark: FedShareMark
+                    if request.framed {
+                        let payload = try FedFramedBodyCodec.decode(request.body).payload
+                        let stored = try FedSharePayloadFiles.store(payload, at: ledger.payloadDirectoryURL)
+                        mark = FedShareMark(destinationKey: computer.publicKey, ownKey: ownKey, requestBytes: bytes,
+                            epoch: remote.epoch, ref: stored.0, sha256: stored.1, framed: true)
+                    } else {
+                        mark = FedShareMark(destinationKey: computer.publicKey, ownKey: ownKey, requestBytes: bytes, epoch: remote.epoch)
+                    }
                     if try transaction.entry(shareID: request.shareID)?.retriesBlocked == true {
                         return (claim, try transaction.record(FedShareOutcome(.unknown), shareID: request.shareID, claim: claim))
                     }
@@ -206,13 +221,12 @@ public struct FedShareClient: Sendable {
                 // released flock before even the first byte reaches transport.
                 // Expiry stops new calls, not the outstanding terminal. Leave
                 // room for admission, dispatch and durable settlement to finish.
-                let result = try await runner.run(stage: .fedNegotiation, duration: .seconds(110)) {
-                    guard clock.nowNanoseconds() - readyAt < 60_000_000_000 else {
-                        throw ShareClose(code: FedShareByeCode.expired.rawValue)
-                    }
-                    try await connection.sendBytes(bytes)
-                    return try await connection.next()
+                let admissionBudget = budget
+                budget.charge(bodyBytes: request.body.count)
+                try await connection.sendCallBytes(bytes) {
+                    admissionBudget.canSend(bodyBytes: request.body.count, now: clock.nowNanoseconds())
                 }
+                let result = try await runner.run(stage: .fedNegotiation, duration: .seconds(110)) { try await connection.next() }
                 guard result.typeName == "share_result", result.header["share_id"] == .string(request.shareID) else {
                     throw FedShareError.invalidFrame
                 }
@@ -231,7 +245,7 @@ public struct FedShareClient: Sendable {
                 return FedShareSessionReport(calls: calls, byeCode: byeCode)
             }
             let recorded = try await FedShareFiles.perform {
-                try ledger.record(outcome, shareID: request.shareID, claim: claim)
+                try ledger.recordOutcome(outcome, shareID: request.shareID, claim: claim, nowNanoseconds: clock.nowNanoseconds())
             }
             calls.append(FedShareCallResult(shareID: request.shareID, claim: claim, outcome: recorded))
         }
@@ -241,9 +255,9 @@ public struct FedShareClient: Sendable {
     }
 }
 
-private struct ShareClose: Error { let code: String? }
+struct ShareClose: Error { let code: String? }
 
-private func shareCloseCode(_ error: any Error) -> String? {
+func shareCloseCode(_ error: any Error) -> String? {
     if let close = error as? ShareClose { return close.code }
     if case FedFailure.protocolViolation(let code) = error { return code }
     if error is FedFrameError || error is FedJSONError || error as? FedShareError == .invalidFrame {
@@ -252,7 +266,7 @@ private func shareCloseCode(_ error: any Error) -> String? {
     return nil
 }
 
-private actor FedShareConnection {
+actor FedShareConnection {
     let transport: any FedSessionByteTransport
     let clock: any FedMonotonicClock
     var decoder: FedFrameStreamDecoder
@@ -269,6 +283,10 @@ private actor FedShareConnection {
         decoder = FedFrameStreamDecoder(negotiatedMaximumBodyLength: maximumBodyBytes, negotiationComplete: true,
                                          negotiatedFeatures: [FedShareCodec.feature])
         decoder.allowedFrameTypes = ["hello", "share_ready", "share_result", "keepalive", "bye"]
+    }
+
+    func setFeatures(_ features: Set<String>) {
+        decoder.setNegotiation(complete: true, features: features)
     }
 
     func startTimers(localIntervalMs: UInt64, peerIntervalMs: UInt64) {
@@ -324,6 +342,14 @@ private actor FedShareConnection {
     }
 
     func sendBytes(_ bytes: Data) async throws {
+        try await writeBytes(bytes, mayStart: nil)
+    }
+
+    func sendCallBytes(_ bytes: Data, mayStart: @escaping @Sendable () -> Bool) async throws {
+        try await writeBytes(bytes, mayStart: mayStart)
+    }
+
+    private func writeBytes(_ bytes: Data, mayStart: (@Sendable () -> Bool)?) async throws {
         try Task.checkCancellation()
         if let failure { throw failure }
         // The timer and the exchange share one frame writer; a transport send
@@ -336,7 +362,17 @@ private actor FedShareConnection {
         }
         if let failure { throw failure }
         try Task.checkCancellation()
-        try await transport.send(bytes)
+        if let mayStart, !mayStart() { throw ShareClose(code: FedShareByeCode.expired.rawValue) }
+        // Start the progress budget only after acquiring the frame writer. A
+        // queued keepalive must not consume any of a call body's fifty seconds.
+        let transport = self.transport
+        do {
+            try await FedStageDeadlineRunner(clock: clock).run(stage: .fedNegotiation,
+                duration: .seconds(FedShareCodec.writeDeadlineFloorSeconds)) { try await transport.send(bytes) }
+        } catch {
+            await close(error)
+            throw error
+        }
         keepalive?.noteOutboundFrame(at: clock.nowNanoseconds())
     }
 

@@ -26,7 +26,8 @@ final class FedShareTests: XCTestCase {
                             body: Data(#"{"method":"send","params":{"text":"hello"}}"#.utf8))
     }
 
-    func entry(at directory: URL, support: Bool = true, key: Data? = nil) async throws -> FedShareDirectoryEntry {
+    func entry(at directory: URL, support: Bool = true, key: Data? = nil,
+               declarations: [FedSharePayloadDeclaration] = []) async throws -> FedShareDirectoryEntry {
         let keys = try FedMemoryPrivateKeyStore(noisePrivateKey: ownPrivate)
         let ownKey = try await keys.staticPublicKey()
         let store = FedMemoryStateStore()
@@ -35,7 +36,7 @@ final class FedShareTests: XCTestCase {
         try await file.update(computers: [FedShareComputer(publicKey: key ?? computerKey,
             lanCandidates: [try FedLANDirectCandidate(candidateID: "lan", host: "192.168.1.2", port: 9)],
             publicCandidates: [try FedPublicDirectCandidate(candidateID: "public", host: "8.8.8.8", port: 10)],
-            advertisedShareV1: support)], ownPublicKey: ownKey, stateStore: store)
+            advertisedShareV1: support, payloadDeclarations: declarations)], ownPublicKey: ownKey, stateStore: store)
         let value = try XCTUnwrap(file.read().first)
         let snapshot = try await store.snapshot()
         XCTAssertEqual(value.originIncarnation, snapshot.global.localIncarnation)
@@ -177,7 +178,7 @@ final class FedShareTests: XCTestCase {
         XCTAssertEqual(restored.calls.first?.outcome.disposition, .unknown)
     }
 
-    private func assertCooperativeProgress(contendingAt lockURL: URL,
+    func assertCooperativeProgress(contendingAt lockURL: URL,
                                            operation: @escaping @Sendable () async throws -> Void) async throws {
         let locked = expectation(description: "lock holder ready")
         let release = DispatchSemaphore(value: 0)

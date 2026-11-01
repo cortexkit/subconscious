@@ -249,6 +249,7 @@ public enum FedFrameCodec {
         }
         let bodyLimit = effectiveBodyLimit(
             for: type,
+            header: header,
             negotiatedMaximumBodyLength: negotiatedMaximumBodyLength
         )
         guard UInt64(body.count) <= UInt64(bodyLimit) else {
@@ -304,6 +305,7 @@ public enum FedFrameCodec {
         }
         let bodyLimit = effectiveBodyLimit(
             for: type,
+            header: header,
             negotiatedMaximumBodyLength: negotiatedMaximumBodyLength
         )
         guard UInt64(body.count) <= UInt64(bodyLimit) else {
@@ -383,9 +385,13 @@ public enum FedFrameCodec {
 
     fileprivate static func effectiveBodyLimit(
         for type: String,
+        header: FedJSONObject,
         negotiatedMaximumBodyLength: UInt32
     ) -> UInt32 {
-        if type == "share_call" { return min(negotiatedMaximumBodyLength, FedShareCodec.maximumRequestBytes) }
+        if type == "share_call" {
+            return min(negotiatedMaximumBodyLength, header["framed"] == .boolean(true)
+                ? FedShareCodec.maximumFramedRequestBytes : FedShareCodec.maximumRequestBytes)
+        }
         if type == "share_result" { return min(negotiatedMaximumBodyLength, FedShareCodec.maximumOutcomeBytes) }
         if type == "share_ready" { return 0 }
         if FedAppAttestCodec.frameTypes.contains(type) { return 0 }
@@ -838,6 +844,7 @@ public struct FedFrameStreamDecoder: Sendable {
                     currentType = type
                     bodyLimit = FedFrameCodec.effectiveBodyLimit(
                         for: type,
+                        header: header,
                         negotiatedMaximumBodyLength: negotiatedMaximumBodyLength
                     )
                     phase = .bodyLength

@@ -230,8 +230,9 @@ disposition row, plus the release's SHA-256 digests. An illegal `never_ran`
 proof is reported as `fed_protocol_violation` with an unknown outcome, never
 as permission to move a marked id to the outbox.
 
-`send` waits for `share_ready`, sends at most eight calls, one outstanding at a
-time, stops starting calls after 60 seconds, and closes with `fed_share_done`.
+`send` waits for `share_ready`, sends one call at a time, and closes with
+`fed_share_done`. With bilateral `share-v2` it has a 64-call, 88,080,384-declared-byte,
+300-second budget; otherwise the unchanged v1 budget is eight calls and 60 seconds.
 An outstanding call may finish after the lifetime. Excess/unattempted calls
 return outbox only if unmarked. Results use new share-only types: sent (including
 module errors and withheld outcomes), refused with `neverRan`, unknown (may
@@ -240,7 +241,7 @@ preserved on the report; none alone licenses fallback for a marked id.
 
 Before any call bytes are written, the ledger durably syncs the claim and the
 immutable mark (share transport, computer key, own key, request digest,
-computer epoch). The mark stores only the SHA-256 `requestDigest` of the exact
+computer epoch). A standalone unframed share mark stores only the SHA-256 `requestDigest` of the exact
 encoded `share_call` bytes, not the request itself. A different mark throws
 `FedShareError.markConflict` from the
 ledger API; the session maps binding changes to unknown and **never resends**.
@@ -249,7 +250,7 @@ Only the newest claim's answer is recorded; old answers return discarded.
 Keep the ledger across launches, upgrades, key changes and computer re-pairing;
 do not delete it to retry an unknown id, and never mint a new id for that retry.
 
-The ledger stores only outcome metadata (`disposition`, `kind`, `code`,
+For standalone calls, the ledger stores only outcome metadata (`disposition`, `kind`, `code`,
 `neverRan`), never response bodies; the full body is returned in the session
 report. Keep the exact pending request in the app's own pending record for
 resends. Each ledger entry's `createdAtMs` comes from its UUIDv7 share id, not
@@ -263,6 +264,46 @@ ran. `FedShareClient` returns unknown without dialing for these ids; the raw
 ledger `claim` and `markIfAbsent` APIs throw `FedShareExpiredID`, and its outbox
 check refuses them. Editing creates a deliberately new operation and id, not
 an automatic retry of the old operation.
+
+### Photo uploads through share-v2
+
+The app publishes each operation's authenticated ordinary-catalog payload limit
+as `FedSharePayloadDeclaration(module:method:maxBytes:)` in
+`FedShareComputer(..., payloadDeclarations:)`. The extension needs no catalog or
+ordinary session. It creates `try await ledger.createUpload(memberCount:)`, saves
+the returned upload `id`, and calls `client.sendUpload(id:to:member:)`. The app can
+resume that same upload through this API after an extension exit. Never pass its
+member ids to `send`, to an ordinary call, or to the outbox.
+
+The synchronous `member` builder returns `FedShareUploadCall(module:head:payload:)`
+for each ordered slot: begin, chunks, then the last, **visible** call (finish or
+the message that makes the photo appear). It can read begin's retained reply
+from `record.members[0].outcomeBody` to get the module upload id. Supply routes
+and file data from the app's saved share context, not from network reads in the
+builder. The builder runs on the dedicated file-I/O Dispatch queue under the
+ledger lock; it must not call back into the ledger. It is never called again for
+a marked slot: the library replays its saved head and immutable, SHA-256-named
+App Group payload instead. Payload length is checked against the declaration,
+and the whole body against the peer's receive cap and 8,454,148-byte framed cap,
+before minting or marking. Framed ids are withheld on v1 sessions.
+
+`sendUpload` rolls to a fresh session at a budget boundary, only after the last
+answer. A drop returns pending work; calling it again replays the outstanding
+id first. An `in_progress` reply sets the slot's `retryAfterMilliseconds` and
+blocks replay for at least 40 seconds. All prerequisites must have newest outcome
+exactly `sent` before the visible slot is marked. `report.upload.visibleSent`
+also includes an unknown visible call: show it as sent and never restart it.
+
+To give up, use `try await ledger.abandonUpload(id:)`. It atomically fences all
+minted ids and leaves unfilled slots unminted, and refuses if a marked visible
+call has no newest `never_ran` proof. Only after successful abandonment may the
+app start a whole new upload under new ids. Payload refusals abandon automatically.
+Upload replies (at most 4 KiB each) are retained for recovery; standalone replies
+are not. Payload files survive unknown attempts and are deleted on resolution
+or after the 24-hour resend horizon; `pruneUploadPayloads()` also runs cleanup
+without a send. Metadata and upload fences retain the existing 30-day horizon.
+All async upload/ledger transactions stay on the file-I/O queue, never occupying
+a cooperative executor while waiting for a file lock.
 
 The ledger uses one compact version-1 format. Missing required fields,
 unexpected fields and unsupported versions are storage errors; no alternate

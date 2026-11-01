@@ -118,7 +118,7 @@ extension FedShareTests {
 }
 
 extension FedShareTests {
-    func testCompactVersionOneRoundTrip() throws {
+    func testCompactVersionTwoRoundTrip() throws {
         let dir = try directory(), ledger = shareTestLedger(directoryURL: dir)
         let bytes = try FedFrameCodec.encode(request().frame, negotiatedFeatures: ["share-v1"])
         let mark = FedShareMark(destinationKey: computerKey, ownKey: ownPrivate, requestBytes: bytes, epoch: "epoch")
@@ -126,7 +126,7 @@ extension FedShareTests {
         try ledger.markIfAbsent(id, mark: mark)
         try ledger.record(FedShareOutcome(.sent, kind: "response", body: Data([1, 2, 3])), shareID: id, claim: claim)
         let document = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: ledger.fileURL)) as? [String: Any])
-        XCTAssertEqual(document["version"] as? Int, 1)
+        XCTAssertEqual(document["version"] as? Int, 2)
         let rows = try XCTUnwrap(document["entries"] as? [String: [String: Any]])
         XCTAssertEqual(rows[id]?["createdAtMs"] as? UInt64, 0x019a0f001234)
         let savedMark = try XCTUnwrap(rows[id]?["mark"] as? [String: Any])
@@ -150,7 +150,7 @@ extension FedShareTests {
         let row = try XCTUnwrap(rows[id])
         var invalid: [(String, [String: Any])] = []
         var changed = document
-        changed["version"] = 2
+        changed["version"] = 3
         invalid.append(("unsupported version", changed))
         changed = document; changed["version"] = nil
         invalid.append(("missing version", changed))

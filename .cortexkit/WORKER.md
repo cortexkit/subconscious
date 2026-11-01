@@ -4,15 +4,18 @@ Standing rules for every worker in this repository. Where your brief names a nar
 
 ## Build and test remotely
 
-- Run builds, checks and tests on the build server (set the bash tool's `runon` field to `"linux"`, requesting more cores for whole suites). Run on this Mac only what needs macOS, at `nice -n 10`.
+- Run builds, checks and tests on the build server (set the bash tool's `runon` field to `"linux"`). Run on this Mac only what needs macOS, at `nice -n 10`.
+- Keep the normal build directory. A separate `CARGO_TARGET_DIR` per run means a cold build every time.
 
 ## Gate before you deliver
 
-- Before delivering, run `scripts/gate.sh fast`, then the full test suite and clippy of every crate you changed (`cargo test -p <crate>` and `cargo clippy -p <crate> --all-targets -- -D warnings`, plus the same clippy with `--target x86_64-pc-windows-gnu`). Filtered tests alone are never a gate.
-- If you add or change a dependency or a feature, also run the whole-workspace `scripts/gate.sh test` on the build server with `runon: "linux,16c"`. Workspace builds unify features across crates, and twice a dependency that passed its own crate's tests turned master red elsewhere.
-- Otherwise don't run `scripts/gate.sh lint` or `scripts/gate.sh test` unless your brief asks. The head runs the workspace gates once when it lands a batch.
-- Report each stage's verdict, counts and every failing test name. If a failure is not yours, show that it fails the same way on your base commit.
-- Run the Swift and TypeScript stages when changing those clients. See `scripts/gate.sh --help` for prerequisites and CI-only checks.
+- Run `scripts/gate.sh fast`, the tests for the code and behaviour you changed, filtered by name or module (`cargo test -p <crate> <filter>`), and clippy for every crate you changed (`cargo clippy -p <crate> --all-targets -- -D warnings`, plus the same with `--target x86_64-pc-windows-gnu`). A bug fix adds a test and shows once that it fails without the fix.
+- Never run a whole crate's test suite or a full gate (`scripts/gate.sh test`, `lint` or `full`). The head runs the full suite once, over several merged deliveries. A filtered run that takes more than about 15 minutes means the filter is too broad: narrow it.
+- If you add or change a dependency or a feature, say so in your report, because workspace builds unify features across crates and the head then runs the workspace suite before landing. Check `cargo tree -e features -i serde_json --workspace` for new serde_json features yourself; it takes seconds.
+- If a test outside your change fails, rerun that one test by name on your base commit, never the suite.
+- Don't wait on remote jobs in long `bash_watch` loops. Run a filtered job in the foreground with a timeout that fits it.
+- Report each check's verdict, counts and every failing test name.
+- When changing the Swift or TypeScript clients, run their tests for what you changed the same way (`swift test --filter`, `bun test <file>`). See `scripts/gate.sh --help` for prerequisites and CI-only checks.
 
 ## Prerequisites
 

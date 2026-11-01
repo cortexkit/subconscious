@@ -53,12 +53,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             other => Some(format!("unexpected subscribe result: {other:?}")),
         };
     let initial = handle.record_activity(event(&module_id, "initial")).await?;
+    // The test polls for this file and parses it as soon as it can be read, so
+    // write it under another name and rename it: the results path then never
+    // exists empty or half-written.
+    let staging = results.with_extension("staging");
     fs::write(
-        &results,
+        &staging,
         serde_json::to_vec(&json!({
             "query_code": query_code, "subscribe_code": subscribe_code, "seq": initial.seq,
         }))?,
     )?;
+    fs::rename(&staging, &results)?;
     while !trigger.exists() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.156
+
+- Test-only: Linux CI now runs the default `ck setup` vault path against the published ck-auth v0.3.0 with a real Secret Service on a private D-Bus session, in a clean home and in one holding an empty store left by an earlier refused setup. No change to `ck` itself.
+
 ## 0.20.155
 
 - Fix `ck setup claustrum` failing on Linux and Windows by leaving the master key in the vault's OS key store unless `--key-path` is supplied. Preserve existing operator key paths and suggest a file outside the data folder when the OS key store is unavailable.

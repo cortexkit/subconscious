@@ -2416,7 +2416,10 @@ export function isRetryableRouteOpenCode(code: string | undefined): boolean {
     code === "scope_changed" ||
     // A target module that can't yet resolve where the session's state lives
     // refuses the bind; nothing was sent, so a re-open can succeed.
-    code === "session_address_unavailable"
+    code === "session_address_unavailable" ||
+    // A target module whose state for the route is temporarily in use (a read
+    // or write still running on it) refuses the bind; nothing was sent on it.
+    code === "bind_busy"
   );
 }
 

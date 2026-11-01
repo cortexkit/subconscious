@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.23.1
+
+- `bind_busy` is a retryable route-open refusal, matching subc-protocol
+  0.34.3: the target module's state for that route is temporarily in use, and
+  nothing was sent on the route. Managed calls retry it like the other
+  retryable route-open refusals. A direct `routeOpen()` doesn't retry: its
+  promise rejects with a `SubcError` carrying the code and detail.
+- A provider's `onBind` rejection can carry a `detail` object, sent as the
+  error's `detail`. The daemon relays the code, message and detail to the
+  opener. Omitting it keeps the error
+  body's bytes unchanged.
+
 ## 0.23.0
 
 - Registered providers can own session scopes with `scopeSync` and `scopeApply`.

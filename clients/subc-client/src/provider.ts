@@ -290,6 +290,12 @@ export type BindDecision =
       accept: boolean;
       code?: string;
       message?: string;
+      /**
+       * Machine-readable fields for a rejection code that defines them, such
+       * as `bind_busy`'s `reason` and `retry_after_ms`. Sent as the error's
+       * `detail`; the daemon relays it to the opener, so never put secrets here.
+       */
+      detail?: Record<string, unknown>;
     };
 
 export type ProviderConnectionState =
@@ -1080,7 +1086,15 @@ export class SubcProvider {
     const rejection = bindRejection(decision);
     if (rejection) {
       try {
-        await this.sendError(frame, rejection.code, rejection.message, controlFlags(), sock, generation);
+        await this.sendError(
+          frame,
+          rejection.code,
+          rejection.message,
+          controlFlags(),
+          sock,
+          generation,
+          rejection.detail,
+        );
       } finally {
         await this.reportRouteGone(tentative);
       }
@@ -1264,6 +1278,7 @@ export class SubcProvider {
     flags: number,
     sock: SubcSocket,
     generation: number,
+    detail?: Record<string, unknown>,
   ): Promise<void> {
     if (frame.header.channel !== 0) {
       const handle = this.liveRoutes.get(frame.header.channel);
@@ -1279,7 +1294,8 @@ export class SubcProvider {
         frame.header.channel,
         frame.header.epoch,
         frame.header.corr,
-        encodeJson({ code, message }),
+        // Omitted detail keeps the error body's bytes unchanged.
+        encodeJson(detail === undefined ? { code, message } : { code, message, detail }),
       ),
     );
   }
@@ -1705,7 +1721,9 @@ function numberField(value: unknown, field: string): number {
   return value;
 }
 
-function bindRejection(decision: BindDecision | undefined): { code: string; message: string } | null {
+function bindRejection(
+  decision: BindDecision | undefined,
+): { code: string; message: string; detail?: Record<string, unknown> } | null {
   if (decision === undefined || decision === true) return null;
   if (decision === false) {
     return { code: "route_rejected", message: "route.bind rejected by provider" };
@@ -1714,6 +1732,7 @@ function bindRejection(decision: BindDecision | undefined): { code: string; mess
   return {
     code: decision.code ?? "route_rejected",
     message: decision.message ?? "route.bind rejected by provider",
+    ...(decision.detail === undefined ? {} : { detail: decision.detail }),
   };
 }
 

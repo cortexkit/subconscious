@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.33.2
+
+- `BindDecision::reject_with_detail` rejects a route bind with an error body
+  that carries `detail`, for refusal codes that define machine-readable
+  fields, such as `bind_busy`'s `reason` and `retry_after_ms`. The daemon
+  relays the code, message and detail object to the opener. `BindDecision::reject` keeps its
+  detail-free bytes.
+- Require subc-protocol 0.34.3, so managed calls retry a `bind_busy` refusal
+  within their route-open deadline.
+
 ## 0.33.1
 
 - `RouteBindRequest` gains `peer`, the daemon's facts about the connection

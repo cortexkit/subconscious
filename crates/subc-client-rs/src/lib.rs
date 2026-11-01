@@ -2251,6 +2251,27 @@ impl BindDecision {
             kind: BindDecisionKind::Reject {
                 code: code.into(),
                 message: message.into(),
+                detail: None,
+            },
+        }
+    }
+
+    /// Reject the route.bind request with a typed Error frame whose `detail`
+    /// carries the code's machine-readable fields, such as `bind_busy`'s
+    /// `reason` and `retry_after_ms`. Pass a JSON object: a JSON `null` is
+    /// dropped on the way, since an absent detail and a null one encode the
+    /// same. The daemon relays the code, message and detail to the opener,
+    /// so the detail must never hold secrets.
+    pub fn reject_with_detail(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        detail: serde_json::Value,
+    ) -> Self {
+        Self {
+            kind: BindDecisionKind::Reject {
+                code: code.into(),
+                message: message.into(),
+                detail: Some(detail),
             },
         }
     }
@@ -2259,7 +2280,11 @@ impl BindDecision {
 #[derive(Debug, Clone)]
 enum BindDecisionKind {
     Accept,
-    Reject { code: String, message: String },
+    Reject {
+        code: String,
+        message: String,
+        detail: Option<serde_json::Value>,
+    },
 }
 
 /// Run a module to completion. Reads `--subc <connection-file>` from args, uses
@@ -3333,8 +3358,16 @@ where
                     }
                     handler.on_bound(&handle).await;
                 }
-                BindDecisionKind::Reject { code, message } => {
-                    let result = serde_json::to_vec(&ErrorBody::new(code, message))
+                BindDecisionKind::Reject {
+                    code,
+                    message,
+                    detail,
+                } => {
+                    let body = match detail {
+                        Some(detail) => ErrorBody::new(code, message).with_detail(detail),
+                        None => ErrorBody::new(code, message),
+                    };
+                    let result = serde_json::to_vec(&body)
                         .map_err(SubcModuleError::Json)
                         .and_then(|body| {
                             Frame::build_with_version(
@@ -5210,13 +5243,56 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Error);
+        let refusal = rx.recv().await.unwrap();
+        assert_eq!(refusal.header.ty, FrameType::Error);
+        // A plain rejection keeps its detail-free bytes.
+        assert_eq!(refusal.body, br#"{"code":"no","message":"rejected"}"#);
         assert_eq!(bound.load(Ordering::SeqCst), 0);
         assert_eq!(cleanup.load(Ordering::SeqCst), 1);
         assert!(matches!(
             module_handle.validate_route(RouteHandle::new(6, 3, 1)),
             Err(SubcModuleError::StaleRouteHandle(_))
         ));
+    }
+
+    struct BusyHandler;
+
+    #[async_trait]
+    impl ModuleHandler for BusyHandler {
+        async fn handle(&self, _ctx: RequestCtx, _body: Vec<u8>) -> HandlerOutcome {
+            HandlerOutcome::Response(Vec::new())
+        }
+
+        async fn on_bind(&self, _req: &RouteBindRequest) -> BindDecision {
+            BindDecision::reject_with_detail(
+                "bind_busy",
+                "a read is still running on this root",
+                serde_json::json!({"reason": "reader", "retry_after_ms": 2000}),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_bind_carries_its_detail_to_the_daemon() {
+        let (module_handle, mut rx) = test_module_handle(&[]);
+        let tx = module_handle.shared.lock_inner().writer.clone().unwrap();
+        handle_frame(
+            route_bind_frame(6, 3, 92),
+            &tx,
+            Arc::new(BusyHandler),
+            RequestDispatcher::new(),
+            module_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let refusal = rx.recv().await.unwrap();
+        assert_eq!(refusal.header.ty, FrameType::Error);
+        let body: ErrorBody = serde_json::from_slice(&refusal.body).unwrap();
+        assert_eq!(body.code, "bind_busy");
+        assert_eq!(
+            body.detail,
+            Some(serde_json::json!({"reason": "reader", "retry_after_ms": 2000}))
+        );
     }
 
     struct RebindCountingHandler {

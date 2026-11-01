@@ -481,6 +481,28 @@ describe("provider bind publication and unknown-slot precedence", () => {
     expect(socket.writes[0]!.header.ty).toBe(FrameType.Error);
   });
 
+  test("a rejected bind carries its detail, and a plain one keeps its bytes", async () => {
+    const busy = providerHarness();
+    busy.internals.opts.onBind = () => ({
+      accept: false,
+      code: "bind_busy",
+      message: "a read is still running on this root",
+      detail: { reason: "reader", retry_after_ms: 2000 },
+    });
+    await busy.internals.handleControlRequest(bindFrame(21, 10), busy.socket, 1);
+    expect(busy.socket.writes[0]!.header.ty).toBe(FrameType.Error);
+    expect(JSON.parse(new TextDecoder().decode(busy.socket.writes[0]!.body))).toEqual({
+      code: "bind_busy",
+      message: "a read is still running on this root",
+      detail: { reason: "reader", retry_after_ms: 2000 },
+    });
+
+    const plain = providerHarness();
+    plain.internals.opts.onBind = () => ({ accept: false, code: "no", message: "rejected" });
+    await plain.internals.handleControlRequest(bindFrame(22, 11), plain.socket, 1);
+    expect(new TextDecoder().decode(plain.socket.writes[0]!.body)).toBe('{"code":"no","message":"rejected"}');
+  });
+
   test("bind ack failure cleans tentative state and never invokes onBound", async () => {
     const socket = new MockSocket();
     socket.failWrites = true;

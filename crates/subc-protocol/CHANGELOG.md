@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.34.3
+
+- Add `error_codes::BIND_BUSY` (`bind_busy`), classified retryable by
+  `is_retryable_route_open`. A target module answers it from its own bind when
+  the state the route would work on is temporarily in use, for example while
+  a read or write is still running on the route's project folder. Nothing was
+  sent on the route, so a caller may re-open within its own deadline. Optional
+  `detail.reason` and `detail.retry_after_ms` give the cause and an estimate
+  of when to retry. The golden `decision_tables.json` gains the row.
+- Rollout: a module should send it only after its callers run this release or
+  `@cortexkit/subc-client` 0.23.1. Nothing checks that, and an older caller
+  treats any unknown code as terminal.
+
 ## 0.34.2
 
 - Add an optional `schema_pin` to `CallOrigin`, with `with_schema_pin` and

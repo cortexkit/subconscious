@@ -120,6 +120,23 @@ pub mod error_codes {
     /// its own bind, so the daemon relays it unchanged. Nothing was sent on
     /// the route, so the caller may re-open within its deadline: RETRYABLE.
     pub const SESSION_ADDRESS_UNAVAILABLE: &str = "session_address_unavailable";
+    /// A target module refused the bind because the state this route would
+    /// work on, such as the project folder it resolved for the route, is
+    /// temporarily in use: a read or write still running on it, or its setup
+    /// not finished. Unlike `session_address_unavailable`, the module knows
+    /// where that state is; something running blocks it. The module answers
+    /// this from its own bind and the daemon relays it unchanged. Nothing was
+    /// sent on the route, so the caller may re-open within its own deadline:
+    /// RETRYABLE.
+    ///
+    /// Optional `detail` fields, which a caller must not rely on:
+    /// `reason`, a short cause such as `reader`, and `retry_after_ms`, the
+    /// module's estimate of when to try again, which a caller never waits
+    /// past its own deadline. A module sends this code only once its callers
+    /// run SDKs that classify it as retryable (subc-protocol 0.34.3 or
+    /// `@cortexkit/subc-client` 0.23.1 and later); nothing enforces that, and
+    /// an older caller ends the open as if refused for good.
+    pub const BIND_BUSY: &str = "bind_busy";
     /// A scoped `route.open` named no `scope_epoch`. Every opener names one,
     /// the owner included, so an old call can never be carried into a newer
     /// session that reused the ref. TERMINAL.
@@ -268,6 +285,7 @@ pub mod error_codes {
                 | SCOPE_NOT_SYNCED
                 | SCOPE_CHANGED
                 | SESSION_ADDRESS_UNAVAILABLE
+                | BIND_BUSY
         )
     }
 

@@ -64,6 +64,17 @@ extension FedShareTests {
         XCTAssertEqual(frame, ShareV2Vectors.declaration(header: callHeader, length: UInt32(body.count)) + body)
         let decoded = try FedFrameCodec.decode(frame, negotiationComplete: true, negotiatedFeatures: ["share-v1", "share-v2"])
         XCTAssertEqual(decoded.body, body)
+        // The vector's call header is the federation module's encoder output.
+        // fed-wire fixes a share header's members, not their order, and this
+        // encoder writes sorted keys, so the phone's own builder is checked
+        // member by member; the body stays byte-exact.
+        guard case .string(let shareID) = decoded.header["share_id"],
+              case .string(let module) = decoded.header["module"] else {
+            return XCTFail("vector call header lacks share_id or module")
+        }
+        let builtCall = try FedShareRequest(shareID: shareID, module: module, body: body, framed: true)
+        XCTAssertEqual(builtCall.frame.header, decoded.header)
+        XCTAssertEqual(builtCall.frame.body, body)
         let rows = try XCTUnwrap(root["cases"] as? [[String: Any]])
         for row in rows {
             let name = try XCTUnwrap(row["name"] as? String)

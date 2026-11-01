@@ -94,8 +94,12 @@ pub enum ProviderResult {
     Approved,
     Declined,
     Unavailable,
+    ProviderError {
+        reason: &'static str,
+    },
     UnsupportedPlatform,
     NoPresence,
+    SetupRequired,
     LocalAuthenticationError {
         failure: OperatorOsErrorKind,
         domain: String,
@@ -135,9 +139,9 @@ impl OperatorLimits {
 
 struct OsProvider;
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 struct OsWithdraw(Arc<dyn subc_presence::Withdraw>);
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 impl OperatorWithdraw for OsWithdraw {
     fn withdraw(&self, _: &str) {
         self.0.withdraw();
@@ -150,15 +154,7 @@ impl OperatorProvider for OsProvider {
         text: &str,
         publish: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
     ) -> ProviderResult {
-        // On Linux the prompt comes from polkit, whose agents may show only the
-        // fixed message of an installed action file, not this request's summary.
-        // A person must see what they approve, so Linux refuses rather than prompts.
-        #[cfg(target_os = "linux")]
-        {
-            let _ = (text, publish);
-            ProviderResult::UnsupportedPlatform
-        }
-        #[cfg(any(target_os = "macos", windows))]
+        #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
         {
             os_outcome(subc_presence::prompt(
                 text,
@@ -174,16 +170,20 @@ impl OperatorProvider for OsProvider {
 }
 
 /// Convert the operating-system prompt's result into the daemon's provider
-/// result. Only an explicit approval may become `Approved`. The real prompt
-/// needs a person, so tests can't reach this mapping through it; keeping it a
-/// separate function lets a test check that no other result grants a write.
-#[cfg(any(target_os = "macos", windows))]
+/// result. Only an explicit OS approval may become `Approved`. Keeping this
+/// separate from the platform bindings lets tests on every host verify that
+/// errors and unavailable providers never grant a write.
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn os_outcome(outcome: subc_presence::Outcome) -> ProviderResult {
     match outcome {
         subc_presence::Outcome::Approved => ProviderResult::Approved,
         subc_presence::Outcome::Declined => ProviderResult::Declined,
         subc_presence::Outcome::ProviderError => ProviderResult::Unavailable,
+        subc_presence::Outcome::ProviderErrorWithReason { reason } => {
+            ProviderResult::ProviderError { reason }
+        }
         subc_presence::Outcome::NoPresence => ProviderResult::NoPresence,
+        subc_presence::Outcome::SetupRequired => ProviderResult::SetupRequired,
         subc_presence::Outcome::UnsupportedPlatform => ProviderResult::UnsupportedPlatform,
         subc_presence::Outcome::LocalAuthenticationError {
             failure,
@@ -204,10 +204,12 @@ fn os_outcome(outcome: subc_presence::Outcome) -> ProviderResult {
             domain,
             code,
         },
+        // Future presence providers must fail closed until explicitly mapped.
+        _ => ProviderResult::Unavailable,
     }
 }
 
-#[cfg(all(test, any(target_os = "macos", windows)))]
+#[cfg(all(test, any(target_os = "macos", windows, target_os = "linux")))]
 mod os_outcome_tests {
     use super::*;
 
@@ -217,7 +219,23 @@ mod os_outcome_tests {
         assert_eq!(os_outcome(Os::Approved), ProviderResult::Approved);
         assert_eq!(os_outcome(Os::Declined), ProviderResult::Declined);
         assert_eq!(os_outcome(Os::ProviderError), ProviderResult::Unavailable);
+        let root_error = os_outcome(Os::ProviderErrorWithReason {
+            reason: "root_user",
+        });
+        assert_eq!(
+            root_error,
+            ProviderResult::ProviderError {
+                reason: "root_user"
+            }
+        );
+        let refusal = Outcome::from_provider(root_error);
+        assert_eq!(refusal.code, error_codes::OPERATOR_PRESENCE_UNAVAILABLE);
+        assert_eq!(refusal.reason, "root_user");
         assert_eq!(os_outcome(Os::NoPresence), ProviderResult::NoPresence);
+        assert_eq!(os_outcome(Os::SetupRequired), ProviderResult::SetupRequired);
+        let refusal = Outcome::from_provider(ProviderResult::SetupRequired);
+        assert_eq!(refusal.code, error_codes::OPERATOR_PRESENCE_UNAVAILABLE);
+        assert_eq!(refusal.reason, "operator_prompt_setup_required");
         assert_eq!(
             os_outcome(Os::UnsupportedPlatform),
             ProviderResult::UnsupportedPlatform
@@ -288,8 +306,10 @@ impl Outcome {
             },
             ProviderResult::Declined => Self::declined("person"),
             ProviderResult::Unavailable => Self::unavailable("provider_error"),
+            ProviderResult::ProviderError { reason } => Self::unavailable(reason),
             ProviderResult::UnsupportedPlatform => Self::unavailable("unsupported_platform"),
             ProviderResult::NoPresence => Self::unavailable("no_presence"),
+            ProviderResult::SetupRequired => Self::unavailable("operator_prompt_setup_required"),
             ProviderResult::LocalAuthenticationError {
                 failure,
                 domain,

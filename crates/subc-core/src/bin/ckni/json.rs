@@ -39,7 +39,7 @@ pub(crate) fn json_form(command: &Command) -> JsonForm {
         Command::MachineShow => JsonForm::Schema("ck.machine.show/v1"),
         Command::MachineAdopt { .. } => JsonForm::Schema("ck.machine.adopt/v1"),
         Command::Quota { .. } => JsonForm::Schema("ck.quota/v1"),
-        Command::Setup(_) => JsonForm::None("setup"),
+        Command::Setup(_) | Command::SetupOperatorPrompt { .. } => JsonForm::None("setup"),
         Command::Upgrade { .. } => JsonForm::None("upgrade"),
         Command::FleetLint { .. } => JsonForm::None("daemon lint"),
         Command::Help(text) => {
@@ -265,6 +265,11 @@ mod tests {
             ),
             (
                 "setup --dry-run",
+                PlainOutput::PipedText,
+                JsonForm::None("setup"),
+            ),
+            (
+                "setup operator-prompt",
                 PlainOutput::PipedText,
                 JsonForm::None("setup"),
             ),

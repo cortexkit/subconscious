@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.39.2
+
+- Route Linux operator confirmations through polkit, including withdrawal. A missing per-user policy refuses with `operator_prompt_setup_required`; all existing cancellation, timeout and late-result guards remain in force.
+- Require subc-presence 0.2 and refuse future unknown provider outcomes. Report effective-root Linux prompt attempts as provider failures with the `root_user` reason rather than accepting polkit's unconditional root authorization.
+
 ## 0.39.1
 
 - Mirror each module's declared build provenance from its HELLO manifest into `catalog.list`, so consumers can detect build changes without a module version bump. Modules without provenance keep their existing catalog entry bytes. Requires subc-control 0.34.1.

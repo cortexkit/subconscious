@@ -43,6 +43,7 @@ pub(super) fn plain_output(command: &Command) -> PlainOutput {
             | ModuleCommand::ReleaseReserved { .. } => PlainOutput::PipedText,
         },
         Command::Setup(_)
+        | Command::SetupOperatorPrompt { .. }
         | Command::Upgrade { .. }
         | Command::Routes { .. }
         | Command::Catalog { .. }

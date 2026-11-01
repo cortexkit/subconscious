@@ -444,7 +444,7 @@ const MACHINE_HELP: &str = "ck machine — this machine's id, the name the daemo
 
 const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info, offline triage, and CI lint\n\nusage:\n  ck [--json] [--verbose] daemon\n  ck [--json] daemon triage\n  ck daemon lint [<config>] [--verbose]\n\n  triage reads only the local run directory; it never contacts the daemon.\n  lint reads module manifests without connecting to the daemon.";
 
-const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run] [--verbose] [--yes|-y]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without changing anything. Interactive setup shows that plan and\n  asks Continue? [y/N] before changes; --yes (-y) skips the question. Piped or\n  non-terminal setup proceeds without a question. --convert is explicit and requires\n  --confirm before it can apply a conversion plan. --verbose includes plan outcomes\n  and download diagnostics when a network request fails.";
+const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run] [--verbose] [--yes|-y]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n  ck setup operator-prompt [--uninstall]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without changing anything. Interactive setup shows that plan and\n  asks Continue? [y/N] before changes; --yes (-y) skips the question. Piped or\n  non-terminal setup proceeds without a question. --convert is explicit and requires\n  --confirm before it can apply a conversion plan. --verbose includes plan outcomes\n  and download diagnostics when a network request fails.";
 
 const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade [--dry-run] [--verbose]\n  ck upgrade --check [--verbose]\n\n  --check reports available updates without changing anything. --dry-run prints\n  the complete plan without changing anything. --verbose includes plan outcomes\n  and execution evidence. --check exits 0 for current binaries or available\n  updates, and 1 when ownership is missing or an unowned destination is found.";
 
@@ -566,6 +566,13 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     }
     if let Command::Setup(request) = &args.command {
         return setup_command(&running_executable()?, request, ckni);
+    }
+    if let Command::SetupOperatorPrompt { uninstall } = &args.command {
+        return setup::operator_prompt::run(
+            *uninstall,
+            !ckni && io::stdin().is_terminal() && io::stdout().is_terminal(),
+        )
+        .map_err(|error| CkError::rejected(format!("operator prompt setup: {error}")));
     }
     if let Command::Upgrade {
         check,
@@ -757,6 +764,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         }
         Command::FleetLint { .. }
         | Command::Setup(_)
+        | Command::SetupOperatorPrompt { .. }
         | Command::Upgrade { .. }
         | Command::Help(_)
         | Command::External { .. }
@@ -1517,6 +1525,9 @@ enum Command {
     CliFaceReservedNames,
     Dashboard,
     Setup(setup::SetupRequest),
+    SetupOperatorPrompt {
+        uninstall: bool,
+    },
     Upgrade {
         check: bool,
         verbose: bool,
@@ -8248,6 +8259,17 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
         {
             Ok(Command::Help(SETUP_HELP.into()))
         }
+        "setup" if tail.first().is_some_and(|value| value == "operator-prompt") => {
+            match &tail[1..] {
+                [] => Ok(Command::SetupOperatorPrompt { uninstall: false }),
+                [flag] if flag == "--uninstall" => {
+                    Ok(Command::SetupOperatorPrompt { uninstall: true })
+                }
+                _ => Err(CkError::Usage(
+                    "usage: ck setup operator-prompt [--uninstall]".into(),
+                )),
+            }
+        }
         "setup" => parse_setup_command(tail).map(Command::Setup),
         "upgrade"
             if tail
@@ -8585,6 +8607,12 @@ fn decode_error_body(body: &[u8]) -> String {
                     _ => "operator approval cancelled or withdrawn".to_string(),
                 },
                 subc_protocol::error_codes::OPERATOR_PRESENCE_UNAVAILABLE => match reason {
+                    Some("operator_prompt_setup_required") => {
+                        "operator prompt needs setup: run `ck setup operator-prompt`".to_string()
+                    }
+                    Some("root_user") => {
+                        "operator prompt cannot authenticate a daemon running as root; run the daemon as your own user".to_string()
+                    }
                     Some("timeout") => "operator prompt timed out without approval".to_string(),
                     Some("queue_wait") => {
                         "refused without asking: operator prompt queue wait expired".to_string()
@@ -8978,6 +9006,16 @@ mod tests {
                     error_codes::OPERATOR_DECLINED,
                     None,
                     "operator approval cancelled or withdrawn",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("operator_prompt_setup_required"),
+                    "operator prompt needs setup: run `ck setup operator-prompt`",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("root_user"),
+                    "operator prompt cannot authenticate a daemon running as root; run the daemon as your own user",
                 ),
                 (
                     error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
@@ -11727,6 +11765,33 @@ mod tests {
         request.yes = false;
         assert!(ckni_refuses_to_ask(false, &request, true, true).is_ok());
         assert!(setup_would_ask(&request, true, true));
+    }
+
+    #[test]
+    fn operator_prompt_setup_is_a_separate_narrow_command() {
+        let test_tail = |tokens: &[&str]| tokens.iter().map(OsString::from).collect::<Vec<_>>();
+        let command = parse_command("setup", &test_tail(&["operator-prompt"])).unwrap();
+        assert!(matches!(
+            command,
+            Command::SetupOperatorPrompt { uninstall: false }
+        ));
+        assert!(matches!(
+            ckni::plain_output(&command),
+            ckni::PlainOutput::PipedText
+        ));
+        assert!(JsonOutput::for_command(&command, true, true).is_err());
+        assert!(matches!(
+            parse_command("setup", &test_tail(&["operator-prompt", "--uninstall"])).unwrap(),
+            Command::SetupOperatorPrompt { uninstall: true }
+        ));
+        for tail in [
+            vec!["operator-prompt", "--yes"],
+            vec!["operator-prompt", "aft"],
+            vec!["operator-prompt", "--uninstall", "--dry-run"],
+        ] {
+            assert!(parse_command("setup", &test_tail(&tail)).is_err());
+        }
+        assert!(SETUP_HELP.contains("ck setup operator-prompt [--uninstall]"));
     }
 
     #[test]

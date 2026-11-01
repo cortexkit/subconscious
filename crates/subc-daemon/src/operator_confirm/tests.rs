@@ -999,13 +999,26 @@ fn in_process_operator_script_non_ckdev_falls_back_and_warns() {
     assert_eq!(state.limits.queue_wait, defaults.queue_wait);
     assert_eq!(state.limits.prompt_timeout, defaults.prompt_timeout);
     assert_eq!(state.limits.stuck_grace, defaults.stuck_grace);
-    // Linux's OS provider refuses without showing a prompt. Do not invoke the
-    // real biometric provider on platforms where it would require a person.
+    // Without the per-user polkit action, Linux's OS provider refuses before
+    // reaching polkit, so no prompt is shown. Skip where the action is
+    // installed or the test runs as root, since either reaches polkit. Do not
+    // invoke the real provider on platforms where it would require a person.
     #[cfg(target_os = "linux")]
-    assert_eq!(
-        state.provider.prompt("text", Box::new(|_| {})),
-        ProviderResult::UnsupportedPlatform
-    );
+    {
+        let uid = std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|ids| ids.split_whitespace().nth(1).map(str::to_owned))
+            .unwrap();
+        let action = format!("/usr/share/polkit-1/actions/io.cortexkit.subc.elevate.u{uid}.policy");
+        if uid != "0" && !std::path::Path::new(&action).exists() {
+            assert_eq!(
+                state.provider.prompt("text", Box::new(|_| {})),
+                ProviderResult::SetupRequired
+            );
+        }
+    }
 }
 
 #[cfg(feature = "test-support")]

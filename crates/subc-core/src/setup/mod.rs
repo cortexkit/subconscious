@@ -62,3 +62,4 @@ pub use upgrade_executor::{
     execute_upgrade, RollbackDecision, UpgradeEvidence, UpgradeExecutionBackend,
     UpgradeExecutionFailure, UpgradeExecutionReport,
 };
+pub mod operator_prompt;

@@ -322,6 +322,40 @@ jobs:
           done
           sudo env SUBC_REQUIRE_CGROUP_TEST=1 "$test_binary" "${tests[@]}" --exact --nocapture --test-threads=1
 
+      # Require the root fixture rather than allowing a missing agent to skip CI.
+      - name: Real polkit operator prompt
+        if: ${{ !cancelled() && matrix.os == 'ubuntu' }}
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y polkitd pkexec policykit-1 python3-dbus
+          sudo useradd --create-home --shell /bin/sh subc-polkit-test
+          trap 'sudo userdel --remove subc-polkit-test' EXIT
+          echo 'subc-polkit-test:polkit-fixture-password' | sudo chpasswd
+          test_binary="$(
+            cargo test -p subc-presence --test linux_polkit --no-run --locked --message-format=json |
+              jq -ers '
+                map(select(.reason == "compiler-artifact"
+                  and .target.name == "linux_polkit"
+                  and .profile.test == true
+                  and .executable != null))
+                | if length == 1 then .[0].executable
+                  else error("expected exactly one linux_polkit test executable") end
+              '
+          )"
+          test_name=real_polkit_password_text_no_agent_and_withdraw
+          "$test_binary" "$test_name" --exact --list | grep -Fx "$test_name: test" > /dev/null
+          # The driver runs this binary again as the test user, who cannot
+          # enter the runner's home directory, so run a copy from /tmp.
+          runnable="$(mktemp -d /tmp/subc-polkit.XXXXXX)"
+          chmod 0755 "$runnable"
+          install -m 0755 "$test_binary" "$runnable/linux_polkit"
+          sudo env SUBC_REQUIRE_POLKIT_TEST=1 SUBC_POLKIT_TEST_USER=subc-polkit-test \
+            SUBC_POLKIT_TEST_PASSWORD=polkit-fixture-password \
+            "$runnable/linux_polkit" "$test_name" --exact --nocapture
+
       # The ignored download test is mandatory here; guard discovery and the run count.
       - name: Published claustrum bootstrap
         if: ${{ !cancelled() && matrix.os == 'ubuntu' }}

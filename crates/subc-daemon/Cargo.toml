@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.39.1"
+version = "0.39.2"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -47,11 +47,10 @@ subc-cgroup = { path = "../subc-cgroup", version = "0.1.8" }
 # because this crate forbids unsafe code and the Win32 calls need it.
 subc-jobobject = { path = "../subc-jobobject", version = "0.2.3" }
 
-[target.'cfg(any(target_os = "macos", windows))'.dependencies]
-# The OS authentication prompts live only in the daemon. Keeping them in their
-# own crate, depended on here and nowhere else, keeps those platform bindings
-# out of subc-client-rs and the other crates modules build against.
-subc-presence = { path = "../subc-presence", version = "0.1.2" }
+[target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
+# Platform bindings stay out of the module SDKs. The CLI shares the Linux
+# policy renderer, but authorization decisions belong only to the daemon.
+subc-presence = { path = "../subc-presence", version = "0.2" }
 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM for `protocol: "none"` teardown. This crate forbids unsafe code, so

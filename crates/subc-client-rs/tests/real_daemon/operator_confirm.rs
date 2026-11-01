@@ -1033,19 +1033,29 @@ async fn non_ckdev_refuses_test_provider() {
     }
     assert!(h.events().is_empty());
 }
+/// Without the per-user polkit action that `ck setup operator-prompt` installs,
+/// the Linux prompt refuses before reaching polkit, so nothing is shown.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn linux_unsupported_platform_without_prompt() {
+async fn linux_without_the_polkit_action_reports_setup_required() {
+    let uid = std::fs::read_to_string("/proc/self/status")
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|ids| ids.split_whitespace().nth(1).map(str::to_owned))
+        .unwrap();
+    let action = format!("/usr/share/polkit-1/actions/io.cortexkit.subc.elevate.u{uid}.policy");
+    if uid == "0" || std::path::Path::new(&action).exists() {
+        eprintln!("skipped: this host runs as root or has the polkit action ({action}) installed");
+        return;
+    }
     let h = Harness::clocks("approve", 5000, 5000, 1000, false).await;
     assert!(h.logs().contains("operator confirm test provider refused"));
-    assert_eq!(
-        h.confirm("linux write").await["result"],
-        "unsupported_platform"
-    );
+    assert_eq!(h.confirm("linux write").await["result"], "unavailable");
     assert_eq!(
         h.audit(
             "operator_presence_unavailable",
-            "unsupported_platform",
+            "operator_prompt_setup_required",
             Some("linux write")
         )
         .await["prompt_shown"],

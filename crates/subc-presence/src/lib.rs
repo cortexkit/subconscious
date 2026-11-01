@@ -8,8 +8,11 @@
 
 use std::sync::Arc;
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod polkit;
 #[cfg(windows)]
 mod windows;
 
@@ -21,14 +24,21 @@ pub enum LocalAuthenticationFailure {
     ProviderError,
 }
 
-/// Only an explicit successful OS authentication approves a request.
+/// Only an explicit OS authorization approves a request.
+/// Treat unknown outcomes as provider unavailability, never approval.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Outcome {
     Approved,
     Declined,
     ProviderError,
+    ProviderErrorWithReason {
+        reason: &'static str,
+    },
     NoPresence,
     UnsupportedPlatform,
+    /// The per-user Linux policy must be installed by an administrator.
+    SetupRequired,
     LocalAuthenticationError {
         failure: LocalAuthenticationFailure,
         domain: String,
@@ -85,10 +95,10 @@ pub fn prompt(text: &str, publish: Box<dyn FnOnce(Arc<dyn Withdraw>) + Send>) ->
     return macos::prompt(text, publish);
     #[cfg(windows)]
     return windows::prompt(text, publish);
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(target_os = "linux")]
+    return linux::prompt(text, publish);
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     {
-        // Linux authentication agents may display only a fixed policy message,
-        // not the requested write. Do not ask for blind approval.
         let _ = (text, publish);
         Outcome::UnsupportedPlatform
     }
@@ -202,7 +212,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
     #[test]
     fn unsupported_platform_never_publishes_a_prompt() {
         assert_eq!(

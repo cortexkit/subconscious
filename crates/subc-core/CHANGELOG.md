@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.157
+
+- Add `ck setup operator-prompt [--uninstall]` for the current user's Linux polkit action. Terminal use runs interactive sudo; non-terminal use prints the complete administrator commands and policy without changing the system. Explain missing operator-prompt setup in CLI refusal messages.
+- Explain why Linux operator prompts refuse daemons running as root. Require subc-daemon 0.39.2 and use subc-presence 0.2 for the CLI's Linux policy renderer.
+
 ## 0.20.156
 
 - Test-only: Linux CI now runs the default `ck setup` vault path against the published ck-auth v0.3.0 with a real Secret Service on a private D-Bus session, in a clean home and in one holding an empty store left by an earlier refused setup. No change to `ck` itself.

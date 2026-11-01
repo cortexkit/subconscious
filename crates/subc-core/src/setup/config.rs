@@ -253,6 +253,14 @@ fn pending_keys_against(
     for (key, desired) in desired_values_with_key(component, binary_home, claustrum_key_path) {
         match existing_value(document, &key) {
             Some(actual) if actual == &desired => {}
+            // Omitting --key-path must not remove or conflict with an existing
+            // operator environment: the vault may still depend on its key file.
+            Some(Value::Object(actual))
+                if component == Component::Claustrum && claustrum_key_path.is_none() && {
+                    let mut without_env = actual.clone();
+                    without_env.remove("env");
+                    Value::Object(without_env) == desired
+                } => {}
             Some(_) => return Err(ConfigConflict { key }),
             None => pending.push(key),
         }
@@ -857,6 +865,62 @@ mod tests {
                 "{component}: config must spawn the module program"
             );
         }
+    }
+
+    #[test]
+    fn claustrum_default_config_has_no_key_override() {
+        let root = fixture_path("claustrum-default-key-store");
+        let change = plan_component(root.join("subc.jsonc"), Component::Claustrum, &root)
+            .unwrap()
+            .unwrap();
+        assert!(!change.after.contains("CK_MASTER_KEY_PATH"));
+        let written: Value = serde_json::from_str(&jsonc_to_json(&change.after).unwrap()).unwrap();
+        assert!(written.pointer("/modules/claustrum/env").is_none());
+    }
+
+    #[test]
+    fn claustrum_rerun_without_key_path_preserves_the_operator_environment() {
+        let root = fixture_path("claustrum-retain-key");
+        let config = root.join("subc.jsonc");
+        let key = root.join("secrets/master.key");
+        let initial = plan_component_with_key(&config, Component::Claustrum, &root, Some(&key))
+            .unwrap()
+            .unwrap();
+        apply(&initial).unwrap();
+        let before = fs::read_to_string(&config).unwrap();
+
+        assert!(
+            pending_dotted_keys(&config, Component::Claustrum, &root, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(plan_component(&config, Component::Claustrum, &root)
+            .unwrap()
+            .is_none());
+        assert_eq!(fs::read_to_string(&config).unwrap(), before);
+
+        let other = plan_component(&config, Component::Core, &root)
+            .unwrap()
+            .unwrap();
+        apply(&other).unwrap();
+        let written: Value =
+            serde_json::from_str(&jsonc_to_json(&fs::read_to_string(&config).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(
+            written.pointer("/modules/claustrum/env/CK_MASTER_KEY_PATH"),
+            Some(&Value::String(key.to_string_lossy().into_owned()))
+        );
+
+        assert!(
+            plan_component_with_key(
+                &config,
+                Component::Claustrum,
+                &root,
+                Some(&root.join("different.key"))
+            )
+            .is_err(),
+            "an explicit conflicting key path must still be refused"
+        );
     }
 
     #[test]

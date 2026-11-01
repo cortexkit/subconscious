@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.155
+
+- Fix `ck setup claustrum` failing on Linux and Windows by leaving the master key in the vault's OS key store unless `--key-path` is supplied. Preserve existing operator key paths and suggest a file outside the data folder when the OS key store is unavailable.
+- Remove partial vault data after a refused bootstrap only when the vault directory did not exist before the attempt; existing vault directories are always left in place.
+
 ## 0.20.154
 
 - Upgrade the daemon to 0.39 and Rust wire crates to their project-free identity releases. CLI management routes no longer claim the current directory as a project. For project-free openers, project attribution comes from an admitted session scope stamp.

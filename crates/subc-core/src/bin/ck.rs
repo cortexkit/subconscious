@@ -11730,6 +11730,20 @@ mod tests {
     }
 
     #[test]
+    fn setup_claustrum_key_path_is_only_selected_by_the_operator() {
+        let default = parse_setup_command(&[OsString::from("claustrum")]).unwrap();
+        assert_eq!(default.claustrum_key_path, None);
+        let key = PathBuf::from("operator-secrets").join("master.key");
+        let explicit = parse_setup_command(&[
+            OsString::from("claustrum"),
+            OsString::from("--key-path"),
+            key.clone().into_os_string(),
+        ])
+        .unwrap();
+        assert_eq!(explicit.claustrum_key_path, Some(key));
+    }
+
+    #[test]
     fn setup_yes_flags_are_parsed_and_documented() {
         for flag in ["--yes", "-y"] {
             let request = parse_setup_command(&[OsString::from(flag)]).unwrap();

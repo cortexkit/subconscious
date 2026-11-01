@@ -1481,6 +1481,30 @@ mod tests {
     }
 
     #[test]
+    fn claustrum_default_plan_leaves_key_store_selection_to_the_vault() {
+        let mut observed = observed_setup();
+        observed
+            .components
+            .insert(Component::Core, ComponentState::Correct);
+        observed.runtime = RuntimeState::Correct;
+        observed
+            .components
+            .insert(Component::Claustrum, ComponentState::Missing);
+        let mut request = SetupRequest::install(vec![Component::Claustrum]);
+        request.claustrum_key_path = super::super::default_claustrum_key_path().unwrap();
+
+        let plan = plan_setup(&observed, &request);
+        assert!(
+            plan.operations.iter().any(|operation| matches!(
+                operation,
+                SetupOperation::BootstrapClaustrum { key_path: None, .. }
+            )),
+            "default bootstrap must not supply a key file: {:?}",
+            plan.operations
+        );
+    }
+
+    #[test]
     fn claustrum_bootstraps_before_it_is_enabled_with_one_key_path() {
         let mut observed = observed_setup();
         observed

@@ -52,6 +52,49 @@ struct ComponentSteps {
     adopted_binaries: Vec<PathBuf>,
     config_change: Option<config::ConfigChange>,
     configuration_inventory_created: bool,
+    failed_bootstrap_directory: Option<BootstrapDirectory>,
+}
+
+struct BootstrapDirectory {
+    path: PathBuf,
+    existed_before: bool,
+}
+
+impl BootstrapDirectory {
+    fn capture(data_dir: &Path) -> Result<Self, String> {
+        let path = data_dir.join("claustrum");
+        let existed_before = match fs::symlink_metadata(&path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+        };
+        Ok(Self {
+            path,
+            existed_before,
+        })
+    }
+
+    fn rollback(self) -> Result<String, String> {
+        // A failed bootstrap may have opened store.db before refusing a key.
+        // Only a directory absent before that attempt belongs to this rollback.
+        if self.existed_before {
+            return Ok(format!(
+                "setup left existing vault directory in place: {}",
+                self.path.display()
+            ));
+        }
+        match fs::remove_dir_all(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "could not roll back {}: {error}",
+                    self.path.display()
+                ))
+            }
+        }
+        Ok(format!("rolled back: {}", self.path.display()))
+    }
 }
 
 struct SetupPaths {
@@ -80,13 +123,9 @@ impl SetupBackend {
                 data_dir: data_dir.clone(),
                 binary_home,
                 config_path: subc_daemon::daemon_config::default_config_path(),
-                // One default is retained and reused for bootstrap and generated
-                // module environment so the vault never receives mismatched keys.
-                claustrum_key_path: if cfg!(target_os = "macos") {
-                    None
-                } else {
-                    Some(data_dir.join("claustrum").join("master.key"))
-                },
+                // The vault chooses its own OS key store and refuses a key file
+                // inside its data folder. Only an operator may select a file.
+                claustrum_key_path: default_claustrum_key_path()?,
                 runtime_paths,
             },
             platform,
@@ -691,7 +730,7 @@ impl SetupBackend {
             .unwrap_or(false)
     }
 
-    fn bootstrap_claustrum(&self, key_path: Option<&Path>) -> Result<(), String> {
+    fn bootstrap_claustrum(&mut self, key_path: Option<&Path>) -> Result<(), String> {
         if self.claustrum_module_is_live() {
             println!("  claustrum credentials already initialized (module is running)");
             return Ok(());
@@ -701,7 +740,8 @@ impl SetupBackend {
         } else {
             "ck-auth"
         });
-        run_auth_bootstrap(&auth, key_path, &self.paths.data_dir, |mut command| {
+        let directory = BootstrapDirectory::capture(&self.paths.data_dir)?;
+        let result = run_auth_bootstrap(&auth, key_path, &self.paths.data_dir, |mut command| {
             let status = command
                 .status()
                 .map_err(|error| format!("could not run ck auth bootstrap: {error}"))?;
@@ -710,7 +750,14 @@ impl SetupBackend {
             } else {
                 Err(format!("ck auth bootstrap failed with {status}"))
             }
-        })?;
+        });
+        if let Err(error) = result {
+            self.component_steps
+                .entry(Component::Claustrum)
+                .or_default()
+                .failed_bootstrap_directory = Some(directory);
+            return Err(error);
+        }
         println!("  initialized claustrum credentials");
         Ok(())
     }
@@ -836,9 +883,8 @@ impl SetupBackend {
 /// every platform. On Unix, folders created here are owner-only (an existing
 /// key folder inside the CortexKit data folder is also narrowed to
 /// owner-only), and the command runs under umask 077 so the key it writes is
-/// private from the start. Windows creates the folders without changing their
-/// access: the default key lives under the per-user `%LOCALAPPDATA%`, whose
-/// inherited access already limits it to that user.
+/// private from the start. Windows creates the operator's folders without
+/// changing their inherited access permissions.
 fn run_auth_bootstrap(
     auth: &Path,
     key_path: Option<&Path>,
@@ -868,7 +914,13 @@ fn run_auth_bootstrap(
     if let Some(key_path) = key_path {
         command.arg("--key-path").arg(key_path);
     }
-    run(command)?;
+    run(command).map_err(|error| {
+        if key_path.is_some() {
+            error
+        } else {
+            format!("{error}\n{}", auth_key_path_hint())
+        }
+    })?;
     if let Some(key_path) = key_path {
         #[cfg(unix)]
         if !fs::symlink_metadata(key_path).is_ok_and(|metadata| metadata.file_type().is_file()) {
@@ -880,6 +932,23 @@ fn run_auth_bootstrap(
         file_modes::tighten_owned_file(key_path, 0o600)?;
     }
     Ok(())
+}
+
+fn auth_key_path_hint() -> String {
+    #[cfg(not(windows))]
+    {
+        "hint: for a key file instead of the OS key store, run: install -d -m 700 ~/.config/cortexkit/secrets && ck setup claustrum --key-path ~/.config/cortexkit/secrets/master.key".to_string()
+    }
+    #[cfg(windows)]
+    {
+        let config = subc_daemon::daemon_config::default_config_path();
+        let secrets = config.parent().unwrap_or(Path::new(".")).join("secrets");
+        format!(
+            "hint: for a key file instead of the OS key store, run in PowerShell: New-Item -ItemType Directory -Force \"{0}\" | Out-Null; ck setup claustrum --key-path \"{1}\"",
+            secrets.display(),
+            secrets.join("master.key").display()
+        )
+    }
 }
 
 impl SetupExecutor for SetupBackend {
@@ -1118,7 +1187,13 @@ impl SetupExecutor for SetupBackend {
             self.inventory
                 .remove_owned_path("configuration", &self.paths.config_path);
         }
-        self.inventory.save()
+        // Save the ownership record first, so a vault folder that can't be
+        // removed never leaves the inventory listing binaries already removed.
+        self.inventory.save()?;
+        if let Some(directory) = steps.failed_bootstrap_directory {
+            println!("{}", directory.rollback()?);
+        }
+        Ok(())
     }
 
     fn runtime_was_live(&self) -> bool {
@@ -1204,11 +1279,7 @@ impl Validator for CkValidator<'_> {
 }
 
 pub fn default_claustrum_key_path() -> Result<Option<PathBuf>, String> {
-    if cfg!(target_os = "macos") {
-        Ok(None)
-    } else {
-        Ok(Some(data_directory()?.join("claustrum").join("master.key")))
-    }
+    Ok(None)
 }
 
 /// The installed daemon service as the service manager sees it, for the
@@ -1277,6 +1348,106 @@ mod tests {
                 stderr: String::new(),
             })
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn failed_bootstrap_rolls_back_only_a_new_vault_directory() {
+        use super::super::test_exec::write_executable;
+        for existed_before in [false, true] {
+            let root = ScratchDir::new("setup-bootstrap-rollback");
+            let mut backend = backend_without_user_manager(&root);
+            let vault = backend.paths.data_dir.join("claustrum");
+            if existed_before {
+                fs::create_dir_all(vault.join("nested")).unwrap();
+                fs::write(vault.join("store.db"), b"existing encrypted vault").unwrap();
+                fs::write(vault.join("nested/operator-file"), b"keep me").unwrap();
+            }
+            fs::create_dir_all(&backend.paths.binary_home).unwrap();
+            let quoted_vault = vault.to_string_lossy().replace('\'', "'\\''");
+            write_executable(
+                &backend.paths.binary_home.join("ck-auth"),
+                format!("#!/bin/sh\nmkdir -p '{quoted_vault}'\ntouch '{quoted_vault}/store.db'\necho 'keyring refused; use --key-path' >&2\nexit 4\n").as_bytes(),
+            );
+
+            let error = backend.bootstrap_claustrum(None).unwrap_err();
+            assert!(error.contains("hint:"), "{error}");
+            assert!(vault.join("store.db").exists());
+            let snapshot = backend.component_steps[&Component::Claustrum]
+                .failed_bootstrap_directory
+                .as_ref()
+                .unwrap();
+            assert_eq!(snapshot.existed_before, existed_before);
+            backend.rollback_component(Component::Claustrum).unwrap();
+            if existed_before {
+                assert_eq!(
+                    fs::read(vault.join("store.db")).unwrap(),
+                    b"existing encrypted vault"
+                );
+                assert_eq!(
+                    fs::read(vault.join("nested/operator-file")).unwrap(),
+                    b"keep me"
+                );
+            } else {
+                assert!(
+                    !vault.exists(),
+                    "failed bootstrap must not leave a partial vault"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bootstrap_rollback_names_the_removed_or_preserved_directory() {
+        let root = ScratchDir::new("setup-bootstrap-rollback-message");
+        let directory = BootstrapDirectory::capture(root.path()).unwrap();
+        fs::create_dir(&directory.path).unwrap();
+        let path = directory.path.clone();
+        assert_eq!(
+            directory.rollback().unwrap(),
+            format!("rolled back: {}", path.display())
+        );
+        fs::create_dir(&path).unwrap();
+        let directory = BootstrapDirectory::capture(root.path()).unwrap();
+        assert_eq!(
+            directory.rollback().unwrap(),
+            format!(
+                "setup left existing vault directory in place: {}",
+                path.display()
+            )
+        );
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn auth_bootstrap_default_passes_no_key_path_and_keeps_the_refusal_with_a_hint() {
+        let root = ScratchDir::new("setup-auth-default");
+        let error = run_auth_bootstrap(
+            &root.join("ck-auth"),
+            default_claustrum_key_path().unwrap().as_deref(),
+            root.path(),
+            |command| {
+                assert!(!command.get_args().any(|arg| arg == "--key-path"));
+                Err("Secret Service unavailable; use --key-path".to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(error.starts_with("Secret Service unavailable; use --key-path\n"));
+        assert!(error.contains(&auth_key_path_hint()), "{error}");
+        assert!(!root.join("claustrum/master.key").exists());
+    }
+
+    #[test]
+    fn auth_bootstrap_explicit_key_failure_does_not_suggest_a_different_path() {
+        let root = ScratchDir::new("setup-auth-explicit-failure");
+        let error = run_auth_bootstrap(
+            &root.join("ck-auth"),
+            Some(&root.join("secrets/master.key")),
+            &root.join("data"),
+            |_| Err("operator key refused".to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(error, "operator key refused");
     }
 
     #[test]
@@ -1393,8 +1564,7 @@ mod tests {
     }
 
     /// ck-auth refuses a key path whose directory is missing, so the directory
-    /// must exist by the time the command runs: the default one under the data
-    /// directory, and a custom one elsewhere.
+    /// must exist by the time the command runs, wherever the operator put it.
     #[test]
     fn auth_bootstrap_creates_the_key_directory_before_ck_auth_runs() {
         let root = ScratchDir::new("setup-auth-key-directory");
@@ -1402,7 +1572,7 @@ mod tests {
         fs::create_dir(&data_dir).unwrap();
         let auth = data_dir.join("bin").join("ck-auth");
         for key_path in [
-            data_dir.join("claustrum").join("master.key"),
+            data_dir.join("operator-secrets").join("master.key"),
             root.join("custom").join("keys").join("master.key"),
         ] {
             let mut directory_existed = None;
@@ -1430,12 +1600,16 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = |path: PathBuf| fs::metadata(path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode(data_dir.join("claustrum")), 0o700);
+            assert_eq!(mode(data_dir.join("operator-secrets")), 0o700);
             assert_eq!(mode(root.join("custom")), 0o700);
             assert_eq!(mode(root.join("custom").join("keys")), 0o700);
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+#[path = "apply/real_auth_tests.rs"]
+mod real_auth_tests;
 
 #[cfg(all(test, unix))]
 mod adoption_tests {

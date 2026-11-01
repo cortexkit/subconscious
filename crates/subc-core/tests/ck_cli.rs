@@ -1244,7 +1244,7 @@ impl SetupFixture {
                     "storage": {"backend": "sqlite"},
                     "modules": {
                         "aft": {"program": bin.join(platform_binary("ck-aft"))},
-                        "claustrum": installed_claustrum_entry(&bin, &data_home),
+                        "claustrum": installed_claustrum_entry(&bin),
                         "insula": {"program": bin.join(platform_binary("ck-insula"))},
                     },
                 }))
@@ -1384,24 +1384,12 @@ impl SetupFixture {
     }
 }
 
-/// The claustrum entry `ck setup claustrum` writes on this host: macOS keeps
-/// the master key in the keychain, every other platform records its file path
-/// in the module environment. A fixture that omits the path reads as
-/// misconfigured (and so "not installed") everywhere except macOS.
-fn installed_claustrum_entry(bin: &Path, data_home: &Path) -> Value {
-    let mut entry = json!({
+/// Default setup leaves key-store selection to the vault on every platform.
+fn installed_claustrum_entry(bin: &Path) -> Value {
+    json!({
         "program": bin.join(platform_binary("ck-claustrum")),
         "reserved": true,
-    });
-    if !cfg!(target_os = "macos") {
-        entry["env"] = json!({
-            "CK_MASTER_KEY_PATH": data_home
-                .join("cortexkit")
-                .join("claustrum")
-                .join("master.key"),
-        });
-    }
-    entry
+    })
 }
 
 struct SignedIndex {
@@ -2050,6 +2038,41 @@ fn setup_live_daemon_uses_core_release_not_connection_library_version() {
         *index.requests.lock().unwrap(),
         vec!["/index.json", "/index.json"]
     );
+}
+
+#[test]
+fn setup_rerun_preserves_an_existing_operator_claustrum_key_path() {
+    let fixture = SetupFixture::installed("ck-setup-keep-operator-key");
+    let path = fixture.config_home.join("cortexkit/subc.jsonc");
+    let key = fixture.config_home.join("cortexkit/secrets/master.key");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["modules"]["claustrum"]["env"] = json!({ "CK_MASTER_KEY_PATH": key });
+    fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    #[cfg(unix)]
+    set_setup_managed_modes(&fixture);
+    let before = fs::read(&path).unwrap();
+    let index = serve_signed_index(|base| {
+        let (mut document, assets) = setup_index(base, None);
+        let unused = fixture_asset(format!("{base}/unused.zip"), "00".repeat(32), 1, None);
+        document["components"]["claustrum"] = index_component(
+            "v0.17.9",
+            Some("0.17.9"),
+            &host_target(),
+            [("ck-claustrum", unused.clone()), ("ck-auth", unused)],
+        );
+        (document, assets)
+    });
+
+    let output = fixture
+        .command(&index, &["setup", "claustrum"])
+        .output()
+        .unwrap();
+
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+    assert!(!text(&output.stdout).contains("initialized claustrum credentials"));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(*index.requests.lock().unwrap(), vec!["/index.json"]);
 }
 
 #[test]
@@ -2908,8 +2931,12 @@ fn setup_keeps_bootstrapped_claustrum_key_owner_only_under_zero_umask() {
             assets,
         )
     });
+    let key = fixture.config_home.join("cortexkit/secrets/master.key");
     let output = fixture
-        .command_with_zero_umask(&index, &["setup", "claustrum"])
+        .command_with_zero_umask(
+            &index,
+            &["setup", "claustrum", "--key-path", key.to_str().unwrap()],
+        )
         .env("CK_TEST_SETUP_RUNTIME_MISSING", "1")
         .output()
         .expect("claustrum setup runs with zero umask in its child");
@@ -2917,8 +2944,14 @@ fn setup_keeps_bootstrapped_claustrum_key_owner_only_under_zero_umask() {
     assert_exit(&output, 0);
     let cortexkit = fixture.data_home.join("cortexkit");
     assert_mode(&cortexkit, 0o700);
-    assert_mode(&cortexkit.join("claustrum"), 0o700);
-    assert_mode(&cortexkit.join("claustrum/master.key"), 0o600);
+    assert_mode(key.parent().unwrap(), 0o700);
+    assert_mode(&key, 0o600);
+    let config = fs::read_to_string(fixture.config_home.join("cortexkit/subc.jsonc")).unwrap();
+    let config: Value = serde_json::from_str(&subc_jsonc::jsonc_to_json(&config).unwrap()).unwrap();
+    assert_eq!(
+        config.pointer("/modules/claustrum/env/CK_MASTER_KEY_PATH"),
+        Some(&json!(key))
+    );
 }
 
 struct UpgradeFixture {

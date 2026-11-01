@@ -27,7 +27,7 @@ import {
   type Frame,
 } from "./envelope.js";
 import { launchNonceOrUndefinedAsync } from "./launch-nonce.js";
-import type { Principal } from "./provider.js";
+import type { ManifestProvenance, Principal } from "./provider.js";
 import {
   belongsToConnection,
   createRouteHandle,
@@ -194,6 +194,8 @@ export interface CatalogRichUiDescriptor {
 
 export interface CatalogEntry {
   module_id: string;
+  /** Build provenance from the registered manifest; absent when undeclared or on older daemons. */
+  provenance?: ManifestProvenance;
   roles: unknown[];
   control_ops: string[];
   /** Static capability claims mirrored from the registered module manifest. */

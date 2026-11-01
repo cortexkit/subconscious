@@ -25,6 +25,7 @@ import {
   type CatalogEntry,
   type CatalogEventDeclaration,
   type Frame,
+  type ManifestProvenance,
   type RouteScope,
 } from "../src/index.js";
 import { rejectionOf } from "./settle.js";
@@ -324,6 +325,29 @@ describe("daemon-originated control pushes", () => {
 });
 
 describe("SubcClient capability resolution", () => {
+  test("catalogList preserves declared build provenance and omits undeclared provenance", async () => {
+    const { connFile } = tempConnectionFile();
+    const provenance: ManifestProvenance = {
+      build_git_sha: "0123456789abcdef0123456789abcdef01234567",
+      build_lock_digest: "ab".repeat(32),
+      wire_crate_version: "0.34.0",
+      store_schema_version: "7",
+      launch_nonce_source: "fd",
+    };
+    const entry: CatalogEntry = { ...catalogEntry("built-provider", undefined), provenance };
+    const legacy = catalogEntry("legacy-provider", undefined);
+    const daemon = await startFakeDaemon({ stats: newStats(), catalogModules: [entry, legacy] });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile });
+    try {
+      const modules = await client.catalogList();
+      expect(modules.find((module) => module.module_id === "built-provider")?.provenance).toEqual(provenance);
+      expect(modules.find((module) => module.module_id === "legacy-provider")).not.toHaveProperty("provenance");
+    } finally {
+      client.close();
+    }
+  });
+
   test("catalogList preserves opaque role declarations and tolerates their absence", async () => {
     const { connFile } = tempConnectionFile();
     const role_declarations = {

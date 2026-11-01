@@ -4398,6 +4398,7 @@ impl ControlHandler {
                 .with_ready(not_ready.is_none())
                 .with_not_ready(not_ready)
                 .with_module_version(Some(registration.manifest.module_version))
+                .with_provenance(registration.manifest.provenance)
                 .with_capabilities(registration.manifest.capabilities)
                 .with_self_signals(registration.manifest.self_signals)
                 .with_events(registration.manifest.events)
@@ -10444,6 +10445,65 @@ mod tests {
     }
 
     #[test]
+    fn catalog_list_with_provenance_mirrors_declared_build_bytes() {
+        for provenance_json in [
+            r#"{"build_git_sha":"0123456789abcdef0123456789abcdef01234567","build_lock_digest":"abababababababababababababababababababababababababababababababab","wire_crate_version":"0.34.0","store_schema_version":"7","launch_nonce_source":"fd"}"#,
+            r#"{"build_git_sha_absence_reason":"no_git_dir","build_lock_digest":"abababababababababababababababababababababababababababababababab"}"#,
+        ] {
+            let registry = Arc::new(Registry::default());
+            let handler = ControlHandler::new(registry);
+            let hello = Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                220,
+                serde_json::to_vec(&ModuleHelloBody {
+                    manifest: ModuleManifest::builder("built", "0.1.0")
+                        .provenance(Some(serde_json::from_str(provenance_json).unwrap()))
+                        .build(),
+                    protocol_ver: PROTOCOL_VERSION,
+                    control_ops: None,
+                    launch_nonce: None,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                handler
+                    .handle_control(ConnectionId::new(220), hello)
+                    .unwrap()[0]
+                    .header
+                    .ty,
+                FrameType::HelloAck
+            );
+            let request = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                221,
+                serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None }).unwrap(),
+            )
+            .unwrap();
+            let response = handler.handle_catalog_list(request, None).unwrap();
+            let ClientControlResponse::CatalogList { modules, .. } =
+                serde_json::from_slice(&response[0].body).unwrap()
+            else {
+                panic!("expected catalog.list");
+            };
+            assert_eq!(modules.len(), 1);
+            assert_eq!(
+                serde_json::to_vec(&modules[0]).unwrap(),
+                format!(
+                    r#"{{"module_id":"built","ready":true,"module_version":"0.1.0","provenance":{provenance_json},"roles":[],"control_ops":["route.bind","route.status"]}}"#
+                )
+                .as_bytes()
+            );
+        }
+    }
+
+    #[test]
     fn catalog_list_without_rich_ui_or_nonce_keeps_legacy_entry_bytes() {
         let registry = Arc::new(Registry::default());
         let handler = ControlHandler::new(Arc::clone(&registry));
@@ -10480,6 +10540,8 @@ mod tests {
         )
         .unwrap();
         let response = handler.handle_catalog_list(request, None).unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&response[0].body).unwrap();
+        assert!(wire["modules"][0].get("provenance").is_none());
         let ClientControlResponse::CatalogList { modules, .. } =
             serde_json::from_slice(&response[0].body).unwrap()
         else {
@@ -10490,6 +10552,7 @@ mod tests {
             br#"{"module_id":"plain","ready":true,"module_version":"0.1.0","roles":[],"control_ops":["route.bind","route.status"]}"#
         );
         assert!(!modules[0].nonce_verified);
+        assert!(modules[0].provenance.is_none());
     }
 
     #[test]

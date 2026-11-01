@@ -2030,6 +2030,10 @@ pub struct CatalogEntry {
     /// hold a guarantee it does not have.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module_version: Option<String>,
+    /// Build provenance mirrored from the registered module's manifest.
+    /// Absent when the module did not declare it or the daemon predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ManifestProvenance>,
     pub roles: Vec<ProviderRole>,
     pub control_ops: Vec<String>,
     /// Static capability declarations from the registering module's manifest.
@@ -2096,6 +2100,7 @@ impl CatalogEntry {
             ready: default_true(),
             not_ready: None,
             module_version: None,
+            provenance: None,
             roles,
             control_ops,
             capabilities: None,
@@ -2155,6 +2160,13 @@ impl CatalogEntry {
     #[must_use]
     pub fn with_module_version(mut self, module_version: Option<String>) -> Self {
         self.module_version = module_version;
+        self
+    }
+
+    /// Set or clear the build provenance mirrored from the registered manifest.
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: Option<ManifestProvenance>) -> Self {
+        self.provenance = provenance;
         self
     }
 

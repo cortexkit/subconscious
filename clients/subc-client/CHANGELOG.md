@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.23.2
+
+- Add optional `CatalogEntry.provenance`, reusing `ManifestProvenance` to describe the registered module's declared build. Catalog decoding is unchanged and accepts entries without provenance.
+
 ## 0.23.1
 
 - `bind_busy` is a retryable route-open refusal, matching subc-protocol

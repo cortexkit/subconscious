@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.39.1
+
+- Mirror each module's declared build provenance from its HELLO manifest into `catalog.list`, so consumers can detect build changes without a module version bump. Modules without provenance keep their existing catalog entry bytes. Requires subc-control 0.34.1.
+
 ## 0.39.0
 
 - Accept project-free protocol 0.34 route opens and retain transitional decoding of legacy opener project fields. Internal root attribution prefers the canonical opener root, else the admitted scope workdir, else no internal project root.

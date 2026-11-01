@@ -5,8 +5,8 @@ use subc_control::{
     RunningImageUnavailableReason, SupervisorEntry, SupervisorHealthStatus, TerminalExitKind,
 };
 use subc_protocol::manifest::{
-    CapabilityDeclarations, EventDeclaration, SelfSignalDeclaration, SelfSignalEffect,
-    SelfSignalKind, SignalAnchor,
+    CapabilityDeclarations, EventDeclaration, ManifestProvenance, SelfSignalDeclaration,
+    SelfSignalEffect, SelfSignalKind, SignalAnchor,
 };
 
 #[test]
@@ -25,6 +25,24 @@ fn catalog_constructor_matches_wire_defaults() {
         serde_json::to_value(entry).unwrap(),
         json!({"module_id": "provider", "ready": true, "roles": [], "control_ops": ["route.bind"]})
     );
+}
+
+#[test]
+fn catalog_provenance_uses_manifest_shape_and_keeps_catalog_decoding_lenient() {
+    let provenance_bytes = br#"{"build_git_sha":"0123456789abcdef0123456789abcdef01234567","build_lock_digest":"abababababababababababababababababababababababababababababababab","wire_crate_version":"0.34.0","store_schema_version":"7","launch_nonce_source":"fd"}"#;
+    let provenance: ManifestProvenance = serde_json::from_slice(provenance_bytes).unwrap();
+    let base = CatalogEntry::new("provider", vec![], vec![]);
+    let entry = base.clone().with_provenance(Some(provenance.clone()));
+    assert_eq!(
+        serde_json::to_vec(entry.provenance.as_ref().unwrap()).unwrap(),
+        provenance_bytes
+    );
+    let mut wire = serde_json::to_value(&entry).unwrap();
+    wire["future_catalog_field"] = json!(true);
+    let decoded: CatalogEntry = serde_json::from_value(wire).unwrap();
+    assert_eq!(decoded, entry);
+    assert_eq!(decoded.provenance, Some(provenance));
+    assert_eq!(entry.with_provenance(None), base);
 }
 
 #[test]

@@ -2577,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.34.0"
+version = "0.34.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2622,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.39.0"
+version = "0.39.1"
 dependencies = [
  "base64",
  "cortexkit-log",

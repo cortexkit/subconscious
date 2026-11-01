@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.1
+
+- Add optional `CatalogEntry::provenance` and `with_provenance`, using the manifest's build provenance type. Absence is omitted and preserves existing catalog bytes; catalog decoding remains lenient and construction remains non-exhaustive.
+
 ## 0.34.0
 
 - Breaking: use protocol 0.34 identities in route opens. Construct them with `BindIdentity::new(harness, session)`. For project attribution, register or select a session scope carrying `workdir` and optional `project_id`, then pass its `ScopeSelector` in `route.open.scope`; the daemon supplies the scope stamp. Upgrade the protocol and control crates together.

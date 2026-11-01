@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.19
+
+- Declare `bind-no-project/v1`. ck-bus never reads a project from a route's bind,
+  so the daemon now sends it none instead of filling the `/` placeholder.
+
 ## 0.4.18
 
 - Upgrade to protocol 0.34 and Rust client 0.33. Credential routes use project-free identities instead of attributing the connection-file directory as a project.

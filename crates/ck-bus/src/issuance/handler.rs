@@ -23,9 +23,10 @@ use subc_client_rs::{
 };
 use subc_protocol::{
     manifest::{
-        Concurrency, ManagementOperation, ManagementOperationKind, ModuleManifest,
-        ModuleManifestBuilder, ProviderRole,
+        CapabilityDeclarations, Concurrency, ManagementOperation, ManagementOperationKind,
+        ModuleManifest, ModuleManifestBuilder, ProviderRole,
     },
+    scope::BIND_NO_PROJECT_CAPABILITY,
     session::{HealthReport, HealthStatus},
     ModuleHelloAckBody, Principal,
 };
@@ -52,6 +53,9 @@ fn route_key(handle: &RouteHandle) -> RouteKey {
 
 /// Adds the issuance and agent-durable ops to the module's manifest as a management
 /// surface, which is how a participant's (or prefrontal's) `route.open` reaches ck-bus.
+///
+/// It also declares `bind-no-project/v1`: ck-bus never reads a project from a route's
+/// bind, so the daemon sends it none instead of filling a placeholder folder.
 pub fn advertise(builder: ModuleManifestBuilder) -> ModuleManifest {
     let issuance = [
         (super::CREDENTIAL_OP, ManagementOperationKind::Mutate),
@@ -80,6 +84,11 @@ pub fn advertise(builder: ModuleManifestBuilder) -> ModuleManifest {
         })
         .collect();
     builder
+        .capabilities(Some(CapabilityDeclarations {
+            provides: vec![BIND_NO_PROJECT_CAPABILITY.to_string()],
+            requires: vec![],
+            must_never_reach: vec![],
+        }))
         .provides(vec![ProviderRole::ManagementSurface {
             operations,
             config_schema: json!({}),
@@ -381,4 +390,20 @@ pub fn wire<H: ModuleHandler>(
         manifest: advertise(builder),
         handler: IssuanceHandler::new(inner, issuance),
     })
+}
+
+#[cfg(test)]
+mod advertise_tests {
+    use super::*;
+
+    #[test]
+    fn manifest_declares_it_reads_no_project_from_binds() {
+        let manifest = advertise(ModuleManifest::builder("ckbus", "0.0.0"));
+        let provides = manifest
+            .capabilities
+            .as_ref()
+            .map(|capabilities| capabilities.provides.clone())
+            .unwrap_or_default();
+        assert_eq!(provides, vec![BIND_NO_PROJECT_CAPABILITY.to_string()]);
+    }
 }

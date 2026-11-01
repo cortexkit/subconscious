@@ -349,6 +349,23 @@ jobs:
           test "$status" -eq 0
           grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' <<< "$output"
 
+          # The default Linux desktop path: a real Secret Service. gnome-keyring
+          # runs inside a private D-Bus session that exists only for this test,
+          # unlocked with a throwaway password, so no other keyring is touched.
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends gnome-keyring dbus
+          test_name=setup::apply::real_auth_tests::published_ck_auth_bootstrap_uses_secret_service
+          "$test_binary" "$test_name" --exact --ignored --list | grep -Fx "$test_name: test" > /dev/null
+          status=0
+          output="$(TEST_BINARY="$test_binary" TEST_NAME="$test_name" dbus-run-session -- bash -c '
+            set -euo pipefail
+            printf "throwaway-ci-password" | gnome-keyring-daemon --unlock --components=secrets > /dev/null
+            SUBC_TEST_SECRET_SERVICE_BUS="$DBUS_SESSION_BUS_ADDRESS" "$TEST_BINARY" "$TEST_NAME" --exact --ignored --nocapture
+          ')" || status=$?
+          printf '%s\n' "$output"
+          test "$status" -eq 0
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' <<< "$output"
+
       # --all-targets does NOT include doctests, despite the name: it expands to
       # --lib --bins --tests --benches --examples. So a doc example that stops
       # compiling leaves the gate green. The workspace has no runnable doc

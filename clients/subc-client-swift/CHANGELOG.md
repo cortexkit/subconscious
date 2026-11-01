@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `AskRequest` reads two optional fields core now puts on every pending ask: `askerAgentID`, the agent of the session that filed the ask, present even when that agent has no running session, and `deliver`, where the producer routes the ask's notification (`phone`, `desktop` or `none`). `deliver` stays the producer's string, so a value added later still decodes. Both are display data and confer no authority. Asks without them decode as before.
+
 - Test-only: vendor the share-v2 release vectors (`share-v2-vectors-v1.1`, which uses only invented module names) under `Tests/SubcFedTests/Fixtures/share-v2/` and pin their manifest digest. The share-v2 vector tests now run on every build, and a missing file fails them instead of skipping.
 
 - Add share-v2 photo uploads without disturbing the app's ordinary session. The share hello offers v2, framed share calls carry an unchanged payload, and sessions obey the 64-call, 84 MiB declared-body and five-minute budgets. The app can publish operation payload limits with each share target; oversized or undeclared first attempts fail before an id is minted or marked. New upload APIs keep ordered slots, begin replies, immutable payload files and per-id marks in the App Group ledger. Unknown members replay their saved bytes before later members, and the visible call waits for every prerequisite's newest outcome to be exactly sent. Abandonment fences all member ids atomically; none can move to the ordinary outbox. Payload refusals abandon, unknown visible calls are shown as sent, and framed ids never travel on v1 sessions. Ledger version 2 still reads version 1. Existing public enum cases and call signatures are unchanged.

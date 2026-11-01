@@ -209,6 +209,15 @@ public struct AskRequest: Codable, Equatable, Identifiable {
     /// (lowercase d), unlike `requestID` and `askerSessionID`. It places the ask under
     /// its lead agent for display only and confers no approval authority.
     public var headAgentId: String?
+    /// The agent of the session that filed the ask. The producer resolves it from that
+    /// session's saved registration, so it stays present even when the agent has no
+    /// running session.
+    /// Display only, like `headAgentId`, and it confers no authority. The wire key ends
+    /// in `ID`, unlike `headAgentId`.
+    public var askerAgentID: String?
+    /// Where the producer routes the ask's notification, such as `phone`, `desktop` or
+    /// `none`. Kept as the producer's string so a value added later still decodes.
+    public var deliver: String?
     public var taskID: String?
     /// The review an ask was filed for, as core names it, when the ask came from
     /// core's review tool. Absent on every other ask.
@@ -283,6 +292,8 @@ public struct AskRequest: Codable, Equatable, Identifiable {
         case recipientKind
         case askerSessionID
         case headAgentId
+        case askerAgentID
+        case deliver
         case taskID
         case review
         case question
@@ -352,6 +363,8 @@ extension AskRequest {
         recipientKind = try container.decodeIfPresent(String.self, forKey: .recipientKind)
         askerSessionID = try container.decodeIfPresent(String.self, forKey: .askerSessionID)
         headAgentId = try container.decodeIfPresent(String.self, forKey: .headAgentId)
+        askerAgentID = try container.decodeIfPresent(String.self, forKey: .askerAgentID)
+        deliver = try container.decodeIfPresent(String.self, forKey: .deliver)
         taskID = try container.decodeIfPresent(String.self, forKey: .taskID)
         review = try container.decodeIfPresent(String.self, forKey: .review)
         question = try container.decode(String.self, forKey: .question)

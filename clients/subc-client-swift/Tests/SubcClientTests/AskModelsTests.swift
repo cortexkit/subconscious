@@ -67,6 +67,50 @@ final class AskModelsTests: XCTestCase {
         XCTAssertNil(misspelled.headAgentId)
     }
 
+    func testDecodesAskerAgentAndDeliverKeepingUnknownDeliverValues() throws {
+        let ask = try decodeAsk([
+            "requestID": "ask-worker",
+            "question": "May I read the file?",
+            "askedAt": 1_700_000_000_000 as Int64,
+            "askerAgentID": "agent_filer",
+            "headAgentId": "agent_lead",
+            "deliver": "phone",
+        ])
+        XCTAssertEqual(ask.askerAgentID, "agent_filer")
+        XCTAssertEqual(ask.deliver, "phone")
+        XCTAssertEqual(ask.headAgentId, "agent_lead")
+
+        // A routing value this library has never seen still decodes as its string.
+        let future = try decodeAsk([
+            "requestID": "ask-future",
+            "question": "Continue?",
+            "askedAt": 1_700_000_000_000 as Int64,
+            "deliver": "watch",
+        ])
+        XCTAssertEqual(future.deliver, "watch")
+        XCTAssertNil(future.askerAgentID)
+
+        let older = try decodeAsk([
+            "requestID": "ask-older",
+            "question": "Continue?",
+            "askedAt": 1_700_000_000_000 as Int64,
+        ])
+        XCTAssertNil(older.askerAgentID)
+        XCTAssertNil(older.deliver)
+
+        // Only the producer's exact spelling is read.
+        let misspelled = try decodeAsk([
+            "requestID": "ask-other",
+            "question": "Continue?",
+            "askedAt": 1_700_000_000_000 as Int64,
+            "askerAgentId": "agent_filer",
+        ])
+        XCTAssertNil(misspelled.askerAgentID)
+
+        let reencoded = try JSONDecoder().decode(AskRequest.self, from: JSONEncoder().encode(ask))
+        XCTAssertEqual(reencoded, ask)
+    }
+
     func testDecodesReviewAskReviewAndRoundTripsIt() throws {
         let review = try decodeAsk([
             "requestID": "ask-review",

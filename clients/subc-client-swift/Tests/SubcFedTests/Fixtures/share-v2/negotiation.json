@@ -1,0 +1,79 @@
+{
+  "cases": [
+    {
+      "boot_sweep": false,
+      "catalog_loaded": false,
+      "computer_share_features": [],
+      "framed_call_answer": "not_sent",
+      "mode": "unavailable",
+      "phone_share_v2": false
+    },
+    {
+      "boot_sweep": false,
+      "catalog_loaded": false,
+      "computer_share_features": [],
+      "framed_call_answer": "not_sent",
+      "mode": "unavailable",
+      "phone_share_v2": true
+    },
+    {
+      "boot_sweep": false,
+      "catalog_loaded": true,
+      "computer_share_features": [],
+      "framed_call_answer": "not_sent",
+      "mode": "unavailable",
+      "phone_share_v2": false
+    },
+    {
+      "boot_sweep": false,
+      "catalog_loaded": true,
+      "computer_share_features": [],
+      "framed_call_answer": "not_sent",
+      "mode": "unavailable",
+      "phone_share_v2": true
+    },
+    {
+      "boot_sweep": true,
+      "catalog_loaded": false,
+      "computer_share_features": [
+        "share-v1"
+      ],
+      "framed_call_answer": "fed_protocol_violation",
+      "mode": "v1",
+      "phone_share_v2": false
+    },
+    {
+      "boot_sweep": true,
+      "catalog_loaded": false,
+      "computer_share_features": [
+        "share-v1"
+      ],
+      "framed_call_answer": "fed_protocol_violation",
+      "mode": "v1",
+      "phone_share_v2": true
+    },
+    {
+      "boot_sweep": true,
+      "catalog_loaded": true,
+      "computer_share_features": [
+        "share-v1",
+        "share-v2"
+      ],
+      "framed_call_answer": "fed_protocol_violation",
+      "mode": "v1",
+      "phone_share_v2": false
+    },
+    {
+      "boot_sweep": true,
+      "catalog_loaded": true,
+      "computer_share_features": [
+        "share-v1",
+        "share-v2"
+      ],
+      "framed_call_answer": "response",
+      "mode": "v2",
+      "phone_share_v2": true
+    }
+  ],
+  "release": "share-v2-vectors-v1.1"
+}

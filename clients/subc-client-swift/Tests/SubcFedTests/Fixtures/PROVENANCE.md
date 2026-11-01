@@ -1,16 +1,18 @@
 # SubcFed exact-byte fixture provenance
 
-## Share-v2 release conformance
+## Share-v2 release conformance (`share-v2/`)
 
-`Share/FedShareV2VectorTests.swift` reads the six checksum-covered share-v2
-release files plus `SHA256SUMS` from `Fixtures/share-v2/`, beside `fed-wire/`.
-Vendoring awaits a release corpus whose examples use only invented public module
-names, without private module names, hostnames or filesystem paths (including
-inside hex-encoded headers).
-Until then the tests explicitly skip with the missing path; set
-`SUBCFED_SHARE_V2_VECTORS` to an external release directory to run them.
-The initial conformance run used the share-v2 vector corpus from ignored
-scratch storage; its fixture bytes are not included here.
+Copied byte for byte from the federation module's published share-v2 release
+corpus, tag `share-v2-vectors-v1.1`, not generated here: a README, five JSON
+files and their `SHA256SUMS`. The release uses only invented module names,
+including inside hex-encoded headers. `SHA256SUMS` itself has SHA-256
+`b30f6054d0d0772d84b3e283f2b9c3b633603ecb74330082382eb5f514bf109b`.
+
+`Share/FedShareV2VectorTests.swift` pins that digest (written in the test,
+not computed from the file), checks every listed file against `SHA256SUMS`,
+and runs the wire, negotiation, admission, budget and lifecycle cases. A
+missing file fails the test. `SUBCFED_SHARE_V2_VECTORS` can point it at another
+copy of a release for comparison.
 
 Every fixture in this directory is an exact-byte golden vector for the
 SubcFed wire layer. Except for the upstream vectors identified below, fixtures
@@ -120,19 +122,16 @@ criteria, each encoded as `u32 LE header_len || header || u32 LE body_len
 
 ### fed-wire effects-v2 vectors (`fed-wire/effects-v2.jsonl`)
 
-Copied byte for byte from callosum, not generated here. They are produced by
-callosum's own effects-v2 frame builders and are the authority for the list
+Copied byte for byte from the federation module's published vectors, not
+generated here. They are produced by its own effects-v2 frame builders and are
+the authority for the list
 `effect_status` query and reply, the whole-reply `busy`, the single-id
 `confirmed` status, and `confirmed_effects` on `call` and `keepalive`.
 
-- Source: callosum tag `fed-wire-vectors/effects-v2-r1`, commit
-  `35f14532b42865d87d694236a90b4b93762d0263`, path
+- Source: tag `fed-wire-vectors/effects-v2-r1`, path
   `test-vectors/fed-wire/effects-v2.jsonl` (7 lines: one comment line, then
-  six vectors).
+  six vectors), copied from the tag, never from a working tree.
 - SHA-256: `a1f9cd06ab7e1bf8524277ad26c834df441802e70bec5666a2cdec3ae7880da8`.
-- Copied with
-  `git -C <callosum> show fed-wire-vectors/effects-v2-r1:test-vectors/fed-wire/effects-v2.jsonl`,
-  never from a callosum working tree.
 
 `FedEffectsV2VectorTests` pins that digest (written in the test, not computed
 from the file), decodes every vector through the frame codec, and re-encodes
@@ -143,14 +142,9 @@ line endings the digest covers.
 
 ### fed-wire hello identity vectors (`fed-wire/hello-identity.jsonl`)
 
-Copied byte for byte from the callosum repository, commit
-`ee69edef2de747eeafbd89b3ff892c4d4e52b05f`, path
+Copied byte for byte from the federation module's published vectors, path
 `test-vectors/fed-wire/hello-identity.jsonl` (32 lines: five comments and
-27 vectors), with:
-
-```bash
-git -C <callosum> show ee69edef:test-vectors/fed-wire/hello-identity.jsonl
-```
+27 vectors), copied from a committed revision, never from a working tree.
 
 SHA-256: `ce4a780f534f063284365e3a03ba335bd8b568601d2f8f106c6b3b15c7c1c096`.
 `FedHelloIdentityVectorTests` pins this digest and runs the machine-name-only
@@ -159,7 +153,7 @@ or refusal depends on `key_record` or `key_record_seen` are skipped explicitly:
 SubcFed does not decode either field yet. Counts are printed and asserted.
 
 Malformed `machine_id` values fail the whole hello with
-`fed_limits_unsupported`, exactly as callosum's refusal rows require. A valid
+`fed_limits_unsupported`, exactly as the published refusal rows require. A valid
 name remains informational, never an authority for trust or pinning.
 
 ### rdv-wire vectors
@@ -190,10 +184,9 @@ boundary.
 ## Historical instance data
 
 The committed fed-frame vectors embed `module:"alfonso-core"` as their call
-target. That module was renamed to `prefrontal-core` fleet-wide (2026-08);
-the string here is INSTANCE DATA inside byte-pinned goldens, not a contract
+target, a module name that has since changed. The string here is INSTANCE DATA inside byte-pinned goldens, not a contract
 claim, and it is deliberately left unrenamed: regenerating every golden to
 update a test-arbitrary string would churn the byte-parity artifacts for
 zero wire value. A rename sweep will match this directory without there
 being anything to change. If the goldens are ever regenerated for a real
-contract reason, use `prefrontal-core` in the new bytes.
+contract reason, use the module's current name in the new bytes.

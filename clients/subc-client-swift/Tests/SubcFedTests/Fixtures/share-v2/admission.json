@@ -1,0 +1,105 @@
+{
+  "cases": [
+    {
+      "body_hex": "7b2275706c6f61645f6964223a22752d3431227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"response\"}",
+      "name": "framed_without_framed_calls_on_share_session"
+    },
+    {
+      "body_hex": "7b2275706c6f61645f6964223a22752d3431227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"response\"}",
+      "name": "recorded_replay_second_session_after_catalog_change"
+    },
+    {
+      "body_hex": "7b2275706c6f61645f6964223a22752d3431227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"response\"}",
+      "name": "canonically_equal_head_replays"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f73686172655f69645f636f6e666c696374222c226d657373616765223a226665645f73686172655f69645f636f6e666c696374227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\"}",
+      "name": "different_payload_conflicts"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f7061796c6f61645f6e6f745f6163636570746564222c226d657373616765223a226665645f7061796c6f61645f6e6f745f6163636570746564227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\",\"never_ran\":true}",
+      "name": "payload_declaration_missing"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f7061796c6f61645f746f6f5f6c61726765222c226d657373616765223a226665645f7061796c6f61645f746f6f5f6c61726765227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\",\"never_ran\":true}",
+      "name": "payload_over_operation_limit"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f6e6f745f6578706f736564222c226d657373616765223a226665645f6e6f745f6578706f736564227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\",\"never_ran\":true}",
+      "name": "exposure_precedes_payload"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f756e6b6e6f776e5f6d6f64756c65222c226d657373616765223a226665645f756e6b6e6f776e5f6d6f64756c65227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\",\"never_ran\":true}",
+      "name": "unknown_module_precedes_payload"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f7461726765745f756e617661696c61626c65222c226d657373616765223a226665645f7461726765745f756e617661696c61626c65227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\",\"never_ran\":true}",
+      "name": "whole_call_proof_records_not_run"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f7061796c6f61645f6e6f745f6163636570746564222c226d657373616765223a226665645f7061796c6f61645f6e6f745f6163636570746564227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\",\"never_ran\":true}",
+      "name": "not_run_rechecks_current_catalog"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f6261645f63616c6c222c226d657373616765223a226665645f6261645f63616c6c227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\"}",
+      "name": "short_body",
+      "request_body_hex": "000000"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f6261645f63616c6c222c226d657373616765223a226665645f6261645f63616c6c227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\"}",
+      "name": "zero_head",
+      "request_body_hex": "00000000"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f6261645f63616c6c222c226d657373616765223a226665645f6261645f63616c6c227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\"}",
+      "name": "head_over_65536",
+      "request_body_hex": "00010001"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f6261645f63616c6c222c226d657373616765223a226665645f6261645f63616c6c227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\"}",
+      "name": "head_past_body",
+      "request_body_hex": "000000037b7d"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f6261645f63616c6c222c226d657373616765223a226665645f6261645f63616c6c227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\"}",
+      "name": "non_json_head",
+      "request_body_hex": "0000000178"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f6261645f63616c6c222c226d657373616765223a226665645f6261645f63616c6c227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\"}",
+      "name": "array_head",
+      "request_body_hex": "000000025b5d"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f6261645f63616c6c222c226d657373616765223a226665645f6261645f63616c6c227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\"}",
+      "name": "bad_management_head",
+      "request_body_hex": "000000027b7d"
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f6261645f63616c6c222c226d657373616765223a226665645f6261645f63616c6c227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\"}",
+      "name": "duplicate_head_key",
+      "request_body_hex": "000000277b226d6574686f64223a2261222c226d6574686f64223a2262222c22706172616d73223a7b7d7d"
+    }
+  ],
+  "framed_body_hex": "000000267b226d6574686f64223a226d657373616765732e73656e64222c22706172616d73223a7b7d7d00ff70686f746f",
+  "release": "share-v2-vectors-v1.1",
+  "request_digest_hex": "429befaa658d97a5c4828f4f4e4cda6b8cb0b90ca8c1b25a93cf05ffa61eec00"
+}

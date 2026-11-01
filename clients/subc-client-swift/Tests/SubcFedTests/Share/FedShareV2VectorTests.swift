@@ -10,10 +10,8 @@ private enum ShareV2Vectors {
     }
 
     static func load(_ name: String) throws -> [String: Any] {
+        // The corpus is vendored, so a missing file is a failure, never a skip.
         let file = directory.appendingPathComponent(name)
-        guard FileManager.default.fileExists(atPath: file.path) else {
-            throw XCTSkip("Share-v2 vectors are not vendored yet; missing \(file.path). Set SUBCFED_SHARE_V2_VECTORS to a release fixture directory.")
-        }
         return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: file)) as? [String: Any])
     }
 
@@ -38,7 +36,7 @@ extension FedShareTests {
     func testShareV2VectorChecksums() throws {
         _ = try ShareV2Vectors.load("wire.json")
         let manifest = try Data(contentsOf: ShareV2Vectors.directory.appendingPathComponent("SHA256SUMS"))
-        XCTAssertEqual(Data(SHA256.hash(data: manifest)).lowercaseHex, "339a060c4da0ed4730e20b0c5165120ff9c9cf63549ef966e7939ddbf8815e6a")
+        XCTAssertEqual(Data(SHA256.hash(data: manifest)).lowercaseHex, "b30f6054d0d0772d84b3e283f2b9c3b633603ecb74330082382eb5f514bf109b")
         let rows = String(decoding: manifest, as: UTF8.self).split(separator: "\n")
         XCTAssertEqual(rows.count, 6)
         for row in rows {

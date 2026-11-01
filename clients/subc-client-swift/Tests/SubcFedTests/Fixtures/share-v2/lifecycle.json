@@ -1,0 +1,17 @@
+{
+  "cases": [
+    {
+      "body_hex": "7b226f6b223a747275657d",
+      "charged_per_body": 16777300,
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"response\"}",
+      "name": "newest_wins_large_detached_calls_backpressure_until_room",
+      "pool_available_with_two_calls": 261992
+    },
+    {
+      "body_hex": "7b22636f6465223a226665645f64697370617463685f616d626967756f7573222c226d657373616765223a226665645f64697370617463685f616d626967756f7573227d",
+      "header": "{\"type\":\"share_result\",\"share_id\":\"0192f3a4-5b6c-7d8e-9f01-23456789abcd\",\"k\":\"error\"}",
+      "name": "boot_sweep_of_framed_running_row"
+    }
+  ],
+  "release": "share-v2-vectors-v1.1"
+}

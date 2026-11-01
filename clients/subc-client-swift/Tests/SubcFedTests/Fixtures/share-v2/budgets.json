@@ -1,0 +1,19 @@
+{
+  "cases": [
+    {
+      "accepted_calls": 64,
+      "answer": "fed_protocol_violation",
+      "declared_bytes": null,
+      "name": "64_calls_including_replays_and_refusals_then_65th",
+      "next_declaration_bytes": 1
+    },
+    {
+      "accepted_calls": 11,
+      "answer": "fed_protocol_violation",
+      "declared_bytes": 88080384,
+      "name": "byte_cap_exact_then_one_more",
+      "next_declaration_bytes": 1
+    }
+  ],
+  "release": "share-v2-vectors-v1.1"
+}

@@ -36,6 +36,9 @@ use crate::{
 };
 use std::sync::Arc;
 
+#[cfg(windows)]
+mod windows_connection_copy;
+
 pub const DEFAULT_SUBC_PORT: u16 = 8757;
 pub const SUBC_PORT_ENV: &str = "SUBC_PORT";
 use subc_transport::CONNECTION_FILE_NAME;
@@ -127,6 +130,8 @@ pub struct BootstrapConfig {
     reserved_capabilities: BTreeMap<String, String>,
     watchdog_config: DaemonSelfWatchdogConfig,
     connection_file_source: ConnectionFileSource,
+    #[cfg(all(test, windows))]
+    local_app_data_override: Option<PathBuf>,
     /// Where module cgroups are prepared. Disabled unless a caller explicitly
     /// opts in, because `Current` derives a host location from `/proc/self/cgroup`.
     cgroup_placement: CgroupPlacementConfig,
@@ -201,6 +206,8 @@ impl BootstrapConfig {
             reserved_capabilities: BTreeMap::new(),
             watchdog_config: DaemonSelfWatchdogConfig::default(),
             connection_file_source: ConnectionFileSource::Explicit,
+            #[cfg(all(test, windows))]
+            local_app_data_override: None,
             cgroup_placement: CgroupPlacementConfig::default(),
             capture_logs_dir: None,
             terminal_journal_path: None,
@@ -561,6 +568,8 @@ pub struct BoundDaemon {
     pub connection_info: ConnectionInfo,
     pub connection_file_path: PathBuf,
     pub connection_file_source: ConnectionFileSource,
+    #[cfg(windows)]
+    connection_file_copy: Option<PathBuf>,
     /// The machine id this daemon serves, established before any connection is
     /// accepted. `None` when the config named no machine id path.
     pub machine_id: Option<crate::machine_id::MachineId>,
@@ -1092,6 +1101,8 @@ async fn serve_bound_daemon(
     // back only once the file is in place.
     let (published, publication_lock) = publish_connection_file(
         &bound.connection_file_path,
+        #[cfg(windows)]
+        bound.connection_file_copy.as_deref(),
         &bound.connection_info,
         bound.local_endpoint.as_ref(),
         publication_lock,
@@ -1235,6 +1246,8 @@ async fn ensure_singleton_inner(
     config: BootstrapConfig,
     publish: bool,
 ) -> Result<Outcome, BootstrapError> {
+    #[cfg(windows)]
+    let copy_path = windows_connection_copy::resolve(&config);
     let path = config.connection_file_path;
 
     if stable_peer(&path).await? {
@@ -1262,6 +1275,8 @@ async fn ensure_singleton_inner(
         .transpose()?;
 
     remove_stale_connection_file_if_present(&path)?;
+    #[cfg(windows)]
+    let copy_path = windows_connection_copy::reclaim(&path, copy_path).await;
 
     // Established under the start lock, and under the run-directory lock when
     // there is one, and before binding: a corrupt file stops boot before
@@ -1335,8 +1350,15 @@ async fn ensure_singleton_inner(
     // these listeners themselves. The daemon entry point defers publication
     // until its own authentication server is running.
     let publication_lock = if publish {
-        let (published, lock) =
-            publish_connection_file(&path, &connection_info, local_endpoint.as_ref(), lock).await;
+        let (published, lock) = publish_connection_file(
+            &path,
+            #[cfg(windows)]
+            copy_path.as_deref(),
+            &connection_info,
+            local_endpoint.as_ref(),
+            lock,
+        )
+        .await;
         if let Err(error) = published {
             if let Some(local_listener) = local_listener.as_ref() {
                 local_listener::release(local_listener);
@@ -1358,6 +1380,8 @@ async fn ensure_singleton_inner(
         connection_info,
         connection_file_path: path,
         connection_file_source: config.connection_file_source,
+        #[cfg(windows)]
+        connection_file_copy: copy_path,
         machine_id,
         run_dir_lock,
         publication_lock,
@@ -1497,8 +1521,15 @@ fn describe_blocking_task_failure(work: &str, join_error: &JoinError) -> String 
 /// across publication); it is returned with the result. It comes back `None`
 /// only when the write task panicked or was cancelled, in which case the
 /// result is an error and the file must be treated as not published.
+///
+/// On Windows, `copy_path` asks for a second publication of the same
+/// information. `path` is written first and is the only required write: if the
+/// second destination can't be claimed or written, a warning is logged and the
+/// result is still success. The two files are written separately, not as one
+/// atomic step.
 async fn publish_connection_file<G: Send + 'static>(
     path: &Path,
+    #[cfg(windows)] copy_path: Option<&Path>,
     info: &ConnectionInfo,
     local_endpoint: Option<&LocalEndpoint>,
     guard: G,
@@ -1506,8 +1537,19 @@ async fn publish_connection_file<G: Send + 'static>(
     let task_path = path.to_path_buf();
     let task_info = info.clone();
     let task_endpoint = local_endpoint.cloned();
+    #[cfg(windows)]
+    let copy = windows_connection_copy::claim_for_publication(path, copy_path, info).await;
     let outcome = run_blocking_holding(guard, move || {
-        write_connection_file(&task_path, &task_info, task_endpoint.as_ref())
+        write_connection_file(&task_path, &task_info, task_endpoint.as_ref())?;
+        #[cfg(windows)]
+        if let Some((copy_path, _lock)) = copy {
+            if let Err(error) =
+                write_connection_file(&copy_path, &task_info, task_endpoint.as_ref())
+            {
+                windows_connection_copy::warn_unavailable(&task_path, Some(&copy_path), &error);
+            }
+        }
+        Ok(())
     })
     .await;
     match outcome {

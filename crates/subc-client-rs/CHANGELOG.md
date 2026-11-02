@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.33.4
+
+- On Windows, operator-app discovery uses only
+  `<Local AppData>\cortexkit\run\subc-connection.json`, resolved through the Windows known-folder
+  API, which the daemon publishes when its connection file falls back to the
+  temporary directory. It never falls back to the environment-derived temporary
+  filename. A known-folder lookup failure is a path-resolution error.
+
 ## 0.33.3
 
 - `SubcConsumer::connect_operator_app_plain` opens the desktop operator app's

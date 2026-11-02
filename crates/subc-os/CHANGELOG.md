@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.27
+
+- Add Windows `local_app_data_dir()` to resolve the current user's Local AppData known folder without reading environment variables, with automatic cleanup of the system-allocated buffer.
+
 ## 0.1.26
 
 - Patch release of the operating-system helper alongside the coordinated route-identity release. No operating-system behavior changes.

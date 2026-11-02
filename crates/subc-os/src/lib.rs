@@ -62,6 +62,11 @@ mod darwin_user_temp;
 #[cfg(target_os = "macos")]
 pub use darwin_user_temp::darwin_user_temp_dir;
 
+#[cfg(windows)]
+mod local_app_data;
+#[cfg(windows)]
+pub use local_app_data::local_app_data_dir;
+
 #[cfg(unix)]
 mod user_home;
 #[cfg(unix)]

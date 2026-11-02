@@ -1,3 +1,6 @@
+//! Installed-daemon discovery from OS facts: Unix account and runtime locations,
+//! or the Windows Local AppData known folder, without environment input.
+
 use std::{error::Error, fmt, path::PathBuf};
 
 /// The installed daemon's path could not be resolved without environment input.
@@ -34,9 +37,12 @@ fn path_error(reason: impl Into<String>) -> OperatorAppPathError {
 /// per-user temporary directory's `subc-<uid>.connection.json`. On Linux it tries
 /// `/run/user/<uid>/subc-connection.json`, then the same password-home rung.
 /// Neither `HOME` nor any other environment variable is read. Custom daemon
-/// environment overrides are deliberately not discovered. Windows returns a
-/// typed error because the installed writer's filename depends on environment-
-/// derived user names, not a known-folder path. No connection files are read.
+/// environment overrides are deliberately not discovered. On Windows it returns
+/// only `<Local AppData>\cortexkit\run\subc-connection.json`, with Local AppData
+/// resolved through the known-folder API. The daemon publishes that file when
+/// its connection file falls back to the temporary directory; a daemon with a
+/// custom connection-file location isn't found here. A failed OS lookup returns
+/// a typed error. No connection files are read.
 pub fn operator_app_candidates() -> Result<Vec<PathBuf>, OperatorAppPathError> {
     platform_candidates()
 }
@@ -133,11 +139,18 @@ fn linux_candidates(home: &std::path::Path, uid: &str) -> Vec<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn platform_candidates() -> Result<Vec<PathBuf>, OperatorAppPathError> {
-    // The installed Task Scheduler action does not pin a connection-file path.
-    // bootstrap uses XDG_RUNTIME_DIR or temp_dir()/subc-<user-token>.connection.json,
-    // and the token comes from USER/USERNAME/HOME/USERPROFILE. A known-folder API
-    // cannot recover those environment choices, so do not guess LOCALAPPDATA.
-    Err(path_error("the installed daemon chooses its directory and user-token filename from environment variables; no known-folder location is fixed"))
+    // Resolve Local AppData through the OS, never through LOCALAPPDATA, and never
+    // guess the daemon's environment-derived temporary-directory filename.
+    let base = subc_os::local_app_data_dir().map_err(|error| path_error(error.to_string()))?;
+    Ok(windows_candidates(&base))
+}
+
+#[cfg(any(windows, test))]
+fn windows_candidates(base: &std::path::Path) -> Vec<PathBuf> {
+    vec![base
+        .join("cortexkit")
+        .join("run")
+        .join("subc-connection.json")]
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -175,6 +188,17 @@ mod tests {
                 PathBuf::from("/run/user/1001/subc-connection.json"),
                 PathBuf::from("/home/operator/.local/share/cortexkit/run/subc-connection.json"),
             ]
+        );
+    }
+
+    #[test]
+    fn windows_candidates_from_os_facts() {
+        let base = std::path::Path::new("C:/Users/operator/AppData/Local");
+        assert_eq!(
+            windows_candidates(base),
+            vec![PathBuf::from(
+                "C:/Users/operator/AppData/Local/cortexkit/run/subc-connection.json"
+            )]
         );
     }
 
@@ -234,17 +258,11 @@ mod tests {
         ];
         if std::env::var_os(PROBE).is_some() {
             let result = operator_app_candidates();
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             assert!(
                 result.is_ok(),
                 "OS path resolution must succeed: {result:?}"
             );
-            #[cfg(target_os = "windows")]
-            {
-                let error = result.as_ref().unwrap_err();
-                assert_eq!(error.os, "windows");
-                assert!(error.reason.contains("environment"));
-            }
             if let Ok(paths) = &result {
                 assert!(paths.iter().all(|path| path.is_absolute()), "{paths:?}");
                 let path = operator_app_path().unwrap();
@@ -253,7 +271,8 @@ mod tests {
                     paths.iter().find(|path| path.exists()).unwrap_or(&paths[0])
                 );
             }
-            println!("{MARKER}{result:?}");
+            // libtest may have already printed the test name on the current line.
+            println!("\n{MARKER}{result:?}");
             return;
         }
 
@@ -276,6 +295,7 @@ mod tests {
             let output = child.output().unwrap();
             assert!(output.status.success(), "{output:?}");
             let stdout = String::from_utf8(output.stdout).unwrap();
+            assert!(stdout.contains("1 passed"), "path probe must run: {stdout}");
             stdout
                 .lines()
                 .find_map(|line| line.strip_prefix(MARKER))

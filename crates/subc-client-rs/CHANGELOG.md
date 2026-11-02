@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.33.4
+
+- On Windows, operator-app discovery uses only
+  `<profile>\AppData\Local\cortexkit\run\subc-connection.json`, where
+  `<profile>` is the profile folder Windows records for the account
+  (`subc_os::profile_dir()`), never a folder derived from the environment. The
+  daemon attempts to publish that file when its connection file falls back to
+  the temporary directory. So, with no environment input, both connect
+  functions work on Windows when that file was published:
+  `connect_operator_app` also needs the named pipe the file advertises, and
+  `connect_operator_app_plain` uses its TCP endpoint. A daemon whose only
+  connection file is at a custom location isn't found. A failed profile lookup
+  is a path-resolution error.
+
 ## 0.33.3
 
 - `SubcConsumer::connect_operator_app_plain` opens the desktop operator app's

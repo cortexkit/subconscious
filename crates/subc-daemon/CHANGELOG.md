@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.39.3
+
+- On Windows, when the connection file falls back to the system temporary
+  directory (`XDG_RUNTIME_DIR` absent or empty), also publish the same
+  connection information at `<profile>\AppData\Local\cortexkit\run\subc-connection.json`,
+  where `<profile>` is the profile folder Windows records for the account
+  (`subc_os::profile_dir()`), never a folder derived from the environment. Both
+  files use the atomic writer with protected access-control lists. At startup,
+  under that file's start lock, the daemon keeps an existing file that passes
+  two authenticated loopback checks 1.5 s apart, and removes a stale one. At
+  publication it repeats that check for a file naming another `daemon_id`, and
+  republishes one naming its own without a check. The primary file stays the
+  only required write: once it's written, a failure to prepare or write the
+  profile copy only logs a warning.
+
 ## 0.39.2
 
 - Route Linux operator confirmations through polkit, including withdrawal. A missing per-user policy refuses with `operator_prompt_setup_required`; all existing cancellation, timeout and late-result guards remain in force.

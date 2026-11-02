@@ -2,11 +2,11 @@
 //! unsafe code, each behind a small safe API.
 //!
 //! The daemon crates forbid unsafe code. This crate is the one deliberate
-//! exception (like `subc-uptime` and `subc-cgroup`): every `unsafe` block here
-//! is a single foreign call with its preconditions stated beside it, and nothing
-//! unsafe is exported.
+//! exception (like `subc-uptime` and `subc-cgroup`): each `unsafe` block here is
+//! a foreign call, or a read of a buffer such a call returned, with its
+//! preconditions stated beside it, and nothing unsafe is exported.
 //!
-//! Today it answers one question: is the process now holding pid N the same
+//! Its central question: is the process now holding pid N the same
 //! process the daemon spawned earlier? A pid alone cannot say, because the
 //! kernel reuses pids once a process has been reaped. [`Process`] reads the two
 //! facts that tell processes apart, the kernel's start time for the pid and the
@@ -44,6 +44,11 @@
 //! For the machine as a whole, [`host`] reads total and available memory, the
 //! load averages and the space on a filesystem, again for reporting only.
 //!
+//! It also resolves per-user locations from account records rather than the
+//! environment: the password-database home and effective uid on Unix, Darwin's
+//! per-user temporary directory on macOS, and the recorded profile folder on
+//! Windows (`profile_dir`).
+//!
 //! For the peer of an accepted local-endpoint connection (a Unix-domain
 //! socket, or a named-pipe client on Windows), [`local_peer`] reads the
 //! kernel's record of the connecting process: its user, pid and executable,
@@ -61,6 +66,11 @@
 mod darwin_user_temp;
 #[cfg(target_os = "macos")]
 pub use darwin_user_temp::darwin_user_temp_dir;
+
+#[cfg(windows)]
+mod profile;
+#[cfg(windows)]
+pub use profile::profile_dir;
 
 #[cfg(unix)]
 mod user_home;

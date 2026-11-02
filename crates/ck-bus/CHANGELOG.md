@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.20
+
+- Take cortexkit-bus-naming 0.2.9: bootstrap provisions the Pi runner's event
+  reader, `m_thalamus-pi`, on the compaction provider's `compaction.>` events,
+  adds the Pi runner's `compaction.>` events to `m_magic-context`'s filters and
+  its `step.finished.v1` subject to `m_astrocyte`'s. Existing durables keep
+  their cursors when their filters change.
+
 ## 0.4.19
 
 - Declare `bind-no-project/v1`. ck-bus never reads a project from a route's bind,

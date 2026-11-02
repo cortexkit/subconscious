@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.15.1
+
+- On Windows, discovery adds `<profile>\AppData\Local\cortexkit\run\subc-connection.json`,
+  where `<profile>` is the profile folder Windows records for the account (`subc_os::profile_dir()`), never a folder derived from the environment, after the runtime-directory and home candidates
+  and before `<system temp>\subc-<user-token>.connection.json`. If the profile
+  lookup fails, the candidate is omitted. Explicit connection-file overrides
+  still select only their named path.
+
 ## 0.15.0
 
 - Breaking: upgrade public frame and decoding types to protocol 0.34. Upgrade transport and protocol together so consumers do not mix incompatible Rust types. Handshake, connection-file and frame-envelope encodings are unchanged.

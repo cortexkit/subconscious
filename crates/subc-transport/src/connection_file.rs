@@ -565,15 +565,25 @@ pub fn read_for_client(path: impl AsRef<Path>) -> Result<ConnectionInfo, Connect
 /// caller's own override (a `--subc` flag); `env_named` is the value of
 /// `SUBC_CONNECTION_FILE` read by the caller. Either, when present, is the
 /// ONLY candidate.
+/// On Windows, `<profile>\AppData\Local\cortexkit\run\subc-connection.json`,
+/// where `<profile>` is the profile folder Windows records for the account
+/// (`subc_os::profile_dir`), comes after the runtime and home candidates and
+/// before the temporary-directory file. If the profile lookup fails, the
+/// candidate is omitted.
 pub fn discovery_candidates(explicit: Option<&Path>, env_named: Option<&OsStr>) -> Vec<PathBuf> {
     let runtime_dir = non_empty_os_var("XDG_RUNTIME_DIR");
     let home = non_empty_os_var("HOME");
+    #[cfg(windows)]
+    let profile = subc_os::profile_dir().ok();
+    #[cfg(not(windows))]
+    let profile: Option<PathBuf> = None;
     discovery_candidates_with_environment(
         explicit,
         env_named,
         runtime_dir.as_deref(),
         home.as_deref(),
         &env::temp_dir(),
+        profile.as_deref(),
     )
 }
 
@@ -591,6 +601,7 @@ fn discovery_candidates_with_environment(
     runtime_dir: Option<&OsStr>,
     home: Option<&OsStr>,
     temp_dir: &Path,
+    profile: Option<&Path>,
 ) -> Vec<PathBuf> {
     if let Some(path) = explicit {
         return vec![path.to_path_buf()];
@@ -628,6 +639,16 @@ fn discovery_candidates_with_environment(
             path.push(part);
         }
         push_unique(&mut candidates, path);
+    }
+    if let Some(base) = profile {
+        push_unique(
+            &mut candidates,
+            base.join("AppData")
+                .join("Local")
+                .join("cortexkit")
+                .join("run")
+                .join(CONNECTION_FILE_NAME),
+        );
     }
     push_unique(
         &mut candidates,
@@ -1227,6 +1248,7 @@ mod tests {
             Some(runtime.as_os_str()),
             Some(home.as_os_str()),
             &temp,
+            None,
         );
         let error = discover_candidates(candidates)
             .expect_err("set-and-wrong SUBC_CONNECTION_FILE must fail rather than use production");
@@ -1260,6 +1282,7 @@ mod tests {
             Some(runtime.as_os_str()),
             Some(home.as_os_str()),
             &temp,
+            None,
         );
         let with_empty_named_override = discovery_candidates_with_environment(
             None,
@@ -1267,17 +1290,25 @@ mod tests {
             Some(runtime.as_os_str()),
             Some(home.as_os_str()),
             &temp,
+            None,
         );
         assert_eq!(with_empty_named_override, without_named_override);
 
-        let without_runtime =
-            discovery_candidates_with_environment(None, None, None, Some(home.as_os_str()), &temp);
+        let without_runtime = discovery_candidates_with_environment(
+            None,
+            None,
+            None,
+            Some(home.as_os_str()),
+            &temp,
+            None,
+        );
         let with_empty_runtime = discovery_candidates_with_environment(
             None,
             None,
             Some(empty),
             Some(home.as_os_str()),
             &temp,
+            None,
         );
         assert_eq!(with_empty_runtime, without_runtime);
         assert!(
@@ -1287,6 +1318,45 @@ mod tests {
         );
 
         drop(root);
+    }
+
+    #[test]
+    fn windows_discovery_places_profile_between_runtime_and_temp() {
+        let root = unique_temp_dir("windows-candidate-order");
+        let runtime = root.join("runtime");
+        let local = root.join("profile");
+        let temp = root.join("temp");
+        let fixed = local.join("AppData/Local/cortexkit/run/subc-connection.json");
+        let candidates = discovery_candidates_with_environment(
+            None,
+            None,
+            Some(runtime.as_os_str()),
+            None,
+            &temp,
+            Some(&local),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                runtime.join(CONNECTION_FILE_NAME),
+                fixed.clone(),
+                temp.join(format!("subc-{}.connection.json", user_connection_token())),
+            ]
+        );
+        write_atomic(&fixed, &sample_info()).unwrap();
+        assert_eq!(discover_candidates(candidates).unwrap().path, fixed);
+        let named = root.join("explicit.json");
+        assert_eq!(
+            discovery_candidates_with_environment(
+                None,
+                Some(named.as_os_str()),
+                Some(runtime.as_os_str()),
+                None,
+                &temp,
+                Some(&local),
+            ),
+            vec![named]
+        );
     }
 
     #[test]
@@ -1302,6 +1372,7 @@ mod tests {
             Some(runtime.as_os_str()),
             Some(home.as_os_str()),
             &temp,
+            None,
         );
         assert_eq!(
             candidates,
@@ -1321,6 +1392,7 @@ mod tests {
             Some(production_dir.as_os_str()),
             Some(home.as_os_str()),
             &temp,
+            None,
         );
         assert_eq!(
             deduplicated,

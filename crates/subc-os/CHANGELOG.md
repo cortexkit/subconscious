@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.27
+
+- Add Windows `profile_dir()`: the profile folder Windows records for the
+  account that owns the current process. It takes the user SID from the
+  process token and reads that SID's `ProfileImagePath` under
+  `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList` without
+  expanding it, so no environment variable can change the result. The shell's
+  per-user known folders can't be used for this: Local AppData is stored as
+  `%USERPROFILE%\AppData\Local` and expanded from the calling process's
+  environment. A missing, empty, relative or `%`-containing value is refused.
+
 ## 0.1.26
 
 - Patch release of the operating-system helper alongside the coordinated route-identity release. No operating-system behavior changes.

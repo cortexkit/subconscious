@@ -2835,7 +2835,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.33.3"
+version = "0.33.4"
 dependencies = [
  "async-trait",
  "cortexkit-paths",
@@ -2903,7 +2903,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.39.2"
+version = "0.39.3"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -2987,7 +2987,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "cortexkit-test-support",
  "libc",
@@ -3022,7 +3022,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.15.0"
+version = "0.15.1"
 dependencies = [
  "cortexkit-test-support",
  "getrandom 0.2.17",

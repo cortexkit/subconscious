@@ -29,6 +29,7 @@ instead of being resolved against the working directory
 | `<config home>/cortexkit/subc.jsonc` | Daemon and module configuration. | The operator and `ck setup`. | Yes. |
 | `<data home>/cortexkit/run/` | The run directory, created `0700`. | The daemon. | Yes. |
 | `$XDG_RUNTIME_DIR/subc-connection.json`, or `<temp dir>/subc-<user>.connection.json` when `XDG_RUNTIME_DIR` is unset | Endpoint, key and daemon identity (section 2). | The daemon at start. | Replaced at each start. |
+| `<profile>\AppData\Local\cortexkit\run\subc-connection.json` (Windows, temporary-directory fallback only) | The same information, at a location found without the environment (section 2). | The daemon at start; optional. | Replaced at each start. |
 | `run/daemon.lock` | Ownership of the run directory (section 3). | The daemon. | The file stays; the lock dies with the process. |
 | `run/live-children.json` | Supervised processes, for the orphan sweep (section 3). | The daemon. | Yes, read once at the next start. |
 | `run/terminals.jsonl` | Module exit history (section 4). | The daemon. | Yes. |
@@ -53,6 +54,17 @@ temporary directory, where `<user>` is the numeric uid on Unix (`connection_file
 `crates/subc-daemon/src/bootstrap.rs`). It writes through a temporary file and
 a rename, mode `0600` on Unix and a private DACL on Windows.
 
+On Windows, when the file falls back to the temporary directory, the daemon
+also publishes the same information at
+`<profile>\AppData\Local\cortexkit\run\subc-connection.json`, where
+`<profile>` is the profile folder Windows records for the account
+(`subc_os::profile_dir`), so a client that must not read the environment can
+find it (`windows_connection_copy` in `crates/subc-daemon/src/bootstrap/`).
+This second file is optional: if it can't be written, the daemon logs a
+warning and the original file stays required. It never replaces or removes an
+existing file there that its liveness probes show belongs to another live
+daemon.
+
 - Readers refuse a file that is not owned by them, is readable by group or
   others, does not parse, or has an unsupported schema, no endpoints or a short
   key. Tests:
@@ -65,8 +77,9 @@ a rename, mode `0600` on Unix and a private DACL on Windows.
   `crates/subc-transport/src/connection_file.rs`): an explicit `--subc` path is
   the only candidate; otherwise `SUBC_CONNECTION_FILE`, when set, is the only
   candidate; otherwise it tries `$XDG_RUNTIME_DIR/subc-connection.json`,
-  `$HOME/.local/share/cortexkit/run/subc-connection.json` and the
-  temporary-directory name above, in that order. Tests:
+  `$HOME/.local/share/cortexkit/run/subc-connection.json`, on Windows the
+  profile file above, and the temporary-directory name above, in that order. A
+  failed profile lookup omits the Windows candidate. Tests:
   `set_and_wrong_environment_path_fails_without_fallback` (`crates/subc-transport/src/connection_file.rs`) and
   `discovery_without_overrides_keeps_three_rung_order_and_deduplicates` (`crates/subc-transport/src/connection_file.rs`).
 - A new daemon writes a new key. A client holding the old one fails the

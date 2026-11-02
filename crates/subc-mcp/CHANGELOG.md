@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.55
+
+- Enforce the inclusive 65,536-byte model-visible provider result limit before returning results to Claude Code, including later task results. Oversized output is discarded with an explicit error, never truncated or retried; oversized refusals keep their code. Warnings are rate-limited per provider and tool and include a running count.
+- Copy the tool-provider 0.15.0 size vectors and implement its accounting locally, using `ryu-js` for ECMAScript numbers without enabling additional serde_json features.
+
 ## 0.1.54
 
 - Tool override objects accept `upfront` in user and project MCP config. Enabled upfront tools carry `_meta["anthropic/alwaysLoad"]: true` for Claude Code, preserving other metadata, and appear directly beside the search meta tools in search mode while remaining searchable and invokable through them. Magic Context's `ctx_reduce`, `ctx_expand`, `ctx_search`, `ctx_memory` and `ctx_note` default to upfront; an explicit `false` opts out. Upfront never enables a disabled provider or tool.

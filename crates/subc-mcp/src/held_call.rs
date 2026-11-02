@@ -203,6 +203,7 @@ pub(super) struct HeldCall {
     pub(super) route: RouteHandle,
     pub(super) corr: u64,
     pub(super) module_id: String,
+    pub(super) tool_name: String,
     /// Whether this attempt was a retry after a module outage; see
     /// `unsent_call_attempt`.
     pub(super) retrying: bool,
@@ -216,7 +217,7 @@ impl HeldCall {
     pub(super) fn new(
         route: RouteHandle,
         corr: u64,
-        module_id: String,
+        provider_tool: (String, String),
         retrying: bool,
         daemon_origin_trusted: bool,
         frames: mpsc::Receiver<SubcReply>,
@@ -225,7 +226,8 @@ impl HeldCall {
         Self {
             route,
             corr,
-            module_id,
+            module_id: provider_tool.0,
+            tool_name: provider_tool.1,
             retrying,
             daemon_origin_trusted,
             frames: HeldFrames {
@@ -507,7 +509,15 @@ mod tests {
                 epoch: 1,
                 connection_token: 1,
             };
-            let mut held = HeldCall::new(route, 7, "module".to_owned(), false, false, rx, None);
+            let mut held = HeldCall::new(
+                route,
+                7,
+                ("module".to_owned(), "tool".to_owned()),
+                false,
+                false,
+                rx,
+                None,
+            );
             // Already past, so promotion is as ready as the queued answer.
             let promote_at = time::Instant::now().checked_sub(Duration::from_millis(50));
             assert!(promote_at.is_some());

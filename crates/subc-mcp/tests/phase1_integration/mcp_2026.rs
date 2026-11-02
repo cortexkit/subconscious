@@ -7,6 +7,216 @@ use rmcp::model::{
     CallToolResponse, InputRequiredResult, InputResponses, ServerNotification, SubscriptionFilter,
 };
 
+fn size_error(tool: &str) -> String {
+    format!("tool_result_too_large: {tool} ran, but its output was 65537 bytes, over the 65,536-byte limit, so it was discarded. Its effects stand: don't run it again for the same output. Ask it for less (a page, a filter, or a file to read).")
+}
+
+fn assert_size_boundary_result(result: &impl serde::Serialize, bytes: usize) {
+    let result = serde_json::to_value(result).unwrap();
+    let expected = if bytes == 65_536 {
+        text_result(&"x".repeat(bytes))
+    } else {
+        json!({"content": [{"type": "text", "text": size_error("probe")}], "isError": true})
+    };
+    assert_eq!(result["content"], expected["content"]);
+    assert_eq!(result["isError"], expected["isError"]);
+    assert!(result.get("structuredContent").is_none());
+}
+
+async fn complete_result(call: JoinHandle<Result<CallToolResponse, ServiceError>>) -> Value {
+    match timeout(READ_TIMEOUT, call).await {
+        Ok(Ok(Ok(CallToolResponse::Complete(result)))) => serde_json::to_value(result).unwrap(),
+        other => panic!("expected a complete tool result, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mcp_model_visible_size_immediate_boundary() {
+    let mut harness = start_2026("mcp-size-immediate", &[]).await;
+    let tool_name = harness.provider.exposed_tool_name();
+    harness.provider.wait_bound().await;
+    for bytes in [65_536, 65_537] {
+        let call = spawn_call_once(&harness, CallToolRequestParams::new(tool_name.clone()));
+        let forward = harness.provider.wait_route_request().await;
+        harness
+            .provider
+            .send_route_response(&forward, text_result(&"x".repeat(bytes)))
+            .await;
+        assert_size_boundary_result(&complete_result(call).await, bytes);
+        assert_no_further_route_request(&mut harness.provider).await;
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_model_visible_size_unknown_part_uses_jcs() {
+    let mut harness = start_2026("mcp-size-unknown", &[]).await;
+    let tool_name = harness.provider.exposed_tool_name();
+    harness.provider.wait_bound().await;
+    let fixed_bytes = r#"{"text":"","type":"future_type"}"#.len();
+    let body =
+        json!({"content": [{"type": "future_type", "text": "x".repeat(65_537 - fixed_bytes)}]});
+    let call = spawn_call_once(&harness, CallToolRequestParams::new(tool_name));
+    let forward = harness.provider.wait_route_request().await;
+    harness.provider.send_route_response(&forward, body).await;
+    assert_size_boundary_result(&complete_result(call).await, 65_537);
+    assert_no_further_route_request(&mut harness.provider).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_model_visible_size_ignores_images_and_structured_content() {
+    let mut harness = start_2026("mcp-size-nontext", &[]).await;
+    let tool_name = harness.provider.exposed_tool_name();
+    harness.provider.wait_bound().await;
+    let body = json!({
+        "content": [
+            {"type": "text", "text": "é".repeat(32768)},
+            {"type": "image", "mimeType": "image/png", "data": "AAAA".repeat(32768)}
+        ],
+        "structuredContent": {"large": "x".repeat(65537)},
+        "isError": true
+    });
+    let call = spawn_call_once(&harness, CallToolRequestParams::new(tool_name));
+    let forward = harness.provider.wait_route_request().await;
+    harness
+        .provider
+        .send_route_response(&forward, body.clone())
+        .await;
+    let result = complete_result(call).await;
+    assert_eq!(result["content"], body["content"]);
+    assert_eq!(result["structuredContent"], body["structuredContent"]);
+    assert_eq!(result["isError"], true);
+    assert_no_further_route_request(&mut harness.provider).await;
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_model_visible_size_pending_boundary() {
+    let mut harness = start_2026("mcp-size-pending", &[]).await;
+    let tool_name = harness.provider.exposed_tool_name();
+    let route = harness.provider.wait_bound().await;
+    for (index, bytes) in [65_536, 65_537].into_iter().enumerate() {
+        let call = spawn_call_once(&harness, CallToolRequestParams::new(tool_name.clone()));
+        let forward = harness.provider.wait_route_request().await;
+        let corr = 1200 + index as u64;
+        let question = form_elicitation_body("size-boundary", Some(forward.header.corr));
+        harness
+            .provider
+            .send_reverse_request(route, corr, question.clone())
+            .await;
+        let asked = expect_input_required(call).await;
+        let requests = serde_json::to_value(asked.input_requests.as_ref().unwrap()).unwrap();
+        let request = requests.as_object().unwrap().values().next().unwrap();
+        assert_eq!(request["method"], question["method"]);
+        let mut expected_params = question["params"].clone();
+        expected_params["mode"] = json!("form");
+        assert_eq!(request["params"], expected_params);
+        let resumed = spawn_call_once(
+            &harness,
+            follow_up(
+                &tool_name,
+                &asked,
+                json!({"action": "accept", "content": {"approved": true}}),
+            ),
+        );
+        let answer = harness.provider.wait_reverse_response(corr).await;
+        assert_eq!(answer["action"], "accept");
+        harness
+            .provider
+            .send_route_response(&forward, text_result(&"x".repeat(bytes)))
+            .await;
+        assert_size_boundary_result(&complete_result(resumed).await, bytes);
+        assert_no_further_route_request(&mut harness.provider).await;
+    }
+    harness.shutdown().await;
+}
+
+fn assert_size_refusal(error: &impl serde::Serialize, bytes: usize) {
+    let error = serde_json::to_value(error).unwrap();
+    assert_eq!(error["data"]["subc_code"], "provider_refused");
+    assert_eq!(error["code"], -32603);
+    let expected = if bytes == 65_536 {
+        "x".repeat(bytes)
+    } else {
+        "tool_result_too_large: provider refusal message exceeded the 65,536-byte limit and was discarded.".to_owned()
+    };
+    assert_eq!(
+        error["message"],
+        format!("subc route tool call failed: provider_refused: {expected}")
+    );
+}
+
+#[tokio::test]
+async fn mcp_model_visible_size_refusal_boundary() {
+    let mut harness = start_2026("mcp-size-refusal", &[]).await;
+    let tool_name = harness.provider.exposed_tool_name();
+    harness.provider.wait_bound().await;
+    for bytes in [65_536, 65_537] {
+        let call = spawn_call_once(&harness, CallToolRequestParams::new(tool_name.clone()));
+        let forward = harness.provider.wait_route_request().await;
+        harness
+            .provider
+            .send_route_error(
+                &forward,
+                json!({"code": "provider_refused", "message": "x".repeat(bytes)}),
+            )
+            .await;
+        match timeout(READ_TIMEOUT, call).await {
+            Ok(Ok(Err(ServiceError::McpError(error)))) => assert_size_refusal(&error, bytes),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_no_further_route_request(&mut harness.provider).await;
+    }
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn mcp_model_visible_size_task_boundary() {
+    let mut harness = start_2026_tasks(
+        "mcp-size-task",
+        &[("SUBC_MCP_TASK_PROMOTION_DELAY_MS", "20")],
+    )
+    .await;
+    let tool_name = harness.provider.exposed_tool_name();
+    harness.provider.wait_bound().await;
+    for refusal in [false, true] {
+        for bytes in [65_536, 65_537] {
+            let call = spawn_call_once(&harness, CallToolRequestParams::new(tool_name.clone()));
+            let forward = harness.provider.wait_route_request().await;
+            let created = expect_task(call).await;
+            assert_eq!(created.task.status, TaskStatus::Working);
+            if refusal {
+                harness
+                    .provider
+                    .send_route_error(
+                        &forward,
+                        json!({"code": "provider_refused", "message": "x".repeat(bytes)}),
+                    )
+                    .await;
+            } else {
+                harness
+                    .provider
+                    .send_route_response(&forward, text_result(&"x".repeat(bytes)))
+                    .await;
+            }
+            let status = if refusal {
+                TaskStatus::Failed
+            } else {
+                TaskStatus::Completed
+            };
+            let done = poll_task_until(&harness, &created.task.task_id, status).await;
+            match &done.task.payload {
+                TaskPayload::Completed { result } => assert_size_boundary_result(result, bytes),
+                TaskPayload::Failed { error } => assert_size_refusal(error, bytes),
+                other => panic!("expected a terminal task result, got {other:?}"),
+            }
+            assert_no_further_route_request(&mut harness.provider).await;
+        }
+    }
+    harness.shutdown().await;
+}
+
 async fn start_2026(label: &str, module_env: &[(&str, &str)]) -> ReverseHarness {
     let mut harness =
         ReverseHarness::start_inner(label, elicitation_capabilities(), module_env, false).await;

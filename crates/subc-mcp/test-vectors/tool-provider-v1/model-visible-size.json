@@ -1,0 +1,191 @@
+{
+  "_about": "Model-visible size of tool results (CONTRACT section 4.5), measured on the decoded body. `results` are tool-result/v1 replies with their exact size; `legacy` are legacy-format bodies (any reply not decoded as tool-result/v1). JSON values count by their RFC 8785 (JCS) length. `boundary` cases build a one-part text reply from `text_unit` repeated `repeat` times, so the file stays small; `over` says whether it exceeds the inclusive 65,536-byte limit.",
+  "limit": 65536,
+  "results": [
+    {
+      "name": "ascii_text",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "hello"
+          }
+        ]
+      },
+      "bytes": 5
+    },
+    {
+      "name": "multibyte_text_counts_utf8_bytes",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "héllo €"
+          }
+        ]
+      },
+      "bytes": 10
+    },
+    {
+      "name": "text_parts_add_up",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "ab"
+          },
+          {
+            "type": "text",
+            "text": "cde"
+          }
+        ]
+      },
+      "bytes": 5
+    },
+    {
+      "name": "image_part_does_not_count",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "ab"
+          },
+          {
+            "type": "image",
+            "mimeType": "image/png",
+            "data": "AA==",
+            "width": 1,
+            "height": 1,
+            "alt": "a pixel"
+          }
+        ]
+      },
+      "bytes": 2
+    },
+    {
+      "name": "structured_content_does_not_count",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "ok"
+          }
+        ],
+        "structuredContent": {
+          "rows": [
+            "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+          ]
+        }
+      },
+      "bytes": 2
+    },
+    {
+      "name": "error_text_counts",
+      "result": {
+        "content": [
+          {
+            "type": "text",
+            "text": "boom"
+          }
+        ],
+        "isError": true,
+        "errorCode": "tool_failed"
+      },
+      "bytes": 4
+    },
+    {
+      "name": "unknown_part_counts_its_canonical_json",
+      "result": {
+        "content": [
+          {
+            "type": "audio",
+            "data": "x"
+          }
+        ]
+      },
+      "bytes": 27
+    },
+    {
+      "name": "escapes_count_in_unknown_parts",
+      "result": {
+        "content": [
+          {
+            "type": "note",
+            "text": "a\"b"
+          }
+        ]
+      },
+      "bytes": 29
+    }
+  ],
+  "legacy": [
+    {
+      "name": "string_body_counts_its_text",
+      "body": "hello €",
+      "bytes": 9
+    },
+    {
+      "name": "object_body_counts_its_canonical_json",
+      "body": {
+        "a": 1,
+        "b": "c"
+      },
+      "bytes": 15
+    },
+    {
+      "name": "array_body_counts_its_canonical_json",
+      "body": [
+        1,
+        "two",
+        null
+      ],
+      "bytes": 14
+    },
+    {
+      "name": "escaped_string_inside_object",
+      "body": {
+        "t": "a\"b"
+      },
+      "bytes": 12
+    },
+    {
+      "name": "numbers_count_in_canonical_form",
+      "body": {
+        "a": 1e+21,
+        "b": 0.1,
+        "c": -0.0
+      },
+      "bytes": 25
+    }
+  ],
+  "boundary": [
+    {
+      "name": "at_the_limit",
+      "text_unit": "a",
+      "repeat": 65536,
+      "bytes": 65536,
+      "over": false
+    },
+    {
+      "name": "one_byte_over",
+      "text_unit": "a",
+      "repeat": 65537,
+      "bytes": 65537,
+      "over": true
+    },
+    {
+      "name": "two_byte_characters_over",
+      "text_unit": "é",
+      "repeat": 32769,
+      "bytes": 65538,
+      "over": true
+    },
+    {
+      "name": "two_byte_characters_at_the_limit",
+      "text_unit": "é",
+      "repeat": 32768,
+      "bytes": 65536,
+      "over": false
+    }
+  ]
+}

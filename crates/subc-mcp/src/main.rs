@@ -3,6 +3,7 @@
 mod held_call;
 mod outage_output;
 mod prompts;
+mod result_size;
 mod session_scope;
 mod tasks;
 
@@ -224,8 +225,11 @@ impl SubcReply {
         &self,
         retrying: bool,
         daemon_origin_trusted: bool,
+        provider: &str,
+        tool: &str,
     ) -> std::result::Result<CallAttempt, ErrorData> {
-        let mut answer = tool_call_answer(&self.frame, retrying, daemon_origin_trusted);
+        let mut answer =
+            tool_call_answer(&self.frame, retrying, daemon_origin_trusted, provider, tool);
         if self.gateway_outcome_unknown {
             if let Err(error) = &mut answer {
                 let data = error.data.get_or_insert_with(|| serde_json::json!({}));
@@ -6668,7 +6672,7 @@ impl SubcMcpServer {
         let held = HeldCall::new(
             route,
             corr,
-            binding.module_id.clone(),
+            (binding.module_id.clone(), binding.bare_tool_name.clone()),
             retrying,
             daemon_origin_trusted,
             frames,
@@ -6725,7 +6729,12 @@ impl SubcMcpServer {
                 }
                 continue;
             }
-            return frame.tool_call_answer(retrying, held.daemon_origin_trusted);
+            return frame.tool_call_answer(
+                retrying,
+                held.daemon_origin_trusted,
+                &held.module_id,
+                &held.tool_name,
+            );
         }
     }
 
@@ -6797,9 +6806,27 @@ fn tool_call_answer(
     frame: &SubcFrame,
     retrying: bool,
     daemon_origin_trusted: bool,
+    provider: &str,
+    tool: &str,
 ) -> std::result::Result<CallAttempt, ErrorData> {
     match frame.header.ty {
         FrameType::Response => {
+            let body =
+                serde_json::from_slice::<serde_json::Value>(&frame.body).map_err(|source| {
+                    ErrorData::internal_error(
+                        format!("provider returned malformed tool result: {source}"),
+                        None,
+                    )
+                })?;
+            // These routes define native MCP CallToolResult, whose content has
+            // the same model-visible measure as tool-result/v1. Measure the
+            // decoded provider body before rmcp normalizes or drops fields,
+            // or rejects a content type it does not know.
+            if let Some(message) = result_size::oversized_result(provider, tool, &body) {
+                return Ok(CallAttempt::Answered(CallToolResult::error(vec![
+                    ContentBlock::text(message),
+                ])));
+            }
             let mut result =
                 serde_json::from_slice::<CallToolResult>(&frame.body).map_err(|source| {
                     ErrorData::internal_error(
@@ -6827,6 +6854,8 @@ fn tool_call_answer(
             Err(subc_error_to_mcp(
                 "subc route tool call failed",
                 &frame.body,
+                provider,
+                tool,
             ))
         }
         ty => Err(ErrorData::internal_error(
@@ -7215,17 +7244,15 @@ async fn reconcile_session_now(
         .await
 }
 
-fn subc_error_to_mcp(prefix: &str, body: &[u8]) -> ErrorData {
+fn subc_error_to_mcp(prefix: &str, body: &[u8], provider: &str, tool: &str) -> ErrorData {
     match serde_json::from_slice::<ErrorBody>(body) {
         Ok(error) => {
             // A provider can return an error after executing the call. Its body
             // cannot establish a send outcome, even if its code or detail looks
             // like a relay-generated failure.
             let data = serde_json::json!({ "subc_code": error.code });
-            ErrorData::internal_error(
-                format!("{prefix}: {}: {}", error.code, error.message),
-                Some(data),
-            )
+            let message = result_size::refusal_message(provider, tool, error.message);
+            ErrorData::internal_error(format!("{prefix}: {}: {message}", error.code), Some(data))
         }
         Err(source) => ErrorData::internal_error(
             format!(
@@ -8942,7 +8969,9 @@ mod tests {
                     )
                     .unwrap();
                     let reply = SubcReply::from(frame);
-                    let error = reply.tool_call_answer(false, trusted).unwrap_err();
+                    let error = reply
+                        .tool_call_answer(false, trusted, "provider", "tool")
+                        .unwrap_err();
                     assert_eq!(error.data, Some(serde_json::json!({ "subc_code": code })));
                 }
             }
@@ -8966,7 +8995,9 @@ mod tests {
         )])));
         fail_pending_on_route(&pending, route, "provider ended").await;
         let frame = rx.recv().await.unwrap();
-        let error = frame.tool_call_answer(false, false).unwrap_err();
+        let error = frame
+            .tool_call_answer(false, false, "provider", "tool")
+            .unwrap_err();
         let data = error.data.unwrap();
         assert_eq!(data["subc_code"], "route_closed");
         assert_eq!(data["send_outcome"], "outcome_unknown");
@@ -10230,7 +10261,9 @@ mod tests {
             error.detail,
             Some(serde_json::json!({ "send_outcome": "outcome_unknown" }))
         );
-        let mcp_error = settled.tool_call_answer(false, false).unwrap_err();
+        let mcp_error = settled
+            .tool_call_answer(false, false, "provider", "tool")
+            .unwrap_err();
         assert_eq!(
             mcp_error.data,
             Some(serde_json::json!({
@@ -11463,7 +11496,8 @@ mod tests {
                     for code in ["module_reloading", "unknown_channel", "stale_route_epoch"] {
                         let frame = build_frame(FrameType::Error, flags, 1, 1, 1, body(code, None))
                             .unwrap();
-                        let error = tool_call_answer(&frame, retrying, trusted).unwrap_err();
+                        let error = tool_call_answer(&frame, retrying, trusted, "provider", "tool")
+                            .unwrap_err();
                         assert_eq!(error.data.unwrap()["subc_code"], code);
                         assert!(!error.message.contains(outage_output::NOTHING_SENT_LINE));
                     }

@@ -1293,11 +1293,49 @@ impl SubcConsumer {
     /// consumer identity, including after reconnect; explicit identities in
     /// [`CallOptions`] and [`CloseRouteOptions`] are still honoured.
     pub async fn connect_operator_app(opts: ConsumerOptions) -> Result<Self, ConsumerError> {
-        Self::connect_operator_app_resolving(opts, crate::operator_app_candidates).await
+        Self::connect_operator_app_resolving(
+            opts,
+            ConsumerTransport::Local,
+            crate::operator_app_candidates,
+        )
+        .await
+    }
+
+    /// Open the desktop operator app's plain connection over TCP.
+    ///
+    /// Selects and owner-checks the installed daemon's connection file with the
+    /// same [`crate::operator_app_candidates`] policy as
+    /// [`Self::connect_operator_app`], then connects to the file's first TCP
+    /// endpoint instead of its Unix socket or Windows named pipe.
+    ///
+    /// The daemon recognises a connection as the operator app only when it
+    /// arrives over its Unix socket or named pipe, so this connection never
+    /// carries the `operator_app` stamp and can't skip the daemon's
+    /// confirmation. Its privileged requests follow the daemon's configured
+    /// policy like any other client's. The caller decides which actions to send
+    /// here, for example those made through assistive technology. This API
+    /// doesn't classify input.
+    ///
+    /// When the daemon supports `connection.describe`,
+    /// [`Self::describe_connection`] reports this connection with
+    /// `local() == false`. There, `local` means the Unix socket or named pipe,
+    /// not loopback.
+    ///
+    /// Like [`Self::connect_operator_app`], it reads no environment variable for
+    /// discovery or consumer identity, including after reconnect, and never
+    /// falls back to the local endpoint.
+    pub async fn connect_operator_app_plain(opts: ConsumerOptions) -> Result<Self, ConsumerError> {
+        Self::connect_operator_app_resolving(
+            opts,
+            ConsumerTransport::Tcp,
+            crate::operator_app_candidates,
+        )
+        .await
     }
 
     async fn connect_operator_app_resolving(
         opts: ConsumerOptions,
+        transport: ConsumerTransport,
         resolve: impl FnOnce() -> Result<Vec<PathBuf>, crate::OperatorAppPathError>,
     ) -> Result<Self, ConsumerError> {
         let candidates = resolve().map_err(|source| ConsumerError::ConnectionFile {
@@ -1309,14 +1347,9 @@ impl SubcConsumer {
             },
         })?;
         let path = candidates[0].clone();
-        let opened = open_connection(
-            &path,
-            opts.handshake_timeout,
-            ConsumerTransport::Local,
-            Some(&candidates),
-        )
-        .await?;
-        let mut shared = Shared::with_transport(path, opts, ConsumerTransport::Local);
+        let opened =
+            open_connection(&path, opts.handshake_timeout, transport, Some(&candidates)).await?;
+        let mut shared = Shared::with_transport(path, opts, transport);
         shared.operator_app_candidates = Some(candidates);
         shared.identity_from_environment = false;
         let shared = Arc::new(shared);

@@ -169,7 +169,29 @@ fn spawn_identity_server(
     activity_identity: Option<ConsumerIdentity>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut stream = accept(listener).await;
+        identity_server(accept(listener).await, info, identities, activity_identity).await
+    })
+}
+
+fn spawn_tcp_identity_server(
+    tcp: TcpListener,
+    info: ConnectionInfo,
+    identities: Vec<Option<ConsumerIdentity>>,
+    activity_identity: Option<ConsumerIdentity>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let stream: Box<dyn ConsumerStream> = Box::new(tcp.accept().await.unwrap().0);
+        identity_server(stream, info, identities, activity_identity).await
+    })
+}
+
+async fn identity_server(
+    mut stream: Box<dyn ConsumerStream>,
+    info: ConnectionInfo,
+    identities: Vec<Option<ConsumerIdentity>>,
+    activity_identity: Option<ConsumerIdentity>,
+) {
+    {
         authenticate_server(
             &mut stream,
             &info.key,
@@ -240,7 +262,7 @@ fn spawn_identity_server(
             write_frame(&mut stream, &reply).await.unwrap();
             stream.flush().await.unwrap();
         }
-    })
+    }
 }
 
 #[tokio::test]
@@ -293,10 +315,13 @@ async fn operator_app_omits_environment_identity_and_honours_explicit() {
         );
         // Inject only the candidate paths so the real constructor's policy and
         // local connection setup run without touching the installed daemon.
-        let client =
-            SubcConsumer::connect_operator_app_resolving(local_opts(), || Ok(vec![file.clone()]))
-                .await
-                .unwrap();
+        let client = SubcConsumer::connect_operator_app_resolving(
+            local_opts(),
+            ConsumerTransport::Local,
+            || Ok(vec![file.clone()]),
+        )
+        .await
+        .unwrap();
 
         run_identity_round(&client, &target, &identity, &explicit).await;
         timeout(BUDGET, task).await.unwrap().unwrap();
@@ -352,6 +377,80 @@ async fn operator_app_omits_environment_identity_and_honours_explicit() {
 }
 
 #[tokio::test]
+async fn operator_app_plain_dials_tcp_and_omits_environment_identity() {
+    const CHILD: &str = "SUBC_OPERATOR_PLAIN_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Run in a child with a module ID and launch nonce in its environment,
+        // so the test catches their use as implicit route or activity identity.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "consumer::local_transport_tests::operator_app_plain_dials_tcp_and_omits_environment_identity",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("SUBC_MODULE_ID", "untrusted-launcher")
+            .env("SUBC_LAUNCH_NONCE", "untrusted-environment-nonce")
+            .env_remove("SUBC_LAUNCH_NONCE_FD")
+            .env_remove("SUBC_LAUNCH_NONCE_HANDLE")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+
+    timeout(Duration::from_secs(20), async {
+        let dir = socket_dir();
+        let file = dir.join("connection.json");
+        let explicit = ConsumerIdentity {
+            module_id: "explicit-caller".into(),
+            launch_nonce: "explicit-nonce".into(),
+        };
+        let target = RouteTarget::ToolProvider {
+            module_id: "provider".into(),
+        };
+        let identity = BindIdentity::new("test", "operator");
+
+        // The file also names a local endpoint; the plain connection must not use it.
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first = info(&tcp);
+        let (endpoint, local) = listen(&dir, "plain");
+        write_atomic_with_local_endpoint(&file, &first, Some(&endpoint)).unwrap();
+        let task = spawn_tcp_identity_server(tcp, first, vec![None, Some(explicit.clone())], None);
+        let client = SubcConsumer::connect_operator_app_resolving(
+            local_opts(),
+            ConsumerTransport::Tcp,
+            || Ok(vec![file.clone()]),
+        )
+        .await
+        .unwrap();
+        run_identity_round(&client, &target, &identity, &explicit).await;
+        timeout(BUDGET, task).await.unwrap().unwrap();
+
+        // Simulate a daemon restart by replacing the TCP listener and rewriting
+        // the connection file. The next round must reconnect over TCP and keep
+        // the identity policy.
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let restarted = info(&tcp);
+        write_atomic_with_local_endpoint(&file, &restarted, Some(&endpoint)).unwrap();
+        let next =
+            spawn_tcp_identity_server(tcp, restarted, vec![None, Some(explicit.clone())], None);
+        run_identity_round(&client, &target, &identity, &explicit).await;
+        timeout(BUDGET, next).await.unwrap().unwrap();
+        client.close().await;
+        assert!(
+            timeout(Duration::from_millis(20), accept(local))
+                .await
+                .is_err(),
+            "the plain connection dialed the local endpoint"
+        );
+    })
+    .await
+    .expect("plain-connection exercise must finish");
+}
+
+#[tokio::test]
 async fn default_transport_is_tcp_with_unchanged_frames() {
     let dir = socket_dir();
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -389,10 +488,13 @@ async fn operator_app_connects_with_only_home_rung() {
     write_atomic_with_local_endpoint(&home, &info, Some(&endpoint)).unwrap();
     assert!(!temp.exists());
     let task = spawn_local(listener, info.clone());
-    let client =
-        SubcConsumer::connect_operator_app_resolving(local_opts(), || Ok(candidates.clone()))
-            .await
-            .unwrap();
+    let client = SubcConsumer::connect_operator_app_resolving(
+        local_opts(),
+        ConsumerTransport::Local,
+        || Ok(candidates.clone()),
+    )
+    .await
+    .unwrap();
     assert!(client.catalog_list().await.unwrap().modules.is_empty());
     timeout(BUDGET, task).await.unwrap().unwrap();
 
@@ -423,11 +525,14 @@ async fn operator_app_does_not_fall_through_owner_checked_home_file() {
         if malformed {
             std::fs::write(&candidates[0], b"not json").unwrap();
         }
-        let error =
-            SubcConsumer::connect_operator_app_resolving(local_opts(), || Ok(candidates.clone()))
-                .await
-                .err()
-                .unwrap();
+        let error = SubcConsumer::connect_operator_app_resolving(
+            local_opts(),
+            ConsumerTransport::Local,
+            || Ok(candidates.clone()),
+        )
+        .await
+        .err()
+        .unwrap();
         if malformed {
             assert!(
                 matches!(error, ConsumerError::ConnectionFile { path, source: ConnectionFileError::JsonRead { .. } } if path == candidates[0])

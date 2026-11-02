@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.33.3
+
+- `SubcConsumer::connect_operator_app_plain` opens the desktop operator app's
+  plain connection. It selects the installed daemon's connection file with the
+  same policy as `connect_operator_app`, then connects to the file's TCP
+  endpoint instead of its Unix socket or named pipe. The daemon recognises the
+  operator app only over its socket or pipe, so this connection never carries
+  the `operator_app` stamp and can't skip confirmation: its privileged requests
+  follow the daemon's configured policy like any other client's. It reads no
+  environment variable for discovery or consumer identity, including after
+  reconnect, and never falls back to the local endpoint.
+
 ## 0.33.2
 
 - `BindDecision::reject_with_detail` rejects a route bind with an error body

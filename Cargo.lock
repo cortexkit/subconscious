@@ -2971,7 +2971,7 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",

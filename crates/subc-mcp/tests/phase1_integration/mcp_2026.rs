@@ -8,7 +8,7 @@ use rmcp::model::{
 };
 
 fn size_error(tool: &str) -> String {
-    format!("tool_result_too_large: {tool} ran, but its output was 65537 bytes, over the 65,536-byte limit, so it was discarded. Its effects stand: don't run it again for the same output. Ask it for less (a page, a filter, or a file to read).")
+    format!("tool_result_too_large: {tool} returned 65537 bytes of model-visible output, over the 65,536-byte limit, so the output was discarded. Whatever the call did has already happened, so don't repeat it just to see the output. Next time ask for less output (a page or a filter), or have the tool write it to a file you read in parts.")
 }
 
 fn assert_size_boundary_result(result: &impl serde::Serialize, bytes: usize) {
@@ -139,7 +139,7 @@ fn assert_size_refusal(error: &impl serde::Serialize, bytes: usize) {
     let expected = if bytes == 65_536 {
         "x".repeat(bytes)
     } else {
-        "tool_result_too_large: provider refusal message exceeded the 65,536-byte limit and was discarded.".to_owned()
+        "tool_result_too_large: this error's message was over the 65,536-byte limit and was discarded. Its error code is kept.".to_owned()
     };
     assert_eq!(
         error["message"],

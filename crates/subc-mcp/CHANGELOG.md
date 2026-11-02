@@ -1,9 +1,13 @@
 # Changelog
 
+## 0.1.56
+
+- Reword the size-limit replacements. The model now reads that the tool returned N bytes of model-visible output over the limit, that whatever the call did has already happened so it shouldn't repeat it to see the output, and to ask for less output or a file next time. An oversized error message is described as an error's message, with its code kept.
+
 ## 0.1.55
 
-- Enforce the inclusive 65,536-byte model-visible provider result limit before returning results to Claude Code, including later task results. Oversized output is discarded with an explicit error, never truncated or retried; oversized refusals keep their code. Warnings are rate-limited per provider and tool and include a running count.
-- Copy the tool-provider 0.15.0 size vectors and implement its accounting locally, using `ryu-js` for ECMAScript numbers without enabling additional serde_json features.
+- Apply tool-provider 0.15.0's model-visible size limit (65,536 bytes, inclusive) to every final provider reply before Claude Code sees it: immediate replies, replies after a held call resumes, and task results. Questions to the person are unchanged. An oversized reply becomes an `isError: true` result saying the output was discarded, and a task carrying it still completes. It is never cut short, and size never triggers a retry. For a route error, only the provider's message is measured: an oversized one is replaced and the error code kept. Warnings are rate-limited per provider and tool and include a running count.
+- The accounting is implemented locally for native MCP replies, checked against tool-provider 0.15.0's copied size samples, and uses `ryu-js` for ECMAScript number formatting without enabling further serde_json features.
 
 ## 0.1.54
 

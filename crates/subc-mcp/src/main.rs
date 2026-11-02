@@ -6818,10 +6818,11 @@ fn tool_call_answer(
                         None,
                     )
                 })?;
-            // These routes define native MCP CallToolResult, whose content has
-            // the same model-visible measure as tool-result/v1. Measure the
-            // decoded provider body before rmcp normalizes or drops fields,
-            // or rejects a content type it does not know.
+            // These routes carry native MCP CallToolResult, whose content is
+            // measured by the tool-result/v1 rule. Measure the parsed JSON
+            // before native MCP decoding, so oversized content is replaced
+            // even if rmcp would drop fields or reject its content type. When
+            // measurement returns None or the size fits, decode as usual.
             if let Some(message) = result_size::oversized_result(provider, tool, &body) {
                 return Ok(CallAttempt::Answered(CallToolResult::error(vec![
                     ContentBlock::text(message),

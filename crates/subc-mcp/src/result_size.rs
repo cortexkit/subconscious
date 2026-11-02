@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 
 pub(crate) const MAX_MODEL_VISIBLE_BYTES: usize = 65_536;
 
-/// None leaves malformed content to the native MCP decoder's error path.
+/// Returns None when `content` is missing or not an array, or a part lacks a
+/// string `type`, or a text part lacks a string `text`. This only measures; it
+/// validates nothing, so the caller still runs the native MCP decoder.
 pub(crate) fn model_visible_bytes(body: &Value) -> Option<usize> {
     body.get("content")?
         .as_array()?
@@ -108,7 +110,7 @@ pub(crate) fn oversized_result(provider: &str, tool: &str, body: &Value) -> Opti
     }
     record_oversize(provider, tool, bytes);
     Some(format!(
-        "tool_result_too_large: {tool} ran, but its output was {bytes} bytes, over the 65,536-byte limit, so it was discarded. Its effects stand: don't run it again for the same output. Ask it for less (a page, a filter, or a file to read)."
+        "tool_result_too_large: {tool} returned {bytes} bytes of model-visible output, over the 65,536-byte limit, so the output was discarded. Whatever the call did has already happened, so don't repeat it just to see the output. Next time ask for less output (a page or a filter), or have the tool write it to a file you read in parts."
     ))
 }
 
@@ -117,7 +119,7 @@ pub(crate) fn refusal_message(provider: &str, tool: &str, message: String) -> St
         return message;
     }
     record_oversize(provider, tool, message.len());
-    "tool_result_too_large: provider refusal message exceeded the 65,536-byte limit and was discarded."
+    "tool_result_too_large: this error's message was over the 65,536-byte limit and was discarded. Its error code is kept."
         .to_owned()
 }
 

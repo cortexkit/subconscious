@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.21
+
+- Take cortexkit-bus-naming 0.2.10: bootstrap provisions `m_cerebellum`, an
+  event reader on the runners' exact `turn_started.v1` and `turn_ended.v1`
+  subjects from `thalamus-harness` and `thalamus-pi`. The browser module's
+  credential can pull that durable and subscribe to the same four subjects as
+  live hints. No existing durable's filters change.
+
 ## 0.4.20
 
 - Take cortexkit-bus-naming 0.2.9: bootstrap provisions the Pi runner's event

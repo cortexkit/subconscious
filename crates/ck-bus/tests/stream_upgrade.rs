@@ -573,6 +573,19 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
             )],
         ),
         (
+            streams.event.clone(),
+            "m_cerebellum",
+            [
+                "thalamus-harness.turn_started",
+                "thalamus-harness.turn_ended",
+                "thalamus-pi.turn_started",
+                "thalamus-pi.turn_ended",
+            ]
+            .iter()
+            .map(|event| format!("ck.{}.event.{event}.v1", names.account()))
+            .collect(),
+        ),
+        (
             streams.room.clone(),
             "m_prefrontal-core",
             vec![names.room_binding()],
@@ -900,6 +913,18 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
                 plane.names.account()
             )],
         ),
+        (
+            "m_cerebellum",
+            [
+                "thalamus-harness.turn_started",
+                "thalamus-harness.turn_ended",
+                "thalamus-pi.turn_started",
+                "thalamus-pi.turn_ended",
+            ]
+            .iter()
+            .map(|event| format!("ck.{}.event.{event}.v1", plane.names.account()))
+            .collect(),
+        ),
     ];
     assert_eq!(
         readers.len(),
@@ -944,6 +969,7 @@ async fn second_bootstrap_keeps_event_durable_creation_times_and_ack_floors() {
     plane
         .store_event("magic-context", "compaction.started")
         .await;
+    plane.store_event("thalamus-harness", "turn_ended").await;
     let durables = [
         "m_basal",
         "m_prefrontal-core",
@@ -954,6 +980,7 @@ async fn second_bootstrap_keeps_event_durable_creation_times_and_ack_floors() {
         "m_thalamus",
         "m_thalamus-pi",
         "m_broca",
+        "m_cerebellum",
     ];
     let mut before = Vec::new();
     for durable in durables {
@@ -1143,6 +1170,7 @@ async fn prefrontal_event_grant_pulls_and_acks_seven_token_events_but_refuses_ot
         "m_thalamus",
         "m_thalamus-pi",
         "m_broca",
+        "m_cerebellum",
     ] {
         for verb in ["INFO", "MSG.NEXT"] {
             let subject = format!(

@@ -186,6 +186,10 @@ impl fmt::Display for PlaneError {
 
 #[async_trait]
 pub trait SystemPlane: Send + Sync {
+    /// The connected server instance's id, or `None` when it is not known.
+    fn server_id(&self) -> Option<String> {
+        None
+    }
     /// Every account id the resolver has stored.
     async fn list_accounts(&self) -> Result<Vec<String>, PlaneError>;
     /// The stored account JWT, `None` when the resolver answers that it holds none.
@@ -512,6 +516,14 @@ impl NatsSystem {
 
 #[async_trait]
 impl SystemPlane for NatsSystem {
+    fn server_id(&self) -> Option<String> {
+        if self.client.connection_state() != async_nats::connection::State::Connected {
+            return None;
+        }
+        let id = self.client.server_info().server_id;
+        (!id.is_empty()).then_some(id)
+    }
+
     async fn list_accounts(&self) -> Result<Vec<String>, PlaneError> {
         let body = self.request(CLAIMS_LIST.to_string(), Vec::new()).await?;
         let value: Value = serde_json::from_slice(&body).map_err(|error| {

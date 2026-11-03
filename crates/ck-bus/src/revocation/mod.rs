@@ -651,6 +651,24 @@ impl Revoker {
         targets.extend(self.connections.targets(&record.user_public));
         let mut kicked = 0;
         for target in targets {
+            // A server restart drops every connection on that instance. Step (1)
+            // has already prevented this credential from reconnecting.
+            if plane
+                .system
+                .server_id()
+                .is_some_and(|id| id != target.server_id)
+            {
+                log_event(
+                    "ckbus.revocation.kick_skipped",
+                    json!({
+                        "level": "info",
+                        "server_id": target.server_id,
+                        "client_id": target.client_id,
+                        "reason": "server_not_running",
+                    }),
+                );
+                continue;
+            }
             match plane.system.kick(&target.server_id, target.client_id).await {
                 Ok(()) => kicked += 1,
                 // The push in step (1) closes the user's connections itself (measured

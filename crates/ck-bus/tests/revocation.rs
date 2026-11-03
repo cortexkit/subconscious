@@ -1394,6 +1394,114 @@ async fn a_damaged_record_is_recovered_from_the_census_or_deferred() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stale_server_kick_targets_complete_and_live_targets_are_kicked() {
+    let _gate = harness::acceptance_gate().await;
+    harness::install_tracing();
+    let Some(run) = start(false).await else {
+        return;
+    };
+    retire_supervised_ckbus(&run).await;
+    let plane = plane(&run).await;
+    let store = tempfile::tempdir().unwrap();
+    let progress = ProgressStore::new(store.path());
+    let first = process(&plane, run.trust.signer.clone(), store.path()).await;
+    let victim = Victim::enter(&run, &plane, "staleserver", 1).await;
+    victim.tracked_by(&first).await;
+    *first.stop_at.lock().unwrap() = Some(Boundary::Step2Recorded);
+    assert_eq!(
+        first.revoke_module(&plane, &victim.module).await,
+        Err(RevocationError::Stopped(Boundary::Step2Recorded))
+    );
+    let Some(progress::Entry::Present(mut record)) = progress.read(&victim.identity()) else {
+        panic!("the kick step's inputs must survive the stop");
+    };
+    assert_eq!(record.highest_completed_step, 2);
+    assert_eq!(record.kick.len(), 1);
+    assert_eq!(
+        plane.system.server_id(),
+        Some(victim.client.server_info().server_id)
+    );
+    // Model a persisted connection from a previous server instance. There is no
+    // responder for this address, but step (1) has already revoked the credential.
+    record.kick = record
+        .kick
+        .into_iter()
+        .map(|target| KickTarget {
+            server_id: "NRETIREDINSTANCE".to_string(),
+            ..target
+        })
+        .collect();
+    progress.write(&record).unwrap();
+    drop(first);
+    let jwt = run.account_jwt().await;
+    let resuming = process(&plane, run.trust.signer.clone(), store.path()).await;
+    let outcomes = resuming.resume_all(&plane).await;
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    assert_eq!(
+        outcomes[0].1,
+        Ok(Completed::default()),
+        "a target on an old server must not defer: {outcomes:?}"
+    );
+    progress_is_empty(store.path()).await;
+    assert!(resuming.resume_all(&plane).await.is_empty());
+    assert_eq!(run.account_jwt().await, jwt, "no claims update is replayed");
+    victim.expect_refused(&run.server.url, &run.server).await;
+
+    // Start directly at step (3) for a live connection so a claims update cannot
+    // hide a skipped kick by closing the socket first.
+    let live = Victim::enter(&run, &plane, "livekick", 1).await;
+    live.tracked_by(&resuming).await;
+    let info = live.client.server_info();
+    progress
+        .write(&Record {
+            identity: live.identity(),
+            highest_completed_step: 2,
+            user_public: live.public.clone(),
+            user_jwt_id: live.jti.clone(),
+            kick: BTreeSet::from([KickTarget {
+                server_id: info.server_id,
+                client_id: info.client_id,
+            }]),
+        })
+        .unwrap();
+    let outcomes = resuming.resume_all(&plane).await;
+    assert_eq!(outcomes.len(), 1, "{outcomes:?}");
+    let completed = outcomes[0].1.clone().expect("the live kick completes");
+    assert_eq!(completed.kicked, 1, "{completed:?}");
+    live.expect_severed().await;
+    progress_is_empty(store.path()).await;
+
+    passed();
+    run.server.stop().await;
+    run.run.shutdown().await;
+}
+
+/// Forwards real system requests without exposing the connected server's identity.
+struct UnknownServer(Arc<dyn SystemPlane>);
+
+#[async_trait]
+impl SystemPlane for UnknownServer {
+    async fn list_accounts(&self) -> Result<Vec<String>, PlaneError> {
+        self.0.list_accounts().await
+    }
+    async fn lookup(&self, account_public: &str) -> Result<Option<String>, PlaneError> {
+        self.0.lookup(account_public).await
+    }
+    async fn update(&self, jwt: &str) -> Result<(), PlaneError> {
+        self.0.update(jwt).await
+    }
+    async fn kick(&self, server_id: &str, client_id: u64) -> Result<(), PlaneError> {
+        self.0.kick(server_id, client_id).await
+    }
+    async fn watch_connections(
+        &self,
+        account_public: &str,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<ConnectionEvent>, PlaneError> {
+        self.0.watch_connections(account_public).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refusals_defer_their_step_and_a_kick_alone_revokes_nothing() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
@@ -1513,8 +1621,8 @@ async fn refusals_defer_their_step_and_a_kick_alone_revokes_nothing() {
     assert_eq!(run.account_jwt().await, jwt, "a kick pushes nothing");
 
     // A kick refused for any reason but the server's "no such client" answer fails
-    // step (3): the record stays at step (2) for the next pass. The target names a
-    // server that does not exist, so the kick request has no responder.
+    // step (3): the record stays at step (2) for the next pass. Without the current
+    // server ID, a missing responder alone cannot prove the target is gone.
     let store = tempfile::tempdir().unwrap();
     let progress = ProgressStore::new(store.path());
     let stuck = Record {
@@ -1532,8 +1640,13 @@ async fn refusals_defer_their_step_and_a_kick_alone_revokes_nothing() {
         }]),
     };
     progress.write(&stuck).unwrap();
-    let resuming = process(&plane, run.trust.signer.clone(), store.path()).await;
-    let outcomes = resuming.resume_all(&plane).await;
+    let unknown_server = RevocationPlane {
+        system: Arc::new(UnknownServer(plane.system.clone())),
+        ..plane.clone()
+    };
+    assert_eq!(unknown_server.system.server_id(), None);
+    let resuming = process(&unknown_server, run.trust.signer.clone(), store.path()).await;
+    let outcomes = resuming.resume_all(&unknown_server).await;
     assert_eq!(outcomes.len(), 1, "{outcomes:?}");
     let Err(RevocationError::Deferred {
         completed_step,

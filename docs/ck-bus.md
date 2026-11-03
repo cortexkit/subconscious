@@ -1101,7 +1101,9 @@ Row contents.
   nats-server v2.15.0 in `tests/revocation.rs`). The kick in step (3) is a backstop for
   a connection the push did not sever, and it normally finds nothing: the server
   answers `no such client or leafnode id`, which counts as already gone, and any other
-  kick refusal fails the step. Revoking before kicking is the safe order: a kick alone
+  kick refusal fails the step. A target whose server ID differs from the connected
+  system server's known ID is skipped as already gone, since a server restart drops
+  its connections. Revoking before kicking is the safe order: a kick alone
   lets the client reconnect at once with the same JWT (the control below). A second reconnect after a server restart is still
   refused, proving the claims update persisted. Exactly-once is asserted on the defined
   observables.

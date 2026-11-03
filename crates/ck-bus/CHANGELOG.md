@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.22
+
+- Complete revocations whose recorded kick targets belong to an old server
+  instance instead of retrying them forever on a missing responder. Compare targets
+  with the connected system server's ID and log skipped targets; unknown server IDs
+  and other kick failures still defer.
+
 ## 0.4.21
 
 - Take cortexkit-bus-naming 0.2.10: bootstrap provisions `m_cerebellum`, an

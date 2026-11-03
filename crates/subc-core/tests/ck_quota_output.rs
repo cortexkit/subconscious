@@ -6,6 +6,10 @@
 //! rows of each class. Accounts are invented; reset times are in the past so
 //! the output doesn't move with the clock. The expected text was captured
 //! from the code as it was before the move.
+//!
+//! The same rows also check `--redact`: no email, account id or organization
+//! name reaches its output, error text included, and `--json --redact` is
+//! refused instead of printing the unredacted reply.
 
 #![cfg(unix)]
 
@@ -69,7 +73,7 @@ fn usage_rows() -> Value {
         {
             "provider": "claude",
             "account": "acct-ops",
-            "accountInfo": { "email": "ops@example.test", "planType": "max" },
+            "accountInfo": { "email": "ops@example.test", "orgName": "Ops Example Org", "planType": "max" },
             "usage": {
                 "primary": { "usedPercent": 25.0, "windowMinutes": 300, "resetsAt": "2020-01-01T05:00:00Z" },
                 "secondary": { "usedPercent": 40.0, "rawUsedPercent": 60.0, "windowMinutes": 10080, "resetsAt": "2020-01-07T00:00:00Z" },
@@ -83,7 +87,7 @@ fn usage_rows() -> Value {
             "provider": "claude",
             "account": "acct-dev",
             "accountInfo": { "email": "dev@example.test" },
-            "error": "token expired",
+            "error": "token expired for dev@example.test",
             "errorClass": "credential_expired"
         },
         {
@@ -180,8 +184,8 @@ fn boot() -> Daemon {
     daemon
 }
 
-const QUOTA_DEFAULT: &str = "Antigravity — 1 account\n  ● ag@example.test\n      ● Gemini Models weekly          ████████████████  100% used · resets Jan 03 22:00 UTC\n      ● Claude and GPT models weekly  ████████████████  100% used · resets Jan 01 21:23 UTC\n\nClaude — 2 accounts\n  ● ops@example.test · plan: max\n      ● 5h           ████░░░░░░░░░░░░  25% used · resets Jan 01 05:00 UTC\n      ● week         ██████████░░░░░░  60% used (40% eff · resets banked) · resets Jan 07 00:00 UTC\n      ● Opus weekly  ███████████░░░░░  70% used · resets Jan 07 00:00 UTC\n  ○ dev@example.test [credential_expired] — token expired\n\nKimi — 1 account\n  ○ account [quota-module defect] — the quota module crashed\n\nClaude Console — 1 account\n  ● 0f1e2d3c\n      API credit (Max 20x)  196.63 of 200.00 USD left · expires 2020-01-25 · included in subscription\n      Bought credit  5.00 USD left · bought credit\n\nDeepseek — 1 account\n  ● account\n      Balance  24.02 CNY left\n\n2 providers not configured\n";
-const QUOTA_VERBOSE: &str = "Antigravity — 1 account\n  ● ag@example.test\n      ● Gemini Models weekly          ████████████████  100% used · resets Jan 03 22:00 UTC\n      ● Claude and GPT models weekly  ████████████████  100% used · resets Jan 01 21:23 UTC\n\nClaude — 2 accounts\n  ● ops@example.test · plan: max\n      ● 5h           ████░░░░░░░░░░░░  25% used · resets Jan 01 05:00 UTC\n      ● week         ██████████░░░░░░  60% used (40% eff · resets banked) · resets Jan 07 00:00 UTC\n      ● Opus weekly  ███████████░░░░░  70% used · resets Jan 07 00:00 UTC\n  ○ dev@example.test [credential_expired] — token expired\n\nCodebuff — 1 account\n  ○ account — no session\n\nJetbrains — 1 account\n  ○ account — no quota reported\n\nKimi — 1 account\n  ○ account [quota-module defect] — the quota module crashed\n\nClaude Console — 1 account\n  ● 0f1e2d3c\n      API credit (Max 20x)  196.63 of 200.00 USD left · expires 2020-01-25 · included in subscription\n      Bought credit  5.00 USD left · bought credit\n\nDeepseek — 1 account\n  ● account\n      Balance  24.02 CNY left\n";
+const QUOTA_DEFAULT: &str = "Antigravity — 1 account\n  ● ag@example.test\n      ● Gemini Models weekly          ████████████████  100% used · resets Jan 03 22:00 UTC\n      ● Claude and GPT models weekly  ████████████████  100% used · resets Jan 01 21:23 UTC\n\nClaude — 2 accounts\n  ● ops@example.test · Ops Example Org · plan: max\n      ● 5h           ████░░░░░░░░░░░░  25% used · resets Jan 01 05:00 UTC\n      ● week         ██████████░░░░░░  60% used (40% eff · resets banked) · resets Jan 07 00:00 UTC\n      ● Opus weekly  ███████████░░░░░  70% used · resets Jan 07 00:00 UTC\n  ○ dev@example.test [credential_expired] — token expired for dev@example.test\n\nKimi — 1 account\n  ○ account [quota-module defect] — the quota module crashed\n\nClaude Console — 1 account\n  ● 0f1e2d3c\n      API credit (Max 20x)  196.63 of 200.00 USD left · expires 2020-01-25 · included in subscription\n      Bought credit  5.00 USD left · bought credit\n\nDeepseek — 1 account\n  ● account\n      Balance  24.02 CNY left\n\n2 providers not configured\n";
+const QUOTA_VERBOSE: &str = "Antigravity — 1 account\n  ● ag@example.test\n      ● Gemini Models weekly          ████████████████  100% used · resets Jan 03 22:00 UTC\n      ● Claude and GPT models weekly  ████████████████  100% used · resets Jan 01 21:23 UTC\n\nClaude — 2 accounts\n  ● ops@example.test · Ops Example Org · plan: max\n      ● 5h           ████░░░░░░░░░░░░  25% used · resets Jan 01 05:00 UTC\n      ● week         ██████████░░░░░░  60% used (40% eff · resets banked) · resets Jan 07 00:00 UTC\n      ● Opus weekly  ███████████░░░░░  70% used · resets Jan 07 00:00 UTC\n  ○ dev@example.test [credential_expired] — token expired for dev@example.test\n\nCodebuff — 1 account\n  ○ account — no session\n\nJetbrains — 1 account\n  ○ account — no quota reported\n\nKimi — 1 account\n  ○ account [quota-module defect] — the quota module crashed\n\nClaude Console — 1 account\n  ● 0f1e2d3c\n      API credit (Max 20x)  196.63 of 200.00 USD left · expires 2020-01-25 · included in subscription\n      Bought credit  5.00 USD left · bought credit\n\nDeepseek — 1 account\n  ● account\n      Balance  24.02 CNY left\n";
 
 #[test]
 fn ck_quota_prints_the_same_text_after_the_row_parser_moved() {
@@ -198,4 +202,61 @@ fn ck_quota_prints_the_same_text_after_the_row_parser_moved() {
         }
     }
     assert!(report.is_empty(), "{report}");
+}
+
+/// For these rows, default and verbose `--redact` output omit the known email,
+/// account-id and organization-name substrings. The plan stays visible, and
+/// the expired-token error keeps its message with an `account ` pseudonym in
+/// place of the email it quoted.
+#[test]
+fn ck_quota_redact_hides_identities_in_names_headers_and_error_text() {
+    let daemon = boot();
+    for args in [
+        ["quota", "--redact"].as_slice(),
+        ["quota", "--verbose", "--redact"].as_slice(),
+    ] {
+        let got = daemon.ck(args);
+        for leaked in ["@example.test", "acct-", "0f1e2d3c", "Ops Example Org"] {
+            assert!(
+                !got.contains(leaked),
+                "ck {args:?} printed {leaked:?}:\n{got}"
+            );
+        }
+        assert!(
+            got.contains(" · plan: max\n"),
+            "ck {args:?} lost the plan:\n{got}"
+        );
+        assert!(
+            got.contains("[credential_expired] — token expired for account "),
+            "ck {args:?} dropped or did not mask the error text:\n{got}"
+        );
+    }
+}
+
+/// `ck --json quota --redact` is refused before connecting, in either flag
+/// order. JSON output is the unredacted reply, so printing it would show every
+/// identity while the caller believes it redacted.
+#[test]
+fn ck_json_quota_redact_is_refused_before_connecting() {
+    let root = ScratchDir::new("ck-quota-json-redact");
+    for args in [
+        ["--json", "quota", "--redact"],
+        ["quota", "--redact", "--json"],
+    ] {
+        let mut command = dev_command(common::ckdev_ck());
+        common::kit::isolate_client(&mut command, &root.join("client"));
+        let out = command
+            .arg("--subc")
+            .arg(root.join("no-daemon-here"))
+            .args(args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "ck {args:?}: {stderr}");
+        assert!(out.stdout.is_empty(), "ck {args:?} printed output");
+        assert!(
+            stderr.contains("--redact cannot be used with --json"),
+            "ck {args:?}: {stderr}"
+        );
+    }
 }

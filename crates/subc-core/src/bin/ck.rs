@@ -52,10 +52,11 @@ use ck_ui::metrics::{
 // How `ck quota` and the app read the quota module's usage rows and name
 // its accounts.
 use ck_ui::quota::{
-    account_name, account_org, entry_error_detail, format_provider_display_name,
-    parse_rfc3339_to_utc_secs, provider_id, quota_disconnect_kind, quota_entry_is_balance_only,
-    quota_entry_is_connected, quota_spend_lines_for_entry, quota_window_rows_for_entry,
-    quota_window_used_percent, usage_rows, QuotaDisconnectKind, USAGE_METHOD, USAGE_MODULE,
+    account_identifiers, account_name, account_org, account_pseudonym, entry_error_detail,
+    format_provider_display_name, mask_identifiers, parse_rfc3339_to_utc_secs, provider_id,
+    quota_disconnect_kind, quota_entry_is_balance_only, quota_entry_is_connected,
+    quota_spend_lines_for_entry, quota_window_rows_for_entry, quota_window_used_percent,
+    usage_rows, QuotaDisconnectKind, USAGE_METHOD, USAGE_MODULE,
 };
 // Helpers only the tests below use.
 #[cfg(test)]
@@ -436,7 +437,9 @@ const ROUTES_HELP: &str = "ck routes — inspect live route consumers\n\nusage: 
 
 const PROVENANCE_HELP: &str = "ck provenance — inspect source-tagged module provenance\n\nusage: ck [--json] [--verbose] provenance <module-id>\n\n  ck provenance <id>  daemon-attested process facts beside module declarations";
 
-const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusage: ck [--json] quota [--verbose] [--redact] [<provider-id>]\n\n  ck quota              connected providers and their usage windows\n  ck quota --verbose    all tracked providers, including unavailable ones\n  ck quota claude       one provider's windows and status in detail\n  ck quota --redact     hide emails and org names, for sharing a screenshot";
+const QUOTA_HELP: &str = "ck quota - AI-provider quota and usage windows\n\nusage: ck [--json] quota [--verbose] [--redact] [<provider-id>]\n\n  ck quota              connected providers and their usage windows\n  ck quota --verbose    all tracked providers, including unavailable ones\n  ck quota claude       one provider's windows and status in detail\n  ck quota --redact     hide emails and org names for screenshots; not with --json";
+
+const QUOTA_REDACT_JSON_REFUSAL: &str = "--redact cannot be used with --json. Omit --json for redacted text output, or omit --redact for unredacted JSON.";
 
 const HEALTH_HELP: &str = "ck health — module health\n\nusage: ck [--json] [--verbose] health [<module-id>]\n\n  ck health            one-line health for every supervised module (cached)\n  ck health <id>       fresh health.check probe with headline metrics\n  ck health <id> --verbose  fresh probe with the complete metrics tree";
 
@@ -524,6 +527,13 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     let args = parse_args(argv)?;
     if args.json && args.wait == Some(true) {
         return Err(CkError::Usage("--wait cannot be used with --json".into()));
+    }
+    // `--redact` hides identities in the quota text view only. JSON output is
+    // the unredacted reply, every account email and organization name
+    // included, so accepting both flags would print identities while looking
+    // redacted (see `print_quota_table`).
+    if args.json && matches!(args.command, Command::Quota { redact: true, .. }) {
+        return Err(CkError::Usage(QUOTA_REDACT_JSON_REFUSAL.into()));
     }
     let ckni = invoked_as_ckni(&args.program);
 
@@ -5510,14 +5520,13 @@ fn quota_entry_not_running_locally(entry: &Value) -> bool {
             })
 }
 
-/// `redact` reaches the RENDER PATH ONLY and cannot reach `--json`: the JSON
-/// branch in `quota` prints the wire body verbatim and returns before this is
-/// called. That separation is deliberate -- a display flag that also filtered
-/// the payload would eventually be used as a privacy mechanism for a machine
-/// consumer, and a missing `account` field reads to a consumer as "this
-/// provider resolves no identity", which silently changes account-set
-/// reconciliation. A display flag must not be able to produce a payload that
-/// lies.
+/// `redact` affects only this text table. The JSON branch in `quota` prints the
+/// complete reply without redacting account data, and `run` refuses `--json`
+/// with `--redact` before connecting, so a caller who asks for both gets an
+/// error instead of identities that look redacted. JSON keeps account fields
+/// intact on purpose: a consumer reads a missing `account` field as "this
+/// provider resolves no identity" and may count accounts differently, so a
+/// display flag must not be able to change what the payload says.
 fn print_quota_table(
     providers: &[Value],
     filter: Option<&str>,
@@ -5713,7 +5722,7 @@ fn print_quota_account(
     // `ck_ui::quota::account_name`, which the app's Usage panel uses too.
     let label = account_name(entry, redact);
     if !quota_entry_is_connected(entry) {
-        let reason = entry_error_detail(entry).unwrap_or_else(|| "no usage data".to_string());
+        let reason = quota_error_text(entry, redact).unwrap_or_else(|| "no usage data".to_string());
         // "Which ones" is the first question after seeing the failing count, so
         // the class is named here rather than left to the prose. The prose is the
         // producer's human message and carries no stability promise; the class is
@@ -5754,7 +5763,7 @@ fn print_quota_account(
     // arm failing while others serve). The default view keeps it quiet;
     // --verbose surfaces it under the account header.
     if verbose {
-        if let Some(detail) = entry_error_detail(entry) {
+        if let Some(detail) = quota_error_text(entry, redact) {
             println!(
                 "      {}",
                 dim_text(&format!("⚠ {}", truncate_cell(&detail)), color_enabled)
@@ -5942,6 +5951,24 @@ fn format_duration_two_units(secs: u64) -> String {
     } else {
         format!("{secs}s")
     }
+}
+
+/// The row's non-empty error text, or `None`. With `redact`, exact occurrences
+/// of the identifiers [`account_identifiers`] returns for the row
+/// (`accountInfo.email`, `account` in full and its shortened UUID form,
+/// `accountInfo.orgName`, and the stored-credential label `credentialRef`) are
+/// replaced by [`account_pseudonym`], because a provider's error sentence can
+/// quote the account it is about. Other text is left unchanged.
+fn quota_error_text(entry: &Value, redact: bool) -> Option<String> {
+    let error = entry_error_detail(entry)?;
+    if !redact {
+        return Some(error);
+    }
+    Some(mask_identifiers(
+        &error,
+        &account_identifiers(entry),
+        &account_pseudonym(entry),
+    ))
 }
 
 /// Optional account metadata after the label: org, plan, saved resets, and
@@ -11518,10 +11545,9 @@ mod tests {
         );
     }
 
-    /// The flag is a RENDER flag and structurally cannot reach `--json`: the
-    /// JSON branch prints the wire body verbatim and returns before any
-    /// redaction runs. Pinned as a parse-level fact so nobody wires `redact`
-    /// into the payload path later and calls it a privacy feature.
+    /// Parsing keeps `--redact` on the quota command, and quota help
+    /// advertises it. The integration tests in `ck_quota_output` check that
+    /// combining it with `--json` is a usage error.
     #[test]
     fn redact_is_parsed_as_a_render_flag_and_is_documented() {
         let command = parse_command(

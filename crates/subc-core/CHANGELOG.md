@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.158
+
+- `ck --json quota --redact` now exits with a usage error before connecting instead of printing the unredacted reply. JSON output keeps every account field; `--redact` applies to the text view only.
+- `ck quota --redact` also masks account emails, account ids, organization names and credential labels inside a provider's error text, which could quote the account it is about.
+
 ## 0.20.157
 
 - Add `ck setup operator-prompt [--uninstall]` for the current user's Linux polkit action. Terminal use runs interactive sudo; non-terminal use prints the complete administrator commands and policy without changing the system. Explain missing operator-prompt setup in CLI refusal messages.

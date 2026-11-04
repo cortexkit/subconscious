@@ -6,9 +6,32 @@
 # staged path doesn't exist, so a case that gets past the guard ends on the
 # staged-artifact refusal instead.
 set -u
+finished=
 ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 PLACE_SCRIPT="$ROOT/scripts/fleet/place-module.sh"
-MISSING=$(mktemp -u "${TMPDIR:-/tmp}/place-module-reexec.XXXXXX")
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/place-module-reexec.XXXXXX") || exit 1
+cleanup() {
+  local rc=$?
+  rm -rf "$TEST_ROOT"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "place-module-reexec.sh: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+MISSING="$TEST_ROOT/missing"
+mkdir -p "$TEST_ROOT/bin" || exit 1
+# Stub supervisor status checks so restart cases never contact the operator's daemon.
+cat >"$TEST_ROOT/bin/ck" <<'EOF' || exit 1
+#!/usr/bin/env bash
+case "$*" in
+  'module status cerebellum'|'module status basal'|'module status thalamus-harness'|'module status aft') exit 0 ;;
+  *) exit 64 ;;
+esac
+EOF
+chmod +x "$TEST_ROOT/bin/ck" || exit 1
+export PATH="$TEST_ROOT/bin:$PATH"
 failures=0
 
 run_case() {
@@ -45,3 +68,4 @@ run_case pinned-aft-no-restart-passes-the-guard \
   --module aft --no-restart
 
 [ "$failures" -eq 0 ] || exit 1
+finished=1

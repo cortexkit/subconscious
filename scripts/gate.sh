@@ -14,7 +14,8 @@ Usage: scripts/gate.sh {fast|lint|test|swift|ts|all} [check]
          path-dependency policy and its tests; CortexKit layout (including
          git ls-files -ci --exclude-standard -- .cortexkit); Markdown links and
          test citations; every wire-vector generator and SHA256SUMS; installer
-         ShellCheck and Unix installer contract. Fails at the first bad check.
+         ShellCheck, Unix installer contract, and shell self-tests for release
+         and placement scripts. Fails at the first bad check.
   lint   CI's workspace all-targets and release clippy, subc-core all-targets
          clippy, then both workspace invocations for x86_64-pc-windows-gnu.
          The untargeted checks use the host: run on Linux for CI's Linux verdict.
@@ -37,7 +38,7 @@ Usage: scripts/gate.sh {fast|lint|test|swift|ts|all} [check]
 
 Prerequisites / network:
   No tools are installed by this script. Provide Rust stable + clippy/rustfmt,
-  Python 3, the pinned vector environment below, ShellCheck, and
+  Python 3, the pinned vector environment below, ShellCheck, jq, zip/unzip, and
   Bun with each client's frozen-lockfile dependencies already installed.
   Tool, pip, Bun dependency and pinned nats-server downloads remain CI setup:
   they require network. The gate itself does not do those downloads. Cargo
@@ -57,7 +58,8 @@ Version comparisons:
 
 CI adapters (optional [check], for the existing job boundaries and conditions):
   fast: fmt, versions, metadata, metadata-online, paths, layout, links,
-        citations, unbound, vectors, vector <vectors/name/>, shellcheck, installer
+        citations, unbound, vectors, vector <vectors/name/>, shellcheck, installer,
+        shell-tests
   lint: workspace, release, alpha, windows, windows-release
   test: workspace, docs, alpha-setup, alpha-cli, alpha-inode
   swift: test, ios, macos
@@ -201,6 +203,15 @@ fast_check() {
     vector) vector "${2:?vector directory required}" ;;
     shellcheck) step 'Installer ShellCheck' shellcheck --shell=bash scripts/install/install.sh scripts/install/tests/install.sh.test ;;
     installer) step 'Unix installer contract' bash scripts/install/tests/install.sh.test ;;
+    shell-tests)
+      step 'Release inventory fixtures' bash scripts/checks/ck-alpha-release-inventory.test
+      step 'Crate version checker fixtures' bash scripts/fleet/tests/check-wire-crate-versions.sh.test
+      step 'Module CLI face fixtures' bash scripts/fleet/tests/place-module-faces.sh
+      step 'Module reexec guard fixtures' bash scripts/fleet/tests/place-module-reexec.sh
+      step 'Module rollback fixtures' bash scripts/fleet/tests/place-module-rollback.sh
+      step 'Signing identity fixtures (stubbed tools)' bash scripts/release/test-macos-sign-notarize.sh
+      step 'Unix release archive fixtures' bash scripts/release/test-package-unix-archives.sh
+      step 'Unpublished crate detector fixtures' bash scripts/release/tests/unpublished-wire-crates.sh.test ;;
     *) invalid_check ;;
   esac
 }
@@ -247,7 +258,9 @@ test_check() {
       # Daemon tests launch feature-gated fixtures from both packages. Cargo's
       # test scheduling does not guarantee those binaries exist before a test.
       step 'Build helper binaries (test-support)' cargo build --locked -p subc-core -p subc-daemon --bins --features subc-core/test-support,subc-daemon/test-support
-      step 'Whole-workspace tests' cargo test --workspace --all-targets --locked --no-fail-fast ;;
+      step 'Whole-workspace tests' cargo test --workspace --all-targets --locked --no-fail-fast
+      # Reuse the compiled test target while also exercising its shell entry point.
+      step 'Workspace scratch fence wrapper' bash scripts/checks/test-scratch-fence.sh ;;
     docs) step 'Workspace doctests' cargo test --workspace --doc --locked ;;
     alpha-setup) step 'Alpha setup selection (nonzero tests)' alpha_logged 'test result: ok\. [1-9][0-9]* passed;' cargo test -p subc-core --lib --locked setup:: ;;
     alpha-cli) step 'Alpha CLI update-check contract' cargo test -p subc-core --test ck_cli --locked -v ;;
@@ -361,7 +374,7 @@ case "$STAGE" in
   fast)
     if [ -n "$CHECK" ]; then fast_check "$CHECK" "${3:-}"; else
       step 'Pinned vector Python prerequisite' require_vector_python
-      for check in fmt versions metadata paths layout links citations unbound vectors shellcheck installer; do fast_check "$check"; done
+      for check in fmt versions metadata paths layout links citations unbound vectors shellcheck installer shell-tests; do fast_check "$check"; done
     fi ;;
   lint)
     if [ -n "$CHECK" ]; then lint_check "$CHECK"; else collect workspace release alpha windows windows-release; fi ;;

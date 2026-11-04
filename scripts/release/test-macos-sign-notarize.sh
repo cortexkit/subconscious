@@ -17,7 +17,13 @@ trap finish EXIT
 
 mkdir -p "$FIXTURE_DIR/bin" "$FIXTURE_DIR/source" "$FIXTURE_DIR/dist"
 for binary in ck ck-subc ck-subc-mcp; do
-  printf '%s fixture\n' "$binary" > "$FIXTURE_DIR/source/$binary"
+  # Signing smoke-runs a copied binary with --version before checking identities.
+  cat > "$FIXTURE_DIR/source/$binary" <<EOF
+#!/bin/sh
+[ "\${1:-}" = --version ] || exit 64
+printf '%s\n' '$binary fixture'
+EOF
+  chmod +x "$FIXTURE_DIR/source/$binary"
 done
 
 cat > "$FIXTURE_DIR/bin/security" <<'EOF'

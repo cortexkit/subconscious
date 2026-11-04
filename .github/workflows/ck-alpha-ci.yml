@@ -8,16 +8,14 @@ on:
       - Cargo.lock
       - Cargo.toml
       - crates/subc-core/**
-      - scripts/install/**
-      - scripts/gate.sh
+      - scripts/**
   pull_request:
     paths:
       - .github/workflows/ck-alpha-ci.yml
       - Cargo.lock
       - Cargo.toml
       - crates/subc-core/**
-      - scripts/install/**
-      - scripts/gate.sh
+      - scripts/**
   workflow_dispatch:
 
 permissions:
@@ -49,13 +47,23 @@ jobs:
         run: bash scripts/gate.sh lint alpha
 
   shell-installer:
-    name: Shell installer contract
-    runs-on: ubuntu-latest
+    name: Shell contracts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v5
 
+      - uses: dtolnay/rust-toolchain@stable
+
       - name: Prove Unix installer contract
-        run: bash scripts/gate.sh fast installer
+        run: PATH="/bin:$PATH" /bin/bash scripts/gate.sh fast installer
+
+      # macOS exercises Bash 3.2; Ubuntu exercises Bash 5. Signing tools are stubbed.
+      - name: Prove shell self-tests
+        run: PATH="/bin:$PATH" /bin/bash scripts/gate.sh fast shell-tests
 
   powershell-installer:
     name: PowerShell installer contract

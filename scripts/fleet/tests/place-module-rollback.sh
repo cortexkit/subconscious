@@ -216,7 +216,7 @@ case_bad_store_restores_current_files() {
 case_good_store_restarts_module() {
   new_sandbox good-store-restarts-module
   make_binary_rollback
-  local store="$CASE_DIR/data/demo.store.db" output saved_dir
+  local store="$CASE_DIR/data/demo.store.db" output saved_dir mode
   printf 'CURRENT_DATABASE_BYTES\n' >"$store"
   printf 'CURRENT_WAL_BYTES\n' >"$store-wal"
   printf 'CURRENT_SHM_BYTES\n' >"$store-shm"
@@ -224,7 +224,10 @@ case_good_store_restarts_module() {
   output=$(invoke --place --restore-store "$store" 2>&1) \
     || { printf '%s\n' "$output" >&2; fail "valid store rollback failed"; }
   assert test "$(<"$store")" = VALID_DATABASE_SNAPSHOT
-  assert test "$(stat -f %Lp "$store" 2>/dev/null || stat -c %a "$store")" = 600
+  # GNU stat can print filesystem data before rejecting BSD's format option.
+  # Separate assignments discard that output when the fallback succeeds.
+  mode=$(stat -f %Lp "$store" 2>/dev/null) || mode=$(stat -c %a "$store")
+  assert test "$mode" = 600
   assert test "$(<"$CASE_DIR/ck-calls")" = $'stop demo\nstart demo'
   assert_contains "$output" "store integrity_check: ok"
   assert_contains "$output" "restart initiated -- verify on a lane opened AFTER this point:"

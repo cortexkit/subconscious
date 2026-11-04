@@ -43,7 +43,9 @@ write_release() {
 
   mkdir -p "$directory"
   for component in "$@"; do
-    for tuple in darwin-arm64 linux-x64 windows-x64; do
+    # Keep aligned with SUPPORTED_TUPLES in ck-alpha-release-inventory.sh;
+    # the checker has no list-only or sourceable entry point.
+    for tuple in darwin-arm64 linux-x64 linux-arm64 windows-x64 windows-arm64; do
       os="${tuple%-*}"
       arch="${tuple#*-}"
       write_asset "$directory" "${component}-${os}-${arch}.zip"

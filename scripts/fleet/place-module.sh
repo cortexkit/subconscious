@@ -1573,6 +1573,21 @@ fi
 
 if [ "$RESTART" -eq 1 ]; then
   say "=== restart"
+  # TCP PORT PRESSURE. A module whose start-up work opens many short-lived
+  # TCP connections can use up the automatic local-port range (about 16k
+  # ports with the default macOS settings) while its own health checks pass.
+  # Unrelated clients needing a port from that range then fail to connect;
+  # on 2026-11-04 a Thalamus harness build did this for six minutes and
+  # local connects failed with os error 49. Connections a process closed can
+  # stay in TIME_WAIT after their descriptors are gone, so per-process socket
+  # listings miss them; the kernel's system-wide TCP PCB count includes them.
+  # On macOS, forward placements with a restart sample that count before the
+  # restart and again after it. Rollback restarts and other systems skip it.
+  # A failed read is ignored (`|| true`): this check only ever warns.
+  tcp_before=""
+  if [ "$(uname)" = Darwin ]; then
+    tcp_before=$(sysctl -n net.inet.tcp.pcbcount 2>/dev/null || true)
+  fi
   # Checked, not piped away: a refused restart leaves the module on the old
   # inode with the new bytes on disk, which reads as placed.
   if ! restart_out=$(ck module restart "$MODULE" 2>&1); then
@@ -1607,4 +1622,16 @@ if [ "$RESTART" -eq 1 ]; then
     # SIZE of the archive, which must not move.
     say "  logs: event in the module's r2 sink ~/.local/share/cortexkit/$MODULE/logs/$MODULE.<YYYY-MM-DD>.log (timestamped)"
     say "        archive ~/.local/share/cortexkit/run/logs/$MODULE.stderr.log must not GROW ($(wc -c < ~/.local/share/cortexkit/run/logs/$MODULE.stderr.log 2>/dev/null || echo 0) bytes now); a line found there is historical"
+  if [ -n "$tcp_before" ]; then
+    sleep 20
+    tcp_after=$(sysctl -n net.inet.tcp.pcbcount 2>/dev/null || true)
+    say "tcp pcbcount: $tcp_before before restart, $tcp_after after the restart command plus a 20 s wait"
+    # A net rise of 2,000 system-wide PCBs across that window is an
+    # investigation threshold, not a measured connection rate: other activity
+    # can add PCBs and expiring TIME_WAIT entries can hide some. At the
+    # window's length it's roughly 100 new connections a second.
+    if [ -n "$tcp_after" ] && [ $((tcp_after - tcp_before)) -ge 2000 ]; then
+      say "WARNING: the system-wide TCP PCB count rose by $((tcp_after - tcp_before)) across the restart window; investigate connection churn, starting with '$MODULE's start-up work"
+    fi
+  fi
 fi

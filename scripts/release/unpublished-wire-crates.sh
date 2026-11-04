@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+finished=
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 registry_json_dir="${SUBC_REGISTRY_JSON_DIR:-}"
@@ -21,6 +22,7 @@ while (($# > 0)); do
       ;;
     -h|--help)
       usage
+      finished=1
       exit 0
       ;;
     *)
@@ -54,9 +56,18 @@ wire_crates=(
 )
 unpublished=()
 tmp_dir=$(mktemp -d)
-trap 'rm -rf "$tmp_dir"' EXIT
+finish() {
+  local rc=$?
+  rm -rf "$tmp_dir"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "unpublished-wire-crates.sh: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 
-for crate in "${wire_crates[@]}"; do
+for crate in "${wire_crates[@]}"; do # nonempty-array: literal published crate list
   manifest="$repo_root/crates/$crate/Cargo.toml"
   version=$(awk -F'"' '/^version[[:space:]]*=/ { print $2; exit }' "$manifest")
   if [[ -z "$version" ]]; then
@@ -119,5 +130,6 @@ for crate in "${wire_crates[@]}"; do
 done
 
 if ((${#unpublished[@]} > 0)); then
-  printf '%s\n' "${unpublished[@]}"
+  printf '%s\n' "${unpublished[@]}" # nonempty-array: positive length guard
 fi
+finished=1

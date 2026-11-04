@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
+finished=
 umask 000
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 installer="$repo_root/scripts/install/install.sh"
 test_root=$(mktemp -d)
-trap 'rm -rf "$test_root"' EXIT
+finish() {
+  local rc=$?
+  rm -rf "$test_root"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "install.sh.test: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 stub_dir="$test_root/stubs"
 mkdir -p "$stub_dir"
 
@@ -438,3 +448,4 @@ grep -Fq 'refusal: systemd-unavailable: Linux setup is unsupported' "$no_systemd
 [[ ! -e "$no_systemd_home/.local/share/cortexkit/bin/ck" ]] || fail 'non-WSL systemd refusal placed ck'
 
 printf 'shell installer tests passed\n'
+finished=1

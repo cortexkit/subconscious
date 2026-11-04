@@ -16,6 +16,7 @@
 # which is past the point where a wake-up report gets skipped.
 
 set -uo pipefail
+finished=
 
 ROOT="$HOME/Work/Projects/CortexKit"
 # Older than this and the redness is not a fix in progress. Deliberately shorter
@@ -248,14 +249,23 @@ probe() {
 }
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-for name in "${repos[@]}"; do
+finish() {
+  local rc=$?
+  rm -rf "$tmp"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "ci-redness.sh: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
+for name in "${repos[@]}"; do # nonempty-array: zero repos refused above
   probe "$name" "$tmp/$name" &
 done
 wait
 
 printed=0
-for name in "${repos[@]}"; do
+for name in "${repos[@]}"; do # nonempty-array: zero repos refused above
   if [ -s "$tmp/$name" ]; then
     cat "$tmp/$name"
     printed=1
@@ -276,7 +286,7 @@ done
 # per-repo sidecars rather than re-parsing the rendered lines.
 total_completed=0
 total_cancelled=0
-for name in "${repos[@]}"; do
+for name in "${repos[@]}"; do # nonempty-array: zero repos refused above
   [ -f "$tmp/$name.runs" ] || continue
   read -r c x <"$tmp/$name.runs"
   total_completed=$(( total_completed + c ))
@@ -300,3 +310,4 @@ if [ "$total_completed" -gt 0 ] && [ -z "$PORCELAIN" ]; then
       "$pct" "$total_cancelled" "$total_completed"
   fi
 fi
+finished=1

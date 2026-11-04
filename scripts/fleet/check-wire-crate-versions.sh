@@ -20,6 +20,7 @@
 # asks whether the OUTPUT can move, not whether a file did -- the same
 # discriminator a corpus regeneration check uses.
 set -uo pipefail
+finished=
 
 BASE="${1:-}"
 if [ -z "$BASE" ]; then
@@ -98,7 +99,7 @@ version_gt() {
   [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$2" ]
 }
 
-for crate in "${CRATES[@]}"; do
+for crate in ${CRATES[@]+"${CRATES[@]}"}; do
   src="crates/$crate/src"
   manifest="crates/$crate/Cargo.toml"
   [ -d "$src" ] || continue
@@ -203,7 +204,16 @@ if [ "${#bumped_crates[@]}" -gt 0 ]; then
   # committed snapshot so uncommitted manifest edits cannot hide a stale floor.
   mkdir -p target/scratch
   snapshot=$(mktemp -d "$(pwd)/target/scratch/wire-versions.XXXXXX") || exit 2
-  trap 'rm -rf "$snapshot"' EXIT
+  finish() {
+    local rc=$?
+    rm -rf "$snapshot"
+    if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+      echo "check-wire-crate-versions.sh: exited early without finishing" >&2
+      rc=1
+    fi
+    exit "$rc"
+  }
+  trap finish EXIT
   if ! git archive HEAD | tar -x -C "$snapshot"; then
     echo "  could not read committed workspace -- refusing" >&2
     exit 2
@@ -212,7 +222,7 @@ if [ "${#bumped_crates[@]}" -gt 0 ]; then
     echo "  cargo metadata failed for committed workspace -- refusing" >&2
     exit 2
   fi
-  python3 - "$snapshot" "$merge_base" "${bumped_crates[@]}" <<'PY'
+  python3 - "$snapshot" "$merge_base" "${bumped_crates[@]}" <<'PY' # nonempty-array: positive length guard
 import json
 import pathlib
 import re
@@ -312,3 +322,4 @@ if [ "$violations" -gt 0 ]; then
 fi
 
 echo "  $examined cross-repo crates examined against $BASE, version bumps and sibling requirements are consistent"
+finished=1

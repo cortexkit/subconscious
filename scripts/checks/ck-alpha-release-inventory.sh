@@ -3,6 +3,7 @@
 # The gate reads each archive's own sidecar; it deliberately does not use a
 # release-wide manifest because installers and upgrades cannot use one either.
 set -uo pipefail
+finished=
 
 readonly DEFAULT_SUBCONSCIOUS_RELEASE_URL="https://github.com/cortexkit/subconscious/releases/latest/download"
 readonly DEFAULT_AFT_RELEASE_URL="https://github.com/cortexkit/aft/releases/latest/download"
@@ -188,7 +189,7 @@ check_lane() {
 
   printf 'inventory-lane: name=%s source=%s\n' "$lane" "$release_url"
   for component in "$@"; do
-    for tuple in "${SUPPORTED_TUPLES[@]}"; do
+    for tuple in "${SUPPORTED_TUPLES[@]}"; do # nonempty-array: readonly literal tuple list
       os="${tuple%-*}"
       arch="${tuple#*-}"
       check_asset "$component" "$lane" "$release_url" "$os" "$arch"
@@ -210,6 +211,7 @@ while (($# > 0)); do
       ;;
     -h|--help)
       usage
+      finished=1
       exit 0
       ;;
     *)
@@ -239,13 +241,22 @@ if ! temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/ck-alpha-release-inventory.XXXXXX"); 
   printf 'inventory-error: could not create a temporary inventory directory\n' >&2
   exit 2
 fi
-trap 'rm -rf "$temp_dir"' EXIT
+finish() {
+  local rc=$?
+  rm -rf "$temp_dir"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "ck-alpha-release-inventory.sh: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 
 printf 'release-inventory: started supported-tuples=darwin-arm64,linux-x64,linux-arm64,windows-x64,windows-arm64\n'
-check_lane "subconscious" "$subconscious_release_url" "${SUBCONSCIOUS_BINARIES[@]}"
+check_lane "subconscious" "$subconscious_release_url" "${SUBCONSCIOUS_BINARIES[@]}" # nonempty-array: readonly literal binaries
 # AFT publication is owned by cortexkit/aft, not this repository. Keeping its
 # result in a separate lane makes the external dependency visible in the gate.
-check_lane "aft-external-dependency" "$aft_release_url" "${AFT_BINARIES[@]}"
+check_lane "aft-external-dependency" "$aft_release_url" "${AFT_BINARIES[@]}" # nonempty-array: readonly literal binary
 
 if [[ "$failed" -ne 0 ]]; then
   printf 'release-inventory: release-incomplete; do not begin the operator matrix\n' >&2
@@ -253,4 +264,5 @@ if [[ "$failed" -ne 0 ]]; then
 fi
 
 printf 'release-inventory: passed; operator matrix may begin\n'
+finished=1
 exit 0

@@ -44,7 +44,7 @@ if [[ "$shape" != "test-support: off" ]]; then
 fi
 
 mkdir -p "$DIST_DIR"
-for binary in "${BINARIES[@]}"; do
+for binary in "${BINARIES[@]}"; do # nonempty-array: three literal binaries
   source_path="${SOURCE_DIR}/${binary}"
   archive_name="${binary}-${OS}-${ARCH}.zip"
   archive_path="${DIST_DIR}/${archive_name}"

@@ -60,7 +60,7 @@ discover_consumers() {
   for repo in "$ROOT"/*/; do
     name=$(basename "$repo")
     [ -d "$repo/.git" ] || continue
-    case " ${UPSTREAMS[*]} " in *" $name "*) continue ;; esac
+    case " ${UPSTREAMS[*]} " in *" $name "*) continue ;; esac # nonempty-array: two literal upstreams
     origin=$(git -C "$repo" remote get-url origin 2>/dev/null || true)
     case "$origin" in "$ROOT"/*) continue ;; esac
     if [ "$(cat "$repo"/Cargo.toml "$repo"/crates/*/Cargo.toml 2>/dev/null \
@@ -76,7 +76,7 @@ while IFS= read -r line; do REPOS+=("$line"); done < <(discover_consumers)
 examined=0
 bad=0
 
-for name in "${UPSTREAMS[@]}"; do
+for name in "${UPSTREAMS[@]}"; do # nonempty-array: two literal upstreams
   repo="$ROOT/$name"
   [ -d "$repo/.git" ] || continue
   for manifest in "$repo"/crates/*/Cargo.toml "$repo"/cortexkit-release/Cargo.toml; do
@@ -90,7 +90,7 @@ for name in "${UPSTREAMS[@]}"; do
     fi
   done
 done
-for name in "${REPOS[@]}"; do
+for name in ${REPOS[@]+"${REPOS[@]}"}; do
   repo="$ROOT/$name"
   [ -f "$repo/Cargo.lock" ] || continue
   grep -qE 'path *= *"(\.\./|/Users/)' "$repo"/Cargo.toml "$repo"/crates/*/Cargo.toml 2>/dev/null || continue

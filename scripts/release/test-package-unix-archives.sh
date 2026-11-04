@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
+finished=
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURE_DIR="$(mktemp -d "${SCRIPT_DIR}/.test-release-package.XXXXXX")"
-trap 'rm -rf "$FIXTURE_DIR"' EXIT
+finish() {
+  local rc=$?
+  rm -rf "$FIXTURE_DIR"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "test-package-unix-archives.sh: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 
 mkdir -p "$FIXTURE_DIR/source" "$FIXTURE_DIR/dist"
 for binary in ck-subc ck-subc-mcp; do
@@ -40,3 +50,4 @@ for binary in ck ck-subc ck-subc-mcp; do
     shasum -a 256 -c "${archive_name}.sha256"
   )
 done
+finished=1

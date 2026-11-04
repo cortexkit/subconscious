@@ -45,9 +45,9 @@ for candidate in "$image.format-versions.json" \
                  "$(dirname "$image")/$(basename "$image" | sed 's/^SIGNED\.//').format-versions.json"; do
   if [ -f "$candidate" ]; then versions="$candidate"; break; fi
 done
-[ -n "$versions" ] || refuse "$module has format floors (${floors[*]}) but $image carries no format-versions map, so nothing proves it can read the stored data. If you have checked what this image reads, write $image.format-versions.json by hand and re-run."
+[ -n "$versions" ] || refuse "$module has format floors (${floors[*]}) but $image carries no format-versions map, so nothing proves it can read the stored data. If you have checked what this image reads, write $image.format-versions.json by hand and re-run." # nonempty-array: empty floors exited above
 
-python3 - "$versions" "${floors[@]}" <<'PY'
+python3 - "$versions" "${floors[@]}" <<'PY' # nonempty-array: empty floors exited above
 import json, sys
 versions_path, floor_paths = sys.argv[1], sys.argv[2:]
 try:

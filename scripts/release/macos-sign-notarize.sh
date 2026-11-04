@@ -37,7 +37,7 @@ else
   identity="$(printf '%s\n' "$developer_id_identities" | head -n 1)"
 fi
 
-for binary in "${BINARIES[@]}"; do
+for binary in "${BINARIES[@]}"; do # nonempty-array: three literal binaries
   binary_path="${SOURCE_DIR}/${binary}"
   [[ -f "$binary_path" ]] || fail "missing release binary: ${binary_path}"
 
@@ -97,7 +97,7 @@ record_staple_pending() {
   fi
 }
 
-for binary in "${BINARIES[@]}"; do
+for binary in "${BINARIES[@]}"; do # nonempty-array: three literal binaries
   archive="${DIST_DIR}/${binary}-darwin-arm64.zip"
   xcrun notarytool submit "$archive" \
     --key "$APP_STORE_CONNECT_API_KEY_PATH" \

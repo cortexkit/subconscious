@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # Exercise the release-inventory gate against local release directories.
 set -euo pipefail
+finished=
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 gate="$repo_root/scripts/checks/ck-alpha-release-inventory.sh"
 test_root=$(mktemp -d)
-trap 'rm -rf "$test_root"' EXIT
+finish() {
+  local rc=$?
+  rm -rf "$test_root"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "ck-alpha-release-inventory.test: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 
 fail() {
   printf 'test failure: %s\n' "$1" >&2
@@ -106,3 +116,4 @@ grep -Fq 'inventory-invalid: component=ck lane=subconscious archive=ck-linux-x64
   || fail 'malformed sidecar did not identify the affected archive and sidecar'
 
 printf 'ck alpha release inventory tests passed\n'
+finished=1

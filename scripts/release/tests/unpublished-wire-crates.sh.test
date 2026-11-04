@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 set -uo pipefail
+finished=
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 detector="$repo_root/scripts/release/unpublished-wire-crates.sh"
 test_root=$(mktemp -d)
-trap 'rm -rf "$test_root"' EXIT
+finish() {
+  local rc=$?
+  rm -rf "$test_root"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "unpublished-wire-crates.sh.test: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 passes=0
 failures=0
 
@@ -142,3 +152,4 @@ printf 'passes: %d failures: %d\n' "$passes" "$failures"
 if ((failures > 0)); then
   exit 1
 fi
+finished=1

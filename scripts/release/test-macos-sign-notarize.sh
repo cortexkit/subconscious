@@ -1,9 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
+finished=
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURE_DIR="$(mktemp -d "${SCRIPT_DIR}/.test-release-notarize.XXXXXX")"
-trap 'rm -rf "$FIXTURE_DIR"' EXIT
+finish() {
+  local rc=$?
+  rm -rf "$FIXTURE_DIR"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "test-macos-sign-notarize.sh: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 
 mkdir -p "$FIXTURE_DIR/bin" "$FIXTURE_DIR/source" "$FIXTURE_DIR/dist"
 for binary in ck ck-subc ck-subc-mcp; do
@@ -50,3 +60,4 @@ if [[ -e "$FIXTURE_DIR/notarytool-invoked" ]]; then
   echo "mixed-identity fixture reached notarization" >&2
   exit 1
 fi
+finished=1

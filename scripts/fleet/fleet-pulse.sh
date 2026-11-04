@@ -1008,7 +1008,7 @@ hr_examined=0; hr_now=""; hr_examined_now=""
 # macOS boxes whose stock /usr/bin/env bash is 3.2.
 IFS=: read -r -a _hr_roots <<< "${FLEET_PULSE_ROOTS:-$HOME/Work/Projects/CortexKit}"
 _hr_seen=""
-for _root in "${_hr_roots[@]}"; do
+for _root in ${_hr_roots[@]+"${_hr_roots[@]}"}; do
   [ -n "$_root" ] || continue
   for _r in "$_root"/*/; do
     _repo="${_r%/}"

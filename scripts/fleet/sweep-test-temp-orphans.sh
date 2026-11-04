@@ -78,7 +78,7 @@ PREFIXES=(
 # match directories only (the orphans are dirs; the .json cache files are files
 # and are swept by their parent dir's removal).
 CANDIDATES=()
-for prefix in "${PREFIXES[@]}"; do
+for prefix in "${PREFIXES[@]}"; do # nonempty-array: literal prefix list
   while IFS= read -r entry; do
     [ -n "$entry" ] && CANDIDATES+=("$entry")
   done < <(find "$TMP_ROOT" -maxdepth 1 -type d -name "$prefix" 2>/dev/null)
@@ -137,7 +137,7 @@ MANIFEST="$(mktemp "${TMP_ROOT}/subc-test-temp-sweep-manifest.XXXXXX")"
   echo "# subc test-temp orphan sweep manifest"
   echo "# generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "# age threshold: ${AGE_MINUTES}m"
-  for entry in "${ORPHANS[@]}"; do
+  for entry in "${ORPHANS[@]}"; do # nonempty-array: zero orphans exited above
     echo "$entry"
   done
 } >"$MANIFEST"
@@ -152,7 +152,7 @@ fi
 # attempted and its failure is reported, not swallowed.
 removed=0
 failed=0
-for entry in "${ORPHANS[@]}"; do
+for entry in "${ORPHANS[@]}"; do # nonempty-array: zero orphans exited above
   if rm -rf -- "$entry"; then
     removed=$((removed + 1))
   else

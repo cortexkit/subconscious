@@ -7,6 +7,7 @@
 #
 # Usage: scripts/release-darwin-binaries.sh subc-core-v0.1.0
 set -euo pipefail
+finished=
 
 TAG="${1:?usage: $0 subc-core-v<version>}"
 TARGET_NAME="darwin-arm64"
@@ -25,7 +26,7 @@ WORKFLOW=".github/workflows/release.yml"
 # a line-oriented substitution yields only the last match on that line.
 read -r -a BINS <<<"$(grep -oE -- '--bin [a-z0-9-]+' "$WORKFLOW" | awk '{print $2}' | sort -u | tr '\n' ' ')"
 (( ${#BINS[@]} > 0 )) || { echo "derived an empty binary list from ${WORKFLOW}" >&2; exit 1; }
-echo "binaries derived from ${WORKFLOW}: ${BINS[*]}"
+echo "binaries derived from ${WORKFLOW}: ${BINS[*]}" # nonempty-array: positive length check above
 
 [[ "$TAG" =~ ^subc-core-v([0-9].*)$ ]] || { echo "tag must be subc-core-v<version>" >&2; exit 1; }
 VERSION="${BASH_REMATCH[1]}"
@@ -44,8 +45,17 @@ cargo build --release --locked -p subc-core -p subc-mcp \
   --bin ck-subc --bin subc-probe --bin ck --bin fake-aft-stub --bin ck-subc-mcp
 
 DIST=$(mktemp -d)
-trap 'rm -rf "$DIST"' EXIT
-for bin in "${BINS[@]}"; do
+finish() {
+  local rc=$?
+  rm -rf "$DIST"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "release-darwin-binaries.sh: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
+for bin in "${BINS[@]}"; do # nonempty-array: positive length check above
   tar -C target/release -czf "${DIST}/${bin}-${TARGET_NAME}.tar.gz" "$bin"
   shasum -a 256 "${DIST}/${bin}-${TARGET_NAME}.tar.gz" | awk '{print $1}' \
     > "${DIST}/${bin}-${TARGET_NAME}.tar.gz.sha256"
@@ -55,3 +65,4 @@ done
 gh release upload "$TAG" "$DIST"/* --repo "$REPO" --clobber
 echo "uploaded ${TARGET_NAME} assets to ${TAG}:"
 ls -la "$DIST"
+finished=1

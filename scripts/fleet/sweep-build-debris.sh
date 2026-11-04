@@ -32,6 +32,7 @@
 # Usage: sweep-build-debris.sh [--root DIR] [--idle-days N] [--dry-run]
 # Scheduled daily by the cortexkit.build-sweep launch agent.
 set -u
+finished=
 # BSD stat, the APFS data volume and lsof's output are assumed below; on another
 # system an age read would fail for every directory.
 [ "$(uname -s)" = Darwin ] || { echo "sweep-build-debris.sh runs on macOS only" >&2; exit 69; }
@@ -76,7 +77,16 @@ RUN=~/.local/share/cortexkit/run
 mkdir -p "$RUN"
 MANIFEST="$RUN/build-sweep-$(date -u +%Y%m%dT%H%M%SZ).manifest"
 OPEN=$(mktemp -t build-sweep-open)
-trap 'rm -f "$OPEN"' EXIT
+finish() {
+  local rc=$?
+  rm -f "$OPEN"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "sweep-build-debris.sh: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 : > "$MANIFEST"
 echo "$(stamp) sweep start: root $ROOT, free ${B} GiB$([ "$DRY" = 1 ] && echo ', dry run')"
 
@@ -140,3 +150,4 @@ if [ "$DRY" = 1 ]; then
 else
   echo "$(stamp) freed $((A-B)) GiB by df delta; free now ${A} GiB"
 fi
+finished=1

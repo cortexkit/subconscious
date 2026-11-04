@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
+finished=
 
 repo_root=$(cd "$(dirname "$0")/../../.." && pwd)
 checker="$repo_root/scripts/fleet/check-wire-crate-versions.sh"
 mkdir -p "$repo_root/target/scratch"
 sandbox=$(mktemp -d "$repo_root/target/scratch/check-wire-versions.XXXXXX")
-trap 'rm -rf "$sandbox"' EXIT
+finish() {
+  local rc=$?
+  rm -rf "$sandbox"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "check-wire-crate-versions.sh.test: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 
 new_fixture() {
   fixture="$sandbox/$1"
@@ -213,7 +223,7 @@ tests=(stale_requirement updated_requirement unchanged_dependent manifest_only_d
   renamed_target_dependency committed_requirements_only requirement_operators
   inherited_dependency dependent_outside_crates)
 count=0
-for test in "${tests[@]}"; do
+for test in "${tests[@]}"; do # nonempty-array: literal test list
   if [ "${1:-all}" != all ] && [ "$1" != "$test" ]; then
     continue
   fi
@@ -223,3 +233,4 @@ for test in "${tests[@]}"; do
 done
 [ "$count" -gt 0 ] || { echo "Unknown test: $1" >&2; exit 2; }
 printf '%s version-check tests passed\n' "$count"
+finished=1

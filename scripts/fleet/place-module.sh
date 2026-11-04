@@ -289,7 +289,7 @@ PY
 face_is_declared() {
   local name
   [ "${#FACE_NAMES[@]}" -gt 0 ] || return 1
-  for name in "${FACE_NAMES[@]}"; do
+  for name in "${FACE_NAMES[@]}"; do # nonempty-array: positive length guard
     [ "$name" = "$1" ] && return 0
   done
   return 1
@@ -310,7 +310,7 @@ prepare_cli_face_plan() {
     fi
     reserved_output=$("$ck_command" --ck-cli-face-reserved-names) \
       || refuse "could not read reserved CLI face names from $ck_command"
-    for name in "${FACE_NAMES[@]}"; do
+    for name in "${FACE_NAMES[@]}"; do # nonempty-array: positive length guard
       while IFS= read -r reserved; do
         [ "$reserved" = "$name" ] \
           && refuse "CLI face '$name' is a built-in ck command and cannot be placed"
@@ -319,7 +319,7 @@ prepare_cli_face_plan() {
   fi
 
   if [ "${#FACE_NAMES[@]}" -gt 0 ]; then
-    for name in "${FACE_NAMES[@]}"; do
+    for name in "${FACE_NAMES[@]}"; do # nonempty-array: positive length guard
       face_path="$BIN_DIR/ck-$name"
       if [ -L "$face_path" ]; then
         if face_link_resolves_to_dest "$face_path"; then
@@ -352,17 +352,17 @@ print_cli_face_plan() {
     present)
       local name link
       if [ "${#FACE_CREATE_NAMES[@]}" -gt 0 ]; then
-        for name in "${FACE_CREATE_NAMES[@]}"; do
+        for name in "${FACE_CREATE_NAMES[@]}"; do # nonempty-array: positive length guard
           say "cli face: would create ck-$name -> $DEST"
         done
       fi
       if [ "${#FACE_KEEP_NAMES[@]}" -gt 0 ]; then
-        for name in "${FACE_KEEP_NAMES[@]}"; do
+        for name in "${FACE_KEEP_NAMES[@]}"; do # nonempty-array: positive length guard
           say "cli face: would keep ck-$name -> $DEST"
         done
       fi
       if [ "${#FACE_REMOVE_PATHS[@]}" -gt 0 ]; then
-        for link in "${FACE_REMOVE_PATHS[@]}"; do
+        for link in "${FACE_REMOVE_PATHS[@]}"; do # nonempty-array: positive length guard
           say "cli face: would remove ${link##*/} -> $DEST"
         done
       fi ;;
@@ -384,12 +384,12 @@ PY
   ) || refuse "could not compute a relative CLI face target for $DEST"
 
   if [ "${#FACE_KEEP_NAMES[@]}" -gt 0 ]; then
-    for name in "${FACE_KEEP_NAMES[@]}"; do
+    for name in "${FACE_KEEP_NAMES[@]}"; do # nonempty-array: positive length guard
       say "cli face: kept ck-$name -> $DEST"
     done
   fi
   if [ "${#FACE_CREATE_NAMES[@]}" -gt 0 ]; then
-    for name in "${FACE_CREATE_NAMES[@]}"; do
+    for name in "${FACE_CREATE_NAMES[@]}"; do # nonempty-array: positive length guard
       face_path="$BIN_DIR/ck-$name"
       if [ -L "$face_path" ]; then
         if face_link_resolves_to_dest "$face_path"; then
@@ -411,7 +411,7 @@ PY
     done
   fi
   if [ "${#FACE_REMOVE_PATHS[@]}" -gt 0 ]; then
-    for link in "${FACE_REMOVE_PATHS[@]}"; do
+    for link in "${FACE_REMOVE_PATHS[@]}"; do # nonempty-array: positive length guard
       # Re-read immediately before unlinking so a user-replaced link survives.
       if face_link_resolves_to_dest "$link"; then
         rm "$link" || refuse "could not remove stale CLI face ${link##*/}"
@@ -1544,7 +1544,7 @@ reconcile_cli_faces
 prune="$(dirname "$0")/prune-rollbacks.sh"
 prune_names=("$(basename "$DEST")")
 [ -n "$MIGRATES" ] && prune_names+=("$MODULE.$(basename "$MIGRATES")")
-if ! CK_STAGING="$STAGING" "$prune" --keep 3 --apply "${prune_names[@]}"; then
+if ! CK_STAGING="$STAGING" "$prune" --keep 3 --apply "${prune_names[@]}"; then # nonempty-array: seeded with destination basename
   say "WARNING: rollback prune failed; the placement itself succeeded and older rollbacks were kept"
 fi
 

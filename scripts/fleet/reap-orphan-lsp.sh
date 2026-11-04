@@ -55,7 +55,7 @@ if [ "$control_ok" -eq 0 ]; then
 fi
 
 alive=0; orphan=0; unreachable=0; orphans=()
-for p in "${PIDS[@]}"; do
+for p in "${PIDS[@]}"; do # nonempty-array: zero PIDS exited above
   c=$(cwd_of "$p")
   # An EMPTY cwd is a null result, not evidence of a dead root. Only a path that
   # is present and gone from disk counts as an orphan.
@@ -77,14 +77,14 @@ echo "orphan roots: $orphan"
 [ "$unreachable" -gt 0 ] && echo "unreachable trees (spared, not orphans): $unreachable"
 [ "$orphan" -eq 0 ] && exit 0
 
-printf '  %s\n' "${orphans[@]}" | head -30
+printf '  %s\n' "${orphans[@]}" | head -30 # nonempty-array: zero orphan count exited above
 if [ "$APPLY" -eq 0 ]; then echo "(dry run; pass --apply to reap)"; exit 0; fi
 
 free_before=$(vm_stat | awk '/Pages free/{printf "%.2f", $3*16384/1073741824}')
-kill -TERM "${orphans[@]}" 2>/dev/null
+kill -TERM "${orphans[@]}" 2>/dev/null # nonempty-array: zero orphan count exited above
 sleep 8
 survivors=0
-for p in "${orphans[@]}"; do ps -p "$p" >/dev/null 2>&1 && survivors=$((survivors+1)); done
+for p in "${orphans[@]}"; do ps -p "$p" >/dev/null 2>&1 && survivors=$((survivors+1)); done # nonempty-array: zero orphan count exited above
 sleep 30
 free_after=$(vm_stat | awk '/Pages free/{printf "%.2f", $3*16384/1073741824}')
 echo "reaped $orphan, survivors after 8s: $survivors"

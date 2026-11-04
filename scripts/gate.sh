@@ -57,7 +57,7 @@ Version comparisons:
 
 CI adapters (optional [check], for the existing job boundaries and conditions):
   fast: fmt, versions, metadata, metadata-online, paths, layout, links,
-        citations, vectors, vector <vectors/name/>, shellcheck, installer
+        citations, unbound, vectors, vector <vectors/name/>, shellcheck, installer
   lint: workspace, release, alpha, windows, windows-release
   test: workspace, docs, alpha-setup, alpha-cli, alpha-inode
   swift: test, ios, macos
@@ -92,6 +92,7 @@ CHECK=${2:-}
 CURRENT_STEP=initialization
 CHECKS=0
 SCRATCH=
+finished=
 
 finish() {
   local rc=$?
@@ -102,6 +103,10 @@ finish() {
     fi
   fi
   if [ -n "$SCRATCH" ]; then rm -rf "$SCRATCH"; fi
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo '[gate] exited early without finishing (possible unbound variable)' >&2
+    rc=1
+  fi
   if [ "$rc" -eq 0 ]; then
     printf '[gate] PASS %s%s (%s checks)\n' "$STAGE" "${CHECK:+/$CHECK}" "$CHECKS"
   else
@@ -189,6 +194,9 @@ fast_check() {
     layout) step 'CortexKit layout and tracked ignored files' bash scripts/check-cortexkit-layout.sh ;;
     links) step 'Markdown links' python3 scripts/checks/check-md-links.py ;;
     citations) step 'Documentation test citations' python3 scripts/checks/check-doc-test-citations.py ;;
+    unbound)
+      step 'Unbound-variable fail-open hazards' bash scripts/checks/no-unbound-fail-open.sh
+      step 'Unbound-variable checker tests' bash scripts/checks/no-unbound-fail-open.test.sh ;;
     vectors) vectors ;;
     vector) vector "${2:?vector directory required}" ;;
     shellcheck) step 'Installer ShellCheck' shellcheck --shell=bash scripts/install/install.sh scripts/install/tests/install.sh.test ;;
@@ -330,7 +338,7 @@ ts_check() {
 }
 
 case "$STAGE" in
-  -h|--help|help) usage; exit 0 ;;
+  -h|--help|help) usage; finished=1; exit 0 ;;
   fast|lint|test|swift|ts|all) ;;
   *) usage >&2; exit 2 ;;
 esac
@@ -344,6 +352,7 @@ if [ "$STAGE" = all ]; then
     esac
     if bash "$ROOT/scripts/gate.sh" "$stage"; then :; else result=1; fi
   done
+  finished=1
   exit "$result"
 fi
 
@@ -352,7 +361,7 @@ case "$STAGE" in
   fast)
     if [ -n "$CHECK" ]; then fast_check "$CHECK" "${3:-}"; else
       step 'Pinned vector Python prerequisite' require_vector_python
-      for check in fmt versions metadata paths layout links citations vectors shellcheck installer; do fast_check "$check"; done
+      for check in fmt versions metadata paths layout links citations unbound vectors shellcheck installer; do fast_check "$check"; done
     fi ;;
   lint)
     if [ -n "$CHECK" ]; then lint_check "$CHECK"; else collect workspace release alpha windows windows-release; fi ;;
@@ -371,3 +380,4 @@ case "$STAGE" in
   ts)
     if [ -n "$CHECK" ]; then ts_check "$CHECK" "${3:-}"; else collect subc-client store log private-files; fi ;;
 esac
+finished=1

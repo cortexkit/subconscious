@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
+finished=
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 repo_root=$(cd -- "$script_dir/../.." && pwd -P)
 check="$script_dir/no-external-path-deps.sh"
 test_root=$(mktemp -d)
-trap 'rm -rf "$test_root"' EXIT
+finish() {
+  local rc=$?
+  rm -rf "$test_root"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "no-external-path-deps.test.sh: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 
 fail() {
   printf 'test failure: %s\n' "$1" >&2
@@ -151,3 +161,4 @@ if ! grep -F 'check itself failed' "$parser_output" >/dev/null; then
   fail 'an unreadable manifest did not report that the check itself failed'
 fi
 printf 'PASS: parser/input error is distinct from violation (exit %s)\n' "$parser_status"
+finished=1

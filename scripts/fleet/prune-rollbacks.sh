@@ -18,6 +18,7 @@
 #   No names: every name found in staging, except the refused legacy one.
 #   Default is a dry run; --apply unlinks.
 set -euo pipefail
+finished=
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 KEEP=3
@@ -41,8 +42,17 @@ if [ "${#names[@]}" -eq 0 ]; then
 fi
 
 list=$(mktemp)
-trap 'rm -f "$list"' EXIT
-for name in "${names[@]}"; do
+finish() {
+  local rc=$?
+  rm -f "$list"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "prune-rollbacks.sh: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
+for name in ${names[@]+"${names[@]}"}; do
   if [ "$name" = "store.db" ]; then
     echo "skipped: store.db (legacy store snapshots of several modules share this name; prune by hand after identifying each)"
     continue
@@ -54,6 +64,7 @@ done
 count=$(wc -l < "$list" | tr -d ' ')
 if [ "$count" -eq 0 ]; then
   echo "nothing to prune: every name has at most $KEEP rollbacks"
+  finished=1
   exit 0
 fi
 
@@ -71,7 +82,9 @@ echo "manifest: $manifest ($count rollbacks, $((bytes / 1048576)) MiB)"
 
 if [ "$APPLY" -ne 1 ]; then
   echo "dry run: would unlink $count rollback(s) and their sidecars; pass --apply"
+  finished=1
   exit 0
 fi
 while read -r f; do rm -f "$f" "$f.sha256" "$f.format-versions.json"; done < "$list"
 echo "unlinked $count rollback(s) and their sidecars"
+finished=1

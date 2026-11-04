@@ -84,6 +84,7 @@
 #   3  the default branch kept moving through 3 re-queue rounds, or the rebase
 #      conflicted
 set -euo pipefail
+finished=
 
 # Run from a private copy of this file. bash reads a script incrementally, so an
 # edit to scripts/train-push.sh while a train is watching CI (a pick of a
@@ -97,7 +98,16 @@ if [ -z "${TRAIN_PUSH_EXEC_COPY:-}" ]; then
   TRAIN_PUSH_EXEC_COPY="$train_push_copy" TRAIN_PUSH_SOURCE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")" \
     exec bash "$train_push_copy" "$@"
 fi
-trap 'rm -f "$TRAIN_PUSH_EXEC_COPY"' EXIT
+finish() {
+  local rc=$?
+  rm -f "$TRAIN_PUSH_EXEC_COPY"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "train-push.sh: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 
 script_dir="$(dirname "${TRAIN_PUSH_SOURCE:-${BASH_SOURCE[0]}}")"
 repo_root="$(git rev-parse --show-toplevel)"
@@ -408,7 +418,7 @@ warn_repo_local_pre_push() {
     esac
   fi
 
-  for hook in "${candidates[@]}"; do
+  for hook in "${candidates[@]}"; do # nonempty-array: seeded with repo-local hook
     [ -f "$hook" ] && [ -x "$hook" ] || continue
     {
       printf 'train-push: WARNING — repo-local pre-push hook: %s\n' "$hook"
@@ -657,14 +667,14 @@ fi
 if [ "${#preflights_ran[@]}" -eq 0 ]; then
   say "preflights: none (no repo-local preflight scripts present)"
 else
-  say "preflights: ${preflights_ran[*]}"
+  say "preflights: ${preflights_ran[*]}" # nonempty-array: zero-length branch is above
 fi
 
 # ---------------------------------------------------------------------------
 # Optional local smoke
 # ---------------------------------------------------------------------------
 if [ "$smoke_given" -eq 1 ]; then
-  say "local smoke: ${smoke_cmd[*]}"
+  say "local smoke: ${smoke_cmd[*]}" # nonempty-array: smoke_given requires command arguments
   set +e
   if [ "${#smoke_cmd[@]}" -eq 1 ]; then
     # A single argument is a shell string, which may be a pipeline. Without
@@ -675,12 +685,12 @@ ${smoke_cmd[0]}"
   else
     # Argv form runs bare: this script adds no pipe of its own, so the
     # command's own status is the status we read.
-    "${smoke_cmd[@]}"
+    "${smoke_cmd[@]}" # nonempty-array: smoke_given requires command arguments
   fi
   smoke_rc=$?
   set -e
   if [ "$smoke_rc" -ne 0 ]; then
-    refuse "local smoke failed (rc=$smoke_rc): ${smoke_cmd[*]}"
+    refuse "local smoke failed (rc=$smoke_rc): ${smoke_cmd[*]}" # nonempty-array: smoke_given requires command arguments
   fi
   say "local smoke ok"
 fi
@@ -703,7 +713,16 @@ watch_log="$(mktemp "${TMPDIR:-/tmp}/train-push-watch.XXXXXX")"
 push_log="$(mktemp "${TMPDIR:-/tmp}/train-push-push.XXXXXX")"
 # Replaces the EXIT trap set at the top (bash traps are global), so the
 # private script copy is named here too.
-trap 'rm -f "$watch_log" "$push_log" "$TRAIN_PUSH_EXEC_COPY"' EXIT
+finish() {
+  local rc=$?
+  rm -f "$watch_log" "$push_log" "$TRAIN_PUSH_EXEC_COPY"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "train-push.sh: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 
 # What we believe $remote/$train_ref points at. Tracked explicitly so every
 # re-push leases against the sha WE pushed instead of trusting a remote-tracking
@@ -907,3 +926,4 @@ if ! git push -q "$remote" --delete "$train_ref"; then
   printf 'train-push: warning — could not delete %s/%s (delete it by hand)\n' "$remote" "$train_ref" >&2
 fi
 say "done"
+finished=1

@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
+finished=
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 PLACE_SCRIPT="$ROOT/scripts/fleet/place-module.sh"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/place-module-rollback.XXXXXX")
-trap 'rm -rf "$TEST_ROOT"' EXIT
+finish() {
+  local rc=$?
+  rm -rf "$TEST_ROOT"
+  if [ "$rc" -eq 0 ] && [ "${finished:-}" != 1 ]; then
+    echo "place-module-rollback.sh: exited early without finishing" >&2
+    rc=1
+  fi
+  exit "$rc"
+}
+trap finish EXIT
 
 CASE_NAME=""
 CASE_DIR=""
@@ -275,3 +285,4 @@ if [ "$#" -eq 0 ] || [ "$1" = all ]; then
 else
   run_case "$1"
 fi
+finished=1

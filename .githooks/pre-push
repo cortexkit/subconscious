@@ -265,9 +265,18 @@ if command -v gh >/dev/null 2>&1; then
   # bound is now DERIVED rather than guessed, which it was when first written:
   #
   #   floor = one cron period (24h) + the observed maximum delay
-  #         = 24h + 5h36m ~= 29.6h      ->  48h clears it with margin
+  #         = 24h + 8h19m ~= 32.3h      ->  48h still clears it
   #
-  # Measured 2026-09-20, three repos, raw distributions not summaries:
+  # Measured 2026-11-05 over 10-20..11-05, the same three repos:
+  #   subconscious  `17 3`  range +4h58m..+8h07m
+  #   cerebellum    `17 4`  range +4h36m..+8h09m
+  #   fusiform      `0 6`   range +4h02m..+8h19m
+  # The delay is NOT stationary: in late October it rose about 70 minutes a
+  # week with no clock change in between, and the maximum moved from 5h36m
+  # (measured 2026-09-20) to 8h19m. If that rate held, the floor would reach
+  # 48h within about 14 weeks, so re-read the series before trusting the bound.
+  #
+  # First measured 2026-09-20, three repos, raw distributions not summaries:
   #   subconscious  `0 6`   n=14  mean +4h19m  range +3h40m..+5h02m
   #   fusiform      `0 6`   n=13  mean +4h31m  range +3h50m..+5h19m
   #   cerebellum    `17 4`  n=14  mean +4h54m  range +4h22m..+5h36m

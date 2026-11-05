@@ -78,6 +78,12 @@ with tempfile.TemporaryDirectory(prefix="unbound-check-", dir=scratch) as direct
     fixture("bash shebang without suffix scanned", [
         "#!/usr/bin/env bash", "set -u", 'echo "DOLLAR{values[@]}"',
     ], "whole-array pattern lacks safe form", "scripts/check")
+    fixture("sh shebang without suffix scanned", [
+        "#!/bin/sh", "set -u", "trap 'true' EXIT",
+    ], "missing finished=1", "scripts/sh-check")
+    fixture("git hook scanned", [
+        "#!/bin/sh", "set -u", "trap 'true' EXIT",
+    ], "missing finished=1", ".githooks/pre-push")
     fixture("action shell script scanned", [
         "#!/usr/bin/env bash", "set -u", 'echo "DOLLAR{values[@]}"',
     ], "whole-array pattern lacks safe form", ".github/actions/example/run.sh")

@@ -48,10 +48,11 @@ for name in sorted(filter(None, paths)):
     if not path.is_file():
         continue
     candidate = name.endswith((".sh", ".test"))
-    if not candidate and not name.startswith(("scripts/", ".github/actions/")):
+    if not candidate and not name.startswith(("scripts/", ".github/actions/", ".githooks/")):
         continue
     text = path.read_text(errors="replace")
-    if not candidate and not re.match(r"^#![^\n]*\bbash\b", text):
+    # macOS /bin/sh is the same bash 3.2, so an `sh` shebang is exposed too.
+    if not candidate and not re.match(r"^#![^\n]*\b(?:bash|sh)\b", text):
         continue
     text = re.sub(r"(?m)^[ \t]*#.*$", "", text)
     if not uses_nounset(text):

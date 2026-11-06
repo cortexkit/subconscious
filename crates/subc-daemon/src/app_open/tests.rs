@@ -573,18 +573,48 @@ mod linux_tests {
         }
     }
 
+    /// Write `contents` to `path` as an executable script that a test will
+    /// then launch.
+    ///
+    /// Do not replace this with `std::fs::write`. Tests run on many threads,
+    /// and any of them may fork for a `Command::spawn`. A child forked while
+    /// this process holds a writable descriptor on the script keeps that
+    /// descriptor until it reaches `execve`, and a launch of the script in
+    /// that window fails with `ETXTBSY` ("Text file busy"). Here `sh` opens
+    /// the file and `cat` fills it from a pipe, so this process only ever
+    /// holds the pipe, which cannot block an exec.
+    fn write_executable(path: &std::path::Path, contents: &str) {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"cat > "$1""#, "write_executable"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("start sh for an executable fixture");
+        {
+            let mut stdin = child.stdin.take().expect("pipe to the fixture writer");
+            stdin
+                .write_all(contents.as_bytes())
+                .expect("send executable fixture contents");
+            // Dropping the pipe here sends end-of-file so `cat` finishes.
+        }
+        let status = child.wait().expect("wait for the fixture writer");
+        assert!(
+            status.success(),
+            "writing executable fixture {} failed: {status}",
+            path.display()
+        );
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// A genuinely long-lived installed file: `app.open` passes no
     /// arguments, and bare `/bin/sleep` exits at once with a usage error,
     /// so the fixture is a script that sleeps. The script content is
     /// static; only its path varies.
     fn sleeper(dir: &cortexkit_test_support::ScratchDir) -> PathBuf {
         let path = dir.join("sleeper.sh");
-        std::fs::write(&path, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_executable(&path, "#!/bin/sh\nexec /bin/sleep 30\n");
         path
     }
 
@@ -721,16 +751,10 @@ mod linux_tests {
         // trailing sentinel proves the dump is complete: the test polls for
         // it instead of trusting the file's mere existence, which
         // redirection creates before `env` finishes writing.
-        std::fs::write(
+        write_executable(
             &probe,
             "#!/bin/sh\n/usr/bin/env > \"$SUBC_APP_OPEN_ENV_DUMP\"\necho done >> \"$SUBC_APP_OPEN_ENV_DUMP\"\nexec /bin/sleep 30\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let handler =
             ControlHandler::default().with_test_operator_app_policy(linux_policy(probe.clone()));
         let pid = handler

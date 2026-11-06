@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.39.4
+
+- Test-only: the Linux `app.open` tests write their launch scripts through a
+  short-lived `sh` child, so a child forked by a parallel test can't inherit a
+  writable descriptor and make the launch fail with "Text file busy". No
+  change to the daemon itself.
+
 ## 0.39.3
 
 - On Windows, when the connection file falls back to the system temporary

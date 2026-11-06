@@ -1,5 +1,5 @@
-//! The module durables bootstrap creates: one durable per module that reads a
-//! non-agent stream, named `m_{module_id}` by the naming crate.
+//! The non-agent durables bootstrap creates: module readers named `m_{module_id}`
+//! and dead-letter diagnostics named `c_ckbus_dead` by the naming crate.
 //!
 //! - `m_basal` on the event stream, filtered on every module event
 //!   (`ck.{acct}.event.>`): the flow engine reads all of them through one cursor and
@@ -16,10 +16,12 @@
 //! Event-reader settings come from the naming crate's shared builder. The ROOM reader
 //! uses the same pull settings. Reconciliation may update a durable, but never deletes
 //! one: deleting it would discard the module's acknowledgement floor.
+//! Reliable command readers on INBOX and CORE_WORK and diagnostics on both dead-letter
+//! streams come from the naming crate's delivery-consumer table.
 
 use cortexkit_bus_naming::{
-    event_consumer_specs, flow_engine_consumer_spec, shipped_streams, validate_consumer,
-    AccountNames, AckPolicy, ConsumerSpec, DeliverPolicy,
+    delivery_consumer_specs, event_consumer_specs, flow_engine_consumer_spec, shipped_streams,
+    validate_consumer, AccountNames, AckPolicy, ConsumerSpec, DeliverPolicy,
 };
 
 use super::plane::DurableConsumer;
@@ -39,7 +41,7 @@ pub fn planned(names: &AccountNames) -> Result<Vec<DurableConsumer>, String> {
         filter_subjects: vec![names.room_binding()],
     };
     let table = event_consumer_specs(names).map_err(|error| error.to_string())?;
-    std::iter::once(flow)
+    let mut durables = std::iter::once(flow)
         .chain(table)
         .chain(std::iter::once(room))
         .map(|spec| {
@@ -63,5 +65,21 @@ pub fn planned(names: &AccountNames) -> Result<Vec<DurableConsumer>, String> {
                 max_ack_pending: spec.max_ack_pending,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    for spec in delivery_consumer_specs(names).map_err(|error| error.to_string())? {
+        let AckPolicy::Explicit = spec.ack_policy;
+        let DeliverPolicy::All = spec.deliver_policy;
+        if !spec.pull {
+            return Err(format!("{} must be a pull consumer", spec.consumer.durable));
+        }
+        durables.push(DurableConsumer {
+            stream: spec.consumer.stream,
+            durable: spec.consumer.durable,
+            filter_subjects: spec.consumer.filter_subjects,
+            ack_wait: spec.ack_wait,
+            max_deliver: spec.max_deliver,
+            max_ack_pending: spec.max_ack_pending,
+        });
+    }
+    Ok(durables)
 }

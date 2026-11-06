@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0
+
+- Adopt cortexkit-bus-naming 0.3.0, bus-trait 0.3.1, bus-nats 0.4.0 and
+  bus-inmemory 0.3.2. Bootstrap creates INBOX, CORE_WORK and DELIVERY_DEAD and
+  the durables specified by bus-naming, including `m_prefrontal-core` on the two command
+  streams and `c_ckbus_dead` on both dead-letter streams.
+- Extend the existing stream-limit reconciliation path: EFFECT loses its 24-hour
+  age eviction and gains a 16 KiB message cap through an in-place update that
+  preserves messages and stream identity. Both dead-letter streams explicitly
+  use a 120-second duplicate window. Unset message caps and duplicate windows
+  are omitted from the wire configuration, not sent as zero.
+- Refresh the vendored permission golden and provenance from bus-naming 0.3.0:
+  only new delivery publish, durable and refusal rows. The live-only golden stays
+  unchanged because these streams do not carry events or live hints. The minor
+  bump marks the new reliable-delivery provisioning contract
+  and adoption of the breaking shared naming API.
+
 ## 0.4.22
 
 - Complete revocations whose recorded kick targets belong to an old server

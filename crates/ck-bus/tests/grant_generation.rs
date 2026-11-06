@@ -136,6 +136,60 @@ fn golden_allows(golden: &str, principal: Principal, operation: Operation) -> BT
 }
 
 #[test]
+fn reliable_delivery_grants_are_authority_only_and_scoped_to_its_durables() {
+    let account = grants::derive_account("box_deliverygrants").unwrap();
+    let participant = grants::issued_grant(&account, "runner-one", "credential", &[]).unwrap();
+    let authority = grants::issued_grant(&account, "prefrontal-core", "credential", &[]).unwrap();
+    let permits = |grant: &grants::Grant, subject: &str| {
+        grant
+            .publish_allow()
+            .iter()
+            .any(|pattern| subject_matches(pattern, subject))
+    };
+    for suffix in [
+        "inbox.head.token.ready",
+        "inbox.worker.token.ready",
+        "core_work.effect.token.run",
+        "core_work.consult.token.run",
+        "core_work.work.token.run",
+        "core_work.campaign.token.run",
+        "core_work.hire.token.run",
+        "core_work.spec.token.run",
+        "delivery.dead",
+    ] {
+        let subject = format!("ck.box_deliverygrants.{suffix}");
+        assert!(permits(&authority, &subject), "{subject}");
+        assert!(!permits(&participant, &subject), "{subject}");
+    }
+    for stream in ["INBOX", "CORE_WORK"] {
+        for subject in [
+            format!("$JS.ACK.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal-core.1"),
+            format!("$JS.API.CONSUMER.MSG.NEXT.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal-core"),
+            format!("$JS.API.CONSUMER.INFO.CK_BOX_DELIVERYGRANTS_{stream}.m_prefrontal-core"),
+        ] {
+            assert!(permits(&authority, &subject), "{subject}");
+            assert!(!permits(&participant, &subject), "{subject}");
+            assert!(!permits(
+                &authority,
+                &subject.replace("m_prefrontal-core", "m_other")
+            ));
+        }
+        assert!(!permits(
+            &authority,
+            &format!("$JS.API.CONSUMER.CREATE.CK_BOX_DELIVERYGRANTS_{stream}")
+        ));
+    }
+    for subject in [
+        "ck.box_deliverygrants.core_work.unknown.token.run",
+        "ck.box_deliverygrants.inbox.unknown.token.ready",
+        "ck.foreign.inbox.head.token.ready",
+        "$JS.API.CONSUMER.MSG.NEXT.CK_BOX_DELIVERYGRANTS_DELIVERY_DEAD.c_ckbus_dead",
+    ] {
+        assert!(!permits(&authority, subject), "{subject}");
+    }
+}
+
+#[test]
 fn a_participant_may_publish_only_its_own_live_hints() {
     let account = grants::derive_account("box_livefixture").unwrap();
     let grant = grants::issued_grant(&account, "runner-one", "credential", &[]).unwrap();
@@ -485,8 +539,9 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "10c522db79f47c41779679d202c93ccddb4d0314"
+        "a8b73bf89a277d96fcbb4f6ff83bd0799b2fd4aa"
     );
+    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.3.0");
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),
         ("permission_golden.txt", "golden_sha256"),

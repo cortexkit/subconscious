@@ -1,19 +1,18 @@
-//! Upgrading a plane that ck-bus 0.1.29 built with five streams to the current six
+//! Upgrading a plane that ck-bus 0.1.29 built with five streams to the current nine
 //! streams and module durables, in place. This is the upgrade arm of the "Install
 //! bootstrap and own users" acceptance row in `docs/ck-bus.md`. The vault
 //! is the harness signer answered in process, the broker a real `nats-server`; no subc
 //! daemon is started.
 //!
-//! - The emitted configuration of the five older streams is byte-for-byte the one the
-//!   five-stream ck-bus sent (`EARLIER_STREAM_CONFIGS`), and the event stream carries its
-//!   per-subject cap.
-//! - Live: boot once as the five-stream ck-bus did (the event stream and the module
-//!   durables withheld), store one message on each stream, then boot the current ck-bus.
-//!   The five streams are untouched (same configuration as the server reports it, same
-//!   creation time, same message count), the event stream exists with its limits, and
+//! - Older wire configurations remain pinned in `EARLIER_STREAM_CONFIGS`. Only
+//!   EFFECT's age and message cap change; unset optional properties are omitted.
+//! - Live: boot once as the five-stream ck-bus did (newer streams and module durables
+//!   withheld), store one message on each stream, then boot the current ck-bus.
+//!   The five streams retain their creation times and messages, EFFECT updates in
+//!   place, the new streams exist with their limits, and
 //!   `m_basal` and `m_prefrontal-core` exist with the shipped durable configuration. The
 //!   room post published before `m_prefrontal-core` existed is pending on it. A further
-//!   boot leaves all six streams and all module durables unchanged. Further cases cover
+//!   boot leaves all nine streams and all module durables unchanged. Further cases cover
 //!   an existing event stream's cap and readers whose acknowledgement floors must survive.
 
 #[allow(dead_code)]
@@ -68,8 +67,7 @@ const GOLDEN_ACCOUNT: &str = "box_upgradegolden";
 
 /// What the five-stream ck-bus (0.1.29) sent to create each of its streams, serialized
 /// exactly as `create_stream` puts it on the wire, recorded from that build for
-/// `GOLDEN_ACCOUNT`. nats-server refuses a create whose configuration differs from the
-/// stored stream, so any change here would stop an upgraded ck-bus from booting.
+/// `GOLDEN_ACCOUNT`. Changed limits must use an in-place update, not another create.
 const EARLIER_STREAM_CONFIGS: [&str; 5] = [
     r#"{"name":"CK_BOX_UPGRADEGOLDEN_ROOM","max_bytes":1073741824,"max_msgs":0,"max_msgs_per_subject":0,"discard":"old","subjects":["ck.box_upgradegolden.room.*.post"],"retention":"limits","max_consumers":0,"max_age":86400000000000,"storage":"file","num_replicas":1,"duplicate_window":120000000000,"consumer_limits":null}"#,
     r#"{"name":"CK_BOX_UPGRADEGOLDEN_WAKE","max_bytes":1073741824,"max_msgs":0,"max_msgs_per_subject":0,"discard":"old","subjects":["ck.box_upgradegolden.wake.*.fire"],"retention":"limits","max_consumers":0,"max_age":86400000000000,"storage":"file","num_replicas":1,"duplicate_window":120000000000,"consumer_limits":null}"#,
@@ -96,19 +94,36 @@ fn passed() {
 }
 
 #[test]
-fn the_five_older_streams_are_emitted_exactly_as_before() {
+fn older_stream_wire_configs_change_only_the_reviewed_delivery_policies() {
     let names = AccountNames::derive(GOLDEN_ACCOUNT).unwrap();
     let specs = shipped_streams(&names);
     let older: Vec<&StreamSpec> = specs
         .iter()
-        .filter(|spec| spec.kind != StreamKind::Event)
+        .filter(|spec| {
+            matches!(
+                spec.kind,
+                StreamKind::Room
+                    | StreamKind::Wake
+                    | StreamKind::Peer
+                    | StreamKind::Effect
+                    | StreamKind::EffectDead
+            )
+        })
         .collect();
     assert_eq!(older.len(), EARLIER_STREAM_CONFIGS.len());
     for (spec, earlier) in older.into_iter().zip(EARLIER_STREAM_CONFIGS) {
-        let emitted = serde_json::to_string(&bootstrap::plane::stream_config(spec)).unwrap();
+        let emitted = serde_json::to_value(bootstrap::plane::stream_config(spec)).unwrap();
+        let mut expected: Value = serde_json::from_str(earlier).unwrap();
+        if spec.kind != StreamKind::EffectDead {
+            expected.as_object_mut().unwrap().remove("duplicate_window");
+        }
+        if spec.kind == StreamKind::Effect {
+            expected["max_age"] = json!(0);
+            expected["max_msg_size"] = json!(16 * 1024);
+        }
         assert_eq!(
-            emitted, earlier,
-            "{} must be sent exactly as the five-stream ck-bus sent it",
+            emitted, expected,
+            "{} changes only reviewed limits and optional-property omission",
             spec.name
         );
     }
@@ -133,7 +148,7 @@ fn the_event_stream_is_emitted_with_its_per_subject_cap() {
     assert_eq!(emitted["max_bytes"], GIB);
     assert_eq!(emitted["discard"], "old");
     assert_eq!(emitted["retention"], "limits");
-    assert_eq!(emitted["duplicate_window"], 120_000_000_000_u64);
+    assert!(emitted.get("duplicate_window").is_none());
 }
 
 /// Whether a NATS binding can capture any descendant of the account's live root.
@@ -260,10 +275,23 @@ impl BoxPlane for FiveStreamBox {
         self.0.ensure_census(account).await
     }
     async fn ensure_stream(&self, spec: &StreamSpec) -> Result<(), PlaneError> {
-        if spec.kind == StreamKind::Event {
+        if !matches!(
+            spec.kind,
+            StreamKind::Room
+                | StreamKind::Wake
+                | StreamKind::Peer
+                | StreamKind::Effect
+                | StreamKind::EffectDead
+        ) {
             return Ok(());
         }
-        self.0.ensure_stream(spec).await
+        let mut earlier = spec.clone();
+        earlier.duplicate_window = Some(Duration::from_secs(120));
+        if earlier.kind == StreamKind::Effect {
+            earlier.max_age = Duration::from_secs(24 * 3600);
+            earlier.max_message_size = None;
+        }
+        self.0.ensure_stream(&earlier).await
     }
     async fn publish(&self, subject: &str, payload: Vec<u8>) -> Result<(), PlaneError> {
         self.0.publish(subject, payload).await
@@ -370,7 +398,7 @@ async fn consumer_state(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_durables() {
+async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_durables() {
     let _gate = harness::acceptance_gate().await;
     harness::install_tracing();
     let bin = match nats_server_bin() {
@@ -464,12 +492,26 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
     let broker = NatsBroker::new(server.url.clone(), credentials.clone());
     drop(boot_with(&machine_id, &config, &broker, &deps).await);
     for ((stream, _), earlier) in older.iter().zip(&before) {
+        let mut expected = earlier.clone();
+        if stream == &streams.effect {
+            assert_eq!(expected.0["max_age"], 86_400_000_000_000_u64);
+            assert_eq!(expected.0["max_msg_size"], -1);
+            expected.0["max_age"] = json!(0);
+            expected.0["max_msg_size"] = json!(16 * 1024);
+        }
         assert_eq!(
             &stream_state(&js, stream).await,
-            earlier,
-            "{stream} is left exactly as the five-stream ck-bus created it: same \
-             configuration, same creation time, same message count"
+            &expected,
+            "{stream} retains its creation time, messages and all non-upgraded settings"
         );
+        let message = js
+            .get_stream(stream)
+            .await
+            .unwrap()
+            .get_raw_message(1)
+            .await
+            .unwrap();
+        assert_eq!(message.payload.as_ref(), b"before the upgrade");
     }
     let (event_config, _, _) = stream_state(&js, &streams.event).await;
     assert_eq!(
@@ -484,6 +526,26 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
         event_config["max_age"],
         Duration::from_secs(7 * 24 * 3600).as_nanos() as u64
     );
+
+    for stream in [&streams.inbox, &streams.core_work] {
+        let (config, _, count) = stream_state(&js, stream).await;
+        assert_eq!(config["retention"], "workqueue");
+        assert_eq!(config["discard"], "new");
+        assert_eq!(config["max_age"], 0);
+        assert_eq!(config["max_bytes"], 256 * 1024 * 1024);
+        assert_eq!(config["max_msg_size"], 16 * 1024);
+        assert_eq!(count, 0);
+    }
+    let (dead_config, _, _) = stream_state(&js, &streams.delivery_dead).await;
+    assert_eq!(
+        dead_config["subjects"],
+        json!([format!("ck.{}.delivery.dead", names.account())])
+    );
+    assert_eq!(dead_config["retention"], "limits");
+    assert_eq!(dead_config["discard"], "old");
+    assert_eq!(dead_config["max_age"], 604_800_000_000_000_u64);
+    assert_eq!(dead_config["max_bytes"], 64 * 1024 * 1024);
+    assert_eq!(dead_config["duplicate_window"], 120_000_000_000_u64);
 
     let module_durables = [
         (
@@ -590,6 +652,30 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
             "m_prefrontal-core",
             vec![names.room_binding()],
         ),
+        (
+            streams.inbox.clone(),
+            "m_prefrontal-core",
+            ["head", "worker"]
+                .map(|kind| format!("ck.{}.inbox.{kind}.*.ready", names.account()))
+                .into(),
+        ),
+        (
+            streams.core_work.clone(),
+            "m_prefrontal-core",
+            ["effect", "consult", "work", "campaign", "hire", "spec"]
+                .map(|family| format!("ck.{}.core_work.{family}.*.run", names.account()))
+                .into(),
+        ),
+        (
+            streams.effect_dead.clone(),
+            "c_ckbus_dead",
+            vec![names.effect_dead()],
+        ),
+        (
+            streams.delivery_dead.clone(),
+            "c_ckbus_dead",
+            vec![format!("ck.{}.delivery.dead", names.account())],
+        ),
     ];
     for (stream, durable, filter) in &module_durables {
         let (config, _, _) = consumer_state(&js, stream, durable).await;
@@ -603,7 +689,13 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
         assert_eq!(config["deliver_policy"], "all", "{durable}");
         assert_eq!(config["ack_wait"], 30_000_000_000_u64, "{durable}");
         assert_eq!(config["max_deliver"], -1, "{durable}");
-        assert_eq!(config["max_ack_pending"], 1000, "{durable}");
+        let pending = if stream == &streams.inbox || stream == &streams.core_work {
+            1
+        } else {
+            1000
+        };
+        assert_eq!(config["max_ack_pending"], pending, "{durable}");
+        assert!(config.get("deliver_subject").is_none(), "{durable} is pull");
     }
     // The room post stored before `m_prefrontal-core` existed is waiting for it.
     let (_, _, room_pending) = consumer_state(&js, &streams.room, "m_prefrontal-core").await;
@@ -621,13 +713,14 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
     .expect("the event is stored");
 
     // Booting again changes nothing: every stream and durable stays as it is.
-    let mut six = older
-        .iter()
-        .map(|(stream, _)| stream.clone())
+    let all = streams
+        .all()
+        .into_iter()
+        .map(str::to_owned)
         .collect::<Vec<_>>();
-    six.push(streams.event.clone());
+    assert_eq!(all.len(), 9);
     let mut streams_before = Vec::new();
-    for stream in &six {
+    for stream in &all {
         streams_before.push(stream_state(&js, stream).await);
     }
     let mut durables_before = Vec::new();
@@ -636,7 +729,7 @@ async fn a_five_stream_plane_upgrades_in_place_to_six_streams_and_the_module_dur
     }
     assert_eq!(durables_before[0].2, 1, "m_basal holds the event for basal");
     drop(boot_with(&machine_id, &config, &broker, &deps).await);
-    for (stream, earlier) in six.iter().zip(&streams_before) {
+    for (stream, earlier) in all.iter().zip(&streams_before) {
         assert_eq!(
             &stream_state(&js, stream).await,
             earlier,

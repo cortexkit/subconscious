@@ -95,6 +95,9 @@ pub const AGENT_STREAM_KINDS: [StreamKind; 3] =
 pub fn ckbus_owned_durables() -> impl Iterator<Item = (StreamKind, &'static str)> {
     [
         (StreamKind::EffectDead, "c_ckbus_dead"),
+        (StreamKind::DeliveryDead, "c_ckbus_dead"),
+        (StreamKind::Inbox, "m_prefrontal-core"),
+        (StreamKind::CoreWork, "m_prefrontal-core"),
         (StreamKind::Event, "m_basal"),
         (StreamKind::Room, "m_prefrontal-core"),
     ]
@@ -119,15 +122,11 @@ pub fn agent_streams(names: &AccountNames) -> Vec<String> {
 
 /// The literal name of the stream of `kind`.
 pub fn stream_name(names: &AccountNames, kind: StreamKind) -> String {
-    let streams = names.streams();
-    match kind {
-        StreamKind::Room => streams.room.clone(),
-        StreamKind::Wake => streams.wake.clone(),
-        StreamKind::Peer => streams.peer.clone(),
-        StreamKind::Effect => streams.effect.clone(),
-        StreamKind::EffectDead => streams.effect_dead.clone(),
-        StreamKind::Event => streams.event.clone(),
-    }
+    shipped_streams(names)
+        .into_iter()
+        .find(|spec| spec.kind == kind)
+        .expect("the naming crate ships this stream kind")
+        .name
 }
 
 /// The three durables bind creates for `agent_id`, each filter checked against its

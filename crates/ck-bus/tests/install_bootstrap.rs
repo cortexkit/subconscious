@@ -618,16 +618,30 @@ async fn local_listener_refuses_a_connect_from_a_non_loopback_address() {
         .emit(&BTreeSet::new());
 }
 
-/// The stream configurations ck-bus sends state every duplicate window. The install arm
-/// above reads the windows back from a real server, but the server's own default is also
-/// two minutes, so only this check fails when a window is left to that default.
+/// Optional policies must be omitted on the wire, not serialized as zero. Server
+/// readback alone cannot distinguish an omitted window from the explicit default.
 #[test]
-fn every_stream_config_states_its_duplicate_window() {
+fn stream_configs_omit_unset_duplicate_windows_and_message_caps() {
     let names = AccountNames::derive("box_duplicatewindow").unwrap();
     let two_minutes = Duration::from_secs(120);
     for spec in shipped_streams(&names) {
         let config = bootstrap::plane::stream_config(&spec);
-        assert_eq!(config.duplicate_window, two_minutes, "{}", spec.name);
+        let wire = serde_json::to_value(config).unwrap();
+        match spec.kind {
+            cortexkit_bus_naming::StreamKind::EffectDead
+            | cortexkit_bus_naming::StreamKind::DeliveryDead => {
+                assert_eq!(wire["duplicate_window"], 120_000_000_000_u64);
+            }
+            _ => assert!(wire.get("duplicate_window").is_none(), "{}", spec.name),
+        }
+        match spec.kind {
+            cortexkit_bus_naming::StreamKind::Effect
+            | cortexkit_bus_naming::StreamKind::Inbox
+            | cortexkit_bus_naming::StreamKind::CoreWork => {
+                assert_eq!(wire["max_msg_size"], 16 * 1024);
+            }
+            _ => assert!(wire.get("max_msg_size").is_none(), "{}", spec.name),
+        }
     }
     assert_eq!(
         bootstrap::plane::census_config(&names).duplicate_window,

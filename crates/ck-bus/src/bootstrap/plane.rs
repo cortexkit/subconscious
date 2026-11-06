@@ -43,42 +43,9 @@ const SERVER_ERROR_BACKLOG: usize = 64;
 /// evicting a live process's entry, which would read as that process being revoked.
 pub const CENSUS_MAX_BYTES: i64 = 16 * MIB as i64;
 
-/// Every stream's duplicate window is stated rather than left to the server default.
-///
-/// The four workload streams (room, wake, peer, effect): a publisher that lost the ack
-/// of a publish (a timeout, a reconnect) retries within seconds, so two minutes covers
-/// the retry with a wide margin. A longer window costs server memory for
-/// every message id published within it, and a duplicate that outlives the window is
-/// still dropped end to end by prefrontal's delivery id.
-pub const WORKLOAD_DUPLICATE_WINDOW: Duration = Duration::from_secs(2 * 60);
-/// The dead-letter stream: a claimant that dies between storing its record and
-/// terminating the item has its record republished, under the same message id, on the
-/// spare delivery, which the server makes no sooner than one effect-durable ack wait
-/// (30 s) later. The window must cover that wait plus the claim and the republish; two
-/// minutes is four ack waits. A republish later than that (no claimant was pulling) is
-/// stored again, and ck-bus's dead-letter consumer still records it once per message
-/// id.
-pub const DEAD_LETTER_DUPLICATE_WINDOW: Duration = Duration::from_secs(2 * 60);
 /// The census bucket: KV puts carry no message id, so the window deduplicates nothing
 /// there; it is stated at the value nats-server gives a KV bucket without a TTL.
 pub const CENSUS_DUPLICATE_WINDOW: Duration = Duration::from_secs(2 * 60);
-/// The module event stream: a module that lost the ack of an event publish retries
-/// within seconds, under the same message id, so two minutes covers the retry as it does
-/// on the workload streams. A duplicate that outlives the window is still dropped by the
-/// flow engine, which deduplicates on the event id.
-pub const EVENT_DUPLICATE_WINDOW: Duration = Duration::from_secs(2 * 60);
-
-/// The duplicate window of the shipped stream of `kind`.
-pub fn duplicate_window(kind: StreamKind) -> Duration {
-    match kind {
-        StreamKind::EffectDead => DEAD_LETTER_DUPLICATE_WINDOW,
-        StreamKind::Event => EVENT_DUPLICATE_WINDOW,
-        StreamKind::Room | StreamKind::Wake | StreamKind::Peer | StreamKind::Effect => {
-            WORKLOAD_DUPLICATE_WINDOW
-        }
-    }
-}
-
 /// The census bucket's backing stream as ck-bus creates it.
 pub fn census_config(account: &AccountNames) -> stream::Config {
     let buckets = account.buckets();
@@ -108,18 +75,13 @@ pub fn census_config(account: &AccountNames) -> stream::Config {
     }
 }
 
-/// A shipped stream as ck-bus creates it, every limit stated.
-///
-/// The per-subject message cap is set only when the spec names one (only the event
-/// stream does). Otherwise it is left at the client's default, so the five streams that
-/// predate the event stream are sent exactly the configuration they were created with.
-/// Existing event streams have their per-subject cap reconciled in place.
+/// A shipped stream as ck-bus creates it. Optional limits stay at the client's
+/// omission sentinel unless the naming spec supplies them; they never serialize as zero.
 pub fn stream_config(spec: &StreamSpec) -> stream::Config {
     let mut config = stream::Config {
         name: spec.name.clone(),
         subjects: spec.subjects.clone(),
         max_age: spec.max_age,
-        duplicate_window: duplicate_window(spec.kind),
         max_bytes: i64::try_from(spec.max_bytes).unwrap_or(i64::MAX),
         discard: match spec.discard {
             DiscardPolicy::Old => stream::DiscardPolicy::Old,
@@ -136,6 +98,12 @@ pub fn stream_config(spec: &StreamSpec) -> stream::Config {
     };
     if let Some(cap) = spec.max_msgs_per_subject {
         config.max_messages_per_subject = cap;
+    }
+    if let Some(cap) = spec.max_message_size {
+        config.max_message_size = cap;
+    }
+    if let Some(window) = spec.duplicate_window {
+        config.duplicate_window = window;
     }
     config
 }
@@ -680,7 +648,11 @@ impl BoxPlane for NatsBox {
     }
 
     async fn ensure_stream(&self, spec: &StreamSpec) -> Result<(), PlaneError> {
-        if let Some(cap) = spec.max_msgs_per_subject {
+        if spec.max_msgs_per_subject.is_some()
+            || spec.max_message_size.is_some()
+            || spec.duplicate_window.is_some()
+            || spec.kind == StreamKind::Effect
+        {
             let what = format!("stream info {}", spec.name);
             let reply = self
                 .api(format!("STREAM.INFO.{}", spec.name), json!({}), &what)
@@ -689,11 +661,32 @@ impl BoxPlane for NatsBox {
                 api_refusal(&reply, &what)?;
                 let mut config: stream::Config = serde_json::from_value(reply["config"].clone())
                     .map_err(|error| PlaneError::new(format!("{what}: {error}")))?;
-                let old = config.max_messages_per_subject;
-                if old != cap {
+                let old = serde_json::to_value(&config)
+                    .map_err(|error| PlaneError::new(format!("{what}: {error}")))?;
+                if let Some(cap) = spec.max_msgs_per_subject {
+                    config.max_messages_per_subject = cap;
+                }
+                if let Some(cap) = spec.max_message_size {
+                    config.max_message_size = cap;
+                }
+                if let Some(window) = spec.duplicate_window {
+                    config.duplicate_window = window;
+                }
+                if spec.kind == StreamKind::Effect {
+                    config.max_age = spec.max_age;
+                }
+                let new = serde_json::to_value(&config)
+                    .map_err(|error| PlaneError::new(format!("{what}: {error}")))?;
+                if old != new {
                     // Change only the limit being upgraded, preserving the stream's
                     // messages and all other stored settings.
-                    config.max_messages_per_subject = cap;
+                    // Zero is the client's omission sentinel, not a wire value.
+                    if spec.max_message_size.is_none() {
+                        config.max_message_size = 0;
+                    }
+                    if spec.duplicate_window.is_none() {
+                        config.duplicate_window = Duration::ZERO;
+                    }
                     self.jetstream
                         .update_stream(config)
                         .await
@@ -703,8 +696,7 @@ impl BoxPlane for NatsBox {
                     super::log_event(
                         "ckbus.stream.limit_updated",
                         json!({
-                            "stream": spec.name, "max_msgs_per_subject_old": old,
-                            "max_msgs_per_subject_new": cap,
+                            "stream": spec.name, "config_old": old, "config_new": new,
                         }),
                     );
                 }

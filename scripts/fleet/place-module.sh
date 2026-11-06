@@ -1497,7 +1497,9 @@ if [ -n "$MIGRATES" ]; then
     || refuse "store snapshot $store_rb is not owner-only (0600); nothing has been placed"
   (cd "$STAGING" && shasum -a 256 "$(basename "$store_rb")" > "$(basename "$store_rb").sha256")
   say "store rollback $(basename "$store_rb") ($(stat -f %z "$store_rb" 2>/dev/null || stat -c %s "$store_rb") bytes)"
-  say "ROLLBACK IS BINARY + STORE: this card migrates, so restoring the binary alone would meet a newer schema and refuse"
+  # --migrates says a migration MAY run, not that one did, so this line states
+  # only what was done. The schema check after the restart measures it.
+  say "store snapshot taken because --migrates was given; until the check after the restart says otherwise, rollback is binary + this snapshot"
 fi
 fi
 
@@ -1632,6 +1634,24 @@ if [ "$RESTART" -eq 1 ]; then
     # window's length it's roughly 100 new connections a second.
     if [ -n "$tcp_after" ] && [ $((tcp_after - tcp_before)) -ge 2000 ]; then
       say "WARNING: the system-wide TCP PCB count rose by $((tcp_after - tcp_before)) across the restart window; investigate connection churn, starting with '$MODULE's start-up work"
+    fi
+  fi
+  # Measure whether the new build changed the store, rather than assume it from
+  # --migrates. Compare the snapshot's schema and user_version with the live
+  # store's once the new build has started. A data-only migration (rows in a
+  # migrations table, no shape change) doesn't show here, so "unchanged" is
+  # evidence for a binary-only rollback, not proof; the owner's migration
+  # chains decide. Reads only; a failed read never blocks.
+  if [ -n "${store_rb:-}" ] && [ -s "${store_rb:-}" ]; then
+    if s_before=$(sqlite3 "file:$store_rb?immutable=1" '.schema' 'PRAGMA user_version;' 2>/dev/null) \
+      && s_after=$(sqlite3 "file:$MIGRATES?mode=ro" '.schema' 'PRAGMA user_version;' 2>/dev/null); then
+      if [ "$s_before" = "$s_after" ]; then
+        say "store schema and user_version unchanged since the snapshot: rollback is binary-only unless the owner's migration chains say otherwise; the snapshot is kept"
+      else
+        say "STORE SCHEMA CHANGED since the snapshot: rollback is binary + $(basename "$store_rb")"
+      fi
+    else
+      say "could not read one side of the store schema; treat rollback as binary + $(basename "$store_rb")"
     fi
   fi
 fi

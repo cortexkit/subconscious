@@ -794,6 +794,174 @@
         }
       },
       "reply": {}
+    },
+    {
+      "id": "devices_pairing_granted_here",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.devices_watch",
+        "params": {}
+      },
+      "notices": [
+        {
+          "devices": [
+            {
+              "device_class": "computer",
+              "fingerprint": "02d449a31fbb267c8f352e9968a79e3e",
+              "last_seen_unix_ms": null,
+              "name": "02d449a31fbb267c8f352e9968a79e3e",
+              "pairing": "granted_here",
+              "platform": "linux",
+              "release_build": false,
+              "shares": [],
+              "since_unix_ms": 0,
+              "subscriptions_live": 0,
+              "trust": "verified",
+              "tunnel": "closed:not_running"
+            }
+          ],
+          "self": {
+            "account_name": null,
+            "expose_profiles": [
+              {
+                "name": "mobile",
+                "operation_count": 2,
+                "peers_using": 1
+              },
+              {
+                "name": "zeta",
+                "operation_count": 0,
+                "peers_using": 0
+              }
+            ],
+            "fingerprint": "a0289810032eb417274eebc4a38e6899",
+            "lan_addrs": [
+              "192.168.1.2:7841"
+            ],
+            "listen_addr": "192.168.1.2:7841",
+            "rendezvous": "disabled",
+            "wan_port_mapping": "unsupported",
+            "wan_reachability": null,
+            "watch_ops_offered": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "devices_pairing_confirmed_both",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.devices_watch",
+        "params": {}
+      },
+      "notices": [
+        {
+          "devices": [
+            {
+              "device_class": "computer",
+              "fingerprint": "02d449a31fbb267c8f352e9968a79e3e",
+              "last_seen_unix_ms": null,
+              "name": "02d449a31fbb267c8f352e9968a79e3e",
+              "pairing": "confirmed_both",
+              "platform": "linux",
+              "release_build": false,
+              "shares": [],
+              "since_unix_ms": 0,
+              "subscriptions_live": 0,
+              "trust": "verified",
+              "tunnel": "closed:not_running"
+            }
+          ],
+          "self": {
+            "account_name": null,
+            "expose_profiles": [
+              {
+                "name": "mobile",
+                "operation_count": 2,
+                "peers_using": 1
+              },
+              {
+                "name": "zeta",
+                "operation_count": 0,
+                "peers_using": 0
+              }
+            ],
+            "fingerprint": "a0289810032eb417274eebc4a38e6899",
+            "lan_addrs": [
+              "192.168.1.2:7841"
+            ],
+            "listen_addr": "192.168.1.2:7841",
+            "rendezvous": "disabled",
+            "wan_port_mapping": "unsupported",
+            "wan_reachability": null,
+            "watch_ops_offered": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "devices_pairing_legacy_unknown",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.devices_watch",
+        "params": {}
+      },
+      "notices": [
+        {
+          "devices": [
+            {
+              "device_class": "computer",
+              "fingerprint": "02d449a31fbb267c8f352e9968a79e3e",
+              "last_seen_unix_ms": null,
+              "name": "02d449a31fbb267c8f352e9968a79e3e",
+              "pairing": "confirmed_both",
+              "platform": "linux",
+              "release_build": false,
+              "shares": [],
+              "since_unix_ms": 0,
+              "subscriptions_live": 0,
+              "trust": "verified",
+              "tunnel": "closed:not_running"
+            },
+            {
+              "device_class": "computer",
+              "fingerprint": "fc19aa9fbfd2a861d1e58c290f4ccf06",
+              "last_seen_unix_ms": null,
+              "name": "fc19aa9fbfd2a861d1e58c290f4ccf06",
+              "release_build": false,
+              "shares": [],
+              "since_unix_ms": 0,
+              "subscriptions_live": 0,
+              "trust": "verified",
+              "tunnel": "closed:not_running"
+            }
+          ],
+          "self": {
+            "account_name": null,
+            "expose_profiles": [
+              {
+                "name": "mobile",
+                "operation_count": 2,
+                "peers_using": 1
+              },
+              {
+                "name": "zeta",
+                "operation_count": 0,
+                "peers_using": 0
+              }
+            ],
+            "fingerprint": "a0289810032eb417274eebc4a38e6899",
+            "lan_addrs": [
+              "192.168.1.2:7841"
+            ],
+            "listen_addr": "192.168.1.2:7841",
+            "rendezvous": "disabled",
+            "wan_port_mapping": "unsupported",
+            "wan_reachability": null,
+            "watch_ops_offered": 1
+          }
+        }
+      ]
     }
   ]
 }

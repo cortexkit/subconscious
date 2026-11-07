@@ -13,13 +13,25 @@ use serde_json::json;
 mod kit;
 
 fn binary(name: &str) -> PathBuf {
-    let path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    // This test runs from `<target>/<profile>/deps/`, or, when Cargo keeps a
+    // separate build folder, from `<target>/<build folder>/<profile>/deps/`.
+    // The kit binaries are always built into `<target>/<profile>/`. So try the
+    // test's own profile folder first, then `<ancestor>/<profile>/` for a few
+    // folders up, never further, so a stray build higher up isn't picked.
+    let exe = std::env::current_exe().unwrap();
+    let profile_dir = exe.parent().unwrap().parent().unwrap();
+    let profile = profile_dir.file_name().unwrap();
+    let path = std::iter::once(profile_dir.join(&file))
+        .chain(
+            profile_dir
+                .ancestors()
+                .skip(1)
+                .take(4)
+                .map(|dir| dir.join(profile).join(&file)),
+        )
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| profile_dir.join(&file));
     assert!(path.is_file(), "build the private-daemon kit binaries first: cargo build -p subc-core --bin ck --bin ck-subc ({})", path.display());
     cortexkit_test_support::ckdev_binary(path)
 }

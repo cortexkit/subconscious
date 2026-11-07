@@ -26,7 +26,7 @@ fn sample(id: &str) -> Value {
 fn published_samples_are_byte_exact() {
     assert_eq!(
         format!("{:x}", Sha256::digest(SAMPLES.as_bytes())),
-        "592018fe9b6399131cac64f07f50958908e8599ef6f57994f4f3bc8aefd2f4d9"
+        "7361385473af89afedbd80df57a3f8a8ee31371243b7ff2c79f16a0a30f56240"
     );
 }
 
@@ -494,6 +494,39 @@ fn inventory_notices_decode_named_switches_and_optional_pairing_facts() {
     assert!(ck_ui::live::map::devices(&notice, ck_ui::Snapshot::fixture_now()).is_err());
     notice["devices"][0]["shares"] = json!({"vault":true});
     assert!(ck_ui::live::map::devices(&notice, ck_ui::Snapshot::fixture_now()).is_err());
+}
+
+/// The published samples carry the computer's system and its pairing state
+/// as Callosum serves them. A computer paired the older way carries neither,
+/// so its details must not claim either fact.
+#[test]
+fn published_pairing_facts_decode_and_absent_means_unknown() {
+    let facts = |id: &str| {
+        let devices =
+            ck_ui::live::map::devices(&sample(id)["notices"][0], ck_ui::Snapshot::fixture_now())
+                .unwrap();
+        let mut facts: Vec<_> = devices
+            .inventory
+            .computers
+            .values()
+            .map(|d| (d.platform.clone(), d.pairing.clone()))
+            .collect();
+        facts.sort();
+        facts
+    };
+    let linux = || Some("linux".to_string());
+    assert_eq!(
+        facts("devices_pairing_granted_here"),
+        vec![(linux(), Some("granted_here".to_string()))]
+    );
+    assert_eq!(
+        facts("devices_pairing_confirmed_both"),
+        vec![(linux(), Some("confirmed_both".to_string()))]
+    );
+    assert_eq!(
+        facts("devices_pairing_legacy_unknown"),
+        vec![(None, None), (linux(), Some("confirmed_both".to_string()))]
+    );
 }
 
 #[test]

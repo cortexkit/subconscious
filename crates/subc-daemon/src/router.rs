@@ -2408,6 +2408,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    carry_containment: false,
                     module_id: "held-module".to_string(),
                     program: "test-module".into(),
                     args: Vec::new(),

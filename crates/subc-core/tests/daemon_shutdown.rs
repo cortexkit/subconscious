@@ -313,7 +313,7 @@ fn child_is_recorded(path: &Path, pid: u32, observed: &subc_os::Observation) -> 
     else {
         return false;
     };
-    record["version"] == 1
+    matches!(record["version"].as_u64(), Some(1 | 2))
         && record["children"].as_array().is_some_and(|children| {
             children.iter().any(|child| {
                 child["module_id"] == "wire-less"
@@ -420,45 +420,61 @@ fn ready_child_requires_its_matching_identity_in_the_persisted_record() {
         "start_time": 23, "executable": { "device": 29, "inode": 31 },
         "cgroup_name": null
     });
-    let write = |path: &Path, child: Value| {
+    for version in [1, 2] {
+        let write = |path: &Path, child: Value| {
+            fs::write(
+                path,
+                serde_json::to_vec(&json!({
+                    "version": version, "children": [child]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        // The child publishes readiness independently of the daemon's record write.
+        // Even a complete pending record cannot authorize killing the daemon until
+        // rename makes that record visible at the path the next boot will read.
+        fs::write(root.join("wire-less.ready"), "ready\n").unwrap();
+        assert!(!child_is_recorded(&record, 17, &observed));
+        let mut previous = child.clone();
+        previous["module_id"] = json!("shutdown-observer");
+        previous["pid"] = json!(19);
+        write(&record, previous);
+        write(&pending, child.clone());
+        assert!(!child_is_recorded(&record, 17, &observed));
+        fs::rename(&pending, &record).unwrap();
+        assert!(child_is_recorded(&record, 17, &observed));
+
+        for (field, wrong) in [
+            ("pid", json!(19)),
+            ("start_time", json!(24)),
+            ("start_time", Value::Null),
+            ("executable", Value::Null),
+            ("executable", json!({ "device": 30, "inode": 31 })),
+            ("executable", json!({ "device": 29, "inode": 32 })),
+        ] {
+            let mut mismatched = child.clone();
+            mismatched[field] = wrong;
+            write(&record, mismatched);
+            assert!(
+                !child_is_recorded(&record, 17, &observed),
+                "a mismatched or missing {field} cannot identify the orphan"
+            );
+        }
+    }
+    for version in [0, 3, 99] {
         fs::write(
-            path,
+            &record,
             serde_json::to_vec(&json!({
-                "version": 1, "children": [child]
+                "version": version, "children": [child.clone()]
             }))
             .unwrap(),
         )
         .unwrap();
-    };
-
-    // The child publishes readiness independently of the daemon's record write.
-    // Even a complete pending record cannot authorize killing the daemon until
-    // rename makes that record visible at the path the next boot will read.
-    fs::write(root.join("wire-less.ready"), "ready\n").unwrap();
-    assert!(!child_is_recorded(&record, 17, &observed));
-    let mut previous = child.clone();
-    previous["module_id"] = json!("shutdown-observer");
-    previous["pid"] = json!(19);
-    write(&record, previous);
-    write(&pending, child.clone());
-    assert!(!child_is_recorded(&record, 17, &observed));
-    fs::rename(&pending, &record).unwrap();
-    assert!(child_is_recorded(&record, 17, &observed));
-
-    for (field, wrong) in [
-        ("pid", json!(19)),
-        ("start_time", json!(24)),
-        ("start_time", Value::Null),
-        ("executable", Value::Null),
-        ("executable", json!({ "device": 30, "inode": 31 })),
-        ("executable", json!({ "device": 29, "inode": 32 })),
-    ] {
-        let mut mismatched = child.clone();
-        mismatched[field] = wrong;
-        write(&record, mismatched);
         assert!(
             !child_is_recorded(&record, 17, &observed),
-            "a mismatched or missing {field} cannot identify the orphan"
+            "unsupported recovery version {version} cannot identify the orphan"
         );
     }
 }

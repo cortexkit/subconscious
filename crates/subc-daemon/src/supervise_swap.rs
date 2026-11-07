@@ -782,6 +782,9 @@ async fn abandon_candidate(
         }
     }
     candidate.drain_stderr(module_id).await;
+    if let Err(error) = candidate.finish_exit(false).await {
+        warn!(module_id, %error, "could not finalize the abandoned swap candidate");
+    }
 
     let slot = match failure.connection {
         Some(connection) => RegistrationSlot::Connection(connection),
@@ -913,7 +916,9 @@ async fn retire_incumbent(
     });
     // A shutdown waits for the roster to empty. Release only after writing
     // the durable terminal record, never merely after wait() reaps the pid.
-    incumbent.release_roster();
+    if let Err(error) = incumbent.finish_exit(false).await {
+        warn!(module_id, %error, "could not finalize the swapped-out incumbent");
+    }
     if let Err(err) = wait_for_slot_registration_release(
         registry,
         RegistrationSlot::Connection(incumbent_connection),
@@ -946,6 +951,7 @@ mod tests {
                 .with_terminal_journal(journal.clone(), "retirement-test".into());
         let runtime = supervisor.runtime_config();
         let spec = ModuleSpec {
+            carry_containment: false,
             module_id: "retiring".into(),
             program: PathBuf::from("/bin/sleep"),
             args: vec!["60".into()],

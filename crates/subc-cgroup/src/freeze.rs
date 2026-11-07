@@ -103,7 +103,102 @@ pub async fn freeze_module(
     }
 }
 
+fn request_path(placement: &Placement, path: &Path) -> Result<FrozenModule, FreezeOutcome> {
+    let module = match placement.existing_module_path(path) {
+        Ok(Some(module)) => module,
+        Ok(None) => return Err(FreezeOutcome::NotPlaced),
+        Err(error) => {
+            return Err(FreezeOutcome::IoError {
+                path: path.to_owned(),
+                error,
+            })
+        }
+    };
+    let path = module.join("cgroup.freeze");
+    let mut file = match crate::path::open_control(&module, "cgroup.freeze") {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(FreezeOutcome::Unsupported)
+        }
+        Err(error) => return Err(FreezeOutcome::IoError { path, error }),
+    };
+    let frozen = FrozenModule {
+        path: module,
+        thaw_on_drop: true,
+    };
+    file.write_all(b"1")
+        .map_err(|error| FreezeOutcome::IoError { path, error })?;
+    Ok(frozen)
+}
+
+/// Freeze a recorded cgroup beneath the caller's trusted placement root.
+/// No directory or interface is created. Failure or cancellation thaws the
+/// request, and the returned guard keeps confirmed members frozen for listing.
+pub async fn freeze_path(placement: &Placement, path: &Path, timeout: Duration) -> FreezeOutcome {
+    let frozen = match request_path(placement, path) {
+        Ok(frozen) => frozen,
+        Err(outcome) => return outcome,
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match frozen.confirmed() {
+            Ok(true) => return FreezeOutcome::Frozen(frozen),
+            Ok(false) => {}
+            Err(error) => {
+                return FreezeOutcome::IoError {
+                    path: frozen.path.join("cgroup.events"),
+                    error,
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return FreezeOutcome::TimedOut {
+                path: frozen.path.join("cgroup.events"),
+            };
+        }
+        sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// Synchronously freeze a recorded cgroup, for hard-kill cleanup without a
+/// Tokio runtime. Path checks, kernel confirmation and thaw-on-drop match
+/// [`freeze_path`]; callers must keep the timeout short when running in Drop.
+pub fn freeze_path_blocking(
+    placement: &Placement,
+    path: &Path,
+    timeout: Duration,
+) -> FreezeOutcome {
+    let frozen = match request_path(placement, path) {
+        Ok(frozen) => frozen,
+        Err(outcome) => return outcome,
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match frozen.confirmed() {
+            Ok(true) => return FreezeOutcome::Frozen(frozen),
+            Ok(false) => {}
+            Err(error) => {
+                return FreezeOutcome::IoError {
+                    path: frozen.path.join("cgroup.events"),
+                    error,
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return FreezeOutcome::TimedOut {
+                path: frozen.path.join("cgroup.events"),
+            };
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 impl FrozenModule {
+    fn confirmed(&self) -> io::Result<bool> {
+        fs::read_to_string(self.path.join("cgroup.events"))
+            .map(|events| events.lines().any(|line| line == "frozen 1"))
+    }
+
     /// Read this cgroup's and its descendants' `cgroup.procs`, descending only
     /// into entries reported as directories rather than symlinks.
     ///

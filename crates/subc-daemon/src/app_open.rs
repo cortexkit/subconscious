@@ -76,18 +76,7 @@ impl LaunchEntry {
     fn reap(self) {
         if let Some(mut child) = self.child {
             // Our own direct child, if it already exited: release its pid.
-            // A scope child is not ours; the error is ignored.
             let _ = child.try_wait();
-        }
-        #[cfg(target_os = "linux")]
-        {
-            // Our own zombie keeps its numeric pid until reaped. The pidfd
-            // already reported it dead, so this wait only releases the number
-            // and never blocks: a non-child errors, ignored the same way.
-            let _ = rustix::process::waitpid(
-                rustix::process::Pid::from_raw(self.pid as i32),
-                rustix::process::WaitOptions::NOHANG,
-            );
         }
     }
 

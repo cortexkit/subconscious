@@ -43,6 +43,17 @@ fn main() {
             }
         }
         Some("exit") => std::process::exit(args[1].to_str().unwrap().parse().unwrap()),
+        #[cfg(target_os = "macos")]
+        Some("group-wait" | "escape-group") => {
+            use std::io::Write;
+            if args[0] == "escape-group" {
+                rustix::process::setsid().unwrap();
+            }
+            println!("{}", rustix::process::getpgrp().as_raw_nonzero());
+            std::io::stdout().flush().unwrap();
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input).unwrap();
+        }
         _ => std::process::exit(2),
     }
 }

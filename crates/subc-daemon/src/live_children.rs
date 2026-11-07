@@ -10,7 +10,7 @@
 //! So the daemon keeps a record, in its run directory, of every child in its
 //! roster: rewritten whole (temp file, then rename) on each admit and release,
 //! so a reader only ever sees a complete record. At boot, before any module is
-//! spawned, [`sweep_orphans`] reads the previous daemon's record and ends every
+//! spawned, the boot-time sweep reads the previous daemon's record and ends every
 //! listed process that is still the process that was recorded.
 //!
 //! "Still the process that was recorded" is three checks, and a process that
@@ -37,7 +37,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use subc_control::ModuleProtocol;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::run_dir_lock::RunDirLock;
 
@@ -47,7 +47,7 @@ pub(crate) const LIVE_CHILDREN_FILE_NAME: &str = "live-children.json";
 /// Bumped on any change a previous daemon's reader would misread. A record
 /// with another version is not swept: nothing in it is trusted enough to
 /// signal on.
-const RECORD_VERSION: u32 = 1;
+const RECORD_VERSION: u32 = 2;
 
 /// The device and inode of the executable a child was recorded running.
 ///
@@ -156,6 +156,62 @@ impl ExecutableIdentity {
     }
 }
 
+/// A container entry outlives its original leader and every launch generation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ContainerIdentity {
+    pub(crate) pgid: Option<u32>,
+    pub(crate) created_start_time: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) boot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) session_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cgroup_path: Option<PathBuf>,
+}
+
+#[cfg(unix)]
+impl ContainerIdentity {
+    fn current_boot(&self) -> io::Result<bool> {
+        let current = subc_os::boot_id::is_current(self.boot_id.as_deref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recorded container has no boot identity",
+            )
+        })?)?;
+        if current && self.session_id.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recorded container has no session identity",
+            ));
+        }
+        Ok(current)
+    }
+
+    fn group(&self) -> io::Result<crate::group_recovery::RecordedGroup<'_>> {
+        let missing = || {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "recorded container has no complete boot, session and process-group identity",
+            )
+        };
+        Ok(crate::group_recovery::RecordedGroup {
+            pgid: self.pgid.ok_or_else(missing)?,
+            created_start_time: self.created_start_time.ok_or_else(missing)?,
+            boot_id: self.boot_id.as_deref().ok_or_else(missing)?,
+            session_id: self.session_id.ok_or_else(missing)?,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_metadata() -> Self {
+        Self {
+            boot_id: Some(subc_os::boot_id::current().unwrap()),
+            session_id: subc_os::process_group::session_id(std::process::id()).unwrap(),
+            ..Self::default()
+        }
+    }
+}
+
 /// One roster entry as recorded on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LiveChild {
@@ -171,6 +227,8 @@ pub(crate) struct LiveChild {
     pub(crate) executable: Option<ExecutableIdentity>,
     /// The child's cgroup directory name, when it was placed in one (Linux).
     pub(crate) cgroup_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) container: Option<ContainerIdentity>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -241,10 +299,124 @@ pub(crate) fn read_record_with_reasons(
         Err(error) => return Err(RecordReadError::Io(error)),
     };
     let record: RecordFile = serde_json::from_slice(&bytes).map_err(RecordReadError::Malformed)?;
-    if record.version != RECORD_VERSION {
+    if !matches!(record.version, 1 | RECORD_VERSION) {
         return Err(RecordReadError::UnknownVersion(record.version));
     }
     Ok((record.children, record.retained_reasons))
+}
+
+/// Preserve an unusable record as a durable fail-closed marker. Only offline
+/// administration may remove it after establishing that no old module processes
+/// or helpers remain.
+pub(crate) fn quarantine_record(path: &Path, error: &RecordReadError) -> io::Result<PathBuf> {
+    quarantine_record_named(path, error, "", false)
+}
+
+#[cfg(unix)]
+pub(crate) fn quarantine_failed_admission(
+    path: &Path,
+    reason: &str,
+    source: &io::Error,
+) -> io::Result<PathBuf> {
+    // The filename remains the durable marker. Keep a readable cause there as
+    // well, so a restart can explain the failure without modifying the evidence.
+    let label: String = source
+        .to_string()
+        .chars()
+        .take(96)
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let suffix = format!(".failed-late-admission-write.{label}");
+    quarantine_record_named(
+        path,
+        &RecordReadError::Io(io::Error::other(reason)),
+        &suffix,
+        true,
+    )
+}
+
+fn quarantine_record_named(
+    path: &Path,
+    error: &RecordReadError,
+    suffix: &str,
+    allow_missing: bool,
+) -> io::Result<PathBuf> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    loop {
+        let quarantine = directory.join(format!(
+            "{name}.quarantined.{}.{}{suffix}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::symlink_metadata(&quarantine) {
+            Ok(_) => continue,
+            Err(found) if found.kind() == io::ErrorKind::NotFound => {}
+            Err(found) => return Err(found),
+        }
+        // The daemon owns the run-directory lock. Never replace a quarantine
+        // from an earlier boot, even if its PID and sequence were reused.
+        match replace_record(path, &quarantine, directory) {
+            Err(found) if allow_missing && found.kind() == io::ErrorKind::NotFound => {
+                // A failed first write may have left no original record. There
+                // is then no evidence to rename, but absence must not erase the
+                // failure marker at the next daemon start.
+                use std::io::Write;
+                let mut marker = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&quarantine)?;
+                writeln!(marker, "{error}")?;
+                marker.sync_all()?;
+                #[cfg(unix)]
+                fs::File::open(directory)?.sync_all()?;
+            }
+            result => result?,
+        }
+        error!(path = %path.display(), quarantine = %quarantine.display(), %error,
+            "live-children record quarantined; carried modules remain blocked until offline clearance");
+        return Ok(quarantine);
+    }
+}
+
+pub(crate) fn quarantine_block(path: &Path) -> Option<String> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let prefix = format!("{name}.quarantined.");
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return None,
+        Err(error) => return Some(format!("cannot verify recovery quarantines: {error}")),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => return Some(format!("cannot verify recovery quarantines: {error}")),
+        };
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            let cause = if entry
+                .file_name()
+                .to_string_lossy()
+                .contains(".failed-late-admission-write.")
+            {
+                "failed late admission write; "
+            } else {
+                ""
+            };
+            return Some(format!(
+                "{cause}unknown previous container identity: quarantined recovery record {}; offline clearance is required",
+                entry.path().display()
+            ));
+        }
+    }
+    None
 }
 
 /// Write `bytes` to a new file beside `path`, then rename it over `path`.
@@ -469,39 +641,86 @@ pub(crate) enum SweepDecision {
     ForcedStopped,
     /// Matched and signalled, but still observed at the end of the bound.
     Survived,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    ContainerSurvivors(Vec<u32>),
+    #[cfg(target_os = "linux")]
+    EmptyContainerDirectory,
     /// No process identity source on this platform; not signalled.
     #[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
     NotSignalledOnThisPlatform,
 }
 
-/// Why a previous instance still prevents starting its configured module.
+/// Why a previous instance remains recorded. An empty directory awaiting
+/// removal is housekeeping only and does not prevent a fresh instance.
 /// Kept separately from identity evidence so it can never authorize a signal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RetainedReason {
     Hidden,
     Unverifiable,
     Survived,
+    ContainerSurvivors(Vec<u32>),
+    ContainerUnverifiable(String),
+    EmptyContainerDirectory,
 }
 
 impl RetainedReason {
-    pub(crate) fn waiting_message(self, pid: u32) -> String {
+    pub(crate) fn blocks_fresh_copy(&self) -> bool {
+        !matches!(self, Self::EmptyContainerDirectory)
+    }
+
+    pub(crate) fn waiting_message(&self, pid: u32) -> String {
         let reason = match self {
             Self::Hidden => "is still running but hidden; it cannot be identified",
             Self::Unverifiable => "is still running but could not be verified",
             Self::Survived => "did not stop",
+            Self::ContainerSurvivors(pids) => {
+                return format!("waiting: container survivors (pids {pids:?})")
+            }
+            Self::ContainerUnverifiable(error) => {
+                return format!("waiting: container survivors could not be verified: {error}")
+            }
+            Self::EmptyContainerDirectory => {
+                return "container stopped; directory removal pending".into()
+            }
         };
         format!("waiting: previous instance (pid {pid}) {reason}")
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn recheck_container(
+    entry: &LiveChild,
+    #[cfg(target_os = "linux")] placement: Option<&subc_cgroup::Placement>,
+) -> Option<RetainedReason> {
+    let container = entry.container.as_ref()?;
+    match container.current_boot() {
+        Ok(false) => return None,
+        Ok(true) => {}
+        Err(error) => return Some(RetainedReason::ContainerUnverifiable(error.to_string())),
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(path) = &container.cgroup_path {
+        return crate::cgroup_recovery::recheck(placement, path);
+    }
+    match container.group() {
+        Ok(group) => crate::group_recovery::recheck(group),
+        Err(error) => Some(RetainedReason::ContainerUnverifiable(error.to_string())),
+    }
+}
+
 impl SweepDecision {
-    fn retained_reason(&self) -> Option<RetainedReason> {
+    pub(crate) fn retained_reason(&self) -> Option<RetainedReason> {
         match self {
+            #[cfg(target_os = "linux")]
+            Self::EmptyContainerDirectory => Some(RetainedReason::EmptyContainerDirectory),
             #[cfg(target_os = "linux")]
             Self::AliveButUnobservable => Some(RetainedReason::Hidden),
             Self::Unverifiable(_) => Some(RetainedReason::Unverifiable),
             Self::Survived => Some(RetainedReason::Survived),
+            Self::ContainerSurvivors(pids) => {
+                Some(RetainedReason::ContainerSurvivors(pids.clone()))
+            }
             _ => None,
         }
     }
@@ -542,12 +761,63 @@ const POLL: Duration = Duration::from_millis(20);
 /// such a daemon would hold the lock itself.
 ///
 /// Every entry is logged with its decision. Returns the decisions for tests.
+#[cfg(any(test, not(target_os = "linux")))]
 pub(crate) async fn sweep_orphans(
     owner: &RunDirLock,
     adopted: &AdoptedPids,
     bounds: SweepBounds,
 ) -> Vec<(LiveChild, SweepDecision)> {
     sweep_orphans_with(owner, adopted, bounds, sweep_entries).await
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn sweep_orphans_with_placement(
+    owner: &RunDirLock,
+    adopted: &AdoptedPids,
+    bounds: SweepBounds,
+    placement: Option<&subc_cgroup::Placement>,
+) -> Vec<(LiveChild, SweepDecision)> {
+    sweep_orphans_with(
+        owner,
+        adopted,
+        bounds,
+        |entries, adopted, bounds| async move {
+            let mut decisions = Vec::new();
+            let mut other = Vec::new();
+            for entry in entries {
+                if !adopted.contains(entry.pid) {
+                    if let Some(container) = &entry.container {
+                        let decision = match container.current_boot() {
+                            Ok(false) => Some(SweepDecision::Gone),
+                            Ok(true) => None,
+                            Err(error) => Some(SweepDecision::Unverifiable(error.to_string())),
+                        };
+                        if let Some(decision) = decision {
+                            decisions.push((entry, decision));
+                            continue;
+                        }
+                    }
+                }
+                if let Some(path) = entry
+                    .container
+                    .as_ref()
+                    .and_then(|container| container.cgroup_path.as_ref())
+                {
+                    let decision = if adopted.contains(entry.pid) {
+                        SweepDecision::Adopted
+                    } else {
+                        crate::cgroup_recovery::sweep(placement, path, bounds).await
+                    };
+                    decisions.push((entry, decision));
+                } else {
+                    other.push(entry);
+                }
+            }
+            decisions.extend(sweep_entries(other, adopted, bounds).await);
+            decisions
+        },
+    )
+    .await
 }
 
 async fn sweep_orphans_with<'a, F, Fut>(
@@ -564,12 +834,16 @@ where
     let entries = match read_record(path) {
         Ok(entries) => entries,
         Err(error) => {
-            warn!(
+            let quarantine = quarantine_record(path, &error);
+            error!(
                 path = %path.display(),
                 %error,
-                "live-children record unusable; no orphan sweep, nothing signalled"
+                ?quarantine,
+                "live-children record unusable; no orphan sweep, nothing signalled; carried modules must remain blocked"
             );
-            Vec::new()
+            // Do not reset an unreadable identity to an empty record. A failed
+            // rename leaves the original evidence in place for the next boot.
+            return Vec::new();
         }
     };
     let decisions = sweep(entries, adopted, bounds).await;
@@ -584,7 +858,13 @@ where
     let reasons = decisions
         .iter()
         .filter_map(|(entry, decision)| {
-            decision.retained_reason().map(|reason| (entry.pid, reason))
+            let reason = match decision {
+                SweepDecision::Unverifiable(error) if entry.container.is_some() => {
+                    Some(RetainedReason::ContainerUnverifiable(error.clone()))
+                }
+                _ => decision.retained_reason(),
+            };
+            reason.map(|reason| (entry.pid, reason))
         })
         .collect();
     if let Err(error) = write_record_with_reasons(path, &retained, reasons) {
@@ -631,6 +911,18 @@ async fn sweep_entries_with_hooks(
     for entry in entries {
         if adopted.contains(entry.pid) {
             decisions.push((entry, SweepDecision::Adopted));
+            continue;
+        }
+        if let Some(container) = &entry.container {
+            let decision = match container.current_boot() {
+                Ok(false) => SweepDecision::Gone,
+                Err(error) => SweepDecision::Unverifiable(error.to_string()),
+                Ok(true) => match container.group() {
+                    Ok(group) => crate::group_recovery::sweep(group, bounds).await,
+                    Err(error) => SweepDecision::Unverifiable(error.to_string()),
+                },
+            };
+            decisions.push((entry, decision));
             continue;
         }
         // Opened before any check, so on Linux the checks and the signal
@@ -886,6 +1178,10 @@ fn log_decision(entry: &LiveChild, decision: &SweepDecision) {
             reason = verdict.describe(),
             "orphan sweep: pid does not match the recorded child; not signalled"
         ),
+        SweepDecision::Unverifiable(error) if entry.container.is_some() => tracing::error!(
+            module_id, pid, container = ?entry.container, %error,
+            "orphan sweep: container could not be verified; retaining its record and blocking fresh starts"
+        ),
         SweepDecision::Unverifiable(error) => warn!(
             module_id,
             pid,
@@ -912,6 +1208,15 @@ fn log_decision(entry: &LiveChild, decision: &SweepDecision) {
             pid,
             "orphan sweep: previous daemon's child still observed after SIGKILL; keeping its record and blocking its module"
         ),
+        SweepDecision::ContainerSurvivors(pids) => tracing::error!(
+            module_id, pid, ?pids, container = ?entry.container,
+            "orphan sweep: container survivors block a fresh instance"
+        ),
+        #[cfg(target_os = "linux")]
+        SweepDecision::EmptyContainerDirectory => warn!(
+            module_id, container = ?entry.container,
+            "orphan sweep: container is stopped; retaining only a directory-removal retry, without blocking fresh starts"
+        ),
         SweepDecision::NotSignalledOnThisPlatform => info!(
             module_id,
             pid,
@@ -924,6 +1229,14 @@ fn log_decision(entry: &LiveChild, decision: &SweepDecision) {
 pub(crate) fn record_path(run_dir: &Path) -> PathBuf {
     run_dir.join(LIVE_CHILDREN_FILE_NAME)
 }
+
+#[cfg(test)]
+#[path = "live_children/quarantine_tests.rs"]
+mod quarantine_tests;
+
+#[cfg(test)]
+#[path = "live_children/boot_session_tests.rs"]
+mod boot_session_tests;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -964,6 +1277,7 @@ pub(crate) mod tests {
             .unwrap();
         let mut fixture = NonDumpableChild {
             entry: LiveChild {
+                container: None,
                 module_id: "previous".to_owned(),
                 pid: child.id(),
                 protocol: ModuleProtocol::None,
@@ -1121,6 +1435,7 @@ pub(crate) mod tests {
 
         fn spec(module_id: &str) -> ModuleSpec {
             ModuleSpec {
+                carry_containment: false,
                 module_id: module_id.to_owned(),
                 program: PathBuf::from("/bin/sleep"),
                 args: vec!["60".to_owned()],
@@ -1324,6 +1639,7 @@ pub(crate) mod tests {
 
     fn child(module_id: &str, pid: u32) -> LiveChild {
         LiveChild {
+            container: None,
             module_id: module_id.to_owned(),
             pid,
             protocol: ModuleProtocol::None,
@@ -1446,8 +1762,8 @@ pub(crate) mod tests {
 
     #[test]
     fn a_roster_with_a_recorded_sh_interpreter_is_readable_by_the_previous_shape() {
-        // These are the complete version-1 shapes used by the previous daemon.
-        // Its serde deserializer did not deny unknown fields at either level.
+        // The previous serde shapes still decode the image identity. A released
+        // reader rejects the v2 header before using any decoded child to signal.
         #[derive(Debug, Deserialize, PartialEq, Eq)]
         struct PreviousExecutableIdentity {
             device: u64,
@@ -1486,7 +1802,7 @@ pub(crate) mod tests {
         assert_eq!(
             previous,
             PreviousRecordFile {
-                version: 1,
+                version: 2,
                 children: vec![PreviousLiveChild {
                     module_id: "sh-script".to_owned(),
                     pid: 40,
@@ -1519,7 +1835,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn windows_file_id_record_is_full_width_and_readable_by_rollback_reader() {
+    fn windows_file_id_record_is_full_width_and_decodable_by_previous_serde_shape() {
         #[derive(Deserialize)]
         struct PreviousImage {
             device: u64,
@@ -1554,7 +1870,7 @@ pub(crate) mod tests {
         write_record(&path, std::slice::from_ref(&entry)).unwrap();
         assert_eq!(read_record(&path).unwrap(), vec![entry]);
         let previous: PreviousRecord = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(previous.version, 1);
+        assert_eq!(previous.version, 2);
         let previous = &previous.children[0];
         assert_eq!(previous.module_id, "windows-child");
         assert_eq!(previous.pid, 40);
@@ -1566,11 +1882,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn unix_record_without_windows_identity_keeps_original_bytes() {
+    fn unix_record_without_windows_identity_keeps_original_child_bytes() {
         let dir = ScratchDir::new("unix-record-bytes");
         let path = record_path(&dir);
         write_record(&path, &[child("nats", 40)]).unwrap();
-        assert_eq!(fs::read_to_string(path).unwrap(), "{\n  \"version\": 1,\n  \"children\": [\n    {\n      \"module_id\": \"nats\",\n      \"pid\": 40,\n      \"protocol\": \"none\",\n      \"start_time\": 1000,\n      \"executable\": {\n        \"device\": 7,\n        \"inode\": 11\n      },\n      \"cgroup_name\": \"nats-a\"\n    }\n  ]\n}");
+        assert_eq!(fs::read_to_string(path).unwrap(), "{\n  \"version\": 2,\n  \"children\": [\n    {\n      \"module_id\": \"nats\",\n      \"pid\": 40,\n      \"protocol\": \"none\",\n      \"start_time\": 1000,\n      \"executable\": {\n        \"device\": 7,\n        \"inode\": 11\n      },\n      \"cgroup_name\": \"nats-a\"\n    }\n  ]\n}");
     }
 
     #[cfg(windows)]
@@ -1594,6 +1910,7 @@ pub(crate) mod tests {
                 .spawn()
                 .unwrap();
             let entry = LiveChild {
+                container: None,
                 module_id: "previous".to_owned(),
                 pid: child.id(),
                 protocol: ModuleProtocol::None,
@@ -1818,6 +2135,9 @@ pub(crate) mod tests {
         let roster = crate::child_roster::ChildRoster::default();
         roster.record_to(path.clone());
         let recorded = crate::child_roster::RecordedIdentity {
+            container: None,
+            #[cfg(unix)]
+            carried: None,
             start_time: Some(5),
             executable: Some(ExecutableIdentity {
                 device: 1,
@@ -1860,6 +2180,7 @@ pub(crate) mod tests {
                 start_time: Some(5),
                 executable: recorded.executable,
                 cgroup_name: Some("nats-a".to_owned()),
+                container: None,
             }
         );
         drop(first);
@@ -1897,6 +2218,7 @@ pub(crate) mod tests {
                 .spawn()
                 .unwrap();
             let entry = LiveChild {
+                container: None,
                 module_id: "previous".to_owned(),
                 pid: child.id(),
                 protocol: ModuleProtocol::None,
@@ -2051,7 +2373,7 @@ pub(crate) mod tests {
                 RetainedReason::Unverifiable
             };
             assert_eq!(decisions.len(), 1);
-            assert_eq!(decisions[0].1.retained_reason(), Some(reason));
+            assert_eq!(decisions[0].1.retained_reason(), Some(reason.clone()));
             assert_eq!(
                 read_record(&path).unwrap(),
                 vec![fixture.entry.clone()],
@@ -2063,7 +2385,7 @@ pub(crate) mod tests {
             roster.record_to(path.clone());
             assert_eq!(
                 roster.previous_instance("previous"),
-                Some((fixture.entry.pid, reason))
+                Some((fixture.entry.pid, reason.clone()))
             );
             assert_eq!(roster.previous_instance_pid("unrelated"), None);
             let guard = roster.admit(
@@ -2081,6 +2403,7 @@ pub(crate) mod tests {
             )
             .with_live_children_record(path.clone());
             let spec = |module_id: &str| ModuleSpec {
+                carry_containment: false,
                 module_id: module_id.to_owned(),
                 program: program.clone(),
                 args: vec!["60".to_owned()],

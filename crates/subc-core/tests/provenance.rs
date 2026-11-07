@@ -501,6 +501,7 @@ async fn supervisor_provenance_detects_replaced_executable_image() {
     );
     let module = supervisor
         .spawn(ModuleSpec {
+            carry_containment: false,
             module_id: "provenance-replacement".to_string(),
             program: copied_stub.clone(),
             args: Vec::new(),
@@ -534,6 +535,7 @@ async fn supervisor_provenance_detects_replaced_executable_image() {
 
 fn stub_spec(module_id: &str, env: Vec<(&str, &str)>) -> ModuleSpec {
     ModuleSpec {
+        carry_containment: false,
         module_id: module_id.to_string(),
         program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
         args: Vec::new(),

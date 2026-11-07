@@ -322,6 +322,54 @@ jobs:
           done
           sudo env SUBC_REQUIRE_CGROUP_TEST=1 "$test_binary" "${tests[@]}" --exact --nocapture --test-threads=1
 
+      # Run as the runner user inside its own delegated unit, not as root. The
+      # required flag makes a missing or unusable delegation fail rather than skip.
+      - name: Carried kernel cgroup tests
+        if: ${{ !cancelled() && matrix.os == 'ubuntu' }}
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_binary="$(
+            cargo test -p subc-daemon --lib --no-run --locked --message-format=json |
+              jq -ers '
+                map(select(.reason == "compiler-artifact"
+                  and .target.name == "subc_daemon"
+                  and .target.kind == ["lib"]
+                  and .profile.test == true
+                  and .executable != null))
+                | if length == 1 then .[0].executable
+                  else error("expected exactly one subc-daemon lib test executable") end
+              '
+          )"
+          tests=(
+            supervise::cgroup_reap_tests::carried::linux_carried_cgroup_operator_restart_keeps_nested_holder
+            supervise::cgroup_reap_tests::carried::linux_carried_cgroup_crash_restart_keeps_nested_holder
+            supervise::cgroup_reap_tests::carried::linux_carried_cgroup_reload_keeps_nested_holder
+            supervise::cgroup_reap_tests::carried::linux_carried_cgroup_health_restart_keeps_nested_holder
+            supervise::cgroup_reap_tests::carried::linux_carried_cgroup_disable_during_backoff_kills_nested_holder
+            supervise::cgroup_reap_tests::carried::linux_carried_cgroup_recovery_sweeps_nested_holder_without_leader
+            supervise::cgroup_reap_tests::carried::linux_carried_cgroup_monitor_abort_kills_the_nested_holder_or_retains_its_identity
+          )
+          for test_name in "${tests[@]}"; do
+            "$test_binary" "$test_name" --exact --list | grep -Fx "$test_name: test" > /dev/null
+          done
+          sudo systemd-run --wait --pipe --collect --expand-environment=no \
+            --unit="subc-carried-cgroup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            -p Delegate=yes -p "User=$(id -u)" -p "Group=$(id -g)" \
+            -p "WorkingDirectory=$PWD" \
+            /bin/bash -euo pipefail -c '
+              while IFS=: read -r hierarchy controllers path; do
+                if [[ "$hierarchy" == 0 && -z "$controllers" ]]; then
+                  export SUBC_TEST_CGROUP_ROOT="/sys/fs/cgroup$path"
+                  break
+                fi
+              done < /proc/self/cgroup
+              : "${SUBC_TEST_CGROUP_ROOT:?missing unified cgroup path}"
+              export SUBC_TEST_CGROUP_REQUIRED=1
+              exec "$@" --exact --nocapture --test-threads=1
+            ' carried-cgroup-tests "$test_binary" "${tests[@]}"
+
       # Require the root fixture rather than allowing a missing agent to skip CI.
       - name: Real polkit operator prompt
         if: ${{ !cancelled() && matrix.os == 'ubuntu' }}

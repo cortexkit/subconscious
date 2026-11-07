@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.58
+
+- Move the subc-daemon dev-dependency requirement to 0.40.0; no behavior change for the binary.
+
 ## 0.1.57
 
 - Adopt the updated route-open types without changing route behavior.

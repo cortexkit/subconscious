@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.41.0
+
+- Keep carried Unix children behind a serialized, bounded pre-exec admission
+  barrier until placement and complete recovery identity are durable. Preserve
+  failure-atomic container cleanup, including shutdown races, and quarantine a
+  failed late record write rather than admitting an unrecorded second copy.
+- Persist carried containers with their boot UUID and inherited session in a
+  version-2 recovery record. Skip all signalling after a boot mismatch, verify
+  the session again at delivery, and block legacy containers missing evidence.
+- Quarantine unusable child-recovery records and persistently block opted-in
+  carried modules until offline clearance, including across daemon restarts.
+  An existing carried container remains subject to that block even after its
+  configuration flag is turned off; never-carried modules remain unaffected.
+- Preserve non-carried children's per-spawn cgroup cleanup before wait returns,
+  including ordinary restarts and shutdown stragglers.
+- Confirm process-group emptiness with two sequential complete enumerations;
+  retain unknown groups and unverified possible members instead of treating them as gone.
+- Require the first module process's recorded start time to match before
+  signalling or joining its carried group. Reap operator app launches only
+  through their owned child handles.
+- Preserve failed-admission and destructor cleanup ownership until container
+  emptiness is established; allow exactly one fresh retry after a failed group join.
+- Breaking: `ModuleSpec` and `ConfiguredModule` add `carry_containment: bool`.
+  Struct-literal callers must supply it (`false` preserves the default).
+- Opted-in modules retain their process container for a named, pending
+  replacement. Terminal transitions, including stop during restart backoff,
+  destroy the container even without a live module leader. The flag is set in
+  daemon config, not HELLO, is incompatible with safe overlap, and applies to
+  the next fresh container after a reload.
+- Recover unpinned process groups by checking and signalling individual members,
+  never a recycled group ID. Retain unverifiable containers and show the block in
+  module status and supervisor health until verified rechecks confirm them empty.
+  Count an unexpectedly reaped first leader as a supervisor defect.
+- Persist carried cgroup paths and recover them only beneath the daemon's
+  current trusted delegation. Unverifiable roots or surviving members block
+  fresh starts until kernel-confirmed subtree emptiness; an empty directory
+  awaiting removal is retried without blocking. Hard-kill cleanup also works
+  without an async runtime through a frozen-member fallback.
+- If joining a carried process group fails, confirm the old container is gone
+  and try one fresh container within the same restart attempt. Unconfirmed
+  cleanup blocks the retry; cgroups and Windows jobs do not use this retry.
+
 ## 0.40.0
 
 - Keep ready forwarding waits free of diagnostic timers, label allocations and counter clones; observe decoded control operations without reparsing their bodies.

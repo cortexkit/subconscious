@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.2
+
+- Move the subc-daemon dev-dependency requirement to 0.40.0; no behavior change for the binary.
+
 ## 0.5.1
 
 - Adopt compatible dependency requirements for the updated route-open control types; no behavior change.

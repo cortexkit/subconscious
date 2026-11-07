@@ -71,7 +71,7 @@
 #   place-module.sh --module <id> --staged <path> [--dest <path>] [--path-face <name>]
 #                   --marker <string> [--control <string>] [--old-control <string>]
 #                   --tool-defs <unchanged|additive|unregistered|changed|none> [--host-restart-window]
-#                   [--no-restart [--reexec-safe]]
+#                   [--no-restart [--reexec-safe]] [--allow-debuggable <ask_id>]
 #   place-module.sh --module <id> --rollback <stamp> [--dest <path>]
 #                   [--restore-store <path>] [--no-restart]
 #   place-module.sh --module <id> --staged <path> [--dest <path>] --marker <string> --install
@@ -87,7 +87,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; REEXEC_SAFE=0; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; ALLOW_UNSTAMPED=0; INSTALL=0; ROLLBACK=""; RESTORE_STORE=""; TOOL_DEFS=""; HOST_RESTART_WINDOW=0
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; REEXEC_SAFE=0; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; ALLOW_UNSTAMPED=0; INSTALL=0; ROLLBACK=""; RESTORE_STORE=""; TOOL_DEFS=""; HOST_RESTART_WINDOW=0; ALLOW_DEBUGGABLE=""
 
 while (($# > 0)); do
   case "$1" in
@@ -157,11 +157,28 @@ while (($# > 0)); do
     # module that serves no tools.
     --tool-defs) TOOL_DEFS="$2"; shift 2 ;;
     --host-restart-window) HOST_RESTART_WINDOW=1; shift ;;
+    # A build signed with get-task-allow lets any process running as the user
+    # attach to the module and read its memory, including its launch secret,
+    # which the daemon accepts on new connections for the life of the process.
+    # So every such process can act as the module toward other modules until
+    # the module restarts on a normal build. This flag lets one such build
+    # through for a time-boxed profiling window that the operator approved in
+    # the named ask; the ask must have stated that consequence. The window
+    # ends with a normal placement, which restarts the module and so rotates
+    # the secret.
+    --allow-debuggable) ALLOW_DEBUGGABLE="$2"; shift 2 ;;
     *) echo "REFUSED: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
 
 [ -n "$MODULE" ] || { echo "REFUSED: --module is required" >&2; exit 2; }
+if [ -n "$ALLOW_DEBUGGABLE" ]; then
+  [[ "$ALLOW_DEBUGGABLE" =~ ^ask_[0-9a-f]{8,}$ ]] || { echo "REFUSED: --allow-debuggable takes the id of the operator's approving ask (ask_<hex>), not '$ALLOW_DEBUGGABLE'" >&2; exit 2; }
+  [ "$INSTALL" -eq 0 ] && [ -z "$ROLLBACK" ] || { echo "REFUSED: --allow-debuggable is only for placing a staged build over a running module, never a first install or a rollback" >&2; exit 2; }
+  # A debuggable build must start fresh so the window is bounded by its own
+  # process, and so its launch secret dies with the restart that ends it.
+  [ "$RESTART" -eq 1 ] || { echo "REFUSED: --allow-debuggable requires the restart; --no-restart would leave the running process holding a secret the debuggable file's users could later read" >&2; exit 2; }
+fi
 # cerebellum starts its agent-cursor helper from its
 # installed path on macOS, because macOS ties the helper's Screen Recording grant
 # to that path, and refuses the start once the path names a different file. So a
@@ -1156,7 +1173,10 @@ elif command -v codesign >/dev/null; then
   # are printed so the placement card's smoke test can be checked to exercise each.
   ents=$(codesign -d --entitlements - "$STAGED" 2>/dev/null || true)
   if [ "$(printf '%s' "$ents" | grep -c 'get-task-allow')" -gt 0 ]; then
-    refuse "staged binary carries com.apple.security.get-task-allow, which lets any same-user process attach and read its launch nonce"
+    [ -n "$ALLOW_DEBUGGABLE" ] || refuse "staged binary carries com.apple.security.get-task-allow, which lets any same-user process attach and read its launch nonce"
+    say "DEBUGGABLE BY REQUEST (--allow-debuggable $ALLOW_DEBUGGABLE): any process running as this user can attach, read the launch secret and act as $MODULE toward other modules until a normal build is placed and the module restarts"
+  elif [ -n "$ALLOW_DEBUGGABLE" ]; then
+    refuse "--allow-debuggable given but the staged binary has no get-task-allow; drop the flag"
   fi
   exceptions=$(printf '%s' "$ents" | grep -oE 'com\.apple\.security\.cs\.[a-z-]+' | sort -u | paste -sd ' ' - || true)
   if has_runtime "$STAGED"; then

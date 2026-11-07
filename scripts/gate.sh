@@ -208,6 +208,7 @@ fast_check() {
       step 'Crate version checker fixtures' bash scripts/fleet/tests/check-wire-crate-versions.sh.test
       step 'Module CLI face fixtures' bash scripts/fleet/tests/place-module-faces.sh
       step 'Module reexec guard fixtures' bash scripts/fleet/tests/place-module-reexec.sh
+      step 'Module debuggable placement fixtures' bash scripts/fleet/tests/place-module-debuggable.sh
       step 'Module rollback fixtures' bash scripts/fleet/tests/place-module-rollback.sh
       step 'Signing identity fixtures (stubbed tools)' bash scripts/release/test-macos-sign-notarize.sh
       step 'Unix release archive fixtures' bash scripts/release/test-package-unix-archives.sh

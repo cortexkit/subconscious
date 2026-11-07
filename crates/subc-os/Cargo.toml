@@ -1,6 +1,6 @@
 [package]
 name = "subc-os"
-version = "0.1.29"
+version = "0.1.30"
 edition = "2021"
 license = "MIT"
 publish = true
@@ -9,6 +9,12 @@ description = "Operating-system primitives for the subc daemon that need unsafe 
 
 [dependencies]
 tokio = { version = "1", optional = true, features = ["process"] }
+zeroize = "1"
+
+[[bin]]
+name = "ckdev-os-keychain"
+path = "tests/fixtures/config-keychain.rs"
+required-features = ["test-support"]
 
 [[bin]]
 name = "subc-os-admission-fixture"

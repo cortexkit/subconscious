@@ -82,6 +82,7 @@ pub mod admission_gate;
 pub mod boot_id;
 #[cfg(unix)]
 pub mod child_exit;
+pub mod config_keychain;
 #[cfg(all(unix, feature = "test-support"))]
 pub mod fork_exec_test;
 pub mod host;

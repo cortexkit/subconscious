@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.3
+
+- Test only: the revocation tests' severed-socket check waits for the client's
+  `disconnected` event instead of polling its connection state. A kicked client
+  whose credential is still valid reconnects at once, so the state poll could
+  miss the disconnect and fail at random. No change to the binary.
+
 ## 0.5.2
 
 - Move the subc-daemon dev-dependency requirement to 0.40.0; no behavior change for the binary.

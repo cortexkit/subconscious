@@ -593,25 +593,30 @@ impl Victim {
 
     /// "Unavailable on the severed socket": the connection is closed by the server and
     /// the client reports it.
+    ///
+    /// This waits for the client's `disconnected` event, not for its connection
+    /// state. `connect_once` sets `max_reconnects(0)`, which async-nats reads as "no
+    /// limit", so a kicked client whose credential is still valid reconnects at
+    /// once. A 25 ms poll of the state can then miss the whole disconnected
+    /// window, while the event is always recorded.
     async fn expect_severed(&self) {
         let deadline = Instant::now() + RECONNECT_BOUND;
-        while self.client.connection_state() == async_nats::connection::State::Connected {
+        loop {
+            // Copy the log before asserting: panicking while the guard is held
+            // would poison the lock the event callback still writes to.
+            let events = self.events.lock().unwrap().clone();
+            if events
+                .iter()
+                .any(|event| event.to_ascii_lowercase().contains("disconnected"))
+            {
+                return;
+            }
             assert!(
                 Instant::now() < deadline,
-                "the revoked user stayed connected: {:?}",
-                self.events.lock().unwrap()
+                "the client reported no disconnect: {events:?}"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(
-            self.events
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|event| event.to_ascii_lowercase().contains("disconnected")),
-            "the client reported no disconnect: {:?}",
-            self.events.lock().unwrap()
-        );
     }
 
     /// An explicit reconnect with the same JWT and seed is refused as revoked.

@@ -340,7 +340,7 @@ fn consent_request() -> ConsentRequest {
         changeset,
     );
     plan.active_generations.insert("sample".into(), 3);
-    ConsentRequest::new(plan.digest().unwrap(), plan)
+    ConsentRequest::new(plan).unwrap()
 }
 
 #[test]
@@ -349,10 +349,7 @@ fn config_wire_consent_v1_requester_and_responder_decode_shared_golden() {
     golden("consent_v1_request", &requester);
     let responder_input: ConsentRequest =
         serde_json::from_value(fixture("consent_v1_request")).unwrap();
-    assert_eq!(
-        responder_input.plan_digest,
-        responder_input.plan.digest().unwrap()
-    );
+    assert!(responder_input.is_consistent());
     let response = ConsentResponse::new(&responder_input, ConsentDecision::Approved);
     golden("consent_v1_response_approved", &response);
     let requester_input: ConsentResponse =
@@ -388,6 +385,21 @@ fn config_wire_consent_v1_unknown_decisions_and_wrong_bindings_never_approve() {
     let mut wrong_vector = valid;
     wrong_vector.input_vector.inputs.clear();
     assert!(!wrong_vector.approves(&request));
+}
+
+#[test]
+fn config_wire_consent_v1_request_binding_must_describe_its_plan() {
+    let request = consent_request();
+    assert!(request.is_consistent());
+    let mut other_digest = request.clone();
+    other_digest.plan_digest = subc_config::raw_digest(b"another plan");
+    assert!(!other_digest.is_consistent());
+    let mut other_revision = request.clone();
+    other_revision.base_revision += 1;
+    assert!(!other_revision.is_consistent());
+    let mut other_vector = request;
+    other_vector.input_vector.inputs.clear();
+    assert!(!other_vector.is_consistent());
 }
 
 #[test]

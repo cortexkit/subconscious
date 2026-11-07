@@ -6,7 +6,7 @@
 //! or asserting that a terminal showed a diff is not approval.
 
 use serde::{Deserialize, Serialize};
-pub use subc_config::{Digest, InputVector, Plan};
+pub use subc_config::{CanonicalError, Digest, InputVector, Plan};
 
 pub const CONSENT_V1: &str = "consent/v1";
 
@@ -37,14 +37,25 @@ pub struct ConsentRequest {
     pub plan: Plan,
 }
 impl ConsentRequest {
-    pub fn new(plan_digest: Digest, plan: Plan) -> Self {
-        Self {
+    /// Builds the request from the plan alone, so its digest, revision and
+    /// input vector always describe the plan the card shows.
+    pub fn new(plan: Plan) -> Result<Self, CanonicalError> {
+        Ok(Self {
             protocol: ConsentProtocol::V1,
-            plan_digest,
+            plan_digest: plan.digest()?,
             base_revision: plan.base_revision,
             input_vector: plan.input_vector.clone(),
             plan,
-        }
+        })
+    }
+
+    /// Whether the binding fields describe the carried plan. A responder shows
+    /// and answers only a consistent request, so a card can never display one
+    /// plan while its approval binds another.
+    pub fn is_consistent(&self) -> bool {
+        self.plan.digest().is_ok_and(|digest| digest == self.plan_digest)
+            && self.base_revision == self.plan.base_revision
+            && self.input_vector == self.plan.input_vector
     }
 }
 

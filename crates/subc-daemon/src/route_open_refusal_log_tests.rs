@@ -228,6 +228,7 @@ async fn supervised_absent_refused_line_names_the_caller() {
     rig._supervisor
         .supervise_configured(
             ModuleSpec {
+                carry_containment: false,
                 module_id: "stopped".to_string(),
                 program: PathBuf::from("/nonexistent/stopped"),
                 args: Vec::new(),

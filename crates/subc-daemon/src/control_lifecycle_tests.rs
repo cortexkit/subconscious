@@ -53,6 +53,7 @@ async fn request(
 #[cfg(unix)]
 fn spec(home: &ScratchDir, protocol: subc_control::ModuleProtocol) -> ModuleSpec {
     ModuleSpec {
+        carry_containment: false,
         module_id: "lifecycle-worker".into(),
         program: "/bin/sleep".into(),
         args: vec!["600".into()],

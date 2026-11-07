@@ -77,6 +77,11 @@ mod user_home;
 #[cfg(unix)]
 pub use user_home::{effective_uid, real_user_home_dir};
 
+#[cfg(unix)]
+pub mod admission_gate;
+pub mod boot_id;
+#[cfg(unix)]
+pub mod child_exit;
 #[cfg(all(unix, feature = "test-support"))]
 pub mod fork_exec_test;
 pub mod host;
@@ -84,6 +89,8 @@ pub mod launch_nonce;
 pub mod local_peer;
 pub mod named_pipe;
 pub mod privacy_identity;
+#[cfg(unix)]
+pub mod process_group;
 pub mod process_identity;
 pub mod socket_peer;
 #[cfg_attr(not(windows), path = "windows_acl_noop.rs")]
@@ -102,6 +109,9 @@ pub use launch_nonce::{LaunchNoncePipeDelivery, LaunchNoncePipeHandoff};
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+
+#[cfg(target_os = "macos")]
+pub use macos::owned_child_start_time;
 #[cfg(windows)]
 mod windows;
 #[cfg(all(test, windows))]

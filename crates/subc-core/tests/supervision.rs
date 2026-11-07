@@ -586,6 +586,7 @@ async fn failed_spawn_during_enable_allows_a_later_retry() {
     let module = supervisor
         .supervise_configured(
             ModuleSpec {
+                carry_containment: false,
                 module_id: "missing-enable-program".to_string(),
                 program: missing_program,
                 args: Vec::new(),
@@ -1153,6 +1154,7 @@ fn stub_spec<'a>(
     );
 
     ModuleSpec {
+        carry_containment: false,
         module_id: module_id.to_string(),
         program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
         args: Vec::new(),
@@ -1193,6 +1195,7 @@ async fn a_dead_module_leaves_its_stderr_readable_from_the_supervisor() {
     let supervisor = supervisor(&server, 0, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
+            carry_containment: false,
             module_id: "stderr-tail-crasher".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -1256,6 +1259,7 @@ async fn a_silent_module_reports_captured_and_empty_rather_than_uncaptured() {
     let supervisor = supervisor(&server, 0, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
+            carry_containment: false,
             module_id: "stderr-tail-silent".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -1328,6 +1332,7 @@ async fn a_supervised_module_inherits_the_parent_environment() {
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
+            carry_containment: false,
             module_id: "env-inherit-probe".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -1376,6 +1381,7 @@ async fn stderr_from_before_a_restart_survives_with_a_marked_boundary() {
     let supervisor = supervisor(&server, 3, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
+            carry_containment: false,
             module_id: "stderr-tail-looper".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -1449,6 +1455,7 @@ async fn a_held_stderr_pipe_marks_the_tail_incomplete_and_its_late_output_stays_
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
+            carry_containment: false,
             module_id: "stderr-tail-wedged-pump".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
             args: Vec::new(),
@@ -1539,6 +1546,7 @@ async fn child_stdout_and_stderr_reach_the_capture_file_while_only_stderr_reache
         supervisor(&server, 0, Duration::from_millis(10)).with_capture_logs_dir(&logs_dir);
     let module = supervisor
         .spawn(ModuleSpec {
+            carry_containment: false,
             module_id: "two-pipe-capture".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_log-child-fixture")),
             args: Vec::new(),
@@ -1621,6 +1629,7 @@ async fn concurrent_child_pipes_never_tear_a_line_in_the_capture_file() {
         supervisor(&server, 0, Duration::from_millis(10)).with_capture_logs_dir(&logs_dir);
     let module = supervisor
         .spawn(ModuleSpec {
+            carry_containment: false,
             module_id: "two-pipe-burst".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_log-child-fixture")),
             args: Vec::new(),
@@ -2181,5 +2190,104 @@ fn copy_executable(from: &std::path::Path, to: &std::path::Path) {
     #[cfg(not(unix))]
     {
         std::fs::copy(from, to).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn carried_holder_survives_a_real_hello_reload() {
+    struct OwnedHolder {
+        process: subc_os::Process,
+        birth: u64,
+    }
+    impl OwnedHolder {
+        fn alive(&self) -> bool {
+            self.process
+                .observe()
+                .is_some_and(|now| now.start_time == self.birth)
+        }
+    }
+    impl Drop for OwnedHolder {
+        fn drop(&mut self) {
+            if self.alive() {
+                let _ = self.process.signal(subc_os::Signal::Kill);
+            }
+        }
+    }
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 3, Duration::from_millis(10))
+        .with_forwarding(Arc::clone(&server.forwarding));
+    let holder_path = server.temp_dir.join("carried-socket-holder.pid");
+    let module_id = "carried-real-hello-reload";
+    let mut spec = stub_spec(
+        &server,
+        module_id,
+        [(
+            "FAKE_AFT_SOCKET_HOLDER_FIRST_PATH",
+            holder_path.to_str().unwrap(),
+        )],
+    );
+    spec.carry_containment = true;
+    let module = supervisor.spawn(spec).unwrap();
+    let original = wait_for_status(&module, Duration::from_secs(10), |status| {
+        status.live && status.pid.is_some()
+    })
+    .await;
+    let connection = server
+        .registry
+        .get_module(module_id)
+        .unwrap()
+        .unwrap()
+        .connection_id;
+    let pid: u32 = std::fs::read_to_string(&holder_path)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(subc_os::parent_pid(pid), original.pid);
+    let process = subc_os::Process::open(pid).unwrap().unwrap();
+    let birth = process.observe().unwrap().start_time;
+    assert_eq!(subc_os::parent_pid(pid), original.pid);
+    let holder = OwnedHolder { process, birth };
+    assert_eq!(subc_os::process_group::pgid(pid).unwrap(), original.pid);
+    // The existing holder fixture owns null stdout/stderr and a cloned daemon
+    // socket on stdin. This deliberately also exercises releasing an old
+    // registration whose descriptor remains open in a carried holder.
+    module.reload().await.unwrap();
+    let replacement = wait_for_status(&module, Duration::from_secs(10), |status| {
+        status.live && status.pid.is_some() && status.spawn_generation > original.spawn_generation
+    })
+    .await;
+    assert_ne!(replacement.pid, original.pid);
+    assert_ne!(
+        server
+            .registry
+            .get_module(module_id)
+            .unwrap()
+            .unwrap()
+            .connection_id,
+        connection
+    );
+    assert!(
+        holder.alive(),
+        "the same holder must survive the complete real-wire HELLO replacement"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&holder_path)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap(),
+        pid
+    );
+    assert_eq!(subc_os::process_group::pgid(pid).unwrap(), original.pid);
+    module.stop().await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while holder.alive() {
+        assert!(
+            Instant::now() < deadline,
+            "terminal stop must kill the original carried holder"
+        );
+        sleep(Duration::from_millis(10)).await;
     }
 }

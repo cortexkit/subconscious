@@ -59,6 +59,14 @@ mod swap;
 #[path = "supervise_activity.rs"]
 mod activity;
 
+#[cfg(unix)]
+#[path = "supervise/admission.rs"]
+mod admission;
+#[cfg(all(test, windows))]
+mod carried_job_tests;
+pub(crate) mod containment;
+#[cfg(all(test, unix))]
+mod containment_tests;
 mod slow_retry;
 use slow_retry::{FailedRetry, FailureContext};
 
@@ -287,7 +295,6 @@ fn privacy_command(
         .arg("__disclaim-exec")
         .arg(ack.fd().to_string())
         .arg(&program);
-    ack.install(command.as_std_mut());
     Ok((
         command,
         Some(PrivacyExec {
@@ -310,7 +317,7 @@ fn privacy_command(
 
 struct SupervisedChild {
     subtree_target: crate::subtree_resources::Target,
-    child: Child,
+    child: containment::ProcessChild,
     exec: crate::activity::ExecOwner,
     #[cfg(windows)]
     nonce_delivery: Option<subc_os::LaunchNoncePipeDelivery>,
@@ -332,8 +339,9 @@ struct SupervisedChild {
     /// next spawn, so this process keeps being handled by the protocol it
     /// actually speaks.
     protocol: ModuleProtocol,
-    /// This process's cgroup name: a bounded module/slot label followed by a
-    /// spawn suffix unique to this process (when cgroup placement is on). A
+    /// This container's cgroup name: a bounded module/slot label followed by a
+    /// unique suffix (when cgroup placement is on). Carried replacements reuse
+    /// the name; ordinary launches each get a fresh container. A
     /// retired process in a slot may still be draining when a later one is
     /// spawned into that slot, so the suffix keeps the later process out of
     /// the retired one's cgroup, which is the domain a kill applies to.
@@ -341,7 +349,8 @@ struct SupervisedChild {
     module_id: String,
     #[cfg(target_os = "linux")]
     cgroup_placement: Option<subc_cgroup::Placement>,
-    /// The job that contains this child and every process it spawns (issue #109).
+    /// The job for an ordinary, non-carried launch. For carried
+    /// launches the actor owns it and the child holds only a weak container link.
     ///
     /// Dropping this handle is what reaps a surviving tree when no supervisor
     /// code runs — a daemon crash — because the job carries
@@ -413,15 +422,33 @@ impl SupervisedChild {
         // dropping the handle releases it too.
         let result = self.child.wait().await;
         #[cfg(target_os = "linux")]
-        if result.is_ok() {
+        if result.is_ok() && self.child.container().is_none() {
             if let Some(placement) = self.cgroup_placement.as_ref() {
+                // Ordinary children still own a per-spawn cgroup: returning
+                // from wait must leave it empty and removed, as before carry.
+                // Keep cleanup ownership across cancellation until it finishes.
                 cleanup_reaped_cgroup(placement, &self.module_id).await;
-                // Keep ownership while awaiting kernel population changes: a
-                // drain timeout may cancel this wait and then escalate/reap.
                 self.cgroup_placement = None;
             }
         }
         result
+    }
+
+    async fn finish_exit(&mut self, carry: bool) -> io::Result<()> {
+        if self.child.container().is_some() {
+            if !carry {
+                self.child.terminate_container().await;
+            }
+        } else {
+            #[cfg(target_os = "linux")]
+            if let Some(placement) = self.cgroup_placement.as_ref() {
+                cleanup_reaped_cgroup(placement, &self.module_id).await;
+                self.cgroup_placement = None;
+            }
+        }
+        self.child.reap().await?;
+        self.release_roster();
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
@@ -570,16 +597,18 @@ impl SupervisedChild {
             self.spawn_failure = Some(cause);
             // No image is admitted on failure. Reach the entire fresh process
             // group, including a module which spawned a helper before refusal.
-            if let Some(pid) = rustix::process::Pid::from_raw(self.pid as i32) {
+            if let Some(container) = self.child.container() {
+                container.hard_kill();
+            } else if let Some(pid) = rustix::process::Pid::from_raw(self.pid as i32) {
                 let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
             }
             let _ = self.child.start_kill();
         }
     }
 
-    /// Releases this child's daemon-shutdown roster entry once its exit has
-    /// been recorded. The pid is already reaped and free for reuse, so the
-    /// entry must not outlive the record any longer than that.
+    /// Releases the leader's roster entry after recording and finalizing its
+    /// exit. A carried container retains its separate roster entry and, for a
+    /// Unix process group, its unreaped first leader that reserves the group ID.
     fn release_roster(&mut self) {
         self.roster_guard = None;
     }
@@ -597,6 +626,10 @@ impl SupervisedChild {
     /// direct-child kill still decides the outcome, so containment can never
     /// change whether a module is reported as stopped.
     fn start_kill(&mut self) -> io::Result<()> {
+        if let Some(container) = self.child.container() {
+            container.hard_kill();
+            return self.kill_leader();
+        }
         #[cfg(windows)]
         if let Some(job) = &self.job {
             if let Err(error) = job.lock().unwrap_or_else(|p| p.into_inner()).terminate() {
@@ -608,6 +641,10 @@ impl SupervisedChild {
         }
         #[cfg(target_os = "linux")]
         kill_module_cgroup(self.cgroup_placement.as_ref(), &self.module_id);
+        self.child.start_kill()
+    }
+
+    fn kill_leader(&mut self) -> io::Result<()> {
         self.child.start_kill()
     }
 
@@ -756,6 +793,10 @@ pub struct ModuleSpec {
     /// config because the daemon must be able to answer it while the module is
     /// down, and so a module cannot talk itself into it after registering.
     pub overlap: ModuleOverlap,
+    /// Keep module-started helpers in the same container across replacements.
+    /// This is a daemon-config policy, fixed for the lifetime of a container;
+    /// stopping the module or losing its supervisor still destroys the container.
+    pub carry_containment: bool,
 }
 
 /// Only the configured launch inputs enter this value; spawned connection paths,
@@ -3174,6 +3215,7 @@ impl Supervisor {
     }
 
     pub fn with_forwarding(mut self, forwarding: Arc<ForwardingTable>) -> Self {
+        self.child_roster.counters = forwarding.counters();
         self.forwarding = Some(forwarding);
         self
     }
@@ -3202,6 +3244,8 @@ impl Supervisor {
         mut self,
         cgroup_placement: Option<subc_cgroup::Placement>,
     ) -> Self {
+        self.child_roster
+            .set_cgroup_placement(cgroup_placement.clone());
         self.cgroup_placement = cgroup_placement;
         self
     }
@@ -3286,6 +3330,7 @@ impl Supervisor {
         child: &mut SupervisedChild,
     ) -> Result<(), SuperviseError> {
         if let Err(err) = set_running(snapshot, child, &spec.module_id, &runtime.spawn_events) {
+            containment::terminate_blocking(&runtime.child_roster.containment);
             self.abandon_unrostered(&spec.module_id);
             return Err(err);
         }
@@ -3585,6 +3630,7 @@ impl Supervisor {
                 restart_policy,
                 effective_drain_timeout,
                 provenance_probe: self.provenance_probe.clone(),
+                retained: runtime.child_roster.retained_view(),
             }),
         };
         // Identity gates and the configured mark must precede the roster entry,
@@ -3633,6 +3679,7 @@ pub struct SupervisedModule {
 }
 
 struct SupervisedModuleInner {
+    retained: crate::child_roster::RetainedView,
     module_id: String,
     registry: Arc<Registry>,
     snapshot: SharedSnapshot,
@@ -3838,13 +3885,51 @@ impl SupervisedModule {
             ModuleProtocol::Subc => running_process && registration_active,
             ModuleProtocol::None => running_process,
         };
+        // Read only the retained cache: a status read must not resend signals,
+        // rewrite the record, or keep the containment resource alive.
+        let retained = self.inner.retained.waiting_detail(&self.inner.module_id);
+        let carry_configured = self
+            .inner
+            .configuration
+            .lock()
+            .map_err(|_| SuperviseError::StatePoisoned {
+                module_id: Some(self.inner.module_id.clone()),
+            })?
+            .spec
+            .carry_containment;
+        let recovery_block = carries_containment(
+            carry_configured,
+            self.inner
+                .retained
+                .has_carried_container(&self.inner.module_id),
+        )
+        .then(|| self.inner.retained.recovery_block())
+        .flatten();
+        let launch_nonce_source = observed_launch_nonce_source(&snapshot);
+        let pid = snapshot.reported_pid();
+        let mut health = snapshot.health;
+        if let Some(detail) = recovery_block
+            .as_ref()
+            .or_else(|| retained.as_ref().map(|(_, detail)| detail))
+        {
+            health.detail = Some(match health.detail {
+                Some(previous) => format!("{previous}; {detail}"),
+                None => detail.clone(),
+            });
+        }
 
         Ok((
             ModuleStatus {
-                waiting_for_previous_pid: snapshot.waiting_for_previous_pid,
-                waiting_for_previous_detail: snapshot.waiting_for_previous_detail.clone(),
+                waiting_for_previous_pid: retained
+                    .as_ref()
+                    .map(|(pid, _)| *pid)
+                    .filter(|pid| *pid > 0)
+                    .or(snapshot.waiting_for_previous_pid),
+                waiting_for_previous_detail: recovery_block
+                    .or_else(|| retained.map(|(_, detail)| detail))
+                    .or(snapshot.waiting_for_previous_detail),
                 module_id: self.inner.module_id.clone(),
-                launch_nonce_source: observed_launch_nonce_source(&snapshot),
+                launch_nonce_source,
                 state: snapshot.state,
                 enabled: snapshot.enabled,
                 process_alive: snapshot.process_alive,
@@ -3859,13 +3944,13 @@ impl SupervisedModule {
                 drain_timeout,
                 restart_backoff: self.inner.restart_policy.backoff,
                 restart_max_backoff: self.inner.restart_policy.max_backoff,
-                pid: snapshot.reported_pid(),
+                pid,
                 spawned_at_ms: snapshot.spawned_at_ms,
                 spawned_from: snapshot.spawned_from,
                 launch_spec_digest: snapshot.launch_spec_digest,
                 process_start_time: snapshot.process_start_time,
                 last_exit: snapshot.last_exit,
-                health: snapshot.health,
+                health,
             },
             snapshot.spawned_file_identity.clone(),
         ))
@@ -4652,6 +4737,11 @@ impl Error for SuperviseError {
 }
 
 pub(crate) fn validate_spec(spec: &ModuleSpec) -> Result<(), SuperviseError> {
+    if spec.carry_containment && spec.overlap == ModuleOverlap::Safe {
+        return Err(SuperviseError::InvalidSpec {
+            reason: "carry_containment cannot be combined with overlap: safe".to_owned(),
+        });
+    }
     if spec.module_id.trim().is_empty() {
         return Err(SuperviseError::InvalidSpec {
             reason: "module_id must not be empty".to_string(),
@@ -5807,6 +5897,7 @@ mod tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         });
 
         assert!(
@@ -5854,6 +5945,7 @@ mod tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let live = super::terminal_history_tests::fake_aft_stub_path();
         let missing = dir.path().join("definitely-missing-module");
@@ -5986,6 +6078,7 @@ mod tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let handle = SupervisorHandle::new();
         let mut supervisor =
@@ -6059,6 +6152,7 @@ mod tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
 
         let result = set_child_enabled(
@@ -6096,6 +6190,7 @@ mod tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::None,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let mut child = None;
         lock_snapshot(&snapshot).unwrap().respawn_pending = true;
@@ -6151,6 +6246,7 @@ mod tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
 
         let result = handle_reload_spawn_failure(
@@ -6183,6 +6279,7 @@ mod tests {
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
                 overlap: Default::default(),
+                carry_containment: false,
             },
             supervisor.runtime_config(),
             Arc::clone(&snapshot),
@@ -6222,6 +6319,7 @@ mod tests {
             reserved_prefixes: vec![],
             protocol: ModuleProtocol::None,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let supervisor =
             Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
@@ -6290,6 +6388,7 @@ mod tests {
                 reserved_prefixes: vec![],
                 protocol: ModuleProtocol::None,
                 overlap: Default::default(),
+                carry_containment: false,
             };
             let module = supervisor.spawn(spec).unwrap();
             #[cfg(target_os = "macos")]
@@ -6822,6 +6921,7 @@ mod tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let module = supervisor.supervised_module(
             initial.clone(),
@@ -6947,6 +7047,14 @@ async fn supervise_loop(
                 );
             }
         }
+        if child.is_none()
+            && (runtime.child_roster.is_closed()
+                || pending_respawn.is_none()
+                || !lock_snapshot(&snapshot)
+                    .is_ok_and(|state| state.enabled && state.state == ModuleState::Restarting))
+        {
+            containment::terminate(&runtime.child_roster.containment).await;
+        }
         if let Some(command) = requeued.pop_front() {
             if !handle_supervisor_command(
                 command,
@@ -6961,6 +7069,7 @@ async fn supervise_loop(
             )
             .await
             {
+                containment::terminate(&runtime.child_roster.containment).await;
                 return;
             }
             if child.is_some() || !respawn_still_pending(&snapshot) {
@@ -7079,7 +7188,17 @@ async fn supervise_loop(
                     runtime.pending_activity_restart = false;
                     // The exit is recorded, so a daemon shutdown may stop
                     // waiting for this child (see `SupervisedChild::wait`).
-                    active_child.release_roster();
+                    let carry = matches!(next, NextAction::Restart { .. })
+                        && active_child.spawn_failure.is_none()
+                        && !runtime.child_roster.is_closed();
+                    if let Err(error) = active_child.finish_exit(carry).await {
+                        containment::terminate(&runtime.child_roster.containment).await;
+                        fail_after_wait_error(&spec.module_id, &snapshot, &runtime.terminal_ring,
+                            &runtime.spawn_events, format!("failed to reap classified exit: {error}"),
+                            &runtime.failure_context(true));
+                        child = None;
+                        continue;
+                    }
                     match next {
                         NextAction::Stop { registration_released } => {
                             if registration_released {
@@ -7112,6 +7231,7 @@ async fn supervise_loop(
                     #[cfg(test)]
                     { lock_snapshot(&snapshot).unwrap().actor_select = None; }
                     let Some(command) = command else {
+                        containment::terminate(&runtime.child_roster.containment).await;
                         return;
                     };
                     if !handle_supervisor_command(
@@ -7125,6 +7245,7 @@ async fn supervise_loop(
                         &mut commands,
                         &mut requeued,
                     ).await {
+                        containment::terminate(&runtime.child_roster.containment).await;
                         return;
                     }
                 }
@@ -7185,6 +7306,14 @@ async fn supervise_loop(
             }
         } else if let Some(pending) = pending_respawn {
             tokio::select! {
+                _ = runtime.child_roster.closed() => {
+                    pending_respawn = None;
+                    let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| {
+                        state.state = ModuleState::Stopped;
+                        state.respawn_pending = false;
+                    });
+                    containment::terminate(&runtime.child_roster.containment).await;
+                }
                 _ = sleep_until(pending.deadline) => {
                     pending_respawn = None;
                 let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = false);
@@ -7245,6 +7374,7 @@ async fn supervise_loop(
                 }
                 command = commands.recv() => {
                     let Some(command) = command else {
+                        containment::terminate(&runtime.child_roster.containment).await;
                         return;
                     };
                     if !handle_supervisor_command(
@@ -7258,6 +7388,7 @@ async fn supervise_loop(
                         &mut commands,
                         &mut requeued,
                     ).await {
+                        containment::terminate(&runtime.child_roster.containment).await;
                         return;
                     }
                     // Reconcile the pending respawn with what the command did:
@@ -7333,6 +7464,7 @@ async fn supervise_loop(
                 }
             };
             let Some(command) = command else {
+                containment::terminate(&runtime.child_roster.containment).await;
                 return;
             };
             if !handle_supervisor_command(
@@ -7348,6 +7480,7 @@ async fn supervise_loop(
             )
             .await
             {
+                containment::terminate(&runtime.child_roster.containment).await;
                 return;
             }
         }
@@ -7419,28 +7552,33 @@ async fn handle_supervisor_command(
             state.failed_retry.cancel()
         });
     }
-    let command =
-        if let Some((pid, reason)) = runtime.child_roster.previous_instance(&spec.module_id) {
-            match command {
-                SupervisorCommand::Restart { reply, .. }
-                | SupervisorCommand::Reload { reply, .. }
-                | SupervisorCommand::Swap { reply, .. } => {
-                    let _ = reply.send(Err(previous_instance_error(spec, pid, reason)));
-                    return true;
-                }
-                SupervisorCommand::SetEnabled {
-                    enabled: true,
-                    reply,
-                    ..
-                } => {
-                    let _ = reply.send(Err(previous_instance_error(spec, pid, reason)));
-                    return true;
-                }
-                other => other,
+    let blocked = recovery_block_error(spec, &runtime.child_roster).or_else(|| {
+        runtime
+            .child_roster
+            .previous_instance(&spec.module_id)
+            .map(|(pid, reason)| previous_instance_error(spec, pid, reason))
+    });
+    let command = if let Some(error) = blocked {
+        match command {
+            SupervisorCommand::Restart { reply, .. }
+            | SupervisorCommand::Reload { reply, .. }
+            | SupervisorCommand::Swap { reply, .. } => {
+                let _ = reply.send(Err(error));
+                return true;
             }
-        } else {
-            command
-        };
+            SupervisorCommand::SetEnabled {
+                enabled: true,
+                reply,
+                ..
+            } => {
+                let _ = reply.send(Err(error));
+                return true;
+            }
+            other => other,
+        }
+    } else {
+        command
+    };
     match command {
         SupervisorCommand::Drain { requester, reply } => {
             // A plain stop runs no forwarding drain, so nothing reaches the
@@ -7461,6 +7599,7 @@ async fn handle_supervisor_command(
                 &FailureContext::operator(),
             )
             .await;
+            containment::terminate(&runtime.child_roster.containment).await;
             let registration_released = result.is_ok();
             if registration_released {
                 runtime.record_activity_transition(
@@ -7504,6 +7643,7 @@ async fn handle_supervisor_command(
                 .await
             }
             .await;
+            containment::terminate(&runtime.child_roster.containment).await;
             let registration_released = result.is_ok();
             if registration_released {
                 runtime.record_activity_transition(
@@ -7674,6 +7814,9 @@ async fn handle_supervisor_command(
                 &runtime.failure_context(false),
             )
             .await;
+            if !enabled {
+                containment::terminate(&runtime.child_roster.containment).await;
+            }
             if matches!(result, Ok(true)) {
                 runtime.pending_activity_restart = false;
                 if enabled {
@@ -7729,6 +7872,14 @@ async fn handle_supervisor_command(
             ready_timeout,
             reply,
         } => {
+            if spec.carry_containment
+                || containment::current(&runtime.child_roster.containment).is_some()
+            {
+                let _ = reply.send(Err(SuperviseError::InvalidSpec {
+                    reason: "a carried container cannot overlap a swap candidate".to_owned(),
+                }));
+                return true;
+            }
             let mut swap_runtime = runtime.clone();
             swap_runtime.start_requester = requester;
             let before = lock_snapshot(snapshot)
@@ -7949,7 +8100,7 @@ async fn finish_reload_child(
             if let Some(active_child) = child.as_mut() {
                 active_child.drain_stderr(&spec.module_id).await;
             }
-            // Keep the reaped child's roster guard until its terminal is written.
+            // Keep the exited child's roster guard until its terminal is written.
             // Shutdown waits on that guard, not on the child Option used for respawn.
             let mut exited_child = child.take().expect("exited reload child is still stored");
             #[cfg(test)]
@@ -7973,7 +8124,13 @@ async fn finish_reload_child(
                 },
             )
             .await;
-            exited_child.release_roster();
+            exited_child
+                .finish_exit(false)
+                .await
+                .map_err(|source| SuperviseError::Wait {
+                    module_id: spec.module_id.clone(),
+                    source,
+                })?;
             result
         }
         RegistrationWaitOutcome::TimedOut => {
@@ -7994,7 +8151,7 @@ async fn finish_reload_child(
                     source,
                 })?;
             timed_out_child.drain_stderr(&spec.module_id).await;
-            handle_reload_child_registration_failure(
+            let result = handle_reload_child_registration_failure(
                 spec,
                 runtime,
                 registry,
@@ -8013,7 +8170,15 @@ async fn finish_reload_child(
                     ),
                 },
             )
-            .await
+            .await;
+            timed_out_child
+                .finish_exit(false)
+                .await
+                .map_err(|source| SuperviseError::Wait {
+                    module_id: spec.module_id.clone(),
+                    source,
+                })?;
+            result
         }
     }
 }
@@ -8821,6 +8986,24 @@ fn previous_instance_error(
     }
 }
 
+fn carries_containment(configured: bool, has_container: bool) -> bool {
+    configured || has_container
+}
+
+fn recovery_block_error(spec: &ModuleSpec, roster: &ChildRoster) -> Option<SuperviseError> {
+    if !carries_containment(
+        spec.carry_containment,
+        containment::current(&roster.containment).is_some(),
+    ) {
+        return None;
+    }
+    Some(SuperviseError::Spawn {
+        program: spec.program.clone(),
+        source: io::Error::new(io::ErrorKind::WouldBlock, roster.recovery_block()?),
+        cgroup_path: None,
+    })
+}
+
 fn spawn_child(
     spec: &ModuleSpec,
     connection_file_path: Option<&std::path::Path>,
@@ -8830,7 +9013,16 @@ fn spawn_child(
     roster: &ChildRoster,
     #[cfg(target_os = "linux")] cgroup_placement: Option<&subc_cgroup::Placement>,
 ) -> Result<SupervisedChild, SuperviseError> {
-    spawn_child_in_slot(
+    #[cfg(all(test, unix))]
+    if let Some(source) = containment_tests::join_failure(spec, roster) {
+        containment::terminate_blocking(&roster.containment);
+        return Err(SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source,
+            cgroup_path: None,
+        });
+    }
+    let result = spawn_child_in_slot(
         spec,
         connection_file_path,
         handle,
@@ -8841,7 +9033,15 @@ fn spawn_child(
         cgroup_placement,
         SpawnRole::Plain,
         false,
-    )
+    );
+    if result.is_err() {
+        if roster.admission_pending(&spec.module_id) {
+            containment::terminate_deferred(&roster.containment);
+        } else {
+            containment::terminate_blocking(&roster.containment);
+        }
+    }
+    result
 }
 
 /// Spawn one process of `spec` into a slot.
@@ -8868,6 +9068,9 @@ fn spawn_child_in_slot(
     role: SpawnRole,
     alternate_slot: bool,
 ) -> Result<SupervisedChild, SuperviseError> {
+    if let Some(error) = recovery_block_error(spec, roster) {
+        return Err(error);
+    }
     if let Some((pid, reason)) = roster.previous_instance(&spec.module_id) {
         return Err(previous_instance_error(spec, pid, reason));
     }
@@ -8878,13 +9081,56 @@ fn spawn_child_in_slot(
             cgroup_path: None,
         });
     }
+    let carried = containment::current(&roster.containment);
+    let carrying = carries_containment(spec.carry_containment, carried.is_some());
+    if role != SpawnRole::Plain && carrying {
+        return Err(SuperviseError::InvalidSpec {
+            reason: "a carried container cannot overlap a swap candidate".to_owned(),
+        });
+    }
+    #[cfg(unix)]
+    let launch_identity = if carrying && carried.is_none() {
+        Some(
+            containment::LaunchIdentity::capture().map_err(|source| SuperviseError::Spawn {
+                program: spec.program.clone(),
+                source,
+                cgroup_path: None,
+            })?,
+        )
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let cgroup_placement = match &carried {
+        Some(container) => container.cgroup().map(|(placement, _)| placement),
+        None => cgroup_placement,
+    };
+    #[cfg(unix)]
+    let group_target = if let Some(container) = carried
+        .as_ref()
+        .filter(|container| container.group().is_some())
+    {
+        containment::GroupTarget::Pinned(Arc::clone(container))
+    } else {
+        #[cfg(target_os = "linux")]
+        let cgroup_container = carrying && cgroup_placement.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let cgroup_container = false;
+        if cgroup_container {
+            containment::GroupTarget::NoGroup
+        } else {
+            containment::GroupTarget::OwnLeader
+        }
+    };
     #[cfg(target_os = "linux")]
     let cgroup_name = {
         // Slot names alone are not kill domains: a retired incumbent may still
         // be draining when a later enable/restart spawns into the same slot.
         // Decimal entropy keeps the suffix unambiguous; Placement performs
         // the module-id escaping and constructs the filesystem path.
-        if cgroup_placement.is_none() {
+        if let Some((_, name)) = carried.as_ref().and_then(|container| container.cgroup()) {
+            name.to_owned()
+        } else if cgroup_placement.is_none() {
             swap::cgroup_name(&spec.module_id, alternate_slot)
         } else {
             let nonce = generate_launch_nonce()?;
@@ -8952,7 +9198,25 @@ fn spawn_child_in_slot(
 
     #[cfg(target_os = "linux")]
     let cgroup_path = cgroup_placement
-        .map(|placement| placement.module_path(&cgroup_name))
+        .map(|placement| {
+            if let Some(container) = &carried {
+                let path = container
+                    .cgroup_path()
+                    .ok_or_else(|| io::Error::other("carried container has no cgroup path"))?;
+                placement.existing_module_path(path)?.ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "carried cgroup disappeared before replacement",
+                    )
+                })
+            } else {
+                if carrying {
+                    containment::prepare_cgroup_path(placement, &cgroup_name)
+                } else {
+                    placement.module_path(&cgroup_name)
+                }
+            }
+        })
         .transpose()
         .map_err(|source| SuperviseError::Cgroup {
             module_id: spec.module_id.clone(),
@@ -8960,10 +9224,26 @@ fn spawn_child_in_slot(
         })?;
     #[cfg(not(target_os = "linux"))]
     let cgroup_path: Option<PathBuf> = None;
+    #[cfg(unix)]
+    let mut admission_gate = if carrying {
+        Some(
+            admission::Gate::install(&mut command, spec, roster).map_err(|source| {
+                SuperviseError::Spawn {
+                    program: spec.program.clone(),
+                    source,
+                    cgroup_path: cgroup_path.clone(),
+                }
+            })?,
+        )
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    exec_ack.install(command.as_std_mut());
     #[cfg(target_os = "linux")]
     if let Some(path) = &cgroup_path {
         if let Err(error) = apply_cgroup_placement(&mut command, spec, path) {
-            if let Some(placement) = cgroup_placement {
+            if let Some(placement) = cgroup_placement.filter(|_| carried.is_none()) {
                 remove_module_cgroup(placement, &cgroup_name);
             }
             return Err(error);
@@ -8990,7 +9270,7 @@ fn spawn_child_in_slot(
 
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    command.kill_on_drop(true);
+    command.kill_on_drop(!carrying);
     // EACH MODULE LEADS ITS OWN PROCESS GROUP (the child calls setpgid(0, 0)
     // before exec). In the daemon's group, a service manager that kills the
     // job's process group when the daemon exits (launchd's default) killed
@@ -9008,8 +9288,24 @@ fn spawn_child_in_slot(
     // by hand would otherwise hand down. Under a service manager stdin is
     // already /dev/null.
     #[cfg(unix)]
-    command.process_group(0);
+    command.process_group(
+        carried
+            .as_ref()
+            .map(|container| container.verified_join_group())
+            .transpose()
+            .map_err(|source| SuperviseError::Spawn {
+                program: spec.program.clone(),
+                source,
+                cgroup_path: cgroup_path.clone(),
+            })?
+            .flatten()
+            .unwrap_or(0) as i32,
+    );
     command.stdin(Stdio::null());
+    #[cfg(unix)]
+    if let Some(gate) = &mut admission_gate {
+        gate.install_placement(&mut command);
+    }
     // The LAST pre-exec step, after the cgroup placement above: installing the
     // nonce at descriptor 3 replaces whatever the child had there, which could
     // be the descriptor an earlier step writes through.
@@ -9037,11 +9333,40 @@ fn spawn_child_in_slot(
     // call even returns. This conservative bound never labels an older child
     // as a replacement for a request received during process creation.
     let spawned_at = Instant::now();
-    let mut child = match command.spawn() {
+    #[cfg(all(test, unix))]
+    containment_tests::record_spawn_attempt(spec, &mut command);
+    #[cfg(unix)]
+    let spawned = match admission_gate {
+        Some(gate) => gate
+            .spawn(
+                command,
+                spec,
+                roster,
+                launch_identity,
+                #[cfg(target_os = "linux")]
+                cgroup_placement
+                    .zip(cgroup_path.as_ref())
+                    .map(|(placement, path)| {
+                        (placement.clone(), cgroup_name.clone(), path.clone())
+                    }),
+            )
+            .map(|(child, admitted)| (child, Some(admitted))),
+        None => command.spawn().map(|child| (child, None)),
+    };
+    #[cfg(not(unix))]
+    let spawned = command.spawn();
+    let spawned = match spawned {
         Ok(child) => child,
         Err(source) => {
+            if carried
+                .as_ref()
+                .and_then(|container| container.group())
+                .is_some()
+            {
+                containment::terminate_blocking(&roster.containment);
+            }
             #[cfg(target_os = "linux")]
-            if let Some(placement) = cgroup_placement {
+            if let Some(placement) = cgroup_placement.filter(|_| carried.is_none()) {
                 remove_module_cgroup(placement, &cgroup_name);
             }
             return Err(SuperviseError::Spawn {
@@ -9051,6 +9376,15 @@ fn spawn_child_in_slot(
             });
         }
     };
+    #[cfg(unix)]
+    let (mut child, mut admitted) = spawned;
+    #[cfg(unix)]
+    let group_target = admitted
+        .as_ref()
+        .map(|attempt| attempt.group_target())
+        .unwrap_or(group_target);
+    #[cfg(not(unix))]
+    let mut child = spawned;
     #[cfg(test)]
     spawn_record_tests::after_create(&child, spec);
     // The parent must close its writer now: the acknowledgement pipe reports EOF
@@ -9079,7 +9413,7 @@ fn spawn_child_in_slot(
     // Assign the suspended child to its module job; resume only after its
     // process identity has been durably recorded for orphan recovery.
     #[cfg(windows)]
-    let job = contain_spawned_child(&mut child, spec)?;
+    let job = contain_spawned_child(&mut child, spec, carried.as_ref())?;
     let spawned_at_ms = unix_ms_now();
     #[cfg(not(windows))]
     let spawned_from = spec.program.clone();
@@ -9101,7 +9435,10 @@ fn spawn_child_in_slot(
     #[cfg(windows)]
     let nonce_delivery = start_windows_nonce_pipe(nonce_handoff, pid, spec);
     #[cfg(not(windows))]
-    let process_start_time = crate::provenance::process_start_time(pid);
+    let process_start_time = admitted
+        .as_ref()
+        .map(|admitted| admitted.birth)
+        .or_else(|| crate::provenance::process_start_time(pid));
     #[cfg(windows)]
     let process_start_time = Some(windows_image.start_time());
     let process_identity = process_start_time.map(|start_time| ProcessIdentity { pid, start_time });
@@ -9126,42 +9463,61 @@ fn spawn_child_in_slot(
     let recorded_cgroup_name = cgroup_path.as_ref().map(|_| cgroup_name.clone());
     #[cfg(not(target_os = "linux"))]
     let recorded_cgroup_name = None;
-    let roster_guard = roster.admit(
-        spec.module_id.clone(),
-        pid,
-        spec.protocol,
-        process_start_time,
-        crate::child_roster::RecordedIdentity {
-            #[cfg(not(windows))]
-            start_time: recorded_image.map(|image| image.start_time),
-            #[cfg(windows)]
-            start_time: process_start_time,
-            #[cfg(not(windows))]
-            executable: recorded_image
-                .and_then(|image| image.executable)
-                .map(crate::live_children::ExecutableIdentity::from),
-            #[cfg(windows)]
-            executable: Some(crate::live_children::ExecutableIdentity::from(
-                windows_image.identity(),
-            )),
-            cgroup_name: recorded_cgroup_name,
-            #[cfg(target_os = "linux")]
-            cgroup_placement: cgroup_placement.cloned(),
-        },
-    );
+    #[cfg(unix)]
+    let preadmitted = admitted
+        .as_mut()
+        .and_then(|admitted| admitted.leader.take());
+    #[cfg(not(unix))]
+    let preadmitted: Option<crate::child_roster::RosterGuard> = None;
+    let roster_guard = if let Some(guard) = preadmitted {
+        Ok(guard)
+    } else {
+        roster.admit(
+            spec.module_id.clone(),
+            pid,
+            spec.protocol,
+            process_start_time,
+            crate::child_roster::RecordedIdentity {
+                container: None,
+                #[cfg(unix)]
+                carried: None,
+                #[cfg(not(windows))]
+                start_time: recorded_image.map(|image| image.start_time),
+                #[cfg(windows)]
+                start_time: process_start_time,
+                #[cfg(not(windows))]
+                executable: recorded_image
+                    .and_then(|image| image.executable)
+                    .map(crate::live_children::ExecutableIdentity::from),
+                #[cfg(windows)]
+                executable: Some(crate::live_children::ExecutableIdentity::from(
+                    windows_image.identity(),
+                )),
+                cgroup_name: recorded_cgroup_name,
+                #[cfg(target_os = "linux")]
+                cgroup_placement: cgroup_placement.cloned(),
+            },
+        )
+    };
     let roster_guard = match roster_guard {
         Ok(guard) => guard,
         Err(failure) => {
             return failure.with_cleanup(|source| {
                 #[cfg(windows)]
                 if let Some(job) = &job {
-                    let _ = job.terminate();
+                    let _ = job.lock().unwrap_or_else(|p| p.into_inner()).terminate();
                 }
                 #[cfg(target_os = "linux")]
                 kill_module_cgroup(cgroup_placement, &cgroup_name);
-                kill_and_reap_rejected_child(&mut child);
+                #[cfg(unix)]
+                let rejected_group = group_target.clone();
+                kill_and_reap_rejected_child(
+                    &mut child,
+                    #[cfg(unix)]
+                    rejected_group,
+                );
                 #[cfg(target_os = "linux")]
-                if let Some(placement) = cgroup_placement {
+                if let Some(placement) = cgroup_placement.filter(|_| carried.is_none()) {
                     remove_module_cgroup(placement, &cgroup_name);
                 }
                 Err(SuperviseError::Spawn {
@@ -9174,11 +9530,51 @@ fn spawn_child_in_slot(
             });
         }
     };
+    #[cfg(unix)]
+    if admitted.is_some() {
+        if let Some(image) = recorded_image {
+            if let Err(source) = roster_guard.confirm_executable(image) {
+                kill_and_reap_rejected_child(&mut child, group_target.clone());
+                return Err(SuperviseError::Spawn {
+                    program: spec.program.clone(),
+                    source,
+                    cgroup_path,
+                });
+            }
+        }
+    }
     // The pre-spawn check can pass just before shutdown begins. Ownership is
     // published at the start of admission, even while a record write is queued.
     // If shutdown already saw an empty roster before that publication, this
     // check sees the roster closed and ends the child before starting a module.
     if roster.is_closed() {
+        if carrying {
+            #[cfg(unix)]
+            let rejected_group = admitted
+                .as_ref()
+                .map(|admitted| admitted.rejection_target())
+                .unwrap_or_else(|| group_target.clone());
+            #[cfg(windows)]
+            if let Some(job) = &job {
+                let _ = job.lock().unwrap_or_else(|p| p.into_inner()).terminate();
+            }
+            kill_and_reap_rejected_child(
+                &mut child,
+                #[cfg(unix)]
+                rejected_group,
+            );
+            #[cfg(all(test, unix))]
+            let _ =
+                roster.admission_event_for_test(&spec.module_id, "after_rejected_child", Some(pid));
+            drop(roster_guard);
+            return Err(SuperviseError::Spawn {
+                program: spec.program.clone(),
+                source: io::Error::other(
+                    "the daemon began shutting down during carried admission; ended the container",
+                ),
+                cgroup_path,
+            });
+        }
         // This child was never admitted, so there is no module protocol shutdown to wait for.
         #[cfg(target_os = "linux")]
         kill_module_cgroup(cgroup_placement, &cgroup_name);
@@ -9186,7 +9582,7 @@ fn spawn_child_in_slot(
             debug!(module_id = %spec.module_id, pid, %error, "kill of a process spawned during daemon shutdown failed; it may already have exited");
         }
         #[cfg(target_os = "linux")]
-        if let Some(placement) = cgroup_placement {
+        if let Some(placement) = cgroup_placement.filter(|_| carried.is_none()) {
             // This spawn was never admitted, so shutdown has no roster entry
             // to await. Do not detach its cleanup: the runtime could exit
             // before that task reaps the rejected child and removes its group.
@@ -9216,12 +9612,6 @@ fn spawn_child_in_slot(
             ),
             cgroup_path,
         });
-    }
-
-    #[cfg(windows)]
-    if let Err(error) = resume_suspended_child(pid, spec) {
-        kill_and_reap_rejected_child(&mut child);
-        return Err(error);
     }
 
     let stdout_pump = match child.stdout.take() {
@@ -9274,8 +9664,6 @@ fn spawn_child_in_slot(
         exec.finish(crate::activity::ExecState::CommittedExec);
     }
     #[cfg(windows)]
-    let job = job.map(|job| Arc::new(Mutex::new(job)));
-    #[cfg(windows)]
     let subtree_target = job
         .as_ref()
         .map(|job| crate::subtree_resources::Target::Job(Arc::downgrade(job)))
@@ -9286,9 +9674,9 @@ fn spawn_child_in_slot(
         .unwrap_or(crate::subtree_resources::Target::Unavailable("no_cgroup"));
     #[cfg(not(any(target_os = "linux", windows)))]
     let subtree_target = crate::subtree_resources::Target::Unavailable("unsupported_platform");
-    Ok(SupervisedChild {
+    let mut supervised = SupervisedChild {
         subtree_target,
-        child,
+        child: containment::ProcessChild::plain(child, pid),
         exec: crate::activity::ExecOwner(exec),
         #[cfg(windows)]
         nonce_delivery,
@@ -9318,7 +9706,27 @@ fn spawn_child_in_slot(
         #[cfg(target_os = "macos")]
         report_ready: Arc::new(OnceLock::new()),
         spawn_failure: None,
-    })
+    };
+    if let Err(error) = containment::adopt(&mut supervised, spec, roster) {
+        supervised.child.reject(
+            #[cfg(unix)]
+            group_target,
+        );
+        #[cfg(all(test, unix))]
+        let _ = roster.admission_event_for_test(&spec.module_id, "after_rejected_child", Some(pid));
+        return Err(error);
+    }
+    #[cfg(unix)]
+    if let Some(admitted) = admitted.take() {
+        admitted.disarm();
+    }
+    #[cfg(windows)]
+    if let Err(error) = resume_suspended_child(pid, spec) {
+        containment::terminate_blocking(&roster.containment);
+        let _ = supervised.child.start_kill();
+        return Err(error);
+    }
+    Ok(supervised)
 }
 
 #[cfg(test)]
@@ -9380,6 +9788,7 @@ mod spawn_record_tests {
             reserved_prefixes: vec![],
             protocol: ModuleProtocol::None,
             overlap: Default::default(),
+            carry_containment: false,
         }
     }
 
@@ -9416,6 +9825,7 @@ mod spawn_record_tests {
             start_time: Some(1),
             executable: None,
             cgroup_name: None,
+            container: None,
         }];
         let mut samples = Vec::new();
         for _ in 0..50 {
@@ -9615,12 +10025,18 @@ pub(crate) fn kill_module_cgroup(placement: Option<&subc_cgroup::Placement>, mod
 fn contain_spawned_child(
     child: &mut Child,
     spec: &ModuleSpec,
-) -> Result<Option<subc_jobobject::JobObject>, SuperviseError> {
+    carried: Option<&Arc<containment::CarriedContainment>>,
+) -> Result<Option<Arc<Mutex<subc_jobobject::JobObject>>>, SuperviseError> {
     let assignment = || {
-        let job = subc_jobobject::JobObject::new()?;
+        let job = match carried {
+            Some(container) => container.job(),
+            None => Arc::new(Mutex::new(subc_jobobject::JobObject::new()?)),
+        };
         #[cfg(test)]
         spawn_record_tests::assignment_failpoint(spec)?;
-        job.assign(child)?;
+        job.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .assign(child)?;
         Ok::<_, io::Error>(job)
     };
     match assignment() {
@@ -9640,14 +10056,9 @@ fn contain_spawned_child(
 
 /// Rejection is synchronous: do not return a spawn error while the child can
 /// still run, or rely on kill-on-drop to reap it at some later runtime turn.
-fn kill_and_reap_rejected_child(child: &mut Child) {
+fn kill_and_reap_rejected_child(child: &mut Child, #[cfg(unix)] group: containment::GroupTarget) {
     #[cfg(unix)]
-    if let Some(pid) = child
-        .id()
-        .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
-    {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
+    group.signal_rejected(child);
     let _ = child.start_kill();
     while matches!(child.try_wait(), Ok(None)) {
         std::thread::yield_now();
@@ -10111,19 +10522,47 @@ fn spawn_and_mark_running(
 ) -> Result<SupervisedChild, SuperviseError> {
     let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
     let registration_watch = watch_registration(&runtime.registry, spec);
-    let child = spawn_child(
-        spec,
-        runtime.connection_file_path.as_deref(),
-        runtime.supervisor_handle.as_ref(),
-        &runtime.stderr_ring,
-        runtime.capture_logs_dir.as_deref(),
-        &runtime.child_roster,
-        #[cfg(target_os = "linux")]
-        runtime.cgroup_placement.as_ref(),
-    )?;
+    #[cfg(unix)]
+    let joining_group = containment::current(&runtime.child_roster.containment)
+        .is_some_and(|container| container.group().is_some());
+    let spawn = || {
+        spawn_child(
+            spec,
+            runtime.connection_file_path.as_deref(),
+            runtime.supervisor_handle.as_ref(),
+            &runtime.stderr_ring,
+            runtime.capture_logs_dir.as_deref(),
+            &runtime.child_roster,
+            #[cfg(target_os = "linux")]
+            runtime.cgroup_placement.as_ref(),
+        )
+    };
+    let result = spawn();
+    #[cfg(unix)]
+    let result = if result.is_err()
+        && joining_group
+        && !runtime.child_roster.is_closed()
+        && lock_snapshot(snapshot).is_ok_and(|state| state.enabled)
+        && runtime
+            .child_roster
+            .previous_instance(&spec.module_id)
+            .is_none()
+    {
+        // The failed join already destroyed and verified the old container.
+        // Try one fresh group as part of this same restart, without spending
+        // another crash-budget entry. Cgroups and Windows jobs do not retry.
+        warn!(module_id = %spec.module_id, "carried process-group spawn failed; trying one fresh container");
+        spawn()
+    } else {
+        result
+    };
+    let child = result?;
     let mut child = child;
     arm_registration_deadline(&mut child, runtime.register_timeout, registration_watch);
-    set_running(snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
+    if let Err(error) = set_running(snapshot, &child, &spec.module_id, &runtime.spawn_events) {
+        containment::terminate_blocking(&runtime.child_roster.containment);
+        return Err(error);
+    }
     if let Some(spawn) = activity_spawn {
         spawn.complete(snapshot);
     }
@@ -10158,6 +10597,12 @@ fn arm_registration_deadline(
 }
 
 async fn stop_unregistered_child(child: &mut SupervisedChild) -> io::Result<()> {
+    if let Some(container) = child.child.container() {
+        container.stop_members().await;
+        child.kill_leader()?;
+        child.wait().await?;
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         // Children lead their own process groups. Signal the whole group so a
@@ -10181,6 +10626,12 @@ async fn stop_unregistered_child(child: &mut SupervisedChild) -> io::Result<()> 
 
 #[cfg(unix)]
 fn unreaped_registration_group(child: &SupervisedChild) -> io::Result<rustix::process::Pid> {
+    if let Some(container) = child.child.container() {
+        return container
+            .group()
+            .and_then(|pid| rustix::process::Pid::from_raw(pid as i32))
+            .ok_or_else(|| io::Error::other("a carried cgroup has no signalable process group"));
+    }
     // The group id comes only from the pid recorded at spawn, when the child
     // created its own group. Never admit init's group or a negative group id.
     let group = i32::try_from(child.pid)
@@ -11444,7 +11895,13 @@ async fn drain_child_to_state(
                 ?stop_notice,
                 "drain budget expired before the module exited; killing it"
             );
-            child.start_kill().map_err(|source| {
+            let kill =
+                if final_state == ModuleState::Restarting && child.child.container().is_some() {
+                    child.kill_leader()
+                } else {
+                    child.start_kill()
+                };
+            kill.map_err(|source| {
                 fail_after_wait_error(
                     module_id,
                     snapshot,
@@ -11508,7 +11965,20 @@ async fn drain_child_to_state(
     )?;
     child.drain_stderr(module_id).await;
 
-    release_dead_registration(registry, forwarding, snapshot, module_id, failure).await
+    let released =
+        release_dead_registration(registry, forwarding, snapshot, module_id, failure).await;
+    child
+        .finish_exit(
+            released.is_ok()
+                && final_state == ModuleState::Restarting
+                && child.spawn_failure.is_none(),
+        )
+        .await
+        .map_err(|source| SuperviseError::Wait {
+            module_id: module_id.to_owned(),
+            source,
+        })?;
+    released
 }
 
 /// Ask a child that nothing else has asked to stop, by signal.
@@ -11719,6 +12189,7 @@ mod slot_registration_wait_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let connection = ConnectionId::new(90);
         registry
@@ -12174,6 +12645,7 @@ mod terminal_history_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         });
         assert!(
             supervisor
@@ -12198,6 +12670,7 @@ mod terminal_history_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         });
         assert!(supervisor
             .reserved_hello_verification("never-spawned", Some("minted"))
@@ -12375,6 +12848,7 @@ mod terminal_history_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let mut snapshot = SupervisorSnapshot::new(state, enabled);
         seed_crash_restarts(&mut snapshot, restart_count);
@@ -12397,6 +12871,7 @@ mod terminal_history_tests {
                 restart_policy: runtime.restart_policy,
                 effective_drain_timeout: runtime.effective_drain_timeout,
                 provenance_probe: supervisor.provenance_probe.clone(),
+                retained: runtime.child_roster.retained_view(),
             }),
         }
     }
@@ -12416,6 +12891,7 @@ mod terminal_history_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         });
 
         assert!(
@@ -12502,6 +12978,7 @@ mod terminal_history_tests {
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
                 overlap: Default::default(),
+                carry_containment: false,
             })
             .unwrap();
 
@@ -12550,6 +13027,7 @@ mod terminal_history_tests {
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
                 overlap: Default::default(),
+                carry_containment: false,
             })
             .unwrap();
 
@@ -12614,6 +13092,7 @@ mod terminal_history_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::None,
             overlap: Default::default(),
+            carry_containment: false,
         };
         (spec, ready, marker)
     }
@@ -12722,6 +13201,7 @@ mod terminal_history_tests {
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::None,
                 overlap: Default::default(),
+                carry_containment: false,
             })
             .unwrap();
 
@@ -13349,6 +13829,7 @@ mod terminal_history_tests {
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
                 overlap: Default::default(),
+                carry_containment: false,
             })
             .unwrap();
 
@@ -13391,6 +13872,7 @@ mod terminal_history_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let mut child = None;
         let reload = super::finish_reload_child(
@@ -13451,6 +13933,7 @@ mod terminal_history_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
 
         let crash_snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
@@ -13546,6 +14029,7 @@ mod terminal_history_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let process = ProcessIdentity {
@@ -13601,6 +14085,7 @@ mod terminal_history_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
 
@@ -13648,6 +14133,7 @@ mod terminal_history_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         }
     }
 
@@ -13925,6 +14411,7 @@ mod terminal_history_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
         let process = ProcessIdentity {
@@ -13992,6 +14479,7 @@ mod terminal_history_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
 
@@ -14147,6 +14635,7 @@ mod restart_ordering_tests {
             reserved_prefixes: vec![],
             protocol: ModuleProtocol::None,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let mut supervisor =
             Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
@@ -14280,6 +14769,7 @@ mod restart_ordering_tests {
                     reserved_prefixes: vec![],
                     protocol: ModuleProtocol::None,
                     overlap: Default::default(),
+                    carry_containment: false,
                 },
                 true,
                 HealthConfig::default(),
@@ -14423,6 +14913,7 @@ mod health_event_tests {
                 reserved_prefixes: vec![],
                 protocol,
                 overlap: Default::default(),
+                carry_containment: false,
             };
             let module = supervisor
                 .supervise_configured_requested(
@@ -14740,6 +15231,7 @@ mod health_event_tests {
             reserved_prefixes: vec![],
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let module = supervisor
             .supervise_configured_requested(
@@ -15740,6 +16232,7 @@ mod health_tombstone_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let module = supervisor
             .supervise_configured(spec.clone(), false)
@@ -16086,6 +16579,7 @@ mod child_env_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         }
     }
 
@@ -16516,6 +17010,7 @@ mod cgroup_placement_tests {
             reserved_prefixes: vec![],
             protocol: ModuleProtocol::None,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let spawn = |spec: &ModuleSpec| {
             spawn_child(
@@ -16609,6 +17104,7 @@ mod cgroup_placement_tests {
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
                 overlap: Default::default(),
+                carry_containment: false,
             },
             path,
         )
@@ -16645,7 +17141,7 @@ mod cgroup_placement_tests {
         let pid = child.id().expect("spawned child has pid");
         let mut child = SupervisedChild {
             subtree_target: crate::subtree_resources::Target::Unavailable("not_running"),
-            child,
+            child: crate::supervise::containment::ProcessChild::plain(child, pid),
             exec: crate::activity::ExecOwner(Arc::new(crate::activity::ExecOutcome::new())),
             protocol: ModuleProtocol::Subc,
             module_id: module_id.to_string(),
@@ -16673,8 +17169,9 @@ mod cgroup_placement_tests {
 
         assert!(
             !module.exists(),
-            "reaping the supervised child must remove its empty cgroup"
+            "waiting for a non-carried child must remove its empty cgroup before returning"
         );
+        child.finish_exit(false).await.unwrap();
     }
 
     #[test]
@@ -17275,6 +17772,7 @@ mod job_containment_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let child = spawn_and_mark_running(&spec, &runtime, &snapshot)
             .expect("spawn the supervised fixture");
@@ -17480,6 +17978,7 @@ mod privacy_trampoline_configuration_tests {
             reserved_prefixes: vec![],
             protocol: subc_control::ModuleProtocol::None,
             overlap: super::ModuleOverlap::Exclusive,
+            carry_containment: false,
         }
     }
 }
@@ -17525,6 +18024,7 @@ mod privacy_exec_boundary_tests {
             reserved_prefixes: vec![],
             protocol: ModuleProtocol::None,
             overlap: ModuleOverlap::Exclusive,
+            carry_containment: false,
         }
     }
 
@@ -17724,6 +18224,7 @@ mod launch_nonce_descriptor_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let handle = SupervisorHandle::new();
         let ring = Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default())));
@@ -17836,6 +18337,7 @@ mod cgroup_containment_tests {
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::None,
                 overlap: Default::default(),
+                carry_containment: false,
             })
             .unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -17948,6 +18450,7 @@ mod cgroup_containment_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::None,
             overlap: Default::default(),
+            carry_containment: false,
         };
         let child =
             spawn_and_mark_running(&spec, &runtime, &snapshot).expect("spawn supervised tree");
@@ -18057,6 +18560,7 @@ mod record_write_stall_tests {
             reserved_prefixes: vec![],
             protocol: ModuleProtocol::None,
             overlap: Default::default(),
+            carry_containment: false,
         }
     }
 
@@ -18173,5 +18677,74 @@ mod record_write_stall_tests {
         .expect("the restart published its replacement");
         module.stop().await.unwrap();
         server.abort();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod retained_status_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cached_container_block_is_visible_in_status_and_health_without_rechecking() {
+        use crate::live_children::{ContainerIdentity, RetainedReason};
+        for (reason, carried, expected) in [
+            (
+                RetainedReason::ContainerSurvivors(vec![4242]),
+                true,
+                Some("waiting: container survivors (pids [4242])".to_owned()),
+            ),
+            (
+                RetainedReason::ContainerUnverifiable("member inspection denied".into()),
+                true,
+                Some(
+                    "waiting: container survivors could not be verified: member inspection denied"
+                        .to_owned(),
+                ),
+            ),
+            (RetainedReason::Survived, false, None),
+        ] {
+            let supervisor =
+                Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
+            let spec = ModuleSpec {
+                module_id: "retained-status-fixture".into(),
+                program: PathBuf::from("/not-spawned"),
+                args: Vec::new(),
+                env: Vec::new(),
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::None,
+                overlap: ModuleOverlap::Exclusive,
+                carry_containment: carried,
+            };
+            let module = supervisor
+                .supervise_configured(spec.clone(), false)
+                .unwrap();
+            // No process is launched. Invalid group zero is deliberate: if a
+            // status read wrongly rechecks, verification changes the reason
+            // and fails the assertions without signalling any real process.
+            let guard = supervisor
+                .child_roster
+                .admit(
+                    spec.module_id,
+                    0,
+                    ModuleProtocol::None,
+                    None,
+                    crate::child_roster::RecordedIdentity {
+                        container: carried.then_some(ContainerIdentity {
+                            pgid: Some(0),
+                            created_start_time: Some(0),
+                            cgroup_path: None,
+                            ..ContainerIdentity::test_metadata()
+                        }),
+                        ..crate::child_roster::RecordedIdentity::default()
+                    },
+                )
+                .unwrap();
+            guard.retain(reason);
+            let status = module.status().unwrap();
+            assert_eq!(status.waiting_for_previous_detail, expected.clone());
+            assert_eq!(status.health.detail, expected);
+            assert!(!status.process_alive);
+        }
     }
 }

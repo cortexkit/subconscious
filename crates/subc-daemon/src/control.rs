@@ -9491,6 +9491,7 @@ mod tests {
         let source_line = format!("config error: {}", "x".repeat(DEFAULT_MAX_LINE_BYTES));
         let module = supervisor
             .spawn(ModuleSpec {
+                carry_containment: false,
                 module_id: "stderr-tail-wire".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -9600,6 +9601,7 @@ mod tests {
                 .with_terminal_journal(journal_path.clone(), "off-worker-daemon".to_string());
         let module = supervisor
             .spawn(ModuleSpec {
+                carry_containment: false,
                 module_id: "terminal-off-worker".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -9671,6 +9673,7 @@ mod tests {
                 .with_handle(supervisor_handle.clone());
         let module = supervisor
             .spawn(ModuleSpec {
+                carry_containment: false,
                 module_id: "terminal-golden".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -13710,6 +13713,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    carry_containment: false,
                     module_id: "warming".to_string(),
                     program: fake_aft_stub_path(),
                     args: Vec::new(),
@@ -13832,6 +13836,7 @@ mod tests {
                 .with_handle(handle.clone());
         let module = supervisor
             .spawn(crate::ModuleSpec {
+                carry_containment: false,
                 module_id: "retry-list".into(),
                 program: PathBuf::from("/bin/sh"),
                 args: vec!["-c".into(), "exit 17".into()],
@@ -13878,6 +13883,7 @@ mod tests {
             Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let module = supervisor
             .spawn(crate::ModuleSpec {
+                carry_containment: false,
                 module_id: "pid-read-budget".into(),
                 program: std::env::current_exe().unwrap(),
                 args: vec![
@@ -13937,6 +13943,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 crate::ModuleSpec {
+                    carry_containment: false,
                     module_id: "memory-read".into(),
                     program: PathBuf::from("disabled-module"),
                     args: Vec::new(),
@@ -14014,6 +14021,7 @@ mod tests {
         supervisor
             .supervise_configured(
                 crate::ModuleSpec {
+                    carry_containment: false,
                     module_id: "drift".into(),
                     program: PathBuf::from("disabled-module"),
                     args: Vec::new(),
@@ -14373,6 +14381,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    carry_containment: false,
                     module_id: "warming".to_string(),
                     program: fake_aft_stub_path(),
                     args: Vec::new(),
@@ -14463,6 +14472,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    carry_containment: false,
                     module_id: module_id.to_string(),
                     program: fake_aft_stub_path(),
                     args: Vec::new(),
@@ -14867,6 +14877,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    carry_containment: false,
                     module_id: "failed".to_string(),
                     program: missing_program,
                     args: Vec::new(),
@@ -14969,6 +14980,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 crate::ModuleSpec {
+                    carry_containment: false,
                     module_id: "late-health-response".to_string(),
                     program: PathBuf::from("disabled-module"),
                     args: Vec::new(),
@@ -15573,6 +15585,7 @@ mod tests {
             LaunchSpecAgreement as Agreement, LaunchSpecUnavailableReason as Reason,
         };
         let configured = crate::supervise::ModuleSpec {
+            carry_containment: false,
             module_id: "legacy".into(),
             program: "/module".into(),
             args: Vec::new(),
@@ -17619,6 +17632,7 @@ mod tests {
             supervisor
                 .supervise_configured(
                     ModuleSpec {
+                        carry_containment: false,
                         module_id: OWNER.to_string(),
                         program: PathBuf::from("/nonexistent/prefrontal-core"),
                         args: Vec::new(),
@@ -17834,6 +17848,7 @@ mod tests {
             supervisor
                 .supervise_configured(
                     ModuleSpec {
+                        carry_containment: false,
                         module_id: OWNER.to_string(),
                         program: PathBuf::from("/nonexistent/prefrontal-core"),
                         args: Vec::new(),

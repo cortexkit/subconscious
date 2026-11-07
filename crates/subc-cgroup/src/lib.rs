@@ -14,7 +14,13 @@ mod name;
 use name::module_directory_name;
 
 mod freeze;
-pub use freeze::{freeze_module, FreezeOutcome, FrozenModule, ProcsOutcome, ThawOutcome};
+pub use freeze::{
+    freeze_module, freeze_path, freeze_path_blocking, FreezeOutcome, FrozenModule, ProcsOutcome,
+    ThawOutcome,
+};
+
+mod path;
+pub use path::kill_path;
 
 mod memory;
 pub use memory::{read_memory, read_memory_counted, MemoryReadError, MemoryReading, MemorySource};

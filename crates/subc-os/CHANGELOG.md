@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.1.29
+
+- Add a CLOEXEC pre-exec admission gate with bounded parent-side PID readiness,
+  explicit one-shot release, and EOF cancellation before the image can run.
+- Expose process-session identity and validated boot-UUID comparison so recovery
+  cannot confuse recycled group numbers from another session or host boot.
+- Read the exact birth of an owned unreaped macOS child, including a zombie,
+  without changing ordinary process liveness checks.
+- Add safe process-group identity, group-only query and PID-listing APIs for verified per-process recovery on Linux and macOS. macOS uses libc's proc_bsdinfo layout; an exiting process is reported as gone.
+- Add a safe current-boot UUID reader backed by Linux boot_id or macOS kern.bootsessionuuid, with no fallback identity on read or validation errors.
+
+## 0.1.28
+
+- Add non-reaping Unix child-exit observation for container-lifetime decisions.
+  An already-reaped child returns an error instead of being treated as a valid
+  process-group anchor.
+
 ## 0.1.27
 
 - Add Windows `profile_dir()`: the profile folder Windows records for the

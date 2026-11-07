@@ -145,6 +145,7 @@ impl Drop for ConnectedClientGuard {
 #[derive(Debug, Clone, Default)]
 pub struct DaemonCounters {
     reader_diagnostics: Arc<Mutex<ReaderDiagnostics>>,
+    carried_containment_anchor_lost: Arc<AtomicU64>,
     /// Every non-request frame a module sent on a (channel, epoch) the daemon
     /// holds no bound route for, dropped. Counts both kinds below: orphan
     /// traffic on a route the daemon released, and frames on a (channel,
@@ -275,6 +276,12 @@ impl DaemonCounters {
             );
         }
         drop(diagnostics);
+        snapshot.insert(
+            "carried_containment_anchor_lost".into(),
+            self.carried_containment_anchor_lost
+                .load(Ordering::Relaxed)
+                .into(),
+        );
         snapshot.insert(
             "module_frames_dropped_no_route".into(),
             self.module_frames_dropped_no_route
@@ -541,6 +548,12 @@ impl DaemonCounters {
 
     pub(crate) fn increment_drains_with_undeclared_gauge(&self) {
         self.drains_with_undeclared_gauge
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn increment_carried_containment_anchor_lost(&self) {
+        self.carried_containment_anchor_lost
             .fetch_add(1, Ordering::Relaxed);
     }
 }

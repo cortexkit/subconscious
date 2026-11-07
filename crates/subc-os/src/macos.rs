@@ -96,6 +96,28 @@ pub(crate) fn start_time(pid: u32) -> Option<u64> {
     if info.0[P_STAT_OFFSET] == SZOMB {
         return None;
     }
+    birth_time(&info)
+}
+
+/// Exact birth time of an owned, unreaped child, including a zombie.
+///
+/// This verifies the birth of a first group leader retained unreaped to reserve
+/// the group's numeric identity, not ordinary process liveness. Non-reaping
+/// wait observation first proves that the caller owns the child. Missing or
+/// malformed kernel identity is an error, never evidence that the pin is gone.
+pub fn owned_child_start_time(pid: u32) -> std::io::Result<u64> {
+    crate::child_exit::observe(pid)?;
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "could not verify the owned child's exact kernel birth time",
+        )
+    };
+    let info = kinfo_proc(pid).ok_or_else(invalid)?;
+    birth_time(&info).ok_or_else(invalid)
+}
+
+fn birth_time(info: &KinfoProc) -> Option<u64> {
     let seconds = i64::from_ne_bytes(
         info.0[STARTTIME_SEC_OFFSET..STARTTIME_SEC_OFFSET + 8]
             .try_into()
@@ -238,4 +260,50 @@ pub(crate) fn signal(pid: u32, signal: Signal) -> Result<(), Errno> {
         Signal::Kill => rustix::process::Signal::KILL,
     };
     kill_process(raw, signal)
+}
+
+#[cfg(test)]
+mod owned_child_birth_tests {
+    use super::*;
+
+    #[test]
+    fn owned_child_birth_survives_exit_without_reaping_and_refuses_non_children() {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(
+            std::process::Command::new("/bin/sleep")
+                .arg("0.05")
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let birth = owned_child_start_time(pid).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while crate::child_exit::observe(pid).unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned child did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(owned_child_start_time(pid).unwrap(), birth);
+        assert!(
+            start_time(pid).is_none(),
+            "ordinary liveness still filters zombies"
+        );
+        assert!(
+            owned_child_start_time(std::process::id()).is_err(),
+            "a process that is not our child cannot authorize pin ownership"
+        );
+        assert!(child.0.wait().unwrap().success());
+        assert!(
+            owned_child_start_time(pid).is_err(),
+            "a reaped child is not owned"
+        );
+    }
 }

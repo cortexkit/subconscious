@@ -185,6 +185,123 @@ a reason when it is `unavailable`; the digest stays in the daemon. A stopped
 module or a running process without a recorded digest reports `unavailable`,
 and an older daemon's omitted spec verdict is rendered as `not reported`.
 
+## Keeping a process container across module replacements
+
+```jsonc
+{
+  "version": 1,
+  "modules": {
+    "worker": {
+      "program": "/usr/local/bin/worker",
+      "carry_containment": true
+    }
+  }
+}
+```
+
+`carry_containment` is an optional per-module boolean, defaulting to `false`.
+Only daemon configuration can enable it; a module cannot request it in `HELLO`
+or `catalog.update`. Combining it with `overlap: "safe"` is a config error:
+carried containers do not support overlapping blue/green instances.
+
+When enabled, a module's helpers can outlive the module process while a named
+replacement is pending: operator restart, reload respawn, health or crash
+restart within budget, or a restart after the supervisor explicitly marked a
+connection severance as deliberate while the module remains enabled. Generic
+connection loss alone does not set that mark. Replacement leaders join the
+same container. Stop, disable, removal, a clean exit by a module using the Subc protocol,
+exhausted restart budget, failed registration or spawn, supervisor failure or
+abort, and daemon shutdown end the container and its helpers. This includes a
+stop during backoff, when no module leader is alive. A later start gets a fresh
+container. Helpers do **not** survive a daemon restart.
+
+The setting is fixed for each container's lifetime. A config reload applies a
+changed value to the next **fresh container**, not the next replacement in an
+existing container. In particular, turning the flag off never abandons an
+existing container: it is still destroyed at its terminal end. No daemon
+restart is required to apply the per-module configuration.
+
+Containment strength is platform-dependent:
+
+- **Windows:** a kernel job contains the module and its descendants, with no
+  breakaway. Closing the daemon's handles also kills the job on a daemon crash.
+- **Linux with delegated cgroups:** replacements join the existing cgroup.
+  Ordinary process-group or session changes cannot escape it. A same-user
+  process with write access to the delegated subtree could still move itself
+  out, as with ordinary module containment.
+- **macOS and Linux without cgroup placement:** cooperative process groups,
+  **not a security boundary**. A helper can escape with `setpgid` or `setsid`.
+  The first leader is retained unreaped to reserve the group's identity until
+  terminal cleanup, costing one zombie per carried module after its first exit.
+
+Opt in only for trusted modules whose helpers stay in their container. Helpers
+must use their own stdout/stderr rather than inherit the leader's capture
+pipes, and must exit on EOF of their daemon connection.
+
+After a daemon crash, a recorded cgroup is touched only under the daemon's
+current trusted delegation. If that root is unavailable, inspection fails, or
+members remain, module status reports the retained container and fresh starts
+stay blocked. Periodic rechecks lift the block only after the whole subtree is
+confirmed empty. An empty cgroup directory awaiting removal does not block.
+
+An unreadable, malformed or unsupported-version `live-children.json` is never
+treated as an empty recovery record. The daemon renames it beside the original
+as `live-children.json.quarantined.<suffix>`, preserves it, and logs an error.
+Every module with `carry_containment: true` is blocked because the identities
+of any old helpers are unknown; `ck module status <id>` reports the reason.
+The quarantined file itself is the persistent marker: the block survives any
+number of daemon restarts, even if a new valid `live-children.json` exists.
+Modules without the setting keep their ordinary startup behavior.
+
+There is no online command to discard unknown recovery identities. To clear a
+quarantine block safely:
+
+1. Stop the daemon, including its service manager so it cannot restart.
+2. Check that no old module processes or helpers remain. If their identities
+   cannot be established, reboot the host before continuing.
+3. Remove the quarantined file, or move it **out of the daemon run directory**.
+   Preserve it elsewhere if it is needed for diagnosis.
+4. Start the daemon again.
+
+Removing a quarantine while the daemon is running, or without first resolving
+possible survivors, is not a supported clearance and can leave duplicate helpers.
+
+Quarantine also blocks a still-carried container whose configuration flag has
+since been turned off. That container remains carried until its terminal end;
+an ordinary module with no carried container is unaffected.
+
+Recovery records now use version 2; the new daemon also reads version 1. An old
+carried-container record without boot or session evidence blocks only that
+module and is never used to authorize a signal. Ordinary version-1 leader
+records retain their previous PID/start-time verification.
+
+**Rolling back to 0.39.x:** stop the new daemon cleanly first. A verified clean
+shutdown terminates every carried container and rewrites the record with an
+empty `children` list; it does not delete the file. Then place and start 0.39.x.
+If cleanup retains any unresolved entry, resolve it before rolling back.
+If the new daemon crashed, do **not** start 0.39.x directly: start the new
+daemon once, let its crash sweep clear or block the old containers, resolve
+any remaining block, and stop it cleanly before rolling back. If it cannot
+start, use offline cleanup as above instead. The released 0.39.x reader refuses
+version 2 for signalling but then replaces it with an empty version-1 record;
+it skips recovery of **ordinary leaders as well as carried helpers**. Those
+processes can remain running, unknown to the old daemon. Rollback is not
+globally fail-closed.
+
+Carried Unix launches stay before exec while the daemon records their complete
+identity and confirms cgroup/process-group placement. Admission has a fixed
+30-second deadline, allowing slow disk syncs without waiting forever; it is not
+a configuration knob. A timeout never starts the module, counts as a failed
+spawn, and blocks that module until its child is reaped and the late record
+write is durably resolved. Other carried launches can proceed after a known-PID
+timeout. Before the child reports its PID, cancellation uses a buffered cancel
+byte, not a guessed PID; the launch permit stays held until spawn returns.
+If a late admission write or durable removal fails, every carry-enabled module
+is blocked by the persistent quarantine marker, with the underlying cause in
+`ck module status`. Ordinary modules are unaffected. Use the same offline
+clearance steps above for that failed-write quarantine; a timer never clears it.
+
+
 ## Pre-auth limits are not configuration
 
 There is deliberately no `auth_deadline_ms` or

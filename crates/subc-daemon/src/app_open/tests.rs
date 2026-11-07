@@ -538,6 +538,49 @@ fn launch_style_selection_prefers_a_scope_only_with_a_manager() {
 }
 #[cfg(target_os = "linux")]
 mod linux_tests {
+    #[test]
+    fn unowned_scope_entry_never_reaps_a_reserved_child_pid() {
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = OwnedChild(
+            std::process::Command::new("/bin/sleep")
+                .arg("0.05")
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let process = subc_os::Process::open(pid).unwrap().unwrap();
+        let entry = super::super::LaunchEntry {
+            incarnation: 1,
+            pid,
+            start_time: subc_os::start_time(pid),
+            process,
+            child: None,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while subc_os::child_exit::observe(pid).unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned child did not exit"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // A stale scope entry knows a numeric PID, not this child handle. Even
+        // if that PID now belongs to a leader retained unreaped to reserve its
+        // process group, retiring the entry has no reap authority.
+        entry.reap();
+        assert!(
+            subc_os::child_exit::observe(pid).unwrap().is_some(),
+            "only the owner of the child handle may reap the reserved PID"
+        );
+        assert!(child.0.wait().unwrap().success());
+    }
+
     use super::*;
     use subc_os::local_peer::{ObservedPeer as OsPeer, PeerObservation, PeerUser};
 

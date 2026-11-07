@@ -15,6 +15,8 @@ mod bind_compat;
 pub mod bootstrap;
 pub mod caller_identity;
 pub(crate) mod capability_requirements;
+#[cfg(target_os = "linux")]
+mod cgroup_recovery;
 mod child_resources;
 mod child_roster;
 mod clock;
@@ -24,6 +26,8 @@ pub mod daemon_config;
 pub(crate) mod dispatch_spike;
 pub mod fleet_lint;
 pub mod forwarding;
+#[cfg(unix)]
+mod group_recovery;
 pub mod identity;
 mod live_children;
 pub mod local_listener;

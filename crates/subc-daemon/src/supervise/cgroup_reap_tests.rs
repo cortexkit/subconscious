@@ -10,16 +10,29 @@ struct KernelCgroup {
 
 impl KernelCgroup {
     fn new(test_name: &str) -> Option<Self> {
-        let root = PathBuf::from(format!(
-            "/sys/fs/cgroup/subc-reap-test-{test_name}-{}-{}",
+        let required = std::env::var_os("SUBC_REQUIRE_CGROUP_TEST").is_some()
+            || std::env::var_os("SUBC_TEST_CGROUP_REQUIRED").is_some();
+        let base = std::env::var_os("SUBC_TEST_CGROUP_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("SUBC_REQUIRE_CGROUP_TEST")
+                    .map(|_| PathBuf::from("/sys/fs/cgroup"))
+            });
+        let Some(base) = base else {
+            assert!(
+                !required,
+                "required cgroup test needs SUBC_TEST_CGROUP_ROOT"
+            );
+            eprintln!("SKIP {test_name}: set SUBC_TEST_CGROUP_ROOT to an owned delegated cgroup");
+            return None;
+        };
+        let root = base.join(format!(
+            "subc-reap-test-{test_name}-{}-{}",
             std::process::id(),
             unix_ms_now()
         ));
         if let Err(error) = fs::create_dir(&root) {
-            assert!(
-                std::env::var_os("SUBC_REQUIRE_CGROUP_TEST").is_none(),
-                "required cgroup test cannot execute: {error}"
-            );
+            assert!(!required, "required cgroup test cannot execute: {error}");
             eprintln!("SKIP {test_name}: no writable delegated cgroup: {error}");
             return None;
         }
@@ -38,7 +51,7 @@ impl KernelCgroup {
             || !fixture.root.join("cgroup.freeze").exists()
         {
             assert!(
-                std::env::var_os("SUBC_REQUIRE_CGROUP_TEST").is_none(),
+                !required,
                 "required cgroup.kill/cgroup.freeze interface unavailable"
             );
             eprintln!("SKIP {test_name}: cgroup.kill/cgroup.freeze unavailable");
@@ -69,7 +82,17 @@ impl Drop for KernelCgroup {
             while cgroup_is_populated(&module) && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(1));
             }
-            let _ = fs::remove_dir(&module);
+            fn remove_empty_tree(path: &Path) {
+                if let Ok(entries) = fs::read_dir(path) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                            remove_empty_tree(&entry.path());
+                        }
+                    }
+                }
+                let _ = fs::remove_dir(path);
+            }
+            remove_empty_tree(&module);
         }
         let _ = fs::remove_dir(&self.modules);
         let _ = fs::remove_dir(&self.root);
@@ -87,6 +110,7 @@ fn spawn_module(
     )
     .with_cgroup_placement(Some(placement));
     let spec = ModuleSpec {
+        carry_containment: false,
         module_id: "reaped-module".to_string(),
         program: PathBuf::from("/bin/sh"),
         args,
@@ -141,10 +165,13 @@ async fn reap_leftover(test_name: &str, ignore_term: bool) {
         "the spawn must create exactly one module cgroup"
     );
     let started = Instant::now();
-    timeout(Duration::from_secs(10), child.wait())
-        .await
-        .expect("leftover cleanup must finish")
-        .expect("reap module");
+    timeout(Duration::from_secs(10), async {
+        child.wait().await?;
+        child.finish_exit(false).await
+    })
+    .await
+    .expect("leftover cleanup must finish")
+    .expect("reap module");
     let elapsed = started.elapsed();
     let pid: i32 = fs::read_to_string(&pid_file)
         .unwrap()
@@ -214,6 +241,7 @@ async fn linux_reaped_cgroup_empty_has_no_grace_wait() {
     );
     let started = Instant::now();
     child.wait().await.unwrap();
+    child.finish_exit(false).await.unwrap();
     assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(
         kernel.module_cgroups(),
@@ -222,6 +250,9 @@ async fn linux_reaped_cgroup_empty_has_no_grace_wait() {
     );
     eprintln!("EXECUTED linux_reaped_cgroup_empty: no grace wait");
 }
+
+#[path = "carried_cgroup_tests.rs"]
+mod carried;
 
 // Ordinary files let the policy tests run without cgroup delegation. The child
 // remains owned and unreaped until signalling ends, so its PID cannot be reused

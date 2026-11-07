@@ -134,6 +134,10 @@ fn changed_parts(
             current_spec.reserved_prefixes != next.reserved_prefixes,
         ),
         ("overlap", current_spec.overlap != next.overlap),
+        (
+            "carry_containment",
+            current_spec.carry_containment != next.carry_containment,
+        ),
         ("health", *current_health != configured.health),
     ]
     .into_iter()

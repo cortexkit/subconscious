@@ -13,6 +13,7 @@ async fn wait_for(reason: &str, mut ready: impl FnMut() -> bool) {
 
 fn crashing_spec() -> ModuleSpec {
     ModuleSpec {
+        carry_containment: false,
         module_id: "slow-retry-child".into(),
         program: PathBuf::from("/bin/sh"),
         args: vec!["-c".into(), "exit 17".into()],

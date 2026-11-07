@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.20.160
+
+- Require subc-daemon 0.41 and subc-os 0.1.29 so opted-in modules keep their process
+  containers and helpers across module replacements. Existing module specifications
+  retain the default behavior: a replacement gets a fresh container.
+
 ## 0.20.159
 
 - Adopt the updated route-open types without enabling busy refusals in existing CLI callers.

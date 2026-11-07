@@ -2994,7 +2994,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.29"
+version = "0.1.30"
 dependencies = [
  "cortexkit-test-support",
  "libc",
@@ -3002,6 +3002,7 @@ dependencies = [
  "subc-os",
  "tokio",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]

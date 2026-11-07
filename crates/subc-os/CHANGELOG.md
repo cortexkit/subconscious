@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.30
+
+- Add the safe `config_keychain` API for a team-signed macOS daemon's sealing
+  key, content-bound anchor and monotonic revision high-water. Access denial
+  stays distinct from absence; unstamp clears the pair without losing history.
+- Add a file-backed key-store seam and `ckdev-os-keychain` fixture, available
+  only with `test-support` and a development executable name. Keys and encoded
+  copies use zeroizing storage and debug output redacts the key.
+
 ## 0.1.29
 
 - Add a CLOEXEC pre-exec admission gate with bounded parent-side PID readiness,

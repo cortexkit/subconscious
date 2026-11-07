@@ -695,6 +695,7 @@ pub struct Device {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Devices {
+    pub inventory: crate::computer::Inventory,
     pub list: Vec<Device>,
     pub online: u32,
     pub lan_addrs: Option<Vec<String>>,
@@ -787,6 +788,7 @@ pub struct Snapshot {
     /// last it applied, so a result is never lost when snapshots come
     /// faster than frames.
     pub pairing: Vec<(u64, crate::pairing::flow::Event)>,
+    pub computer: Vec<(u64, crate::computer::Event)>,
     /// The latest Save previews' replies, each with its sequence number,
     /// oldest first, applied like `pairing`'s results.
     pub previews: Vec<(u64, crate::live::settings::PreviewReply)>,
@@ -1493,6 +1495,11 @@ mod fixture {
         };
 
         let devices = Devices {
+            inventory: crate::computer::Inventory {
+                fingerprint: v["self"]["fingerprint"].as_str().map(str::to_string),
+                account_name: v["self"]["account_name"].as_str().map(str::to_string),
+                ..Default::default()
+            },
             list: arr(&v["devices"])
                 .iter()
                 .map(|d| {
@@ -1586,6 +1593,7 @@ mod fixture {
             last_result: None,
             serves: Serves::DESIGN,
             pairing: Vec::new(),
+            computer: Vec::new(),
             previews: Vec::new(),
             applies: Vec::new(),
             daemon_connection: 0,

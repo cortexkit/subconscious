@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings      This computer  20:48 
+───────────────────────────────────────────────────────────────────────━━━━━━━━━────────────────────────────────────────
+                                                                                                                        
+  This c╭─ Add a computer ─────────────────────────────────────────────────────────────────────────────────────╮        
+  ──────│                                                                                                      │──────  
+  Machin│   ✓ Choose the computer     2 Start pairing on it too     3 Compare the code                         │        
+  Pairin│ ──────────────────────────────────────────────────────────────────────────────────────────────────── │        
+  Daemon│                                                                                                      │        
+  Accoun│   Pairing with Studio PC · Windows · id 84126d0d                                                     │        
+  Vault │                                                                                                      │        
+        │   ○ Pairing timed out. Nothing was paired.                                                           │        
+  Paired│                                                                                                      │     3  
+  ──────│     Studio PC didn't connect within 5 minutes, or no one answered the code within 2 minutes.         │──────  
+    Devi│     Starting or cancelling a pairing elsewhere on this computer also ends this one.                  │        
+  ● Cort│                                                                                                      │        
+  ● iPho│                                                                                                      │        
+  ○ test│                                                                                                      │        
+        │                                                                                                      │        
+        │                                                                                                      │        
+    a Ad│                                                                                                      │        
+        │                                                                                                      │        
+        │                                                                                                      │        
+  Recent│                                                                                                      │ today  
+  ──────│                                                                                                      │──────  
+  20:49 │    ⏎  Start again    esc  Close                                                                      │        
+  20:41 │                                                                                                      │        
+  18:02 │                                                                                                      │        
+  11:31 │                                                                                                      │        
+  09:36 │                                                                                                      │        
+        │                                                                                                      │        
+        ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  a  add a phone    ⏎  details    x  forget    ↑↓  move                                                   from callosum 

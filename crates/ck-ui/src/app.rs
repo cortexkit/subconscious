@@ -50,7 +50,10 @@ pub struct TextField {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Request {
     /// The `ck module restart`, `stop` and `start` requests.
-    Act { kind: ActionKind, module: String },
+    Act {
+        kind: ActionKind,
+        module: String,
+    },
     /// The module whose log the app shows (the Modules pane or the log
     /// view), or `None` when no log is on screen.
     WatchLog(Option<String>),
@@ -70,6 +73,7 @@ pub enum Request {
     },
     /// A call the Add a phone exchange asks for.
     Pairing(crate::pairing::flow::Command),
+    Computer(crate::computer::Command),
     /// Ask the daemon what saving `candidate`, the staged `subc.jsonc`
     /// text, would do (`supervisor.rescan_checked` with `preview: true`).
     /// The reply comes back under `ticket` in a later snapshot.
@@ -143,6 +147,8 @@ pub struct App {
     /// The Add a phone exchange: what its overlay shows, and every pairing
     /// window ck still watches.
     pub pairing: Flow,
+    pub computer: crate::computer::Flow,
+    computer_seen: u64,
     /// The last pairing result applied from a snapshot (see
     /// [`Snapshot::pairing`]).
     pairing_seen: u64,
@@ -189,6 +195,8 @@ impl App {
             devices: DevicesState::default(),
             settings: SettingsState::default(),
             pairing: Flow::default(),
+            computer: crate::computer::Flow::default(),
+            computer_seen: 0,
             pairing_seen: 0,
             previews_seen: 0,
             applies_seen: 0,
@@ -249,6 +257,8 @@ impl App {
         if self.overlay == Some(Overlay::Pairing) {
             self.close_pairing();
         }
+        self.computer.close();
+        self.pump_computer();
         true
     }
 
@@ -340,8 +350,24 @@ impl App {
             (Tab::Agents, ..) => {
                 screens::agents::draw(&mut c, &v, &self.agents, self.field.is_some())
             }
+            (Tab::Devices, ..) if self.computer.detail.is_some() => {
+                screens::computer::details(&mut c, &v, &self.computer)
+            }
             (Tab::Devices, ..) => screens::devices::draw(&mut c, &v, &self.devices),
             (Tab::Settings, ..) => screens::settings::draw(&mut c, &v, &self.settings),
+        }
+        if self.computer.picker || self.computer.session.is_some() {
+            screens::computer::picker(&mut c, &v, &self.computer);
+        }
+        if self.tab == Tab::Devices {
+            if let Some(notice) = &self.computer.notice {
+                c.right(
+                    c.w - 2,
+                    c.h - 3,
+                    &format!(" {notice} "),
+                    crate::theme::St::O.on(crate::theme::Bg::Key),
+                );
+            }
         }
         self.draw_quit_question(&mut c);
         screens::result_toast(&mut c, &v);
@@ -453,6 +479,50 @@ impl App {
         }
         if self.overlay == Some(Overlay::Pairing) {
             return self.pairing_key(key, snap);
+        }
+        if self.overlay.is_none() && self.tab == Tab::Devices {
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                && (self.computer.picker
+                    || self.computer.session.is_some()
+                    || self.computer.detail.is_some())
+            {
+                return false;
+            }
+            if self.computer.key(key.code, &snap.devices.data) {
+                self.pump_computer();
+                return true;
+            }
+            match key.code {
+                KeyCode::Char('c')
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    self.computer.open();
+                    self.pump_computer();
+                    return true;
+                }
+                KeyCode::Enter | KeyCode::Char('x')
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    if let Some(d) = self.devices.sel.and_then(|i| snap.devices.data.list.get(i)) {
+                        if d.kind == "computer" && d.fingerprint.is_some() {
+                            self.computer.detail = d.fingerprint.clone();
+                            self.computer.remember(&snap.devices.data);
+                            self.computer.notice = None;
+                            if key.code == KeyCode::Char('x') {
+                                self.computer.forget = true;
+                            }
+                            return true;
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
         if self.overlay.is_none() && self.tab == Tab::Settings {
             if self.settings.section == 2 && !self.settings.save.open {
@@ -609,6 +679,8 @@ impl App {
         if self.settings.changes() > 0 && !self.settings.quit_asked {
             self.settings.quit_asked = true;
         } else {
+            self.computer.close();
+            self.pump_computer();
             self.quit = true;
         }
     }
@@ -744,6 +816,12 @@ impl App {
     }
 
     /// Hands the exchange's queued calls to whoever feeds the app.
+    fn pump_computer(&mut self) {
+        for command in self.computer.outbox.drain(..) {
+            self.requests.push(Request::Computer(command));
+        }
+    }
+
     fn pump_pairing(&mut self) {
         for command in self.pairing.outbox.drain(..) {
             self.requests.push(Request::Pairing(command));
@@ -779,6 +857,16 @@ impl App {
             }
         }
         self.pump_settings();
+        self.computer.remember(&snap.devices.data);
+        self.computer.tick(now.unix_millis());
+        for (seq, event) in &snap.computer {
+            if *seq > self.computer_seen {
+                self.computer_seen = *seq;
+                self.computer.absorb(event.clone(), &snap.devices.data);
+                settings_changed = true;
+            }
+        }
+        self.pump_computer();
         let before = self.pairing.stage.clone();
         let mut applied = false;
         self.pairing.tick(now);

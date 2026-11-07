@@ -1236,6 +1236,13 @@ async fn handle_requests(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Re
             now,
         )
     };
+    let computer = {
+        let sink = Arc::clone(&shared);
+        super::computer::Computer::new(
+            Arc::new(DaemonCallosum(Arc::clone(&shared))),
+            Arc::new(move |event| sink.update(|s| s.record_computer(event))),
+        )
+    };
     // Where a running upgrade's rollback question waits for its answer.
     // The answer's sender lives only here, so when this loop ends (the app
     // has gone) the sender is dropped and the run, which waits on the other
@@ -1268,6 +1275,10 @@ async fn handle_requests(shared: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<Re
                 })
             }),
             Request::Pairing(command) => pairing.run(command),
+            Request::Computer(crate::computer::Command::ReadDevices) => {
+                tokio::spawn(read_groups(Arc::clone(&shared)));
+            }
+            Request::Computer(command) => computer.run(command),
             Request::Show(showing) => {
                 let wanted = schedule::wanted(&showing);
                 shared.demand.send_if_modified(|d| {
@@ -1626,6 +1637,16 @@ fn call_failure(e: &CallError) -> CallFailure {
 }
 
 impl pairing::Callosum for DaemonCallosum {
+    fn watch_computer(
+        &self,
+        window_id: u64,
+    ) -> BoxFuture<'static, Result<Box<dyn WatchStream>, CallFailure>> {
+        daemon_pairing_watch(
+            Arc::clone(&self.0),
+            "callosum.pairing_computer_watch",
+            json!({"window_id":window_id}),
+        )
+    }
     fn call(
         &self,
         method: &'static str,
@@ -1670,54 +1691,65 @@ impl pairing::Callosum for DaemonCallosum {
         &self,
         window_id: String,
     ) -> BoxFuture<'static, Result<Box<dyn WatchStream>, CallFailure>> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let shared = Arc::clone(&self.0);
-        Box::pin(async move {
-            let Some(conn) = shared.conn() else {
-                return Err(CallFailure::Lost);
-            };
-            // A session name of its own gives the watch a route of its own,
-            // apart from the shared route opens and confirms use.
-            let session = format!(
-                "pairing-watch-{}",
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            );
-            let handle = conn
-                .consumer
-                .open_route(
-                    RouteTarget::ManagementSurface {
-                        module_id: modules::DEVICES.to_string(),
-                    },
-                    BindIdentity::new("ck", session),
-                    call_options(),
-                )
-                .await
-                .map_err(|e| call_failure(&e))?;
-            let body = serde_json::to_vec(&json!({
-                "method": "callosum.pairing_qr_watch",
-                "params": { "window_id": window_id },
-            }))
-            .map_err(|_| CallFailure::Lost)?;
-            match conn
-                .consumer
-                .subscribe_route(&handle, body, SubscribeOptions::default())
-                .await
-            {
-                Ok(sub) => Ok(Box::new(DaemonWatch {
-                    consumer: Arc::clone(&conn.consumer),
-                    handle,
-                    sub,
-                }) as Box<dyn WatchStream>),
-                Err(e) => {
-                    let _ = conn
-                        .consumer
-                        .close_handle(&handle, CloseRouteOptions::default())
-                        .await;
-                    Err(call_failure(&e))
-                }
-            }
-        })
+        daemon_pairing_watch(
+            Arc::clone(&self.0),
+            "callosum.pairing_qr_watch",
+            json!({"window_id":window_id}),
+        )
     }
+}
+
+fn daemon_pairing_watch(
+    shared: Arc<Shared>,
+    method: &'static str,
+    params: Value,
+) -> BoxFuture<'static, Result<Box<dyn WatchStream>, CallFailure>> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    Box::pin(async move {
+        let Some(conn) = shared.conn() else {
+            return Err(CallFailure::Lost);
+        };
+        // A session name of its own gives the watch a route of its own,
+        // apart from the shared route opens and confirms use.
+        let session = format!(
+            "pairing-watch-{}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let handle = conn
+            .consumer
+            .open_route(
+                RouteTarget::ManagementSurface {
+                    module_id: modules::DEVICES.to_string(),
+                },
+                BindIdentity::new("ck", session),
+                call_options(),
+            )
+            .await
+            .map_err(|e| call_failure(&e))?;
+        let body = serde_json::to_vec(&json!({
+            "method": method,
+            "params": params,
+        }))
+        .map_err(|_| CallFailure::Lost)?;
+        match conn
+            .consumer
+            .subscribe_route(&handle, body, SubscribeOptions::default())
+            .await
+        {
+            Ok(sub) => Ok(Box::new(DaemonWatch {
+                consumer: Arc::clone(&conn.consumer),
+                handle,
+                sub,
+            }) as Box<dyn WatchStream>),
+            Err(e) => {
+                let _ = conn
+                    .consumer
+                    .close_handle(&handle, CloseRouteOptions::default())
+                    .await;
+                Err(call_failure(&e))
+            }
+        }
+    })
 }
 
 /// One window's watch subscription and the route it alone uses.

@@ -1,0 +1,799 @@
+{
+  "version": "computer-pairing-ops-v1",
+  "cases": [
+    {
+      "id": "candidates_synced",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_candidates_read",
+        "params": {}
+      },
+      "reply": {
+        "devices": [
+          {
+            "fingerprint": "02d449a31fbb267c8f352e9968a79e3e",
+            "name": "Build box",
+            "platform": "linux",
+            "state": "available"
+          },
+          {
+            "fingerprint": "9f72ea0cf49536e3c66c787f705186df",
+            "name": "Office Mac",
+            "platform": "macos",
+            "state": "paired"
+          },
+          {
+            "fingerprint": "deb0e38ced1e41de6f92e70e80c418d2",
+            "name": "Old laptop",
+            "platform": "windows",
+            "state": "unavailable"
+          },
+          {
+            "fingerprint": "bb391415c05e39d77ca17381d3be3f7d",
+            "name": "Retired server",
+            "platform": "linux",
+            "state": "unavailable"
+          },
+          {
+            "fingerprint": "84126d0dd850199be29021aadbaee68c",
+            "name": "Studio PC",
+            "platform": "windows",
+            "state": "available"
+          }
+        ],
+        "registry": "synced"
+      }
+    },
+    {
+      "id": "candidates_not_direct",
+      "caller": "reserved:ck",
+      "request": {
+        "method": "callosum.pairing_candidates_read",
+        "params": {}
+      },
+      "error": {
+        "code": "fed_not_authorized",
+        "message": "callosum.pairing_candidates_read requires a direct caller"
+      }
+    },
+    {
+      "id": "candidates_waiting",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_candidates_read",
+        "params": {}
+      },
+      "reply": {
+        "devices": [],
+        "registry": "waiting"
+      }
+    },
+    {
+      "id": "unpair_not_direct",
+      "caller": "reserved:ck",
+      "request": {
+        "method": "callosum.unpair",
+        "params": {
+          "fingerprint": "9f72ea0cf49536e3c66c787f705186df"
+        }
+      },
+      "error": {
+        "code": "fed_not_authorized",
+        "message": "callosum.unpair requires a direct caller"
+      }
+    },
+    {
+      "id": "unpair_success",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.unpair",
+        "params": {
+          "fingerprint": "9f72ea0cf49536e3c66c787f705186df"
+        }
+      },
+      "reply": {}
+    },
+    {
+      "id": "unpair_unknown_fingerprint",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.unpair",
+        "params": {
+          "fingerprint": "9f72ea0cf49536e3c66c787f705186df"
+        }
+      },
+      "error": {
+        "code": "fed_not_paired",
+        "message": "no device with that fingerprint is in the profile or on the roster"
+      }
+    },
+    {
+      "id": "unpair_partly_done",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.unpair",
+        "params": {
+          "fingerprint": "352302489bc2fcf025cf00cda8308033"
+        }
+      },
+      "error": {
+        "code": "fed_target_unavailable",
+        "message": "the profile entry was removed, but the roster row could not be retired (storage backend: injected fault after journal append and before commit); unpair again to finish"
+      }
+    },
+    {
+      "id": "devices_watch_first_notice",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.devices_watch",
+        "params": {}
+      },
+      "notices": [
+        {
+          "devices": [
+            {
+              "device_class": "phone",
+              "fingerprint": "e29442e61ad354e5cb0831e2e8359e8f",
+              "last_seen_unix_ms": null,
+              "name": "e29442e61ad354e5cb0831e2e8359e8f",
+              "release_build": false,
+              "since_unix_ms": 0,
+              "subscriptions_live": 0,
+              "trust": "verified",
+              "tunnel": "closed:not_running"
+            }
+          ],
+          "self": {
+            "account_name": "This Mac",
+            "expose_profiles": [
+              {
+                "name": "mobile",
+                "operation_count": 2,
+                "peers_using": 1
+              },
+              {
+                "name": "zeta",
+                "operation_count": 0,
+                "peers_using": 0
+              }
+            ],
+            "fingerprint": "a0289810032eb417274eebc4a38e6899",
+            "lan_addrs": [
+              "192.168.1.2:7841"
+            ],
+            "listen_addr": "192.168.1.2:7841",
+            "rendezvous": "disabled",
+            "wan_port_mapping": "unsupported",
+            "wan_reachability": null,
+            "watch_ops_offered": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "devices_watch_not_direct",
+      "caller": "reserved:ck",
+      "request": {
+        "method": "callosum.devices_watch",
+        "params": {}
+      },
+      "error": {
+        "code": "fed_not_authorized",
+        "message": "callosum.devices_watch requires a direct caller"
+      }
+    },
+    {
+      "id": "devices_watch_bad_params",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.devices_watch",
+        "params": {
+          "since": 0
+        }
+      },
+      "error": {
+        "code": "fed_bad_request",
+        "message": "callosum.devices_watch requires empty object params"
+      }
+    },
+    {
+      "id": "computer_open_not_direct",
+      "caller": "reserved:ck",
+      "request": {
+        "method": "callosum.pairing_computer_open",
+        "params": {
+          "fingerprint": "02d449a31fbb267c8f352e9968a79e3e"
+        }
+      },
+      "error": {
+        "code": "fed_not_authorized",
+        "message": "callosum.pairing_computer_open requires a direct caller"
+      }
+    },
+    {
+      "id": "computer_open_success",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_open",
+        "params": {
+          "fingerprint": "02d449a31fbb267c8f352e9968a79e3e"
+        }
+      },
+      "reply": {
+        "expires_at_ms": 4000000300000,
+        "window_id": 4294967297
+      }
+    },
+    {
+      "id": "computer_open_not_available",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_open",
+        "params": {
+          "fingerprint": "9f72ea0cf49536e3c66c787f705186df"
+        }
+      },
+      "error": {
+        "code": "fed_bad_request",
+        "message": "that fingerprint isn't an available computer on this account"
+      }
+    },
+    {
+      "id": "computer_watch_not_direct",
+      "caller": "reserved:ck",
+      "request": {
+        "method": "callosum.pairing_computer_watch",
+        "params": {
+          "window_id": 4294967297
+        }
+      },
+      "error": {
+        "code": "fed_not_authorized",
+        "message": "callosum.pairing_computer_watch requires a direct caller"
+      }
+    },
+    {
+      "id": "computer_confirm_not_pending",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_confirm",
+        "params": {
+          "match": true,
+          "window_id": 4294967297
+        }
+      },
+      "error": {
+        "code": "fed_pairing_not_pending",
+        "message": "the computer pairing window isn't waiting for an answer"
+      }
+    },
+    {
+      "id": "computer_confirm_not_direct",
+      "caller": "reserved:ck",
+      "request": {
+        "method": "callosum.pairing_computer_confirm",
+        "params": {
+          "match": true,
+          "window_id": 4294967297
+        }
+      },
+      "error": {
+        "code": "fed_not_authorized",
+        "message": "callosum.pairing_computer_confirm requires a direct caller"
+      }
+    },
+    {
+      "id": "computer_confirm_success",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_confirm",
+        "params": {
+          "match": true,
+          "window_id": 4294967297
+        }
+      },
+      "reply": {}
+    },
+    {
+      "id": "computer_confirm_already_answered",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_confirm",
+        "params": {
+          "match": true,
+          "window_id": 4294967297
+        }
+      },
+      "error": {
+        "code": "fed_pairing_not_pending",
+        "message": "the computer pairing window isn't waiting for an answer"
+      }
+    },
+    {
+      "id": "watch_live_to_paired",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_watch",
+        "params": {
+          "window_id": 4294967297
+        }
+      },
+      "events": [
+        {
+          "state": "waiting_for_device"
+        },
+        {
+          "state": "connecting"
+        },
+        {
+          "code": "082 917",
+          "confirm_by_ms": 4000000120000,
+          "state": "code"
+        },
+        {
+          "code": "082 917",
+          "confirm_by_ms": 4000000120000,
+          "state": "peer_confirmed"
+        },
+        {
+          "confirmed_with": "prompt",
+          "name": "Build box",
+          "state": "paired"
+        }
+      ]
+    },
+    {
+      "id": "watch_paired_typed",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_watch",
+        "params": {
+          "window_id": 4294967297
+        }
+      },
+      "events": [
+        {
+          "confirmed_with": "typed",
+          "name": "Build box",
+          "state": "paired"
+        }
+      ]
+    },
+    {
+      "id": "watch_declined_here",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_watch",
+        "params": {
+          "window_id": 4294967297
+        }
+      },
+      "events": [
+        {
+          "by": "here",
+          "state": "declined"
+        }
+      ]
+    },
+    {
+      "id": "watch_declined_peer",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_watch",
+        "params": {
+          "window_id": 4294967297
+        }
+      },
+      "events": [
+        {
+          "by": "peer",
+          "state": "declined"
+        }
+      ]
+    },
+    {
+      "id": "watch_expired_here",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_watch",
+        "params": {
+          "window_id": 4294967297
+        }
+      },
+      "events": [
+        {
+          "by": "here",
+          "state": "expired"
+        }
+      ]
+    },
+    {
+      "id": "watch_expired_peer",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_watch",
+        "params": {
+          "window_id": 4294967297
+        }
+      },
+      "events": [
+        {
+          "by": "peer",
+          "state": "expired"
+        }
+      ]
+    },
+    {
+      "id": "watch_failed_commit_mismatch",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_watch",
+        "params": {
+          "window_id": 4294967297
+        }
+      },
+      "events": [
+        {
+          "reason": "commit_mismatch",
+          "state": "failed"
+        }
+      ]
+    },
+    {
+      "id": "watch_failed_protocol",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_watch",
+        "params": {
+          "window_id": 4294967297
+        }
+      },
+      "events": [
+        {
+          "reason": "protocol",
+          "state": "failed"
+        }
+      ]
+    },
+    {
+      "id": "watch_failed_device_changed",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_watch",
+        "params": {
+          "window_id": 4294967297
+        }
+      },
+      "events": [
+        {
+          "reason": "device_changed",
+          "state": "failed"
+        }
+      ]
+    },
+    {
+      "id": "watch_failed_confirm_failed",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_watch",
+        "params": {
+          "window_id": 4294967297
+        }
+      },
+      "events": [
+        {
+          "reason": "confirm_failed",
+          "state": "failed"
+        }
+      ]
+    },
+    {
+      "id": "watch_failed_peer_failed",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_watch",
+        "params": {
+          "window_id": 4294967297
+        }
+      },
+      "events": [
+        {
+          "reason": "peer_failed",
+          "state": "failed"
+        }
+      ]
+    },
+    {
+      "id": "watch_failed_interrupted",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_computer_watch",
+        "params": {
+          "window_id": 4294967297
+        }
+      },
+      "events": [
+        {
+          "reason": "interrupted",
+          "state": "failed"
+        }
+      ]
+    },
+    {
+      "id": "cancel_not_direct",
+      "caller": "reserved:ck",
+      "request": {
+        "method": "callosum.pairing_cancel",
+        "params": {
+          "window_id": 4294967298
+        }
+      },
+      "error": {
+        "code": "fed_not_authorized",
+        "message": "callosum.pairing_cancel requires a direct caller"
+      }
+    },
+    {
+      "id": "cancel_computer_window",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_cancel",
+        "params": {
+          "window_id": 4294967298
+        }
+      },
+      "reply": {}
+    },
+    {
+      "id": "cancel_qr_window",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_cancel",
+        "params": {
+          "window_id": 1
+        }
+      },
+      "reply": {}
+    },
+    {
+      "id": "cancel_unknown_window",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.pairing_cancel",
+        "params": {
+          "window_id": 999
+        }
+      },
+      "error": {
+        "code": "fed_pairing_not_found",
+        "message": "no pairing window has that id"
+      }
+    },
+    {
+      "id": "sharing_not_direct",
+      "caller": "reserved:ck",
+      "request": {
+        "method": "callosum.sharing_set",
+        "params": {
+          "enabled": true,
+          "fingerprint": "af834b2357bae6ad7eccd35c0a050538",
+          "module": "claustrum",
+          "share": "vault"
+        }
+      },
+      "error": {
+        "code": "fed_not_authorized",
+        "message": "sharing switches require a direct caller"
+      }
+    },
+    {
+      "id": "sharing_not_paired",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.sharing_set",
+        "params": {
+          "enabled": true,
+          "fingerprint": "5bcd7f17c6d1d2636206ea55dfb2204a",
+          "module": "claustrum",
+          "share": "vault"
+        }
+      },
+      "error": {
+        "code": "fed_not_paired",
+        "message": "device is not paired"
+      }
+    },
+    {
+      "id": "sharing_unknown_share",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.sharing_set",
+        "params": {
+          "enabled": true,
+          "fingerprint": "af834b2357bae6ad7eccd35c0a050538",
+          "module": "claustrum",
+          "share": "missing"
+        }
+      },
+      "error": {
+        "code": "fed_bad_request",
+        "message": "share is not available for this device"
+      }
+    },
+    {
+      "id": "sharing_refused",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.sharing_set",
+        "params": {
+          "enabled": true,
+          "fingerprint": "af834b2357bae6ad7eccd35c0a050538",
+          "module": "claustrum",
+          "share": "vault"
+        }
+      },
+      "error": {
+        "code": "fed_operator_confirmation_refused",
+        "message": "operator confirmation declined or unavailable; sharing unchanged"
+      }
+    },
+    {
+      "id": "sharing_on",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.sharing_set",
+        "params": {
+          "enabled": true,
+          "fingerprint": "af834b2357bae6ad7eccd35c0a050538",
+          "module": "claustrum",
+          "share": "vault"
+        }
+      },
+      "reply": {}
+    },
+    {
+      "id": "devices_shares_on",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.devices_watch",
+        "params": {}
+      },
+      "notices": [
+        {
+          "devices": [
+            {
+              "device_class": "computer",
+              "fingerprint": "af834b2357bae6ad7eccd35c0a050538",
+              "last_seen_unix_ms": null,
+              "name": "af834b2357bae6ad7eccd35c0a050538",
+              "release_build": false,
+              "shares": [
+                {
+                  "enabled": true,
+                  "label": "Use this computer's vault",
+                  "module": "claustrum",
+                  "needs_review": false,
+                  "share": "vault"
+                }
+              ],
+              "since_unix_ms": 0,
+              "subscriptions_live": 0,
+              "trust": "verified",
+              "tunnel": "closed:not_running"
+            }
+          ],
+          "self": {
+            "account_name": null,
+            "expose_profiles": [
+              {
+                "name": "mobile",
+                "operation_count": 2,
+                "peers_using": 1
+              },
+              {
+                "name": "zeta",
+                "operation_count": 0,
+                "peers_using": 0
+              }
+            ],
+            "fingerprint": "a0289810032eb417274eebc4a38e6899",
+            "lan_addrs": [
+              "192.168.1.2:7841"
+            ],
+            "listen_addr": "192.168.1.2:7841",
+            "rendezvous": "disabled",
+            "wan_port_mapping": "unsupported",
+            "wan_reachability": null,
+            "watch_ops_offered": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "devices_shares_needs_review",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.devices_watch",
+        "params": {}
+      },
+      "notices": [
+        {
+          "devices": [
+            {
+              "device_class": "computer",
+              "fingerprint": "af834b2357bae6ad7eccd35c0a050538",
+              "last_seen_unix_ms": null,
+              "name": "af834b2357bae6ad7eccd35c0a050538",
+              "release_build": false,
+              "shares": [
+                {
+                  "enabled": true,
+                  "label": "Use this computer's vault",
+                  "module": "claustrum",
+                  "needs_review": true,
+                  "share": "vault"
+                }
+              ],
+              "since_unix_ms": 0,
+              "subscriptions_live": 0,
+              "trust": "verified",
+              "tunnel": "closed:not_running"
+            }
+          ],
+          "self": {
+            "account_name": null,
+            "expose_profiles": [
+              {
+                "name": "mobile",
+                "operation_count": 2,
+                "peers_using": 1
+              },
+              {
+                "name": "zeta",
+                "operation_count": 0,
+                "peers_using": 0
+              }
+            ],
+            "fingerprint": "a0289810032eb417274eebc4a38e6899",
+            "lan_addrs": [
+              "192.168.1.2:7841"
+            ],
+            "listen_addr": "192.168.1.2:7841",
+            "rendezvous": "disabled",
+            "wan_port_mapping": "unsupported",
+            "wan_reachability": null,
+            "watch_ops_offered": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "sharing_reapprove",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.sharing_set",
+        "params": {
+          "enabled": true,
+          "fingerprint": "af834b2357bae6ad7eccd35c0a050538",
+          "module": "claustrum",
+          "share": "vault"
+        }
+      },
+      "reply": {}
+    },
+    {
+      "id": "sharing_off",
+      "caller": "direct",
+      "request": {
+        "method": "callosum.sharing_set",
+        "params": {
+          "enabled": false,
+          "fingerprint": "af834b2357bae6ad7eccd35c0a050538",
+          "module": "claustrum",
+          "share": "vault"
+        }
+      },
+      "reply": {}
+    }
+  ]
+}

@@ -822,7 +822,46 @@ pub fn devices(reply: &Value, now: Timestamp) -> Result<Devices, Fault> {
             .map(|v| v.as_str().map(str::to_string))
             .collect()
     };
+    let mut inventory = crate::computer::Inventory {
+        fingerprint: this
+            .get("fingerprint")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        account_name: this
+            .get("account_name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        ..Default::default()
+    };
+    for d in list {
+        if d.get("device_class").and_then(Value::as_str) != Some("computer") {
+            continue;
+        }
+        if let Some(id) = d.get("fingerprint").and_then(Value::as_str) {
+            inventory.computers.insert(
+                id.to_string(),
+                crate::computer::Details {
+                    platform: d
+                        .get("platform")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    pairing: d
+                        .get("pairing")
+                        .and_then(Value::as_str)
+                        .filter(|p| matches!(*p, "granted_here" | "confirmed_both"))
+                        .map(str::to_string),
+                    since: d.get("since_unix_ms").and_then(Value::as_i64),
+                    shares: d
+                        .get("shares")
+                        .map(|v| serde_json::from_value(v.clone()))
+                        .transpose()
+                        .map_err(|_| Fault::sentence("unexpected sharing switches reply"))?,
+                },
+            );
+        }
+    }
     Ok(Devices {
+        inventory,
         list: out,
         online,
         lan_addrs: strings(&this["lan_addrs"]),

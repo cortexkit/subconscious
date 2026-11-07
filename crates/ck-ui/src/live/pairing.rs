@@ -37,8 +37,16 @@ pub enum CallFailure {
     Lost,
 }
 
-/// The three pairing operations, as ck sends them.
+/// Pairing operations and subscriptions, as ck sends them.
 pub trait Callosum: Send + Sync + 'static {
+    /// Watches one computer-pairing window (the six-digit-code ceremony),
+    /// named by its numeric window id, on its own subscription route.
+    fn watch_computer(
+        &self,
+        _window_id: u64,
+    ) -> BoxFuture<'static, Result<Box<dyn WatchStream>, CallFailure>> {
+        Box::pin(async { Err(CallFailure::Lost) })
+    }
     /// One `{"method", "params"}` request on callosum's shared route.
     fn call(
         &self,
@@ -217,7 +225,7 @@ impl Pairing {
 
 /// An error callosum put inside a reply: its code, message and the wait a
 /// backoff names.
-fn reply_refusal(reply: &Value) -> Option<Refusal> {
+pub(crate) fn reply_refusal(reply: &Value) -> Option<Refusal> {
     let e = reply.get("error").filter(|e| !e.is_null())?;
     let text = |key: &str| e.get(key).and_then(Value::as_str).map(str::to_string);
     Some(Refusal {

@@ -144,10 +144,24 @@ pub fn draw(c: &mut Canvas, v: &View, state: &DevicesState) {
         },
         _ => UNKNOWN.into(),
     };
-    field(c, 6, "Daemon", &daemon);
+    let has_pairing_id = devices.data.inventory.fingerprint.is_some();
+    field(c, if has_pairing_id { 7 } else { 6 }, "Daemon", &daemon);
+    if let Some(id) = &devices.data.inventory.fingerprint {
+        field(c, 6, "Pairing id", &crate::computer::short_id(id));
+    }
     if design {
-        field(c, 7, "Account", "signed in · relay connected");
-        field(c, 8, "Vault", "88 credentials · protected");
+        field(
+            c,
+            if has_pairing_id { 8 } else { 7 },
+            "Account",
+            "signed in · relay connected",
+        );
+        field(
+            c,
+            if has_pairing_id { 9 } else { 8 },
+            "Vault",
+            "88 credentials · protected",
+        );
     }
     let room = (c.w - rx - 16).max(0) as usize;
     let lan = devices
@@ -228,18 +242,17 @@ pub fn draw(c: &mut Canvas, v: &View, state: &DevicesState) {
     if let Some(y) = at.phone {
         c.put(4, y, "a", St::bg(Bg::Key).bold());
         c.put(6, y, "Add a phone", St::NONE);
-        if design {
-            c.put(22, y, "c", St::bg(Bg::Key).bold());
-            c.put(24, y, "Add a computer", St::NONE);
-        }
+        c.put(22, y, "c", St::bg(Bg::Key).bold());
+        c.put(24, y, "Add a computer", St::NONE);
     }
     if let Some(y) = at.recent {
         recent(c, y);
     }
     let mut hints = vec![("a", "add a phone")];
-    if design {
-        hints.extend([("⏎", "details"), ("x", "forget")]);
+    if !design {
+        hints.push(("c", "add a computer"));
     }
+    hints.extend([("⏎", "details"), ("x", "forget")]);
     hints.push(("↑↓", "move"));
     frame_end(c, &hints, &meta.text, meta.st);
 }

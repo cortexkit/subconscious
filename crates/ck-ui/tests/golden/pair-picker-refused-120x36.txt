@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings      This computer  20:48 
+───────────────────────────────────────────────────────────────────────━━━━━━━━━────────────────────────────────────────
+                                                                                                                        
+  This c╭─ Add a computer ─────────────────────────────────────────────────────────────────────────────────────╮        
+  ──────│                                                                                                      │──────  
+  Machin│   1 Choose the computer     2 Start pairing on it too     3 Compare the code                         │        
+  Pairin│ ──────────────────────────────────────────────────────────────────────────────────────────────────── │        
+  Daemon│                                                                                                      │        
+  Accoun│   Choose the computer to pair with. It has to be signed in to your account too.                      │        
+  Vault │                                                                                                      │        
+        │     Computer                  System      Id          Status                                         │        
+  Paired│   ────────────────────────────────────────────────────────────────────────────────────────────────   │     3  
+  ──────│     Build box                 Linux       02d449a3    not paired yet                                 │──────  
+    Devi│     CortexKit Box 2           macOS       9f72ea0c    already paired                                 │        
+  ● Cort│     Old laptop                Windows     deb0e38c    unavailable                                    │        
+  ● iPho│     Retired server            Linux       bb391415    unavailable                                    │        
+  ○ test│     Studio PC                 Linux       5be0c1d7    not paired yet                                 │        
+        │     Studio PC                 Windows     84126d0d    unavailable                                    │        
+        │                                                                                                      │        
+    a Ad│   Two computers can have the same name. The system and id tell them apart.                           │        
+        │                                                                                                      │        
+        │   ▲ Studio PC on Windows can't be paired right now, so the list was read again.                      │        
+  Recent│                                                                                                      │ today  
+  ──────│                                                                                                      │──────  
+  20:49 │    ⏎  Pair    esc  Close                                                                             │        
+  20:41 │                                                                                                      │        
+  18:02 │                                                                                                      │        
+  11:31 │                                                                                                      │        
+  09:36 │                                                                                                      │        
+        │                                                                                                      │        
+        ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  a  add a phone    ⏎  details    x  forget    ↑↓  move                                                   from callosum 

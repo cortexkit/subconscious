@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings      This computer  20:48 
+───────────────────────────────────────────────────────────────────────━━━━━━━━━────────────────────────────────────────
+                                                                                                                        
+  This c╭─ Add a computer ─────────────────────────────────────────────────────────────────────────────────────╮        
+  ──────│                                                                                                      │──────  
+  Machin│   ✓ Choose the computer     2 Start pairing on it too     3 Compare the code                         │        
+  Pairin│ ──────────────────────────────────────────────────────────────────────────────────────────────────── │        
+  Daemon│                                                                                                      │        
+  Accoun│   Pairing with Studio PC · Windows · id 84126d0d                                                     │        
+  Vault │                                                                                                      │        
+        │   ⠸ Connecting to Studio PC…                                                                         │        
+  Paired│     stops in 3:40                                                                                    │     3  
+  ──────│                                                                                                      │──────  
+    Devi│   Start pairing on Studio PC too                                                                     │        
+  ● Cort│   On Studio PC, open ck, go to Devices, press c and choose Studio Mac.                               │        
+  ● iPho│   Its id there is c7e2a90d, the Pairing id on this computer's Devices.                               │        
+  ○ test│   Pairing works only while both computers are doing it.                                              │        
+        │                                                                                                      │        
+        │   Studio PC can be reached. The code appears once it is pairing too.                                 │        
+    a Ad│                                                                                                      │        
+        │                                                                                                      │        
+        │                                                                                                      │        
+  Recent│                                                                                                      │ today  
+  ──────│                                                                                                      │──────  
+  20:49 │    esc  Cancel                                                                                       │        
+  20:41 │                                                                                                      │        
+  18:02 │                                                                                                      │        
+  11:31 │                                                                                                      │        
+  09:36 │                                                                                                      │        
+        │                                                                                                      │        
+        ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  a  add a phone    ⏎  details    x  forget    ↑↓  move                                                   from callosum 

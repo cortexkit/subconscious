@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings      This computer  20:48 
+───────────────────────────────────────────────────────────────────────━━━━━━━━━────────────────────────────────────────
+                                                                                                                        
+  ← Studio PC · computer · Windows · id 84126d0d                                                           ● connected  
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  
+                                                                                                                        
+  Status                                                      Pairing                                                   
+  ──────────────────────────────────────────────────────      ────────────────────────────────────────────────────────  
+  Connection        direct · LAN                              ◌ Paired on this computer                                 
+  Connected since   today 20:51                                 Studio PC hasn't reported that it finished pairing.     
+  Last seen         now                                         If they can't connect, forget it on both computers      
+                                                                and pair them again.                                    
+                                                                                                                        
+  Sharing                                                                                                    1 of 3 on  
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  
+    Switch  What Studio PC can do                   Module                                                              
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  
+    ◉ on    Use this computer's vault               claustrum                                                           
+    ○ off   Run builds on this computer             motor                                                               
+    ○ off   See this computer's agents              entorhinal                                                          
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+    Turning a switch on asks you to confirm on this computer. Turning one off happens at once.                          
+    If this computer has no system prompt, ⏎ itself is your confirmation.                                               
+                                                                                                                        
+                                                                                                                        
+  Recent                                                                                                         today  
+  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  
+  20:52  connected directly over the LAN                                                                                
+  20:51  paired on this computer                                                                                        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏎  on or off    ↑↓  move    x  forget    esc  back                                                      from callosum 

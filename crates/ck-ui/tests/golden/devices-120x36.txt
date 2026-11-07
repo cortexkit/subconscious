@@ -4,10 +4,10 @@
   This computer                                               Reachable as                                              
   ──────────────────────────────────────────────────────      ────────────────────────────────────────────────────────  
   Machine id    4f1a9c2e7b3d40c8a6e5d1b2c3f40912              LAN           192.168.1.20:7841                           
-  Daemon        0.36.17 · up 9h 15m                           Relay         rdv.cortexkit.io                            
-  Account       signed in · relay connected                   Live feeds    10 offered to phones                        
+  Pairing id    c7e2a90d                                      Relay         rdv.cortexkit.io                            
+  Daemon        0.36.17 · up 9h 15m                           Live feeds    10 offered to phones                        
+  Account       signed in · relay connected                                                                             
   Vault         88 credentials · protected                                                                              
-                                                                                                                        
                                                                                                                         
   Paired devices                                                                                                     3  
   ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  

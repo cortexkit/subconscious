@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod computer;
 pub mod draw;
 pub mod live;
 pub mod metrics;

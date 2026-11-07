@@ -457,3 +457,239 @@ fn agents_120x36() {
     app.tab = Tab::Agents;
     check("agents-120x36", &app, &Snapshot::fixture());
 }
+
+fn computer_frame(name: &str) -> (App, Snapshot) {
+    use ck_ui::computer::{self, Opened, Session, Watch};
+    use serde_json::Value;
+    let fixture: Value = serde_json::from_str(include_str!("golden/fixture.json")).unwrap();
+    let cp = &fixture["computer_pairing"];
+    let mut app = app();
+    app.tab = Tab::Devices;
+    app.tick = 3;
+    let mut snap = Snapshot::fixture();
+    app.devices.sel = Some(1);
+    let now = Snapshot::fixture_now().unix_millis();
+    if name.starts_with("picker") {
+        app.computer.picker = true;
+        let key = match name {
+            "picker-empty" => "candidates_empty",
+            "picker-list-waiting" => "candidates_waiting",
+            "picker-refused" => "candidates_after_refusal",
+            _ => "candidates",
+        };
+        let (waiting, list) = computer::candidates(&cp[key]).unwrap();
+        app.computer.waiting = waiting;
+        app.computer.candidates = list;
+        app.computer.selected = Some(cp["target"].as_str().unwrap().into());
+        if name == "picker-refused" {
+            app.computer.refreshed = Some(
+                "Studio PC on Windows can't be paired right now, so the list was read again."
+                    .into(),
+            );
+        }
+    } else if [
+        "waiting",
+        "connecting",
+        "code",
+        "code-prompt",
+        "waiting-for-other",
+        "paired",
+        "paired-typed",
+        "declined",
+        "declined-peer",
+        "expired",
+        "expired-peer",
+        "failed",
+    ]
+    .contains(&name)
+    {
+        let target = computer::candidates(&cp["candidates"])
+            .unwrap()
+            .1
+            .into_iter()
+            .find(|d| d.fingerprint == cp["target"])
+            .unwrap();
+        let seconds = match name {
+            "waiting" => 252,
+            "connecting" => 220,
+            "code" => 107,
+            "code-prompt" => 98,
+            "waiting-for-other" => 91,
+            _ => 0,
+        };
+        let state = match name {
+            "waiting" => Watch::Waiting,
+            "connecting" => Watch::Connecting,
+            "code" | "code-prompt" | "waiting-for-other" => Watch::Code {
+                code: "082917".into(),
+                confirm_by_ms: now + seconds * 1000,
+            },
+            "paired" | "paired-typed" => Watch::Paired {
+                name: "Studio PC".into(),
+                typed: name == "paired-typed",
+            },
+            "declined" | "declined-peer" => Watch::Declined {
+                peer: name.ends_with("-peer"),
+            },
+            "expired" | "expired-peer" => Watch::Expired {
+                peer: name.ends_with("-peer"),
+            },
+            _ => Watch::Failed {
+                reason: "commit_mismatch".into(),
+            },
+        };
+        app.computer.session = Some(Session {
+            target,
+            opened: Opened {
+                window_id: 1,
+                expires_at_ms: now + seconds * 1000,
+            },
+            state,
+            confirming: name == "code-prompt",
+            answered: name == "waiting-for-other",
+            retry_at: None,
+        });
+    } else if name == "forgotten" || name == "forget-already" {
+        app.computer.notice = Some(format!(
+            "✓ {}. Studio PC still lists this computer until you forget it there too.",
+            if name == "forgotten" {
+                "Studio PC forgotten"
+            } else {
+                "Already forgotten"
+            }
+        ));
+    } else {
+        let d = &fixture["paired_computer"];
+        let id = d["fingerprint"].as_str().unwrap().to_string();
+        app.computer.detail = Some(id.clone());
+        snap.devices.data.list.push(ck_ui::model::Device {
+            name: "Studio PC".into(),
+            short_name: "Studio PC".into(),
+            kind: "computer".into(),
+            status: ck_ui::model::Status::Ok,
+            path: "direct · LAN".into(),
+            seen: "now".into(),
+            feeds: "—".into(),
+            fingerprint: Some(id.clone()),
+            trust: Some("paired".into()),
+        });
+        let mut info = computer::Details {
+            platform: Some("windows".into()),
+            pairing: Some(
+                if name == "details-one-sided" {
+                    "granted_here"
+                } else {
+                    "confirmed_both"
+                }
+                .into(),
+            ),
+            since: Some(now + 3 * 60 * 1000),
+            shares: Some(serde_json::from_value(d["shares"].clone()).unwrap()),
+        };
+        if name == "needs-review" {
+            info.shares.as_mut().unwrap()[0].needs_review = true;
+        }
+        if name == "switch-prompt" || name == "switch-refused" {
+            app.computer.share_selected = Some(("motor".into(), "builds".into()));
+            let call = computer::ShareCall {
+                fingerprint: id.clone(),
+                module: "motor".into(),
+                share: "builds".into(),
+                label: "Run builds on this computer".into(),
+                enabled: true,
+            };
+            if name == "switch-prompt" {
+                app.computer.share_pending = Some((1, call));
+            } else {
+                app.computer.share_error = Some((
+                    call,
+                    ck_ui::pairing::flow::Refusal::code("fed_operator_confirmation_refused"),
+                    0,
+                ));
+            }
+        }
+        app.computer.forget = name == "forget-confirm" || name == "forget-partial";
+        app.computer.partial = name == "forget-partial";
+        snap.devices.data.inventory.computers.insert(id, info);
+    }
+    (app, snap)
+}
+
+macro_rules! computer_golden {
+    ($test:ident, $name:literal) => {
+        #[test]
+        fn $test() {
+            let (app, snap) = computer_frame($name);
+            check(concat!("pair-", $name, "-120x36"), &app, &snap);
+        }
+    };
+}
+computer_golden!(computer_picker, "picker");
+computer_golden!(computer_picker_waiting, "picker-list-waiting");
+computer_golden!(computer_picker_empty, "picker-empty");
+computer_golden!(computer_picker_refused, "picker-refused");
+computer_golden!(computer_waiting, "waiting");
+computer_golden!(computer_connecting, "connecting");
+computer_golden!(computer_code, "code");
+computer_golden!(computer_code_prompt, "code-prompt");
+computer_golden!(computer_waiting_for_other, "waiting-for-other");
+computer_golden!(computer_paired, "paired");
+computer_golden!(computer_paired_typed, "paired-typed");
+computer_golden!(computer_declined, "declined");
+computer_golden!(computer_declined_peer, "declined-peer");
+computer_golden!(computer_expired, "expired");
+computer_golden!(computer_expired_peer, "expired-peer");
+computer_golden!(computer_failed, "failed");
+computer_golden!(computer_details, "details-with-switches");
+computer_golden!(computer_details_one_sided, "details-one-sided");
+computer_golden!(computer_needs_review, "needs-review");
+computer_golden!(computer_switch_prompt, "switch-prompt");
+computer_golden!(computer_switch_refused, "switch-refused");
+computer_golden!(computer_forget_confirm, "forget-confirm");
+computer_golden!(computer_forget_partial, "forget-partial");
+computer_golden!(computer_forgotten, "forgotten");
+computer_golden!(computer_forget_already, "forget-already");
+
+/// Older inventories do not report a system or which computers finished pairing.
+/// This frame is the approved details frame with those lines and mock-only recent
+/// activity removed, not an app-generated replacement for an approved golden.
+#[test]
+fn computer_details_unknown_omits_unreported_facts() {
+    let (app, mut snap) = computer_frame("details-with-switches");
+    let info = snap
+        .devices
+        .data
+        .inventory
+        .computers
+        .values_mut()
+        .next()
+        .unwrap();
+    info.platform = None;
+    info.pairing = None;
+    snap.serves = ck_ui::model::Serves::LIVE;
+    check("pair-details-unknown-120x36", &app, &snap);
+}
+
+/// The mock's r key changes only the reason line. These frames preserve the
+/// failure layout and carry one sentence for each supported failure reason.
+#[test]
+fn computer_failure_reasons() {
+    for reason in [
+        "protocol",
+        "device_changed",
+        "confirm_failed",
+        "peer_failed",
+        "interrupted",
+    ] {
+        let (mut app, snap) = computer_frame("failed");
+        app.computer.session.as_mut().unwrap().state = ck_ui::computer::Watch::Failed {
+            reason: reason.into(),
+        };
+        check(
+            &format!("pair-failed-{}-120x36", reason.replace('_', "-")),
+            &app,
+            &snap,
+        );
+    }
+    assert!(ck_ui::screens::computer::failure_reason("future_reason", "Studio PC").is_none());
+}

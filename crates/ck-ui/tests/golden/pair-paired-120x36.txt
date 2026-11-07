@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings      This computer  20:48 
+───────────────────────────────────────────────────────────────────────━━━━━━━━━────────────────────────────────────────
+                                                                                                                        
+  This c╭─ Add a computer ─────────────────────────────────────────────────────────────────────────────────────╮        
+  ──────│                                                                                                      │──────  
+  Machin│   ✓ Choose the computer     ✓ Start pairing on it too     ✓ Compare the code                         │        
+  Pairin│ ──────────────────────────────────────────────────────────────────────────────────────────────────── │        
+  Daemon│                                                                                                      │        
+  Accoun│   Pairing with Studio PC · Windows · id 84126d0d                                                     │        
+  Vault │                                                                                                      │        
+        │   ✓ Studio PC is paired.                                                                             │        
+  Paired│                                                                                                      │     3  
+  ──────│     The two computers are connected. Nothing is shared yet: Studio PC can't use anything on          │──────  
+    Devi│     this computer until you turn on a switch in its details.                                         │        
+  ● Cort│                                                                                                      │        
+  ● iPho│                                                                                                      │        
+  ○ test│                                                                                                      │        
+        │                                                                                                      │        
+        │                                                                                                      │        
+    a Ad│                                                                                                      │        
+        │                                                                                                      │        
+        │                                                                                                      │        
+  Recent│                                                                                                      │ today  
+  ──────│                                                                                                      │──────  
+  20:49 │    ⏎  Open details    esc  Done                                                                      │        
+  20:41 │                                                                                                      │        
+  18:02 │                                                                                                      │        
+  11:31 │                                                                                                      │        
+  09:36 │                                                                                                      │        
+        │                                                                                                      │        
+        ╰──────────────────────────────────────────────────────────────────────────────────────────────────────╯        
+                                                                                                                        
+                                                                                                                        
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  a  add a phone    ⏎  details    x  forget    ↑↓  move                                                   from callosum 

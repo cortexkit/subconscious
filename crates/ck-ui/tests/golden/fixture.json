@@ -4126,6 +4126,10 @@
    "feeds": "—"
   }
  ],
+ "self": {
+  "fingerprint": "c7e2a90d41b85f36e0d9a1c4b27f6e58",
+  "account_name": "Studio Mac"
+ },
  "pairing": {
   "payload": "ckpair:1/AdqPX2RPFYiniz5M14ZLRjNLurVgCWhEMv0NLh9Kehtg8jyc4OFEaeD4bkO8K6FPN5B6CNRdeqtiWz6jjk3feThq19SsClN0dWRpbyBNYWMBwKgBFB6h",
   "groups": [
@@ -4181,6 +4185,220 @@
    "10000010110100101110011000001100101110011",
    "11111110110011001110010000011110100000010"
   ]
+ },
+ "computer_pairing": {
+  "candidates": {
+   "registry": "synced",
+   "devices": [
+    {
+     "fingerprint": "02d449a31fbb267c8f352e9968a79e3e",
+     "name": "Build box",
+     "platform": "linux",
+     "state": "available"
+    },
+    {
+     "fingerprint": "9f72ea0cf49536e3c66c787f705186df",
+     "name": "CortexKit Box 2",
+     "platform": "macos",
+     "state": "paired"
+    },
+    {
+     "fingerprint": "deb0e38ced1e41de6f92e70e80c418d2",
+     "name": "Old laptop",
+     "platform": "windows",
+     "state": "unavailable"
+    },
+    {
+     "fingerprint": "bb391415c05e39d77ca17381d3be3f7d",
+     "name": "Retired server",
+     "platform": "linux",
+     "state": "unavailable"
+    },
+    {
+     "fingerprint": "5be0c1d7a90e44f2b3186c0d9e27f4a1",
+     "name": "Studio PC",
+     "platform": "linux",
+     "state": "available"
+    },
+    {
+     "fingerprint": "84126d0dd850199be29021aadbaee68c",
+     "name": "Studio PC",
+     "platform": "windows",
+     "state": "available"
+    }
+   ]
+  },
+  "candidates_waiting": {
+   "registry": "waiting",
+   "devices": []
+  },
+  "candidates_empty": {
+   "registry": "synced",
+   "devices": []
+  },
+  "candidates_after_refusal": {
+   "registry": "synced",
+   "devices": [
+    {
+     "fingerprint": "02d449a31fbb267c8f352e9968a79e3e",
+     "name": "Build box",
+     "platform": "linux",
+     "state": "available"
+    },
+    {
+     "fingerprint": "9f72ea0cf49536e3c66c787f705186df",
+     "name": "CortexKit Box 2",
+     "platform": "macos",
+     "state": "paired"
+    },
+    {
+     "fingerprint": "deb0e38ced1e41de6f92e70e80c418d2",
+     "name": "Old laptop",
+     "platform": "windows",
+     "state": "unavailable"
+    },
+    {
+     "fingerprint": "bb391415c05e39d77ca17381d3be3f7d",
+     "name": "Retired server",
+     "platform": "linux",
+     "state": "unavailable"
+    },
+    {
+     "fingerprint": "5be0c1d7a90e44f2b3186c0d9e27f4a1",
+     "name": "Studio PC",
+     "platform": "linux",
+     "state": "available"
+    },
+    {
+     "fingerprint": "84126d0dd850199be29021aadbaee68c",
+     "name": "Studio PC",
+     "platform": "windows",
+     "state": "unavailable"
+    }
+   ]
+  },
+  "open_refusal": {
+   "code": "fed_bad_request",
+   "message": "that computer is not available to pair"
+  },
+  "target": "84126d0dd850199be29021aadbaee68c",
+  "open_reply": {
+   "window_id": "cpw_01J9Y2M4",
+   "expires_at_ms": 1792529532000
+  },
+  "remaining_s": {
+   "waiting": 252,
+   "connecting": 220,
+   "code": 107,
+   "prompt": 98,
+   "other": 91
+  },
+  "watch": [
+   {
+    "state": "waiting_for_device"
+   },
+   {
+    "state": "connecting"
+   },
+   {
+    "state": "code",
+    "code": "082917",
+    "confirm_by_ms": 1792529387000
+   },
+   {
+    "state": "peer_confirmed"
+   },
+   {
+    "state": "paired",
+    "name": "Studio PC",
+    "confirmed_with": "prompt"
+   },
+   {
+    "state": "paired",
+    "name": "Studio PC",
+    "confirmed_with": "typed"
+   },
+   {
+    "state": "declined",
+    "by": "here"
+   },
+   {
+    "state": "declined",
+    "by": "peer"
+   },
+   {
+    "state": "expired",
+    "by": "here"
+   },
+   {
+    "state": "expired",
+    "by": "peer"
+   },
+   {
+    "state": "failed",
+    "reason": "commit_mismatch"
+   }
+  ],
+  "failed_reasons": [
+   "commit_mismatch",
+   "protocol",
+   "device_changed",
+   "confirm_failed",
+   "peer_failed",
+   "interrupted"
+  ],
+  "code": "082917"
+ },
+ "paired_computer": {
+  "name": "Studio PC",
+  "platform": "windows",
+  "fingerprint": "84126d0dd850199be29021aadbaee68c",
+  "status": "ok",
+  "path": "direct · LAN",
+  "since": "today 20:51",
+  "seen": "now",
+  "pairing": "confirmed_both",
+  "shares": [
+   {
+    "module": "claustrum",
+    "share": "vault",
+    "label": "Use this computer's vault",
+    "enabled": true,
+    "needs_review": false
+   },
+   {
+    "module": "motor",
+    "share": "builds",
+    "label": "Run builds on this computer",
+    "enabled": false,
+    "needs_review": false
+   },
+   {
+    "module": "entorhinal",
+    "share": "agents",
+    "label": "See this computer's agents",
+    "enabled": false,
+    "needs_review": false
+   }
+  ],
+  "recent": [
+   [
+    "20:52",
+    "connected directly over the LAN"
+   ],
+   [
+    "20:51",
+    "paired on this computer"
+   ]
+  ],
+  "unpair_partial": {
+   "code": "fed_target_unavailable",
+   "message": "the profile entry is already removed; unpair again to finish"
+  },
+  "unpair_gone": {
+   "code": "fed_not_paired",
+   "message": "no device with that fingerprint is paired"
+  }
  },
  "upgrade": [
   [

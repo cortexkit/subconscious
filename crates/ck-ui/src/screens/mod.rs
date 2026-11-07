@@ -2,6 +2,7 @@
 
 pub mod activity;
 pub mod agents;
+pub mod computer;
 pub mod devices;
 pub mod down;
 pub mod home;

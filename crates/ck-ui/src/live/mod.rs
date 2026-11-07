@@ -15,6 +15,7 @@
 pub mod actions;
 pub mod activity;
 pub mod apply;
+pub mod computer;
 pub mod map;
 pub mod pairing;
 mod run;
@@ -410,6 +411,8 @@ pub struct State {
     pub pairing: std::collections::VecDeque<(u64, crate::pairing::flow::Event)>,
     /// The number the next pairing result gets.
     pub pairing_seq: u64,
+    pub computer: std::collections::VecDeque<(u64, crate::computer::Event)>,
+    pub computer_seq: u64,
     /// The latest Save preview replies, numbered in arrival order (see
     /// [`State::record_preview`]).
     pub previews: std::collections::VecDeque<(u64, settings::PreviewReply)>,
@@ -479,6 +482,8 @@ impl State {
             down_note: None,
             pairing: std::collections::VecDeque::new(),
             pairing_seq: 1,
+            computer: std::collections::VecDeque::new(),
+            computer_seq: 1,
             previews: std::collections::VecDeque::new(),
             preview_seq: 1,
             applies: std::collections::VecDeque::new(),
@@ -514,6 +519,14 @@ impl State {
         self.pairing_seq += 1;
         while self.pairing.len() > PAIRING_KEPT {
             self.pairing.pop_front();
+        }
+    }
+
+    pub fn record_computer(&mut self, event: crate::computer::Event) {
+        self.computer.push_back((self.computer_seq, event));
+        self.computer_seq += 1;
+        while self.computer.len() > PAIRING_KEPT {
+            self.computer.pop_front();
         }
     }
 
@@ -969,6 +982,7 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
         last_result: state.last_result.clone(),
         serves: crate::model::Serves::LIVE,
         pairing: state.pairing.iter().cloned().collect(),
+        computer: state.computer.iter().cloned().collect(),
         previews: state.previews.iter().cloned().collect(),
         applies: state.applies.iter().cloned().collect(),
         daemon_connection: state.daemon_connection,

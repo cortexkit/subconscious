@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+- Add the named-computer picker and an explicit forget action, including recovery when forgetting only partly succeeds.
+- Pair two computers by comparing a six-digit code, with per-window deadlines, confirmation on both computers, cancellation and plain failure reasons.
+- Turn sharing switches on and off by module and switch name, with confirmation, declined-confirmation recovery and cooldowns. Read optional platform and pairing evidence without guessing missing facts.
+
 ## 0.3.1
 
 - Adopt compatible dependency requirements for the updated route-open control types; no behavior change.

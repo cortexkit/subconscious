@@ -198,24 +198,12 @@ fn live_hides_mock_panels_and_unsupported_actions() {
     s.serves = Serves::LIVE;
     let mut a = app();
     let text = screen(&render(&a, &s, 120, 36));
-    for absent in [
-        "Account",
-        "Vault",
-        "Recent",
-        "relay connected",
-        "Add a computer",
-        "details",
-        "forget",
-    ] {
+    for absent in ["Account", "Vault", "Recent", "relay connected"] {
         assert!(!text.contains(absent), "{absent}:\n{text}");
     }
     assert!(text.contains("a Add a phone"));
-    for key in [
-        KeyCode::Char('c'),
-        KeyCode::Enter,
-        KeyCode::Char('x'),
-        KeyCode::Char('/'),
-    ] {
+    assert!(text.contains("c Add a computer"));
+    for key in [KeyCode::Enter, KeyCode::Char('x'), KeyCode::Char('/')] {
         assert!(!press(&mut a, &s, key), "{key:?}");
         assert!(a.requests.is_empty() && a.confirm.is_none() && a.overlay.is_none());
     }

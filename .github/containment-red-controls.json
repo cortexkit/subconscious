@@ -1,0 +1,51 @@
+[
+  {
+    "group": "carried-replacement-preservation",
+    "crate": "subc-daemon",
+    "target": "--lib",
+    "tests": [
+      "supervise::cgroup_reap_tests::carried::linux_carried_cgroup_operator_restart_keeps_nested_holder",
+      "supervise::cgroup_reap_tests::carried::linux_carried_cgroup_crash_restart_keeps_nested_holder",
+      "supervise::cgroup_reap_tests::carried::linux_carried_cgroup_reload_keeps_nested_holder",
+      "supervise::cgroup_reap_tests::carried::linux_carried_cgroup_health_restart_keeps_nested_holder"
+    ],
+    "file": "crates/subc-daemon/src/supervise.rs",
+    "old": "if self.child.container().is_some() {\n            if !carry {",
+    "replacement": "if self.child.container().is_some() {\n            if true {"
+  },
+  {
+    "group": "carried-terminal-and-recovery-cleanup",
+    "crate": "subc-daemon",
+    "target": "--lib",
+    "tests": [
+      "supervise::cgroup_reap_tests::carried::linux_carried_cgroup_disable_during_backoff_kills_nested_holder",
+      "supervise::cgroup_reap_tests::carried::linux_carried_cgroup_recovery_sweeps_nested_holder_without_leader"
+    ],
+    "file": "crates/subc-daemon/src/cgroup_recovery.rs",
+    "old": ") -> SweepDecision {\n    let path = match trusted_path(placement, path) {",
+    "replacement": ") -> SweepDecision {\n    return SweepDecision::Killed;\n    let path = match trusted_path(placement, path) {"
+  },
+  {
+    "group": "carried-monitor-abort-backstop",
+    "crate": "subc-daemon",
+    "target": "--lib",
+    "tests": [
+      "supervise::cgroup_reap_tests::carried::linux_carried_cgroup_monitor_abort_kills_the_nested_holder_or_retains_its_identity"
+    ],
+    "file": "crates/subc-daemon/src/cgroup_recovery.rs",
+    "old": "        kill_checked(placement.expect(\"validated placement\"), &path);",
+    "replacement": ""
+  },
+  {
+    "group": "ordinary-successful-wait-cleanup",
+    "crate": "subc-daemon",
+    "target": "--lib",
+    "tests": [
+      "supervise::cgroup_placement_tests::unique_spawn_cgroups_clean_up_across_restarts_and_shutdown",
+      "supervise::cgroup_containment_tests::linux_shutdown_straggler_reaps_the_grandchild"
+    ],
+    "file": "crates/subc-daemon/src/supervise.rs",
+    "old": "        #[cfg(target_os = \"linux\")]\n        if result.is_ok() && self.child.container().is_none() {\n            if let Some(placement) = self.cgroup_placement.as_ref() {\n                // Ordinary children still own a per-spawn cgroup: returning\n                // from wait must leave it empty and removed, as before carry.\n                // Keep cleanup ownership across cancellation until it finishes.\n                cleanup_reaped_cgroup(placement, &self.module_id).await;\n                self.cgroup_placement = None;\n            }\n        }\n",
+    "replacement": ""
+  }
+]

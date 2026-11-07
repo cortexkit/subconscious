@@ -1,0 +1,92 @@
+name: Containment red proof
+
+# One-off proof for the carried-containment change, run on a proof branch and
+# never merged. For each control group in .github/containment-red-controls.json
+# it first runs every named real-cgroup test green, then applies that group's
+# one-line break, requires each test to fail by name, and restores the file.
+# Carried tests run as the runner user inside a delegated systemd unit; the
+# older ordinary tests hardcode /sys/fs/cgroup and run as root, as in CI.
+on:
+  push:
+    branches: ['proof/containment-red']
+
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Green, then red per control group
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_test() {
+            cargo test -p subc-daemon --lib --no-run --locked --message-format=json |
+              jq -ers 'map(select(.reason == "compiler-artifact" and .target.name == "subc_daemon" and .target.kind == ["lib"] and .profile.test == true and .executable != null)) | if length == 1 then .[0].executable else error("expected exactly one daemon test binary") end'
+          }
+          run_exact() {
+            local test_name="$1" test_binary="$2"
+            "$test_binary" "$test_name" --exact --list | grep -Fx "$test_name: test" > /dev/null
+            if [[ "$test_name" == *::carried::* ]]; then
+              sudo systemd-run --wait --pipe --collect --expand-environment=no \
+                --unit="subc-carried-proof-${GITHUB_RUN_ID}-$RANDOM" \
+                -p Delegate=yes -p "User=$(id -u)" -p "Group=$(id -g)" -p "WorkingDirectory=$PWD" \
+                /bin/bash -euo pipefail -c '
+                  while IFS=: read -r hierarchy controllers path; do
+                    if [[ "$hierarchy" == 0 && -z "$controllers" ]]; then
+                      export SUBC_TEST_CGROUP_ROOT="/sys/fs/cgroup$path"; break
+                    fi
+                  done < /proc/self/cgroup
+                  : "${SUBC_TEST_CGROUP_ROOT:?missing unified cgroup path}"
+                  export SUBC_TEST_CGROUP_REQUIRED=1
+                  exec "$@" --exact --nocapture --test-threads=1
+                ' carried-proof "$test_binary" "$test_name"
+            else
+              sudo env SUBC_REQUIRE_CGROUP_TEST=1 "$test_binary" "$test_name" --exact --nocapture --test-threads=1
+            fi
+          }
+          expect_green() {
+            local out="$RUNNER_TEMP/green.log"
+            run_exact "$1" "$2" > "$out" 2>&1 || { cat "$out"; echo "GREEN FAILED: $1"; exit 1; }
+            if [[ "$1" == *::carried::* ]]; then
+              grep -q 'EXECUTED ' "$out" || { cat "$out"; echo "NO EXECUTED WITNESS: $1"; exit 1; }
+            fi
+            grep -q 'test result: ok. 1 passed; 0 failed' "$out" || { cat "$out"; echo "NOT EXACTLY ONE PASS: $1"; exit 1; }
+            echo "GREEN $1"
+          }
+          expect_red() {
+            local out="$RUNNER_TEMP/red.log" rc=0
+            run_exact "$1" "$2" > "$out" 2>&1 || rc=$?
+            if [ "$rc" -eq 0 ]; then cat "$out"; echo "STAYED GREEN: $1"; exit 1; fi
+            grep -qF "thread '$1'" "$out" || { cat "$out"; echo "RED BUT NOT BY NAME: $1"; exit 1; }
+            grep -q 'test result: FAILED. 0 passed; 1 failed' "$out" || { cat "$out"; echo "RED NOT EXACTLY ONE FAILURE: $1"; exit 1; }
+            grep -E 'panicked at|assertion' "$out" | head -3
+            echo "RED $1 (exit $rc)"
+          }
+          controls=.github/containment-red-controls.json
+          groups=$(jq -r 'length' "$controls")
+          b=$(build_test)
+          for i in $(seq 0 $((groups - 1))); do
+            for t in $(jq -r ".[$i].tests[]" "$controls"); do expect_green "$t" "$b"; done
+          done
+          total=0
+          for i in $(seq 0 $((groups - 1))); do
+            group=$(jq -r ".[$i].group" "$controls"); file=$(jq -r ".[$i].file" "$controls")
+            echo "=== break $group in $file"
+            python3 - "$controls" "$i" <<'PY'
+          import json, sys
+          from pathlib import Path
+          c = json.load(open(sys.argv[1]))[int(sys.argv[2])]
+          p = Path(c['file'])
+          s = p.read_text()
+          assert s.count(c['old']) == 1, s.count(c['old'])
+          p.write_text(s.replace(c['old'], c['replacement'], 1))
+          PY
+            git diff --stat | grep -q "$(basename "$file")"
+            b=$(build_test)
+            for t in $(jq -r ".[$i].tests[]" "$controls"); do expect_red "$t" "$b"; total=$((total + 1)); done
+            git checkout -- "$file"
+            [ -z "$(git status --porcelain --untracked-files=no)" ]
+          done
+          echo "ALL GREEN, ALL $total RED BY NAME"

@@ -170,13 +170,15 @@ impl OperatorProvider for OsProvider {
 }
 
 /// Convert the operating-system prompt's result into the daemon's provider
-/// result. Only an explicit OS approval may become `Approved`. Keeping this
-/// separate from the platform bindings lets tests on every host verify that
-/// errors and unavailable providers never grant a write.
+/// result. Legacy prompts accept an OS policy-rule grant even without an
+/// interactive prompt. Keeping this separate from the platform bindings lets
+/// tests on every host verify that errors and unavailable providers never
+/// grant a write.
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn os_outcome(outcome: subc_presence::Outcome) -> ProviderResult {
     match outcome {
         subc_presence::Outcome::Approved => ProviderResult::Approved,
+        subc_presence::Outcome::AuthorizedWithoutPrompt => ProviderResult::Approved,
         subc_presence::Outcome::Declined => ProviderResult::Declined,
         subc_presence::Outcome::ProviderError => ProviderResult::Unavailable,
         subc_presence::Outcome::ProviderErrorWithReason { reason } => {
@@ -212,6 +214,14 @@ fn os_outcome(outcome: subc_presence::Outcome) -> ProviderResult {
 #[cfg(all(test, any(target_os = "macos", windows, target_os = "linux")))]
 mod os_outcome_tests {
     use super::*;
+
+    #[test]
+    fn policy_authorization_still_approves_legacy_prompts() {
+        assert_eq!(
+            os_outcome(subc_presence::Outcome::AuthorizedWithoutPrompt),
+            ProviderResult::Approved
+        );
+    }
 
     #[test]
     fn only_an_os_approval_becomes_approved() {

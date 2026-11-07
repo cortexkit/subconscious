@@ -56,7 +56,7 @@ pub(crate) fn preflight_outcome(authorized: bool, challenge: bool) -> Option<Out
         // as the subject's own user, with no retained grants. This probe did not
         // ask anyone, so an approval is an administrator's policy-rule grant.
         // Root's unconditional polkit grant is rejected before any bus call.
-        (true, _) => Some(Outcome::Approved),
+        (true, _) => Some(Outcome::AuthorizedWithoutPrompt),
         (false, true) => None,
         (false, false) => Some(Outcome::NoPresence),
     }
@@ -108,7 +108,17 @@ mod tests {
     fn policy_denial_without_a_challenge_is_not_a_persons_decline() {
         assert_eq!(preflight_outcome(false, false), Some(Outcome::NoPresence));
         assert_eq!(preflight_outcome(false, true), None);
-        assert_eq!(preflight_outcome(true, false), Some(Outcome::Approved));
-        assert_eq!(preflight_outcome(true, true), Some(Outcome::Approved));
+    }
+
+    #[test]
+    fn preflight_authorization_without_prompt_is_distinct() {
+        assert_eq!(
+            preflight_outcome(true, false),
+            Some(Outcome::AuthorizedWithoutPrompt)
+        );
+        assert_eq!(
+            preflight_outcome(true, true),
+            Some(Outcome::AuthorizedWithoutPrompt)
+        );
     }
 }

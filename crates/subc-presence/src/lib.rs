@@ -25,11 +25,15 @@ pub enum LocalAuthenticationFailure {
 }
 
 /// Only an explicit OS authorization approves a request.
+/// Authorization without an interactive prompt is reported separately.
 /// Treat unknown outcomes as provider unavailability, never approval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Outcome {
     Approved,
+    /// The OS authorized the request without asking a person to authenticate.
+    /// Linux reports this for policy-rule grants from its polkit preflight.
+    AuthorizedWithoutPrompt,
     Declined,
     ProviderError,
     ProviderErrorWithReason {

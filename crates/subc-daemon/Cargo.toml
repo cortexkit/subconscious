@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.41.0"
+version = "0.41.1"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -50,7 +50,7 @@ subc-jobobject = { path = "../subc-jobobject", version = "0.2.3" }
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 # Platform bindings stay out of the module SDKs. The CLI shares the Linux
 # policy renderer, but authorization decisions belong only to the daemon.
-subc-presence = { path = "../subc-presence", version = "0.2" }
+subc-presence = { path = "../subc-presence", version = "0.2.1" }
 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM for `protocol: "none"` teardown. This crate forbids unsafe code, so

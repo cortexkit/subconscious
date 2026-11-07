@@ -86,7 +86,9 @@ and [session lookup](https://github.com/polkit-org/polkit/blob/126/src/polkitbac
 A non-interactive preflight distinguishes a policy denial (no presence) from a
 person declining. A challenge proceeds to an interactive check. An authorized
 non-interactive probe is an administrator's policy-rule grant, not a person's
-approval: the generated `auth_self` policy has no retained grants. Linux refuses
+approval: the generated `auth_self` policy has no retained grants. It returns
+`Outcome::AuthorizedWithoutPrompt`, distinct from the interactive check's
+`Outcome::Approved`, so callers can require an interactive confirmation. Linux refuses
 an effective-root daemon with a `root_user` provider error before any D-Bus call,
 because polkit otherwise authorizes root subjects unconditionally.
 Authorization is

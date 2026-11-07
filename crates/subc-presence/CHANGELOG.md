@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Report an authorized non-interactive polkit preflight as `Outcome::AuthorizedWithoutPrompt`, distinct from an interactive approval, so callers can require a person to confirm a request.
+
 ## 0.2.0
 
 - Add one-shot Linux polkit authentication with literal per-request text, per-user policy rendering, and same-connection withdrawal. Distinguish missing setup and lack of a usable authentication challenge from a person's decline.

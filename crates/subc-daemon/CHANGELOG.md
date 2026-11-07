@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.41.1
+
+- Explicitly accept subc-presence's non-interactive policy authorization for legacy privileged-operation prompts and module `operator.confirm` requests, preserving their existing behavior.
+
 ## 0.41.0
 
 - Keep carried Unix children behind a serialized, bounded pre-exec admission

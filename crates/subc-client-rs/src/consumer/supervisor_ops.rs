@@ -698,7 +698,8 @@ mod tests {
     }
 
     /// Drops the waiting caller's reply channel for `command`, as a transport
-    /// failure before any reply does: the caller sees a retryable `NotSent`.
+    /// failure before any reply does. The request may already have been
+    /// written, so the caller sees `OutcomeUnknown`.
     fn lose_reply(shared: &Shared, command: &super::super::WriteCommand) {
         let key = command.pending.expect("a request waits for its reply");
         assert!(shared.lock_inner().pending.remove(&key).is_some());
@@ -742,7 +743,7 @@ mod tests {
         let only = rx.recv().await.unwrap();
         lose_reply(&shared, &only);
         let err = call.await.unwrap().unwrap_err();
-        assert!(matches!(err, CallError::NotSent(_)), "{err:?}");
+        assert!(matches!(err, CallError::OutcomeUnknown(_)), "{err:?}");
         assert!(
             rx.try_recv().is_err(),
             "an apply is never sent a second time"

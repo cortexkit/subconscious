@@ -748,7 +748,13 @@ async fn closed_flow_control_and_completion_channel_have_typed_sources() {
         .wait_for_reply(registration, rx, Instant::now() + Duration::from_secs(5))
         .await
         .unwrap_err();
-    assert_not_sent(&err, NotSentCause::CompletionFailed, false);
+    // A closed completion channel can't prove the request was never written.
+    assert!(!err.is_not_sent(), "{err:?}");
+    assert_eq!(
+        err.outcome_cause(),
+        Some(OutcomeUnknownCause::CompletionFailed)
+    );
+    assert_eq!(err.never_forwarded(), None);
 }
 
 #[tokio::test(start_paused = true)]

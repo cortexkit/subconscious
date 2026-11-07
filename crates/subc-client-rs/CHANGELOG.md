@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.34.1
+
+- Report a request whose pending reply channel closes without a result as
+  `OutcomeUnknown` (cause `CompletionFailed`), not as `NotSent` with
+  `never_forwarded() == Some(false)`. The request may already have been
+  written, so `NotSent` was misleading for callers that treat it as safe to
+  send again.
+
 ## 0.34.0
 
 - Keep channel-0 route polls outside data admission, and release retained slots

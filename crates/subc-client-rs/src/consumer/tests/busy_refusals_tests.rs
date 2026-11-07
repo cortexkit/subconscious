@@ -289,11 +289,11 @@ async fn busy_proven_unsent_rolls_back_but_completion_failure_keeps_slot() {
             .remove_pending(&sent.pending.unwrap()),
     );
     let error = request.await.unwrap().unwrap_err();
-    assert!(matches!(
-        error.not_sent_cause(),
-        Some(NotSentCause::CompletionFailed)
-    ));
-    assert_eq!(error.never_forwarded(), Some(false));
+    assert_eq!(
+        error.outcome_cause(),
+        Some(OutcomeUnknownCause::CompletionFailed)
+    );
+    assert_eq!(error.never_forwarded(), None);
     assert_eq!(rig.route.sem.available_permits(), 0);
     rig.terminal(&sent, FrameType::StreamEnd, false);
     assert_eq!(rig.route.sem.available_permits(), 1);

@@ -2947,7 +2947,10 @@ pub enum NotSentCause {
     WriterRejected,
     /// A control response could not be decoded or had an unexpected shape.
     InvalidResponse,
-    /// An internal completion channel dropped without proving non-delivery.
+    /// No longer produced: since 0.34.1 a dropped completion channel, which
+    /// can't prove non-delivery, is reported as [`CallError::OutcomeUnknown`]
+    /// with [`OutcomeUnknownCause::CompletionFailed`]. Kept so existing
+    /// matches still compile.
     CompletionFailed,
     /// A daemon-marked data-plane refusal proved this attempt was not forwarded.
     DaemonRefusedBeforeForward { code: String },
@@ -4643,10 +4646,13 @@ impl Shared {
                     result.into_call_result()
                 }
                 Ok(Err(_)) => {
+                    // The entry was settled without a result, so the request may already
+                    // have been written: report the outcome as unknown, never `NotSent`.
                     registration.disarm();
-                    Err(CallError::not_sent_with_cause(
-                        "pending response channel closed", NotSentCause::CompletionFailed,
-                    ).with_never_forwarded(false))
+                    Err(CallError::outcome_unknown(
+                        "pending response channel closed",
+                        OutcomeUnknownCause::CompletionFailed,
+                    ))
                 }
                 Err(_) => {
                     let accepted = if registration.retain_on_drop {

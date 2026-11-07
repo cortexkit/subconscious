@@ -1,0 +1,6 @@
+{
+  "op": "route.open",
+  "request_window": 1,
+  "route_channel": 42,
+  "route_epoch": 7
+}

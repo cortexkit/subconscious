@@ -6,6 +6,7 @@ import {
   classifyRouteCloseReason,
   DEFAULT_REQUEST_TIMEOUT_MS,
   isEstablishedRouteDead,
+  isRouteBusyRetryable,
   isRetryableRouteOpenCode,
   LIVENESS_PROBE_WINDOW_MS,
   ROUTE_OPEN_RETRY_DEADLINE_MS,
@@ -507,6 +508,16 @@ describe("Rust golden fixtures", () => {
     for (const row of tables.established_route_dead.rows) {
       const flags = row.daemon_origin ? DAEMON_ORIGIN_FLAG : 0;
       expect(isEstablishedRouteDead(flags, row.code)).toBe(row.route_dead);
+    }
+  });
+
+  test("execute route_busy_retryable decision table over every row", () => {
+    const tables = loadGolden<{
+      route_busy_retryable: { code: string; daemon_origin: boolean; route_opted_in: boolean; retryable: boolean }[];
+    }>("decision_tables");
+    expect(tables.route_busy_retryable).toHaveLength(12);
+    for (const row of tables.route_busy_retryable) {
+      expect(isRouteBusyRetryable(row.daemon_origin ? DAEMON_ORIGIN_FLAG : 0, row.code, row.route_opted_in)).toBe(row.retryable);
     }
   });
 

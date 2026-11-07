@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Tag session subscriptions only when the route negotiated credit windows;
+  older daemons keep the original subscription frame flags.
+- Opt in to route credit refusals. Only trusted
+  daemon-origin `route_busy` refusals retry, with a cancellable 30-second ceiling.
+  Older daemons keep their existing behaviour. No public enum gains a case.
+  The non-Sendable synchronous client supports one caller, not concurrent calls;
+  it reads each request through RESPONSE, ERROR or STREAM_END and therefore
+  needs no concurrent local admission gate.
+
 - `AskRequest` and `AskThreadEntry` read the photos a person attaches to an ask's answer or to a clarification. `AskRequest` gains `answerArtifactIds` and `answerAttachments`, and `AskThreadEntry` gains `artifactIds` and `attachments`, beside its existing `attachmentIndexes`. Each pointer is the existing `AskAttachment` (`artifactId`, `title`, `mime`, `byteCount`, `kind`, `sealed`), listed in the order the photos were sent. `AskRequest` also gains `answerPhotos`, the producer's flag for whether the ask accepts photos with its answer; nil means the producer did not say, and a client should then not offer photos. All five fields are optional, so asks without photos decode as before. `AskThreadEntry`'s initializer gains the two fields as defaulted parameters, so existing call sites compile unchanged. A test decodes the producer's `ask-attachments-v1` sample, copied byte for byte and checked against its digest.
 
 - `AskRequest` reads two optional fields core now puts on every pending ask: `askerAgentID`, the agent of the session that filed the ask, present even when that agent has no running session, and `deliver`, where the producer routes the ask's notification (`phone`, `desktop` or `none`). `deliver` stays the producer's string, so a value added later still decodes. Both are display data and confer no authority. Asks without them decode as before.

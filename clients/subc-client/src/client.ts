@@ -17,6 +17,7 @@ import { AuthError, authenticateClient } from "./auth.js";
 import { ConnectionFileError, readConnectionFile, readConnectionFileWithLocalEndpoint, type ConnectionInfo, type ConnectionInfoWithLocalEndpoint } from "./connection-file.js";
 import {
   AdmissionClass,
+  DAEMON_ORIGIN_FLAG,
   buildFrame,
   buildFlags,
   encodeFrame,
@@ -27,6 +28,7 @@ import {
   type Frame,
 } from "./envelope.js";
 import { launchNonceOrUndefinedAsync } from "./launch-nonce.js";
+import { RequestGate, type RequestSlot } from "./request-gate.js";
 import type { ManifestProvenance, Principal } from "./provider.js";
 import {
   belongsToConnection,
@@ -52,6 +54,8 @@ const debug = debuglog("subc-client");
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+// Socket timers use milliseconds; never dispatch with less than one left.
+const MIN_REQUEST_BUDGET_MS = 1;
 // When a request-timeout timer fires, its reply may already be sitting in the
 // socket read buffer, unprocessed only because the event loop was starved (Node
 // runs the TIMERS phase before the POLL phase, so an expired timer can beat an
@@ -434,6 +438,7 @@ interface Pending {
   acceptFrame?: (frame: Frame) => boolean;
   /** Retained only when a local route.open deadline wins. */
   onLateResponse?: (frame: Frame) => void;
+  slot?: RequestSlot;
 }
 
 export interface ConnectOptions {
@@ -721,6 +726,11 @@ export class SubcClient {
   private reconnecting: Promise<void> | null = null;
   private generation = 1;
   private routeOpenGateInstance: RouteOpenGate | undefined;
+  private requestGates?: Map<RouteHandle, RequestGate>;
+  private wireSlots?: Map<string, { handle: RouteHandle; slot: RequestSlot }>;
+
+  private get gates(): Map<RouteHandle, RequestGate> { return (this.requestGates ??= new Map()); }
+  private get slots(): Map<string, { handle: RouteHandle; slot: RequestSlot }> { return (this.wireSlots ??= new Map()); }
   // True while the read loop is actively reading/dispatching a frame off the
   // current socket (between reading a header and finishing its dispatch). The
   // timeout arbitration reads it to decide whether a just-fired timeout should
@@ -834,6 +844,7 @@ export class SubcClient {
     const consumerCapabilities = reverseRequests.capabilities();
     const body = this.encode({
       op: "route.open",
+      busy_refusals: true,
       target,
       identity,
       ...(consumerIdentity ? { consumer_identity: consumerIdentity } : {}),
@@ -846,11 +857,12 @@ export class SubcClient {
     let installed: RouteHandle | null = null;
     const install = (frame: Frame): boolean => {
       if (frame.header.ty !== FrameType.Response) return true;
-      const parsed = this.parseJson(frame) as { route_channel?: number; route_epoch?: number };
+      const parsed = this.parseJson(frame) as { route_channel?: number; route_epoch?: number; request_window?: number; watch_window?: number };
       if (typeof parsed.route_channel !== "number" || typeof parsed.route_epoch !== "number") {
         throw new SubcError(`route.open returned no route handle: ${JSON.stringify(parsed)}`);
       }
       installed = this.installRoute(parsed.route_channel, parsed.route_epoch, reverseRequests);
+      if (parsed.request_window !== undefined) this.gates.set(installed, new RequestGate(parsed.request_window, parsed.watch_window));
       this.routeModules.set(parsed.route_channel, target.module_id);
       return true;
     };
@@ -1033,6 +1045,7 @@ export class SubcClient {
     opts: SubscribeOptions = {},
   ): Subscription {
     this.assertLiveHandle(handle);
+    if (this.gates.has(handle)) return this.subscribeGated(handle, body, onEvent, opts);
     const bytes = body instanceof Uint8Array ? body : this.encode(body);
     const priority = opts.priority ?? Priority.Interactive;
     const admission = opts.admissionClass ?? AdmissionClass.Normal;
@@ -1303,6 +1316,115 @@ export class SubcClient {
   }
 
   private send(
+    ...args: Parameters<SubcClient["sendAttempt"]>
+  ): Promise<Frame> {
+    const [handle, body, priority, admission, timeoutMs, onProgress, acceptFrame, onLateResponse, binary, signal] = args;
+    if (!handle || !this.gates.has(handle)) return this.sendAttempt(...args);
+    return this.gatedRequest(handle, false, timeoutMs, signal, (slot, remaining) =>
+      this.sendAttempt(handle, body, priority, admission, remaining, onProgress, acceptFrame, onLateResponse, binary, signal, slot));
+  }
+
+  private async gatedRequest(
+    handle: RouteHandle, watch: boolean, timeoutMs: number | undefined, signal: AbortSignal | undefined,
+    attempt: (slot: RequestSlot, remaining: number) => Promise<Frame>,
+  ): Promise<Frame> {
+    const gate = this.gates.get(handle)!;
+    const deadline = this.opts.now() + (timeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS);
+    let slot: RequestSlot;
+    try { slot = await gate.acquire(watch, deadline - this.opts.now(), signal); }
+    catch (error) { throw this.notSentCallError("request was not sent while waiting for a route slot", error); }
+    let delay = 25;
+    let busyDeadlineError: SubcCallError | undefined;
+    try {
+      for (;;) {
+        if (gate.signal.aborted) throw gate.signal.reason;
+        if (signal?.aborted) throw this.notSentCallError("request cancelled before write", signal.reason);
+        this.assertLiveHandle(handle);
+        const budget = deadline - this.opts.now();
+        if (budget < MIN_REQUEST_BUDGET_MS) throw busyDeadlineError ?? this.notSentCallError(
+          "request deadline elapsed before write", new Error("less than 1ms remains before the request deadline"));
+        try { return await attempt(slot, budget); }
+        catch (error) {
+          const refusal = error instanceof SubcError ? error
+            : error instanceof SubcCallError && error.cause instanceof SubcError ? error.cause : undefined;
+          // Only a negotiated daemon-origin refusal proves that retry cannot
+          // execute a module operation twice. Keep the slot through the sleep.
+          if (!refusal || !isRouteBusyRetryable(errorFrameFlags.get(refusal) ?? 0, refusal.code, this.gates.get(handle) === gate)) throw error;
+          const exhausted = (): SubcCallError => new SubcCallError("not_sent", `daemon refused before forwarding: ${refusal.message}`, "route_busy", refusal);
+          busyDeadlineError = exhausted();
+          const remaining = deadline - this.opts.now();
+          if (remaining <= 0 || signal?.aborted) throw exhausted();
+          const ms = Math.min(remaining, delay * (0.5 + this.opts.random() * 0.5));
+          delay = Math.min(1_000, delay * 2);
+          const proceed = await this.busySleep(ms, gate.signal, signal);
+          if (gate.signal.aborted) throw gate.signal.reason;
+          if (!proceed || this.opts.now() >= deadline) throw exhausted();
+        }
+      }
+    } finally {
+      // A timed-out attempt that was written keeps its slot, held by its
+      // correlation, until a late terminal arrives, because the daemon still
+      // counts it. A refused or proven-unwritten attempt has no response
+      // outstanding on the wire, so its slot is released here.
+      if (!slot.inFlight) slot.release();
+    }
+  }
+
+  private async busySleep(ms: number, closed: AbortSignal, signal?: AbortSignal): Promise<boolean> {
+    if (closed.aborted || signal?.aborted) return false;
+    let abort!: () => void;
+    const cancelled = new Promise<boolean>((resolve) => { abort = () => resolve(false); });
+    closed.addEventListener("abort", abort, { once: true });
+    signal?.addEventListener("abort", abort, { once: true });
+    try { return await Promise.race([this.opts.sleep(ms).then(() => true), cancelled]); }
+    finally {
+      closed.removeEventListener("abort", abort);
+      signal?.removeEventListener("abort", abort);
+    }
+  }
+
+  private subscribeGated(handle: RouteHandle, body: unknown, onEvent: (body: Uint8Array) => void, opts: SubscribeOptions): Subscription {
+    const bytes = body instanceof Uint8Array ? body : this.encode(body);
+    const priority = opts.priority ?? Priority.Interactive;
+    const admission = opts.admissionClass ?? AdmissionClass.Normal;
+    const abort = new AbortController();
+    let current: { key: string; pending: Pending; corr: bigint } | undefined;
+    let cancelled = false;
+    let resolveClosed!: () => void;
+    let rejectClosed!: (error: Error) => void;
+    let resolveEnded!: (end: SubscriptionEnd) => void;
+    const closed = new Promise<void>((resolve, reject) => { resolveClosed = resolve; rejectClosed = reject; });
+    const ended = new Promise<SubscriptionEnd>((resolve) => { resolveEnded = resolve; });
+    void this.gatedRequest(handle, true, undefined, abort.signal, (slot, remaining) =>
+      this.sendAttempt(handle, bytes, priority, admission, remaining, onEvent, undefined, undefined, false, undefined, slot, true,
+        (key, pending, corr) => { current = { key, pending, corr }; }))
+      .then((frame) => {
+        if (cancelled) return;
+        resolveEnded(frame.header.ty === FrameType.Response ? { kind: "response", body: frame.body } : { kind: "stream_end" });
+        resolveClosed();
+      }, (error: Error) => {
+        if (cancelled) return;
+        if (error instanceof SubcError && error.closeReason) resolveEnded(error.closeReason === "connection_lost"
+          ? { kind: "connection_lost" } : { kind: "route_closed", reason: error.closeReason });
+        else if (error instanceof SubcError || error instanceof SubcCallError) resolveEnded({ kind: "error", code: error.code, message: error.message, detail: error.detail });
+        else resolveEnded({ kind: "connection_lost" });
+        rejectClosed(error);
+      });
+    return { closed, ended, unsubscribe: () => {
+      if (cancelled) return;
+      cancelled = true;
+      abort.abort();
+      if (current && this.pending.get(current.key) === current.pending) {
+        const { key, pending, corr } = current;
+        this.settle(key, pending, () => pending.reject(new SubcError("subscription cancelled")));
+        if (this.isLiveHandle(handle)) this.cancel(handle, corr, priority);
+      }
+      resolveEnded({ kind: "cancelled" });
+      resolveClosed();
+    } };
+  }
+
+  private sendAttempt(
     handle: RouteHandle | null,
     body: Uint8Array,
     priority: Priority,
@@ -1313,6 +1435,9 @@ export class SubcClient {
     onLateResponse?: (frame: Frame) => void,
     binary = false,
     signal?: AbortSignal,
+    slot?: RequestSlot,
+    subscription = false,
+    registered?: (key: string, pending: Pending, corr: bigint) => void,
   ): Promise<Frame> {
     if (handle) this.assertLiveHandle(handle);
     if (this.closedErr) return Promise.reject(this.closedErr);
@@ -1327,7 +1452,7 @@ export class SubcClient {
     const epoch = handle?.epoch ?? 0;
     const frame = buildFrame(
       FrameType.Request,
-      buildFlags(binary, priority, false, admission),
+      buildFlags(binary, priority, false, admission) | (subscription ? SUBSCRIPTION_FLAG : 0),
       channel,
       epoch,
       corr,
@@ -1344,10 +1469,19 @@ export class SubcClient {
         timer: null,
         acceptFrame,
         onLateResponse,
+        slot,
+        subscription,
       };
-      pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, channel, corr, ms), ms);
+      if (!subscription) pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, channel, corr, ms), ms);
       this.pending.set(key, pending);
-      writeBorrowed(this.sock, encodeFrame(frame), Date.now() + ms).catch((error) => {
+      registered?.(key, pending, corr);
+      if (slot && handle) { slot.inFlight = true; this.slots.set(key, { handle, slot }); }
+      const write = writeTrackedBorrowed(this.sock, encodeFrame(frame), Date.now() + ms);
+      if (slot && !write.queued) { this.slots.delete(key); slot.inFlight = false; slot.release(); }
+      write.completed.catch((error) => {
+        // Preserve the socket's public error shape. Slot ownership above uses
+        // write.queued, not the error's class, to prove an attempt was unsent.
+        if (error instanceof SocketWriteNotQueuedError || error instanceof SocketWriteQueuedError) error = error.cause ?? error;
         const current = this.pending.get(key);
         if (current) this.rejectPending(key, current, error instanceof Error ? error : new SubcError(String(error)));
       });
@@ -1370,6 +1504,7 @@ export class SubcClient {
   private arbitrateTimeout(key: string, pending: Pending, channel: number, corr: bigint, ms: number): void {
     const settleAsTimeout = (): void => {
       if (pending.onLateResponse) this.lateResponses.set(key, pending.onLateResponse);
+      if (pending.slot?.inFlight && pending.handle && this.isLiveHandle(pending.handle)) this.cancel(pending.handle, corr);
       this.rejectPending(
         key,
         pending,
@@ -1418,6 +1553,15 @@ export class SubcClient {
   }
 
   private sendManaged(
+    ...args: Parameters<SubcClient["sendManagedAttempt"]>
+  ): Promise<Frame> {
+    const [handle, body, priority, admission, timeoutMs, onProgress, binary, signal] = args;
+    if (!this.gates.has(handle)) return this.sendManagedAttempt(...args);
+    return this.gatedRequest(handle, false, timeoutMs, signal, (slot, remaining) =>
+      this.sendManagedAttempt(handle, body, priority, admission, remaining, onProgress, binary, signal, slot));
+  }
+
+  private sendManagedAttempt(
     handle: RouteHandle,
     body: Uint8Array,
     priority: Priority,
@@ -1426,6 +1570,7 @@ export class SubcClient {
     onProgress: ((body: Uint8Array) => void) | undefined,
     binary = false,
     signal?: AbortSignal,
+    slot?: RequestSlot,
   ): Promise<Frame> {
     try {
       this.assertLiveHandle(handle);
@@ -1477,11 +1622,14 @@ export class SubcClient {
         onProgress,
         timer: null,
         classifyFailure,
+        slot,
       };
       pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, handle.channel, corr, ms), ms);
       this.pending.set(key, pending);
+      if (slot) { slot.inFlight = true; this.slots.set(key, { handle, slot }); }
       const write = writeTrackedBorrowed(this.sock, encodeFrame(frame), Date.now() + ms);
       handedToSocket = write.queued;
+      if (slot && !write.queued) { this.slots.delete(key); slot.inFlight = false; slot.release(); }
       write.completed.catch((error) => {
         const current = this.pending.get(key);
         if (current) this.rejectPending(key, current, error instanceof Error ? error : new SubcError(String(error)));
@@ -1599,6 +1747,7 @@ export class SubcClient {
       if ("handle" in outcome) {
         const { handle } = outcome;
         if (cached.closed) {
+          this.failHandle(handle, new SubcError("route closed during route.open", "route_closed", undefined, "closed_by_caller"));
           this.liveRoutes.delete(handle.channel);
           this.sendRouteGoodbye(handle);
           throw this.routeClosedDuringOpen();
@@ -1972,6 +2121,16 @@ export class SubcClient {
 
     const key = pendingKey(handle, frame.header.corr);
     const pending = this.pending.get(key);
+    if (frame.header.ty === FrameType.Response || frame.header.ty === FrameType.Error || frame.header.ty === FrameType.StreamEnd) {
+      const record = this.slots.get(key);
+      if (record) {
+        this.slots.delete(key);
+        record.slot.inFlight = false;
+        const busy = frame.header.ty === FrameType.Error && pending?.slot === record.slot &&
+          isRouteBusyRetryable(frame.header.flags, this.errorFromFrame(frame).code, !!handle && this.gates.has(handle));
+        if (!busy) record.slot.release();
+      }
+    }
     if (pending) {
       if (pending.acceptFrame && !pending.acceptFrame(frame)) return;
         switch (frame.header.ty) {
@@ -2244,6 +2403,11 @@ export class SubcClient {
   }
 
   private failHandle(handle: RouteHandle, error: Error): void {
+    this.gates.get(handle)?.close(error);
+    this.gates.delete(handle);
+    for (const [key, record] of this.slots) {
+      if (sameRouteHandle(record.handle, handle)) { record.slot.release(); this.slots.delete(key); }
+    }
     for (const [key, pending] of this.pending) {
       if (pending.handle && sameRouteHandle(pending.handle, handle)) this.rejectPending(key, pending, error);
     }
@@ -2254,6 +2418,9 @@ export class SubcClient {
       : new SubcError(err.message, errorCode(err), undefined,
         this.closeStarted ? "closed_by_caller" : "connection_lost");
     if (!this.closedErr) this.closedErr = err;
+    for (const gate of this.gates.values()) gate.close(routeError);
+    this.gates.clear();
+    this.slots.clear();
     this.routeEndReasons.clear();
     this.legacyChannelReasons.clear();
     this.routeModules.clear();
@@ -2296,6 +2463,8 @@ export class SubcClient {
     epoch: number,
     reverseRequests = new ReverseRequestRegistry(),
   ): RouteHandle {
+    const previous = this.liveRoutes.get(channel);
+    if (previous && this.gates.has(previous)) this.failHandle(previous, new SubcError("route replaced", "route_closed", undefined, "closed_by_caller"));
     const handle = createRouteHandle(channel, epoch, this.connectionToken, reverseRequests);
     this.routeEndReasons.delete(channel);
     this.legacyChannelReasons.delete(channel);
@@ -2488,6 +2657,11 @@ export const STALE_ROUTE_EPOCH = "stale_route_epoch";
  */
 export function isEstablishedRouteDead(_flags: number, code: string | undefined): boolean {
   return code === UNKNOWN_CHANNEL || code === STALE_ROUTE_EPOCH;
+}
+
+/** A module cannot authorize replay; both route negotiation and origin are required. */
+export function isRouteBusyRetryable(flags: number, code: string | undefined, routeOptedIn: boolean): boolean {
+  return routeOptedIn && (flags & DAEMON_ORIGIN_FLAG) !== 0 && code === "route_busy";
 }
 
 /** Whether an ERROR answering a managed call's request is the daemon's drain

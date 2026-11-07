@@ -107,6 +107,8 @@ private struct InFlightKey: Hashable {
     let corr: UInt64
 }
 
+/// A single-caller synchronous client. This non-Sendable class is not safe for
+/// concurrent callers; each request reads through RESPONSE, ERROR or STREAM_END.
 public final class SubcClient {
     private let transport: Transport
     private let connectionToken = ConnectionToken()
@@ -115,11 +117,23 @@ public final class SubcClient {
     private var corrExhausted = false
     private var inFlight: Set<InFlightKey> = []
     private var abandonedRouteOpens: Set<UInt64> = []
+    private var busyRoutes: Set<UInt16> = []
+    private let busyNow: () -> TimeInterval
+    private let busySleep: (TimeInterval) throws -> Void
+    private let busyRandom: () -> Double
     public private(set) var droppedIngressFrames: UInt64 = 0
 
-    init(transport: Transport, nextCorr: UInt64 = 1) {
+    init(
+        transport: Transport, nextCorr: UInt64 = 1,
+        busyNow: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        busySleep: @escaping (TimeInterval) throws -> Void = { Thread.sleep(forTimeInterval: $0) },
+        busyRandom: @escaping () -> Double = { Double.random(in: 0..<1) }
+    ) {
         self.transport = transport
         self.nextCorr = nextCorr == 0 ? 1 : nextCorr
+        self.busyNow = busyNow
+        self.busySleep = busySleep
+        self.busyRandom = busyRandom
     }
 
     /// Read the connection file, connect to the first endpoint, run the HMAC
@@ -194,6 +208,7 @@ public final class SubcClient {
         try validateRequestAdmission(admissionClass)
         var payload: [String: Any] = [
             "op": "route.open",
+            "busy_refusals": true,
             "target": ["kind": "management_surface", "module_id": moduleId],
             "identity": ["project_root": projectRoot, "harness": harness, "session": session],
         ]
@@ -286,6 +301,7 @@ public final class SubcClient {
         try validateAdmission(admissionClass, for: .goodbye)
         try writeGoodbye(route, admissionClass: admissionClass)
         liveEpochs.removeValue(forKey: route.channel)
+        busyRoutes.remove(route.channel)
     }
 
     /// Drive one broca session turn end-to-end using dedicated command and
@@ -344,7 +360,7 @@ public final class SubcClient {
         )
         subscribeRouteForCleanup = subscribeRoute
 
-        let subscribeCorr = try allocateCorr()
+        var subscribeCorr = try allocateCorr()
         subscribeCorrForCleanup = subscribeCorr
         let fromValue: Any
         if let cursor = fromCursor {
@@ -360,10 +376,11 @@ public final class SubcClient {
             route: subscribeRoute,
             corr: subscribeCorr,
             body: subscribeBody,
-            admissionClass: admissionClass
+            admissionClass: admissionClass,
+            subscription: true
         )
 
-        let sendCorr = try allocateCorr()
+        var sendCorr = try allocateCorr()
         let sendBody = try JSONSerialization.data(withJSONObject: [
             "method": "session.send",
             "params": [
@@ -380,12 +397,12 @@ public final class SubcClient {
             admissionClass: admissionClass
         )
 
-        let subscribeKey = InFlightKey(
+        var subscribeKey = InFlightKey(
             channel: subscribeRoute.channel,
             epoch: subscribeRoute.epoch,
             corr: subscribeCorr
         )
-        let sendKey = InFlightKey(
+        var sendKey = InFlightKey(
             channel: commandRoute.channel,
             epoch: commandRoute.epoch,
             corr: sendCorr
@@ -393,6 +410,8 @@ public final class SubcClient {
         inFlight.formUnion([subscribeKey, sendKey])
         subscribeKeyForCleanup = subscribeKey
         sendKeyForCleanup = sendKey
+        var subscribeRetry = BusyRetry(deadline: busyNow() + 30)
+        var sendRetry = BusyRetry(deadline: busyNow() + 30)
 
         var lastCursor: SubscribeCursor? = fromCursor
         while true {
@@ -414,9 +433,18 @@ public final class SubcClient {
             guard inFlight.contains(key) else { continue }
             if key == sendKey {
                 if frame.header.ty == .error {
+                    if try retryBusy(frame, route: commandRoute, retry: &sendRetry) {
+                        inFlight.remove(sendKey)
+                        sendCorr = try allocateCorr()
+                        sendKey = InFlightKey(channel: commandRoute.channel, epoch: commandRoute.epoch, corr: sendCorr)
+                        sendKeyForCleanup = sendKey
+                        inFlight.insert(sendKey)
+                        try beginRouteRequest(route: commandRoute, corr: sendCorr, body: sendBody, admissionClass: admissionClass)
+                        continue
+                    }
                     throw remoteError(prefix: "session.send rejected", body: frame.body)
                 }
-                if frame.header.ty == .response { inFlight.remove(sendKey) }
+                if frame.header.ty == .response || frame.header.ty == .streamEnd { inFlight.remove(sendKey) }
                 continue
             }
             guard key == subscribeKey else { continue }
@@ -431,6 +459,16 @@ public final class SubcClient {
                 subscriptionEnded = true
                 return lastCursor
             case .error:
+                if try retryBusy(frame, route: subscribeRoute, retry: &subscribeRetry) {
+                    inFlight.remove(subscribeKey)
+                    subscribeCorr = try allocateCorr()
+                    subscribeCorrForCleanup = subscribeCorr
+                    subscribeKey = InFlightKey(channel: subscribeRoute.channel, epoch: subscribeRoute.epoch, corr: subscribeCorr)
+                    subscribeKeyForCleanup = subscribeKey
+                    inFlight.insert(subscribeKey)
+                    try beginRouteRequest(route: subscribeRoute, corr: subscribeCorr, body: subscribeBody, admissionClass: admissionClass, subscription: true)
+                    continue
+                }
                 throw remoteError(prefix: "subscribe stream error", body: frame.body)
             default:
                 continue
@@ -441,6 +479,7 @@ public final class SubcClient {
     /// Close the connection and invalidate every handle minted by it.
     public func close() {
         liveEpochs.removeAll()
+        busyRoutes.removeAll()
         transport.close()
     }
 
@@ -474,8 +513,8 @@ public final class SubcClient {
     ) throws -> Data {
         try ensureCurrent(route)
         try validateRequestAdmission(admissionClass)
-        let corr = try allocateCorr()
-        let key = InFlightKey(channel: route.channel, epoch: route.epoch, corr: corr)
+        var corr = try allocateCorr()
+        var key = InFlightKey(channel: route.channel, epoch: route.epoch, corr: corr)
         inFlight.insert(key)
         defer { inFlight.remove(key) }
         try beginRouteRequest(
@@ -484,6 +523,7 @@ public final class SubcClient {
             body: body,
             admissionClass: admissionClass
         )
+        var retry = BusyRetry(deadline: busyNow() + 30)
         while true {
             let frame = try nextIngressFrame()
             let frameKey = InFlightKey(
@@ -502,6 +542,14 @@ public final class SubcClient {
             case .response, .streamEnd:
                 return frame.body
             case .error:
+                if try retryBusy(frame, route: route, retry: &retry) {
+                    inFlight.remove(key)
+                    corr = try allocateCorr()
+                    key = InFlightKey(channel: route.channel, epoch: route.epoch, corr: corr)
+                    inFlight.insert(key)
+                    try beginRouteRequest(route: route, corr: corr, body: body, admissionClass: admissionClass)
+                    continue
+                }
                 throw remoteError(
                     prefix: "request on route \(route.channel):\(route.epoch) rejected",
                     body: frame.body
@@ -516,7 +564,8 @@ public final class SubcClient {
         route: RouteHandle,
         corr: UInt64,
         body: Data,
-        admissionClass: AdmissionClass
+        admissionClass: AdmissionClass,
+        subscription: Bool = false
     ) throws {
         try ensureCurrent(route)
         try validateRequestAdmission(admissionClass)
@@ -528,7 +577,7 @@ public final class SubcClient {
         )
         try transport.writeAll(try encodeFrame(
             ty: .request,
-            flags: flags,
+            flags: flags | (subscription && busyRoutes.contains(route.channel) ? SUBSCRIPTION_FLAG : 0),
             channel: route.channel,
             epoch: route.epoch,
             corr: corr,
@@ -570,6 +619,7 @@ public final class SubcClient {
             }
             if frame.header.ty == .goodbye {
                 liveEpochs.removeValue(forKey: frame.header.channel)
+                busyRoutes.remove(frame.header.channel)
             }
             return frame
         }
@@ -616,7 +666,31 @@ public final class SubcClient {
             connectionToken: connectionToken
         )
         liveEpochs[route.channel] = route.epoch
+        busyRoutes.remove(route.channel)
+        if object["request_window"] != nil { busyRoutes.insert(route.channel) }
         return route
+    }
+
+    private func retryBusy(_ frame: Frame, route: RouteHandle, retry: inout BusyRetry) throws -> Bool {
+        let body = (try? JSONSerialization.jsonObject(with: frame.body)) as? [String: Any]
+        guard isRouteBusyRetryable(
+            flags: frame.header.flags, code: body?["code"] as? String,
+            routeOptedIn: busyRoutes.contains(route.channel)
+        ) else { return false }
+
+        let refusal = RouteBusyError(body: frame.body)
+        guard busyNow() < retry.deadline else { throw refusal }
+        let end = min(retry.deadline, busyNow() + retry.delay * (0.5 + busyRandom() * 0.5))
+        retry.delay = min(1, retry.delay * 2)
+        // Short sleeps keep synchronous backoff responsive to Task cancellation.
+        while busyNow() < end {
+            try Task<Never, Never>.checkCancellation()
+            try busySleep(min(0.01, end - busyNow()))
+        }
+        try Task<Never, Never>.checkCancellation()
+        guard busyNow() < retry.deadline else { throw refusal }
+        try ensureCurrent(route)
+        return true
     }
 
     private func exactWireUInt(_ value: Any?, field: String, max: UInt64) throws -> UInt64 {

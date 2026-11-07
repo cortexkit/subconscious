@@ -1004,7 +1004,7 @@ where
                 close = &mut close_receiver => {
                     return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
                 }
-                result = send_refusal(&ctx.egress, refusal) => result,
+                result = router.observe_connection_wait(&ctx, "reply_egress", send_refusal(&ctx.egress, refusal)) => result,
             };
             send_result.map_err(ConnectionError::Router)?;
             return Ok(ConnectionLoopExit::PeerClosed);
@@ -1038,7 +1038,7 @@ where
                     close = &mut close_receiver => {
                         return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
                     }
-                    result = ctx.egress.send(response) => result,
+                    result = router.observe_connection_wait(&ctx, "reply_egress", ctx.egress.send(response)) => result,
                 };
                 send_result.map_err(ConnectionError::Router)?;
             } else {
@@ -1075,7 +1075,7 @@ where
                     close = &mut close_receiver => {
                         return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
                     }
-                    result = ctx.egress.send(refusal) => result,
+                    result = router.observe_connection_wait(&ctx, "reply_egress", ctx.egress.send(refusal)) => result,
                 };
                 send_result.map_err(ConnectionError::Router)?;
                 continue;
@@ -1121,7 +1121,7 @@ where
                     close = &mut close_receiver => {
                         return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
                     }
-                    result = ctx.egress.send(error_frame) => result,
+                    result = router.observe_connection_wait(&ctx, "reply_egress", ctx.egress.send(error_frame)) => result,
                 };
                 send_result.map_err(ConnectionError::Router)?;
             } else {
@@ -1173,7 +1173,9 @@ async fn route_open_tail(
                 error = %err,
                 "routing failure recovered with ERROR frame"
             );
-            ctx.egress.send(error_frame).await
+            router
+                .observe_connection_wait(&ctx, "reply_egress", ctx.egress.send(error_frame))
+                .await
         }
     }
 }
@@ -2537,6 +2539,7 @@ mod tests {
             0,
             2,
             serde_json::to_vec(&ClientControlRequest::RouteOpen {
+                busy_refusals: None,
                 target: RouteTarget::ToolProvider {
                     module_id: "frame-test".into(),
                 },
@@ -2702,6 +2705,7 @@ mod tests {
             &control_request(
                 2,
                 ClientControlRequest::RouteOpen {
+                    busy_refusals: None,
                     target: RouteTarget::ToolProvider {
                         module_id: "healthy".into(),
                     },
@@ -2745,6 +2749,7 @@ mod tests {
                 ClientControlResponse::RouteOpen {
                     route_channel,
                     route_epoch,
+                    ..
                 } => (route_channel, route_epoch),
                 other => panic!("expected a healthy module route, got {other:?}"),
             };

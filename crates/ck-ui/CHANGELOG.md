@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.1
+
+- Adopt compatible dependency requirements for the updated route-open control types; no behavior change.
+
 ## 0.3.0
 
 - Breaking: upgrade the control types in the public UI mapping API to control 0.34. Management and pairing routes use project-free identities; their unscoped routes no longer attribute the current directory as a project.

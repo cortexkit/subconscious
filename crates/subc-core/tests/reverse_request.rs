@@ -848,6 +848,7 @@ async fn open_route(
         .send(&control_request_frame(
             corr,
             ClientControlRequest::RouteOpen {
+                busy_refusals: None,
                 target: RouteTarget::ToolProvider {
                     module_id: module_id.to_string(),
                 },
@@ -898,6 +899,7 @@ async fn open_route(
         ClientControlResponse::RouteOpen {
             route_channel,
             route_epoch: client_epoch,
+            ..
         } => RoutePair {
             client_channel: route_channel,
             client_epoch,

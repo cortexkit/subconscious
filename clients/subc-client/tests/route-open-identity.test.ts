@@ -69,7 +69,7 @@ describe.skipIf(process.platform === "win32")("SubcClient route.open consumer id
     const { client, captured } = routeOpenHarness();
     await client.routeOpen(TARGET, IDENTITY);
 
-    expect(captured()).toEqual({ op: "route.open", target: TARGET, identity: IDENTITY });
+    expect(captured()).toEqual({ op: "route.open", busy_refusals: true, target: TARGET, identity: IDENTITY });
   });
 
   test("attaches consumer_identity when both env vars are present", async () => {
@@ -81,6 +81,7 @@ describe.skipIf(process.platform === "win32")("SubcClient route.open consumer id
 
     expect(captured()).toEqual({
       op: "route.open",
+      busy_refusals: true,
       target: TARGET,
       identity: IDENTITY,
       consumer_identity: { module_id: "subc-mcp", launch_nonce: "nonce-123" },
@@ -113,6 +114,7 @@ describe.skipIf(process.platform === "win32")("SubcClient route.open consumer id
 
       expect(captured()).toEqual({
         op: "route.open",
+        busy_refusals: true,
         target: TARGET,
         identity: IDENTITY,
         consumer_identity: { module_id: "subc-mcp", launch_nonce: "nonce-from-the-pipe" },
@@ -133,7 +135,7 @@ describe.skipIf(process.platform === "win32")("SubcClient route.open consumer id
     const { client, captured } = routeOpenHarness();
     await client.routeOpen(TARGET, IDENTITY);
 
-    expect(captured()).toEqual({ op: "route.open", target: TARGET, identity: IDENTITY });
+    expect(captured()).toEqual({ op: "route.open", busy_refusals: true, target: TARGET, identity: IDENTITY });
   });
 
   test("registered handlers derive route.open consumer_capabilities", async () => {
@@ -148,6 +150,7 @@ describe.skipIf(process.platform === "win32")("SubcClient route.open consumer id
 
     expect(captured()).toEqual({
       op: "route.open",
+      busy_refusals: true,
       target: TARGET,
       identity: IDENTITY,
       consumer_capabilities: ["elicitation", "roots"],

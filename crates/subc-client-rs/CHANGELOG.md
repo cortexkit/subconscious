@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.34.0
+
+- Keep channel-0 route polls outside data admission, and release retained slots
+  when a response deadline retires a route so a hung request cannot block GOODBYE.
+- Preserve pre-dispatch cancellation when route capacity is immediately
+  available, and send at most one CANCEL per correlation when its deadline
+  follows an explicit cancellation.
+- Clarify that `CallOptions.route_retry_deadline` includes the first open attempt;
+  zero permits no open, not one attempt without retries.
+- Adopt subc-control 0.35.0 and opt in to route credit refusals. Negotiated routes
+  gate requests and watches locally, retaining slots until a wire terminal or
+  route close. Trusted daemon-origin `route_busy` refusals retry on the same
+  route while retaining their slot; exhausted refusals are never forwarded.
+  Older daemons keep their existing behaviour.
+
 ## 0.33.4
 
 - On Windows, operator-app discovery uses only

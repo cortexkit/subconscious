@@ -86,6 +86,8 @@ const ACTIVITY_EVENT_BUFFER: usize = 2048;
 mod activity_consumer_tests;
 
 mod cancellation;
+mod slots;
+use slots::*;
 mod reservation;
 pub use reservation::{CorrelationId, PendingReply, RequestBody, RequestReservation};
 mod supervisor_ops;
@@ -553,6 +555,8 @@ pub struct CallOptions {
     pub admission_class: AdmissionClass,
     pub route_retry: RetryBackoff,
     /// Maximum real-time limit for retrying route.open attempts when the target is temporarily absent.
+    /// Bounds the whole route open, including the first attempt: a zero budget
+    /// means no open is attempted. For a single attempt, allow that attempt's time.
     pub route_retry_deadline: Duration,
     /// Explicit consumer identity for route.open; when absent, the supervised
     /// launch identity is used, except on [`SubcConsumer::connect_operator_app`]
@@ -1197,29 +1201,34 @@ impl Future for SubscriptionClosed {
 
 struct SubscriptionCancel {
     shared: Arc<Shared>,
-    key: PendingKey,
+    position: Arc<SubscriptionPosition>,
     priority: Priority,
     cancelled: AtomicBool,
 }
 
 impl SubscriptionCancel {
-    fn new(shared: Arc<Shared>, key: PendingKey, priority: Priority) -> Self {
+    fn new(shared: Arc<Shared>, position: Arc<SubscriptionPosition>, priority: Priority) -> Self {
         Self {
             shared,
-            key,
+            position,
             priority,
             cancelled: AtomicBool::new(false),
         }
     }
 
     fn unsubscribe(&self) -> Result<(), CallError> {
-        let handle = RouteHandle::new(self.key.channel, self.key.epoch, self.key.generation);
+        let key = *self
+            .position
+            .key
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        let handle = RouteHandle::new(key.channel, key.epoch, key.generation);
         self.shared.validate_current_handle(handle)?;
         if self.cancelled.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
         self.shared
-            .unsubscribe_subscription(self.key, self.priority)
+            .unsubscribe_subscription(&self.position, self.priority)
     }
 }
 
@@ -1534,6 +1543,7 @@ impl SubcConsumer {
         let consumer_capabilities = route_open_consumer_capabilities(opts);
         let target_label = route_target_label(&target);
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+            busy_refusals: Some(true),
             target,
             identity,
             consumer_identity: self.shared.route_open_consumer_identity(opts),
@@ -1569,6 +1579,9 @@ impl SubcConsumer {
         let ClientControlResponse::RouteOpen {
             route_channel,
             route_epoch,
+            request_window,
+            watch_window,
+            ..
         } = serde_json::from_slice(&body).map_err(|err| {
             CallError::not_sent_with_cause(
                 format!("failed to decode route.open response: {err}"),
@@ -1596,10 +1609,7 @@ impl SubcConsumer {
                 ),
                 None => RouteHandle::new(route_channel, route_epoch, generation),
             });
-        let route = RouteState {
-            handle,
-            sem: Arc::new(Semaphore::new(DEFAULT_ROUTE_WINDOW)),
-        };
+        let route = RouteState::windows(handle, request_window, watch_window);
         self.shared.install_one_shot_route(route.clone())?;
         Ok(route.handle)
     }
@@ -1929,7 +1939,7 @@ impl SubcConsumer {
                     admission_class: AdmissionClass::Normal,
                     event_buffer: ACTIVITY_EVENT_BUFFER,
                     deadline,
-                    permit,
+                    permit: RoutePermit::legacy(permit),
                 })
                 .await
             {
@@ -1985,7 +1995,7 @@ impl SubcConsumer {
                     admission_class: AdmissionClass::Normal,
                     event_buffer: SPAWN_EVENT_BUFFER,
                     deadline,
-                    permit,
+                    permit: RoutePermit::legacy(permit),
                 })
                 .await
             {
@@ -2096,38 +2106,46 @@ impl SubcConsumer {
     ) -> Result<Vec<u8>, CallError> {
         let deadline = Instant::now() + opts.timeout;
         let route = self.shared.route_state(*handle)?;
-        let permit = match timeout_at(deadline, Arc::clone(&route.sem).acquire_owned()).await {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return Err(CallError::StaleRouteHandle(*handle)),
-            Err(_) => {
-                return Err(CallError::not_sent(
-                    "call deadline elapsed waiting for route flow-control",
-                ))
+        let permit = route.acquire(false, deadline, cancel.as_ref()).await?;
+        let mut busy_delay = Duration::from_millis(25);
+        loop {
+            let result = self
+                .shared
+                .send_request_with_slot(
+                    RequestSend {
+                        binary: false,
+                        expected_handle: Some(*handle),
+                        channel: handle.channel,
+                        epoch: handle.epoch,
+                        body: body.clone(),
+                        priority: opts.priority,
+                        admission_class: opts.admission_class,
+                        deadline,
+                        retain_late_route_open: false,
+                        route_open_reverse_requests: None,
+                    },
+                    cancel.clone(),
+                    Some(Arc::clone(&permit)),
+                )
+                .await;
+            match result? {
+                TerminalFrame::Response { body, .. } => return Ok(body),
+                TerminalFrame::StreamEnd => return Ok(Vec::new()),
+                TerminalFrame::Error { body, flags }
+                    if error_codes::is_route_busy_retryable(flags, &body.code, route.opted_in) =>
+                {
+                    if !self
+                        .shared
+                        .busy_backoff(deadline, busy_delay, cancel.as_ref())
+                        .await
+                    {
+                        return Err(busy_error(&body));
+                    }
+                    busy_delay = (busy_delay * 2).min(Duration::from_secs(1));
+                    self.shared.validate_current_handle(*handle)?;
+                }
+                TerminalFrame::Error { body, .. } => return Err(CallError::Module(body)),
             }
-        };
-        let result = self
-            .shared
-            .send_request_cancellable(
-                RequestSend {
-                    binary: false,
-                    expected_handle: Some(*handle),
-                    channel: handle.channel,
-                    epoch: handle.epoch,
-                    body,
-                    priority: opts.priority,
-                    admission_class: opts.admission_class,
-                    deadline,
-                    retain_late_route_open: false,
-                    route_open_reverse_requests: None,
-                },
-                cancel,
-            )
-            .await;
-        drop(permit);
-        match result? {
-            TerminalFrame::Response { body, .. } => Ok(body),
-            TerminalFrame::StreamEnd => Ok(Vec::new()),
-            TerminalFrame::Error { body, .. } => Err(CallError::Module(body)),
         }
     }
 
@@ -2140,15 +2158,7 @@ impl SubcConsumer {
     ) -> Result<Subscription, CallError> {
         let deadline = Instant::now() + opts.route_open_timeout;
         let route = self.shared.route_state(*handle)?;
-        let permit = match timeout_at(deadline, Arc::clone(&route.sem).acquire_owned()).await {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return Err(CallError::StaleRouteHandle(*handle)),
-            Err(_) => {
-                return Err(CallError::not_sent(
-                    "subscription deadline elapsed waiting for route flow-control",
-                ))
-            }
-        };
+        let permit = route.acquire(true, deadline, None).await?;
         self.shared
             .send_subscription(SubscriptionSend {
                 expected_handle: Some(*handle),
@@ -2487,24 +2497,33 @@ impl SubcConsumer {
             scope: None,
         };
 
+        let mut busy_permit: Option<Arc<RoutePermit>> = None;
+        let mut busy_delay = Duration::from_millis(25);
         loop {
             let route = self
                 .shared
                 .ensure_route(&route_key, &route_open, &opts, call_deadline)
                 .await
                 .map_err(request_not_sent_after_route_open_failure)?;
-            let permit =
-                match timeout_at(call_deadline, Arc::clone(&route.sem).acquire_owned()).await {
-                    Ok(Ok(permit)) => permit,
-                    Ok(Err(_)) => {
-                        return Err(self.shared.route_not_sent_error(route.handle));
-                    }
-                    Err(_) => {
-                        return Err(CallError::not_sent(
-                            "call deadline elapsed waiting for route flow-control",
-                        ));
-                    }
-                };
+            if busy_permit
+                .as_ref()
+                .is_some_and(|permit| !permit.belongs_to(&route))
+            {
+                busy_permit.take();
+            }
+            let permit = match busy_permit.take() {
+                Some(permit) => permit,
+                None => route
+                    .acquire(false, call_deadline, cancel.as_ref())
+                    .await
+                    .map_err(|err| {
+                        if matches!(err, CallError::StaleRouteHandle(_)) {
+                            self.shared.route_not_sent_error(route.handle)
+                        } else {
+                            err
+                        }
+                    })?,
+            };
 
             if !self.shared.route_is_current(&route_key, &route) {
                 drop(permit);
@@ -2522,7 +2541,7 @@ impl SubcConsumer {
             };
             let response = self
                 .shared
-                .send_request_cancellable(
+                .send_request_with_slot(
                     RequestSend {
                         expected_handle: Some(route.handle),
                         channel: route.handle.channel,
@@ -2536,14 +2555,14 @@ impl SubcConsumer {
                         route_open_reverse_requests: None,
                     },
                     cancel.clone(),
+                    Some(Arc::clone(&permit)),
                 )
                 .await;
-            drop(permit);
 
             history.sent |= response.is_ok();
             let proven_undelivered = match &response {
                 Ok(TerminalFrame::Error { body, flags }) => {
-                    is_daemon_refusal_before_forward(daemon_origin_trusted, *flags, &body.code)
+                    is_refusal_on_route(daemon_origin_trusted, *flags, &body.code, route.opted_in)
                 }
                 Err(err) => {
                     err.never_forwarded() == Some(true)
@@ -2565,6 +2584,20 @@ impl SubcConsumer {
                         body: Vec::new(),
                         binary: false,
                     });
+                }
+                Ok(TerminalFrame::Error { body, flags })
+                    if error_codes::is_route_busy_retryable(flags, &body.code, route.opted_in) =>
+                {
+                    if !self
+                        .shared
+                        .busy_backoff(call_deadline, busy_delay, cancel.as_ref())
+                        .await
+                    {
+                        return Err(busy_error(&body));
+                    }
+                    busy_delay = (busy_delay * 2).min(Duration::from_secs(1));
+                    busy_permit = Some(permit);
+                    continue;
                 }
                 // Route-dead and drain refusals share one eviction/resend budget.
                 // Only a trusted daemon-origin flag proves non-delivery; the retry
@@ -2627,8 +2660,9 @@ impl SubcConsumer {
     /// [`SubcConsumer::call`], sends one Request that the provider keeps open, and
     /// returns a [`Subscription`] whose event receiver yields each matching
     /// `StreamData` payload. The request holds one route flow-control permit until
-    /// `StreamEnd`, an Error frame, route teardown, connection loss, local
-    /// backpressure, or [`Subscription::unsubscribe`]. Reconnects reject the
+    /// `StreamEnd`, an Error frame, route teardown or connection loss. On negotiated
+    /// routes, local backpressure and unsubscribe keep credit until a wire terminal.
+    /// Reconnects reject the
     /// subscription; callers that need durable replay should resubscribe with their
     /// own cursor after observing the failure.
     pub async fn subscribe(
@@ -2676,18 +2710,16 @@ impl SubcConsumer {
                 .ensure_route(&route_key, &route_open, &route_opts, open_deadline)
                 .await
                 .map_err(request_not_sent_after_route_open_failure)?;
-            let permit =
-                match timeout_at(open_deadline, Arc::clone(&route.sem).acquire_owned()).await {
-                    Ok(Ok(permit)) => permit,
-                    Ok(Err(_)) => {
-                        return Err(self.shared.route_not_sent_error(route.handle));
+            let permit = route
+                .acquire(true, open_deadline, None)
+                .await
+                .map_err(|err| {
+                    if matches!(err, CallError::StaleRouteHandle(_)) {
+                        self.shared.route_not_sent_error(route.handle)
+                    } else {
+                        err
                     }
-                    Err(_) => {
-                        return Err(CallError::not_sent(
-                            "subscription open deadline elapsed waiting for route flow-control",
-                        ));
-                    }
-                };
+                })?;
 
             if !self.shared.route_is_current(&route_key, &route) {
                 drop(permit);
@@ -3044,8 +3076,15 @@ impl CallError {
             Self::CapabilityUnprovided { .. } => Some("capability_unprovided"),
             Self::CapabilityAmbiguous { .. } => Some("capability_ambiguous"),
             Self::InvalidCapabilityIdentifier { .. } => Some("invalid_capability_identifier"),
-            Self::NotSent(_)
-            | Self::OutcomeUnknown(_)
+            Self::NotSent(source) => match &source.downcast_ref::<NotSentSource>()?.cause {
+                NotSentCause::DaemonRefusedBeforeForward { code }
+                    if code == error_codes::ROUTE_BUSY =>
+                {
+                    Some(code)
+                }
+                _ => None,
+            },
+            Self::OutcomeUnknown(_)
             | Self::SubscriptionBackpressure(_)
             | Self::StaleRouteHandle(_) => None,
         }
@@ -3410,6 +3449,7 @@ struct Inner {
     next_corr: Option<u64>,
     writer: Option<mpsc::Sender<WriteCommand>>,
     pending: HashMap<PendingKey, PendingEntry>,
+    wire_slots: HashMap<PendingKey, Arc<RoutePermit>>,
     routes: HashMap<RouteKey, RouteState>,
     route_by_channel: HashMap<u16, RouteKey>,
     one_shot_routes: HashMap<u16, RouteState>,
@@ -3507,15 +3547,18 @@ impl Inner {
     }
 
     fn reap_retired_route(&mut self, handle: RouteHandle) {
-        // The pending map is authoritative, including subscriptions and calls
-        // dropped by their owner. Scan only on retired routes instead of
-        // maintaining a second count on every registration/removal path.
+        // A caller may be gone while its written correlation still owns credit.
+        // Keep ingress for those tombstones as well as live pending callers.
         if !self.retired_routes.contains(&handle)
-            || self.pending.keys().any(|key| {
-                key.generation == handle.connection_token()
-                    && key.channel == handle.channel
-                    && key.epoch == handle.epoch
-            })
+            || self
+                .pending
+                .keys()
+                .chain(self.wire_slots.keys())
+                .any(|key| {
+                    key.generation == handle.connection_token()
+                        && key.channel == handle.channel
+                        && key.epoch == handle.epoch
+                })
         {
             return;
         }
@@ -3559,8 +3602,25 @@ impl Inner {
 
     fn remove_pending(&mut self, key: &PendingKey) -> Option<PendingEntry> {
         let entry = self.pending.remove(key);
+        if entry.as_ref().is_some_and(|entry| !entry.accepted) {
+            if let Some(slot) = self.wire_slots.remove(key) {
+                slot.release();
+            }
+        }
         self.reap_retired_route(RouteHandle::new(key.channel, key.epoch, key.generation));
         entry
+    }
+
+    fn release_wire_slots(&mut self, handle: RouteHandle) {
+        self.wire_slots.retain(|key, slot| {
+            let keep = key.generation != handle.connection_token()
+                || key.channel != handle.channel
+                || key.epoch != handle.epoch;
+            if !keep {
+                slot.release();
+            }
+            keep
+        });
     }
 
     fn remove_route_by_handle(&mut self, handle: RouteHandle) -> Option<RouteState> {
@@ -3587,6 +3647,9 @@ impl Inner {
     }
 
     fn drain_routes(&mut self) -> Vec<RouteState> {
+        for (_, slot) in self.wire_slots.drain() {
+            slot.release();
+        }
         self.retirement_goodbyes.clear();
         for handle in self.retired_routes.drain() {
             release_reverse_request_registry(handle);
@@ -3607,7 +3670,7 @@ impl Inner {
     fn close_routes(&mut self) {
         self.push_event_receivers.clear();
         for route in self.drain_routes() {
-            route.sem.close();
+            route.close();
         }
     }
 }
@@ -3636,6 +3699,7 @@ impl Shared {
                 next_corr: Some(1),
                 writer: None,
                 pending: HashMap::new(),
+                wire_slots: HashMap::new(),
                 routes: HashMap::new(),
                 route_by_channel: HashMap::new(),
                 one_shot_routes: HashMap::new(),
@@ -4184,6 +4248,7 @@ impl Shared {
         loop {
             attempt = attempt.saturating_add(1);
             let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+                busy_refusals: Some(true),
                 target: route_open.target.clone(),
                 identity: route_open.identity.clone(),
                 consumer_identity: route_open.consumer_identity.clone(),
@@ -4214,6 +4279,9 @@ impl Shared {
                     let ClientControlResponse::RouteOpen {
                         route_channel,
                         route_epoch,
+                        request_window,
+                        watch_window,
+                        ..
                     } = response
                     else {
                         return Err(CallError::not_sent_with_cause(
@@ -4231,10 +4299,7 @@ impl Shared {
                                 route_open.reverse_requests.clone(),
                             )
                         });
-                    let route = RouteState {
-                        handle,
-                        sem: Arc::new(Semaphore::new(DEFAULT_ROUTE_WINDOW)),
-                    };
+                    let route = RouteState::windows(handle, request_window, watch_window);
                     let install = {
                         let mut inner = self.lock_inner();
                         if inner.closed {
@@ -4419,6 +4484,15 @@ impl Shared {
         request: RequestSend,
         cancel: Option<Arc<UnaryCancel>>,
     ) -> Result<TerminalFrame, CallError> {
+        self.send_request_with_slot(request, cancel, None).await
+    }
+
+    async fn send_request_with_slot(
+        self: &Arc<Self>,
+        request: RequestSend,
+        cancel: Option<Arc<UnaryCancel>>,
+        slot: Option<Arc<RoutePermit>>,
+    ) -> Result<TerminalFrame, CallError> {
         let RequestSend {
             expected_handle,
             channel,
@@ -4436,6 +4510,16 @@ impl Shared {
                 "call deadline elapsed before request was sent",
             ));
         }
+        let slot = match (slot, expected_handle) {
+            (Some(slot), _) => Some(slot),
+            (None, Some(handle)) if channel != 0 => match self.route_state(handle) {
+                Ok(route) if route.opted_in => {
+                    Some(route.acquire(false, deadline, cancel.as_ref()).await?)
+                }
+                _ => None,
+            },
+            (None, _) => None,
+        };
         let (key, writer) = self.allocate_request(expected_handle, channel, epoch)?;
         let generation = key.generation;
 
@@ -4483,6 +4567,9 @@ impl Shared {
                     route_open_reverse_requests,
                 ),
             );
+            if let Some(slot) = slot.filter(|slot| slot.opted_in()) {
+                inner.wire_slots.insert(key, slot);
+            }
             if retain_late_route_open {
                 inner.pending.get_mut(&key).unwrap().route_open_module =
                     serde_json::from_slice::<serde_json::Value>(&frame.body)
@@ -4497,6 +4584,7 @@ impl Shared {
         }
         let mut registration =
             PendingRegistration::new(Arc::clone(self), key, retain_late_route_open);
+        registration.unary_cancel = cancel.clone();
 
         match timeout_at(
             deadline,
@@ -4568,6 +4656,13 @@ impl Shared {
                         registration.remove_pending().unwrap_or(true)
                     };
                     if accepted {
+                        // Removing the pending entry prevents an explicit cancel
+                        // from queueing afterward. If it won that race, its sent
+                        // state is already visible and the deadline sends nothing.
+                        let cancel_sent = registration.unary_cancel.as_ref().is_some_and(|cancel| cancel.sent());
+                        if !cancel_sent && self.lock_inner().wire_slots.contains_key(&key) {
+                            self.send_cancel(RouteHandle::new(key.channel, key.epoch, key.generation), key.corr, Priority::Interactive);
+                        }
                         self.spawn_liveness_probe();
                     }
                     Err(classify_failure(
@@ -4758,6 +4853,16 @@ impl Shared {
             epoch,
             corr,
         };
+        let position = Arc::new(SubscriptionPosition {
+            key: Mutex::new(key),
+            stop: CancellationToken::new(),
+        });
+        let retry = permit.opted_in().then(|| SubscriptionRetry {
+            frame: frame.clone(),
+            deadline,
+            delay: Duration::from_millis(25),
+            position: Arc::clone(&position),
+        });
         let (events_tx, events_rx) = mpsc::channel(event_buffer.max(1));
         let (closed_tx, closed_rx) = oneshot::channel();
         let (ended_tx, ended_rx) = watch::channel(None);
@@ -4775,10 +4880,13 @@ impl Shared {
                     return Err(CallError::StaleRouteHandle(expected));
                 }
             }
-            inner.pending.insert(
-                key,
-                PendingEntry::subscription(events_tx, closed_tx, ended_tx, permit, priority),
-            );
+            if permit.opted_in() {
+                inner.wire_slots.insert(key, Arc::clone(&permit));
+            }
+            let mut entry =
+                PendingEntry::subscription(events_tx, closed_tx, ended_tx, permit, priority);
+            entry.retry = retry;
+            inner.pending.insert(key, entry);
         }
         let mut registration = PendingRegistration::new(Arc::clone(self), key, false);
 
@@ -4816,21 +4924,37 @@ impl Shared {
             events: events_rx,
             closed: SubscriptionClosed { rx: closed_rx },
             ended: ended_rx,
-            cancel: SubscriptionCancel::new(Arc::clone(self), key, priority),
+            cancel: SubscriptionCancel::new(Arc::clone(self), position, priority),
         })
     }
 
     fn unsubscribe_subscription(
         &self,
-        key: PendingKey,
+        position: &SubscriptionPosition,
         priority: Priority,
     ) -> Result<(), CallError> {
+        let key = *position.key.lock().unwrap_or_else(|err| err.into_inner());
         let handle = RouteHandle::new(key.channel, key.epoch, key.generation);
         self.validate_current_handle(handle)?;
-        let entry = self.lock_inner().pending.remove(&key);
+        let (key, entry) = {
+            let mut inner = self.lock_inner();
+            let key = *position.key.lock().unwrap_or_else(|err| err.into_inner());
+            position.stop.cancel();
+            let entry = inner.pending.remove(&key);
+            if entry.as_ref().is_some_and(|entry| !entry.accepted) {
+                if let Some(slot) = inner.wire_slots.remove(&key) {
+                    slot.release();
+                }
+            }
+            // Keep retired-route ingress until its advisory Cancel is queued.
+            (key, entry)
+        };
         if let Some(entry) = entry {
+            let should_cancel = entry.accepted || entry.retry.is_none();
             entry.settle_subscription_result(Ok(()));
-            self.send_cancel(handle, key.corr, priority);
+            if should_cancel {
+                self.send_cancel(handle, key.corr, priority);
+            }
             self.lock_inner().reap_retired_route(handle);
         }
         Ok(())
@@ -5038,7 +5162,38 @@ impl Shared {
     }
 
     fn settle_pending(self: &Arc<Self>, key: PendingKey, terminal: PendingTerminal) {
-        let entry = self.lock_inner().remove_pending(&key);
+        let (entry, retry) = {
+            let mut inner = self.lock_inner();
+            let entry = inner.remove_pending(&key);
+            let slot = inner.wire_slots.remove(&key);
+            let busy = matches!(&terminal, PendingTerminal::Error { body, flags }
+                if error_codes::is_route_busy_retryable(*flags, &body.code, slot.as_ref().is_some_and(|slot| slot.opted_in())))
+                && entry
+                    .as_ref()
+                    .is_some_and(|entry| !entry.completion_is_closed());
+            if let Some(slot) = slot {
+                if !busy {
+                    slot.release();
+                }
+            }
+            if busy && entry.as_ref().is_some_and(|entry| entry.retry.is_some()) {
+                let mut entry = entry.unwrap();
+                entry.accepted = false;
+                let retry = entry.retry.clone();
+                inner.pending.insert(key, entry);
+                (None, retry)
+            } else {
+                inner.reap_retired_route(RouteHandle::new(key.channel, key.epoch, key.generation));
+                (entry, None)
+            }
+        };
+        if let Some(retry) = retry {
+            let shared = Arc::clone(self);
+            tokio::spawn(async move {
+                shared.retry_subscription(key, retry, terminal).await;
+            });
+            return;
+        }
         let Some(entry) = entry else {
             return;
         };
@@ -5050,6 +5205,7 @@ impl Shared {
                 if let Ok(ClientControlResponse::RouteOpen {
                     route_channel,
                     route_epoch,
+                    ..
                 }) = serde_json::from_slice::<ClientControlResponse>(body)
                 {
                     let handle = RouteHandle::new(route_channel, route_epoch, *generation);
@@ -5156,7 +5312,7 @@ impl Shared {
             )
         };
         for route in routes {
-            route.sem.close();
+            route.close();
         }
         if let Some(handle) = reader {
             handle.abort();
@@ -5262,6 +5418,9 @@ impl Shared {
                         inner.retired_routes.insert(route.handle);
                         if response_deadline_expired {
                             inner.retirement_goodbyes.insert(route.handle);
+                            // Closing this route releases slots retained for outstanding calls.
+                            // A module that never answers must not block the route's GOODBYE.
+                            inner.release_wire_slots(route.handle);
                             let pending_calls = inner
                                 .pending
                                 .keys()
@@ -5287,7 +5446,7 @@ impl Shared {
             }
         };
         if let Some(route) = removed {
-            route.sem.close();
+            route.close();
         }
     }
 
@@ -5318,7 +5477,7 @@ impl Shared {
             self.drain_channel(handle, opts.drain_timeout).await;
         }
         for route in routes {
-            route.sem.close();
+            route.close();
         }
         self.fail_channel_pending(
             handle,
@@ -5364,7 +5523,7 @@ impl Shared {
         // Closing the semaphore makes any not-yet-sent acquire() return Err -> the
         // caller classifies it NotSent. Already-sent pending requests are settled
         // at-most-once (OutcomeUnknown if the writer accepted their bytes).
-        route.sem.close();
+        route.close();
         self.fail_channel_pending(
             route.handle,
             "route closed by close_route",
@@ -5379,6 +5538,7 @@ impl Shared {
 
     fn uninstall_route_handle(&self, handle: RouteHandle) {
         let mut inner = self.lock_inner();
+        inner.release_wire_slots(handle);
         inner.retired_routes.remove(&handle);
         inner.retirement_goodbyes.remove(&handle);
         if inner.route_epochs.get(&handle.channel) == Some(&handle) {
@@ -5414,6 +5574,7 @@ impl Shared {
     ) {
         let entries = {
             let mut inner = self.lock_inner();
+            inner.release_wire_slots(handle);
             inner
                 .route_end_reasons
                 .insert(handle.channel, (close_reason.clone(), true));
@@ -5578,7 +5739,20 @@ struct SubscriptionSend {
     admission_class: AdmissionClass,
     event_buffer: usize,
     deadline: Instant,
-    permit: OwnedSemaphorePermit,
+    permit: Arc<RoutePermit>,
+}
+
+struct SubscriptionPosition {
+    key: Mutex<PendingKey>,
+    stop: CancellationToken,
+}
+
+#[derive(Clone)]
+struct SubscriptionRetry {
+    frame: Frame,
+    deadline: Instant,
+    delay: Duration,
+    position: Arc<SubscriptionPosition>,
 }
 
 struct OpeningGuard {
@@ -5648,6 +5822,8 @@ impl Drop for InlineReconnectGuard {
 struct RouteState {
     handle: RouteHandle,
     sem: Arc<Semaphore>,
+    watch_sem: Option<Arc<Semaphore>>,
+    opted_in: bool,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -5910,6 +6086,7 @@ struct PendingEntry {
     expected_control_handle: Option<RouteHandle>,
     route_open_reverse_requests: Option<ReverseRequestRegistry>,
     route_open_module: Option<String>,
+    retry: Option<SubscriptionRetry>,
     completion: PendingCompletion,
 }
 
@@ -5919,7 +6096,7 @@ enum PendingCompletion {
         events: mpsc::Sender<Vec<u8>>,
         closed: oneshot::Sender<Result<(), CallError>>,
         ended: watch::Sender<Option<SubscriptionEnd>>,
-        _permit: OwnedSemaphorePermit,
+        _permit: Arc<RoutePermit>,
         priority: Priority,
     },
 }
@@ -5944,6 +6121,7 @@ impl PendingEntry {
             expected_control_handle,
             route_open_reverse_requests,
             route_open_module: None,
+            retry: None,
             completion: PendingCompletion::Unary(tx),
         }
     }
@@ -5952,7 +6130,7 @@ impl PendingEntry {
         events: mpsc::Sender<Vec<u8>>,
         closed: oneshot::Sender<Result<(), CallError>>,
         ended: watch::Sender<Option<SubscriptionEnd>>,
-        permit: OwnedSemaphorePermit,
+        permit: Arc<RoutePermit>,
         priority: Priority,
     ) -> Self {
         Self {
@@ -5962,6 +6140,7 @@ impl PendingEntry {
             expected_control_handle: None,
             route_open_reverse_requests: None,
             route_open_module: None,
+            retry: None,
             completion: PendingCompletion::Subscription {
                 events,
                 closed,
@@ -6001,6 +6180,9 @@ impl PendingEntry {
     }
 
     fn settle_terminal(self, terminal: PendingTerminal) {
+        if let Some(retry) = &self.retry {
+            retry.position.stop.cancel();
+        }
         match self.completion {
             PendingCompletion::Unary(tx) => {
                 let _ = tx.send(PendingResult::Terminal(terminal));
@@ -6011,10 +6193,18 @@ impl PendingEntry {
                         (SubscriptionEnd::Response(body), Ok(()))
                     }
                     PendingTerminal::StreamEnd => (SubscriptionEnd::StreamEnd, Ok(())),
-                    PendingTerminal::Error { body, .. } => (
-                        SubscriptionEnd::Error(body.clone()),
-                        Err(CallError::Module(body)),
-                    ),
+                    PendingTerminal::Error { body, flags } => {
+                        let err = if error_codes::is_route_busy_retryable(
+                            flags,
+                            &body.code,
+                            self.retry.is_some(),
+                        ) {
+                            busy_error(&body)
+                        } else {
+                            CallError::Module(body.clone())
+                        };
+                        (SubscriptionEnd::Error(body.clone()), Err(err))
+                    }
                 };
                 let _ = ended.send(Some(end));
                 let _ = closed.send(result);
@@ -6023,6 +6213,9 @@ impl PendingEntry {
     }
 
     fn settle_failure(self, reason: String) {
+        if let Some(retry) = &self.retry {
+            retry.position.stop.cancel();
+        }
         let err = classify_failure(self.accepted, reason, OutcomeUnknownCause::ConsumerClosed);
         match self.completion {
             PendingCompletion::Unary(tx) => {
@@ -6038,6 +6231,9 @@ impl PendingEntry {
     }
 
     fn settle_call_error(self, err: CallError) {
+        if let Some(retry) = &self.retry {
+            retry.position.stop.cancel();
+        }
         match self.completion {
             PendingCompletion::Unary(tx) => {
                 let _ = tx.send(PendingResult::CallError(err));
@@ -6062,6 +6258,9 @@ impl PendingEntry {
     }
 
     fn settle_subscription_result(self, result: Result<(), CallError>) {
+        if let Some(retry) = &self.retry {
+            retry.position.stop.cancel();
+        }
         match self.completion {
             PendingCompletion::Subscription { closed, ended, .. } => {
                 let _ = ended.send(Some(SubscriptionEnd::Cancelled));
@@ -6082,6 +6281,7 @@ struct PendingRegistration {
     key: PendingKey,
     active: bool,
     retain_on_drop: bool,
+    unary_cancel: Option<Arc<UnaryCancel>>,
 }
 
 impl PendingRegistration {
@@ -6091,6 +6291,7 @@ impl PendingRegistration {
             key,
             active: true,
             retain_on_drop,
+            unary_cancel: None,
         }
     }
 
@@ -6481,6 +6682,7 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
         if let Ok(ClientControlResponse::RouteOpen {
             route_channel,
             route_epoch,
+            ..
         }) = serde_json::from_slice::<ClientControlResponse>(&frame.body)
         {
             let reverse_requests = shared
@@ -6672,6 +6874,7 @@ impl Shared {
             if inner.route_epochs.get(&handle.channel) != Some(&handle) {
                 return;
             }
+            inner.release_wire_slots(handle);
             let installed = inner.route_epochs.remove(&handle.channel).unwrap();
             inner.retired_routes.remove(&handle);
             inner.retirement_goodbyes.remove(&handle);
@@ -6683,7 +6886,7 @@ impl Shared {
                 .collect::<Vec<_>>()
         };
         for route in removed {
-            route.sem.close();
+            route.close();
         }
     }
 }
@@ -7080,6 +7283,8 @@ fn daemon_version_at_least(daemon_ver: &str, minimum: (u64, u64, u64)) -> bool {
 /// (0.37.15 or later). It proves only this attempt, not any earlier attempts of
 /// a call. For managed calls use [`CallError::never_forwarded`] instead.
 /// Unmarked errors and untrusted daemon versions never prove non-delivery.
+/// This helper cannot see route negotiation and does not classify `route_busy`;
+/// SDK-managed requests on opted-in routes handle that refusal internally.
 pub fn is_daemon_refusal_before_forward(
     daemon_origin_trusted: bool,
     flags: Flags,
@@ -7150,6 +7355,7 @@ mod local_transport_tests;
 mod tests {
     use super::*;
 
+    mod busy_refusals_tests;
     mod not_sent_tests;
     mod route_deadline_tests;
 
@@ -7267,6 +7473,8 @@ mod tests {
             .install_one_shot_route(RouteState {
                 handle,
                 sem: Arc::new(Semaphore::new(1)),
+                watch_sem: None,
+                opted_in: false,
             })
             .unwrap();
         let request = tokio::spawn(async move {
@@ -7323,6 +7531,8 @@ mod tests {
         let command = receiver.recv().await.expect("route.open frame");
         let request = serde_json::from_slice(&command.frame.body).unwrap();
         let response_body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+            request_window: None,
+            watch_window: None,
             route_channel: 17,
             route_epoch: 3,
         })
@@ -7388,7 +7598,7 @@ mod tests {
                 admission_class: AdmissionClass::Normal,
                 event_buffer: 1,
                 deadline: Instant::now() + Duration::from_secs(1),
-                permit,
+                permit: RoutePermit::legacy(permit),
             })
             .await
             .unwrap();
@@ -7654,6 +7864,8 @@ mod tests {
             .install_one_shot_route(RouteState {
                 handle,
                 sem: Arc::clone(&sem),
+                watch_sem: None,
+                opted_in: false,
             })
             .unwrap();
         let consumer = SubcConsumer {
@@ -8566,6 +8778,8 @@ mod tests {
                 0,
                 corr,
                 serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                    request_window: None,
+                    watch_window: None,
                     route_channel: channel,
                     route_epoch: 1,
                 })
@@ -9358,6 +9572,8 @@ mod tests {
                 let route = RouteState {
                     handle: RouteHandle::new(channel, channel.into(), 1),
                     sem: Arc::new(Semaphore::new(DEFAULT_ROUTE_WINDOW)),
+                    watch_sem: None,
+                    opted_in: false,
                 };
                 inner.cache_route(key.clone(), route.clone());
                 expected.push((key, route));
@@ -10047,6 +10263,8 @@ mod tests {
             RouteState {
                 handle,
                 sem: Arc::new(Semaphore::new(1)),
+                watch_sem: None,
+                opted_in: false,
             },
         );
         let consumer = SubcConsumer { shared };
@@ -10299,7 +10517,7 @@ mod tests {
                 events_tx,
                 closed_tx,
                 ended_tx,
-                permit,
+                RoutePermit::legacy(permit),
                 Priority::Interactive,
             ),
         );
@@ -10539,6 +10757,8 @@ mod tests {
                 .insert(key, PendingEntry::unary(tx, true, None, None));
         }
         let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+            request_window: None,
+            watch_window: None,
             route_channel: 12,
             route_epoch: 7,
         })
@@ -10583,6 +10803,8 @@ mod tests {
                 .insert(key, PendingEntry::unary(tx, true, None, None));
         }
         let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+            request_window: None,
+            watch_window: None,
             route_channel: 13,
             route_epoch: 8,
         })
@@ -10693,6 +10915,8 @@ mod tests {
                 RouteState {
                     handle,
                     sem: Arc::new(Semaphore::new(1)),
+                    watch_sem: None,
+                    opted_in: false,
                 },
             );
         }
@@ -10861,6 +11085,8 @@ mod tests {
         let command = rx.recv().await.expect("one route.open must be queued");
         let request: ClientControlRequest = serde_json::from_slice(&command.frame.body).unwrap();
         let response = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+            request_window: None,
+            watch_window: None,
             route_channel: 21,
             route_epoch: 4,
         })
@@ -11260,6 +11486,8 @@ mod tests {
                 RouteState {
                     handle,
                     sem: Arc::clone(&route_sem),
+                    watch_sem: None,
+                    opted_in: false,
                 },
             );
         }

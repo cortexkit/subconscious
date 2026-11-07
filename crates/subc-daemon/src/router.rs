@@ -945,6 +945,32 @@ impl Router {
         self.route_for_connection_started(ctx, frame, None).await
     }
 
+    pub(crate) async fn observe_connection_wait<F: std::future::Future>(
+        &self,
+        ctx: &RouteCtx,
+        kind: &'static str,
+        future: F,
+    ) -> F::Output {
+        self.counters
+            .observe_reader_wait(
+                || {
+                    let module = self
+                        .forwarding
+                        .module_id_for_connection(ctx.connection_id)
+                        .ok()
+                        .flatten();
+                    let principal = if module.is_some() { "module" } else { "direct" };
+                    (
+                        module.unwrap_or_else(|| crate::observability::CONTROL_WAIT_BUCKET.into()),
+                        principal.into(),
+                    )
+                },
+                kind,
+                future,
+            )
+            .await
+    }
+
     pub(crate) async fn route_for_connection_started(
         &self,
         ctx: &RouteCtx,
@@ -973,7 +999,8 @@ impl Router {
                 .handle_control_frame_timed(ctx, frame, dispatch_started_at)
                 .await?;
             for response in responses {
-                ctx.egress.send(response).await?;
+                self.observe_connection_wait(ctx, "reply_egress", ctx.egress.send(response))
+                    .await?;
             }
             return Ok(());
         }
@@ -1001,7 +1028,12 @@ impl Router {
                         corr,
                     };
                     if let Some(error_frame) = err.to_error_frame() {
-                        ctx.egress.send(error_frame).await?;
+                        self.observe_connection_wait(
+                            ctx,
+                            "reply_egress",
+                            ctx.egress.send(error_frame),
+                        )
+                        .await?;
                     }
                 } else {
                     self.handle_orphan_module_frame(ctx, &frame)?;
@@ -1029,7 +1061,12 @@ impl Router {
                         corr,
                     };
                     if let Some(error_frame) = err.to_error_frame() {
-                        ctx.egress.send(error_frame).await?;
+                        self.observe_connection_wait(
+                            ctx,
+                            "reply_egress",
+                            ctx.egress.send(error_frame),
+                        )
+                        .await?;
                     }
                 } else {
                     self.record_module_frame_drop(ctx.connection_id)?;
@@ -1057,7 +1094,12 @@ impl Router {
                         corr,
                     };
                     if let Some(error_frame) = err.to_error_frame() {
-                        ctx.egress.send(error_frame).await?;
+                        self.observe_connection_wait(
+                            ctx,
+                            "reply_egress",
+                            ctx.egress.send(error_frame),
+                        )
+                        .await?;
                     }
                 } else {
                     self.handle_orphan_module_frame(ctx, &frame)?;
@@ -1082,7 +1124,14 @@ impl Router {
                         // daemon-authored, so the origin bit is cleared on
                         // every module frame relayed to a client.
                         goodbye.header.flags = goodbye.header.flags.without_daemon_origin();
-                        if let Err(err) = target.sink.send_to_client(goodbye).await {
+                        if let Err(err) = self
+                            .observe_connection_wait(
+                                ctx,
+                                "module_to_client",
+                                target.sink.send_to_client(goodbye),
+                            )
+                            .await
+                        {
                             if !target.close_on_delivery_failure() {
                                 self.forwarding.warn_frame_drop(
                                     target.connection_id,
@@ -1161,7 +1210,15 @@ impl Router {
                 // module may have set is cleared; every other flag bit and
                 // the body travel unchanged.
                 frame.header.flags = frame.header.flags.without_daemon_origin();
-                if let Err(err) = route.client_sink.send_to_client(frame).await {
+                if let Err(err) = self
+                    .counters
+                    .observe_reader_wait(
+                        || (route.module_id.clone(), principal_label(&route.principal)),
+                        "module_to_client",
+                        route.client_sink.send_to_client(frame),
+                    )
+                    .await
+                {
                     if self
                         .forwarding
                         .escalate_client_delivery_failure_diagnosed(
@@ -1207,7 +1264,12 @@ impl Router {
                         corr,
                     };
                     if let Some(error_frame) = err.to_error_frame() {
-                        ctx.egress.send(error_frame).await?;
+                        self.observe_connection_wait(
+                            ctx,
+                            "reply_egress",
+                            ctx.egress.send(error_frame),
+                        )
+                        .await?;
                     }
                 }
                 debug!(
@@ -1231,7 +1293,12 @@ impl Router {
                         corr,
                     };
                     if let Some(error_frame) = err.to_error_frame() {
-                        ctx.egress.send(error_frame).await?;
+                        self.observe_connection_wait(
+                            ctx,
+                            "reply_egress",
+                            ctx.egress.send(error_frame),
+                        )
+                        .await?;
                     }
                 }
                 return Ok(());
@@ -1273,7 +1340,8 @@ impl Router {
                 corr,
             };
             if let Some(error_frame) = err.to_error_frame() {
-                ctx.egress.send(error_frame).await?;
+                self.observe_connection_wait(ctx, "reply_egress", ctx.egress.send(error_frame))
+                    .await?;
             }
         }
         Ok(())
@@ -1337,14 +1405,14 @@ impl Router {
         if ty == FrameType::Request {
             // A reverse request belongs to the module, not to a waiting client.
             // Answer its sender without forwarding any part of it to the client.
-            ctx.egress
-                .send(frame_too_large_error(
-                    route.module_channel,
-                    route.module_epoch,
-                    corr,
-                    bytes,
-                    limit,
-                )?)
+            let error = frame_too_large_error(
+                route.module_channel,
+                route.module_epoch,
+                corr,
+                bytes,
+                limit,
+            )?;
+            self.observe_connection_wait(ctx, "reply_egress", ctx.egress.send(error))
                 .await?;
         } else {
             // A refused stream chunk also ends the waiting request. Releasing
@@ -1359,7 +1427,15 @@ impl Router {
             )?;
             // The replacement shares the reply's bounded burst grace, so a
             // stopped client cannot indefinitely stall the module frame reader.
-            if let Err(err) = route.client_sink.send_to_client(error).await {
+            if let Err(err) = self
+                .counters
+                .observe_reader_wait(
+                    || (route.module_id.clone(), principal_label(&route.principal)),
+                    "module_to_client",
+                    route.client_sink.send_to_client(error),
+                )
+                .await
+            {
                 if self
                     .forwarding
                     .escalate_client_delivery_failure_diagnosed(
@@ -1499,10 +1575,72 @@ impl ForwardBackend {
         // CANCEL and other non-REQUEST frames bypass the request-credit window;
         // the original request's credit is freed only by the module's terminal frame.
         let acquired_credit = frame_type == FrameType::Request;
-        if acquired_credit {
-            if let Err(err) = route
-                .flow
-                .acquire_tagged(corr, frame.header.flags.is_subscription())
+        if acquired_credit && route.flow.busy_refusals() {
+            use crate::forwarding::RequestAdmission;
+            match self
+                .forwarding
+                .try_admit_request(
+                    &route,
+                    frame.header.epoch,
+                    corr,
+                    frame.header.flags.is_subscription(),
+                )
+                .map_err(RouterError::Forwarding)?
+            {
+                RequestAdmission::Admitted => {}
+                RequestAdmission::Busy(detail) => {
+                    let principal = principal_label(&route.principal);
+                    let counters = self.forwarding.counters_ref();
+                    counters.increment_route_busy(&route.module_id, &principal);
+                    if route.flow.should_warn_busy() {
+                        warn!(module_id = %route.module_id, client_principal = %principal, client_channel = channel,
+                            route_epoch = route.client_epoch, ?detail, "request refused: route_busy");
+                    }
+                    let error = RouterError::RouteBusy {
+                        channel,
+                        epoch: frame.header.epoch,
+                        corr,
+                        detail: Box::new(detail),
+                    };
+                    let refusal = error
+                        .to_error_frame()
+                        .expect("route_busy is a serializable wire error");
+                    counters
+                        .observe_reader_wait(
+                            || (route.module_id.clone(), principal),
+                            "route_busy_egress",
+                            route.client_sink.send(refusal),
+                        )
+                        .await?;
+                    return Ok(());
+                }
+                RequestAdmission::ModuleReloading => {
+                    return Err(RouterError::route_error_with_epoch(
+                        channel,
+                        frame.header.epoch,
+                        corr,
+                        error_codes::MODULE_RELOADING,
+                        format!("module endpoint for route channel {channel} is reloading"),
+                    ));
+                }
+                RequestAdmission::Stale => {
+                    return Err(RouterError::StaleRouteEpoch {
+                        channel,
+                        epoch: frame.header.epoch,
+                        corr,
+                    })
+                }
+            }
+        } else if acquired_credit {
+            let counters = self.forwarding.counters_ref();
+            if let Err(err) = counters
+                .observe_reader_wait(
+                    || (route.module_id.clone(), principal_label(&route.principal)),
+                    "legacy_credit",
+                    route
+                        .flow
+                        .acquire_tagged(corr, frame.header.flags.is_subscription()),
+                )
                 .await
             {
                 self.forwarding.warn_frame_drop(
@@ -1547,16 +1685,24 @@ impl ForwardBackend {
         // frame carrying it must not reach a module appearing daemon-authored,
         // so it is cleared here; every other flag bit travels unchanged.
         frame.header.flags = frame.header.flags.without_daemon_origin();
-        let result = route.module_sink.send(frame).await.map_err(|err| {
-            self.forwarding.warn_frame_drop(
-                route.client_connection_id,
-                channel,
-                route.client_epoch,
-                "client_to_module",
-                "endpoint_gone",
-            );
-            RouterError::backend_with_epoch(channel, route.client_epoch, corr, err.to_string())
-        });
+        let counters = self.forwarding.counters_ref();
+        let result = counters
+            .observe_reader_wait(
+                || (route.module_id.clone(), principal_label(&route.principal)),
+                "module_queue",
+                route.module_sink.send(frame),
+            )
+            .await
+            .map_err(|err| {
+                self.forwarding.warn_frame_drop(
+                    route.client_connection_id,
+                    channel,
+                    route.client_epoch,
+                    "client_to_module",
+                    "endpoint_gone",
+                );
+                RouterError::backend_with_epoch(channel, route.client_epoch, corr, err.to_string())
+            });
         if acquired_credit && result.is_err() {
             route.flow.release_corr(corr);
         }
@@ -1588,6 +1734,12 @@ pub enum RouterError {
         channel: u16,
         epoch: u32,
         corr: u64,
+    },
+    RouteBusy {
+        channel: u16,
+        epoch: u32,
+        corr: u64,
+        detail: Box<subc_protocol::RouteBusyDetail>,
     },
     Backend {
         channel: u16,
@@ -1653,6 +1805,29 @@ impl RouterError {
     /// Translate route failures that belong on the wire into an `ERROR` frame.
     pub fn to_error_frame(&self) -> Option<Frame> {
         match self {
+            Self::RouteBusy {
+                channel,
+                epoch,
+                corr,
+                detail,
+            } => {
+                let body = serde_json::to_vec(&ErrorBody {
+                    code: error_codes::ROUTE_BUSY.into(),
+                    message: "route has no free request or watch credit; retry on the same route"
+                        .into(),
+                    detail: Some(serde_json::to_value(detail).ok()?),
+                })
+                .ok()?;
+                Frame::build(
+                    FrameType::Error,
+                    daemon_error_flags(),
+                    *channel,
+                    *epoch,
+                    *corr,
+                    body,
+                )
+                .ok()
+            }
             Self::UnknownChannel {
                 channel,
                 epoch,
@@ -1769,6 +1944,9 @@ impl fmt::Display for RouterError {
             Self::StaleRouteEpoch { channel, corr, .. } => {
                 write!(f, "stale route epoch for channel {channel} corr {corr}")
             }
+            Self::RouteBusy { channel, corr, .. } => {
+                write!(f, "route busy on channel {channel} corr {corr}")
+            }
             Self::Backend {
                 channel,
                 corr,
@@ -1803,6 +1981,7 @@ impl Error for RouterError {
             | Self::DuplicateChannel { .. }
             | Self::UnknownChannel { .. }
             | Self::StaleRouteEpoch { .. }
+            | Self::RouteBusy { .. }
             | Self::Backend { .. }
             | Self::RouteError { .. } => None,
         }
@@ -1811,6 +1990,7 @@ impl Error for RouterError {
 
 #[cfg(test)]
 mod tests {
+    include!("route_busy_router_tests.rs");
     use super::*;
     use crate::{
         forwarding::RouteBindRelayOutcome,
@@ -3602,6 +3782,10 @@ mod tests {
     );
 
     fn dynamic_route_fixture(commit: bool) -> DynamicRouteFixture {
+        dynamic_route_fixture_with_busy(commit, false)
+    }
+
+    fn dynamic_route_fixture_with_busy(commit: bool, busy_refusals: bool) -> DynamicRouteFixture {
         let forwarding = Arc::new(ForwardingTable::default());
         let control = Arc::new(crate::ControlHandler::with_forwarding(
             Arc::new(crate::Registry::default()),
@@ -3610,7 +3794,7 @@ mod tests {
         let router = Router::with_control_handler(control);
         let module_connection = ConnectionId::new(500);
         let client_connection = ConnectionId::new(501);
-        let (module_tx, module_rx) = mpsc::channel(8);
+        let (module_tx, module_rx) = mpsc::channel(if busy_refusals { 64 } else { 8 });
         forwarding
             .register_module_connection(
                 module_connection,
@@ -3620,14 +3804,15 @@ mod tests {
                 FrameSink::new(module_tx),
             )
             .unwrap();
-        let (client_tx, client_rx) = mpsc::channel(8);
+        let (client_tx, client_rx) = mpsc::channel(if busy_refusals { 64 } else { 8 });
         let client_sink = FrameSink::new(client_tx);
         let pending = forwarding
-            .begin_route_bind_relay_for_test(
+            .begin_route_bind_relay_with_busy_for_test(
                 client_connection,
                 client_sink.clone(),
                 700,
                 "epoch-router",
+                busy_refusals,
             )
             .unwrap();
         if commit {

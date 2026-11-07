@@ -537,6 +537,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let request = ClientControlRequest::RouteOpen {
+        busy_refusals: None,
         target,
         identity: BindIdentity::new("opencode".to_string(), format!("closure-{}", corr)),
         consumer_identity: None,
@@ -558,6 +559,7 @@ where
         ClientControlResponse::RouteOpen {
             route_channel,
             route_epoch,
+            ..
         } => RouteOpenAck {
             route_channel,
             route_epoch,

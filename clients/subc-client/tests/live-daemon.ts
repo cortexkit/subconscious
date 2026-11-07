@@ -1,5 +1,16 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  chmodSync,
+  constants,
+  copyFileSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -54,7 +65,15 @@ export async function startLiveDaemon(
   const runtimeDir = mkdtempSync(join(tmpdir(), `${prefix}-rt-`));
   // Test daemons must not look like the operator's ck-subc to process-name tooling.
   const executable = join(runtimeDir, "ckdev-subc");
-  linkSync(DAEMON, executable);
+  try {
+    linkSync(DAEMON, executable);
+  } catch (error) {
+    if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== "EXDEV") throw error;
+    // Build output and the temp folder can sit on different filesystems.
+    copyFileSync(DAEMON, executable, constants.COPYFILE_EXCL);
+    chmodSync(executable, 0o700);
+    accessSync(executable, constants.X_OK);
+  }
   const configDir = mkdtempSync(join(tmpdir(), `${prefix}-cfg-`));
   // The daemon mints its machine id and writes its run directory under the
   // data home, so it must never inherit the operator's real one.

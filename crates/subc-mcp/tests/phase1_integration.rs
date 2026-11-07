@@ -4685,6 +4685,7 @@ async fn supervised_mcp_module_reports_live_non_routable_and_preserves_provider_
         &mut client,
         2_001,
         ClientControlRequest::RouteOpen {
+            busy_refusals: None,
             target: RouteTarget::ToolProvider {
                 module_id: "mcp".to_string(),
             },
@@ -5517,6 +5518,7 @@ where
         stream,
         corr,
         ClientControlRequest::RouteOpen {
+            busy_refusals: None,
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
@@ -5533,6 +5535,7 @@ where
         ClientControlResponse::RouteOpen {
             route_channel,
             route_epoch,
+            ..
         } => WireRoute {
             channel: route_channel,
             epoch: route_epoch,

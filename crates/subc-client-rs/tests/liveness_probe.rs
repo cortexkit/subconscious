@@ -339,6 +339,8 @@ async fn serve_connection(
                 serde_json::from_slice(&frame.body).map_err(io::Error::other)?;
             if matches!(request, ClientControlRequest::RouteOpen { .. }) {
                 let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                    request_window: None,
+                    watch_window: None,
                     route_channel: 41,
                     route_epoch: 1,
                 })

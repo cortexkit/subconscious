@@ -26,6 +26,7 @@ fn refusal_open_frame(
     let (ctx, rx) = wide_ctx(rig.next_connection);
     let root = unique_project_root("refused-line");
     let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+        busy_refusals: None,
         target: RouteTarget::ToolProvider {
             module_id: target.to_string(),
         },

@@ -55,6 +55,10 @@ pub mod error_codes {
 
     pub const UNKNOWN_CHANNEL: &str = "unknown_channel";
     pub const STALE_ROUTE_EPOCH: &str = "stale_route_epoch";
+    /// An opted-in established route has no free request or watch credit.
+    /// The daemon did not forward this request; retry on the same route, never
+    /// by treating the route as dead or reopening it.
+    pub const ROUTE_BUSY: &str = "route_busy";
     /// A module reply exceeds the client connection's whole egress byte budget.
     /// TERMINAL for this request: the module already received it, and retrying
     /// unchanged would produce the same oversized reply. The route stays open.
@@ -307,6 +311,13 @@ pub mod error_codes {
     pub fn is_established_route_dead(_flags: Flags, code: &str) -> bool {
         matches!(code, UNKNOWN_CHANNEL | STALE_ROUTE_EPOCH)
     }
+
+    /// Whether an error proves a retryable credit refusal on the same route.
+    /// A negotiated request window and daemon origin are both required: module
+    /// errors, and errors on routes without the opt-in, prove no non-delivery.
+    pub fn is_route_busy_retryable(flags: Flags, code: &str, route_opted_in: bool) -> bool {
+        route_opted_in && flags.is_daemon_origin() && code == ROUTE_BUSY
+    }
 }
 
 pub use frame::{Frame, FrameBuildError};
@@ -499,6 +510,18 @@ pub struct ErrorBody {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
+}
+
+/// Credit snapshot attached to a daemon's never-forwarded `route_busy` error.
+/// `request_in_flight` counts all admitted requests, including watches.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteBusyDetail {
+    pub reason: String,
+    pub request_in_flight: usize,
+    pub watch_in_flight: usize,
+    pub request_window: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_window: Option<usize>,
 }
 
 impl ErrorBody {

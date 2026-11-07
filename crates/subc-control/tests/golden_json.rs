@@ -356,6 +356,7 @@ fn golden_path(name: &str) -> PathBuf {
 
 fn route_open_role_versions(with_role_versions: bool) -> ClientControlRequest {
     ClientControlRequest::RouteOpen {
+        busy_refusals: None,
         target: RouteTarget::ToolProvider {
             module_id: "aft".to_string(),
         },
@@ -370,6 +371,86 @@ fn route_open_role_versions(with_role_versions: bool) -> ClientControlRequest {
         admission_facts: None,
         scope: None,
     }
+}
+
+#[test]
+fn route_open_busy_refusals_optional_fields_round_trip_with_older_peers() {
+    let mut request = route_open_role_versions(false);
+    let ClientControlRequest::RouteOpen { busy_refusals, .. } = &mut request else {
+        unreachable!()
+    };
+    *busy_refusals = Some(true);
+    assert_golden(
+        "client_control_request_route_open_with_busy_refusals",
+        &request,
+    );
+    let response = ClientControlResponse::RouteOpen {
+        route_channel: 42,
+        route_epoch: 7,
+        request_window: Some(32),
+        watch_window: Some(24),
+    };
+    assert_golden(
+        "client_control_response_route_open_with_busy_refusals",
+        &response,
+    );
+    assert_golden(
+        "client_control_response_route_open_without_watch_window",
+        &ClientControlResponse::RouteOpen {
+            route_channel: 42,
+            route_epoch: 7,
+            request_window: Some(1),
+            watch_window: None,
+        },
+    );
+
+    #[derive(serde::Deserialize)]
+    struct OlderRequest {
+        target: RouteTarget,
+        identity: BindIdentity,
+    }
+    let older: OlderRequest =
+        serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+    assert_eq!(
+        older.target,
+        RouteTarget::ToolProvider {
+            module_id: "aft".into()
+        }
+    );
+    assert_eq!(older.identity, bind_identity());
+    #[derive(serde::Deserialize)]
+    struct OlderResponse {
+        route_channel: u16,
+        route_epoch: u32,
+    }
+    let older: OlderResponse =
+        serde_json::from_value(serde_json::to_value(response).unwrap()).unwrap();
+    assert_eq!((older.route_channel, older.route_epoch), (42, 7));
+
+    let old_response =
+        serde_json::json!({ "op": "route.open", "route_channel": 42, "route_epoch": 7 });
+    assert!(matches!(
+        serde_json::from_value::<ClientControlResponse>(old_response).unwrap(),
+        ClientControlResponse::RouteOpen {
+            request_window: None,
+            watch_window: None,
+            ..
+        }
+    ));
+    let old_request: ClientControlRequest = serde_json::from_str(
+        &fs::read_to_string(golden_path(
+            "client_control_request_route_open_without_role_versions",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        old_request,
+        ClientControlRequest::RouteOpen {
+            busy_refusals: None,
+            ..
+        }
+    ));
 }
 
 fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
@@ -402,6 +483,7 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                     serde_json::json!({"schema": 1, "verified_class": "service"}),
                 ),
                 scope: None,
+                busy_refusals: None,
             },
         ),
         (
@@ -420,6 +502,7 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                 role_versions: None,
                 admission_facts: None,
                 scope: None,
+                busy_refusals: None,
             },
         ),
         // A consumer declaring the role versions it speaks, and the same open
@@ -454,6 +537,7 @@ fn client_control_requests() -> Vec<(&'static str, ClientControlRequest)> {
                     "head-1",
                     Some(3),
                 )),
+                busy_refusals: None,
             },
         ),
         (
@@ -675,6 +759,8 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
             ClientControlResponse::RouteOpen {
                 route_channel: 42,
                 route_epoch: 7,
+                request_window: None,
+                watch_window: None,
             },
         ),
         (

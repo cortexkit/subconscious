@@ -503,6 +503,7 @@ struct RouteOpenRequest {
     consumer_identity: Option<ConsumerIdentity>,
     consumer_capabilities: Option<Vec<String>>,
     role_versions: Option<BTreeMap<String, String>>,
+    busy_refusals: Option<bool>,
     admission_facts: Option<serde_json::Value>,
     scope: Option<ScopeSelector>,
 }
@@ -2061,7 +2062,14 @@ impl ControlHandler {
                     return self.handle_operator_confirm(ctx, frame);
                 }
                 if op.as_ref().is_some_and(|probe| probe.op == ops::APP_OPEN) {
-                    return self.handle_app_open(ctx, frame).await;
+                    return self
+                        .observe_control_wait(
+                            ctx,
+                            None,
+                            ops::APP_OPEN,
+                            self.handle_app_open(ctx, frame),
+                        )
+                        .await;
                 }
                 if op
                     .as_ref()
@@ -3122,8 +3130,10 @@ impl ControlHandler {
                 consumer_identity,
                 consumer_capabilities,
                 role_versions,
+                busy_refusals,
                 admission_facts,
                 scope,
+                ..
             } => {
                 self.handle_route_open(
                     ctx,
@@ -3134,6 +3144,7 @@ impl ControlHandler {
                         consumer_identity,
                         consumer_capabilities,
                         role_versions,
+                        busy_refusals,
                         admission_facts,
                         scope,
                     },
@@ -3230,7 +3241,7 @@ impl ControlHandler {
                     )?;
                 }
                 let requester = self.supervisor_requester(ctx, frame.header.corr)?;
-                self.handle_supervisor_rescan(
+                let operation = self.handle_supervisor_rescan(
                     frame,
                     if preview {
                         RescanMode::Preview
@@ -3238,16 +3249,22 @@ impl ControlHandler {
                         RescanMode::Execute
                     },
                     requester,
-                )
-                .await
+                );
+                self.observe_control_wait(ctx, None, ops::SUPERVISOR_RESCAN, operation)
+                    .await
             }
             ClientControlRequest::SupervisorRescanChecked {
                 preview,
                 candidate,
                 expect,
             } => {
-                self.handle_supervisor_rescan_checked(ctx, frame, preview, candidate, expect)
-                    .await
+                self.observe_control_wait(
+                    ctx,
+                    None,
+                    ops::SUPERVISOR_RESCAN,
+                    self.handle_supervisor_rescan_checked(ctx, frame, preview, candidate, expect),
+                )
+                .await
             }
             ClientControlRequest::SupervisorReleaseReserved { module_id } => {
                 self.log_supervisor_request_received(
@@ -3273,14 +3290,16 @@ impl ControlHandler {
                     .await
             }
             ClientControlRequest::SupervisorHealthProbe { module_id } => {
-                self.handle_supervisor_health_probe(frame, module_id).await
+                self.handle_supervisor_health_probe(ctx, frame, module_id)
+                    .await
             }
             ClientControlRequest::SupervisorHealth {} => self.handle_supervisor_health(frame),
             ClientControlRequest::SupervisorRoutes { module_id } => {
                 self.handle_supervisor_routes(frame, module_id)
             }
             ClientControlRequest::SupervisorProvenance { module_id } => {
-                self.handle_supervisor_provenance(frame, module_id).await
+                self.handle_supervisor_provenance(ctx, frame, module_id)
+                    .await
             }
             ClientControlRequest::SupervisorStderrTail {
                 module_id,
@@ -3288,7 +3307,8 @@ impl ControlHandler {
                 max_bytes,
             } => self.handle_supervisor_stderr_tail(frame, module_id, max_lines, max_bytes),
             ClientControlRequest::SupervisorTerminals { module_id } => {
-                self.handle_supervisor_terminals(frame, module_id).await
+                self.handle_supervisor_terminals(ctx, frame, module_id)
+                    .await
             }
         }
     }
@@ -4797,6 +4817,7 @@ impl ControlHandler {
             consumer_identity,
             consumer_capabilities,
             role_versions,
+            busy_refusals,
             admission_facts,
             scope,
         } = request;
@@ -5419,6 +5440,7 @@ impl ControlHandler {
                 build_class,
                 operator_app.clone(),
                 relay_deadline,
+                busy_refusals == Some(true),
             )
             .await
         {
@@ -6017,8 +6039,61 @@ impl ControlHandler {
         )?])
     }
 
+    async fn observe_control_wait<F: std::future::Future>(
+        &self,
+        ctx: &RouteCtx,
+        target: Option<&str>,
+        kind: &'static str,
+        future: F,
+    ) -> F::Output {
+        self.counters
+            .observe_reader_wait(
+                || {
+                    let module = self
+                        .forwarding
+                        .module_id_for_connection(ctx.connection_id)
+                        .ok()
+                        .flatten();
+                    let principal = if module.is_some() { "module" } else { "direct" };
+                    (
+                        self.resolve_reader_wait_target(kind, target)
+                            .or(module)
+                            .unwrap_or_else(|| crate::observability::CONTROL_WAIT_BUCKET.into()),
+                        principal.into(),
+                    )
+                },
+                kind,
+                future,
+            )
+            .await
+    }
+
+    /// Resolve the reader-wait module ID only from supervisor or registry
+    /// records; never attribute a wait from the request selector alone.
+    pub(crate) fn resolve_reader_wait_target(
+        &self,
+        op: &str,
+        selector: Option<&str>,
+    ) -> Option<String> {
+        let selector = selector?;
+        match op {
+            ops::SUPERVISOR_TERMINALS | ops::SUPERVISOR_PROVENANCE => self
+                .supervisor
+                .get(selector)
+                .map(|module| module.module_id().to_owned()),
+            ops::SUPERVISOR_HEALTH_PROBE => self
+                .registry
+                .get_module(selector)
+                .ok()
+                .flatten()
+                .map(|registration| registration.manifest.module_id),
+            _ => None,
+        }
+    }
+
     async fn handle_supervisor_terminals(
         &self,
+        ctx: &RouteCtx,
         frame: Frame,
         module_id: String,
     ) -> Result<Vec<Frame>, RouterError> {
@@ -6032,8 +6107,13 @@ impl ControlHandler {
 
         // The journal read runs on a blocking thread: it can be megabytes of
         // file I/O and must not occupy a runtime worker.
-        let terminals = module
-            .read_durable_terminal_history()
+        let terminals = self
+            .observe_control_wait(
+                ctx,
+                Some(module.module_id()),
+                ops::SUPERVISOR_TERMINALS,
+                module.read_durable_terminal_history(),
+            )
             .await
             .map_err(|error| {
                 RouterError::backend(
@@ -6099,10 +6179,12 @@ impl ControlHandler {
 
     async fn handle_supervisor_provenance(
         &self,
+        ctx: &RouteCtx,
         frame: Frame,
         module_id: Option<String>,
     ) -> Result<Vec<Frame>, RouterError> {
-        let mut selected = if let Some(module_id) = module_id {
+        let targeted = module_id.is_some();
+        let selected = if let Some(module_id) = module_id {
             let Some(module) = self.supervisor.get(&module_id) else {
                 return Ok(vec![control_error_frame(
                     &frame,
@@ -6115,71 +6197,75 @@ impl ControlHandler {
             self.supervisor.list()
         };
 
-        let mut modules = Vec::with_capacity(selected.len());
-        for module in selected.drain(..) {
-            let (status, observed_image) = module
-                .status_and_running_image_agreement()
-                .await
-                .map_err(|err| {
-                    RouterError::backend(
-                        0,
-                        frame.header.corr,
-                        format!("failed to read supervisor status: {err}"),
-                    )
-                })?;
-            let module_declared = self
-                .registry
-                .get_module(&status.module_id)
-                .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
-                .and_then(|registration| registration.manifest.provenance)
-                .map(|build| ModuleDeclaredProvenance::Reported { build })
-                .unwrap_or(ModuleDeclaredProvenance::Unverifiable);
-            #[cfg(test)]
-            let running_image = match &self.provenance_probe_override {
-                Some(result) => result.clone(),
-                None => observed_image,
-            };
-            #[cfg(not(test))]
-            let running_image = observed_image;
-            modules.push(SupervisorModuleProvenance {
-                module_id: status.module_id,
-                module_declared,
-                daemon_observed: SupervisorObservedProcess {
-                    launch_nonce_source: status.launch_nonce_source,
-                    pid: status.pid,
-                    spawned_at_ms: status.spawned_at_ms,
-                    spawned_from: status.spawned_from,
-                    running_image,
+        let target = targeted.then(|| selected[0].module_id());
+        self.observe_control_wait(ctx, target, ops::SUPERVISOR_PROVENANCE, async {
+            let mut modules = Vec::with_capacity(selected.len());
+            for module in &selected {
+                let (status, observed_image) = module
+                    .status_and_running_image_agreement()
+                    .await
+                    .map_err(|err| {
+                        RouterError::backend(
+                            0,
+                            frame.header.corr,
+                            format!("failed to read supervisor status: {err}"),
+                        )
+                    })?;
+                let module_declared = self
+                    .registry
+                    .get_module(&status.module_id)
+                    .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+                    .and_then(|registration| registration.manifest.provenance)
+                    .map(|build| ModuleDeclaredProvenance::Reported { build })
+                    .unwrap_or(ModuleDeclaredProvenance::Unverifiable);
+                #[cfg(test)]
+                let running_image = match &self.provenance_probe_override {
+                    Some(result) => result.clone(),
+                    None => observed_image,
+                };
+                #[cfg(not(test))]
+                let running_image = observed_image;
+                modules.push(SupervisorModuleProvenance {
+                    module_id: status.module_id,
+                    module_declared,
+                    daemon_observed: SupervisorObservedProcess {
+                        launch_nonce_source: status.launch_nonce_source,
+                        pid: status.pid,
+                        spawned_at_ms: status.spawned_at_ms,
+                        spawned_from: status.spawned_from,
+                        running_image,
+                    },
+                });
+            }
+            let daemon = SupervisorDaemonProvenance {
+                daemon_build: self.daemon_provenance.build.clone(),
+                daemon_observed: DaemonObservedProcess {
+                    pid: self.daemon_provenance.pid,
+                    started_at_ms: self
+                        .daemon_provenance
+                        .start_clock
+                        .map(|clock| clock.started_at_ms())
+                        .or(self.daemon_provenance.started_at_ms),
+                    running_image: self
+                        .daemon_provenance
+                        .probe
+                        .observe(
+                            self.daemon_provenance.pid,
+                            self.daemon_provenance.executable_path.as_deref(),
+                            self.daemon_provenance.executable_identity.clone(),
+                            self.daemon_provenance.process_start_time,
+                        )
+                        .await,
                 },
-            });
-        }
-        let daemon = SupervisorDaemonProvenance {
-            daemon_build: self.daemon_provenance.build.clone(),
-            daemon_observed: DaemonObservedProcess {
-                pid: self.daemon_provenance.pid,
-                started_at_ms: self
-                    .daemon_provenance
-                    .start_clock
-                    .map(|clock| clock.started_at_ms())
-                    .or(self.daemon_provenance.started_at_ms),
-                running_image: self
-                    .daemon_provenance
-                    .probe
-                    .observe(
-                        self.daemon_provenance.pid,
-                        self.daemon_provenance.executable_path.as_deref(),
-                        self.daemon_provenance.executable_identity.clone(),
-                        self.daemon_provenance.process_start_time,
-                    )
-                    .await,
-            },
-        };
-        let response = ClientControlResponse::SupervisorProvenance { daemon, modules };
-        Ok(vec![control_response_body_frame(
-            &frame,
-            &response,
-            "ClientControlResponse::SupervisorProvenance",
-        )?])
+            };
+            let response = ClientControlResponse::SupervisorProvenance { daemon, modules };
+            Ok(vec![control_response_body_frame(
+                &frame,
+                &response,
+                "ClientControlResponse::SupervisorProvenance",
+            )?])
+        })
+        .await
     }
 
     fn handle_supervisor_health(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
@@ -6997,6 +7083,7 @@ impl ControlHandler {
 
     async fn handle_supervisor_health_probe(
         &self,
+        ctx: &RouteCtx,
         frame: Frame,
         module_id: String,
     ) -> Result<Vec<Frame>, RouterError> {
@@ -7034,162 +7121,172 @@ impl ControlHandler {
             )?]);
         }
 
-        let deadline = Instant::now() + self.health_probe_timeout;
-        let pending = match self.forwarding.begin_module_control_rpc_for(
-            &module_id,
-            MODULE_CONTROL_OP_HEALTH_CHECK,
-            deadline,
-        ) {
-            Ok(pending) => pending,
-            Err(err) => {
-                return Ok(vec![control_error_frame(
-                    &frame,
-                    forwarding_error_code(&err),
-                    err.to_string(),
-                )?])
-            }
-        };
+        self.observe_control_wait(
+            ctx,
+            Some(&registration.manifest.module_id),
+            ops::SUPERVISOR_HEALTH_PROBE,
+            async {
+                let deadline = Instant::now() + self.health_probe_timeout;
+                let pending = match self.forwarding.begin_module_control_rpc_for(
+                    &module_id,
+                    MODULE_CONTROL_OP_HEALTH_CHECK,
+                    deadline,
+                ) {
+                    Ok(pending) => pending,
+                    Err(err) => {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            forwarding_error_code(&err),
+                            err.to_string(),
+                        )?])
+                    }
+                };
 
-        let PendingModuleControlRpc {
-            endpoint,
-            module_sink,
-            negotiated_ver,
-            corr: probe_corr,
-            receiver,
-        } = pending;
-        let mut guard =
-            ModuleControlRpcGuard::new(Arc::clone(&self.forwarding), endpoint, probe_corr);
-        let probe_body =
-            serde_json::to_vec(&ModuleControlRequest::HealthCheck {}).map_err(|err| {
-                RouterError::backend(
+                let PendingModuleControlRpc {
+                    endpoint,
+                    module_sink,
+                    negotiated_ver,
+                    corr: probe_corr,
+                    receiver,
+                } = pending;
+                let mut guard =
+                    ModuleControlRpcGuard::new(Arc::clone(&self.forwarding), endpoint, probe_corr);
+                let probe_body = serde_json::to_vec(&ModuleControlRequest::HealthCheck {})
+                    .map_err(|err| {
+                        RouterError::backend(
+                            0,
+                            frame.header.corr,
+                            format!("failed to encode health.check request: {err}"),
+                        )
+                    })?;
+                let probe_frame = Frame::build_with_version(
+                    negotiated_ver,
+                    FrameType::Request,
+                    control_flags(),
                     0,
-                    frame.header.corr,
-                    format!("failed to encode health.check request: {err}"),
+                    0,
+                    probe_corr,
+                    probe_body,
                 )
-            })?;
-        let probe_frame = Frame::build_with_version(
-            negotiated_ver,
-            FrameType::Request,
-            control_flags(),
-            0,
-            0,
-            probe_corr,
-            probe_body,
-        )
-        .map_err(RouterError::FrameBuild)?;
+                .map_err(RouterError::FrameBuild)?;
 
-        // Queue admission and the reply share one deadline, so a module that
-        // stops reading cannot park the requesting connection's reader forever.
-        match timeout_at(deadline, module_sink.send(probe_frame)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                return Ok(vec![control_error_frame(
-                    &frame,
-                    "target_unavailable",
-                    err.to_string(),
-                )?]);
-            }
-            Err(_) => {
-                return Ok(vec![control_error_frame(
-                    &frame,
-                    "module_timeout",
-                    format!(
-                        "module_id '{module_id}' did not answer health.check within {:?}",
-                        self.health_probe_timeout
-                    ),
-                )?]);
-            }
-        }
+                // Queue admission and the reply share one deadline, so a module that
+                // stops reading cannot park the requesting connection's reader forever.
+                match timeout_at(deadline, module_sink.send(probe_frame)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            "target_unavailable",
+                            err.to_string(),
+                        )?]);
+                    }
+                    Err(_) => {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            "module_timeout",
+                            format!(
+                                "module_id '{module_id}' did not answer health.check within {:?}",
+                                self.health_probe_timeout
+                            ),
+                        )?]);
+                    }
+                }
 
-        match timeout_at(deadline, receiver).await {
-            Ok(Ok(ModuleControlRpcOutcome::Response(response))) => {
-                guard.disarm();
-                let Some(report) = response.health_report() else {
-                    return Ok(vec![control_error_frame(
+                match timeout_at(deadline, receiver).await {
+                    Ok(Ok(ModuleControlRpcOutcome::Response(response))) => {
+                        guard.disarm();
+                        let Some(report) = response.health_report() else {
+                            return Ok(vec![control_error_frame(
+                                &frame,
+                                "invalid_control_body",
+                                "health.check RPC returned a non-health response",
+                            )?]);
+                        };
+                        // Metrics go out whole here. The supervisor's cached snapshot
+                        // caps this blob (see truncate_health_metrics), and this path
+                        // exists precisely to answer without that cap -- so applying it
+                        // here would leave no way to see what the cached view drops.
+                        let HealthReport {
+                            status,
+                            detail,
+                            metrics,
+                        } = report;
+                        let capability_detail = self
+                            .capability_evaluator
+                            .required_problem_detail(&module_id);
+                        let response = ClientControlResponse::SupervisorHealthProbe {
+                            module_id,
+                            status,
+                            detail: append_capability_problem_detail(detail, capability_detail),
+                            metrics,
+                        };
+                        Ok(vec![control_response_body_frame(
+                            &frame,
+                            &response,
+                            "ClientControlResponse::SupervisorHealthProbe",
+                        )?])
+                    }
+                    Ok(Ok(ModuleControlRpcOutcome::Rejected(body))) => {
+                        guard.disarm();
+                        // The module refused the health probe with its own body, so
+                        // the refusal is relayed without the daemon-origin flag
+                        // (bit 6): a client must not read it as the daemon's own
+                        // refusal, which it may treat as never forwarded.
+                        Ok(vec![control_relayed_error_body_frame(&frame, body)?])
+                    }
+                    Ok(Ok(ModuleControlRpcOutcome::ModuleGone(message))) => {
+                        guard.disarm();
+                        Ok(vec![control_error_frame(
+                            &frame,
+                            "target_unavailable",
+                            message,
+                        )?])
+                    }
+                    Ok(Ok(ModuleControlRpcOutcome::MalformedResponse(message))) => {
+                        guard.disarm();
+                        Ok(vec![control_error_frame(
+                            &frame,
+                            "invalid_control_body",
+                            message,
+                        )?])
+                    }
+                    Ok(Ok(ModuleControlRpcOutcome::UnexpectedOp { expected, actual })) => {
+                        guard.disarm();
+                        Ok(vec![control_error_frame(
+                            &frame,
+                            "invalid_control_body",
+                            format!("expected module-control op '{expected}', got '{actual}'"),
+                        )?])
+                    }
+                    Ok(Ok(ModuleControlRpcOutcome::DeadlineElapsed)) => {
+                        guard.disarm();
+                        Ok(vec![control_error_frame(
+                            &frame,
+                            "module_timeout",
+                            format!(
+                                "module_id '{module_id}' answered health.check after {:?}",
+                                self.health_probe_timeout
+                            ),
+                        )?])
+                    }
+                    Ok(Err(_)) => Ok(vec![control_error_frame(
                         &frame,
-                        "invalid_control_body",
-                        "health.check RPC returned a non-health response",
-                    )?]);
-                };
-                // Metrics go out whole here. The supervisor's cached snapshot
-                // caps this blob (see truncate_health_metrics), and this path
-                // exists precisely to answer without that cap -- so applying it
-                // here would leave no way to see what the cached view drops.
-                let HealthReport {
-                    status,
-                    detail,
-                    metrics,
-                } = report;
-                let capability_detail = self
-                    .capability_evaluator
-                    .required_problem_detail(&module_id);
-                let response = ClientControlResponse::SupervisorHealthProbe {
-                    module_id,
-                    status,
-                    detail: append_capability_problem_detail(detail, capability_detail),
-                    metrics,
-                };
-                Ok(vec![control_response_body_frame(
-                    &frame,
-                    &response,
-                    "ClientControlResponse::SupervisorHealthProbe",
-                )?])
-            }
-            Ok(Ok(ModuleControlRpcOutcome::Rejected(body))) => {
-                guard.disarm();
-                // The module refused the health probe with its own body, so
-                // the refusal is relayed without the daemon-origin bit.
-                Ok(vec![control_relayed_error_body_frame(&frame, body)?])
-            }
-            Ok(Ok(ModuleControlRpcOutcome::ModuleGone(message))) => {
-                guard.disarm();
-                Ok(vec![control_error_frame(
-                    &frame,
-                    "target_unavailable",
-                    message,
-                )?])
-            }
-            Ok(Ok(ModuleControlRpcOutcome::MalformedResponse(message))) => {
-                guard.disarm();
-                Ok(vec![control_error_frame(
-                    &frame,
-                    "invalid_control_body",
-                    message,
-                )?])
-            }
-            Ok(Ok(ModuleControlRpcOutcome::UnexpectedOp { expected, actual })) => {
-                guard.disarm();
-                Ok(vec![control_error_frame(
-                    &frame,
-                    "invalid_control_body",
-                    format!("expected module-control op '{expected}', got '{actual}'"),
-                )?])
-            }
-            Ok(Ok(ModuleControlRpcOutcome::DeadlineElapsed)) => {
-                guard.disarm();
-                Ok(vec![control_error_frame(
-                    &frame,
-                    "module_timeout",
-                    format!(
-                        "module_id '{module_id}' answered health.check after {:?}",
-                        self.health_probe_timeout
-                    ),
-                )?])
-            }
-            Ok(Err(_)) => Ok(vec![control_error_frame(
-                &frame,
-                "target_unavailable",
-                "health.check waiter was canceled before the module responded",
-            )?]),
-            Err(_) => Ok(vec![control_error_frame(
-                &frame,
-                "module_timeout",
-                format!(
-                    "module_id '{module_id}' did not answer health.check within {:?}",
-                    self.health_probe_timeout
-                ),
-            )?]),
-        }
+                        "target_unavailable",
+                        "health.check waiter was canceled before the module responded",
+                    )?]),
+                    Err(_) => Ok(vec![control_error_frame(
+                        &frame,
+                        "module_timeout",
+                        format!(
+                            "module_id '{module_id}' did not answer health.check within {:?}",
+                            self.health_probe_timeout
+                        ),
+                    )?]),
+                }
+            },
+        )
+        .await
     }
 
     fn supervisor_status(
@@ -8587,6 +8684,46 @@ pub(crate) fn send_route_control_pushes(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn route_busy_wait_attribution_resolves_targets_instead_of_trusting_selectors() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(registry);
+        assert_eq!(
+            handler.resolve_reader_wait_target(ops::SUPERVISOR_HEALTH_PROBE, Some("daemon")),
+            None
+        );
+        let (ctx, mut rx) = route_ctx(ConnectionId::new(901));
+        hello_via_sink(
+            &handler,
+            &ctx,
+            &mut rx,
+            hello_frame("daemon", PROTOCOL_VERSION, 1),
+        )
+        .await;
+        assert_eq!(
+            handler.resolve_reader_wait_target(ops::SUPERVISOR_HEALTH_PROBE, Some("daemon")),
+            Some("daemon".into())
+        );
+        assert_eq!(
+            handler.resolve_reader_wait_target(ops::SUPERVISOR_HEALTH_PROBE, Some("missing")),
+            None
+        );
+        assert_eq!(
+            handler.resolve_reader_wait_target(ops::SUPERVISOR_TERMINALS, Some("daemon")),
+            None,
+            "a registered module is not necessarily supervised"
+        );
+        assert_eq!(
+            handler.resolve_reader_wait_target(ops::SUPERVISOR_PROVENANCE, None),
+            None,
+            "aggregate provenance has no single target"
+        );
+        assert_eq!(
+            handler.resolve_reader_wait_target(ops::APP_OPEN, Some("daemon")),
+            None
+        );
+    }
+
     mod peer_manifest {
         include!("peer_manifest_tests.rs");
     }
@@ -9142,6 +9279,7 @@ mod tests {
         consumer_capabilities: Option<Vec<String>>,
     ) -> Frame {
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+            busy_refusals: None,
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
@@ -9163,6 +9301,7 @@ mod tests {
         role_versions: Option<BTreeMap<String, String>>,
     ) -> Frame {
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+            busy_refusals: None,
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
@@ -9192,6 +9331,7 @@ mod tests {
         facts: Option<Value>,
     ) -> Frame {
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+            busy_refusals: None,
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
@@ -11265,6 +11405,7 @@ mod tests {
             ClientControlResponse::RouteOpen {
                 route_channel,
                 route_epoch,
+                ..
             } => (route_channel, route_epoch),
             other => panic!("expected a route.open response, got {other:?}"),
         }
@@ -12674,6 +12815,7 @@ mod tests {
         let mut identity = BindIdentity::new("unit".to_string(), "s".to_string());
         identity.build_class = Some(subc_protocol::BUILD_CLASS_PRODUCTION.to_string());
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+            busy_refusals: None,
             target: RouteTarget::ToolProvider {
                 module_id: "target".to_string(),
             },
@@ -17785,6 +17927,7 @@ mod tests {
                 self.next_connection += 1;
                 let (ctx, rx) = wide_ctx(self.next_connection);
                 let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
+                    busy_refusals: None,
                     target: RouteTarget::ToolProvider {
                         module_id: target.to_string(),
                     },

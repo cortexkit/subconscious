@@ -6581,6 +6581,7 @@ where
         stream,
         corr,
         ClientControlRequest::RouteOpen {
+            busy_refusals: None,
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
@@ -6597,6 +6598,7 @@ where
         ClientControlResponse::RouteOpen {
             route_channel,
             route_epoch,
+            ..
         } => CliTestRoute {
             channel: route_channel,
             epoch: route_epoch,

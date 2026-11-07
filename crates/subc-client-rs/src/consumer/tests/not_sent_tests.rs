@@ -474,7 +474,7 @@ async fn writer_capacity_timeouts_classify_pending_acceptance() {
                             admission_class: AdmissionClass::Normal,
                             event_buffer: 1,
                             deadline,
-                            permit,
+                            permit: RoutePermit::legacy(permit),
                         })
                         .await
                         .map(|_| ())

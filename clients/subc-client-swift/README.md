@@ -649,3 +649,12 @@ add `--disable-sandbox`. The cross-process store tests re-run a single XCTest
 helper on macOS; the store itself also supports iOS. The package currently uses
 Apple frameworks and is not a Linux package; its ownership lock uses Darwin's
 `flock`, with a Glibc import branch for Linux ports.
+## Synchronous transport client concurrency
+
+`SubcClient` is a non-Sendable, single-caller synchronous client, not safe for
+concurrent calls. Each request reads through its RESPONSE, ERROR or STREAM_END.
+`runSessionTurn`
+owns its subscription and command exchange together; these fit within the
+route windows without a concurrent local admission gate. Negotiated routes
+retry only daemon-origin `route_busy` refusals (25 ms to 1 s jittered backoff,
+30 s ceiling), and stop backoff when the calling Task is cancelled.

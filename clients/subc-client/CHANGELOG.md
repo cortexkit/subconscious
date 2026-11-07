@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.24.0
+
+- Bound local admission by the request deadline, refusing to write with less
+  than 1 ms left. Serial subscriptions retain FIFO order with ordinary calls.
+  Legacy write failures preserve their original error classes, and a managed
+  route closed during its open leaves no admission gate behind.
+- Opt in to route credit refusals. Negotiated routes use FIFO request and watch
+  windows, retaining slots until a wire terminal or route close, and retry only
+  daemon-origin `route_busy` refusals without invalidating the route. Older
+  daemons keep their existing behaviour.
+
 ## 0.23.2
 
 - Add optional `CatalogEntry.provenance`, reusing `ManifestProvenance` to describe the registered module's declared build. Catalog decoding is unchanged and accepts entries without provenance.

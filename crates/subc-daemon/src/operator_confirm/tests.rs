@@ -1202,6 +1202,7 @@ async fn open_route_while_provider_runs(f: &Fixture, module: &mut Module, name: 
         role_versions: None,
         admission_facts: None,
         scope: None,
+        busy_refusals: None,
     };
     let handler = f.handler.clone();
     let call = tokio::spawn(async move {

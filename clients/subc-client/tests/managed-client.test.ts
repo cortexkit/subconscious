@@ -1675,7 +1675,7 @@ describe("scoped route opens", () => {
       const target = { kind: "management_surface", module_id: "scoped-provider" } as const;
       await client.routeOpen(target, IDENTITY, { scope, consumerIdentity: null });
       await client.call(target.module_id, "echo", {}, { scope, consumerIdentity: null });
-      const expected = Buffer.from('{"op":"route.open","target":{"kind":"management_surface","module_id":"scoped-provider"},"identity":{"project_root":"/tmp/subc-client-test","harness":"bun","session":"managed"},"scope":{"owner":{"kind":"reserved","module_id":"session-owner"},"ref":"session-α","scope_epoch":7}}', "utf8");
+      const expected = Buffer.from('{"op":"route.open","busy_refusals":true,"target":{"kind":"management_surface","module_id":"scoped-provider"},"identity":{"project_root":"/tmp/subc-client-test","harness":"bun","session":"managed"},"scope":{"owner":{"kind":"reserved","module_id":"session-owner"},"ref":"session-α","scope_epoch":7}}', "utf8");
       expect(stats.routeOpenBodies).toEqual([expected, expected]);
     } finally { client.close(); }
   });

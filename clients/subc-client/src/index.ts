@@ -6,6 +6,7 @@ export {
   UNKNOWN_CHANNEL,
   STALE_ROUTE_EPOCH,
   isEstablishedRouteDead,
+  isRouteBusyRetryable,
   isRetryableRouteOpenCode,
   DEFAULT_RECONNECT_BACKOFF,
   SUBC_MODULE_ID_ENV,

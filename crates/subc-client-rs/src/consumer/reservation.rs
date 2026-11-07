@@ -71,9 +71,10 @@ impl RequestReservation {
 }
 
 /// The reply to a reserved request, with the same result as
-/// [`SubcConsumer::request`]. Dropping it releases the route credit and stops
-/// waiting. The writer skips a queued frame if its reply was dropped before
-/// dequeue, but dropping the reply cannot recall a frame already dequeued.
+/// [`SubcConsumer::request`]. Dropping it stops waiting. On negotiated routes a
+/// written request keeps its credit until a wire terminal or route close. The
+/// writer skips a queued frame if its reply was dropped before dequeue, but
+/// dropping the reply cannot recall a frame already dequeued.
 #[must_use = "the reply must be awaited to observe the request outcome"]
 pub struct PendingReply {
     future: Pin<Box<dyn Future<Output = Result<Vec<u8>, CallError>> + Send>>,
@@ -104,15 +105,7 @@ impl SubcConsumer {
         deadline: Instant,
     ) -> Result<RequestReservation, CallError> {
         let state = self.shared.route_state(*route)?;
-        let permit = match timeout_at(deadline, Arc::clone(&state.sem).acquire_owned()).await {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return Err(CallError::StaleRouteHandle(*route)),
-            Err(_) => {
-                return Err(CallError::not_sent(
-                    "call deadline elapsed waiting for route flow-control",
-                ));
-            }
-        };
+        let permit = state.acquire(false, deadline, None).await?;
         let writer = self
             .shared
             .lock_inner()
@@ -155,6 +148,9 @@ impl SubcConsumer {
             let mut entry = PendingEntry::unary(tx, false, None, None);
             entry.send_deadline = Some(deadline);
             inner.pending.insert(key, entry);
+            if state.opted_in {
+                inner.wire_slots.insert(key, Arc::clone(&permit));
+            }
         }
         let registration = PendingRegistration::new(Arc::clone(&self.shared), key, false);
         let shared = Arc::clone(&self.shared);
@@ -164,6 +160,15 @@ impl SubcConsumer {
                 match shared.wait_for_reply(registration, rx, deadline).await? {
                     TerminalFrame::Response { body, .. } => Ok(body),
                     TerminalFrame::StreamEnd => Ok(Vec::new()),
+                    TerminalFrame::Error { body, flags }
+                        if error_codes::is_route_busy_retryable(
+                            flags,
+                            &body.code,
+                            state.opted_in,
+                        ) =>
+                    {
+                        Err(busy_error(&body))
+                    }
                     TerminalFrame::Error { body, .. } => Err(CallError::Module(body)),
                 }
             }),

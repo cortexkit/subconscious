@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.159
+
+- Adopt the updated route-open types without enabling busy refusals in existing CLI callers.
+- Show nonzero per-module/principal busy refusals and reader waits exceeding five seconds in `ck module status`, including a separate control-operations row. Quiet modules retain their existing output; diagnostic JSON keys are sorted explicitly.
+
 ## 0.20.158
 
 - `ck --json quota --redact` now exits with a usage error before connecting instead of printing the unredacted reply. JSON output keeps every account field; `--redact` applies to the text view only.

@@ -1316,6 +1316,60 @@ fn established_route_dead_predicate_matches_the_decision_table() {
     }
 }
 
+#[test]
+fn route_busy_retry_predicate_matches_the_decision_table() {
+    let table: Value =
+        serde_json::from_str(&fs::read_to_string(golden_path("decision_tables")).unwrap()).unwrap();
+    let rows = table["route_busy_retryable"].as_array().unwrap();
+    assert_eq!(rows.len(), 12, "three codes, both origin bits and opt-ins");
+    for row in rows {
+        let mut flags = subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false);
+        if row["daemon_origin"].as_bool().unwrap() {
+            flags = flags.with_daemon_origin();
+        }
+        assert_eq!(
+            error_codes::is_route_busy_retryable(
+                flags,
+                row["code"].as_str().unwrap(),
+                row["route_opted_in"].as_bool().unwrap(),
+            ),
+            row["retryable"].as_bool().unwrap(),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn route_busy_detail_round_trips_and_omits_absent_watch_window() {
+    let detail = subc_protocol::RouteBusyDetail {
+        reason: "no_credit".into(),
+        request_in_flight: 32,
+        watch_in_flight: 24,
+        request_window: 32,
+        watch_window: Some(24),
+    };
+    let value = serde_json::to_value(&detail).unwrap();
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "reason": "no_credit", "request_in_flight": 32,
+            "watch_in_flight": 24, "request_window": 32, "watch_window": 24
+        })
+    );
+    assert_eq!(
+        serde_json::from_value::<subc_protocol::RouteBusyDetail>(value).unwrap(),
+        detail
+    );
+    let without_watch = subc_protocol::RouteBusyDetail {
+        watch_window: None,
+        ..detail
+    };
+    assert!(serde_json::to_value(without_watch)
+        .unwrap()
+        .get("watch_window")
+        .is_none());
+}
+
 fn assert_golden<T>(name: &str, value: &T)
 where
     T: Serialize + DeserializeOwned + PartialEq + Debug,

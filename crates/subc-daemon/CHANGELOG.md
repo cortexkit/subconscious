@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.40.0
+
+- Keep ready forwarding waits free of diagnostic timers, label allocations and counter clones; observe decoded control operations without reparsing their bodies.
+
+- Breaking: adopt subc-control 0.35.0 route-open types. Clients may opt in to immediate, never-forwarded `route_busy` refusals instead of waiting for a request credit. An opted-in `module_managed` route reserves eight of its unchanged 32 credits for ordinary requests by limiting watches to 24. Route-open replies advertise both windows atomically with publication; module-facing binds and routes without the opt-in are unchanged.
+- Count busy refusals per module and client principal, and observe reader waits exceeding five seconds without changing their behavior. Refusal warnings are rate-limited per route; wait warnings are rate-limited per module and principal.
+
 ## 0.39.4
 
 - Test-only: the Linux `app.open` tests write their launch scripts through a

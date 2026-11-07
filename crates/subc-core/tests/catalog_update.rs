@@ -1145,6 +1145,7 @@ fn route_open_frame(_project: &TestProject, module_id: &str, corr: u64) -> Frame
     control_request_frame(
         corr,
         ClientControlRequest::RouteOpen {
+            busy_refusals: None,
             target: RouteTarget::ToolProvider {
                 module_id: module_id.to_string(),
             },
@@ -1238,6 +1239,8 @@ async fn route_open_expect_bound(
         ClientControlResponse::RouteOpen {
             route_channel: client_channel,
             route_epoch: client_epoch,
+            request_window: None,
+            watch_window: None,
         } => RoutePair {
             client_channel,
             client_epoch,
@@ -1312,6 +1315,7 @@ async fn open_route(
         .send(&control_request_frame(
             corr,
             ClientControlRequest::RouteOpen {
+                busy_refusals: None,
                 target: RouteTarget::ToolProvider {
                     module_id: module_id.to_string(),
                 },
@@ -1358,6 +1362,8 @@ async fn open_route(
         ClientControlResponse::RouteOpen {
             route_channel: client_channel,
             route_epoch: client_epoch,
+            request_window: None,
+            watch_window: None,
         } => RoutePair {
             client_channel,
             client_epoch,
@@ -1527,6 +1533,7 @@ async fn route_open_terminal(
         .send(&control_request_frame(
             corr,
             ClientControlRequest::RouteOpen {
+                busy_refusals: None,
                 target: RouteTarget::ToolProvider {
                     module_id: module_id.to_string(),
                 },

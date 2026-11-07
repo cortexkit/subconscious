@@ -100,10 +100,14 @@ Rules:
 2. **Admission is a hint today.** The daemon decodes and forwards the expedite
    and sheddable classes but does not reorder or drop frames because of them.
    Senders may set them; they change no delivery guarantee.
-3. **Daemon origin is decoded, not yet relied on.** Every decoder accepts bit 6
-   (test `daemon_origin_flags_decode_and_round_trip` (`crates/subc-protocol/src/lib.rs`)). The daemon does not set it
-   on its own error frames yet, so `is_established_route_dead` deliberately
-   ignores it (see section 5).
+3. **Daemon origin identifies daemon-authored frames.** Every decoder accepts
+   bit 6 (test `daemon_origin_flags_decode_and_round_trip` (`crates/subc-protocol/src/lib.rs`)).
+   The daemon sets it on its own errors
+   through `daemon_error_flags()`; test
+   `daemon_authored_data_plane_errors_carry_daemon_origin` (`crates/subc-daemon/src/router.rs`)
+   asserts this. The daemon clears it on
+   forwarded module frames. A client may trust a `route_busy` refusal only
+   when this flag is set and its route's open reply carried `request_window`.
 4. **Subscription credits.** A `REQUEST` with bit 7 set takes a request credit
    tagged as a subscription. A drain does not wait for subscription credits to
    be returned; it excludes them and reports how many it excluded in
@@ -142,10 +146,30 @@ target role's declared `concurrency` (`crates/subc-protocol/src/manifest.rs`):
 | `concurrency` | Delivery |
 | --- | --- |
 | `serial` | One call in flight, strict order. |
-| `module_managed` | Concurrent calls; FIFO submission within a channel. 32 credits per channel (`DEFAULT_MODULE_MANAGED_WINDOW` in `crates/subc-daemon/src/forwarding.rs`). |
+| `module_managed` | Concurrent calls; FIFO submission within a channel, or within each lane on an opted-in route (see below). 32 credits per channel (`DEFAULT_MODULE_MANAGED_WINDOW` in `crates/subc-daemon/src/forwarding.rs`). |
 | `stateless_parallel` | Fully parallel, no ordering. 1024 credits per channel, as an out-of-memory guard. |
 
 A management surface that omits `concurrency` is treated as `module_managed`.
+
+A client may send the optional `busy_refusals: true` member in `route.open`.
+The daemon never copies this member into the module's `route.bind`. For an
+opted-in route the open reply includes `request_window` (the total credits)
+and, only for `module_managed`, `watch_window` (24). These reply members are
+absent unless the client opted in. Older daemons ignore the request member;
+a reply without `request_window` means the route is not opted in.
+
+On an opted-in route, a REQUEST never waits for a credit: the daemon refuses
+it immediately with `route_busy` if admission is full, without forwarding it.
+A bit-7 watch on `module_managed` consumes one total credit and one watch
+credit, so at most 24 watches may hold the unchanged 32-credit window. Serial
+and stateless-parallel routes have no separate watch limit. Routes without
+the opt-in retain their existing credit waits and ordering.
+
+On opted-in `module_managed` routes, submission is FIFO within each lane
+(ordinary requests and watches), not across lanes. An ordinary request may
+pass an earlier queued watch. A refused request retried while another sender
+shares the route's credits may arrive after later submissions. Serial routes
+retain strict submission order; stateless-parallel routes remain unordered.
 
 ## 5. Error body and error codes
 
@@ -198,6 +222,9 @@ in `crates/subc-protocol/tests/golden/decision_tables.json`.
 epoch or bind-proof replacement found bound routes, in-flight binds or
 connection-held presence under the live epoch (see `scopes.md` section 4).
 
+`route_busy` is not a `route.open` refusal. It is retryable on the same
+established route, not by reopening it, and is not route-dead.
+
 ### 5.2 Established-route death
 
 `error_codes::is_established_route_dead` answers "evict this route, reopen it
@@ -207,6 +234,19 @@ module (`RouterError::to_error_frame` in `crates/subc-daemon/src/router.rs`).
 Test: `established_route_dead_predicate_matches_the_decision_table` (`crates/subc-protocol/tests/golden_json.rs`).
 
 ### 5.3 Other daemon codes
+
+`route_busy` is a daemon-origin ERROR on the refused REQUEST's correlation.
+The daemon never forwarded that request. Its detail is
+`{reason, request_in_flight, watch_in_flight, request_window, watch_window?}`;
+`reason` is `no_credit`, and `watch_window` is present only on
+`module_managed`. A trusted refusal may be retried with backoff on the same
+route until the caller's deadline; it never invalidates the route.
+`error_codes::is_route_busy_retryable(flags, code, route_opted_in)` is the
+shared trust predicate. The `route_busy_retryable` golden table in
+`crates/subc-protocol/tests/golden/decision_tables.json` pins every combination
+of code, daemon origin and opt-in. `route_busy` is false in the existing
+`is_retryable_route_open` and `is_established_route_dead` predicates and their
+tables: neither reopening nor evicting the route is appropriate.
 
 The scope registration codes (`scope_sync_*`, per-record `scope_*`) are listed
 in [`scopes.md`](scopes.md). The `operator.confirm` codes
@@ -222,8 +262,11 @@ Guaranteed:
 - The header layout, frame kinds and flag positions above, for envelope
   version 2.
 - A refusal the daemon authors carries an `ErrorBody` with a stable `code`.
-- `module_reloading`, `unknown_channel` and `stale_route_epoch` on a data-plane
-  request mean the module did not receive it.
+- `module_reloading`, `unknown_channel`, `stale_route_epoch` and trusted
+  `route_busy` on a data-plane request mean the module did not receive it.
+- The credit-wait guarantee is per connection only if every route on that
+  connection opted in. Other reader waits (including module queue sends,
+  control operations and client reply sends) retain their existing behavior.
 
 Not guaranteed:
 

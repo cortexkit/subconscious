@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+- Adopt compatible dependency requirements for the updated route-open control types; no behavior change.
+
 ## 0.2.0
 
 - Breaking: `manifest()` now returns the protocol 0.34 `ModuleManifest`; the internal module handler uses Rust client 0.33. Test openers use project-free identities. Inspection admission remains based on the daemon-stamped principal or an owner-authorized flow scope, not a caller-supplied folder.

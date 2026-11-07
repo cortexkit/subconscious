@@ -59,6 +59,7 @@ struct CancelState {
 pub(super) struct UnaryCancel {
     shared: Arc<Shared>,
     state: Mutex<CancelState>,
+    cancelled: CancellationToken,
 }
 
 impl UnaryCancel {
@@ -68,6 +69,14 @@ impl UnaryCancel {
 
     pub(super) fn requested(&self) -> bool {
         self.lock().requested
+    }
+
+    pub(super) fn sent(&self) -> bool {
+        self.lock().sent
+    }
+
+    pub(super) async fn cancelled(&self) {
+        self.cancelled.cancelled().await;
     }
 
     pub(super) fn activate(&self, key: PendingKey, priority: Priority, deadline: Instant) {
@@ -104,6 +113,7 @@ impl UnaryCancel {
     }
 
     pub(super) async fn cancel(&self) -> CancelOutcome {
+        self.cancelled.cancel();
         let active = {
             let mut state = self.lock();
             state.requested = true;
@@ -161,6 +171,7 @@ impl CancelRegistration {
         let state = Arc::new(UnaryCancel {
             shared,
             state: Mutex::new(CancelState::default()),
+            cancelled: CancellationToken::new(),
         });
         (
             CancelHandle {
@@ -214,6 +225,7 @@ mod tests {
         let state = Arc::new(UnaryCancel {
             shared,
             state: Mutex::new(CancelState::default()),
+            cancelled: CancellationToken::new(),
         });
         state.activate(
             key,

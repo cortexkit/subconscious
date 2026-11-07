@@ -222,6 +222,8 @@ async fn identity_server(
                 0,
                 request.header.corr,
                 serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                    request_window: None,
+                    watch_window: None,
                     route_channel: channel,
                     route_epoch: 1,
                 })

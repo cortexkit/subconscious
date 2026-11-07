@@ -316,6 +316,7 @@ async fn route_open(
     args: &ProbeArgs,
 ) -> Result<RouteHandle, ProbeError> {
     let request = ClientControlRequest::RouteOpen {
+        busy_refusals: None,
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
         },
@@ -333,6 +334,7 @@ async fn route_open(
                 ClientControlResponse::RouteOpen {
                     route_channel,
                     route_epoch,
+                    ..
                 } => Ok(RouteHandle {
                     channel: route_channel,
                     epoch: route_epoch,

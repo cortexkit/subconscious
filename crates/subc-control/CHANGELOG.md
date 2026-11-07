@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.35.0
+
+- Breaking: `ClientControlRequest::RouteOpen` gains `busy_refusals: Option<bool>` and `ClientControlResponse::RouteOpen` gains `request_window: Option<usize>` and `watch_window: Option<usize>`. The request member and both reply members are omitted on the wire when absent; older peers decode unchanged. Upgrade callers together.
+
 ## 0.34.1
 
 - Add optional `CatalogEntry::provenance` and `with_provenance`, using the manifest's build provenance type. Absence is omitted and preserves existing catalog bytes; catalog decoding remains lenient and construction remains non-exhaustive.

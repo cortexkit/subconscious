@@ -425,6 +425,7 @@ async fn route_open_error(
     module_id: &str,
 ) -> ErrorBody {
     let request = ClientControlRequest::RouteOpen {
+        busy_refusals: None,
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
         },

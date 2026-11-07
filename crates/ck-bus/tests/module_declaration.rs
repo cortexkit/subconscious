@@ -526,7 +526,7 @@ async fn assert_stub_catalog(run: &AcceptanceRun, module_id: &str, expected: &[&
 
 async fn assert_stub_principal_controls(run: &AcceptanceRun) {
     let request = |consumer_identity| ClientControlRequest::RouteOpen {
-        // Claustrum registers its read surface as a management surface, and so does
+        busy_refusals: None, // Claustrum registers its read surface as a management surface, and so does
         // the stub standing in for it.
         target: RouteTarget::ManagementSurface {
             module_id: "claustrum".to_string(),

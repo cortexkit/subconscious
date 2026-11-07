@@ -34,6 +34,8 @@ use tokio::{
 };
 
 mod common;
+#[path = "forwarding/route_busy.rs"]
+mod route_busy;
 use common::{
     connect_authed_client, start_test_daemon_with_bind_timeout,
     start_test_daemon_with_bind_timeout_and_breaker,
@@ -1002,6 +1004,7 @@ fn role_versions_open(
         unreachable!("attach_request builds a route.open");
     };
     ClientControlRequest::RouteOpen {
+        busy_refusals: None,
         target,
         identity,
         consumer_identity,
@@ -4044,6 +4047,7 @@ async fn route_open_vanished_project_root_attaches_under_its_recorded_identity()
         .await
         .unwrap();
     let request = ClientControlRequest::RouteOpen {
+        busy_refusals: None,
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
         },
@@ -4105,6 +4109,7 @@ async fn route_open_unreconstructable_project_root_returns_error_without_provide
         .await
         .unwrap();
     let request = ClientControlRequest::RouteOpen {
+        busy_refusals: None,
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
         },
@@ -7352,6 +7357,7 @@ where
         ClientControlResponse::RouteOpen {
             route_channel,
             route_epoch,
+            ..
         } => RouteOpenAck {
             route_channel,
             route_epoch,
@@ -7502,6 +7508,7 @@ fn attach_request_with_consumer_identity(
     consumer_identity: Option<ConsumerIdentity>,
 ) -> ClientControlRequest {
     ClientControlRequest::RouteOpen {
+        busy_refusals: None,
         target: RouteTarget::ToolProvider {
             module_id: module_id.to_string(),
         },

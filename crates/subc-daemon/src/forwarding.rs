@@ -28,6 +28,9 @@ use crate::{
 /// Default per-channel request-credit window for modules that schedule internally.
 const DEFAULT_MODULE_MANAGED_WINDOW: usize = 32;
 
+/// Watches leave eight request credits available for ordinary calls.
+const DEFAULT_MODULE_MANAGED_WATCH_WINDOW: usize = 24;
+
 /// High per-channel cap for stateless modules; this is an OOM guard, not scheduling policy.
 const STATELESS_PARALLEL_WINDOW: usize = 1024;
 
@@ -459,6 +462,9 @@ struct PendingRouteBindRelayEntry {
     client_negotiated_ver: u8,
     client_permit: crate::router::EgressPermit,
     route_open_frame: Frame,
+    busy_refusals: bool,
+    request_window: usize,
+    watch_window: Option<usize>,
     principal: Principal,
     /// The scope admitted at `route.open`, with the tag captured then. Commit
     /// compares it with the published tag.
@@ -841,6 +847,10 @@ impl ForwardingTable {
 
     pub(crate) fn counters(&self) -> DaemonCounters {
         self.counters.clone()
+    }
+
+    pub(crate) fn counters_ref(&self) -> &DaemonCounters {
+        &self.counters
     }
 
     pub(crate) fn route_bind_breakers(&self) -> RouteBindBreakers {
@@ -1238,6 +1248,7 @@ impl ForwardingTable {
         build_class: Option<String>,
         operator_app: Option<crate::operator_apps::OperatorAppStamp>,
         deadline: Instant,
+        busy_refusals: bool,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         // Reserve egress capacity before taking the forwarding lock. The permit is
         // held until the bind reaches one terminal state, so an accepted bind can
@@ -1263,6 +1274,7 @@ impl ForwardingTable {
             operator_app,
             deadline,
             client_permit,
+            busy_refusals,
         )
     }
 
@@ -1273,6 +1285,24 @@ impl ForwardingTable {
         client_sink: FrameSink,
         client_corr: u64,
         module_id: &str,
+    ) -> Result<PendingRouteBindRelay, ForwardingError> {
+        self.begin_route_bind_relay_with_busy_for_test(
+            client_connection_id,
+            client_sink,
+            client_corr,
+            module_id,
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_route_bind_relay_with_busy_for_test(
+        &self,
+        client_connection_id: ConnectionId,
+        client_sink: FrameSink,
+        client_corr: u64,
+        module_id: &str,
+        busy_refusals: bool,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         let permit =
             client_sink
@@ -1294,6 +1324,7 @@ impl ForwardingTable {
             None,
             Instant::now() + std::time::Duration::from_secs(60),
             permit,
+            busy_refusals,
         )
     }
 
@@ -1481,6 +1512,7 @@ impl ForwardingTable {
         operator_app: Option<crate::operator_apps::OperatorAppStamp>,
         deadline: Instant,
         client_permit: crate::router::EgressPermit,
+        busy_refusals: bool,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         let mut inner = self.write_inner()?;
         // HELLO and route.open can run on different tasks. Decide the role under
@@ -1550,6 +1582,8 @@ impl ForwardingTable {
             project_root,
         };
         let response_body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+            request_window: None,
+            watch_window: None,
             route_channel: client_channel,
             route_epoch: client_epoch,
         })
@@ -1575,6 +1609,10 @@ impl ForwardingTable {
                 client_negotiated_ver,
                 client_permit,
                 route_open_frame,
+                busy_refusals,
+                request_window: window_for(&module.concurrency),
+                watch_window: (busy_refusals && module.concurrency == Concurrency::ModuleManaged)
+                    .then_some(DEFAULT_MODULE_MANAGED_WATCH_WINDOW),
                 principal,
                 scope,
                 harness,
@@ -2113,6 +2151,41 @@ impl ForwardingTable {
         module_id: &str,
     ) -> Result<bool, ForwardingError> {
         Ok(self.read_inner()?.modules_by_id.contains_key(module_id))
+    }
+
+    /// Admission and route teardown share the forwarding-then-flow lock order.
+    /// No asynchronous work may split validation from recording the credits.
+    pub(crate) fn try_admit_request(
+        &self,
+        route: &Arc<RouteBinding>,
+        epoch: u32,
+        corr: u64,
+        subscription: bool,
+    ) -> Result<RequestAdmission, ForwardingError> {
+        let inner = self.read_inner()?;
+        let key = ClientRouteKey {
+            connection_id: route.client_connection_id,
+            channel: route.client_channel,
+        };
+        if epoch != route.client_epoch
+            || !inner
+                .client_to_module
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, route))
+        {
+            return Ok(RequestAdmission::Stale);
+        }
+        let admission = route.flow.try_acquire_tagged(corr, subscription);
+        Ok(match admission {
+            RequestAdmission::Stale
+                if inner
+                    .draining_endpoints
+                    .contains_key(&route.module_endpoint) =>
+            {
+                RequestAdmission::ModuleReloading
+            }
+            admission => admission,
+        })
     }
 
     pub(crate) fn lookup_data_route(
@@ -3363,7 +3436,7 @@ fn release_module_route_locked(
 
 fn commit_route_locked(
     inner: &mut ForwardingInner,
-    pending: PendingRouteBindRelayEntry,
+    mut pending: PendingRouteBindRelayEntry,
 ) -> Result<Option<GoodbyeTarget>, ForwardingError> {
     let reservation = pending.reservation;
     if inner
@@ -3384,6 +3457,25 @@ fn commit_route_locked(
         .contains_key(&reservation.module_key.endpoint)
     {
         return Err(ForwardingError::ModuleReloading { module_id });
+    }
+    if pending.busy_refusals {
+        let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+            route_channel: reservation.client_key.channel,
+            route_epoch: reservation.client_epoch,
+            request_window: Some(pending.request_window),
+            watch_window: pending.watch_window,
+        })
+        .map_err(|err| ForwardingError::RouteOpenBuild(err.to_string()))?;
+        pending.route_open_frame = Frame::build_with_version(
+            pending.client_negotiated_ver,
+            FrameType::Response,
+            pending.route_open_frame.header.flags,
+            0,
+            0,
+            pending.route_open_frame.header.corr,
+            body,
+        )
+        .map_err(|err| ForwardingError::RouteOpenBuild(err.to_string()))?;
     }
     if inner.reserved_client.remove(&reservation.client_key) != Some(reservation.module_key)
         || inner.reserved_module.remove(&reservation.module_key) != Some(reservation.client_key)
@@ -3417,7 +3509,11 @@ fn commit_route_locked(
         operator_app: pending.operator_app,
         project_root: reservation.project_root.clone(),
         bound_at: Instant::now(),
-        flow: Arc::new(ChannelFlow::new(window_for(&module.concurrency))),
+        flow: Arc::new(if pending.busy_refusals {
+            ChannelFlow::with_admission(pending.request_window, true, pending.watch_window)
+        } else {
+            ChannelFlow::new(pending.request_window)
+        }),
         scope: pending.scope,
     });
     inner
@@ -3657,6 +3753,7 @@ fn remove_module_connection_locked(
 #[derive(Debug, Clone, Copy)]
 struct RequestCredit {
     subscription: bool,
+    watch_credit: bool,
     excluded_from_drain: bool,
 }
 
@@ -3666,18 +3763,17 @@ struct CreditLedger {
 }
 
 impl CreditLedger {
-    fn acquire(&mut self, corr: u64, subscription: bool) {
+    fn acquire(&mut self, corr: u64, subscription: bool, watch_credit: bool) {
         self.by_corr.entry(corr).or_default().push(RequestCredit {
             subscription,
+            watch_credit,
             excluded_from_drain: false,
         });
     }
 
-    fn release(&mut self, corr: u64) -> bool {
-        let Some(credits) = self.by_corr.get_mut(&corr) else {
-            return false;
-        };
-        let released = credits.pop().is_some();
+    fn release(&mut self, corr: u64) -> Option<RequestCredit> {
+        let credits = self.by_corr.get_mut(&corr)?;
+        let released = credits.pop();
         if credits.is_empty() {
             self.by_corr.remove(&corr);
         }
@@ -3695,7 +3791,6 @@ impl CreditLedger {
         excluded
     }
 
-    #[cfg(test)]
     fn in_flight(&self) -> usize {
         self.by_corr.values().map(Vec::len).sum()
     }
@@ -3730,6 +3825,7 @@ impl CreditLedger {
 struct ChannelFlowState {
     closed: bool,
     credits: CreditLedger,
+    last_busy_warn: Option<tokio::time::Instant>,
 }
 
 /// Per-channel request-credit accounting shared by the client and module route halves.
@@ -3737,17 +3833,95 @@ struct ChannelFlowState {
 pub(crate) struct ChannelFlow {
     sem: Semaphore,
     window: usize,
+    busy_refusals: bool,
+    watch_sem: Option<Semaphore>,
+    watch_window: Option<usize>,
     state: Mutex<ChannelFlowState>,
 }
 
 impl ChannelFlow {
     pub(crate) fn new(window: usize) -> Self {
+        Self::with_admission(window, false, None)
+    }
+
+    fn with_admission(window: usize, busy_refusals: bool, watch_window: Option<usize>) -> Self {
         debug_assert!(window > 0, "flow-control window must be non-zero");
         Self {
             sem: Semaphore::new(window),
             window,
+            busy_refusals,
+            watch_sem: watch_window.map(Semaphore::new),
+            watch_window,
             state: Mutex::new(ChannelFlowState::default()),
         }
+    }
+
+    pub(crate) fn busy_refusals(&self) -> bool {
+        self.busy_refusals
+    }
+
+    fn try_acquire_tagged(&self, corr: u64, subscription: bool) -> RequestAdmission {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.closed {
+            return RequestAdmission::Stale;
+        }
+        let busy = |state: &ChannelFlowState| {
+            RequestAdmission::Busy(subc_protocol::RouteBusyDetail {
+                reason: "no_credit".into(),
+                request_in_flight: state.credits.in_flight(),
+                watch_in_flight: state
+                    .credits
+                    .by_corr
+                    .values()
+                    .flatten()
+                    .filter(|credit| credit.subscription)
+                    .count(),
+                request_window: self.window,
+                watch_window: self.watch_window,
+            })
+        };
+        let Ok(total) = self.sem.try_acquire() else {
+            return busy(&state);
+        };
+        // A watch takes the total credit first. Dropping it on watch-lane
+        // exhaustion rolls back before any ledger entry becomes visible.
+        let watch = if subscription {
+            if let Some(sem) = &self.watch_sem {
+                match sem.try_acquire() {
+                    Ok(permit) => Some(permit),
+                    Err(_) => return busy(&state),
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        state.credits.acquire(corr, subscription, watch.is_some());
+        total.forget();
+        if let Some(watch) = watch {
+            watch.forget();
+        }
+        RequestAdmission::Admitted
+    }
+
+    pub(crate) fn should_warn_busy(&self) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = tokio::time::Instant::now();
+        if state
+            .last_busy_warn
+            .is_some_and(|last| now.duration_since(last) < std::time::Duration::from_secs(60))
+        {
+            return false;
+        }
+        state.last_busy_warn = Some(now);
+        true
     }
 
     #[cfg(test)]
@@ -3768,7 +3942,7 @@ impl ChannelFlow {
         if state.closed {
             return Err(ChannelFlowClosed);
         }
-        state.credits.acquire(corr, subscription);
+        state.credits.acquire(corr, subscription, false);
         permit.forget();
         Ok(())
     }
@@ -3779,13 +3953,11 @@ impl ChannelFlow {
     }
 
     pub(crate) fn release_corr(&self, corr: u64) {
-        let released = self
+        let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .credits
-            .release(corr);
-        if !released {
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(released) = state.credits.release(corr) else {
             // Protocol-conforming modules emit exactly one terminal per request.
             // This guard is a best-effort safety net against window growth, not a
             // security boundary against malicious peers.
@@ -3795,9 +3967,14 @@ impl ChannelFlow {
                 "flow-control over-release ignored"
             );
             return;
-        }
+        };
         if !self.sem.is_closed() {
             self.sem.add_permits(1);
+        }
+        if released.watch_credit {
+            if let Some(watch_sem) = self.watch_sem.as_ref().filter(|sem| !sem.is_closed()) {
+                watch_sem.add_permits(1);
+            }
         }
     }
 
@@ -3838,20 +4015,35 @@ impl ChannelFlow {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         state.closed = true;
         self.sem.close();
+        if let Some(sem) = &self.watch_sem {
+            sem.close();
+        }
         state.credits.capture_subscription_exclusions()
     }
 
     pub(crate) fn close(&self) {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .closed = true;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closed = true;
         self.sem.close();
+        if let Some(sem) = &self.watch_sem {
+            sem.close();
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChannelFlowClosed;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RequestAdmission {
+    Admitted,
+    Busy(subc_protocol::RouteBusyDetail),
+    ModuleReloading,
+    Stale,
+}
 
 impl fmt::Display for ChannelFlowClosed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -3860,6 +4052,10 @@ impl fmt::Display for ChannelFlowClosed {
 }
 
 impl Error for ChannelFlowClosed {}
+
+#[cfg(test)]
+#[path = "route_busy_flow_tests.rs"]
+mod route_busy_flow_tests;
 
 fn window_for(concurrency: &Concurrency) -> usize {
     match concurrency {
@@ -3980,7 +4176,7 @@ mod tests {
     #[test]
     fn ordinary_long_running_request_is_not_excluded_from_drain() {
         let mut ledger = CreditLedger::default();
-        ledger.acquire(1, false);
+        ledger.acquire(1, false, false);
 
         assert_eq!(ledger.capture_subscription_exclusions(), 0);
         assert_eq!(ledger.drain_in_flight(), 1);
@@ -3989,7 +4185,7 @@ mod tests {
     #[test]
     fn bit_set_subscription_is_excluded_and_counted() {
         let mut ledger = CreditLedger::default();
-        ledger.acquire(1, true);
+        ledger.acquire(1, true, false);
 
         assert_eq!(ledger.capture_subscription_exclusions(), 1);
         assert_eq!(ledger.drain_in_flight(), 0);
@@ -3998,10 +4194,10 @@ mod tests {
     #[test]
     fn subscription_opened_after_drain_snapshot_is_not_excluded() {
         let mut ledger = CreditLedger::default();
-        ledger.acquire(1, true);
+        ledger.acquire(1, true, false);
         assert_eq!(ledger.capture_subscription_exclusions(), 1);
 
-        ledger.acquire(2, true);
+        ledger.acquire(2, true, false);
 
         assert_eq!(ledger.drain_in_flight(), 1);
     }
@@ -4624,6 +4820,7 @@ mod tests {
                 None,
                 None,
                 Instant::now() + Duration::from_secs(60),
+                false,
             ),
         )
         .await

@@ -221,6 +221,11 @@ pub enum ClientControlRequest {
         /// the provider would never see it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role_versions: Option<BTreeMap<String, String>>,
+        /// Opt into immediate, never-forwarded `route_busy` refusals instead of
+        /// waiting for request credits. This field is daemon-only and is never
+        /// copied into the module's bind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        busy_refusals: Option<bool>,
         /// Opaque admission facts supplied by the configured carrier module.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         admission_facts: Option<serde_json::Value>,
@@ -485,6 +490,12 @@ pub enum ClientControlResponse {
     RouteOpen {
         route_channel: u16,
         route_epoch: u32,
+        /// Total request credits, present only when busy refusals were enabled.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_window: Option<usize>,
+        /// Watch credits on an opted-in module-managed route.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        watch_window: Option<usize>,
     },
     #[serde(rename = "route.poll")]
     RoutePoll {
@@ -2995,6 +3006,7 @@ mod tests {
     #[test]
     fn route_open_is_internally_tagged() {
         let request = ClientControlRequest::RouteOpen {
+            busy_refusals: None,
             target: RouteTarget::ToolProvider {
                 module_id: "aft".to_string(),
             },
@@ -3567,6 +3579,7 @@ mod launch_nonce_redaction_tests {
     #[test]
     fn route_open_request_debug_never_prints_the_nonce() {
         let request = ClientControlRequest::RouteOpen {
+            busy_refusals: None,
             target: subc_protocol::RouteTarget::ToolProvider {
                 module_id: "broca".to_string(),
             },

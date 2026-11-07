@@ -3235,6 +3235,7 @@ async fn open_scoped_route(
     scope: Option<ScopeSelector>,
 ) -> Result<RouteHandle> {
     let request = ClientControlRequest::RouteOpen {
+        busy_refusals: None,
         target,
         identity: identity.clone(),
         consumer_identity: consumer_identity_from_env(),
@@ -3256,6 +3257,7 @@ async fn open_scoped_route(
                 ClientControlResponse::RouteOpen {
                     route_channel,
                     route_epoch,
+                    ..
                 } => Ok(RouteHandle {
                     channel: route_channel,
                     epoch: route_epoch,
@@ -7399,6 +7401,7 @@ async fn subc_reader_loop_until_closed<R>(
                                 Ok(ClientControlResponse::RouteOpen {
                                     route_channel,
                                     route_epoch,
+                                    ..
                                 }) if frame.header.ty == FrameType::Response => {
                                     Some(relay.route_handle(route_channel, route_epoch))
                                 }
@@ -9061,6 +9064,8 @@ mod tests {
                     0,
                     open.header.corr,
                     serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                        request_window: None,
+                        watch_window: None,
                         route_channel: 7,
                         route_epoch: 1,
                     })
@@ -9144,6 +9149,8 @@ mod tests {
             assert_eq!(consumer_capabilities, expected_for_server);
 
             let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                request_window: None,
+                watch_window: None,
                 route_channel: 7,
                 route_epoch: 11,
             })
@@ -10703,6 +10710,8 @@ mod tests {
                             recorded_scopes.lock().unwrap().push(scope);
                             next_channel += 1;
                             let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                                request_window: None,
+                                watch_window: None,
                                 route_channel: channel,
                                 route_epoch: 1,
                             })

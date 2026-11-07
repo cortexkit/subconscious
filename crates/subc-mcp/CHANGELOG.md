@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.57
+
+- Adopt the updated route-open types without changing route behavior.
+
 ## 0.1.56
 
 - Reword the size-limit replacements. The model now reads that the tool returned N bytes of model-visible output over the limit, that whatever the call did has already happened so it shouldn't repeat it to see the output, and to ask for less output or a file next time. An oversized error message is described as an error's message, with its code kept.

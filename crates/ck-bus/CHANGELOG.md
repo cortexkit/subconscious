@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1
+
+- Adopt compatible dependency requirements for the updated route-open control types; no behavior change.
+
 ## 0.5.0
 
 - Adopt cortexkit-bus-naming 0.3.0, bus-trait 0.3.1, bus-nats 0.4.0 and

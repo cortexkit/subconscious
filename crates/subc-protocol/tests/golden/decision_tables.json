@@ -15,6 +15,7 @@
     "module_timeout": "retryable",
     "module_warming": "retryable",
     "op_not_allowed": "terminal",
+    "route_busy": "terminal",
     "route_limit": "terminal",
     "scope_bind_proof_required": "terminal",
     "scope_bind_proof_mismatch": "terminal",
@@ -50,7 +51,9 @@
       { "code": "frame_too_large", "daemon_origin": false, "route_dead": false },
       { "code": "frame_too_large", "daemon_origin": true, "route_dead": false },
       { "code": "handler_failed", "daemon_origin": false, "route_dead": false },
-      { "code": "handler_failed", "daemon_origin": true, "route_dead": false }
+      { "code": "handler_failed", "daemon_origin": true, "route_dead": false },
+      { "code": "route_busy", "daemon_origin": false, "route_dead": false },
+      { "code": "route_busy", "daemon_origin": true, "route_dead": false }
     ]
   },
   "route_close_disposition": {
@@ -64,5 +67,19 @@
     "scope_ended": "must_not_reopen",
     "scope_parent_ended": "must_not_reopen",
     "unknown": "must_not_reopen"
-  }
+  },
+  "route_busy_retryable": [
+    { "code": "route_busy", "daemon_origin": false, "route_opted_in": false, "retryable": false },
+    { "code": "route_busy", "daemon_origin": false, "route_opted_in": true, "retryable": false },
+    { "code": "route_busy", "daemon_origin": true, "route_opted_in": false, "retryable": false },
+    { "code": "route_busy", "daemon_origin": true, "route_opted_in": true, "retryable": true },
+    { "code": "module_reloading", "daemon_origin": false, "route_opted_in": false, "retryable": false },
+    { "code": "module_reloading", "daemon_origin": false, "route_opted_in": true, "retryable": false },
+    { "code": "module_reloading", "daemon_origin": true, "route_opted_in": false, "retryable": false },
+    { "code": "module_reloading", "daemon_origin": true, "route_opted_in": true, "retryable": false },
+    { "code": "a_code_nobody_declared", "daemon_origin": false, "route_opted_in": false, "retryable": false },
+    { "code": "a_code_nobody_declared", "daemon_origin": false, "route_opted_in": true, "retryable": false },
+    { "code": "a_code_nobody_declared", "daemon_origin": true, "route_opted_in": false, "retryable": false },
+    { "code": "a_code_nobody_declared", "daemon_origin": true, "route_opted_in": true, "retryable": false }
+  ]
 }

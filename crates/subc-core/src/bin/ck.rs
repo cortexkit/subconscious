@@ -1804,6 +1804,7 @@ impl CkClient {
 
     async fn route_open_management(&mut self, module_id: &str) -> Result<RouteHandle, CkError> {
         let request = ClientControlRequest::RouteOpen {
+            busy_refusals: None,
             target: RouteTarget::ManagementSurface {
                 module_id: module_id.to_string(),
             },
@@ -1819,6 +1820,7 @@ impl CkClient {
             ClientControlResponse::RouteOpen {
                 route_channel,
                 route_epoch,
+                ..
             } => Ok(RouteHandle {
                 channel: route_channel,
                 epoch: route_epoch,
@@ -3006,6 +3008,7 @@ async fn module_status(
         .await?;
     let frame_drops = module_frame_drop_count(&describe, module_id);
     let undeclared_gauge_drains = drains_with_undeclared_gauge_count(&describe);
+    let reader_diagnostics = module_reader_diagnostics(&describe, module_id);
     // The supervisor knows whether the process runs; only the catalog knows
     // whether the daemon will route to it. A running, healthy module can still
     // be refused `module_warming` because a capability it requires has no
@@ -3038,12 +3041,17 @@ async fn module_status(
     };
 
     if json_output.enabled {
-        json_output.print(&json!({
+        let mut status = json!({
             "module": module,
             "health": health_entry,
             "catalog": catalog_entry,
             "last_exit_reason": last_exit_reason,
-        }))?;
+        });
+        if let Some(diagnostics) = reader_diagnostics {
+            status["reader_diagnostics"] = diagnostics;
+        }
+        sort_module_status_keys(&mut status);
+        json_output.print(&status)?;
     } else {
         let provenance = client
             .rpc_value(ClientControlRequest::SupervisorProvenance {
@@ -3061,6 +3069,11 @@ async fn module_status(
             observed,
             verbose,
         );
+        if let Some(diagnostics) = reader_diagnostics {
+            for line in module_reader_diagnostic_lines(&diagnostics) {
+                println!("{line}");
+            }
+        }
         if let Some(reason) = last_exit_reason {
             println!("  last exit reason: {}", terminal_safe_string(&reason));
         }
@@ -6914,6 +6927,106 @@ fn format_undeclared_gauge_drains(count: Option<u64>) -> String {
         Some(count) => format!("drain gauges: {count} drains with undeclared gauge"),
         None => "drain gauges: undeclared-gauge drain count unavailable".to_string(),
     }
+}
+
+fn sort_module_status_keys(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for child in object.values_mut() {
+                sort_module_status_keys(child);
+            }
+            object.sort_keys();
+        }
+        Value::Array(array) => {
+            for child in array {
+                sort_module_status_keys(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn retain_nonzero_reader_counts(value: &mut Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.retain(|_, child| retain_nonzero_reader_counts(child));
+            !object.is_empty()
+        }
+        Value::Number(count) => count.as_u64().is_some_and(|count| count > 0),
+        _ => false,
+    }
+}
+
+// The slash cannot name a module: the daemon rejects separators in
+// `crates/subc-daemon/src/registry.rs:855-875`.
+const CONTROL_WAIT_BUCKET: &str = "daemon/control";
+
+fn module_reader_diagnostics(describe: &Value, module_id: &str) -> Option<Value> {
+    let counters = describe.get("counters")?;
+    let mut rows = serde_json::Map::new();
+    for module in [module_id, CONTROL_WAIT_BUCKET] {
+        let mut row = serde_json::Map::new();
+        for (key, source) in [
+            ("route_busy", "route_busy_by_module_principal"),
+            ("waits_over_5s", "reader_wait_over_5s_by_module_principal"),
+        ] {
+            if let Some(mut counts) = counters
+                .get(source)
+                .and_then(|counts| counts.get(module))
+                .cloned()
+            {
+                if retain_nonzero_reader_counts(&mut counts) {
+                    row.insert(key.into(), counts);
+                }
+            }
+        }
+        if !row.is_empty() {
+            rows.insert(module.into(), Value::Object(row));
+        }
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let mut rows = Value::Object(rows);
+    sort_module_status_keys(&mut rows);
+    Some(rows)
+}
+
+fn module_reader_diagnostic_lines(diagnostics: &Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Some(rows) = diagnostics.as_object() else {
+        return lines;
+    };
+    for (module, row) in rows {
+        let label = if module == CONTROL_WAIT_BUCKET {
+            "control operations"
+        } else {
+            "reader waits and refusals"
+        };
+        lines.push(format!("  {label}:"));
+        if let Some(busy) = row.get("route_busy").and_then(Value::as_object) {
+            for (principal, count) in busy {
+                lines.push(format!(
+                    "    {}: {count} route_busy refusals",
+                    terminal_safe_string(principal)
+                ));
+            }
+        }
+        if let Some(waits) = row.get("waits_over_5s").and_then(Value::as_object) {
+            for (principal, kinds) in waits {
+                if let Some(kinds) = kinds.as_object() {
+                    for (kind, count) in kinds {
+                        lines.push(format!(
+                            "    {}: {} waited over 5 s {count} times",
+                            terminal_safe_string(principal),
+                            terminal_safe_string(kind)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    lines
 }
 
 fn module_frame_drop_count(describe: &Value, module_id: &str) -> Option<u64> {
@@ -12580,5 +12693,83 @@ mod inspect_cli_tests {
         ] {
             assert!(matches!(parse(&tail), Err(CkError::Usage(_))));
         }
+    }
+}
+
+#[cfg(test)]
+mod module_status_reader_tests {
+    use super::*;
+
+    #[test]
+    fn module_status_reader_diagnostics_hide_quiet_and_other_modules() {
+        let quiet = json!({"counters": {"route_busy_by_module_principal": {"quiet": {"direct": 0}, "other": {"direct": 9}}}});
+        assert_eq!(module_reader_diagnostics(&quiet, "quiet"), None);
+        assert_eq!(module_reader_diagnostics(&json!({}), "quiet"), None);
+        assert!(module_reader_diagnostic_lines(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn module_status_reader_diagnostics_keep_module_named_daemon_distinct() {
+        let describe = json!({"counters": {
+            "route_busy_by_module_principal": {"daemon": {"direct": 7}},
+            "reader_wait_over_5s_by_module_principal": {
+                "daemon": {"module": {"reply_egress": 2}},
+                "daemon/control": {"direct": {"app.open": 9}}
+            }
+        }});
+        let rows = module_reader_diagnostics(&describe, "daemon").unwrap();
+        assert_eq!(rows.as_object().unwrap().len(), 2);
+        assert_eq!(rows["daemon"]["route_busy"]["direct"], 7);
+        assert_eq!(rows["daemon"]["waits_over_5s"]["module"]["reply_egress"], 2);
+        assert_eq!(
+            rows["daemon/control"]["waits_over_5s"]["direct"]["app.open"],
+            9
+        );
+        assert!(rows["daemon"]["waits_over_5s"].get("direct").is_none());
+        let lines = module_reader_diagnostic_lines(&rows);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("control operations:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("reader waits and refusals:"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn module_status_reader_diagnostics_show_principals_and_control_row_sorted() {
+        let describe = json!({"counters": {
+            "route_busy_by_module_principal": {"target": {"reserved:z": 2, "direct": 3}, "other": {"direct": 8}},
+            "reader_wait_over_5s_by_module_principal": {
+                "target": {"direct": {"module_queue": 1, "legacy_credit": 2, "reply_egress": 0}},
+                "daemon/control": {"direct": {"app.open": 1}}
+            }
+        }});
+        let rows = module_reader_diagnostics(&describe, "target").unwrap();
+        assert_eq!(
+            rows,
+            json!({
+                "daemon/control": {"waits_over_5s": {"direct": {"app.open": 1}}},
+                "target": {"route_busy": {"direct": 3, "reserved:z": 2}, "waits_over_5s": {"direct": {"legacy_credit": 2, "module_queue": 1}}}
+            })
+        );
+        let text = serde_json::to_string(&rows).unwrap();
+        assert!(text.find("daemon/control").unwrap() < text.find("target").unwrap());
+        assert!(text.find("legacy_credit").unwrap() < text.find("module_queue").unwrap());
+        let lines = module_reader_diagnostic_lines(&rows).join("\n");
+        assert!(lines.contains("control operations:"), "{lines}");
+        assert!(lines.contains("direct: 3 route_busy refusals"), "{lines}");
+        assert!(
+            lines.contains("module_queue waited over 5 s 1 times"),
+            "{lines}"
+        );
+        assert!(!lines.contains("other"), "{lines}");
     }
 }

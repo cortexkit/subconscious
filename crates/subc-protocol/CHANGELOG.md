@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.4
+
+- Add `route_busy`, its credit snapshot detail and the trusted same-route retry predicate. Pin route-open, route-death and same-route decisions in the shared golden tables.
+
 ## 0.34.3
 
 - Add `error_codes::BIND_BUSY` (`bind_busy`), classified retryable by

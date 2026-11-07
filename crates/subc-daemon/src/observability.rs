@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, MutexGuard,
@@ -8,9 +8,13 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::registry::ConnectionId;
+
+/// The slash prevents collision with a module ID: `module_id_path_hazard`
+/// rejects separators in `registry.rs:855-875`.
+pub(crate) const CONTROL_WAIT_BUCKET: &str = "daemon/control";
 
 /// The only keys the route.open refusal counter may carry. A module's own
 /// error code on a rejected bind is counted under `module_rejected` and rides
@@ -137,9 +141,10 @@ impl Drop for ConnectedClientGuard {
     }
 }
 
-/// Lock-free counters for route lifecycle drops and delivery failures.
+/// Counters for route lifecycle drops, delivery failures and reader waits.
 #[derive(Debug, Clone, Default)]
 pub struct DaemonCounters {
+    reader_diagnostics: Arc<Mutex<ReaderDiagnostics>>,
     /// Every non-request frame a module sent on a (channel, epoch) the daemon
     /// holds no bound route for, dropped. Counts both kinds below: orphan
     /// traffic on a route the daemon released, and frames on a (channel,
@@ -172,6 +177,13 @@ pub struct DaemonCounters {
     route_released_epoch_fenced: Arc<AtomicU64>,
     route_release_stale_skipped: Arc<AtomicU64>,
     drains_with_undeclared_gauge: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Default)]
+struct ReaderDiagnostics {
+    busy: BTreeMap<String, BTreeMap<String, u64>>,
+    waits: BTreeMap<String, BTreeMap<String, BTreeMap<String, u64>>>,
+    warned_waits: HashMap<(String, String), tokio::time::Instant>,
 }
 
 /// Ten one-minute buckets make sustained module-to-client route drops visible
@@ -246,6 +258,23 @@ impl DaemonCounters {
     /// `server.describe` diagnostic endpoint backward-compatible.
     pub fn snapshot(&self) -> Value {
         let mut snapshot = serde_json::Map::new();
+        let diagnostics = self
+            .reader_diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !diagnostics.busy.is_empty() {
+            snapshot.insert(
+                "route_busy_by_module_principal".into(),
+                json!(diagnostics.busy),
+            );
+        }
+        if !diagnostics.waits.is_empty() {
+            snapshot.insert(
+                "reader_wait_over_5s_by_module_principal".into(),
+                json!(diagnostics.waits),
+            );
+        }
+        drop(diagnostics);
         snapshot.insert(
             "module_frames_dropped_no_route".into(),
             self.module_frames_dropped_no_route
@@ -351,6 +380,76 @@ impl DaemonCounters {
                 .into(),
         );
         Value::Object(snapshot)
+    }
+
+    pub(crate) fn increment_route_busy(&self, module: &str, principal: &str) {
+        let mut diagnostics = self
+            .reader_diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        *diagnostics
+            .busy
+            .entry(module.into())
+            .or_default()
+            .entry(principal.into())
+            .or_default() += 1;
+    }
+
+    /// Observe a wait without imposing a deadline or cancelling its future.
+    /// Counts advance once at five seconds, even if the peer never recovers.
+    pub(crate) async fn observe_reader_wait<F: std::future::Future>(
+        &self,
+        labels: impl FnOnce() -> (String, String),
+        kind: &'static str,
+        future: F,
+    ) -> F::Output {
+        tokio::pin!(future);
+        // Ready sends need neither a timer nor diagnostic labels. Poll before
+        // constructing Sleep, which would otherwise touch the runtime clock.
+        if let std::task::Poll::Ready(result) =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(future.as_mut().poll(cx))).await
+        {
+            return result;
+        }
+        tokio::select! {
+            biased;
+            result = &mut future => return result,
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
+        let (module, principal) = labels();
+        let should_warn = {
+            let mut diagnostics = self
+                .reader_diagnostics
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *diagnostics
+                .waits
+                .entry(module.clone())
+                .or_default()
+                .entry(principal.clone())
+                .or_default()
+                .entry(kind.into())
+                .or_default() += 1;
+            let now = tokio::time::Instant::now();
+            let key = (module.to_owned(), principal.to_owned());
+            let should_warn = diagnostics
+                .warned_waits
+                .get(&key)
+                .is_none_or(|last| now.duration_since(*last) >= Duration::from_secs(60));
+            if should_warn {
+                diagnostics.warned_waits.insert(key, now);
+            }
+            should_warn
+        };
+        if should_warn {
+            warn!(
+                module_id = module,
+                client_principal = principal,
+                wait_kind = kind,
+                "connection reader wait exceeded 5 seconds"
+            );
+        }
+        future.await
     }
 
     pub(crate) fn increment_module_frames_dropped_no_route(&self, module_id: Option<&str>) {
@@ -469,6 +568,69 @@ fn insert_nonempty_counts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ready_reader_wait_needs_no_runtime_clock_or_labels() {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+
+        let counters = DaemonCounters::new();
+        let wait = counters.observe_reader_wait(
+            || panic!("ready waits must not resolve diagnostic labels"),
+            "module_queue",
+            std::future::ready(7),
+        );
+        let mut wait = std::pin::pin!(wait);
+        let mut cx = Context::from_waker(Waker::noop());
+        // No Tokio runtime exists here: even constructing Sleep would panic.
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(7));
+        assert!(counters.reader_diagnostics.lock().unwrap().waits.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reader_wait_labels_are_resolved_once_only_after_five_seconds() {
+        use std::{
+            cell::Cell,
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+
+        let counters = DaemonCounters::new();
+        let calls = Cell::new(0);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let wait = counters.observe_reader_wait(
+            || {
+                calls.set(calls.get() + 1);
+                ("alpha".into(), "direct".into())
+            },
+            "module_queue",
+            receiver,
+        );
+        tokio::pin!(wait);
+        assert!(poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        assert_eq!(calls.get(), 0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(poll_fn(|cx| Poll::Ready(wait.as_mut().poll(cx)))
+            .await
+            .is_pending());
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            counters.snapshot()["reader_wait_over_5s_by_module_principal"]["alpha"]["direct"]
+                ["module_queue"],
+            1
+        );
+        sender.send(()).unwrap();
+        wait.await.unwrap();
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn counter_snapshot_includes_zero_rate_and_omits_empty_module_maps() {

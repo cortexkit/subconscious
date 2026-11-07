@@ -6,6 +6,9 @@
 //! schemas such as [`ErrorBody`], and the capability manifest. JSON-RPC request
 //! and response bodies remain module-owned opaque payloads to subc.
 //!
+//! Config-gate bodies expose `subc-config` types in the public API: a breaking
+//! `subc-config` release is a breaking `subc-protocol` release.
+//!
 //! ## The envelope (locked — see docs/subc-core-architecture.md §4.8)
 //!
 //! ```text
@@ -37,6 +40,8 @@ use serde::{Deserialize, Serialize};
 pub use machine_id::{MachineId, MachineIdError};
 
 pub mod call_mode;
+pub mod config;
+pub mod consent;
 pub mod frame;
 pub mod framed_body;
 pub mod machine_id;
@@ -48,10 +53,36 @@ pub mod tool_call;
 
 /// Canonical error codes emitted by subc.
 ///
-/// Error frames remain extensible strings, but these daemon-owned route-open
-/// outcomes need identical spelling across the daemon and SDK retry policies.
+/// Error frames remain extensible strings, but daemon-owned outcomes need
+/// identical spelling across the daemon and SDK retry policies.
 pub mod error_codes {
     use crate::Flags;
+
+    /// No approved configuration is available. Keep the last view, never fall
+    /// back to files or exit merely because this refusal was received.
+    pub const CONFIG_GATED: &str = "config_gated";
+    /// A saved plan's read set changed. The refusal carries no fresh digest.
+    pub const PLAN_STALE: &str = "plan_stale";
+    pub const LAYER_FORBIDDEN: &str = "layer_forbidden";
+    pub const BOUND_VIOLATED: &str = "bound_violated";
+    pub const VALUE_INVALID: &str = "value_invalid";
+    pub const CREDENTIAL_SHARED: &str = "credential_shared";
+    /// Declare exactly once per connection, before config.get or config.applied.
+    pub const DECLARATION_ORDER: &str = "declaration_order";
+    pub const PROGRAM_REFUSED: &str = "program_refused";
+    pub const STORE_TAMPERED: &str = "store_tampered";
+    /// The store write is durable, but the protected revision-and-digest record
+    /// that detects replay has not caught up. Keep the current view and report
+    /// config.applied again after that protected record can be updated.
+    pub const ANCHOR_PENDING: &str = "anchor_pending";
+    pub const GENERATION_PRUNED: &str = "generation_pruned";
+    pub const APPROVAL_SURFACE_UNAVAILABLE: &str = "approval_surface_unavailable";
+    /// The operator declined, or the desktop app, phone card or OS prompt did
+    /// not answer in time.
+    pub const APPROVAL_DECLINED: &str = "approval_declined";
+    /// The connection is not the module's delivery target. This refusal never
+    /// sets the module to gated and never changes its delivery state.
+    pub const NOT_DELIVERY_TARGET: &str = "not_delivery_target";
 
     pub const UNKNOWN_CHANNEL: &str = "unknown_channel";
     pub const STALE_ROUTE_EPOCH: &str = "stale_route_epoch";

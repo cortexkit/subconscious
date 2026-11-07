@@ -1,0 +1,10 @@
+{
+  "op": "config.applied",
+  "generation": 4,
+  "attempt": 8,
+  "project_id": "project-a",
+  "result": "nack",
+  "reasons": [
+    "Cannot activate this generation"
+  ]
+}

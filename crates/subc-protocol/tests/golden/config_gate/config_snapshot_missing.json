@@ -1,0 +1,7 @@
+{
+  "module_id": "sample",
+  "project_id": "project-a",
+  "workspace_id": "workspace-a",
+  "layer": "project",
+  "path": "/projects/a/.cortexkit/sample.jsonc"
+}

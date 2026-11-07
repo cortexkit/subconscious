@@ -8,6 +8,7 @@ use tokio::io::AsyncWriteExt;
 
 fn configured(module_id: &str, program: PathBuf, enabled: bool) -> ConfiguredModule {
     ConfiguredModule {
+        carry_containment: false,
         module_id: module_id.into(),
         program,
         args: Vec::new(),

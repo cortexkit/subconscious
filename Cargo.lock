@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -2833,7 +2833,7 @@ dependencies = [
 
 [[package]]
 name = "subc-cgroup"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "cortexkit-test-support",
  "tokio",
@@ -2871,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.159"
+version = "0.20.160"
 dependencies = [
  "async-trait",
  "base64",
@@ -2909,7 +2909,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.40.0"
+version = "0.41.0"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -2971,7 +2971,7 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.57"
+version = "0.1.58"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -2994,7 +2994,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.27"
+version = "0.1.29"
 dependencies = [
  "cortexkit-test-support",
  "libc",

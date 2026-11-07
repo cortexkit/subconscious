@@ -890,6 +890,15 @@ async fn serve_bound_daemon(
     let run_dir_lock = bound.run_dir_lock;
     let publication_lock = bound.publication_lock;
     if let Some(owner) = &run_dir_lock {
+        #[cfg(target_os = "linux")]
+        crate::live_children::sweep_orphans_with_placement(
+            owner,
+            &crate::live_children::AdoptedPids::none(),
+            crate::live_children::SweepBounds::default(),
+            cgroup_placement.as_ref(),
+        )
+        .await;
+        #[cfg(not(target_os = "linux"))]
         crate::live_children::sweep_orphans(
             owner,
             &crate::live_children::AdoptedPids::none(),
@@ -2148,6 +2157,7 @@ mod tests {
         );
         let capture = temp.join("logs").join(format!("{module_id}.stderr.log"));
         let module = ConfiguredModule {
+            carry_containment: false,
             module_id,
             program: PathBuf::from("sh"),
             args: vec!["-c".to_string(), "sleep 30".to_string()],
@@ -2933,6 +2943,7 @@ mod tests {
         crate::live_children::write_record(
             &record,
             &[LiveChild {
+                container: None,
                 module_id: "old-sleep".into(),
                 pid: child.id(),
                 protocol: subc_control::ModuleProtocol::None,

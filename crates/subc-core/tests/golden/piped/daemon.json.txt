@@ -12,6 +12,7 @@ exit: Some(0)
     "activity_lifecycle_append_failures": 0,
     "activity_started_digest_skips": 0,
     "activity_unparseable_lines": 0,
+    "carried_containment_anchor_lost": 0,
     "client_connections_with_routes": 0,
     "client_egress_close_delivery_failed": 0,
     "client_frames_dropped_stale_route": 0,

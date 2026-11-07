@@ -288,6 +288,9 @@ pub struct ConfiguredModule {
     /// Whether a second process of this module may run beside the first, which
     /// a blue/green swap does. Absent in config means exclusive.
     pub overlap: ModuleOverlap,
+    /// Keep the current process container across module restarts. The value is
+    /// fixed when a fresh container starts, not when an existing one is replaced.
+    pub carry_containment: bool,
     pub health: HealthConfig,
     /// Effective drain budget (ms) for this module's teardown, already resolved
     /// against the daemon-wide default at parse time. `None` = built-in default.
@@ -357,6 +360,7 @@ impl ConfiguredModule {
             reserved_prefixes: self.reserved_prefixes.clone(),
             protocol: self.protocol,
             overlap: self.overlap,
+            carry_containment: self.carry_containment,
         }
     }
 }
@@ -452,6 +456,8 @@ struct RawModuleConfig {
     /// Read as a raw string for the same reason as `protocol`.
     #[serde(default)]
     overlap: Option<String>,
+    #[serde(default)]
+    carry_containment: bool,
     #[serde(default)]
     health: Option<RawHealthConfig>,
     #[serde(default)]
@@ -853,6 +859,15 @@ fn parse_doc_with_activity(
                 );
             }
             let overlap = parse_module_overlap(module.overlap.as_deref(), path, &module_id)?;
+            if module.carry_containment && overlap == ModuleOverlap::Safe {
+                return Err(DaemonConfigError::InvalidValue {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "module '{}' sets carry_containment: true with overlap: \"safe\"; carried containment does not support overlapping instances",
+                        module_id.escape_debug()
+                    ),
+                });
+            }
             // The spawn role is set by the supervisor on a swap candidate and
             // nowhere else; a configured value would put the long swap warm-up
             // budget on every plain restart, where callers wait on it.
@@ -910,6 +925,7 @@ fn parse_doc_with_activity(
                 reserved_prefixes: module.reserved_prefixes,
                 protocol,
                 overlap,
+                carry_containment: module.carry_containment,
                 health,
                 // Per-module wins; the daemon-wide value is the fallback. `0` is
                 // legitimate ("never wait"), so this is `.or`, not `filter+or`.
@@ -2561,6 +2577,40 @@ mod tests {
         assert_eq!(safe.module_spec().overlap, ModuleOverlap::Safe);
         let typo = parse(r#", "overlap": "sfae""#).expect_err("an unknown overlap is refused");
         assert!(typo.to_string().contains("sfae"), "{typo}");
+    }
+
+    #[test]
+    fn carry_containment_defaults_off_and_refuses_overlap() {
+        let parse = |module_body: &str| {
+            parse_doc(
+                &format!(
+                    r#"{{
+                      "version": 1,
+                      "modules": {{ "worker": {{ "program": "worker"{module_body} }} }}
+                    }}"#
+                ),
+                Path::new("subc.jsonc"),
+            )
+        };
+
+        let absent = parse("").unwrap().modules.remove(0);
+        let explicit_off = parse(r#", "carry_containment": false"#)
+            .unwrap()
+            .modules
+            .remove(0);
+        assert_eq!(absent, explicit_off);
+        assert!(!absent.module_spec().carry_containment);
+        let carried = parse(r#", "carry_containment": true"#)
+            .unwrap()
+            .modules
+            .remove(0);
+        assert!(carried.module_spec().carry_containment);
+        let error = parse(r#", "carry_containment": true, "overlap": "safe""#)
+            .expect_err("a carried container cannot have overlapping leaders");
+        let message = error.to_string();
+        assert!(message.contains("worker"), "{message}");
+        assert!(message.contains("carry_containment"), "{message}");
+        assert!(message.contains("overlap"), "{message}");
     }
 
     /// The spawn role is the supervisor's to set on a swap candidate. A

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.9
+
+- Add non-creating recorded-path lookup, removal, cgroup-tree kill and async/blocking
+  freeze APIs. Paths must be canonical descendants of the caller's trusted
+  placement root, with no symlinks or parent traversal. A missing container is
+  already gone; lookup never recreates it. Existing module-name APIs are unchanged.
+
 ## 0.1.8
 
 - Read memory charged to a module cgroup (`memory.current`), or, only when that file doesn't exist, sum resident and swapped memory across its processes and child cgroups. A malformed value or other read error fails the reading rather than falling back. Reads accept a deadline and never change controller settings.

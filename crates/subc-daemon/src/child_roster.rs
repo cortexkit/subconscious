@@ -55,6 +55,9 @@ pub(crate) struct RecordedIdentity {
     pub(crate) start_time: Option<u64>,
     pub(crate) executable: Option<ExecutableIdentity>,
     pub(crate) cgroup_name: Option<String>,
+    pub(crate) container: Option<crate::live_children::ContainerIdentity>,
+    #[cfg(unix)]
+    pub(crate) carried: Option<std::sync::Weak<crate::supervise::containment::CarriedContainment>>,
     /// The owning subtree for shutdown tree kills; not persisted in the record.
     #[cfg(target_os = "linux")]
     pub(crate) cgroup_placement: Option<subc_cgroup::Placement>,
@@ -90,13 +93,19 @@ impl DaemonShutdownFlag {
 
 #[derive(Debug, Default)]
 struct RosterInner {
+    #[cfg(target_os = "linux")]
+    cgroup_placement: Mutex<Option<subc_cgroup::Placement>>,
     next_key: AtomicU64,
     closed: DaemonShutdownFlag,
+    closed_notify: tokio::sync::Notify,
     live: Mutex<HashMap<u64, RosterEntry>>,
     record_write: Mutex<()>,
     /// Where the live-children record is written; unset means no record, the
     /// default for an in-process daemon (see `BootstrapConfig`).
     record_path: OnceLock<PathBuf>,
+    recovery_block: OnceLock<String>,
+    pending_admissions: Mutex<HashMap<String, (u32, String)>>,
+    unquarantined_record: std::sync::atomic::AtomicBool,
     retained: Mutex<Vec<(LiveChild, crate::live_children::RetainedReason)>>,
     #[cfg(target_os = "macos")]
     privacy_trampoline: OnceLock<Result<PathBuf, String>>,
@@ -104,6 +113,14 @@ struct RosterInner {
     /// test can block there to stand in for a slow write.
     #[cfg(test)]
     record_write_hook: Mutex<Option<RecordWriteHook>>,
+    #[cfg(all(test, unix))]
+    admission_timeout: Mutex<Option<Duration>>,
+    #[cfg(all(test, unix))]
+    admission_hook: Mutex<Option<AdmissionHook>>,
+    #[cfg(test)]
+    fail_adoption: AtomicBool,
+    #[cfg(all(test, unix))]
+    placement_pause: Mutex<HashMap<String, subc_os::admission_gate::PlacementPause>>,
 }
 
 #[cfg(test)]
@@ -112,6 +129,18 @@ type RecordWriteFn = dyn Fn(&HashMap<u64, RosterEntry>) + Send + Sync;
 #[cfg(test)]
 #[derive(Clone)]
 struct RecordWriteHook(Arc<RecordWriteFn>);
+
+#[cfg(all(test, unix))]
+type AdmissionHookFn = dyn Fn(&str, &'static str, Option<u32>) -> bool + Send + Sync;
+#[cfg(all(test, unix))]
+#[derive(Clone)]
+struct AdmissionHook(Arc<AdmissionHookFn>);
+#[cfg(all(test, unix))]
+impl std::fmt::Debug for AdmissionHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AdmissionHook")
+    }
+}
 
 #[cfg(test)]
 impl std::fmt::Debug for RecordWriteHook {
@@ -160,6 +189,11 @@ impl RosterInner {
     /// each snapshot inside that gate prevents an older snapshot from replacing
     /// a newer record, without locking the live roster across disk syncs.
     fn write_record(&self, live: &HashMap<u64, RosterEntry>) -> std::io::Result<()> {
+        if self.unquarantined_record.load(Ordering::Acquire) {
+            return Err(std::io::Error::other(
+                "unusable recovery record could not be quarantined; refusing to overwrite it",
+            ));
+        }
         let Some(path) = self.record_path.get() else {
             return Ok(());
         };
@@ -181,6 +215,7 @@ impl RosterInner {
                 start_time: entry.recorded.start_time,
                 executable: entry.recorded.executable,
                 cgroup_name: entry.recorded.cgroup_name.clone(),
+                container: entry.recorded.container.clone(),
             })
             .collect();
         let children: Vec<_> = children
@@ -189,7 +224,7 @@ impl RosterInner {
             .collect();
         let reasons = lock(&self.retained)
             .iter()
-            .map(|(entry, reason)| (entry.pid, *reason))
+            .map(|(entry, reason)| (entry.pid, reason.clone()))
             .collect();
         if let Err(error) =
             crate::live_children::write_record_with_reasons(path, &children, reasons)
@@ -215,9 +250,38 @@ impl RosterInner {
         let changed = {
             let mut retained = lock(&self.retained);
             let before = retained.len();
-            retained.retain(|(entry, _)| {
+            #[cfg(unix)]
+            let mut updated = false;
+            #[cfg(not(unix))]
+            let updated = false;
+            retained.retain_mut(|(entry, reason)| {
+                #[cfg(not(unix))]
+                let _ = reason;
                 #[cfg(unix)]
                 {
+                    if entry.container.is_some() {
+                        return match crate::live_children::recheck_container(entry,
+                            #[cfg(target_os = "linux")]
+                            lock(&self.cgroup_placement).as_ref(),
+                        ) {
+                            Some(next) => {
+                                if reason.blocks_fresh_copy() && !next.blocks_fresh_copy() {
+                                    tracing::info!(module_id = %entry.module_id, container = ?entry.container,
+                                        "container survivors are gone; fresh starts are no longer blocked");
+                                }
+                                updated |= *reason != next;
+                                *reason = next;
+                                true
+                            }
+                            None => {
+                                if reason.blocks_fresh_copy() {
+                                    tracing::info!(module_id = %entry.module_id, container = ?entry.container,
+                                        "container survivors are gone; fresh starts are no longer blocked");
+                                }
+                                false
+                            }
+                        };
+                    }
                     let Some(pid) = i32::try_from(entry.pid)
                         .ok()
                         .and_then(rustix::process::Pid::from_raw)
@@ -244,7 +308,7 @@ impl RosterInner {
                     true
                 }
             });
-            retained.len() != before
+            retained.len() != before || updated
         };
         if changed {
             let live = lock(&self.live).clone();
@@ -260,6 +324,8 @@ impl RosterInner {
 pub(crate) struct ChildRoster {
     inner: Arc<RosterInner>,
     drain_budget: Arc<Mutex<Duration>>,
+    pub(crate) containment: crate::supervise::containment::Slot,
+    pub(crate) counters: crate::observability::DaemonCounters,
 }
 
 impl Default for ChildRoster {
@@ -267,7 +333,44 @@ impl Default for ChildRoster {
         Self {
             inner: Arc::default(),
             drain_budget: Arc::new(Mutex::new(crate::supervise::DEFAULT_DRAIN_TIMEOUT)),
+            containment: Arc::default(),
+            counters: crate::observability::DaemonCounters::default(),
         }
+    }
+}
+
+/// A cached diagnostic view of containment; it does not own the resource.
+#[derive(Debug, Clone)]
+pub(crate) struct RetainedView(std::sync::Weak<RosterInner>);
+
+impl RetainedView {
+    pub(crate) fn has_carried_container(&self, module_id: &str) -> bool {
+        let Some(inner) = self.0.upgrade() else {
+            return false;
+        };
+        let live = lock(&inner.live);
+        live.values()
+            .any(|entry| entry.module_id == module_id && entry.recorded.container.is_some())
+    }
+
+    pub(crate) fn recovery_block(&self) -> Option<String> {
+        self.0.upgrade()?.recovery_block.get().cloned()
+    }
+
+    pub(crate) fn waiting_detail(&self, module_id: &str) -> Option<(u32, String)> {
+        let inner = self.0.upgrade()?;
+        if let Some((pid, reason)) = lock(&inner.pending_admissions).get(module_id) {
+            return Some((*pid, reason.clone()));
+        }
+        let retained = lock(&inner.retained);
+        retained
+            .iter()
+            .find(|(entry, reason)| {
+                entry.module_id == module_id
+                    && entry.container.is_some()
+                    && reason.blocks_fresh_copy()
+            })
+            .map(|(entry, reason)| (entry.pid, reason.waiting_message(entry.pid)))
     }
 }
 
@@ -279,6 +382,49 @@ pub(crate) struct RosterGuard {
     key: u64,
 }
 
+impl RosterGuard {
+    /// Remove a cancelled, proven-never-executed attempt only after the new
+    /// record is durable. An error requires quarantining the recovery store.
+    #[cfg(unix)]
+    pub(crate) fn release_durably(self) -> std::io::Result<()> {
+        self.inner.without_stalling_runtime(|| {
+            let _write = lock(&self.inner.record_write);
+            let snapshot = {
+                let mut live = lock(&self.inner.live);
+                live.remove(&self.key);
+                live.clone()
+            };
+            self.inner.write_record(&snapshot)
+        })
+    }
+    #[cfg(unix)]
+    pub(crate) fn retain(self, reason: crate::live_children::RetainedReason) {
+        self.inner.without_stalling_runtime(|| {
+            let _write = lock(&self.inner.record_write);
+            let Some(entry) = lock(&self.inner.live).remove(&self.key) else {
+                return;
+            };
+            let recorded = LiveChild {
+                module_id: entry.module_id,
+                pid: entry.pid,
+                protocol: entry.protocol,
+                start_time: entry.recorded.start_time,
+                executable: entry.recorded.executable,
+                cgroup_name: entry.recorded.cgroup_name,
+                container: entry.recorded.container,
+            };
+            if reason.blocks_fresh_copy() {
+                tracing::error!(module_id = %recorded.module_id, container = ?recorded.container,
+                    reason = %reason.waiting_message(recorded.pid),
+                    "container survivors block a fresh instance; retaining the container record");
+            }
+            lock(&self.inner.retained).push((recorded, reason));
+            let live = lock(&self.inner.live).clone();
+            let _ = self.inner.write_record(&live);
+        });
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct AdmissionError {
     source: std::io::Error,
@@ -286,6 +432,12 @@ pub(crate) struct AdmissionError {
 }
 
 impl AdmissionError {
+    /// Transfer ownership to cleanup that may have to retain an unresolved
+    /// container. Dropping the error itself would discard that recovery guard.
+    pub(crate) fn into_parts(self) -> (std::io::Error, RosterGuard) {
+        (self.source, self.guard)
+    }
+
     /// Keep shutdown ownership until the caller has killed and reaped the
     /// rejected child. A failed record write is not proof that the child exited.
     pub(crate) fn with_cleanup<T>(self, cleanup: impl FnOnce(std::io::Error) -> T) -> T {
@@ -310,11 +462,11 @@ impl Drop for RosterGuard {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 impl RosterGuard {
-    /// Publish an executable only after the privacy trampoline has exec'd and
-    /// the kernel image agrees with the configured module. Before then shutdown
-    /// owns the pid, but orphan cleanup has no image it could mistakenly trust.
+    /// Publish the committed executable after exec. A gated fork's provisional
+    /// record must not persist the daemon's pre-exec image, nor the macOS privacy
+    /// trampoline before it has replaced itself with the configured module.
     pub(crate) fn confirm_executable(
         &self,
         observation: subc_os::Observation,
@@ -341,6 +493,14 @@ impl RosterGuard {
 }
 
 impl ChildRoster {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_cgroup_placement(&self, placement: Option<subc_cgroup::Placement>) {
+        *lock(&self.inner.cgroup_placement) = placement;
+    }
+
+    pub(crate) fn retained_view(&self) -> RetainedView {
+        RetainedView(Arc::downgrade(&self.inner))
+    }
     #[cfg(target_os = "macos")]
     pub(crate) fn set_privacy_trampoline(&self, result: Result<PathBuf, String>) {
         let _ = self.inner.privacy_trampoline.set(result);
@@ -359,6 +519,8 @@ impl ChildRoster {
         Self {
             inner: Arc::clone(&self.inner),
             drain_budget,
+            containment: Arc::default(),
+            counters: self.counters.clone(),
         }
     }
 
@@ -370,6 +532,18 @@ impl ChildRoster {
         self.inner.closed.is_set()
     }
 
+    pub(crate) async fn closed(&self) {
+        loop {
+            let changed = self.inner.closed_notify.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.is_closed() {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     /// The flag [`Self::close`] sets, for the terminal rings to read.
     pub(crate) fn shutdown_flag(&self) -> DaemonShutdownFlag {
         self.inner.closed.clone()
@@ -378,16 +552,39 @@ impl ChildRoster {
     /// Keep the live-children record at `path` from now on. Set once, before
     /// anything is admitted; a second call is ignored.
     pub(crate) fn record_to(&self, path: PathBuf) {
-        let (retained, reasons) =
-            crate::live_children::read_record_with_reasons(&path).unwrap_or_default();
-        let first_record = self.inner.record_path.set(path).is_ok();
-        if first_record {
+        if self.inner.record_path.set(path.clone()).is_err() {
+            return;
+        }
+        let (retained, reasons) = match crate::live_children::read_record_with_reasons(&path) {
+            Ok(record) => record,
+            Err(error) => {
+                if let Err(quarantine_error) =
+                    crate::live_children::quarantine_record(&path, &error)
+                {
+                    self.inner
+                        .unquarantined_record
+                        .store(true, Ordering::Release);
+                    tracing::error!(path = %path.display(), %error, %quarantine_error,
+                        "cannot quarantine recovery identity; refusing to overwrite the evidence");
+                }
+                let _ = self.inner.recovery_block.set(format!(
+                    "unknown previous container identity: unusable recovery record {}: {error}; offline clearance is required",
+                    path.display()
+                ));
+                Default::default()
+            }
+        };
+        if let Some(reason) = crate::live_children::quarantine_block(&path) {
+            tracing::error!(%reason, "carried modules blocked by quarantined recovery identity");
+            let _ = self.inner.recovery_block.set(reason);
+        }
+        {
             *lock(&self.inner.retained) = retained
                 .into_iter()
                 .map(|entry| {
                     let reason = reasons
                         .get(&entry.pid)
-                        .copied()
+                        .cloned()
                         .unwrap_or(crate::live_children::RetainedReason::Hidden);
                     (entry, reason)
                 })
@@ -407,19 +604,138 @@ impl ChildRoster {
         }
     }
 
+    pub(crate) fn recovery_block(&self) -> Option<&str> {
+        self.inner.recovery_block.get().map(String::as_str)
+    }
+
     pub(crate) fn previous_instance_pid(&self, module_id: &str) -> Option<u32> {
-        self.previous_instance(module_id).map(|(pid, _)| pid)
+        self.previous_instance(module_id)
+            .map(|(pid, _)| pid)
+            .filter(|pid| *pid > 0)
     }
 
     pub(crate) fn previous_instance(
         &self,
         module_id: &str,
     ) -> Option<(u32, crate::live_children::RetainedReason)> {
+        if let Some((pid, reason)) = lock(&self.inner.pending_admissions).get(module_id) {
+            return Some((
+                *pid,
+                crate::live_children::RetainedReason::ContainerUnverifiable(reason.clone()),
+            ));
+        }
+        // A different module's stalled write cannot change an absent retained
+        // identity into this module's previous instance. Avoid the write gate
+        // until there is actually retained state for this module to recheck.
+        if !lock(&self.inner.retained)
+            .iter()
+            .any(|(entry, _)| entry.module_id == module_id)
+        {
+            return None;
+        }
         self.inner.recheck_retained();
         lock(&self.inner.retained)
             .iter()
-            .find(|(entry, _)| entry.module_id == module_id)
-            .map(|(entry, reason)| (entry.pid, *reason))
+            .find(|(entry, reason)| entry.module_id == module_id && reason.blocks_fresh_copy())
+            .map(|(entry, reason)| (entry.pid, reason.clone()))
+    }
+
+    pub(crate) fn admission_pending(&self, module_id: &str) -> bool {
+        lock(&self.inner.pending_admissions).contains_key(module_id)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_admission_timeout_for_test(&self, timeout: Duration) {
+        *lock(&self.inner.admission_timeout) = Some(timeout);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn admission_timeout_for_test(&self) -> Option<Duration> {
+        *lock(&self.inner.admission_timeout)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_admission_hook_for_test(
+        &self,
+        hook: impl Fn(&str, &'static str, Option<u32>) -> bool + Send + Sync + 'static,
+    ) {
+        *lock(&self.inner.admission_hook) = Some(AdmissionHook(Arc::new(hook)));
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn admission_event_for_test(
+        &self,
+        module: &str,
+        stage: &'static str,
+        pid: Option<u32>,
+    ) -> bool {
+        let hook = lock(&self.inner.admission_hook).clone();
+        hook.is_none_or(|hook| (hook.0)(module, stage, pid))
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn fail_adoption_for_test(&self) {
+        self.inner.fail_adoption.store(true, Ordering::Release);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_placement_pause_for_test(
+        &self,
+        module: &str,
+        pause: subc_os::admission_gate::PlacementPause,
+    ) {
+        lock(&self.inner.placement_pause).insert(module.into(), pause);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn take_placement_pause_for_test(
+        &self,
+        module: &str,
+    ) -> Option<subc_os::admission_gate::PlacementPause> {
+        lock(&self.inner.placement_pause).remove(module)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_adoption_failure_for_test(&self) -> bool {
+        self.inner.fail_adoption.swap(false, Ordering::AcqRel)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn flush_admissions(&self) -> std::io::Result<()> {
+        self.inner.without_stalling_runtime(|| {
+            let _write = lock(&self.inner.record_write);
+            let snapshot = lock(&self.inner.live).clone();
+            self.inner.write_record(&snapshot)
+        })
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn begin_pending_admission(&self, module_id: &str, pid: u32) {
+        lock(&self.inner.pending_admissions).insert(module_id.into(), (pid,
+            "carried admission cleanup pending; the child and durable record must be resolved before another start".into()));
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn finish_pending_admission(&self, module_id: &str) {
+        lock(&self.inner.pending_admissions).remove(module_id);
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn quarantine_failed_admission(&self, module_id: &str, source: &std::io::Error) {
+        let reason = format!(
+            "failed late admission write for {module_id}: {source}; offline clearance is required"
+        );
+        let _ = self.inner.recovery_block.set(reason.clone());
+        tracing::error!(module_id, %source, "failed late admission write; quarantining the recovery store");
+        self.inner.without_stalling_runtime(|| {
+            let _write = lock(&self.inner.record_write);
+            if let Some(path) = self.inner.record_path.get() {
+                if let Err(error) = crate::live_children::quarantine_failed_admission(path, &reason, source) {
+                    self.inner.unquarantined_record.store(true, Ordering::Release);
+                    tracing::error!(%error, %reason, "cannot persist admission failure quarantine; preserving recovery evidence");
+                }
+            }
+        });
     }
 
     pub(crate) fn admit(
@@ -486,6 +802,7 @@ impl ChildRoster {
     #[cfg(unix)]
     pub(crate) fn close(&self) {
         self.inner.closed.set();
+        self.inner.closed_notify.notify_waiters();
     }
 }
 
@@ -860,6 +1177,14 @@ mod unix_shutdown {
     }
 
     fn signal(entry: &RosterEntry, signal: Signal) {
+        if let Some(carried) = &entry.recorded.carried {
+            if let Some(container) = carried.upgrade() {
+                if signal == Signal::KILL {
+                    container.hard_kill();
+                }
+            }
+            return;
+        }
         // A reaped child's pid can be reused. Where the kernel start time is
         // known, refuse to signal a process that is not the one spawned.
         if let Some(expected) = entry.start_time {
@@ -884,5 +1209,126 @@ mod unix_shutdown {
                 "signal to supervised child failed; it has most likely already exited"
             );
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod retained_container_tests {
+    use super::*;
+    use crate::live_children::{ContainerIdentity, RetainedReason};
+    use cortexkit_test_support::ScratchDir;
+    use std::os::unix::process::CommandExt;
+    use std::process::{Child, Command};
+
+    struct OwnedChild(Child);
+    impl OwnedChild {
+        fn spawn(group: u32) -> Self {
+            Self(
+                Command::new("/bin/sleep")
+                    .arg("600")
+                    .process_group(group as i32)
+                    .spawn()
+                    .unwrap(),
+            )
+        }
+        fn id(&self) -> u32 {
+            self.0.id()
+        }
+    }
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn fixture(label: &str) -> (ScratchDir, ChildRoster, OwnedChild, u32) {
+        let dir = ScratchDir::new(label);
+        let roster = ChildRoster::default();
+        roster.record_to(dir.join("children.json"));
+        let mut first = OwnedChild::spawn(0);
+        let identity = subc_os::process_group::inspect(first.id())
+            .unwrap()
+            .unwrap();
+        let holder = OwnedChild::spawn(first.id());
+        let guard = roster
+            .admit(
+                label.into(),
+                first.id(),
+                ModuleProtocol::None,
+                Some(identity.start_time),
+                RecordedIdentity {
+                    container: Some(ContainerIdentity {
+                        pgid: Some(first.id()),
+                        created_start_time: Some(identity.start_time),
+                        cgroup_path: None,
+                        ..ContainerIdentity::test_metadata()
+                    }),
+                    ..RecordedIdentity::default()
+                },
+            )
+            .unwrap();
+        first.0.kill().unwrap();
+        first.0.wait().unwrap();
+        guard.retain(RetainedReason::ContainerSurvivors(vec![holder.id()]));
+        (dir, roster, holder, first.id())
+    }
+
+    #[test]
+    fn retained_container_survivor_blocks_until_its_death() {
+        let label = "retained-container-live";
+        let (dir, roster, mut holder, pgid) = fixture(label);
+        let recorded = crate::live_children::read_record(&dir.join("children.json")).unwrap();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the dead leader's container record must survive guard release"
+        );
+        assert_eq!(recorded[0].container.as_ref().unwrap().pgid, Some(pgid));
+        let (pid, reason) = roster
+            .previous_instance(label)
+            .expect("a live container member blocks a fresh copy");
+        assert_eq!(pid, pgid);
+        assert_eq!(
+            reason,
+            RetainedReason::ContainerSurvivors(vec![holder.id()])
+        );
+        let detail = reason.waiting_message(pid);
+        assert!(
+            detail.contains("container survivors") && detail.contains(&holder.id().to_string()),
+            "{detail}"
+        );
+        // The recheck queued SIGKILL after verifying this owned child. Confirm
+        // its death before checking that the roster no longer blocks a fresh copy.
+        holder.0.wait().unwrap();
+        assert_eq!(roster.previous_instance(label), None);
+        assert!(
+            crate::live_children::read_record(&dir.join("children.json"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn retained_container_zombie_does_not_block_a_fresh_copy() {
+        let label = "retained-container-zombie";
+        let (_dir, roster, mut holder, _) = fixture(label);
+        holder.0.kill().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while subc_os::child_exit::observe(holder.id()).unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned child must reach zombie state"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(subc_os::process_group::inspect(holder.id())
+            .unwrap()
+            .is_none_or(|facts| facts.exited));
+        assert_eq!(
+            roster.previous_instance(label),
+            None,
+            "an exited unreaped helper has no live resources"
+        );
     }
 }

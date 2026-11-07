@@ -2947,7 +2947,7 @@ pub enum NotSentCause {
     WriterRejected,
     /// A control response could not be decoded or had an unexpected shape.
     InvalidResponse,
-    /// No longer produced: since 0.34.1 a dropped completion channel, which
+    /// No longer produced: since 0.34.2 a dropped completion channel, which
     /// can't prove non-delivery, is reported as [`CallError::OutcomeUnknown`]
     /// with [`OutcomeUnknownCause::CompletionFailed`]. Kept so existing
     /// matches still compile.

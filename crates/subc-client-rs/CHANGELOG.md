@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.34.1
+## 0.34.2
+
+0.34.1 was tagged in the repository but never published; its change ships here.
 
 - Report a request whose pending reply channel closes without a result as
   `OutcomeUnknown` (cause `CompletionFailed`), not as `NotSent` with

@@ -743,7 +743,10 @@ mod tests {
         let only = rx.recv().await.unwrap();
         lose_reply(&shared, &only);
         let err = call.await.unwrap().unwrap_err();
-        assert!(matches!(err, CallError::OutcomeUnknown(_)), "{err:?}");
+        assert!(
+            !err.is_not_sent() && err.outcome_cause().is_some(),
+            "{err:?}"
+        );
         assert!(
             rx.try_recv().is_err(),
             "an apply is never sent a second time"

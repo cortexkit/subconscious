@@ -90,6 +90,11 @@ fn file_key_store_retains_key_and_high_water_through_unstamp_and_restamp() {
         }),
         Err(KeychainError::RevisionConflict)
     ));
+    assert!(matches!(
+        store.clear_anchor(7),
+        Err(KeychainError::RevisionConflict)
+    ));
+    store.clear_anchor(8).unwrap();
     store.clear_anchor(8).unwrap();
     drop(store);
     let store = self::store(path);

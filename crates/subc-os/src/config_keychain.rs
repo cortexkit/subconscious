@@ -67,7 +67,11 @@ impl AnchorState {
     }
 
     fn clear(self, revision: u64) -> Result<Self, KeychainError> {
-        if revision < self.high_water || revision == 0 {
+        // The unstamp is its own committed revision, so it must pass the stamp
+        // it removes. Equal is accepted only to repeat a clear that already
+        // happened, when nothing is stamped.
+        let repeat = self.current.is_none() && revision == self.high_water;
+        if revision == 0 || (revision <= self.high_water && !repeat) {
             return Err(KeychainError::RevisionConflict);
         }
         Ok(Self {
@@ -131,6 +135,7 @@ impl KeychainState {
 
 /// Failure to reach/read an eligible keychain is never `Unsupported`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum KeychainError {
     Unsupported,
     Unavailable,

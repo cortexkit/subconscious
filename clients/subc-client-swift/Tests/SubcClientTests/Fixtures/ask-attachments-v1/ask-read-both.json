@@ -1,0 +1,96 @@
+{
+  "reply": {
+    "result": {
+      "answer": "Here are the photos.",
+      "answerArtifactIds": [
+        "<artifact-2>",
+        "<artifact-3>"
+      ],
+      "answerAttachments": [
+        {
+          "artifactId": "<artifact-2>",
+          "byteCount": 16,
+          "kind": "file",
+          "mime": "image/png",
+          "sealed": true,
+          "title": "first.png"
+        },
+        {
+          "artifactId": "<artifact-3>",
+          "byteCount": 14,
+          "kind": "file",
+          "mime": "image/jpeg",
+          "sealed": true,
+          "title": "second.jpg"
+        }
+      ],
+      "answerKind": "free_form",
+      "answeredAt": 2000,
+      "answeredAtMs": 2000,
+      "askedAt": 1000,
+      "askerAgentID": "<asking-agent>",
+      "askerSessionID": "<asking-session>",
+      "attachments": [
+        {
+          "artifactId": "<artifact-1>",
+          "byteCount": 24,
+          "kind": "file",
+          "mime": "image/webp",
+          "sealed": true,
+          "title": "detail.webp"
+        },
+        {
+          "artifactId": "<artifact-2>",
+          "byteCount": 16,
+          "kind": "file",
+          "mime": "image/png",
+          "sealed": true,
+          "title": "first.png"
+        },
+        {
+          "artifactId": "<artifact-3>",
+          "byteCount": 14,
+          "kind": "file",
+          "mime": "image/jpeg",
+          "sealed": true,
+          "title": "second.jpg"
+        }
+      ],
+      "blocking": false,
+      "deliver": "phone",
+      "materialDamage": false,
+      "purpose": "general",
+      "question": "Which report?",
+      "recipientKind": "user",
+      "renudgeAttempts": 0,
+      "requestID": "<ask>",
+      "thread": [
+        {
+          "artifactIds": [
+            "<artifact-1>"
+          ],
+          "atMs": 1500,
+          "attachments": [
+            {
+              "artifactId": "<artifact-1>",
+              "byteCount": 24,
+              "kind": "file",
+              "mime": "image/webp",
+              "sealed": true,
+              "title": "detail.webp"
+            }
+          ],
+          "text": "Which part of this photo?",
+          "who": "user"
+        }
+      ],
+      "urgency": "normal"
+    }
+  },
+  "request": {
+    "method": "ask.get",
+    "params": {
+      "requestID": "<ask>"
+    }
+  }
+}

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `AskRequest` and `AskThreadEntry` read the photos a person attaches to an ask's answer or to a clarification. `AskRequest` gains `answerArtifactIds` and `answerAttachments`, and `AskThreadEntry` gains `artifactIds` and `attachments`, beside its existing `attachmentIndexes`. Each pointer is the existing `AskAttachment` (`artifactId`, `title`, `mime`, `byteCount`, `kind`, `sealed`), listed in the order the photos were sent. `AskRequest` also gains `answerPhotos`, the producer's flag for whether the ask accepts photos with its answer; nil means the producer did not say, and a client should then not offer photos. All five fields are optional, so asks without photos decode as before. `AskThreadEntry`'s initializer gains the two fields as defaulted parameters, so existing call sites compile unchanged. A test decodes the producer's `ask-attachments-v1` sample, copied byte for byte and checked against its digest.
+
 - `AskRequest` reads two optional fields core now puts on every pending ask: `askerAgentID`, the agent of the session that filed the ask, present even when that agent has no running session, and `deliver`, where the producer routes the ask's notification (`phone`, `desktop` or `none`). `deliver` stays the producer's string, so a value added later still decodes. Both are display data and confer no authority. Asks without them decode as before.
 
 - Test-only: vendor the share-v2 release vectors (`share-v2-vectors-v1.1`, which uses only invented module names) under `Tests/SubcFedTests/Fixtures/share-v2/` and pin their manifest digest. The share-v2 vector tests now run on every build, and a missing file fails them instead of skipping.

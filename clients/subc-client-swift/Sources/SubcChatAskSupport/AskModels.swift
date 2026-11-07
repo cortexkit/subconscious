@@ -267,6 +267,19 @@ public struct AskRequest: Codable, Equatable, Identifiable {
     public var attachments: [AskAttachment]?
     public var thread: [AskThreadEntry]?
 
+    // Photos the person attached to the answer, in the order they were sent.
+    // `answerArtifactIds` lists their artifact ids; `answerAttachments` holds the
+    // matching pointers, which also appear in the ask-wide `attachments` list. Both
+    // are absent on answers without photos and from producers that predate them.
+    public var answerArtifactIds: [String]?
+    public var answerAttachments: [AskAttachment]?
+    /// Whether this ask accepts photos with its answer. The producer sets it on the
+    /// ask records it serves to the person's apps: false for asks whose answer
+    /// channel takes no photos, such as review verdicts. Nil when the producer did
+    /// not say, which older producers never do; a client should then not offer
+    /// photos.
+    public var answerPhotos: Bool?
+
     // Ask revisions. An agent can update an open ask in place; each update raises
     // `revision` (1 for the original) and stamps `updatedAtMs`, and an answer records
     // the revision it answered as `answeredRevision`. A client merging newest-wins
@@ -319,6 +332,9 @@ public struct AskRequest: Codable, Equatable, Identifiable {
         case autoProceededAt
         case attachments
         case thread
+        case answerArtifactIds
+        case answerAttachments
+        case answerPhotos
         case revision
         case updatedAtMs
         case answeredRevision
@@ -390,6 +406,9 @@ extension AskRequest {
         autoProceededAt = try container.decodeIfPresent(Int64.self, forKey: .autoProceededAt)
         attachments = try container.decodeIfPresent([AskAttachment].self, forKey: .attachments)
         thread = try container.decodeIfPresent([AskThreadEntry].self, forKey: .thread)
+        answerArtifactIds = try container.decodeIfPresent([String].self, forKey: .answerArtifactIds)
+        answerAttachments = try container.decodeIfPresent([AskAttachment].self, forKey: .answerAttachments)
+        answerPhotos = try container.decodeIfPresent(Bool.self, forKey: .answerPhotos)
         revision = try container.decodeIfPresent(Int.self, forKey: .revision)
         updatedAtMs = try container.decodeIfPresent(Int64.self, forKey: .updatedAtMs)
         answeredRevision = try container.decodeIfPresent(Int.self, forKey: .answeredRevision)
@@ -509,17 +528,33 @@ private struct AnyAskCodingKey: CodingKey {
 /// open set, and an enum's decode throw on an unrecognised speaker would take the
 /// WHOLE ask down with it -- the same one-malformed-block-fails-the-board class
 /// the board decoder already had to fix.
+///
+/// An entry's attachments come in two forms. `attachmentIndexes` joins inline
+/// attachments on the ask by their `index`. `artifactIds` and `attachments` carry
+/// artifact pointers, such as photos the person attached to a clarification, in the
+/// order they were sent. Each is absent when the entry has none of that kind.
 public struct AskThreadEntry: Codable, Equatable, Hashable {
     public var who: String
     public var text: String
     public var atMs: Int64
     public var attachmentIndexes: [Int]?
+    public var artifactIds: [String]?
+    public var attachments: [AskAttachment]?
 
-    public init(who: String, text: String, atMs: Int64, attachmentIndexes: [Int]? = nil) {
+    public init(
+        who: String,
+        text: String,
+        atMs: Int64,
+        attachmentIndexes: [Int]? = nil,
+        artifactIds: [String]? = nil,
+        attachments: [AskAttachment]? = nil
+    ) {
         self.who = who
         self.text = text
         self.atMs = atMs
         self.attachmentIndexes = attachmentIndexes
+        self.artifactIds = artifactIds
+        self.attachments = attachments
     }
 }
 

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import XCTest
 @testable import SubcChatAskSupport
@@ -556,5 +557,59 @@ extension AskModelsTests {
         ])
         XCTAssertNil(ask.attachments)
         XCTAssertNil(ask.thread)
+    }
+
+    /// `answerPhotos` decodes both values, and its absence stays distinguishable.
+    func testAnswerPhotosFlagDecodesTrueFalseAndAbsent() throws {
+        func decode(_ extra: String) throws -> AskRequest {
+            let json = #"{"requestID":"a","question":"q","askedAt":1"# + extra + "}"
+            return try JSONDecoder().decode(AskRequest.self, from: Data(json.utf8))
+        }
+        XCTAssertEqual(try decode(#","answerPhotos":true"#).answerPhotos, true)
+        XCTAssertEqual(try decode(#","answerPhotos":false"#).answerPhotos, false)
+        XCTAssertNil(try decode("").answerPhotos)
+    }
+
+    /// The producer's own sample of an ask with clarification and answer photos
+    /// (Fixtures/ask-attachments-v1). Both pointer sets must decode in sent order,
+    /// and the copy must still match the producer's digest.
+    func testAskReadBothDecodesAnswerAndClarificationPhotos() throws {
+        let directory = try XCTUnwrap(Bundle.module.resourceURL)
+            .appendingPathComponent("ask-attachments-v1", isDirectory: true)
+        let data = try Data(contentsOf: directory.appendingPathComponent("ask-read-both.json"))
+        let sums = try String(contentsOf: directory.appendingPathComponent("SHA256SUMS"), encoding: .utf8)
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        XCTAssertEqual(sums.split(separator: " ").first.map(String.init), digest, "sample differs from the producer's copy")
+
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let reply = try XCTUnwrap(object["reply"] as? [String: Any])
+        let result = try XCTUnwrap(reply["result"])
+        let ask = try JSONDecoder().decode(
+            AskRequest.self, from: JSONSerialization.data(withJSONObject: result))
+
+        XCTAssertEqual(ask.answer, "Here are the photos.")
+        XCTAssertEqual(ask.answerArtifactIds, ["<artifact-2>", "<artifact-3>"])
+        let answerPhotos = try XCTUnwrap(ask.answerAttachments)
+        XCTAssertEqual(answerPhotos.map(\.artifactID), ["<artifact-2>", "<artifact-3>"])
+        XCTAssertEqual(answerPhotos.map(\.mime), ["image/png", "image/jpeg"])
+        XCTAssertEqual(answerPhotos.map(\.title), ["first.png", "second.jpg"])
+        XCTAssertEqual(answerPhotos.map(\.byteCount), [16, 14])
+        XCTAssertEqual(answerPhotos.map(\.kind), [AskAttachment.fileKind, AskAttachment.fileKind])
+        XCTAssertEqual(answerPhotos.map(\.sealed), [true, true])
+
+        let entry = try XCTUnwrap(ask.thread?.first)
+        XCTAssertEqual(entry.who, "user")
+        XCTAssertEqual(entry.artifactIds, ["<artifact-1>"])
+        let clarificationPhoto = try XCTUnwrap(entry.attachments?.first)
+        XCTAssertEqual(clarificationPhoto.artifactID, "<artifact-1>")
+        XCTAssertEqual(clarificationPhoto.mime, "image/webp")
+        XCTAssertEqual(clarificationPhoto.byteCount, 24)
+        XCTAssertNil(entry.attachmentIndexes)
+
+        // This sample predates the `answerPhotos` flag, so it reads as unknown.
+        XCTAssertNil(ask.answerPhotos)
+
+        // The ask-wide list still carries every pointer, clarification first.
+        XCTAssertEqual(ask.attachments?.map(\.artifactID), ["<artifact-1>", "<artifact-2>", "<artifact-3>"])
     }
 }

@@ -1,0 +1,36 @@
+{
+  "protocol": "consent/v1",
+  "plan_digest": "sha256:3c117d4ce718c334a2f68b776f4c2c1368c79fc1bc71e7e527a26fa7eeecb748",
+  "base_revision": 7,
+  "input_vector": {
+    "inputs": {
+      "subc.jsonc": {
+        "state": "absent"
+      }
+    }
+  },
+  "plan": {
+    "base_revision": 7,
+    "base_generation": 3,
+    "active_generations": {
+      "sample": 3
+    },
+    "daemon_incarnation": "test-daemon",
+    "input_vector": {
+      "inputs": {
+        "subc.jsonc": {
+          "state": "absent"
+        }
+      }
+    },
+    "changeset": {
+      "fields": [],
+      "affected_projects": [],
+      "policy_changes": [],
+      "launch_manifests": {},
+      "apply_plan": {
+        "kind": "live"
+      }
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "module_id": "sample",
+  "layer": "user",
+  "path": "/config/sample.jsonc",
+  "bytes": "77u/eyJsaW1pdCI6MTB9DQo=",
+  "digest": "sha256:e03c35c4623207b271db0b0c0cd1d3355bbc3e0a12367cd9fcc0482c0928191a"
+}

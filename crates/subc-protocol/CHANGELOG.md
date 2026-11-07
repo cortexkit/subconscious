@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.34.5
+
+- Add standalone, opt-in `config.review`, `config.declare`, `config.get`,
+  `config.applied` and `config.changed` bodies and the `config.gate` capability.
+  `config.get` separates the active view from an optional pending delivery.
+  Existing exhaustive control enums, HELLO bodies and manifest fields are unchanged.
+- Add `consent/v1` request/reply bodies bound to the plan digest, base revision
+  and input vector, with shared golden fixtures for requesters and responders.
+  Unknown decisions never approve; unknown apply results never ACK.
+- Define the shared config-gate refusal spellings, including
+  `not_delivery_target`, which does not change module delivery state.
+- Expose `subc-config` 0.1 types, including `Digest`, `Layer` and `FieldChange`,
+  in the public API. A breaking `subc-config` release requires a breaking
+  `subc-protocol` release. Add `subc-config` and `base64` dependencies; no new
+  Cargo features are enabled. Snapshot bytes use canonical padded base64 and
+  decode only when their raw-byte digest matches.
+
 ## 0.34.4
 
 - Add `route_busy`, its credit snapshot detail and the trusted same-route retry predicate. Pin route-open, route-death and same-route decisions in the shared golden tables.

@@ -3033,10 +3033,12 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.34.4"
+version = "0.34.5"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
+ "subc-config",
 ]
 
 [[package]]

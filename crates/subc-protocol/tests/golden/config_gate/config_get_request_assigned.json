@@ -1,0 +1,6 @@
+{
+  "op": "config.get",
+  "project_id": "project-a",
+  "generation": 4,
+  "attempt": 8
+}

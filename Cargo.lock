@@ -2861,6 +2861,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "subc-config"
+version = "0.1.0"
+dependencies = [
+ "regex",
+ "ryu",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "subc-control"
 version = "0.35.0"
 dependencies = [

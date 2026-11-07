@@ -42,6 +42,7 @@ fi
 # everything it depends on, which is the order the publish jobs run in.
 wire_crates=(
   subc-protocol
+  subc-config
   subc-transport
   subc-control
   subc-client-rs

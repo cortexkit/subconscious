@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/subc-protocol",
+    "crates/subc-config",
     "crates/subc-control",
     "crates/subc-transport",
     "crates/subc-client-rs",

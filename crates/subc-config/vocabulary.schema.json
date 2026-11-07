@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cortexkit.com/schemas/subc-config/v1/vocabulary",
+  "title": "subc-config policy annotations",
+  "type": "object",
+  "properties": {
+    "x-ck-required": { "type": "boolean" },
+    "x-ck-apply": { "enum": ["live", "module_restart", "daemon_restart", "next_supervision", "route_rebind"] },
+    "x-ck-layers": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "enum": ["user", "workspace", "project"] } },
+    "x-ck-bound": { "enum": ["raise_only", "lower_only", "subset_only"] },
+    "x-ck-kind": { "enum": ["credential_ref", "model_ref", "project_ref", "path", "duration", "bytes", "percent"] },
+    "x-ck-ordering": { "type": "array", "minItems": 2, "uniqueItems": true, "items": { "type": ["string", "boolean", "number"] } },
+    "x-ck-section": { "type": "string" },
+    "x-ck-order": { "type": "number" },
+    "x-ck-options": {
+      "type": "object",
+      "required": ["source", "items_pointer", "value_pointer", "label_pointer", "depends_on", "closed"],
+      "properties": {
+        "source": { "$ref": "#/$defs/source" },
+        "items_pointer": { "type": "string" },
+        "value_pointer": { "type": "string" },
+        "label_pointer": { "type": "string" },
+        "depends_on": { "type": "array", "items": { "type": "string" } },
+        "closed": { "type": "boolean" },
+        "items_from_parent_pointer": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "x-ck-action": { "type": "object" }
+  },
+  "$defs": {
+    "source": {
+      "type": "object",
+      "required": ["module", "op", "params"],
+      "properties": { "module": { "type": "string", "minLength": 1 }, "op": { "type": "string", "minLength": 1 }, "params": { "type": "object" } },
+      "additionalProperties": false
+    }
+  }
+}

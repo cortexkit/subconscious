@@ -26,7 +26,7 @@
       },
       "additionalProperties": false
     },
-    "x-ck-action": { "$ref": "#/$defs/source" }
+    "x-ck-action": { "type": "object" }
   },
   "$defs": {
     "source": {

@@ -966,6 +966,12 @@ fn validate_vocabulary(node: &Value, path: &str) -> Result<(), Refusal> {
                 return Err(schema_error(path));
             }
         }
+        if options
+            .get("items_from_parent_pointer")
+            .is_some_and(|v| !v.as_str().is_some_and(valid_pointer))
+        {
+            return Err(schema_error(path));
+        }
         if !options.get("closed").is_some_and(Value::is_boolean) {
             return Err(schema_error(path));
         }
@@ -990,6 +996,19 @@ fn validate_vocabulary(node: &Value, path: &str) -> Result<(), Refusal> {
                     .is_some_and(|s| !s.is_empty())
             })
             || !source.get("params").is_some_and(Value::is_object)
+        {
+            return Err(schema_error(path));
+        }
+    }
+    if let Some(order) = node.get("x-ck-ordering").and_then(Value::as_array) {
+        if order.len() < 2
+            || order
+                .iter()
+                .any(|v| v.is_null() || v.is_array() || v.is_object())
+            || order
+                .iter()
+                .enumerate()
+                .any(|(i, v)| order[..i].iter().any(|x| same_scalar(x, v)))
         {
             return Err(schema_error(path));
         }
@@ -1325,5 +1344,26 @@ mod tests {
         root["$schema"] = json!("https://json-schema.org/draft/2020-12/schema");
         root["x-ck-layers"] = json!(["user"]);
         assert!(Schema::new(root).is_err());
+    }
+
+    #[test]
+    fn policy_contract_optional_annotation_values_are_checked() {
+        for (keyword, value) in [
+            ("x-ck-action", json!("not an operation object")),
+            ("x-ck-ordering", json!([false, false])),
+            ("x-ck-ordering", json!([null, true])),
+            ("x-ck-kind", json!("unknown")),
+            ("x-ck-required", json!("yes")),
+        ] {
+            let mut n = field("number", json!(5));
+            n[keyword] = value;
+            let mut root = object(json!({"n":n}));
+            root["$schema"] = json!("https://json-schema.org/draft/2020-12/schema");
+            assert_eq!(
+                Schema::new(root).unwrap_err().code,
+                RefusalCode::SchemaInvalid,
+                "{keyword}"
+            );
+        }
     }
 }

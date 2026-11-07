@@ -36,7 +36,7 @@ write_current_responses() {
   local dir="$1"
   mkdir -p "$dir"
   local crate
-  for crate in subc-protocol subc-transport subc-control subc-client-rs \
+  for crate in subc-protocol subc-config subc-transport subc-control subc-client-rs \
     subc-jsonc subc-cgroup subc-uptime subc-os subc-jobobject subc-presence \
     subc-daemon cortexkit-bus-testkit; do
     write_response "$dir" "$crate" "$(manifest_version "$crate")"
@@ -104,14 +104,15 @@ subc-control $(manifest_version subc-control)" 0 \
 
 daemon_and_leaves="$test_root/daemon-and-leaves"
 write_current_responses "$daemon_and_leaves"
-for crate in subc-jsonc subc-cgroup subc-uptime subc-os subc-jobobject subc-presence \
+for crate in subc-config subc-jsonc subc-cgroup subc-uptime subc-os subc-jobobject subc-presence \
   subc-daemon; do
   printf '%s\n' 404 >"$daemon_and_leaves/$crate.status"
   printf '%s\n' '{"errors":[{"detail":"crate does not exist"}]}' \
     >"$daemon_and_leaves/$crate.json"
 done
 check_case daemon-after-its-leaves \
-  "subc-jsonc $(manifest_version subc-jsonc)
+  "subc-config $(manifest_version subc-config)
+subc-jsonc $(manifest_version subc-jsonc)
 subc-cgroup $(manifest_version subc-cgroup)
 subc-uptime $(manifest_version subc-uptime)
 subc-os $(manifest_version subc-os)

@@ -1,0 +1,15 @@
+[package]
+name = "subc-config"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = true
+repository = "https://github.com/cortexkit/subconscious"
+description = "Shared configuration policy, canonical digests and approval records for subc."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ryu = "1"
+regex = "1"

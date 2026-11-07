@@ -20,6 +20,7 @@ Standing rules for every worker in this repository. Where your brief names a nar
 ## Prerequisites
 
 - Vector regeneration uses only `target/gate-python/bin/python3`, with the committed dependency pins, not system Python. One-time setup: `python3 -m venv target/gate-python && for requirements in vectors/*/requirements.txt; do target/gate-python/bin/pip install -r "$requirements"; done`. The gate never installs dependencies itself.
+- Run `scripts/gate.sh fast` and that setup on this Mac in your worktree, not on the Linux build server: the build server's Python can't create a venv, and you must never install packages there.
 
 ## Crate versions
 

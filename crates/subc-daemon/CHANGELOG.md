@@ -33,6 +33,9 @@
   A candidate launched before a newer required start is abandoned without
   cutover; one replacement uses the current configured command. Retain the
   successful supersession outcome in daemon-local status.
+- Require route-rebind readiness from a health probe begun after policy
+  installation. Queue an immediate ordinary supervisor probe, bind its result
+  to the child and policy installation, and recover once on failure or timeout.
 
 ## 0.41.9
 

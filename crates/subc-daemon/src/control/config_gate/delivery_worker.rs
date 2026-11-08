@@ -197,6 +197,26 @@ async fn module_worker(
                                 continue;
                             }
                         }
+                        if let Ok(Some((generation, attempt))) =
+                            owner.policy_probe_due(registration.connection_id)
+                        {
+                            let supervised = control.supervisor.get(module);
+                            drop(_guard);
+                            drop(control);
+                            if let Some(supervised) = supervised {
+                                if let Err(error) = supervised
+                                    .config_policy_probe(
+                                        registration.connection_id,
+                                        generation,
+                                        attempt,
+                                    )
+                                    .await
+                                {
+                                    warn!(%error, "post-policy configuration health probe could not be queued");
+                                }
+                            }
+                            continue;
+                        }
                         let window = owner
                             .delivery_window(registration.connection_id)
                             .ok()

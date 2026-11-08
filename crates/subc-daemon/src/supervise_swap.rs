@@ -601,6 +601,10 @@ fn serve_command_while_warming(
         module_id: module_id.to_string(),
     };
     match command {
+        SupervisorCommand::ConfigPolicyProbe { .. } => {
+            end.requeue.push(command);
+            None
+        }
         SupervisorCommand::ConfigApplyRestart { .. } => Some(command),
         SupervisorCommand::Drain { .. }
         | SupervisorCommand::ConfigExitHold { .. }

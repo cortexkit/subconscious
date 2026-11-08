@@ -2,7 +2,9 @@
 //! module claims in `config.applied`.
 
 use super::*;
-use crate::config_gate::runtime::{DeliveryObserver, DeliverySpawn, RuntimeOwner};
+use crate::config_gate::runtime::{
+    AppliedDisposition, DeliveryObserver, DeliverySpawn, RuntimeOwner,
+};
 
 #[derive(Clone)]
 pub(super) struct ConfigDelivery(pub(super) Arc<RuntimeOwner>);
@@ -149,42 +151,62 @@ impl ConfigDelivery {
         self.0.notify_delivery_changed();
     }
 
-    pub(super) async fn healthy(
+    pub(super) fn health_probe(
         &self,
         module: &str,
         forwarding: Option<&ForwardingTable>,
         registry: &Registry,
-    ) {
-        let Ok(gate) = self.0.module_gate(module) else {
-            return;
-        };
-        let _guard = gate.lock().await;
-        let Some(registration) = registry.get_module(module).ok().flatten() else {
-            return;
-        };
+    ) -> Option<crate::config_gate::runtime::DeliveryProbe> {
+        let registration = registry.get_module(module).ok().flatten()?;
         if forwarding
             .and_then(|forwarding| forwarding.active_module_endpoint(module).ok().flatten())
             .is_none_or(|endpoint| endpoint.connection_id != registration.connection_id)
         {
-            return;
+            return None;
         }
-        let generation = self
-            .0
-            .delivery_current_attempt(registration.connection_id)
+        self.0
+            .health_probe(registration.connection_id, module)
             .ok()
             .flatten()
-            .map(|(generation, _)| generation)
-            .or_else(|| {
-                self.0
-                    .delivery_child_generation(registration.connection_id)
-                    .ok()
-                    .flatten()
-            });
-        if let Some(generation) = generation {
-            if let Err(error) = self.0.ready(registration.connection_id, module, generation) {
-                warn!(module_id=module, %error, "configuration health observation failed");
-            }
+    }
+
+    pub(super) async fn health_result(
+        &self,
+        module: &str,
+        forwarding: Option<&ForwardingTable>,
+        registry: &Registry,
+        probe: crate::config_gate::runtime::DeliveryProbe,
+        healthy: bool,
+    ) -> bool {
+        // Even an obsolete policy probe belongs to delivery, not to a second
+        // health-triggered restart after its attempt has already failed.
+        let owned_failure = !healthy && probe.owns_failure();
+        let Ok(gate) = self.0.module_gate(module) else {
+            return false;
+        };
+        let _guard = gate.lock().await;
+        let active = registry
+            .get_module(module)
+            .ok()
+            .flatten()
+            .is_some_and(|registration| registration.connection_id == probe.connection())
+            && forwarding
+                .and_then(|table| table.active_module_endpoint(module).ok().flatten())
+                .is_some_and(|endpoint| endpoint.connection_id == probe.connection());
+        if !active {
+            return owned_failure;
         }
+        let failed = match self.0.health_result(probe, healthy) {
+            Ok(Some(
+                AppliedDisposition::Failed { .. } | AppliedDisposition::CatchupFailed { .. },
+            )) => true,
+            Ok(_) => false,
+            Err(error) => {
+                warn!(module_id=module, %error, "configuration health observation failed");
+                !healthy && error.code == "anchor_pending"
+            }
+        };
         self.0.notify_delivery_changed();
+        failed || owned_failure
     }
 }

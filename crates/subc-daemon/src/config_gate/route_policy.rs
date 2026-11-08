@@ -255,7 +255,7 @@ impl RuntimeOwner {
             )
         };
         let installation = authority.install_and_revoke(policy).await?;
-        let observed = {
+        {
             let mut state = self.lock()?;
             if !state
                 .store
@@ -274,6 +274,10 @@ impl RuntimeOwner {
                     "route policy generation was superseded during installation",
                 ));
             }
+            let target = state.active_declarations.get(module).copied();
+            state
+                .delivery
+                .policy_installed(module, generation, target)?;
             state
                 .installed_route_policies
                 .insert(module.into(), generation);
@@ -285,12 +289,6 @@ impl RuntimeOwner {
                 },
             );
             state.commit_anchored_route_policies();
-            state
-                .delivery
-                .observed_readiness(module, generation, &state.active_declarations)
-        };
-        if let Some(connection) = observed {
-            self.delivery_readiness_complete(connection, module, generation)?;
         }
         self.notify_delivery_changed();
         Ok(())

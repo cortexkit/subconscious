@@ -656,6 +656,8 @@ async fn config_delivery_mixed_route_rebind_and_live_require_route_readiness_bef
     assert!(owner.ready(INCUMBENT, "a", 2).unwrap().is_none());
     assert_active(&owner, INCUMBENT, 1);
     owner.install_approved_route_policy("a", 2).await.unwrap();
+    assert_active(&owner, INCUMBENT, 1);
+    owner.ready(INCUMBENT, "a", 2).unwrap();
     assert_active(&owner, INCUMBENT, 2);
 }
 
@@ -1647,6 +1649,8 @@ async fn config_delivery_route_authority_installs_saved_approved_bytes_and_revok
     owner.install_approved_route_policy("a", 2).await.unwrap();
     assert!(authority.live_stamps.lock().unwrap().is_empty());
     assert_eq!(authority.new_open_generation.load(Ordering::SeqCst), 2);
+    assert_active(&owner, INCUMBENT, 1);
+    owner.ready(INCUMBENT, "a", 2).unwrap();
     assert_active(&owner, INCUMBENT, 2);
     let policies = authority.policies.lock().unwrap();
     assert_eq!(policies.len(), 1);
@@ -2113,10 +2117,7 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
         )
         .unwrap();
     rig.declare(&owner, 30);
-    wait_for_delivery_condition(|| {
-        owner.delivery_child_generation(replacement).unwrap() == Some(2)
-    })
-    .await;
+    wait_for_delivery_condition(|| owner.health_probe(replacement, "a").unwrap().is_some()).await;
     assert_eq!(pending(&owner, replacement).generation, 2);
     registry.deregister_connection(replacement).unwrap();
     module.stop().await.unwrap();
@@ -2176,5 +2177,242 @@ fn config_delivery_swap_never_uses_cutover_as_a_missing_start_or_daemon_boundary
             assert_eq!(result.unwrap_err().code, "config_gated");
             assert_active(&owner, INCUMBENT, 1);
         }
+    }
+}
+
+#[tokio::test]
+async fn config_delivery_route_policy_install_does_not_reuse_pre_install_health() {
+    let (rig, owner) = rig();
+    let owner =
+        owner.with_route_policy_authority(std::sync::Arc::new(FakeRouteAuthority::default()));
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+    let view = pending(&owner, INCUMBENT);
+    owner.ready(INCUMBENT, "a", 2).unwrap();
+    applied(&owner, INCUMBENT, &view, true).unwrap();
+    owner.install_approved_route_policy("a", 2).await.unwrap();
+    assert_active(&owner, INCUMBENT, 1);
+}
+
+#[tokio::test]
+async fn config_delivery_route_health_reply_started_before_install_does_not_count_but_a_fresh_probe_does(
+) {
+    let (rig, owner) = rig();
+    let owner =
+        owner.with_route_policy_authority(std::sync::Arc::new(FakeRouteAuthority::default()));
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+    let view = pending(&owner, INCUMBENT);
+    applied(&owner, INCUMBENT, &view, true).unwrap();
+    let in_flight = owner.health_probe(INCUMBENT, "a").unwrap().unwrap();
+    owner.install_approved_route_policy("a", 2).await.unwrap();
+    assert_eq!(owner.health_result(in_flight, true).unwrap(), None);
+    assert_active(&owner, INCUMBENT, 1);
+    let fresh = owner.health_probe(INCUMBENT, "a").unwrap().unwrap();
+    assert_eq!(
+        owner.health_result(fresh, true).unwrap(),
+        Some(AppliedDisposition::Active)
+    );
+    assert_active(&owner, INCUMBENT, 2);
+}
+
+#[tokio::test]
+async fn config_delivery_route_unhealthy_fresh_probe_restores_policy_through_the_delivery_failure_path(
+) {
+    use std::sync::{atomic::Ordering, Arc};
+    let (rig, owner) = rig();
+    let authority = Arc::new(FakeRouteAuthority::default());
+    authority.new_open_generation.store(1, Ordering::SeqCst);
+    let owner = owner.with_route_policy_authority(authority.clone());
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+    pending(&owner, INCUMBENT);
+    let stale = owner.health_probe(INCUMBENT, "a").unwrap().unwrap();
+    owner.install_approved_route_policy("a", 2).await.unwrap();
+    assert_eq!(owner.health_result(stale, false).unwrap(), None);
+    let fresh = owner.health_probe(INCUMBENT, "a").unwrap().unwrap();
+    assert!(matches!(
+        owner.health_result(fresh.clone(), false).unwrap(),
+        Some(AppliedDisposition::Failed {
+            generation: 2,
+            restore: Some(1),
+            ..
+        })
+    ));
+    assert_eq!(authority.new_open_generation.load(Ordering::SeqCst), 1);
+    assert_active(&owner, INCUMBENT, 1);
+    assert_eq!(owner.health_result(fresh, true).unwrap(), None);
+    assert_eq!(owner.delivery_take_recoveries().unwrap().len(), 1);
+    assert!(owner.lock().unwrap().store.body().unwrap().generations[&2]
+        .generation
+        .never_redeliver
+        .contains(&"a".into()));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn config_delivery_route_worker_requests_immediate_health_and_uses_delivery_failure_for_unhealthy_or_timeout(
+) {
+    use crate::supervise::{HealthConfig, RestartPolicy, Supervisor, SupervisorHandle};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        sync::{atomic::Ordering, Arc},
+    };
+    use subc_protocol::session::{HealthStatus, ModuleControlResponse};
+    for answer in [Some(HealthStatus::Ok), Some(HealthStatus::Failing), None] {
+        let rig = Rig::new();
+        std::fs::write(
+            rig.path.join("program"),
+            b"#!/bin/sh\nexec /bin/sleep 600\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            rig.path.join("program"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        write(&rig, 1);
+        let authority = Arc::new(FakeRouteAuthority::default());
+        authority.new_open_generation.store(1, Ordering::SeqCst);
+        let owner = Arc::new(
+            rig.owner("post-policy-probe")
+                .with_route_policy_authority(authority.clone()),
+        );
+        rig.declare(&owner, INCUMBENT.get());
+        rig.stamp(&owner);
+        applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+        let registry = Arc::new(crate::Registry::default());
+        let forwarding = Arc::new(crate::ForwardingTable::default());
+        let handle = SupervisorHandle::new();
+        let health = HealthConfig {
+            cadence: Duration::from_secs(3600),
+            ..HealthConfig::default()
+        };
+        let supervisor = Supervisor::new(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
+            .with_handle(handle.clone())
+            .with_forwarding(forwarding.clone())
+            .with_health_config(health)
+            .with_config_runtime(owner.clone())
+            .with_drain_timeout(Duration::ZERO);
+        let mut spec = supervised_spec(&rig, "a");
+        spec.protocol = subc_control::ModuleProtocol::Subc;
+        let module = supervisor.spawn(spec).unwrap();
+        registry
+            .register_with_control_ops(
+                subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+                subc_protocol::PROTOCOL_VERSION,
+                INCUMBENT,
+                vec!["config.review".into(), "health.check".into()],
+            )
+            .unwrap();
+        let (sender, mut frames) = tokio::sync::mpsc::channel(8);
+        forwarding
+            .register_module_connection(
+                INCUMBENT,
+                "a".into(),
+                subc_protocol::PROTOCOL_VERSION,
+                subc_protocol::manifest::Concurrency::ModuleManaged,
+                crate::FrameSink::new(sender),
+            )
+            .unwrap();
+        let handler = Arc::new(
+            crate::ControlHandler::with_forwarding(registry.clone(), forwarding.clone())
+                .with_supervisor(handle)
+                .with_config_runtime(owner.clone()),
+        );
+        approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+        let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
+        let frame = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let mut frame = frames.recv().await.unwrap();
+                if let Some(flushed) = frame.flushed.take() {
+                    flushed.send(()).unwrap();
+                }
+                if serde_json::from_slice::<serde_json::Value>(&frame.body)
+                    .is_ok_and(|body| body["op"] == "health.check")
+                {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("the installation must request health immediately, not at its hour-long cadence");
+        assert_eq!(authority.new_open_generation.load(Ordering::SeqCst), 2);
+        assert_active(&owner, INCUMBENT, 1);
+        let view = pending(&owner, INCUMBENT);
+        if answer == Some(HealthStatus::Ok) {
+            assert_eq!(
+                applied(&owner, INCUMBENT, &view, true).unwrap(),
+                AppliedDisposition::WaitingForReadiness
+            );
+        }
+        if let Some(status) = answer {
+            forwarding
+                .complete_module_control_rpc(
+                    INCUMBENT,
+                    frame.header.corr,
+                    Some("health.check"),
+                    crate::forwarding::ModuleControlRpcOutcome::Response(
+                        ModuleControlResponse::HealthCheck {
+                            status,
+                            detail: None,
+                            metrics: None,
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let body = owner.lock().unwrap().store.body().unwrap().clone();
+                if if answer == Some(HealthStatus::Ok) {
+                    body.versions[0].1.active == Some(2)
+                } else {
+                    body.generations[&2]
+                        .generation
+                        .never_redeliver
+                        .contains(&"a".into())
+                } {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the fresh health result must settle configuration delivery");
+        assert_active(
+            &owner,
+            INCUMBENT,
+            if answer == Some(HealthStatus::Ok) {
+                2
+            } else {
+                1
+            },
+        );
+        assert_eq!(
+            authority.new_open_generation.load(Ordering::SeqCst),
+            if answer == Some(HealthStatus::Ok) {
+                2
+            } else {
+                1
+            }
+        );
+        registry.deregister_connection(INCUMBENT).unwrap();
+        if answer != Some(HealthStatus::Ok) {
+            wait_for_delivery_condition(|| {
+                module
+                    .status()
+                    .is_ok_and(|status| status.restart_count == 1)
+            })
+            .await;
+            assert_eq!(
+                module.status().unwrap().restart_count,
+                1,
+                "config failure spends once, not a second time through health supervision"
+            );
+        } else {
+            assert_eq!(module.status().unwrap().restart_count, 0);
+        }
+        module.stop().await.unwrap();
     }
 }

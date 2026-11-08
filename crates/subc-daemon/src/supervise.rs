@@ -3735,6 +3735,24 @@ impl fmt::Debug for SupervisedModule {
 }
 
 impl SupervisedModule {
+    pub(crate) async fn config_policy_probe(
+        &self,
+        connection: crate::ConnectionId,
+        generation: u64,
+        attempt: u64,
+    ) -> Result<(), SuperviseError> {
+        self.inner
+            .commands
+            .send(SupervisorCommand::ConfigPolicyProbe {
+                connection,
+                generation,
+                attempt,
+            })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })
+    }
     pub(crate) async fn config_exit_hold(&self) -> Result<(), SuperviseError> {
         let (reply, result) = oneshot::channel();
         self.inner
@@ -4477,6 +4495,11 @@ impl Drop for SupervisedModuleInner {
 
 #[derive(Debug)]
 enum SupervisorCommand {
+    ConfigPolicyProbe {
+        connection: crate::ConnectionId,
+        generation: u64,
+        attempt: u64,
+    },
     ConfigApplyRestart {
         generation: u64,
         supersedes_swap: bool,
@@ -5131,6 +5154,9 @@ async fn run_health_probe_cycle(
     child: &mut Option<SupervisedChild>,
 ) {
     let now_ms = unix_ms_now();
+    let delivery_probe = runtime.config_delivery.as_ref().and_then(|delivery| {
+        delivery.health_probe(&spec.module_id, runtime.forwarding.as_deref(), registry)
+    });
     let http = (running_protocol(spec, snapshot) == ModuleProtocol::None)
         .then_some(runtime.health.http.as_deref())
         .flatten();
@@ -5149,6 +5175,7 @@ async fn run_health_probe_cycle(
                 child,
                 report,
                 now_ms,
+                delivery_probe,
             )
             .await;
         }
@@ -5167,6 +5194,7 @@ async fn run_health_probe_cycle(
                 child,
                 err,
                 now_ms,
+                delivery_probe,
             )
             .await;
         }
@@ -5554,7 +5582,22 @@ async fn handle_health_report(
     child: &mut Option<SupervisedChild>,
     report: HealthReport,
     now_ms: u64,
+    delivery_probe: Option<crate::config_gate::runtime::DeliveryProbe>,
 ) {
+    let delivery_failed = match (&runtime.config_delivery, delivery_probe) {
+        (Some(delivery), Some(probe)) => {
+            delivery
+                .health_result(
+                    &spec.module_id,
+                    runtime.forwarding.as_deref(),
+                    registry,
+                    probe,
+                    report.status == HealthStatus::Ok,
+                )
+                .await
+        }
+        _ => false,
+    };
     let status = supervisor_health_status(report.status);
     let detail = report.detail.clone();
     let metrics = truncate_health_metrics(report.metrics);
@@ -5570,15 +5613,11 @@ async fn handle_health_report(
         );
     });
 
+    if delivery_failed {
+        return;
+    }
     let action = match report.status {
-        HealthStatus::Ok => {
-            if let Some(delivery) = &runtime.config_delivery {
-                delivery
-                    .healthy(&spec.module_id, runtime.forwarding.as_deref(), registry)
-                    .await;
-            }
-            return;
-        }
+        HealthStatus::Ok => return,
         HealthStatus::Degraded => runtime.health.on_degraded,
         HealthStatus::Failing => runtime.health.on_failing,
     };
@@ -5607,7 +5646,22 @@ async fn handle_health_probe_failure(
     child: &mut Option<SupervisedChild>,
     err: HealthProbeError,
     now_ms: u64,
+    delivery_probe: Option<crate::config_gate::runtime::DeliveryProbe>,
 ) {
+    let delivery_failed = match (&runtime.config_delivery, delivery_probe) {
+        (Some(delivery), Some(probe)) => {
+            delivery
+                .health_result(
+                    &spec.module_id,
+                    runtime.forwarding.as_deref(),
+                    registry,
+                    probe,
+                    false,
+                )
+                .await
+        }
+        _ => false,
+    };
     let threshold = runtime.health.failure_threshold.max(1);
     let mut failures = 0;
     // Carry the evidence class into the operator-visible detail. Without it,
@@ -5631,6 +5685,9 @@ async fn handle_health_probe_failure(
         failures = state.health.consecutive_failures;
     });
 
+    if delivery_failed {
+        return;
+    }
     if failures < threshold {
         warn!(
             module_id = %spec.module_id,
@@ -7750,7 +7807,10 @@ async fn handle_supervisor_command(
     commands: &mut mpsc::Receiver<SupervisorCommand>,
     requeued: &mut VecDeque<SupervisorCommand>,
 ) -> bool {
-    if !matches!(command, SupervisorCommand::UpdateConfiguration { .. }) {
+    if !matches!(
+        command,
+        SupervisorCommand::UpdateConfiguration { .. } | SupervisorCommand::ConfigPolicyProbe { .. }
+    ) {
         runtime.recovery_is_daemon = false;
     }
     if matches!(
@@ -7795,6 +7855,35 @@ async fn handle_supervisor_command(
         command
     };
     match command {
+        SupervisorCommand::ConfigPolicyProbe {
+            connection,
+            generation,
+            attempt,
+        } => {
+            let Some(delivery) = &runtime.config_delivery else {
+                return true;
+            };
+            let Ok(gate) = delivery.0.module_gate(&spec.module_id) else {
+                return true;
+            };
+            let guard = gate.lock().await;
+            let pending = delivery
+                .0
+                .policy_probe_pending(connection, generation, attempt)
+                .unwrap_or(false)
+                && child.is_some()
+                && registry
+                    .get_module(&spec.module_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|registration| registration.connection_id == connection);
+            drop(guard);
+            if pending {
+                run_health_probe_cycle(spec, runtime, registry, process_liveness, snapshot, child)
+                    .await;
+            }
+            true
+        }
         SupervisorCommand::ConfigApplyRestart {
             generation,
             supersedes_swap,

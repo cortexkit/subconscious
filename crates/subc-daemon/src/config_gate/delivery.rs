@@ -24,6 +24,7 @@ struct Attempt {
     // A daemon restart drops it: every fresh launch receives the active vector.
     catchup: bool,
     write_deadline: Option<tokio::time::Instant>,
+    policy_probe_requested: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -44,6 +45,7 @@ impl DeliverySpawn {
 pub(super) struct DeliveryState {
     next_spawn: u64,
     next_attempt: u64,
+    policy_epochs: HashMap<String, u64>,
     attempts: HashMap<ConnectionId, Attempt>,
     served: HashMap<ConnectionId, (Option<u64>, Option<u64>)>,
     stamp_running: HashSet<ConnectionId>,
@@ -57,6 +59,27 @@ pub(super) struct DeliveryState {
     // Transport cleanup may precede the process-exit observation. Retain the
     // last active child's assigned generation, not an unattempted deferred one.
     last_target_attempt: HashMap<String, (u64, u64)>,
+}
+
+/// Captured before a health RPC; only the same child and installed policy may
+/// consume its result. The fields are private so a completion cannot retarget it.
+#[derive(Clone, Debug)]
+pub struct DeliveryProbe {
+    connection: ConnectionId,
+    module: String,
+    generation: u64,
+    attempt: Option<u64>,
+    policy_epoch: u64,
+    route_readiness: bool,
+}
+
+impl DeliveryProbe {
+    pub(crate) fn connection(&self) -> ConnectionId {
+        self.connection
+    }
+    pub(crate) fn owns_failure(&self) -> bool {
+        self.route_readiness
+    }
 }
 
 #[derive(Clone)]
@@ -99,18 +122,45 @@ impl DeliveryState {
             .filter(|attempt| attempt.module == module && attempt.generation == generation)
         {
             attempt.ready = false;
+            attempt.policy_probe_requested = false;
         }
     }
-    pub(super) fn observed_readiness(
-        &self,
+    pub(super) fn policy_installed(
+        &mut self,
         module: &str,
         generation: u64,
-        targets: &BTreeMap<String, ConnectionId>,
-    ) -> Option<ConnectionId> {
-        targets.get(module).copied().filter(|connection| {
-            self.readiness_observed.contains(&(*connection, generation))
-                || self.healthy_children.contains(&(*connection, generation))
-        })
+        target: Option<ConnectionId>,
+    ) -> Result<()> {
+        // The generation may be unchanged after a restore and retry. Use a
+        // separate epoch so a probe begun before this installation cannot count.
+        let epoch = self.policy_epochs.entry(module.into()).or_default();
+        *epoch = epoch.checked_add(1).ok_or_else(|| {
+            GateError::new(
+                "delivery_probe_exhausted",
+                "policy readiness epochs exhausted",
+            )
+        })?;
+        self.invalidate_policy(module, generation);
+        let connections: HashSet<_> = self
+            .children
+            .iter()
+            .filter(|(_, spawn)| spawn.module == module)
+            .map(|(connection, _)| *connection)
+            .chain(
+                self.attempts
+                    .iter()
+                    .filter(|(_, attempt)| attempt.module == module)
+                    .map(|(connection, _)| *connection),
+            )
+            .chain(target)
+            .collect();
+        self.readiness_observed.retain(|(connection, observed)| {
+            *observed != generation || !connections.contains(connection)
+        });
+        self.healthy_children.retain(|(connection, observed)| {
+            *observed != generation || !connections.contains(connection)
+        });
+        Ok(())
     }
     pub(super) fn declared(&mut self, connection: ConnectionId, module: &str, active: bool) {
         if let Some(spawn) = self.unregistered_children.remove(&(module.into(), active)) {
@@ -178,6 +228,7 @@ impl DeliveryState {
             deadline: None,
             catchup: false,
             write_deadline: None,
+            policy_probe_requested: false,
         })
     }
 }
@@ -293,6 +344,175 @@ pub(super) fn bind_get(
 }
 
 impl RuntimeOwner {
+    pub(crate) fn policy_probe_due(&self, connection: ConnectionId) -> Result<Option<(u64, u64)>> {
+        let mut state = self.lock()?;
+        let Some(bound) = state.delivery.attempts.get(&connection) else {
+            return Ok(None);
+        };
+        let (module, generation, attempt) = (bound.module.clone(), bound.generation, bound.id);
+        if bound.ready
+            || bound.policy_probe_requested
+            || state.active_declarations.get(&module) != Some(&connection)
+            || !state
+                .store
+                .body()?
+                .generations
+                .get(&generation)
+                .is_some_and(|entry| {
+                    super::route_policy::required(&entry.generation.changeset, &module)
+                })
+            || !super::route_policy::ready(&mut state, &module, generation)?
+        {
+            return Ok(None);
+        }
+        state
+            .delivery
+            .attempts
+            .get_mut(&connection)
+            .unwrap()
+            .policy_probe_requested = true;
+        Ok(Some((generation, attempt)))
+    }
+
+    pub(crate) fn policy_probe_pending(
+        &self,
+        connection: ConnectionId,
+        generation: u64,
+        attempt: u64,
+    ) -> Result<bool> {
+        let mut state = self.lock()?;
+        let Some(bound) = state.delivery.attempts.get(&connection) else {
+            return Ok(false);
+        };
+        let module = bound.module.clone();
+        Ok(bound.generation == generation
+            && bound.id == attempt
+            && !bound.ready
+            && state.active_declarations.get(&module) == Some(&connection)
+            && super::route_policy::ready(&mut state, &module, generation)?)
+    }
+    pub(crate) fn delivery_health_probe(
+        &self,
+        connection: ConnectionId,
+        module: &str,
+    ) -> Result<Option<DeliveryProbe>> {
+        let mut state = self.lock()?;
+        if state.active_declarations.get(module) != Some(&connection) {
+            return Ok(None);
+        }
+        let attempt = state
+            .delivery
+            .attempts
+            .get(&connection)
+            .map(|attempt| (attempt.generation, attempt.id));
+        let generation = attempt.map(|attempt| attempt.0).or_else(|| {
+            state
+                .delivery
+                .children
+                .get(&connection)
+                .map(|child| child.generation)
+        });
+        let route_readiness = match generation {
+            Some(generation) if attempt.is_some() => state
+                .store
+                .body()?
+                .generations
+                .get(&generation)
+                .is_some_and(|entry| {
+                    super::route_policy::required(&entry.generation.changeset, module)
+                }),
+            _ => false,
+        };
+        Ok(generation.map(|generation| DeliveryProbe {
+            connection,
+            module: module.into(),
+            generation,
+            attempt: attempt.map(|attempt| attempt.1),
+            route_readiness,
+            policy_epoch: state
+                .delivery
+                .policy_epochs
+                .get(module)
+                .copied()
+                .unwrap_or_default(),
+        }))
+    }
+
+    pub(crate) fn delivery_health_result(
+        &self,
+        probe: DeliveryProbe,
+        healthy: bool,
+    ) -> Result<Option<AppliedDisposition>> {
+        let attempt = {
+            let mut state = self.lock()?;
+            if state.active_declarations.get(&probe.module) != Some(&probe.connection)
+                || state
+                    .delivery
+                    .policy_epochs
+                    .get(&probe.module)
+                    .copied()
+                    .unwrap_or_default()
+                    != probe.policy_epoch
+            {
+                return Ok(None);
+            }
+            let current = state.delivery.attempts.get(&probe.connection);
+            if probe
+                .attempt
+                .is_some_and(|id| current.is_none_or(|bound| bound.id != id))
+                || current.is_some_and(|bound| bound.generation != probe.generation)
+            {
+                return Ok(None);
+            }
+            let attempt = current.map(|bound| bound.id);
+            if !healthy
+                && (!super::route_policy::ready(&mut state, &probe.module, probe.generation)?
+                    || !state
+                        .store
+                        .body()?
+                        .generations
+                        .get(&probe.generation)
+                        .is_some_and(|entry| {
+                            super::route_policy::required(
+                                &entry.generation.changeset,
+                                &probe.module,
+                            )
+                        }))
+            {
+                return Ok(None);
+            }
+            attempt
+        };
+        if healthy {
+            self.delivery_readiness_complete(probe.connection, &probe.module, probe.generation)
+        } else if let Some(attempt) = attempt {
+            self.module_outcome(
+                probe.connection,
+                &probe.module,
+                ConfigAppliedRequest::new(
+                    probe.generation,
+                    attempt,
+                    subc_protocol::config::ConfigApplyResult::Nack,
+                    vec![],
+                ),
+                true,
+            )
+            .map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn ready(
+        &self,
+        connection: ConnectionId,
+        module: &str,
+        generation: u64,
+    ) -> Result<Option<AppliedDisposition>> {
+        self.delivery_readiness_complete(connection, module, generation)
+    }
+
     pub(crate) fn pending_config_restarts(&self) -> Result<Vec<(String, u64)>> {
         let mut state = self.lock()?;
         state.store.delivery_ready()?;
@@ -554,29 +774,7 @@ impl RuntimeOwner {
             true,
         )
     }
-    pub(crate) fn delivery_current_attempt(
-        &self,
-        connection: ConnectionId,
-    ) -> Result<Option<(u64, u64)>> {
-        Ok(self
-            .lock()?
-            .delivery
-            .attempts
-            .get(&connection)
-            .map(|attempt| (attempt.generation, attempt.id)))
-    }
 
-    pub(crate) fn delivery_child_generation(
-        &self,
-        connection: ConnectionId,
-    ) -> Result<Option<u64>> {
-        Ok(self
-            .lock()?
-            .delivery
-            .children
-            .get(&connection)
-            .map(|spawn| spawn.generation))
-    }
     /// Capture the common spawn instant, not the later HELLO instant, so a slow
     /// registration cannot extend the approved generation's warm-up deadline.
     pub(crate) fn delivery_spawned(
@@ -832,7 +1030,17 @@ impl RuntimeOwner {
         attempt.catchup = catchup;
         // Swap readiness completed before promotion. Its new target now gets
         // a full live ACK window, independently of the finished spawn budget.
-        attempt.ready = super::route_policy::ready(&mut state, module, generation)?;
+        // A route obligation still needs its own post-install probe: the
+        // candidate's earlier HEALTHY did not bind the installed policy epoch.
+        attempt.ready = super::route_policy::ready(&mut state, module, generation)?
+            && !state
+                .store
+                .body()?
+                .generations
+                .get(&generation)
+                .is_some_and(|entry| {
+                    super::route_policy::required(&entry.generation.changeset, module)
+                });
         attempt.deadline = Some(cutover_at + CONFIG_LIVE_ACK_TIMEOUT);
         let assignment = (generation, attempt.id);
         state.delivery.attempts.insert(connection, attempt);

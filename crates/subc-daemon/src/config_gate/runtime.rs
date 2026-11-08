@@ -34,7 +34,7 @@ pub use route_policy::{
     RoutePolicyReceipt,
 };
 
-pub use delivery::{AppliedDisposition, DeliverySpawn};
+pub use delivery::{AppliedDisposition, DeliveryProbe, DeliverySpawn};
 
 /// Supervisor callbacks for the configuration delivery lifecycle. The caller
 /// supplies observed process events, never a module's claimed readiness.
@@ -50,11 +50,12 @@ pub trait DeliveryObserver: Send + Sync {
         first_health_budget: std::time::Duration,
     ) -> Result<Option<DeliverySpawn>>;
     fn registered(&self, connection: ConnectionId, spawn: &DeliverySpawn) -> Result<()>;
-    fn ready(
+    fn health_probe(&self, connection: ConnectionId, module: &str)
+        -> Result<Option<DeliveryProbe>>;
+    fn health_result(
         &self,
-        connection: ConnectionId,
-        module: &str,
-        generation: u64,
+        probe: DeliveryProbe,
+        healthy: bool,
     ) -> Result<Option<AppliedDisposition>>;
     fn promoted(
         &self,
@@ -82,13 +83,24 @@ impl DeliveryObserver for RuntimeOwner {
         self.delivery_child_registered(connection, spawn)
     }
 
-    fn ready(
+    /// Capture before dispatching the ordinary health RPC. A later result must
+    /// use this witness, not look up whichever target is current on completion.
+    fn health_probe(
         &self,
         connection: ConnectionId,
         module: &str,
-        generation: u64,
+    ) -> Result<Option<DeliveryProbe>> {
+        self.delivery_health_probe(connection, module)
+    }
+
+    /// Complete under the module gate. A new target, attempt or policy install
+    /// invalidates an older witness rather than lending its health to new bytes.
+    fn health_result(
+        &self,
+        probe: DeliveryProbe,
+        healthy: bool,
     ) -> Result<Option<AppliedDisposition>> {
-        self.delivery_readiness_complete(connection, module, generation)
+        self.delivery_health_result(probe, healthy)
     }
 
     fn promoted(

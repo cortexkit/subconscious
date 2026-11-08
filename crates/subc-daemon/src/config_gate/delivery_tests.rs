@@ -980,6 +980,55 @@ async fn config_delivery_io_get_checks_keychain_and_store_hash_off_the_runtime_t
         "the real get handler must never check sealed authority on the async runtime thread: {seen:?}");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn config_spawn_async_io_checks_keychain_and_store_hash_off_the_runtime_thread() {
+    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+    let rig = Rig::new();
+    std::fs::write(
+        rig.path.join("program"),
+        b"#!/bin/sh\nexec /bin/sleep 600\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        rig.path.join("program"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    write(&rig, 1);
+    let key = crate::config_store::TestStoreKey::default();
+    let owner = Arc::new(sealed_owner(&rig, &key, "async-spawn-io"));
+    rig.declare(&owner, INCUMBENT.get());
+    rig.stamp(&owner);
+    let supervisor = crate::supervise::Supervisor::new(
+        Arc::new(crate::Registry::default()),
+        crate::supervise::RestartPolicy::new(3, Duration::ZERO),
+    )
+    .with_config_runtime(owner.clone())
+    .with_drain_timeout(Duration::ZERO);
+    let threads = Arc::new(std::sync::Mutex::new(vec![]));
+    owner
+        .lock()
+        .unwrap()
+        .store
+        .observe_io_threads(threads.clone());
+    let module = supervisor
+        .spawn_async(supervised_spec(&rig, "a"))
+        .await
+        .unwrap();
+    {
+        let seen = threads.lock().unwrap();
+        assert!(seen.iter().any(|(op, _)| *op == "keychain_load"));
+        assert!(seen.iter().any(|(op, _)| *op == "store_hash"));
+        assert!(
+            seen.iter()
+                .all(|(_, thread)| *thread != std::thread::current().id()),
+            "async launch must check sealed authority only on blocking workers: {seen:?}"
+        );
+    }
+    module.stop().await.unwrap();
+}
+
 #[test]
 fn config_callback_queues_are_independent_of_the_store_mutex() {
     let (_rig, owner) = rig();

@@ -32,9 +32,12 @@ pub struct RuntimeOwner {
     // These short queues/indexes never perform store I/O while locked.
     approval_request_index: Mutex<HashMap<(ConnectionId, u64), u64>>,
     disconnected_pending: Mutex<Vec<ConnectionId>>,
+    abandoned_spawns: Mutex<Vec<(DeliverySpawn, bool)>>,
     phone_withdrawals: Mutex<phone::PhoneWithdrawals>,
     #[cfg(test)]
     os_prompt_policy: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    spawn_preflight_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// The post-answer deadline can withdraw queued work, but never a publication
@@ -465,9 +468,12 @@ impl RuntimeOwner {
             canceled_approvals: Mutex::new(Vec::new()),
             approval_request_index: Mutex::new(HashMap::new()),
             disconnected_pending: Mutex::new(Vec::new()),
+            abandoned_spawns: Mutex::new(Vec::new()),
             phone_withdrawals: Mutex::new(phone::PhoneWithdrawals::default()),
             #[cfg(test)]
             os_prompt_policy: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            spawn_preflight_hook: Mutex::new(None),
         }
     }
 
@@ -501,6 +507,7 @@ impl RuntimeOwner {
         })?;
         self.drain_canceled_approvals(&mut guard);
         self.drain_disconnections(&mut guard);
+        self.drain_abandoned_spawns(&mut guard);
         guard.expire_idle(Instant::now());
         Ok(guard)
     }

@@ -167,19 +167,14 @@ async fn run_swap_inner(
     let candidate_alternate = !lock_snapshot(snapshot)
         .map(|state| state.in_alternate_slot)
         .unwrap_or(false);
-    let mut candidate = match spawn_child_in_slot(
+    let mut candidate = match spawn_child_in_slot_async(
         spec,
-        runtime.connection_file_path.as_deref(),
-        Some(&handle),
-        &runtime.stderr_ring,
-        runtime.capture_logs_dir.as_deref(),
-        &runtime.child_roster,
-        runtime.spawn_delivery(),
-        #[cfg(target_os = "linux")]
-        runtime.cgroup_placement.as_ref(),
+        runtime,
         SpawnRole::SwapCandidate,
         candidate_alternate,
-    ) {
+    )
+    .await
+    {
         Ok(candidate) => candidate,
         Err(err) => {
             handle.close_swap(module_id);
@@ -345,9 +340,22 @@ async fn run_swap_inner(
                 .any(|op| op == "config.review")
         });
     if let Some(owner) = config_owner.as_ref().filter(|_| config_opted_in) {
-        if let Ok(Some(generation)) =
-            owner.requires_fresher_spawn(module_id, candidate.config_delivery.as_ref())
-        {
+        let module = module_id.to_owned();
+        let spawn = candidate.config_delivery.clone();
+        let current = owner
+            .on_blocking(move |owner| {
+                let newer = owner.requires_fresher_spawn(&module, spawn.as_ref())?;
+                if newer.is_none() {
+                    owner.module_get(
+                        candidate_connection,
+                        &module,
+                        subc_protocol::config::ConfigGetRequest::new(),
+                    )?;
+                }
+                Ok(newer)
+            })
+            .await;
+        if let Ok(Some(generation)) = current {
             drop(config_guard);
             abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
             update_snapshot(snapshot, Some(module_id), |state| {
@@ -361,11 +369,7 @@ async fn run_swap_inner(
             let _ = reply.send(Ok(SwapOutcome::SupersededByConfigRestart));
             return;
         }
-        if let Err(error) = owner.module_get(
-            candidate_connection,
-            module_id,
-            subc_protocol::config::ConfigGetRequest::new(),
-        ) {
+        if let Err(error) = current {
             drop(config_guard);
             let failure = CandidateFailure {
                 arm: SwapFailureArm::CandidateUnhealthy,
@@ -427,7 +431,10 @@ async fn run_swap_inner(
     };
     #[cfg(feature = "test-support")]
     if let Some(owner) = &config_owner {
-        if let Err(error) = owner.pause_swap_before_promotion() {
+        if let Err(error) = owner
+            .on_blocking(|owner| owner.pause_swap_before_promotion())
+            .await
+        {
             warn!(module_id, %error, "swap test pause failed");
         }
     }
@@ -482,7 +489,12 @@ async fn run_swap_inner(
 
     if let Some(owner) = config_owner.as_ref().filter(|_| config_opted_in) {
         use crate::config_gate::runtime::DeliveryObserver;
-        if let Err(error) = owner.promoted(candidate_connection, module_id, Instant::now()) {
+        let module = module_id.to_owned();
+        let at = Instant::now();
+        if let Err(error) = owner
+            .on_blocking(move |owner| owner.promoted(candidate_connection, &module, at))
+            .await
+        {
             warn!(module_id, %error, "promoted configuration target is gated");
         }
         owner.notify_delivery_changed();
@@ -835,8 +847,12 @@ async fn warm_candidate(
                     return Warm::Interrupted { command: None, connection: registered };
                 };
                 if matches!(command, SupervisorCommand::ConfigApplyRestart { .. }) {
-                    if let Some(generation) = config_delivery.and_then(|delivery| delivery.0.requires_fresher_spawn(module_id, candidate.config_delivery.as_ref()).ok().flatten()) {
-                        return Warm::Superseded { generation };
+                    if let Some(delivery) = config_delivery {
+                        let module = module_id.to_owned();
+                        let spawn = candidate.config_delivery.clone();
+                        if let Ok(Some(generation)) = delivery.0.on_blocking(move |owner| owner.requires_fresher_spawn(&module, spawn.as_ref())).await {
+                            return Warm::Superseded { generation };
+                        }
                     }
                     continue;
                 }

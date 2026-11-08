@@ -7074,7 +7074,7 @@ impl ControlHandler {
                 .get(module_id)
                 .expect("added module id came from configured map");
             supervisor
-                .supervise_configured_requested(
+                .supervise_configured_requested_async(
                     configured_module.module_spec(),
                     configured_module.enabled,
                     configured_module.health.clone(),
@@ -7083,6 +7083,7 @@ impl ControlHandler {
                     configured_module.register_timeout,
                     Some(requester.clone()),
                 )
+                .await
                 .map_err(|err| {
                     format!("failed to add module_id '{module_id}' during rescan: {err}")
                 })?;

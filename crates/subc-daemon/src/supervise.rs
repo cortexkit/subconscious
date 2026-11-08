@@ -62,6 +62,8 @@ mod activity;
 #[cfg(unix)]
 #[path = "supervise/admission.rs"]
 mod admission;
+#[cfg(all(test, target_os = "linux"))]
+mod async_spawn_tests;
 #[cfg(all(test, windows))]
 mod carried_job_tests;
 mod config_delivery;
@@ -3275,6 +3277,9 @@ impl Supervisor {
     /// The child is expected to parse `--subc <connection-file-path>`, read the
     /// TCP+key connection file, authenticate to the already-running listener, and
     /// register with channel-0 `HELLO` using `spec.module_id` as its manifest id.
+    ///
+    /// This synchronous embedder API blocks on launch admission and store I/O.
+    /// Do not call it on an async runtime thread; use [`Self::spawn_async`].
     pub fn spawn(&self, spec: ModuleSpec) -> Result<SupervisedModule, SuperviseError> {
         validate_spec(&spec)?;
         self.establish_identity(&spec);
@@ -3315,6 +3320,44 @@ impl Supervisor {
             spawn.complete(&snapshot);
         }
 
+        Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
+    }
+
+    /// Spawn without running configuration integrity or keychain checks on the
+    /// runtime thread. Cancellation during preparation cannot create a child.
+    pub async fn spawn_async(&self, spec: ModuleSpec) -> Result<SupervisedModule, SuperviseError> {
+        validate_spec(&spec)?;
+        self.establish_identity(&spec);
+        let mut identity = AsyncInitialIdentity {
+            supervisor: self,
+            module: spec.module_id.clone(),
+            committed: false,
+        };
+        let runtime = self.runtime_config();
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
+        let registration_watch = watch_registration(&self.registry, &spec);
+        let spawned = spawn_child_async(&spec, &runtime).await;
+        #[cfg(test)]
+        self.test_after_first_spawn.run(&spec.module_id);
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
+                defer_config_spawn(&spec, &runtime, &snapshot, RespawnKind::Spawn)?;
+                identity.committed = true;
+                return Ok(self.supervised_module(spec, runtime, snapshot, None));
+            }
+            Err(err) => {
+                self.abandon_unrostered(&spec.module_id);
+                return Err(err);
+            }
+        };
+        arm_registration_deadline(&mut child, runtime.register_timeout, registration_watch);
+        self.mark_first_process_running(&spec, &runtime, &snapshot, &mut child)?;
+        if let Some(spawn) = activity_spawn {
+            spawn.complete(&snapshot);
+        }
+        identity.committed = true;
         Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
     }
 
@@ -3430,6 +3473,30 @@ impl Supervisor {
         )?;
         let daemon_initiated = requester.is_none();
         self.start_registered_configured(registered, requester, daemon_initiated)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn supervise_configured_requested_async(
+        &self,
+        spec: ModuleSpec,
+        enabled: bool,
+        health: HealthConfig,
+        drain_timeout_ms: Option<u64>,
+        restart_policy: RestartPolicy,
+        register_timeout: Duration,
+        requester: Option<Principal>,
+    ) -> Result<SupervisedModule, SuperviseError> {
+        let registered = self.register_configured_with_health(
+            spec,
+            enabled,
+            health,
+            drain_timeout_ms,
+            restart_policy,
+            register_timeout,
+        )?;
+        let daemon_initiated = requester.is_none();
+        self.start_registered_configured_async(registered, requester, daemon_initiated)
+            .await
     }
 
     /// Record a configured module as starting or disabled, without launching a
@@ -3554,6 +3621,72 @@ impl Supervisor {
                             error = %err,
                             "configured module failed to spawn; marking failed and continuing"
                         );
+                    }
+                    fail_snapshot(
+                        snapshot,
+                        Some(&spec.module_id),
+                        None,
+                        &runtime.failure_context(daemon_initiated),
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.start_monitor(spec, runtime, &module, child, commands);
+        Ok(module)
+    }
+
+    pub(crate) async fn start_registered_configured_async(
+        &self,
+        registered: RegisteredConfiguredModule,
+        requester: Option<Principal>,
+        daemon_initiated: bool,
+    ) -> Result<SupervisedModule, SuperviseError> {
+        let RegisteredConfiguredModule {
+            spec,
+            mut runtime,
+            module,
+            commands,
+        } = registered;
+        runtime.start_requester = requester;
+        runtime.recovery_is_daemon = daemon_initiated;
+        let snapshot = &module.inner.snapshot;
+        let should_spawn = {
+            let state = lock_snapshot(snapshot)?;
+            state.enabled && state.waiting_for_previous_pid.is_none()
+        };
+        let child = if should_spawn {
+            let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
+            let registration_watch = watch_registration(&self.registry, &spec);
+            let spawned = spawn_child_async(&spec, &runtime).await;
+            #[cfg(test)]
+            self.test_after_first_spawn.run(&spec.module_id);
+            match spawned {
+                Ok(mut child) => {
+                    arm_registration_deadline(
+                        &mut child,
+                        runtime.register_timeout,
+                        registration_watch,
+                    );
+                    self.mark_first_process_running(&spec, &runtime, snapshot, &mut child)?;
+                    if let Some(spawn) = activity_spawn {
+                        spawn.complete(snapshot);
+                    }
+                    Some(child)
+                }
+                Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
+                    defer_config_spawn(&spec, &runtime, snapshot, RespawnKind::Spawn)?;
+                    None
+                }
+                Err(err) => {
+                    if runtime.health.critical {
+                        error!(module_id = %spec.module_id, program = %spec.program.display(), error = %err,
+                            "critical configured module failed to spawn; marking failed and alerting");
+                    } else {
+                        error!(module_id = %spec.module_id, program = %spec.program.display(), error = %err,
+                            "configured module failed to spawn; marking failed and continuing");
                     }
                     fail_snapshot(
                         snapshot,
@@ -7626,7 +7759,7 @@ async fn supervise_loop(
                         continue;
                     }
                     process_liveness.track(spec.module_id.clone(), Arc::clone(&snapshot));
-                    match spawn_and_mark_running(&spec, &runtime, &snapshot) {
+                    match spawn_and_mark_running_async(&spec, &runtime, &snapshot).await {
                         Ok(next_child) => {
                             child = Some(next_child);
                             if runtime.pending_activity_restart {
@@ -7691,7 +7824,7 @@ async fn supervise_loop(
                             let enabled = lock_snapshot(&snapshot).is_ok_and(|state| state.enabled);
                             if enabled && !runtime.child_roster.is_closed() {
                                 process_liveness.track(spec.module_id.clone(), Arc::clone(&snapshot));
-                                match spawn_and_mark_running(&spec, &runtime, &snapshot) {
+                                match spawn_and_mark_running_async(&spec, &runtime, &snapshot).await {
                                     Ok(next_child) => child = Some(next_child),
                                     Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
                                         let _ = defer_config_spawn(&spec, &runtime, &snapshot, RespawnKind::Spawn);
@@ -8534,7 +8667,7 @@ async fn finish_reload_child(
     child: &mut Option<SupervisedChild>,
 ) -> Result<(), SuperviseError> {
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-    let next_child = match spawn_and_mark_running(spec, runtime, snapshot) {
+    let next_child = match spawn_and_mark_running_async(spec, runtime, snapshot).await {
         Ok(next_child) => next_child,
         Err(error @ SuperviseError::ConfigDeliveryDeferred { .. }) => {
             defer_config_spawn(spec, runtime, snapshot, RespawnKind::Reload)?;
@@ -8724,7 +8857,7 @@ async fn set_child_enabled(
         .await?;
         reset_restart_count(snapshot, &spec.module_id)?;
         process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
-        let next_child = match spawn_and_mark_running(spec, runtime, snapshot) {
+        let next_child = match spawn_and_mark_running_async(spec, runtime, snapshot).await {
             Ok(next_child) => next_child,
             Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
                 defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn)?;
@@ -9555,6 +9688,223 @@ fn spawn_child_in_slot(
     role: SpawnRole,
     alternate_slot: bool,
 ) -> Result<SupervisedChild, SuperviseError> {
+    let prepared = prepare_child_in_slot(
+        spec,
+        connection_file_path,
+        handle,
+        capture_logs_dir,
+        roster,
+        config_delivery,
+        #[cfg(target_os = "linux")]
+        cgroup_placement,
+        role,
+        alternate_slot,
+        false,
+    )?;
+    launch_child_in_slot(spec, ring, roster, prepared)
+}
+
+struct AsyncInitialIdentity<'a> {
+    supervisor: &'a Supervisor,
+    module: String,
+    committed: bool,
+}
+impl Drop for AsyncInitialIdentity<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.supervisor.abandon_unrostered(&self.module);
+        }
+    }
+}
+
+/// Child-free preparation can be abandoned without orphaning a process. After
+/// this value returns, the async caller validates its launch witness and creates
+/// and publishes the child without another await.
+struct PreparedChild {
+    command: Command,
+    carrying: bool,
+    carried: Option<Arc<containment::CarriedContainment>>,
+    #[cfg(unix)]
+    launch_identity: Option<containment::LaunchIdentity>,
+    #[cfg(unix)]
+    group_target: containment::GroupTarget,
+    #[cfg(target_os = "linux")]
+    cgroup_placement: Option<subc_cgroup::Placement>,
+    #[cfg(target_os = "linux")]
+    cgroup_name: String,
+    #[cfg(target_os = "linux")]
+    cgroup_cleanup: PreparedCgroup,
+    cgroup_path: Option<PathBuf>,
+    #[cfg(unix)]
+    admission_gate: Option<admission::Gate>,
+    output_sink: ChildOutputSink,
+    #[cfg(target_os = "macos")]
+    privacy_exec: Option<PrivacyExec>,
+    #[cfg(target_os = "macos")]
+    exec_ack: subc_os::privacy_identity::ExecAcknowledgement,
+    #[cfg(windows)]
+    image_capture: subc_os::ExecutableCapture,
+    #[cfg(windows)]
+    nonce_handoff: Option<NonceHandoff>,
+    spawned_at: Instant,
+    config_delivery: Option<crate::config_gate::runtime::DeliverySpawn>,
+    delivery_registration: Option<config_delivery::RegistrationGuard>,
+    program_binding: Option<SpawnProgramBinding>,
+}
+
+#[cfg(target_os = "linux")]
+struct PreparedCgroup(Option<(subc_cgroup::Placement, String)>);
+#[cfg(target_os = "linux")]
+impl Drop for PreparedCgroup {
+    fn drop(&mut self) {
+        if let Some((placement, name)) = &self.0 {
+            remove_module_cgroup(placement, name);
+        }
+    }
+}
+
+struct SpawnProgramBinding {
+    path: PathBuf,
+    // Keep the inode alive if the configured name is replaced while preparation
+    // is suspended, so replacement cannot pass through inode reuse.
+    _file: std::fs::File,
+    identity: subc_os::FileIdentity,
+}
+
+impl SpawnProgramBinding {
+    fn capture(spec: &ModuleSpec) -> Result<Self, SuperviseError> {
+        let path = if spec.program.is_absolute() || spec.program.components().count() > 1 {
+            spec.program.clone()
+        } else {
+            let path = spec
+                .env
+                .iter()
+                .rev()
+                .find(|(key, _)| key == "PATH")
+                .map(|(_, path)| std::ffi::OsString::from(path))
+                .or_else(|| std::env::var_os("PATH"))
+                .unwrap_or_default();
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(&spec.program))
+                .find(|path| path.is_file())
+                .unwrap_or_else(|| spec.program.clone())
+        };
+        let file = std::fs::File::open(&path).map_err(|source| SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source,
+            cgroup_path: None,
+        })?;
+        let identity = subc_os::file_identity(&path).ok_or_else(|| spawn_plan_stale(spec))?;
+        Ok(Self {
+            path,
+            _file: file,
+            identity,
+        })
+    }
+    fn current(&self) -> bool {
+        subc_os::file_identity(&self.path) == Some(self.identity)
+    }
+}
+
+fn spawn_plan_stale(spec: &ModuleSpec) -> SuperviseError {
+    SuperviseError::InvalidSpec {
+        reason: format!("plan_stale: launch witness changed for {}", spec.module_id),
+    }
+}
+
+async fn spawn_child_async(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+) -> Result<SupervisedChild, SuperviseError> {
+    #[cfg(all(test, unix))]
+    if let Some(source) = containment_tests::join_failure(spec, &runtime.child_roster) {
+        containment::terminate_blocking(&runtime.child_roster.containment);
+        return Err(SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source,
+            cgroup_path: None,
+        });
+    }
+    let result = spawn_child_in_slot_async(spec, runtime, SpawnRole::Plain, false).await;
+    if result.is_err() {
+        if runtime.child_roster.admission_pending(&spec.module_id) {
+            containment::terminate_deferred(&runtime.child_roster.containment);
+        } else {
+            containment::terminate_blocking(&runtime.child_roster.containment);
+        }
+    }
+    result
+}
+
+async fn spawn_child_in_slot_async(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    role: SpawnRole,
+    alternate_slot: bool,
+) -> Result<SupervisedChild, SuperviseError> {
+    let gate = runtime
+        .config_delivery
+        .as_ref()
+        .map(|delivery| delivery.0.module_gate(&spec.module_id))
+        .transpose()
+        .map_err(|error| SuperviseError::InvalidSpec {
+            reason: error.to_string(),
+        })?;
+    let gate = match gate {
+        Some(gate) => Some(gate.lock_owned().await),
+        None => None,
+    };
+    let prepared_spec = spec.clone();
+    let prepared_runtime = runtime.clone();
+    let (prepared, _gate) = tokio::task::spawn_blocking(move || {
+        let prepared = prepare_child_in_slot(
+            &prepared_spec,
+            prepared_runtime.connection_file_path.as_deref(),
+            prepared_runtime.supervisor_handle.as_ref(),
+            prepared_runtime.capture_logs_dir.as_deref(),
+            &prepared_runtime.child_roster,
+            prepared_runtime.spawn_delivery(),
+            #[cfg(target_os = "linux")]
+            prepared_runtime.cgroup_placement.as_ref(),
+            role,
+            alternate_slot,
+            true,
+        );
+        prepared.map(|prepared| (prepared, gate))
+    })
+    .await
+    .map_err(|_| SuperviseError::InvalidSpec {
+        reason: "configuration launch preparation stopped".into(),
+    })??;
+    if let Some(registration) = &prepared.delivery_registration {
+        if !registration.launch_current().await? {
+            return Err(spawn_plan_stale(spec));
+        }
+    }
+    if prepared
+        .program_binding
+        .as_ref()
+        .is_some_and(|binding| !binding.current())
+    {
+        return Err(spawn_plan_stale(spec));
+    }
+    // No await may separate this last identity check from ownership publication.
+    launch_child_in_slot(spec, &runtime.stderr_ring, &runtime.child_roster, prepared)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_child_in_slot(
+    spec: &ModuleSpec,
+    connection_file_path: Option<&std::path::Path>,
+    handle: Option<&SupervisorHandle>,
+    capture_logs_dir: Option<&std::path::Path>,
+    roster: &ChildRoster,
+    config_delivery: Option<config_delivery::SpawnDelivery<'_>>,
+    #[cfg(target_os = "linux")] cgroup_placement: Option<&subc_cgroup::Placement>,
+    role: SpawnRole,
+    alternate_slot: bool,
+    asynchronous: bool,
+) -> Result<PreparedChild, SuperviseError> {
     if let Some(error) = recovery_block_error(spec, roster) {
         return Err(error);
     }
@@ -9645,9 +9995,25 @@ fn spawn_child_in_slot(
         cgroup_path: None,
     })?;
     #[cfg(windows)]
+    let program_binding = if asynchronous {
+        let mut resolved = spec.clone();
+        resolved.program = image_capture.path().to_path_buf();
+        Some(SpawnProgramBinding::capture(&resolved)?)
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let program_binding = asynchronous
+        .then(|| SpawnProgramBinding::capture(spec))
+        .transpose()?;
+    #[cfg(windows)]
     let mut command = Command::new(image_capture.path());
     #[cfg(not(any(target_os = "macos", windows)))]
-    let mut command = Command::new(&spec.program);
+    let mut command = Command::new(
+        program_binding
+            .as_ref()
+            .map_or(spec.program.as_path(), |binding| binding.path.as_path()),
+    );
     command.args(&spec.args);
     // AMBIENT `CK_LOG` MUST NOT LEAK INTO AN OTHERWISE UNCONFIGURED MODULE — but
     // that is the whole of the intent, so remove that one key rather than the
@@ -9832,8 +10198,91 @@ fn spawn_child_in_slot(
         .map(|delivery| delivery.spawned(spec, spawned_at, role))
         .transpose()?
         .flatten();
-    let delivery_registration =
+    let mut delivery_registration =
         delivery_context.map(|context| context.registration_guard(config_delivery.as_ref(), role));
+    if asynchronous {
+        if let Some(registration) = &mut delivery_registration {
+            registration.defer_cleanup();
+        }
+        #[cfg(test)]
+        if let Some(context) = delivery_context {
+            context.pause_preflight_for_test();
+        }
+    }
+    Ok(PreparedChild {
+        command,
+        carrying,
+        carried: carried.clone(),
+        #[cfg(unix)]
+        launch_identity,
+        #[cfg(unix)]
+        group_target,
+        #[cfg(target_os = "linux")]
+        cgroup_placement: cgroup_placement.cloned(),
+        #[cfg(target_os = "linux")]
+        cgroup_cleanup: PreparedCgroup(
+            cgroup_placement
+                .filter(|_| carried.is_none())
+                .map(|placement| (placement.clone(), cgroup_name.clone())),
+        ),
+        #[cfg(target_os = "linux")]
+        cgroup_name,
+        cgroup_path,
+        #[cfg(unix)]
+        admission_gate,
+        output_sink,
+        #[cfg(target_os = "macos")]
+        privacy_exec,
+        #[cfg(target_os = "macos")]
+        exec_ack,
+        #[cfg(windows)]
+        image_capture,
+        #[cfg(windows)]
+        nonce_handoff,
+        spawned_at,
+        config_delivery,
+        delivery_registration,
+        program_binding,
+    })
+}
+
+fn launch_child_in_slot(
+    spec: &ModuleSpec,
+    ring: &Arc<Mutex<StderrRing>>,
+    roster: &ChildRoster,
+    prepared: PreparedChild,
+) -> Result<SupervisedChild, SuperviseError> {
+    let mut command = prepared.command;
+    let carrying = prepared.carrying;
+    let carried = prepared.carried;
+    #[cfg(unix)]
+    let launch_identity = prepared.launch_identity;
+    #[cfg(unix)]
+    let group_target = prepared.group_target;
+    #[cfg(target_os = "linux")]
+    let cgroup_placement = prepared.cgroup_placement.as_ref();
+    #[cfg(target_os = "linux")]
+    let cgroup_name = prepared.cgroup_name;
+    #[cfg(target_os = "linux")]
+    let mut cgroup_cleanup = prepared.cgroup_cleanup;
+    #[cfg(target_os = "linux")]
+    let _ = cgroup_cleanup.0.take();
+    let cgroup_path = prepared.cgroup_path;
+    #[cfg(unix)]
+    let admission_gate = prepared.admission_gate;
+    let output_sink = prepared.output_sink;
+    #[cfg(target_os = "macos")]
+    let privacy_exec = prepared.privacy_exec;
+    #[cfg(target_os = "macos")]
+    let exec_ack = prepared.exec_ack;
+    #[cfg(windows)]
+    let image_capture = prepared.image_capture;
+    #[cfg(windows)]
+    let nonce_handoff = prepared.nonce_handoff;
+    let spawned_at = prepared.spawned_at;
+    let config_delivery = prepared.config_delivery;
+    let delivery_registration = prepared.delivery_registration;
+    let _program_binding = prepared.program_binding;
     #[cfg(all(test, unix))]
     containment_tests::record_spawn_attempt(spec, &mut command);
     #[cfg(unix)]
@@ -11020,6 +11469,47 @@ fn windows_spawn_capture(spec: &ModuleSpec) -> io::Result<subc_os::ExecutableCap
     ))
 }
 
+async fn spawn_and_mark_running_async(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+) -> Result<SupervisedChild, SuperviseError> {
+    let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
+    let registration_watch = watch_registration(&runtime.registry, spec);
+    #[cfg(unix)]
+    let joining_group = containment::current(&runtime.child_roster.containment)
+        .is_some_and(|container| container.group().is_some());
+    let result = spawn_child_async(spec, runtime).await;
+    #[cfg(unix)]
+    let result = if result.is_err()
+        && joining_group
+        && !runtime.child_roster.is_closed()
+        && lock_snapshot(snapshot).is_ok_and(|state| state.enabled)
+        && runtime
+            .child_roster
+            .previous_instance(&spec.module_id)
+            .is_none()
+    {
+        // A failed group join has already ended the old container. Its single
+        // fresh-container retry belongs to the same restart budget entry.
+        warn!(module_id = %spec.module_id, "carried process-group spawn failed; trying one fresh container");
+        spawn_child_async(spec, runtime).await
+    } else {
+        result
+    };
+    let mut child = result?;
+    arm_registration_deadline(&mut child, runtime.register_timeout, registration_watch);
+    if let Err(error) = set_running(snapshot, &child, &spec.module_id, &runtime.spawn_events) {
+        containment::terminate_blocking(&runtime.child_roster.containment);
+        return Err(error);
+    }
+    if let Some(spawn) = activity_spawn {
+        spawn.complete(snapshot);
+    }
+    Ok(child)
+}
+
+#[cfg(test)]
 fn spawn_and_mark_running(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,

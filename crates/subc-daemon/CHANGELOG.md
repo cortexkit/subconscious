@@ -48,6 +48,12 @@
   on blocking workers. Keep reader cancellation, disconnect and phone withdrawal
   queues independent of the store mutex, so they cannot park behind a keychain
   load or a whole-store integrity check.
+- Add `Supervisor::spawn_async` and use child-free blocking preparation on all
+  daemon-owned launch paths, including retries and swap candidates. Keep the
+  synchronous embedder API explicitly blocking. Recheck the captured generation,
+  launch attempt and executable identity under the module gate immediately before
+  creating a child; a changed witness refuses `plan_stale`. Cancelled preparation
+  drops its launch reservation without ever creating a process.
 - Fence respawn until a spontaneous warm-up exit's configuration failure is
   recorded. Waiting spends no extra crash budget; intentional restarts preserve
   pending configuration, and a failed first generation stays stopped.

@@ -1211,7 +1211,10 @@ async fn serve_bound_daemon(
     );
 
     for registered in registered_modules {
-        match supervisor.start_registered_configured(registered, None, true) {
+        match supervisor
+            .start_registered_configured_async(registered, None, true)
+            .await
+        {
             Ok(module) => {
                 info!(module_id = %module.module_id(), "configured module supervised");
             }

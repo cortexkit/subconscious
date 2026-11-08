@@ -331,6 +331,24 @@ pub struct ConfigStore {
     hooks: Option<testing::TestSupport>,
 }
 impl ConfigStore {
+    /// Recheck a launch witness after a full authority check on a blocking
+    /// worker. This is only loaded state, never a replacement for `check`.
+    pub(crate) fn loaded_module_generation(&self, module: &str) -> Option<u64> {
+        if !matches!(self.state, StoreState::Unstamped | StoreState::Stamped) {
+            return None;
+        }
+        Some(
+            self.deferred_failure
+                .as_ref()
+                .or(self.unanchored_ack.as_ref().map(|ack| &ack.visible))
+                .unwrap_or(&self.envelope.body)
+                .versions
+                .iter()
+                .find(|(tuple, _)| tuple.module == module && tuple.project.is_none())
+                .and_then(|(_, versions)| versions.pending.or(versions.active))
+                .unwrap_or(0),
+        )
+    }
     #[cfg(test)]
     pub(crate) fn observe_io_threads(&mut self, threads: IoThreads) {
         self.io_threads = Some(threads);

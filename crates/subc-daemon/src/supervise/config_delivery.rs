@@ -35,6 +35,10 @@ impl SupervisorRuntimeConfig {
 }
 
 impl<'a> SpawnDelivery<'a> {
+    #[cfg(test)]
+    pub(super) fn pause_preflight_for_test(&self) {
+        self.runtime.0.pause_spawn_preflight_for_test();
+    }
     pub(super) fn admit(&self, spec: &ModuleSpec) -> Result<(), SuperviseError> {
         match self.runtime.0.delivery_exit_fence(&spec.module_id) {
             Ok(None) => Ok(()),
@@ -50,12 +54,13 @@ impl<'a> SpawnDelivery<'a> {
         self,
         spawn: Option<&DeliverySpawn>,
         role: SpawnRole,
-    ) -> RegistrationGuard<'a> {
+    ) -> RegistrationGuard {
         RegistrationGuard {
-            runtime: self.runtime,
+            runtime: self.runtime.clone(),
             spawn: spawn.cloned(),
             active: !matches!(role, SpawnRole::SwapCandidate),
             committed: false,
+            deferred_cleanup: false,
         }
     }
     pub(super) fn spawned(
@@ -91,22 +96,52 @@ impl<'a> SpawnDelivery<'a> {
     }
 }
 
-pub(super) struct RegistrationGuard<'a> {
-    runtime: &'a ConfigDelivery,
+pub(super) struct RegistrationGuard {
+    runtime: ConfigDelivery,
     spawn: Option<DeliverySpawn>,
     active: bool,
     committed: bool,
+    deferred_cleanup: bool,
 }
-impl RegistrationGuard<'_> {
+impl RegistrationGuard {
+    pub(super) fn defer_cleanup(&mut self) {
+        self.deferred_cleanup = true;
+    }
+    pub(super) async fn launch_current(&self) -> Result<bool, SuperviseError> {
+        let Some(spawn) = &self.spawn else {
+            return Ok(true);
+        };
+        loop {
+            match self.runtime.0.delivery_launch_current(spawn, self.active) {
+                Ok(Some(current)) => return Ok(current),
+                Ok(None) => {
+                    self.runtime
+                        .0
+                        .on_blocking(|owner| owner.delivery_wait_for_owner())
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+            .map_err(|error| SuperviseError::InvalidSpec {
+                reason: error.to_string(),
+            })?;
+        }
+    }
     pub(super) fn commit(mut self) {
         self.committed = true;
     }
 }
-impl Drop for RegistrationGuard<'_> {
+impl Drop for RegistrationGuard {
     fn drop(&mut self) {
         if !self.committed {
             if let Some(spawn) = &self.spawn {
-                self.runtime.0.delivery_abandon_spawn(spawn, self.active);
+                if self.deferred_cleanup {
+                    self.runtime
+                        .0
+                        .delivery_queue_abandoned_spawn(spawn.clone(), self.active);
+                } else {
+                    self.runtime.0.delivery_abandon_spawn(spawn, self.active);
+                }
             }
         }
     }

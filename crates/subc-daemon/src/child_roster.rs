@@ -776,6 +776,11 @@ impl ChildRoster {
         }
     }
 
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn live_count_for_test(&self) -> usize {
+        self.live().len()
+    }
+
     #[cfg(unix)]
     fn live(&self) -> Vec<(u64, RosterEntry)> {
         lock(&self.inner.live)

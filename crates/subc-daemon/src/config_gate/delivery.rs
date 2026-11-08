@@ -692,6 +692,75 @@ impl RuntimeOwner {
             }
         }
     }
+    pub(crate) fn delivery_queue_abandoned_spawn(&self, spawn: DeliverySpawn, active: bool) {
+        if let Ok(mut abandoned) = self.abandoned_spawns.lock() {
+            abandoned.push((spawn, active));
+        }
+        self.notify_delivery_changed();
+    }
+    pub(super) fn drain_abandoned_spawns(&self, state: &mut OwnerState) {
+        if let Ok(mut abandoned) = self.abandoned_spawns.lock() {
+            for (spawn, active) in abandoned.drain(..) {
+                let key = (spawn.module.clone(), active);
+                if state
+                    .delivery
+                    .unregistered_children
+                    .get(&key)
+                    .is_some_and(|current| current.id == spawn.id)
+                {
+                    state.delivery.unregistered_children.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// The full authority check and reservation ran on a blocking worker while
+    /// the caller owned the module gate. Recheck only that exact witness here;
+    /// contention asks the async caller to wait off the runtime thread.
+    pub(crate) fn delivery_launch_current(
+        &self,
+        spawn: &DeliverySpawn,
+        active: bool,
+    ) -> Result<Option<bool>> {
+        let state = match self.inner.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(_) => {
+                return Err(GateError::new(
+                    "config_unavailable",
+                    "configuration owner lock is poisoned",
+                ))
+            }
+        };
+        Ok(Some(
+            state.store.loaded_module_generation(&spawn.module) == Some(spawn.generation)
+                && state
+                    .delivery
+                    .unregistered_children
+                    .get(&(spawn.module.clone(), active))
+                    .is_some_and(|current| current.id == spawn.id)
+                && !state.delivery.exited.contains_key(&spawn.module),
+        ))
+    }
+    pub(crate) fn delivery_wait_for_owner(&self) -> Result<()> {
+        drop(self.lock()?);
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn pause_spawn_preflight_for_test(&self) {
+        let hook = self.spawn_preflight_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn set_spawn_preflight_hook_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.spawn_preflight_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn unregistered_spawn_count_for_test(&self) -> usize {
+        self.lock().unwrap().delivery.unregistered_children.len()
+    }
     pub(crate) fn delivery_spawned_in_slot(
         &self,
         module: &str,

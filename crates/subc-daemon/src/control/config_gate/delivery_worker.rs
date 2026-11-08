@@ -22,6 +22,7 @@ impl ControlHandler {
             let mut tasks = JoinSet::new();
             let mut wakes = HashMap::<ConnectionId, Arc<Notify>>::new();
             let recording = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
+            let mut restarting = HashSet::<(String, u64)>::new();
             loop {
                 let next_anchor = {
                     let Some(control) = handler.upgrade() else {
@@ -47,6 +48,23 @@ impl ControlHandler {
                                     .unwrap_or_else(|p| p.into_inner())
                                     .remove(&module);
                             });
+                        }
+                    }
+                    if let Ok(pending) = owner.pending_config_restarts() {
+                        restarting.retain(|entry| pending.contains(entry));
+                        for (module, generation) in pending {
+                            if owner.delivery_exit_fence(&module).ok().flatten().is_some() {
+                                continue;
+                            }
+                            if let Some(supervised) = control.supervisor.get(&module) {
+                                if restarting.insert((module.clone(), generation)) {
+                                    tasks.spawn(async move {
+                                        if let Err(error) = supervised.config_apply_restart(generation).await {
+                                            warn!(module_id=%module, %error, "approved configuration restart could not be queued");
+                                        }
+                                    });
+                                }
+                            }
                         }
                     }
                     let registrations = control

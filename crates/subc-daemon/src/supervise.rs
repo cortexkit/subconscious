@@ -1248,6 +1248,8 @@ pub struct ModuleStatus {
     /// and never falls out of a window.
     pub lifetime_restarts: u32,
     pub spawn_generation: u64,
+    /// Retained daemon-local outcome; the legacy control response omits it.
+    pub swap_outcome: Option<SwapOutcome>,
     /// The budget `restart_count` is spent against. Carried alongside the count
     /// because the count alone does not say how close the module is to being
     /// disabled, and reporting one without the other is what makes an
@@ -1323,6 +1325,7 @@ struct SupervisorSnapshot {
     /// and 3921), so a failed spawn can consume it. This counter moves only
     /// when a live PID is accepted below.
     spawn_generation: u64,
+    swap_outcome: Option<SwapOutcome>,
     pid: Option<u32>,
     #[cfg(target_os = "macos")]
     report_ready: Option<Arc<OnceLock<()>>>,
@@ -1462,6 +1465,7 @@ impl SupervisorSnapshot {
             crash_restarts: VecDeque::new(),
             lifetime_restarts: 0,
             spawn_generation: 0,
+            swap_outcome: None,
             pid: None,
             #[cfg(target_os = "macos")]
             report_ready: None,
@@ -3757,6 +3761,19 @@ impl SupervisedModule {
                 module_id: self.module_id().to_string(),
             })
     }
+
+    pub(crate) async fn config_apply_restart(&self, generation: u64) -> Result<(), SuperviseError> {
+        self.inner
+            .commands
+            .send(SupervisorCommand::ConfigApplyRestart {
+                generation,
+                supersedes_swap: false,
+            })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })
+    }
     pub fn module_id(&self) -> &str {
         &self.inner.module_id
     }
@@ -3990,6 +4007,7 @@ impl SupervisedModule {
                 restart_count,
                 lifetime_restarts: snapshot.lifetime_restarts,
                 spawn_generation: snapshot.spawn_generation,
+                swap_outcome: snapshot.swap_outcome,
                 max_restarts: self.inner.restart_policy.max_restarts,
                 restart_window: self.inner.restart_policy.window,
                 drain_timeout,
@@ -4272,9 +4290,13 @@ impl SupervisedModule {
 
     /// Blue/green restart: see `SupervisorCommand::Swap` and the
     /// `supervisor_swap` module. Returns once the swap has cut over (the old
-    /// process then drains in the background of the supervise loop) or has
-    /// failed, leaving the old process serving.
-    pub async fn swap(&self, ready_timeout: Option<Duration>) -> Result<(), SuperviseError> {
+    /// process then drains in the background of the supervise loop), has been
+    /// superseded by an approved configuration restart, or has failed. Both
+    /// supersession and failure leave the old process serving until replacement.
+    pub async fn swap(
+        &self,
+        ready_timeout: Option<Duration>,
+    ) -> Result<SwapOutcome, SuperviseError> {
         self.swap_requested(ready_timeout, None).await
     }
 
@@ -4282,7 +4304,7 @@ impl SupervisedModule {
         &self,
         ready_timeout: Option<Duration>,
         requester: Option<Principal>,
-    ) -> Result<(), SuperviseError> {
+    ) -> Result<SwapOutcome, SuperviseError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
@@ -4455,6 +4477,10 @@ impl Drop for SupervisedModuleInner {
 
 #[derive(Debug)]
 enum SupervisorCommand {
+    ConfigApplyRestart {
+        generation: u64,
+        supersedes_swap: bool,
+    },
     ConfigExitHold {
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
@@ -4509,8 +4535,26 @@ enum SupervisorCommand {
         /// ready. `None` uses [`DEFAULT_SWAP_READY_TIMEOUT`].
         ready_timeout: Option<Duration>,
         /// Answered at cutover or failure; the incumbent's drain follows.
-        reply: oneshot::Sender<Result<(), SuperviseError>>,
+        reply: oneshot::Sender<Result<SwapOutcome, SuperviseError>>,
     },
+}
+
+/// Successful daemon-local swap disposition. Supersession leaves the incumbent
+/// serving until an approved replacement starts with the latest configured
+/// command; the legacy control acknowledgment does not carry this disposition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwapOutcome {
+    Cutover,
+    SupersededByConfigRestart,
+}
+
+impl SwapOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cutover => "cutover",
+            Self::SupersededByConfigRestart => "superseded_by_config_restart",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -7728,12 +7772,15 @@ async fn handle_supervisor_command(
     });
     let command = if let Some(error) = blocked {
         match command {
-            SupervisorCommand::Restart { reply, .. }
-            | SupervisorCommand::Reload { reply, .. }
-            | SupervisorCommand::Swap { reply, .. } => {
+            SupervisorCommand::Restart { reply, .. } | SupervisorCommand::Reload { reply, .. } => {
                 let _ = reply.send(Err(error));
                 return true;
             }
+            SupervisorCommand::Swap { reply, .. } => {
+                let _ = reply.send(Err(error));
+                return true;
+            }
+            SupervisorCommand::ConfigApplyRestart { .. } => return true,
             SupervisorCommand::SetEnabled {
                 enabled: true,
                 reply,
@@ -7748,6 +7795,54 @@ async fn handle_supervisor_command(
         command
     };
     match command {
+        SupervisorCommand::ConfigApplyRestart {
+            generation,
+            supersedes_swap,
+        } => {
+            let Some(owner) = runtime
+                .config_delivery
+                .as_ref()
+                .map(|delivery| delivery.0.clone())
+            else {
+                return true;
+            };
+            let Ok(gate) = owner.module_gate(&spec.module_id) else {
+                return true;
+            };
+            let _guard = gate.lock().await;
+            let spawn = child
+                .as_ref()
+                .and_then(|child| child.config_delivery.as_ref());
+            if (!supersedes_swap
+                && !owner
+                    .pending_config_restarts()
+                    .is_ok_and(|pending| pending.contains(&(spec.module_id.clone(), generation))))
+                || !owner
+                    .requires_fresher_spawn(&spec.module_id, spawn)
+                    .is_ok_and(|pending| pending == Some(generation))
+                || !lock_snapshot(snapshot).is_ok_and(|state| {
+                    state.enabled && !state.respawn_pending && state.process_alive
+                })
+            {
+                return true;
+            }
+            info!(module_id=%spec.module_id, config_generation=generation, "approved configuration restart preserves the crash budget");
+            if let Err(error) = restart_child_with_budget_policy(
+                spec,
+                runtime,
+                registry,
+                process_liveness,
+                snapshot,
+                child,
+                runtime.drain_timeout,
+                false,
+            )
+            .await
+            {
+                warn!(module_id=%spec.module_id, %error, "approved configuration restart could not be scheduled");
+            }
+            true
+        }
         SupervisorCommand::ConfigExitHold { reply } => {
             let result = if child.is_none() {
                 cancel_deferred_reload(
@@ -8166,6 +8261,30 @@ async fn restart_child(
     child: &mut Option<SupervisedChild>,
     drain_timeout: Duration,
 ) -> Result<(), SuperviseError> {
+    restart_child_with_budget_policy(
+        spec,
+        runtime,
+        registry,
+        process_liveness,
+        snapshot,
+        child,
+        drain_timeout,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn restart_child_with_budget_policy(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<SupervisedChild>,
+    drain_timeout: Duration,
+    reset_budget: bool,
+) -> Result<(), SuperviseError> {
     // Restart cycles a running module; it must not silently start a disabled one.
     if !lock_snapshot(snapshot)?.enabled {
         return Err(SuperviseError::Disabled {
@@ -8216,7 +8335,9 @@ async fn restart_child(
         .await?;
     }
 
-    reset_restart_count(snapshot, &spec.module_id)?;
+    if reset_budget {
+        reset_restart_count(snapshot, &spec.module_id)?;
+    }
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
     schedule_respawn(
         runtime,

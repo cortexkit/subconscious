@@ -34,6 +34,12 @@ pub struct DeliverySpawn {
     deadline: tokio::time::Instant,
 }
 
+impl DeliverySpawn {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 #[derive(Default)]
 pub(super) struct DeliveryState {
     next_spawn: u64,
@@ -287,6 +293,59 @@ pub(super) fn bind_get(
 }
 
 impl RuntimeOwner {
+    pub(crate) fn pending_config_restarts(&self) -> Result<Vec<(String, u64)>> {
+        let mut state = self.lock()?;
+        state.store.delivery_ready()?;
+        let body = state.store.body()?;
+        body.versions
+            .iter()
+            .filter(|(tuple, _)| tuple.project.is_none())
+            .filter_map(|(tuple, versions)| {
+                let generation = versions.pending?;
+                let entry = body.generations.get(&generation)?;
+                Some(
+                    Transition::for_module(&entry.generation.changeset, &tuple.module).map(
+                        |transition| {
+                            (transition == Transition::ModuleRestart)
+                                .then(|| (tuple.module.clone(), generation))
+                        },
+                    ),
+                )
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|entries| entries.into_iter().flatten().collect())
+    }
+
+    pub(crate) fn requires_fresher_spawn(
+        &self,
+        module: &str,
+        spawn: Option<&DeliverySpawn>,
+    ) -> Result<Option<u64>> {
+        let mut state = self.lock()?;
+        state.store.delivery_ready()?;
+        let body = state.store.body()?;
+        let pending = body
+            .versions
+            .iter()
+            .find(|(tuple, _)| tuple.module == module && tuple.project.is_none())
+            .and_then(|(_, versions)| versions.pending);
+        let Some(generation) = pending else {
+            return Ok(None);
+        };
+        let entry = body
+            .generations
+            .get(&generation)
+            .ok_or_else(|| GateError::new("config_gated", "pending generation is absent"))?;
+        let transition = Transition::for_module(&entry.generation.changeset, module)?;
+        let deferred_daemon = transition == Transition::DaemonRestart
+            && generation > state.delivery.initial_generation;
+        Ok((transition.requires_spawn()
+            && !deferred_daemon
+            && spawn
+                .is_none_or(|spawn| spawn.module != module || spawn.generation() != generation))
+        .then_some(generation))
+    }
+
     /// A supervised process exit, not a transport disconnect, fails warm-up.
     /// The synchronous fence closes the gap before the async failure commit.
     pub(crate) fn delivery_child_exited(&self, spawn: &DeliverySpawn) -> Result<()> {
@@ -714,33 +773,58 @@ impl RuntimeOwner {
             .find(|(key, _)| key == &tuple)
             .map(|(_, versions)| versions.clone())
             .unwrap_or_default();
-        let expected = versions
-            .pending
-            .or(versions.active)
-            .and_then(|id| body.generations.get(&id))
-            .and_then(|entry| entry.delivery.as_ref())
-            .and_then(|snapshot| snapshot.declarations.get(module));
-        if expected != Some(&declaration) {
-            return Err(GateError::new(
-                "config_gated",
-                "candidate declaration differs from the approved declaration",
-            ));
-        }
         let transition = versions
             .pending
             .and_then(|id| body.generations.get(&id))
             .map(|entry| Transition::for_module(&entry.generation.changeset, module))
             .transpose()?
             .unwrap_or(Transition::Live);
-        let vector = (versions.active, versions.pending);
-        let catchup = versions.pending.is_none()
+        let pending_declaration = versions
+            .pending
+            .and_then(|id| body.generations.get(&id))
+            .and_then(|entry| entry.delivery.as_ref())
+            .and_then(|snapshot| snapshot.declarations.get(module))
+            .cloned();
+        let active_declaration = versions
+            .active
+            .and_then(|id| body.generations.get(&id))
+            .and_then(|entry| entry.delivery.as_ref())
+            .and_then(|snapshot| snapshot.declarations.get(module))
+            .cloned();
+        let pending = versions.pending.filter(|generation| {
+            state
+                .delivery
+                .boundary_open(connection, *generation, transition)
+        });
+        if pending != versions.pending && transition != Transition::DaemonRestart {
+            return Err(GateError::new(
+                "config_gated",
+                "candidate launch was superseded by a configuration requiring a fresh start",
+            ));
+        }
+        let expected = if pending.is_some() {
+            pending_declaration
+        } else {
+            active_declaration
+        };
+        if expected.as_ref() != Some(&declaration) {
+            return Err(GateError::new(
+                "config_gated",
+                "candidate declaration differs from the approved declaration",
+            ));
+        }
+        let transition = if pending.is_some() {
+            transition
+        } else {
+            Transition::Live
+        };
+        let vector = (versions.active, pending);
+        let catchup = pending.is_none()
             && versions.active.is_some()
             && state.delivery.served.get(&connection) != Some(&vector);
         state.active_declarations.insert(id, connection);
         state.delivery.attempts.remove(&connection);
-        let Some(generation) = versions
-            .pending
-            .or_else(|| catchup.then_some(versions.active).flatten())
+        let Some(generation) = pending.or_else(|| catchup.then_some(versions.active).flatten())
         else {
             return Ok(None);
         };
@@ -865,7 +949,32 @@ impl RuntimeOwner {
                 .deadline
                 .is_some_and(|deadline| tokio::time::Instant::now() >= deadline);
         if bound.catchup {
-            if versions.pending.is_some() || versions.active != Some(bound.generation) {
+            // A later approval waiting for a new daemon cannot replace the
+            // active configuration this child is catching up to now.
+            let pending_transition = versions
+                .pending
+                .map(|generation| {
+                    let entry = state
+                        .store
+                        .body()?
+                        .generations
+                        .get(&generation)
+                        .ok_or_else(|| {
+                            GateError::new("config_gated", "pending generation is absent")
+                        })?;
+                    Transition::for_module(&entry.generation.changeset, module)
+                })
+                .transpose()?;
+            let pending_is_deliverable =
+                versions
+                    .pending
+                    .zip(pending_transition)
+                    .is_some_and(|(generation, transition)| {
+                        state
+                            .delivery
+                            .boundary_open(connection, generation, transition)
+                    });
+            if pending_is_deliverable || versions.active != Some(bound.generation) {
                 return Ok(AppliedDisposition::Ignored);
             }
             state.delivery.attempts.remove(&connection);

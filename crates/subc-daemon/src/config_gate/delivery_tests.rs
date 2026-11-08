@@ -1893,3 +1893,288 @@ async fn config_delivery_route_receipts_are_not_persisted_and_owner_drop_restore
         .windows(b"receipt".len())
         .all(|window| window != b"receipt"));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn config_delivery_approved_restart_preserves_the_crash_ring_and_its_warmup_failure_spends_once(
+) {
+    let (rig, owner, supervisor, handler) = supervised_fixture(true);
+    let module = supervisor.spawn(supervised_spec(&rig, "a")).unwrap();
+    wait_for_delivery_condition(|| owner.delivery_exit_fence("a").unwrap().is_some()).await;
+    let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
+    wait_for_delivery_condition(|| {
+        module
+            .status()
+            .is_ok_and(|status| status.spawn_generation == 2 && status.process_alive)
+    })
+    .await;
+    assert_eq!(module.status().unwrap().restart_count, 1);
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::ModuleRestart]);
+    owner.notify_delivery_changed();
+    wait_for_delivery_condition(|| {
+        module
+            .status()
+            .is_ok_and(|status| status.spawn_generation == 3 && status.process_alive)
+    })
+    .await;
+    assert_eq!(
+        module.status().unwrap().restart_count,
+        1,
+        "approval neither spends nor clears the preceding real crash"
+    );
+    assert_eq!(
+        std::fs::read_to_string(rig.path.join("a.launches"))
+            .unwrap()
+            .lines()
+            .count(),
+        3
+    );
+    module.config_apply_restart(3).await.unwrap();
+    let pid = module.status().unwrap().pid.unwrap();
+    assert!(std::process::Command::new("/bin/kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    wait_for_delivery_condition(|| {
+        module
+            .status()
+            .is_ok_and(|status| status.spawn_generation == 4 && status.process_alive)
+    })
+    .await;
+    assert_eq!(
+        module.status().unwrap().restart_count,
+        2,
+        "the failed replacement spends exactly one additional entry"
+    );
+    assert!(owner.delivery_exit_fence("a").unwrap().is_none());
+    rig.declare(&owner, 30);
+    let view = owner
+        .module_get(ConnectionId::new(30), "a", ConfigGetRequest::new())
+        .unwrap();
+    assert_eq!(view.active.unwrap().generation, 1);
+    assert!(view.pending.is_none());
+    module.stop().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_starts_one_current_command(
+) {
+    use crate::supervise::{
+        ModuleOverlap, ModuleState, RestartPolicy, Supervisor, SupervisorHandle, SwapOutcome,
+    };
+    use std::sync::Arc;
+    let (rig, owner, _, _) = supervised_fixture(false);
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    std::fs::write(rig.path.join("a.seen"), b"keep running").unwrap();
+    let registry = Arc::new(crate::Registry::default());
+    let forwarding = Arc::new(crate::ForwardingTable::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
+        .with_handle(handle.clone())
+        .with_forwarding(forwarding.clone())
+        .with_config_runtime(owner.clone())
+        .with_drain_timeout(Duration::from_millis(20));
+    let handler = Arc::new(
+        crate::ControlHandler::with_forwarding(registry.clone(), forwarding.clone())
+            .with_supervisor(handle)
+            .with_config_runtime(owner.clone()),
+    );
+    let mut spec = supervised_spec(&rig, "a");
+    spec.protocol = subc_control::ModuleProtocol::Subc;
+    spec.overlap = ModuleOverlap::Safe;
+    let module = supervisor.spawn(spec.clone()).unwrap();
+    let mut manifest = subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build();
+    manifest.ready = Some(true);
+    registry
+        .register_with_control_ops(
+            manifest.clone(),
+            subc_protocol::PROTOCOL_VERSION,
+            INCUMBENT,
+            vec!["config.review".into()],
+        )
+        .unwrap();
+    let (sender, _incumbent_frames) = tokio::sync::mpsc::channel(8);
+    forwarding
+        .register_module_connection(
+            INCUMBENT,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(sender),
+        )
+        .unwrap();
+    let swap = {
+        let module = module.clone();
+        tokio::spawn(async move { module.swap(Some(Duration::from_secs(30))).await })
+    };
+    wait_for_delivery_condition(|| {
+        std::fs::read_to_string(rig.path.join("a.launches"))
+            .is_ok_and(|text| text.lines().count() == 2)
+    })
+    .await;
+    manifest.ready = Some(false);
+    registry
+        .register_candidate_with_control_ops(
+            manifest,
+            subc_protocol::PROTOCOL_VERSION,
+            CANDIDATE,
+            vec!["config.review".into()],
+        )
+        .unwrap();
+    let (sender, _candidate_frames) = tokio::sync::mpsc::channel(8);
+    forwarding
+        .register_candidate_module_connection(
+            CANDIDATE,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(sender),
+        )
+        .unwrap();
+    assert_eq!(
+        forwarding
+            .active_module_endpoint("a")
+            .unwrap()
+            .unwrap()
+            .connection_id,
+        INCUMBENT
+    );
+    let mut next = spec;
+    next.program = rig.path.join("next-program");
+    std::fs::copy(rig.path.join("program"), &next.program).unwrap();
+    next.args[1] = rig
+        .path
+        .join("a.next-command.launches")
+        .to_string_lossy()
+        .into_owned();
+    module.update_spec_for_test(next.clone()).await.unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"), serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":next.program,"args":next.args,"overlap":"safe"}}})).unwrap()).unwrap();
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::ModuleRestart]);
+    let gate = owner.module_gate("a").unwrap();
+    let guard = gate.lock().await;
+    let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
+    registry.deregister_connection(CANDIDATE).unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), swap)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, SwapOutcome::SupersededByConfigRestart);
+    assert_eq!(outcome.as_str(), "superseded_by_config_restart");
+    assert_eq!(module.status().unwrap().swap_outcome, Some(outcome));
+    assert_eq!(module.state().unwrap(), ModuleState::Running);
+    assert_eq!(
+        forwarding
+            .active_module_endpoint("a")
+            .unwrap()
+            .unwrap()
+            .connection_id,
+        INCUMBENT
+    );
+    assert_eq!(module.status().unwrap().restart_count, 0);
+    registry.deregister_connection(INCUMBENT).unwrap();
+    drop(guard);
+    wait_for_delivery_condition(|| rig.path.join("a.next-command.launches").exists()).await;
+    assert_eq!(
+        std::fs::read_to_string(rig.path.join("a.next-command.launches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(module.status().unwrap().spawn_generation, 2);
+    assert_eq!(module.status().unwrap().restart_count, 0);
+    assert_eq!(
+        std::fs::read_to_string(rig.path.join("a.launches"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    let replacement = ConnectionId::new(30);
+    registry
+        .register_with_control_ops(
+            subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+            subc_protocol::PROTOCOL_VERSION,
+            replacement,
+            vec!["config.review".into()],
+        )
+        .unwrap();
+    let (sender, _replacement_frames) = tokio::sync::mpsc::channel(8);
+    forwarding
+        .register_module_connection(
+            replacement,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(sender),
+        )
+        .unwrap();
+    rig.declare(&owner, 30);
+    wait_for_delivery_condition(|| {
+        owner.delivery_child_generation(replacement).unwrap() == Some(2)
+    })
+    .await;
+    assert_eq!(pending(&owner, replacement).generation, 2);
+    registry.deregister_connection(replacement).unwrap();
+    module.stop().await.unwrap();
+}
+
+#[test]
+fn config_delivery_swap_never_uses_cutover_as_a_missing_start_or_daemon_boundary() {
+    for kind in [
+        subc_config::ApplyKind::ModuleRestart,
+        subc_config::ApplyKind::NextSupervision,
+        subc_config::ApplyKind::DaemonRestart,
+    ] {
+        let (rig, owner) = rig();
+        applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+        let spawn = owner
+            .spawned(
+                "a",
+                tokio::time::Instant::now(),
+                Duration::from_secs(120),
+                Duration::from_secs(5),
+            )
+            .unwrap()
+            .unwrap();
+        candidate(&rig, &owner);
+        owner.registered(CANDIDATE, &spawn).unwrap();
+        approve_kinds(&rig, &owner, &[kind]);
+        let result = owner.promoted(CANDIDATE, "a", tokio::time::Instant::now());
+        if kind == subc_config::ApplyKind::DaemonRestart {
+            assert_eq!(
+                owner.requires_fresher_spawn("a", Some(&spawn)).unwrap(),
+                None,
+                "an approval deferred to the next daemon must not restart a running module"
+            );
+            assert_eq!(
+                result.unwrap().unwrap().0,
+                1,
+                "only active per-child catch-up is eligible"
+            );
+            let catchup = pending(&owner, CANDIDATE);
+            assert_eq!(catchup.generation, 1);
+            assert_eq!(
+                applied(&owner, CANDIDATE, &catchup, true).unwrap(),
+                AppliedDisposition::CatchupComplete
+            );
+            assert_active(&owner, CANDIDATE, 1);
+            assert_eq!(
+                owner.lock().unwrap().store.body().unwrap().versions[0]
+                    .1
+                    .pending,
+                Some(2)
+            );
+        } else {
+            assert_eq!(
+                owner.requires_fresher_spawn("a", Some(&spawn)).unwrap(),
+                Some(2)
+            );
+            assert_eq!(result.unwrap_err().code, "config_gated");
+            assert_active(&owner, INCUMBENT, 1);
+        }
+    }
+}

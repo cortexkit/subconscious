@@ -29,6 +29,11 @@
   presence. Bound swap configuration readiness from the original launch, and
   leave connections open when a configuration response cannot flush in time.
 
+- Apply approved module restarts without clearing or spending the crash budget.
+  A candidate launched before a newer required start is abandoned without
+  cutover; one replacement uses the current configured command. Retain the
+  successful supersession outcome in daemon-local status.
+
 ## 0.41.9
 
 - Bind desktop approval to the complete immutable plan actually flushed to the

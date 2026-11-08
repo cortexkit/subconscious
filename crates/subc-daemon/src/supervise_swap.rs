@@ -66,6 +66,10 @@ enum Warm {
     /// this connection.
     Ready(ConnectionId),
     Failed(CandidateFailure),
+    /// A newer approved configuration requires a launch the candidate missed.
+    Superseded {
+        generation: u64,
+    },
     /// An operator command that must win over the swap arrived while the
     /// candidate warmed. `connection` is the candidate's, if it registered.
     Interrupted {
@@ -79,8 +83,8 @@ enum Warm {
 pub(super) struct SwapEnd {
     /// Commands for the loop to run next, in arrival order: configuration
     /// updates that arrived during the warm-up (already answered, applied now
-    /// that the swap no longer holds the spec), then the stop, disable or
-    /// retire that interrupted the swap, if one did.
+    /// that the swap no longer holds the spec), followed by an interrupting stop,
+    /// disable or retire, or the approved restart that superseded the candidate.
     pub(super) requeue: Vec<SupervisorCommand>,
 }
 
@@ -116,7 +120,7 @@ pub(super) async fn run_swap(
     child: &mut Option<SupervisedChild>,
     commands: &mut mpsc::Receiver<SupervisorCommand>,
     ready_timeout: Duration,
-    reply: oneshot::Sender<Result<(), SuperviseError>>,
+    reply: oneshot::Sender<Result<SwapOutcome, SuperviseError>>,
 ) -> SwapEnd {
     let mut end = SwapEnd::default();
     run_swap_inner(
@@ -145,7 +149,7 @@ async fn run_swap_inner(
     child: &mut Option<SupervisedChild>,
     commands: &mut mpsc::Receiver<SupervisorCommand>,
     ready_timeout: Duration,
-    reply: oneshot::Sender<Result<(), SuperviseError>>,
+    reply: oneshot::Sender<Result<SwapOutcome, SuperviseError>>,
     end: &mut SwapEnd,
 ) {
     let module_id = spec.module_id.as_str();
@@ -215,11 +219,25 @@ async fn run_swap_inner(
         incumbent_connection,
         ready_timeout,
         config_deadline,
+        runtime.config_delivery.as_ref(),
         commands,
         end,
     )
     .await;
     let candidate_connection = match warm {
+        Warm::Superseded { generation } => {
+            abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
+            update_snapshot(snapshot, Some(module_id), |state| {
+                state.swap_outcome = Some(SwapOutcome::SupersededByConfigRestart)
+            })
+            .ok();
+            end.requeue.push(SupervisorCommand::ConfigApplyRestart {
+                generation,
+                supersedes_swap: true,
+            });
+            let _ = reply.send(Ok(SwapOutcome::SupersededByConfigRestart));
+            return;
+        }
         Warm::Ready(connection) => connection,
         Warm::Interrupted {
             command,
@@ -238,7 +256,7 @@ async fn run_swap_inner(
                 &forwarding,
                 &handle,
                 candidate,
-                &failure,
+                Some(&failure),
             )
             .await;
             let _ = reply.send(Err(failure.into_error(module_id)));
@@ -252,7 +270,7 @@ async fn run_swap_inner(
                 &forwarding,
                 &handle,
                 candidate,
-                &failure,
+                Some(&failure),
             )
             .await;
             let _ = reply.send(Err(failure.into_error(module_id)));
@@ -276,7 +294,7 @@ async fn run_swap_inner(
             &forwarding,
             &handle,
             candidate,
-            &failure,
+            Some(&failure),
         )
         .await;
         let _ = reply.send(Err(failure.into_error(module_id)));
@@ -303,7 +321,7 @@ async fn run_swap_inner(
                     &forwarding,
                     &handle,
                     candidate,
-                    &failure,
+                    Some(&failure),
                 )
                 .await;
                 let _ = reply.send(Err(failure.into_error(module_id)));
@@ -327,6 +345,22 @@ async fn run_swap_inner(
                 .any(|op| op == "config.review")
         });
     if let Some(owner) = config_owner.as_ref().filter(|_| config_opted_in) {
+        if let Ok(Some(generation)) =
+            owner.requires_fresher_spawn(module_id, candidate.config_delivery.as_ref())
+        {
+            drop(config_guard);
+            abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
+            update_snapshot(snapshot, Some(module_id), |state| {
+                state.swap_outcome = Some(SwapOutcome::SupersededByConfigRestart)
+            })
+            .ok();
+            end.requeue.push(SupervisorCommand::ConfigApplyRestart {
+                generation,
+                supersedes_swap: true,
+            });
+            let _ = reply.send(Ok(SwapOutcome::SupersededByConfigRestart));
+            return;
+        }
         if let Err(error) = owner.module_get(
             candidate_connection,
             module_id,
@@ -345,7 +379,7 @@ async fn run_swap_inner(
                 &forwarding,
                 &handle,
                 candidate,
-                &failure,
+                Some(&failure),
             )
             .await;
             let _ = reply.send(Err(failure.into_error(module_id)));
@@ -384,7 +418,7 @@ async fn run_swap_inner(
                 &forwarding,
                 &handle,
                 candidate,
-                &failure,
+                Some(&failure),
             )
             .await;
             let _ = reply.send(Err(failure.into_error(module_id)));
@@ -424,7 +458,7 @@ async fn run_swap_inner(
                 &forwarding,
                 &handle,
                 candidate,
-                &failure,
+                Some(&failure),
             )
             .await;
             let _ = reply.send(Err(failure.into_error(module_id)));
@@ -488,7 +522,11 @@ async fn run_swap_inner(
         superseded_connection_id = incumbent_connection.get(),
         "swap cut over; new routes land on the promoted candidate, draining the incumbent"
     );
-    let _ = reply.send(Ok(()));
+    update_snapshot(snapshot, Some(module_id), |state| {
+        state.swap_outcome = Some(SwapOutcome::Cutover)
+    })
+    .ok();
+    let _ = reply.send(Ok(SwapOutcome::Cutover));
 
     dispatch_retirement(
         spec,
@@ -563,6 +601,7 @@ fn serve_command_while_warming(
         module_id: module_id.to_string(),
     };
     match command {
+        SupervisorCommand::ConfigApplyRestart { .. } => Some(command),
         SupervisorCommand::Drain { .. }
         | SupervisorCommand::ConfigExitHold { .. }
         | SupervisorCommand::ConfigDeliveryFailed { .. }
@@ -670,6 +709,7 @@ async fn warm_candidate(
     incumbent_connection: ConnectionId,
     ready_timeout: Duration,
     config_deadline: Option<Instant>,
+    config_delivery: Option<&super::config_delivery::ConfigDelivery>,
     commands: &mut mpsc::Receiver<SupervisorCommand>,
     end: &mut SwapEnd,
 ) -> Warm {
@@ -790,6 +830,12 @@ async fn warm_candidate(
                 let Some(command) = command else {
                     return Warm::Interrupted { command: None, connection: registered };
                 };
+                if matches!(command, SupervisorCommand::ConfigApplyRestart { .. }) {
+                    if let Some(generation) = config_delivery.and_then(|delivery| delivery.0.requires_fresher_spawn(module_id, candidate.config_delivery.as_ref()).ok().flatten()) {
+                        return Warm::Superseded { generation };
+                    }
+                    continue;
+                }
                 if let Some(command) = serve_command_while_warming(module_id, command, end) {
                     return Warm::Interrupted { command: Some(command), connection: registered };
                 }
@@ -905,16 +951,20 @@ async fn abandon_candidate(
     forwarding: &ForwardingTable,
     handle: &SupervisorHandle,
     mut candidate: SupervisedChild,
-    failure: &CandidateFailure,
+    failure: Option<&CandidateFailure>,
 ) {
-    warn!(
-        module_id,
-        arm = failure.arm.as_str(),
-        detail = %failure.detail,
-        candidate_pid = candidate.pid,
-        "swap failed; killing the candidate and leaving the incumbent serving"
-    );
-    if failure.exit.is_none() {
+    if let Some(failure) = failure {
+        warn!(module_id, arm=failure.arm.as_str(), detail=%failure.detail, candidate_pid=candidate.pid,
+            "swap failed; killing the candidate and leaving the incumbent serving");
+    } else {
+        info!(
+            module_id,
+            candidate_pid = candidate.pid,
+            outcome = SwapOutcome::SupersededByConfigRestart.as_str(),
+            "swap superseded by approved configuration restart; leaving the incumbent serving"
+        );
+    }
+    if failure.is_none_or(|failure| failure.exit.is_none()) {
         if let Err(err) = candidate.start_kill() {
             debug!(module_id, error = %err, "swap candidate kill failed; it may already have exited");
         }
@@ -927,7 +977,7 @@ async fn abandon_candidate(
         warn!(module_id, %error, "could not finalize the abandoned swap candidate");
     }
 
-    let slot = match failure.connection {
+    let slot = match failure.and_then(|failure| failure.connection) {
         Some(connection) => RegistrationSlot::Connection(connection),
         None => RegistrationSlot::Candidate(module_id),
     };
@@ -938,7 +988,7 @@ async fn abandon_candidate(
         // registration outlived the wait, close the connection outright so the
         // candidate slot is free for the next swap.
         warn!(module_id, error = %err, "abandoned swap candidate is still registered; closing its connection");
-        if let Some(connection) = failure.connection.or_else(|| {
+        if let Some(connection) = failure.and_then(|failure| failure.connection).or_else(|| {
             registry
                 .get_candidate(module_id)
                 .ok()
@@ -949,7 +999,7 @@ async fn abandon_candidate(
                 connection,
                 CloseReason::new(
                     "swap_candidate_abandoned",
-                    format!("swap of module '{module_id}' failed; closing its candidate"),
+                    format!("swap of module '{module_id}' ended; closing its candidate"),
                 ),
             );
         }
@@ -1203,6 +1253,7 @@ mod tests {
                 ConnectionId::new(1),
                 Duration::from_secs(60),
                 Some(cap),
+                None,
                 &mut commands,
                 &mut end
             )
@@ -1217,6 +1268,7 @@ mod tests {
             ConnectionId::new(1),
             Duration::from_secs(60),
             Some(cap),
+            None,
             &mut commands,
             &mut end,
         )

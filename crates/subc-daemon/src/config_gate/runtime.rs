@@ -38,6 +38,8 @@ pub struct RuntimeOwner {
     os_prompt_policy: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     spawn_preflight_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    exit_record_attempts: std::sync::atomic::AtomicUsize,
 }
 
 /// The post-answer deadline can withdraw queued work, but never a publication
@@ -474,6 +476,8 @@ impl RuntimeOwner {
             os_prompt_policy: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             spawn_preflight_hook: Mutex::new(None),
+            #[cfg(test)]
+            exit_record_attempts: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 

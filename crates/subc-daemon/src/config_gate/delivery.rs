@@ -620,6 +620,9 @@ impl RuntimeOwner {
     /// `AnchorPending` still restores the previous active generation in memory;
     /// its durable failure record is retried before delivery can resume.
     pub(crate) fn delivery_record_exit(&self, exited: &ExitedDelivery) -> Result<bool> {
+        #[cfg(test)]
+        self.exit_record_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut state = self.lock()?;
         if !state
             .delivery
@@ -662,6 +665,12 @@ impl RuntimeOwner {
             });
         }
         Ok(versions.active.is_none())
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn exit_record_attempts_for_test(&self) -> usize {
+        self.exit_record_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) fn delivery_release_exit(&self, exited: &ExitedDelivery) -> Result<()> {

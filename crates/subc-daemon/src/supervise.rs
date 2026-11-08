@@ -67,6 +67,8 @@ mod async_spawn_tests;
 #[cfg(all(test, windows))]
 mod carried_job_tests;
 mod config_delivery;
+mod config_exit_failure;
+pub use config_exit_failure::ModuleStopReason;
 #[cfg(all(test, unix))]
 mod config_exit_hold_tests;
 pub(crate) mod containment;
@@ -1214,6 +1216,9 @@ pub struct ExitReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleStatus {
     pub module_id: String,
+    /// Retained configuration-exit infrastructure failure. Cleared only after a
+    /// successful launch; an ordinary stop has no infrastructure stop reason.
+    pub stop_reason: Option<ModuleStopReason>,
     /// A previous daemon's unresolved process, not a child owned by this supervisor.
     pub waiting_for_previous_pid: Option<u32>,
     /// Why the previous instance still prevents a new start.
@@ -1294,6 +1299,7 @@ struct ActorSelectCheckpoint {
 
 #[derive(Debug, Clone, PartialEq)]
 struct SupervisorSnapshot {
+    stop_reason: Option<ModuleStopReason>,
     subtree_target: crate::subtree_resources::Target,
     failed_retry: FailedRetry,
     exec_outcome: Option<Arc<crate::activity::ExecOutcome>>,
@@ -1450,6 +1456,7 @@ impl SupervisorSnapshot {
 
     fn new(state: ModuleState, enabled: bool) -> Self {
         Self {
+            stop_reason: None,
             subtree_target: crate::subtree_resources::Target::Unavailable("not_running"),
             failed_retry: FailedRetry::default(),
             exec_outcome: None,
@@ -4141,6 +4148,7 @@ impl SupervisedModule {
 
         Ok((
             ModuleStatus {
+                stop_reason: snapshot.stop_reason,
                 waiting_for_previous_pid: retained
                     .as_ref()
                     .map(|(pid, _)| *pid)
@@ -13403,6 +13411,7 @@ fn set_running(
     }
     state.drain_disposition_detail = None;
     state.spawn_failure = None;
+    state.stop_reason = None;
     state.waiting_for_previous_pid = None;
     state.waiting_for_previous_detail = None;
     // Every caller of this is a plain spawn, which always uses the primary key;

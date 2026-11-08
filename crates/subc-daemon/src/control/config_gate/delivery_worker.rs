@@ -14,8 +14,8 @@ impl ControlHandler {
     pub(crate) async fn record_config_exit_for_test(
         self: &Arc<Self>,
         exited: crate::config_gate::runtime::delivery::ExitedDelivery,
-    ) {
-        record_exit(Arc::downgrade(self), exited).await;
+    ) -> bool {
+        record_exit(Arc::downgrade(self), exited).await
     }
 
     /// The bootstrap task owns this handle and aborts it at daemon teardown.
@@ -78,11 +78,12 @@ impl ControlHandler {
                             let handler = handler.clone();
                             let recording = recording.clone();
                             tasks.spawn(async move {
-                                record_exit(handler, exited).await;
-                                recording
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .remove(&module);
+                                if record_exit(handler, exited).await {
+                                    recording
+                                        .lock()
+                                        .unwrap_or_else(|p| p.into_inner())
+                                        .remove(&module);
+                                }
                             });
                         }
                     }
@@ -397,47 +398,104 @@ async fn module_worker(
 async fn record_exit(
     handler: std::sync::Weak<ControlHandler>,
     exited: crate::config_gate::runtime::delivery::ExitedDelivery,
-) {
+) -> bool {
     let Some(control) = handler.upgrade() else {
-        return;
+        return true;
     };
     let Some(owner) = &control.config_runtime else {
-        return;
+        return true;
     };
-    let Ok(gate) = owner.module_gate(&exited.module) else {
-        return;
+    let mut failure = None;
+    // Reconciliation is idempotent. Three attempts, with 50/100 ms backoff,
+    // cover transient record/hold errors without an endless hidden retry loop.
+    for delay in [
+        Duration::ZERO,
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    ] {
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        match reconcile_exit(&control, owner, &exited).await {
+            Ok(()) => return true,
+            Err(reason) => {
+                failure.get_or_insert(reason);
+            }
+        }
+    }
+    let reason = failure.expect("each unsuccessful attempt records a reason");
+    if let Some(module) = control.supervisor.get(&exited.module) {
+        // The exit fence still prevents respawn. Never wait for this command
+        // under the module gate: an earlier restart may need that same gate.
+        if reason.code != "config_exit_hold_failed" {
+            let _ = hold_exited_module(&module).await;
+        }
+        if let Err(error) = module.config_exit_failed(reason.clone()) {
+            warn!(module_id=%exited.module, %error, "configuration exit stopped-state diagnostic could not be retained");
+        }
+    }
+    if let Some(ledger) = &control.activity {
+        ledger.config_exit_failed(&exited.module, &reason);
+    }
+    warn!(module_id=%exited.module, reason=%reason.code, error_kind=%reason.error_kind,
+        "configuration exit reconciliation exhausted its retries; module remains stopped behind its exit fence");
+    // Retain the coordinator's per-module entry. Future notifications must not
+    // silently restart this bounded retry cycle while the terminal fence stays.
+    false
+}
+
+async fn reconcile_exit(
+    control: &ControlHandler,
+    owner: &Arc<crate::config_gate::runtime::RuntimeOwner>,
+    exited: &crate::config_gate::runtime::delivery::ExitedDelivery,
+) -> Result<(), crate::supervise::ModuleStopReason> {
+    let reason = |code: &str, error_kind: String| crate::supervise::ModuleStopReason {
+        code: code.into(),
+        error_kind,
     };
-    let recorded = {
+    let gate = owner
+        .module_gate(&exited.module)
+        .map_err(|error| reason("config_exit_record_failed", error.code))?;
+    let hold = {
         let _guard = gate.lock().await;
         let exited = exited.clone();
         owner
             .on_blocking(move |owner| owner.delivery_record_exit(&exited))
             .await
+            .map_err(|error| reason("config_exit_record_failed", error.code))?
     };
-    // The exit fence still prevents respawn. The supervisor must be able to
-    // take the module gate for an earlier command before answering this hold.
-    match recorded {
-        Ok(hold) => {
-            if hold {
-                if let Some(module) = control.supervisor.get(&exited.module) {
-                    if let Err(error) = module.config_exit_hold().await {
-                        warn!(module_id=%exited.module, %error, "configuration exit hold could not be recorded");
-                        return;
-                    }
-                }
-            }
-            let _guard = gate.lock().await;
-            let exited_token = exited.clone();
-            if let Err(error) = owner
-                .on_blocking(move |owner| owner.delivery_release_exit(&exited_token))
+    if hold {
+        if let Some(module) = control.supervisor.get(&exited.module) {
+            hold_exited_module(&module)
                 .await
-            {
-                warn!(module_id=%exited.module, %error, "configuration exit fence could not be released");
-            }
+                .map_err(|kind| reason("config_exit_hold_failed", kind.into()))?;
         }
-        Err(error) => {
-            warn!(module_id=%exited.module, %error, "configuration exit failure could not be recorded")
+    }
+    let _guard = gate.lock().await;
+    let exited = exited.clone();
+    owner
+        .on_blocking(move |owner| owner.delivery_release_exit(&exited))
+        .await
+        .map_err(|error| reason("config_exit_release_failed", error.code))
+}
+
+// A stuck supervisor cannot leave reconciliation parked forever. A timed-out
+// hold may still finish later; it can only stop this already-exited child.
+const CONFIG_EXIT_HOLD_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn hold_exited_module(
+    module: &crate::supervise::SupervisedModule,
+) -> Result<(), &'static str> {
+    match tokio::time::timeout(CONFIG_EXIT_HOLD_TIMEOUT, module.config_exit_hold()).await {
+        Ok(Ok(())) => Ok(()),
+        Err(_) => Err("supervisor_hold_timeout"),
+        Ok(Err(crate::supervise::SuperviseError::CommandClosed { .. })) => {
+            Err("supervisor_command_closed")
         }
+        Ok(Err(crate::supervise::SuperviseError::StatePoisoned { .. })) => {
+            Err("supervisor_state_poisoned")
+        }
+        Ok(Err(_)) => Err("supervisor_error"),
     }
 }
 

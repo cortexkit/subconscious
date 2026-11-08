@@ -62,6 +62,11 @@
   pending configuration, and a failed first generation stays stopped.
   Exit reconciliation releases the module gate before waiting for supervisor
   commands, so an earlier queued restart cannot deadlock the stopped-state hold.
+  Retry reconciliation three times with 50/100 ms backoff, allowing five seconds
+  for each supervisor reply to the command holding the exited module stopped.
+  On exhaustion retain the exit fence, stop the
+  module with a named daemon-local reason and error kind, and emit a matching
+  `config.exit_failure` activity and warning instead of silently parking it.
 
 - Refuse route-policy changes until a trusted policy installer is supplied.
   Retain reversible installations until the generation is durably active, and

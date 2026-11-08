@@ -228,6 +228,29 @@ impl ActivityLedger {
         );
     }
 
+    pub(crate) fn config_exit_failed(
+        &self,
+        module: &str,
+        reason: &crate::supervise::ModuleStopReason,
+    ) {
+        self.enqueue_lifecycle_with_summary(
+            "config.exit_failure",
+            Some(module),
+            Principal::Reserved {
+                module_id: "subc".into(),
+            },
+            serde_json::json!({"reason": reason.code, "error_kind": reason.error_kind})
+                .as_object()
+                .unwrap()
+                .clone(),
+            None,
+            Some(&format!(
+                "{module}: {} ({})",
+                reason.code, reason.error_kind
+            )),
+        );
+    }
+
     pub(crate) fn module_rescanned(
         &self,
         added: &[String],

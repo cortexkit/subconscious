@@ -4,7 +4,8 @@
 //! This area picks the set for a role (participant, bus module, system account),
 //! checks it with the naming crate's own
 //! permission-file validator, and shapes it as the allow-only `pub`/`sub` lists of a
-//! NATS user JWT. Live subscriptions use the event durables' exact filters.
+//! NATS user JWT. Live subscriptions use the naming crate's code-reviewed reader
+//! allowlists, which runtime configuration cannot extend.
 //!
 //! The same generator, fed the fixed fixture identities the naming crate pins for its
 //! reference document (`PINNED_GOLDEN_FIXTURE`), renders a permission document. The
@@ -16,8 +17,8 @@
 use std::{collections::BTreeSet, error::Error, fmt};
 
 use cortexkit_bus_naming::{
-    bus_permissions, delivery_authority_permissions, event_consumer_specs,
-    flow_engine_consumer_spec, flow_engine_permissions, generate_permission_golden,
+    bus_permissions, delivery_authority_permissions, flow_engine_consumer_spec,
+    flow_engine_permissions, generate_permission_golden, live_hint_subscriptions,
     participant_permissions, system_permissions, validate_permission_file, AccountNames,
     AllowEntry, GoldenFixture, GrantError, NamingError, Operation, Principal,
 };
@@ -211,7 +212,7 @@ pub fn derive_account(account: &str) -> Result<AccountNames, GrantRefusal> {
 /// no agent: it may pull, inspect and ack any agent's durable on the agent streams, and
 /// publishes no workload subject. It publishes module events on its own event subjects
 /// (`ck.{acct}.event.{module_id}.>`) and live hints on its own live subjects, and on no
-/// other module's. Live subscriptions mirror its event durable's filters, if any.
+/// other module's. Live subscriptions come from the naming crate's reader allowlists.
 /// `credential_public` is the user's public key, which names its inbox prefix.
 pub fn participant_grant(
     account: &AccountNames,
@@ -259,9 +260,9 @@ pub fn flow_engine_grant(
     Grant::from_entries(GrantRole::FlowEngine, account, entries)
 }
 
-/// Live hints have the same publishers and readers as events, but use Core NATS rather
-/// than a durable. Reuse the naming crate's reader filters so adding a live delivery
-/// mechanism cannot broaden which modules or kinds a credential can observe.
+/// Live hints mirror event publishers but use Core NATS rather than a durable.
+/// The naming crate combines event readers and live-only readers without granting
+/// live-only subjects any JetStream permissions.
 fn add_live_permissions(
     account: &AccountNames,
     module_id: &str,
@@ -282,30 +283,22 @@ fn add_live_permissions(
         .collect::<Vec<_>>();
     entries.extend(publishes);
 
-    let durable = AccountNames::module_consumer_name(module_id)?;
-    let mut readers = event_consumer_specs(account)
-        .map_err(|error| GrantRefusal::ReaderFilters(error.to_string()))?;
+    let mut subscriptions = live_hint_subscriptions(account, module_id)?;
     if role == GrantRole::FlowEngine {
-        readers.push(
+        subscriptions.extend(
             flow_engine_consumer_spec(account, module_id)
-                .map_err(|error| GrantRefusal::ReaderFilters(error.to_string()))?,
+                .map_err(|error| GrantRefusal::ReaderFilters(error.to_string()))?
+                .consumer
+                .filter_subjects
+                .into_iter()
+                .map(|subject| subject.replacen(&event_prefix, &live_prefix, 1)),
         );
     }
-    for reader in readers {
-        if reader.consumer.durable == durable {
-            entries.extend(
-                reader
-                    .consumer
-                    .filter_subjects
-                    .into_iter()
-                    .map(|subject| AllowEntry {
-                        principal: role.principal(),
-                        operation: Operation::Subscribe,
-                        subject: subject.replacen(&event_prefix, &live_prefix, 1),
-                    }),
-            );
-        }
-    }
+    entries.extend(subscriptions.into_iter().map(|subject| AllowEntry {
+        principal: role.principal(),
+        operation: Operation::Subscribe,
+        subject,
+    }));
     Ok(())
 }
 
@@ -364,7 +357,7 @@ pub fn system_account_grant(
     Grant::from_entries(GrantRole::SystemAccount, account, entries)
 }
 
-/// Renders the permission document from the role grants and closed event-reader table.
+/// Renders the permission document from the role grants and reader allowlists.
 ///
 /// The fixture has no real user key, so each role's module id stands in where a
 /// credential public key goes: the participant's and bus module's inbox subjects read
@@ -406,19 +399,25 @@ pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRe
         .iter()
         .flat_map(Grant::allow_entries)
         .collect::<BTreeSet<_>>();
-    for reader in cortexkit_bus_naming::EVENT_CONSUMERS
+    let readers = cortexkit_bus_naming::EVENT_CONSUMERS
         .iter()
-        .filter(|reader| {
-            reader.module_id != fixture.delivery_authority_module
-                && reader.module_id != fixture.module_id
+        .map(|reader| reader.module_id)
+        .chain(
+            cortexkit_bus_naming::LIVE_HINT_READERS
+                .iter()
+                .map(|reader| reader.module_id),
+        )
+        .filter(|module_id| {
+            *module_id != fixture.delivery_authority_module && *module_id != fixture.module_id
         })
-    {
+        .collect::<BTreeSet<_>>();
+    for module_id in readers {
         allows.extend(
-            issued_grant(&account, reader.module_id, reader.module_id, &[])?
+            issued_grant(&account, module_id, module_id, &[])?
                 .allow_entries()
                 .into_iter()
                 .map(|mut entry| {
-                    entry.principal = Principal::EventConsumer(reader.module_id);
+                    entry.principal = Principal::EventConsumer(module_id);
                     entry
                 }),
         );

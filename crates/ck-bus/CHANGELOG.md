@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.5
+
+- Adopt cortexkit-bus-naming 0.3.2, replacing the routing change in 0.5.4,
+  which was never placed (deployed). `prefrontal-routing`'s durable returns to Insula quota
+  events only; its exact runner step hints are plain live subscriptions, with no
+  additional JetStream rights. Bootstrap updates existing durable filters in
+  place, preserving their delivered positions.
+- Derive live subscriptions from both code-reviewed reader allowlists and refresh the
+  permission goldens. The removed `thalamus-pi` runner no longer contributes any
+  reader or permission rows; existing orphaned durables are not deleted.
+
 ## 0.5.4
 
 - Adopt cortexkit-bus-naming 0.3.1 so `prefrontal-routing` can read the exact

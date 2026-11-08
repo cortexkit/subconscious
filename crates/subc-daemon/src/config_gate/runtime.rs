@@ -25,6 +25,7 @@ pub struct RuntimeOwner {
     inner: Mutex<OwnerState>,
     capturer: ConfigCapturer,
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    delivery_changed: std::sync::Arc<tokio::sync::Notify>,
 }
 
 pub use delivery::{AppliedDisposition, DeliverySpawn};
@@ -278,6 +279,27 @@ mod tests;
 pub(crate) mod delivery;
 
 impl RuntimeOwner {
+    #[cfg(feature = "test-support")]
+    pub(crate) fn pause_spawn_before_exec(&self) -> Result<()> {
+        let hooks = self.lock()?.store.test_support().cloned();
+        if let Some(hooks) = hooks {
+            hooks
+                .pause_spawn_before_exec()
+                .map_err(|error| GateError::new("config_test_pause", error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) fn pause_swap_before_promotion(&self) -> Result<()> {
+        let hooks = self.lock()?.store.test_support().cloned();
+        if let Some(hooks) = hooks {
+            hooks
+                .pause_swap_before_promotion()
+                .map_err(|error| GateError::new("config_test_pause", error.to_string()))?;
+        }
+        Ok(())
+    }
     /// Record the exact full response only after its writer flush succeeds and
     /// the adapter revalidates the same live desktop connection.
     pub(crate) fn desktop_view_delivered(
@@ -321,6 +343,7 @@ impl RuntimeOwner {
             }),
             capturer,
             module_gates: Mutex::new(HashMap::new()),
+            delivery_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -330,6 +353,14 @@ impl RuntimeOwner {
             .lock()
             .map_err(|_| GateError::new("config_unavailable", "module gate lock is poisoned"))?;
         Ok(gates.entry(module.into()).or_default().clone())
+    }
+
+    pub(crate) fn delivery_notifications(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.delivery_changed.clone()
+    }
+
+    pub(crate) fn notify_delivery_changed(&self) {
+        self.delivery_changed.notify_one();
     }
 
     pub(crate) fn retain_writer_lock(
@@ -393,6 +424,7 @@ impl RuntimeOwner {
         state
             .declarations
             .insert(connection, (module.into(), declaration));
+        state.delivery.declared(connection, module, active);
         if active {
             state.active_declarations.insert(module.into(), connection);
         }
@@ -400,6 +432,7 @@ impl RuntimeOwner {
     }
 
     pub fn disconnected(&self, connection: ConnectionId) {
+        self.notify_delivery_changed();
         if let Ok(mut state) = self.inner.lock() {
             state.desktop_views.remove(&connection.get());
             state.delivery.disconnected(connection);

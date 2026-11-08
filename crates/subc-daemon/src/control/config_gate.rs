@@ -1,6 +1,7 @@
 use subc_control::config::{ConfigControlRequest, ConfigControlResponse};
 
 use super::*;
+mod delivery_worker;
 
 /// Bound each immutable module review so an unanswered request cannot approve a plan.
 const CONFIG_REVIEW_TIMEOUT: Duration = Duration::from_secs(30);
@@ -167,7 +168,54 @@ impl ControlHandler {
                 let response =
                     control_response_body_frame(&frame, &response, "module config response")?;
                 if let Some(view) = delivered_view {
-                    ctx.egress.send_flushed(response).await?;
+                    use crate::config_gate::runtime::delivery::CONFIG_LIVE_ACK_TIMEOUT;
+                    let selected = view
+                        .pending
+                        .as_ref()
+                        .and_then(|view| view.attempt.map(|attempt| (view.generation, attempt)));
+                    if active {
+                        if let Some((generation, attempt)) = selected {
+                            runtime
+                                .delivery_write_started(
+                                    connection,
+                                    generation,
+                                    attempt,
+                                    tokio::time::Instant::now(),
+                                )
+                                .map_err(|error| {
+                                    RouterError::backend(0, frame.header.corr, error.to_string())
+                                })?;
+                        }
+                    }
+                    match tokio::time::timeout(
+                        CONFIG_LIVE_ACK_TIMEOUT,
+                        ctx.egress.send_flushed(response),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        failed => {
+                            if active {
+                                if let Some((generation, attempt)) = selected {
+                                    let _ = runtime.delivery_timeout(
+                                        connection,
+                                        &registration.manifest.module_id,
+                                        generation,
+                                        attempt,
+                                    );
+                                    runtime.notify_delivery_changed();
+                                }
+                            }
+                            return match failed {
+                                Ok(Err(error)) => Err(error),
+                                _ => Err(RouterError::backend(
+                                    0,
+                                    frame.header.corr,
+                                    "configuration delivery timed out",
+                                )),
+                            };
+                        }
+                    }
                     let module = registration.manifest.module_id;
                     config_work(runtime, move |owner| {
                         owner.module_view_delivered(
@@ -707,9 +755,13 @@ async fn config_work<T: Send + 'static>(
         + Send
         + 'static,
 ) -> std::result::Result<T, GateError> {
-    tokio::task::spawn_blocking(move || work(runtime))
-        .await
-        .map_err(|_| GateError::new("config_unavailable", "configuration worker stopped"))?
+    tokio::task::spawn_blocking(move || {
+        let result = work(runtime.clone());
+        runtime.notify_delivery_changed();
+        result
+    })
+    .await
+    .map_err(|_| GateError::new("config_unavailable", "configuration worker stopped"))?
 }
 
 fn config_error_frame(frame: &Frame, error: GateError) -> Result<Frame, RouterError> {

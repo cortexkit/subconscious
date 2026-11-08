@@ -170,6 +170,7 @@ async fn run_swap_inner(
         &runtime.stderr_ring,
         runtime.capture_logs_dir.as_deref(),
         &runtime.child_roster,
+        runtime.spawn_delivery(),
         #[cfg(target_os = "linux")]
         runtime.cgroup_placement.as_ref(),
         SpawnRole::SwapCandidate,
@@ -279,6 +280,76 @@ async fn run_swap_inner(
         return;
     }
 
+    let config_owner = runtime
+        .config_delivery
+        .as_ref()
+        .map(|delivery| delivery.0.clone());
+    let config_gate = match &config_owner {
+        Some(owner) => match owner.module_gate(module_id) {
+            Ok(gate) => Some(gate),
+            Err(error) => {
+                let failure = CandidateFailure {
+                    arm: SwapFailureArm::CandidateUnhealthy,
+                    detail: format!("config_gated: {error}"),
+                    exit: None,
+                    connection: Some(candidate_connection),
+                };
+                abandon_candidate(
+                    module_id,
+                    registry,
+                    &forwarding,
+                    &handle,
+                    candidate,
+                    &failure,
+                )
+                .await;
+                let _ = reply.send(Err(failure.into_error(module_id)));
+                return;
+            }
+        },
+        None => None,
+    };
+    let config_guard = match config_gate {
+        Some(gate) => Some(gate.lock_owned().await),
+        None => None,
+    };
+    let config_opted_in = registry
+        .registration(RegistrationSlot::Connection(candidate_connection))
+        .ok()
+        .flatten()
+        .is_some_and(|registration| {
+            registration
+                .control_ops
+                .iter()
+                .any(|op| op == "config.review")
+        });
+    if let Some(owner) = config_owner.as_ref().filter(|_| config_opted_in) {
+        if let Err(error) = owner.module_get(
+            candidate_connection,
+            module_id,
+            subc_protocol::config::ConfigGetRequest::new(),
+        ) {
+            drop(config_guard);
+            let failure = CandidateFailure {
+                arm: SwapFailureArm::CandidateUnhealthy,
+                detail: format!("config_gated: {error}"),
+                exit: None,
+                connection: Some(candidate_connection),
+            };
+            abandon_candidate(
+                module_id,
+                registry,
+                &forwarding,
+                &handle,
+                candidate,
+                &failure,
+            )
+            .await;
+            let _ = reply.send(Err(failure.into_error(module_id)));
+            return;
+        }
+    }
+
     // CUTOVER. Forwarding first, then the registry: two calls under two locks,
     // so there is a moment when they disagree, and the order decides which way.
     // Every route.open reads the registry and then reserves its relay under the
@@ -294,6 +365,7 @@ async fn run_swap_inner(
     let forwarding_cutover = match forwarding.cutover_candidate(module_id) {
         Ok(Some(cutover)) => cutover,
         Ok(None) | Err(_) => {
+            drop(config_guard);
             // The candidate's forwarding entry is gone, so its connection was
             // torn down just now. Nothing was promoted; the incumbent is still
             // the active endpoint.
@@ -316,9 +388,16 @@ async fn run_swap_inner(
             return;
         }
     };
+    #[cfg(feature = "test-support")]
+    if let Some(owner) = &config_owner {
+        if let Err(error) = owner.pause_swap_before_promotion() {
+            warn!(module_id, %error, "swap test pause failed");
+        }
+    }
     let promoted = match registry.promote_candidate(module_id) {
         Ok(Some(cutover)) => cutover.promoted,
         Ok(None) | Err(_) => {
+            drop(config_guard);
             // Forwarding promoted the candidate and the registry could not: its
             // registration went away between the two calls, so the process that
             // was just made the active endpoint is gone and the incumbent sits in
@@ -363,6 +442,15 @@ async fn run_swap_inner(
             return;
         }
     };
+
+    if let Some(owner) = config_owner.as_ref().filter(|_| config_opted_in) {
+        use crate::config_gate::runtime::DeliveryObserver;
+        if let Err(error) = owner.promoted(candidate_connection, module_id, Instant::now()) {
+            warn!(module_id, %error, "promoted configuration target is gated");
+        }
+        owner.notify_delivery_changed();
+    }
+    drop(config_guard);
 
     // The candidate is the module now: its nonce is the module's nonce, the
     // control plane's capability state is recomputed from its manifest (its
@@ -473,6 +561,8 @@ fn serve_command_while_warming(
     };
     match command {
         SupervisorCommand::Drain { .. }
+        | SupervisorCommand::ConfigExitHold { .. }
+        | SupervisorCommand::ConfigDeliveryFailed { .. }
         | SupervisorCommand::Retire { .. }
         | SupervisorCommand::SetEnabled { enabled: false, .. } => Some(command),
         SupervisorCommand::SetEnabled {
@@ -693,7 +783,8 @@ async fn warm_candidate(
 ///
 /// The same `health.check` the supervisor probes every module with, sent only
 /// when the candidate advertises it. A `failing` answer or no usable answer
-/// fails the swap; `degraded` does not, since a degraded module still serves.
+/// fails the swap. A configuration-delivery candidate must answer healthy;
+/// otherwise the existing non-config swap policy also accepts degraded service.
 /// Like every other swap failure it spends no crash-restart budget: the
 /// budget is the incumbent's, and the incumbent did nothing.
 async fn probe_candidate(
@@ -709,17 +800,29 @@ async fn probe_candidate(
         exit: None,
         connection: Some(candidate_connection),
     };
-    let advertises_health = registry
+    let registration = registry
         .registration(RegistrationSlot::Connection(candidate_connection))
         .ok()
-        .flatten()
-        .is_some_and(|registration| {
+        .flatten();
+    let config_owned = runtime.config_delivery.is_some()
+        && registration.as_ref().is_some_and(|registration| {
             registration
                 .control_ops
                 .iter()
-                .any(|op| op == MODULE_CONTROL_OP_HEALTH_CHECK)
+                .any(|op| op == "config.review")
         });
+    let advertises_health = registration.as_ref().is_some_and(|registration| {
+        registration
+            .control_ops
+            .iter()
+            .any(|op| op == MODULE_CONTROL_OP_HEALTH_CHECK)
+    });
     if !advertises_health {
+        if config_owned {
+            return Err(unhealthy(
+                "config_gated: configuration readiness requires the first healthy probe".into(),
+            ));
+        }
         return Ok(());
     }
     let Some(endpoint) = forwarding
@@ -732,6 +835,8 @@ async fn probe_candidate(
         ));
     };
     match probe_endpoint_health(endpoint, runtime, None).await {
+        Ok(report) if config_owned && report.status != HealthStatus::Ok => Err(unhealthy(
+            "config_gated: configuration readiness requires a healthy, not degraded or failing, probe".into())),
         Ok(report) if report.status == HealthStatus::Failing => Err(unhealthy(format!(
             "the candidate answered its health probe with status failing{}",
             report
@@ -971,6 +1076,7 @@ mod tests {
             &runtime.stderr_ring,
             None,
             &runtime.child_roster,
+            runtime.spawn_delivery(),
             #[cfg(target_os = "linux")]
             None,
         )

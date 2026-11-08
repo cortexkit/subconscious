@@ -1010,6 +1010,10 @@ async fn serve_bound_daemon(
         .with_handle(supervisor_handle.clone())
         .with_connection_file_path(bound.connection_file_path.clone())
         .with_daemon_incarnation(daemon_incarnation.clone());
+    let supervisor = match &config_runtime {
+        Some(owner) => supervisor.with_config_runtime(owner.clone()),
+        None => supervisor,
+    };
     let supervisor = match privacy_trampoline {
         Some(path) => supervisor.with_privacy_trampoline(path),
         None => supervisor,
@@ -1244,6 +1248,7 @@ async fn serve_bound_daemon(
     control.refresh_capability_requirements();
     Arc::clone(&control).spawn_capability_deadline_loop();
     Arc::clone(&control).spawn_scope_expiry_loop();
+    let _config_delivery_task = control.spawn_config_delivery_worker().map(AbortOnDrop::new);
 
     #[cfg(unix)]
     {

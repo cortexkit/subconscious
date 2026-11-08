@@ -15,6 +15,12 @@
 - Add a non-interactive pending-anchor retry schedule with bounded backoff and
   state-change logging. Background control waiters no longer retain an embedded
   daemon's configuration store after their owner is dropped.
+- Isolate each module's delivery write and acknowledgment deadlines. Observe
+  supervised launches and first healthy probes, and bind promoted targets under
+  the same module lock as forwarding cutover and registration promotion.
+- Fence respawn until a spontaneous warm-up exit's configuration failure is
+  recorded. Waiting spends no extra crash budget; intentional restarts preserve
+  pending configuration, and a failed first generation stays stopped.
 
 ## 0.41.9
 

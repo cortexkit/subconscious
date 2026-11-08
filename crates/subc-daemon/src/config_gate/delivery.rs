@@ -23,10 +23,12 @@ struct Attempt {
     // Catch-up belongs to one promoted child, not to the durable generation.
     // A daemon restart drops it: every fresh launch receives the active vector.
     catchup: bool,
+    write_deadline: Option<tokio::time::Instant>,
 }
 
 #[derive(Clone, Debug)]
 pub struct DeliverySpawn {
+    id: u64,
     module: String,
     generation: u64,
     deadline: tokio::time::Instant,
@@ -34,12 +36,28 @@ pub struct DeliverySpawn {
 
 #[derive(Default)]
 pub(super) struct DeliveryState {
+    next_spawn: u64,
     next_attempt: u64,
     attempts: HashMap<ConnectionId, Attempt>,
     served: HashMap<ConnectionId, (Option<u64>, Option<u64>)>,
     stamp_running: HashSet<ConnectionId>,
     initial_generation: u64,
     children: HashMap<ConnectionId, DeliverySpawn>,
+    healthy_children: HashSet<(ConnectionId, u64)>,
+    unregistered_children: HashMap<(String, bool), DeliverySpawn>,
+    recoveries: Vec<(ConnectionId, String, AppliedDisposition)>,
+    exited: HashMap<String, ExitedDelivery>,
+    // Transport cleanup may precede the process-exit observation. Retain the
+    // last active child's assigned generation, not an unattempted deferred one.
+    last_target_attempt: HashMap<String, (u64, u64)>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ExitedDelivery {
+    pub module: String,
+    spawn: u64,
+    generation: u64,
+    changed: tokio::sync::watch::Sender<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,7 +76,20 @@ pub enum AppliedDisposition {
     },
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct DeliveryWindow {
+    pub generation: u64,
+    pub attempt: u64,
+    pub delivered: bool,
+    pub deadline: Option<tokio::time::Instant>,
+}
+
 impl DeliveryState {
+    pub(super) fn declared(&mut self, connection: ConnectionId, module: &str, active: bool) {
+        if let Some(spawn) = self.unregistered_children.remove(&(module.into(), active)) {
+            self.children.insert(connection, spawn);
+        }
+    }
     pub(super) fn new(initial_generation: u64) -> Self {
         Self {
             initial_generation,
@@ -71,6 +102,8 @@ impl DeliveryState {
         self.served.remove(&connection);
         self.stamp_running.remove(&connection);
         self.children.remove(&connection);
+        self.healthy_children
+            .retain(|(child, _)| *child != connection);
     }
 
     pub(super) fn remember_stamp_connections(&mut self, connections: Vec<ConnectionId>) {
@@ -115,6 +148,7 @@ impl DeliveryState {
             delivered: false,
             deadline: None,
             catchup: false,
+            write_deadline: None,
         })
     }
 }
@@ -186,6 +220,10 @@ pub(super) fn bind_get(
                 .delivery
                 .allocate(module, pending.generation, transition)?;
             if transition.requires_spawn() {
+                attempt.ready = state
+                    .delivery
+                    .healthy_children
+                    .contains(&(connection, pending.generation));
                 attempt.deadline = state
                     .delivery
                     .children
@@ -200,6 +238,15 @@ pub(super) fn bind_get(
             .attempts
             .get(&connection)
             .map(|bound| bound.id);
+        if state.active_declarations.get(module) == Some(&connection) {
+            if let Some(spawn) = state.delivery.children.get(&connection) {
+                let id = spawn.id;
+                state
+                    .delivery
+                    .last_target_attempt
+                    .insert(module.into(), (id, pending.generation));
+            }
+        }
     } else {
         state.delivery.attempts.remove(&connection);
     }
@@ -216,6 +263,236 @@ pub(super) fn bind_get(
 }
 
 impl RuntimeOwner {
+    /// A supervised process exit, not a transport disconnect, fails warm-up.
+    /// The synchronous fence closes the gap before the async failure commit.
+    pub(crate) fn delivery_child_exited(&self, spawn: &DeliverySpawn) -> Result<()> {
+        let mut state = self.lock()?;
+        let pending = state
+            .store
+            .body()?
+            .versions
+            .iter()
+            .find(|(tuple, _)| tuple.module == spawn.module && tuple.project.is_none())
+            .and_then(|(_, versions)| versions.pending);
+        if let Some(generation) = pending.filter(|generation| {
+            *generation == spawn.generation
+                || state.delivery.last_target_attempt.get(&spawn.module)
+                    == Some(&(spawn.id, *generation))
+        }) {
+            state
+                .delivery
+                .exited
+                .entry(spawn.module.clone())
+                .or_insert_with(|| ExitedDelivery {
+                    module: spawn.module.clone(),
+                    spawn: spawn.id,
+                    generation,
+                    changed: tokio::sync::watch::channel(true).0,
+                });
+        }
+        self.notify_delivery_changed();
+        Ok(())
+    }
+
+    pub(crate) fn delivery_exit_fence(
+        &self,
+        module: &str,
+    ) -> Result<Option<tokio::sync::watch::Receiver<bool>>> {
+        Ok(self
+            .lock()?
+            .delivery
+            .exited
+            .get(module)
+            .map(|entry| entry.changed.subscribe()))
+    }
+
+    pub(crate) fn delivery_exits(&self) -> Result<Vec<ExitedDelivery>> {
+        Ok(self.lock()?.delivery.exited.values().cloned().collect())
+    }
+
+    /// The delivery worker holds this module's asynchronous configuration lock
+    /// while recording the failure. Respawn stays blocked until the failure has
+    /// restored the previous active generation or, if none exists, the supervisor
+    /// has canceled respawn and stopped the module.
+    /// `AnchorPending` still restores the previous active generation in memory;
+    /// its durable failure record is retried before delivery can resume.
+    pub(crate) fn delivery_record_exit(&self, exited: &ExitedDelivery) -> Result<bool> {
+        let mut state = self.lock()?;
+        if !state
+            .delivery
+            .exited
+            .get(&exited.module)
+            .is_some_and(|entry| entry.spawn == exited.spawn)
+        {
+            return Ok(false);
+        }
+        let tuple = Tuple {
+            module: exited.module.clone(),
+            project: None,
+        };
+        let versions = state
+            .store
+            .body()?
+            .versions
+            .iter()
+            .find(|(key, _)| key == &tuple)
+            .map(|(_, versions)| versions.clone())
+            .unwrap_or_default();
+        if versions
+            .pending
+            .is_some_and(|generation| generation != exited.generation)
+        {
+            return Ok(false);
+        }
+        if versions.pending == Some(exited.generation) {
+            let result = state
+                .store
+                .record_delivery(&tuple, exited.generation, false);
+            if let Err(error) = result {
+                if error.code != crate::config_store::StoreErrorCode::AnchorPending {
+                    return Err(error.into());
+                }
+            }
+            state.delivery.attempts.retain(|_, attempt| {
+                attempt.module != exited.module || attempt.generation != exited.generation
+            });
+        }
+        Ok(versions.active.is_none())
+    }
+
+    pub(crate) fn delivery_release_exit(&self, exited: &ExitedDelivery) -> Result<()> {
+        let mut state = self.lock()?;
+        if state
+            .delivery
+            .exited
+            .get(&exited.module)
+            .is_some_and(|entry| entry.spawn == exited.spawn)
+        {
+            if let Some(entry) = state.delivery.exited.remove(&exited.module) {
+                entry.changed.send_replace(false);
+            }
+        }
+        self.notify_delivery_changed();
+        Ok(())
+    }
+    pub(crate) fn delivery_abandon_spawn(&self, spawn: &DeliverySpawn, active: bool) {
+        if let Ok(mut state) = self.lock() {
+            let key = (spawn.module.clone(), active);
+            if state
+                .delivery
+                .unregistered_children
+                .get(&key)
+                .is_some_and(|current| current.id == spawn.id)
+            {
+                state.delivery.unregistered_children.remove(&key);
+            }
+        }
+    }
+    pub(crate) fn delivery_spawned_in_slot(
+        &self,
+        module: &str,
+        at: tokio::time::Instant,
+        register: Duration,
+        health: Duration,
+        active: bool,
+    ) -> Result<Option<DeliverySpawn>> {
+        let spawn = self.delivery_spawned(module, at, register, health)?;
+        if let Some(spawn) = &spawn {
+            self.lock()?
+                .delivery
+                .unregistered_children
+                .insert((module.into(), active), spawn.clone());
+        }
+        Ok(spawn)
+    }
+    pub(crate) fn delivery_take_recoveries(
+        &self,
+    ) -> Result<Vec<(ConnectionId, String, AppliedDisposition)>> {
+        Ok(std::mem::take(&mut self.lock()?.delivery.recoveries))
+    }
+
+    pub(crate) fn delivery_window(
+        &self,
+        connection: ConnectionId,
+    ) -> Result<Option<DeliveryWindow>> {
+        Ok(self
+            .lock()?
+            .delivery
+            .attempts
+            .get(&connection)
+            .map(|bound| DeliveryWindow {
+                generation: bound.generation,
+                attempt: bound.id,
+                delivered: bound.delivered,
+                deadline: bound.deadline,
+            }))
+    }
+
+    pub(crate) fn delivery_write_started(
+        &self,
+        connection: ConnectionId,
+        generation: u64,
+        attempt: u64,
+        now: tokio::time::Instant,
+    ) -> Result<()> {
+        if let Some(bound) = self
+            .lock()?
+            .delivery
+            .attempts
+            .get_mut(&connection)
+            .filter(|bound| {
+                bound.generation == generation && bound.id == attempt && !bound.delivered
+            })
+        {
+            bound
+                .write_deadline
+                .get_or_insert(now + CONFIG_LIVE_ACK_TIMEOUT);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn delivery_timeout(
+        &self,
+        connection: ConnectionId,
+        module: &str,
+        generation: u64,
+        attempt: u64,
+    ) -> Result<AppliedDisposition> {
+        self.module_outcome(
+            connection,
+            module,
+            ConfigAppliedRequest::new(
+                generation,
+                attempt,
+                subc_protocol::config::ConfigApplyResult::Nack,
+                vec![],
+            ),
+            true,
+        )
+    }
+    pub(crate) fn delivery_current_attempt(
+        &self,
+        connection: ConnectionId,
+    ) -> Result<Option<(u64, u64)>> {
+        Ok(self
+            .lock()?
+            .delivery
+            .attempts
+            .get(&connection)
+            .map(|attempt| (attempt.generation, attempt.id)))
+    }
+
+    pub(crate) fn delivery_child_generation(
+        &self,
+        connection: ConnectionId,
+    ) -> Result<Option<u64>> {
+        Ok(self
+            .lock()?
+            .delivery
+            .children
+            .get(&connection)
+            .map(|spawn| spawn.generation))
+    }
     /// Capture the common spawn instant, not the later HELLO instant, so a slow
     /// registration cannot extend the approved generation's warm-up deadline.
     pub(crate) fn delivery_spawned(
@@ -232,18 +509,21 @@ impl RuntimeOwner {
             .versions
             .iter()
             .find(|(tuple, _)| tuple.module == module && tuple.project.is_none())
-            .and_then(|(_, versions)| versions.pending);
-        if let Some(generation) = generation {
-            let deadline =
-                spawned_at + register_timeout + first_health_budget + CONFIG_WARMUP_SLACK;
-            Ok(Some(DeliverySpawn {
-                module: module.into(),
-                generation,
-                deadline,
-            }))
-        } else {
-            Ok(None)
-        }
+            .and_then(|(_, versions)| versions.pending.or(versions.active))
+            .unwrap_or(0);
+        let deadline = spawned_at + register_timeout + first_health_budget + CONFIG_WARMUP_SLACK;
+        state.delivery.next_spawn = state.delivery.next_spawn.checked_add(1).ok_or_else(|| {
+            GateError::new(
+                "delivery_spawn_exhausted",
+                "delivery spawn identifiers exhausted",
+            )
+        })?;
+        Ok(Some(DeliverySpawn {
+            id: state.delivery.next_spawn,
+            module: module.into(),
+            generation,
+            deadline,
+        }))
     }
 
     pub(crate) fn delivery_child_registered(
@@ -324,6 +604,12 @@ impl RuntimeOwner {
                 .children
                 .get(&connection)
                 .is_some_and(|warmup| warmup.generation == generation);
+            if started_for_generation {
+                state
+                    .delivery
+                    .healthy_children
+                    .insert((connection, generation));
+            }
             let Some(bound) = state
                 .delivery
                 .attempts
@@ -364,6 +650,16 @@ impl RuntimeOwner {
     ) -> Result<Option<(u64, u64)>> {
         let mut state = self.lock()?;
         state.store.delivery_ready()?;
+        if state.store.status().state == crate::config_store::StoreState::Unstamped {
+            if state
+                .declarations
+                .get(&connection)
+                .is_some_and(|(id, _)| id == module)
+            {
+                state.active_declarations.insert(module.into(), connection);
+            }
+            return Ok(None);
+        }
         let Some((id, declaration)) = state
             .declarations
             .get(&connection)
@@ -439,6 +735,15 @@ impl RuntimeOwner {
         let mut state = self.lock()?;
         if let Some(bound) = state.delivery.attempts.get_mut(&connection) {
             if bound.generation == generation && bound.id == attempt {
+                if bound
+                    .write_deadline
+                    .is_some_and(|deadline| written_at >= deadline)
+                {
+                    return Err(GateError::new(
+                        "delivery_expired",
+                        "configuration delivery timed out",
+                    ));
+                }
                 bound.delivered = true;
                 if !bound.transition.requires_spawn() && bound.deadline.is_none() {
                     bound.deadline = Some(written_at + CONFIG_LIVE_ACK_TIMEOUT);
@@ -453,6 +758,16 @@ impl RuntimeOwner {
         connection: ConnectionId,
         module: &str,
         request: ConfigAppliedRequest,
+    ) -> Result<AppliedDisposition> {
+        self.module_outcome(connection, module, request, false)
+    }
+
+    fn module_outcome(
+        &self,
+        connection: ConnectionId,
+        module: &str,
+        request: ConfigAppliedRequest,
+        timed_out: bool,
     ) -> Result<AppliedDisposition> {
         let mut state = self.lock()?;
         if !state
@@ -491,7 +806,7 @@ impl RuntimeOwner {
         else {
             return Ok(AppliedDisposition::Ignored);
         };
-        if !bound.delivered {
+        if !bound.delivered && !timed_out {
             return Ok(AppliedDisposition::Ignored);
         }
         let tuple = Tuple {
@@ -515,6 +830,15 @@ impl RuntimeOwner {
                 return Ok(AppliedDisposition::Ignored);
             }
             state.delivery.attempts.remove(&connection);
+            if !ack {
+                state.delivery.recoveries.push((
+                    connection,
+                    module.into(),
+                    AppliedDisposition::CatchupFailed {
+                        active: bound.generation,
+                    },
+                ));
+            }
             return Ok(if ack {
                 AppliedDisposition::CatchupComplete
             } else {
@@ -541,6 +865,19 @@ impl RuntimeOwner {
         // even though the durable failure must wait for the anchor retry.
         if result.is_ok() || !ack {
             state.delivery.attempts.remove(&connection);
+        }
+        if !ack {
+            let keep_running =
+                versions.active.is_none() && state.delivery.stamp_running.contains(&connection);
+            state.delivery.recoveries.push((
+                connection,
+                module.into(),
+                AppliedDisposition::Failed {
+                    generation: bound.generation,
+                    restore: versions.active,
+                    keep_running,
+                },
+            ));
         }
         result?;
         Ok(if ack {

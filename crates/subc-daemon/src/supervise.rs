@@ -64,6 +64,7 @@ mod activity;
 mod admission;
 #[cfg(all(test, windows))]
 mod carried_job_tests;
+mod config_delivery;
 pub(crate) mod containment;
 #[cfg(all(test, unix))]
 mod containment_tests;
@@ -379,6 +380,7 @@ struct SupervisedChild {
     /// Conservative monotonic bound sampled before `command.spawn()`, not when
     /// identity recording finishes or the spawn generation is published.
     spawned_at: Instant,
+    config_delivery: Option<crate::config_gate::runtime::DeliverySpawn>,
     /// Ordinary spawns must send their first HELLO within this budget. Once
     /// accepted, a later disconnect must not restart the registration clock.
     registration_deadline: Option<Instant>,
@@ -1990,6 +1992,7 @@ type ReloadReply = oneshot::Sender<Result<(), SuperviseError>>;
 #[derive(Debug, Clone)]
 struct SupervisorRuntimeConfig {
     registry: Arc<Registry>,
+    config_delivery: Option<config_delivery::ConfigDelivery>,
     /// Retained across an operation's deferred backoff, until its child starts.
     recovery_is_daemon: bool,
     start_requester: Option<Principal>,
@@ -2805,6 +2808,7 @@ impl SupervisorHandle {
 #[derive(Debug, Clone)]
 pub struct Supervisor {
     registry: Arc<Registry>,
+    config_delivery: Option<config_delivery::ConfigDelivery>,
     restart_policy: RestartPolicy,
     drain_timeout: Duration,
     connection_file_path: Option<PathBuf>,
@@ -3144,6 +3148,7 @@ impl Supervisor {
     pub fn new(registry: Arc<Registry>, restart_policy: RestartPolicy) -> Self {
         Self {
             registry,
+            config_delivery: None,
             restart_policy,
             drain_timeout: DEFAULT_DRAIN_TIMEOUT,
             connection_file_path: None,
@@ -3179,6 +3184,15 @@ impl Supervisor {
         process_liveness: Arc<SupervisorProcessLiveness>,
     ) -> Self {
         self.process_liveness = process_liveness;
+        self
+    }
+
+    /// Connect configuration delivery to observed process lifecycle events.
+    pub fn with_config_runtime(
+        mut self,
+        owner: Arc<crate::config_gate::runtime::RuntimeOwner>,
+    ) -> Self {
+        self.config_delivery = Some(config_delivery::ConfigDelivery(owner));
         self
     }
 
@@ -3270,6 +3284,7 @@ impl Supervisor {
             &runtime.stderr_ring,
             runtime.capture_logs_dir.as_deref(),
             &runtime.child_roster,
+            runtime.spawn_delivery(),
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
         );
@@ -3277,6 +3292,10 @@ impl Supervisor {
         self.test_after_first_spawn.run(&spec.module_id);
         let mut child = match spawned {
             Ok(child) => child,
+            Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
+                defer_config_spawn(&spec, &runtime, &snapshot, RespawnKind::Spawn)?;
+                return Ok(self.supervised_module(spec, runtime, snapshot, None));
+            }
             Err(err) => {
                 // Unlike the configured paths, a failed `spawn` leaves nothing
                 // on the roster, so the module must not stay marked configured.
@@ -3491,6 +3510,7 @@ impl Supervisor {
                 &runtime.stderr_ring,
                 runtime.capture_logs_dir.as_deref(),
                 &runtime.child_roster,
+                runtime.spawn_delivery(),
                 #[cfg(target_os = "linux")]
                 runtime.cgroup_placement.as_ref(),
             );
@@ -3508,6 +3528,10 @@ impl Supervisor {
                         spawn.complete(snapshot);
                     }
                     Some(child)
+                }
+                Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
+                    defer_config_spawn(&spec, &runtime, snapshot, RespawnKind::Spawn)?;
+                    None
                 }
                 Err(err) => {
                     if runtime.health.critical {
@@ -3545,6 +3569,7 @@ impl Supervisor {
         let effective_drain_timeout = Arc::new(Mutex::new(self.drain_timeout));
         SupervisorRuntimeConfig {
             registry: self.registry.clone(),
+            config_delivery: self.config_delivery.clone(),
             recovery_is_daemon: true,
             start_requester: None,
             pending_activity_restart: false,
@@ -3706,6 +3731,32 @@ impl fmt::Debug for SupervisedModule {
 }
 
 impl SupervisedModule {
+    pub(crate) async fn config_exit_hold(&self) -> Result<(), SuperviseError> {
+        let (reply, result) = oneshot::channel();
+        self.inner
+            .commands
+            .send(SupervisorCommand::ConfigExitHold { reply })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.module_id().to_string(),
+            })?;
+        result.await.map_err(|_| SuperviseError::CommandClosed {
+            module_id: self.module_id().to_string(),
+        })?
+    }
+    pub(crate) async fn config_delivery_failed(
+        &self,
+        connection: crate::ConnectionId,
+        hold: bool,
+    ) -> Result<(), SuperviseError> {
+        self.inner
+            .commands
+            .send(SupervisorCommand::ConfigDeliveryFailed { connection, hold })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.module_id().to_string(),
+            })
+    }
     pub fn module_id(&self) -> &str {
         &self.inner.module_id
     }
@@ -4404,6 +4455,13 @@ impl Drop for SupervisedModuleInner {
 
 #[derive(Debug)]
 enum SupervisorCommand {
+    ConfigExitHold {
+        reply: oneshot::Sender<Result<(), SuperviseError>>,
+    },
+    ConfigDeliveryFailed {
+        connection: crate::ConnectionId,
+        hold: bool,
+    },
     Drain {
         requester: Option<Principal>,
         reply: oneshot::Sender<Result<(), SuperviseError>>,
@@ -4457,6 +4515,9 @@ enum SupervisorCommand {
 
 #[derive(Debug)]
 pub enum SuperviseError {
+    ConfigDeliveryDeferred {
+        module_id: String,
+    },
     InvalidSpec {
         reason: String,
     },
@@ -4605,6 +4666,7 @@ impl SwapFailureArm {
 impl fmt::Display for SuperviseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ConfigDeliveryDeferred { module_id } => write!(f, "config_gated: module '{module_id}' is waiting for its exited delivery target's failure record"),
             Self::InvalidSpec { reason } => write!(f, "invalid module spec: {reason}"),
             Self::Spawn {
                 program,
@@ -4722,6 +4784,7 @@ impl Error for SuperviseError {
             Self::Forwarding(err) => Some(err),
             Self::Registry(err) => Some(err),
             Self::LaunchNonce { .. }
+            | Self::ConfigDeliveryDeferred { .. }
             | Self::InvalidSpec { .. }
             | Self::ReloadUnavailable { .. }
             | Self::Disabled { .. }
@@ -5464,7 +5527,14 @@ async fn handle_health_report(
     });
 
     let action = match report.status {
-        HealthStatus::Ok => return,
+        HealthStatus::Ok => {
+            if let Some(delivery) = &runtime.config_delivery {
+                delivery
+                    .healthy(&spec.module_id, runtime.forwarding.as_deref(), registry)
+                    .await;
+            }
+            return;
+        }
         HealthStatus::Degraded => runtime.health.on_degraded,
         HealthStatus::Failing => runtime.health.on_failing,
     };
@@ -5633,6 +5703,39 @@ async fn health_restart_child(
     detail: Option<&str>,
     now_ms: u64,
 ) -> Result<(), SuperviseError> {
+    budgeted_restart_child(
+        spec,
+        runtime,
+        registry,
+        process_liveness,
+        snapshot,
+        child,
+        status,
+        detail,
+        now_ms,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn budgeted_restart_child(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<SupervisedChild>,
+    status: SupervisorHealthStatus,
+    detail: Option<&str>,
+    now_ms: u64,
+    health_failure: bool,
+) -> Result<(), SuperviseError> {
+    let recovery_reason = if health_failure {
+        "health_check"
+    } else {
+        "configuration_delivery"
+    };
     let (enabled, schedule) = {
         let mut state = lock_snapshot(snapshot)?;
         let enabled = state.enabled;
@@ -5651,7 +5754,9 @@ async fn health_restart_child(
     }
 
     if schedule.is_none() {
-        record_health_action(snapshot, &spec.module_id, "failed".to_string(), now_ms);
+        if health_failure {
+            record_health_action(snapshot, &spec.module_id, "failed".to_string(), now_ms);
+        }
         error!(
             module_id = %spec.module_id,
             status = ?status,
@@ -5659,7 +5764,8 @@ async fn health_restart_child(
             max_restarts = runtime.restart_policy.max_restarts,
             window_secs = runtime.restart_policy.window.as_secs(),
             reason = %runtime.restart_policy.budget_exhausted_detail(),
-            "health restart budget exhausted; marking module failed"
+            recovery_reason,
+            "automatic restart budget exhausted; marking module failed"
         );
         let stop_notice = begin_forwarding_drain_if_configured(
             spec,
@@ -5704,9 +5810,11 @@ async fn health_restart_child(
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
         restart_count = state.crash_restarts.len();
         state.state = ModuleState::Unresponsive;
-        state.health.status = status;
-        state.health.last_action = Some(HealthAction::Restart.to_string());
-        state.health.last_action_ms = Some(now_ms);
+        if health_failure {
+            state.health.status = status;
+            state.health.last_action = Some(HealthAction::Restart.to_string());
+            state.health.last_action_ms = Some(now_ms);
+        }
     })?;
     warn!(
         module_id = %spec.module_id,
@@ -5715,7 +5823,8 @@ async fn health_restart_child(
         restart_count,
         restart_in_window = schedule.restart_in_window,
         delay_ms = schedule.delay.as_millis() as u64,
-        "health-triggered module restart"
+        recovery_reason,
+        "automatic module restart"
     );
 
     let stop_notice = begin_forwarding_drain_if_configured(
@@ -5786,6 +5895,28 @@ fn schedule_respawn(
         deadline: Instant::now() + delay,
         kind,
         daemon_initiated,
+    });
+    Ok(())
+}
+
+fn defer_config_spawn(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    kind: RespawnKind,
+) -> Result<(), SuperviseError> {
+    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.state = ModuleState::Restarting;
+        state.respawn_pending = true;
+        clear_current_process_facts(state);
+    })?;
+    *runtime
+        .scheduled_respawn
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(PendingRespawn {
+        deadline: Instant::now(),
+        kind,
+        daemon_initiated: runtime.recovery_is_daemon,
     });
     Ok(())
 }
@@ -7091,6 +7222,18 @@ async fn supervise_loop(
             }
             health_probe.refresh_registration(&spec, &runtime, &registry, &snapshot);
             let active = child.as_mut().expect("child checked above");
+            if active.registered_since_spawn() {
+                if let Some(delivery) = &runtime.config_delivery {
+                    delivery
+                        .registered(
+                            &spec.module_id,
+                            runtime.forwarding.as_deref(),
+                            &registry,
+                            active,
+                        )
+                        .await;
+                }
+            }
             if runtime.child_roster.is_closed() || active.registered_since_spawn() {
                 active.registration_deadline = None;
             }
@@ -7175,6 +7318,12 @@ async fn supervise_loop(
                         }
                     };
                     active_child.drain_stderr(&spec.module_id).await;
+
+                    if let (Some(delivery), Some(spawn)) = (&runtime.config_delivery, &active_child.config_delivery) {
+                        if let Err(error) = delivery.0.delivery_child_exited(spawn) {
+                            warn!(module_id=%spec.module_id, %error, "configuration exit observation failed");
+                        }
+                    }
 
                     let next = on_child_exit(
                         &spec,
@@ -7317,7 +7466,12 @@ async fn supervise_loop(
                     });
                     containment::terminate(&runtime.child_roster.containment).await;
                 }
-                _ = sleep_until(pending.deadline) => {
+                _ = async {
+                    sleep_until(pending.deadline).await;
+                    if let Some(delivery) = &runtime.config_delivery {
+                        delivery.unfenced(&spec.module_id).await;
+                    }
+                } => {
                     pending_respawn = None;
                 let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = false);
                     // A command handled below while the backoff elapsed may
@@ -7351,6 +7505,10 @@ async fn supervise_loop(
                     if matches!(pending.kind, RespawnKind::Reload) {
                         let reply = runtime.deferred_reload_reply.lock().unwrap_or_else(|p| p.into_inner()).take();
                         let result = finish_reload_child(&spec, &runtime, &registry, &process_liveness, &snapshot, &mut child).await;
+                        if matches!(result, Err(SuperviseError::ConfigDeliveryDeferred { .. })) {
+                            *runtime.deferred_reload_reply.lock().unwrap_or_else(|p| p.into_inner()) = reply;
+                            continue;
+                        }
                         if result.is_ok() && runtime.pending_activity_restart {
                             runtime.record_activity_transition("subc.module_restarted", &spec.module_id, runtime.start_requester.clone());
                         }
@@ -7367,6 +7525,10 @@ async fn supervise_loop(
                                 runtime.pending_activity_restart = false;
                             }
                             debug!(module_id = %spec.module_id, "supervised module restarted after crash");
+                        }
+                        Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
+                            pending_respawn = Some(PendingRespawn { deadline:Instant::now(), ..pending });
+                            let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = true);
                         }
                         Err(err) => {
                             fail_snapshot(&snapshot, Some(&spec.module_id), None, &runtime.failure_context(runtime.recovery_is_daemon));
@@ -7422,6 +7584,9 @@ async fn supervise_loop(
                                 process_liveness.track(spec.module_id.clone(), Arc::clone(&snapshot));
                                 match spawn_and_mark_running(&spec, &runtime, &snapshot) {
                                     Ok(next_child) => child = Some(next_child),
+                                    Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
+                                        let _ = defer_config_spawn(&spec, &runtime, &snapshot, RespawnKind::Spawn);
+                                    }
                                     Err(error) => {
                                         fail_snapshot(&snapshot, Some(&spec.module_id), None, &runtime.failure_context(true));
                                         error!(module_id = %spec.module_id, %error, "failed to start module after its previous instance exited");
@@ -7583,6 +7748,85 @@ async fn handle_supervisor_command(
         command
     };
     match command {
+        SupervisorCommand::ConfigExitHold { reply } => {
+            let result = if child.is_none() {
+                cancel_deferred_reload(
+                    runtime,
+                    &spec.module_id,
+                    "configuration delivery has no active generation",
+                );
+                *runtime
+                    .scheduled_respawn
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) = None;
+                update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                    state.state = ModuleState::Stopped;
+                    state.respawn_pending = false;
+                    state.failed_retry.pending = None;
+                    clear_current_process_facts(state);
+                })
+            } else {
+                Ok(())
+            };
+            let _ = reply.send(result);
+            true
+        }
+        SupervisorCommand::ConfigDeliveryFailed { connection, hold } => {
+            if registry
+                .get_module(&spec.module_id)
+                .ok()
+                .flatten()
+                .is_none_or(|registration| registration.connection_id != connection)
+            {
+                return true;
+            }
+            runtime.recovery_is_daemon = true;
+            if hold {
+                let notice = begin_forwarding_drain_if_configured(
+                    spec,
+                    runtime,
+                    registry,
+                    snapshot,
+                    Some(true),
+                    RouteCloseReason::Disable,
+                )
+                .await;
+                if let Ok(notice) = notice {
+                    let _ = drain_optional_child(
+                        &spec.module_id,
+                        spec.protocol,
+                        notice,
+                        registry,
+                        runtime.forwarding.as_deref(),
+                        snapshot,
+                        &runtime.terminal_ring,
+                        &runtime.spawn_events,
+                        child,
+                        runtime.drain_timeout,
+                        ModuleState::Failed,
+                        Some(true),
+                        &runtime.failure_context(true),
+                    )
+                    .await;
+                }
+            } else if let Err(error) = budgeted_restart_child(
+                spec,
+                runtime,
+                registry,
+                process_liveness,
+                snapshot,
+                child,
+                SupervisorHealthStatus::Unknown,
+                Some("configuration delivery failed"),
+                unix_ms_now(),
+                false,
+            )
+            .await
+            {
+                warn!(module_id=%spec.module_id, %error, "configuration failure restart could not be scheduled");
+            }
+            true
+        }
         SupervisorCommand::Drain { requester, reply } => {
             // A plain stop runs no forwarding drain, so nothing reaches the
             // module over its connection before the wait: ask by signal.
@@ -8064,6 +8308,10 @@ async fn finish_reload_child(
     process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
     let next_child = match spawn_and_mark_running(spec, runtime, snapshot) {
         Ok(next_child) => next_child,
+        Err(error @ SuperviseError::ConfigDeliveryDeferred { .. }) => {
+            defer_config_spawn(spec, runtime, snapshot, RespawnKind::Reload)?;
+            return Err(error);
+        }
         Err(err) => {
             return handle_reload_spawn_failure(
                 spec,
@@ -8250,6 +8498,10 @@ async fn set_child_enabled(
         process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
         let next_child = match spawn_and_mark_running(spec, runtime, snapshot) {
             Ok(next_child) => next_child,
+            Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
+                defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn)?;
+                return Ok(true);
+            }
             Err(err) => {
                 fail_snapshot(snapshot, Some(&spec.module_id), None, failure);
                 process_liveness.untrack_if_current(&spec.module_id, snapshot);
@@ -9007,6 +9259,7 @@ fn recovery_block_error(spec: &ModuleSpec, roster: &ChildRoster) -> Option<Super
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_child(
     spec: &ModuleSpec,
     connection_file_path: Option<&std::path::Path>,
@@ -9014,6 +9267,7 @@ fn spawn_child(
     ring: &Arc<Mutex<StderrRing>>,
     capture_logs_dir: Option<&std::path::Path>,
     roster: &ChildRoster,
+    config_delivery: Option<config_delivery::SpawnDelivery<'_>>,
     #[cfg(target_os = "linux")] cgroup_placement: Option<&subc_cgroup::Placement>,
 ) -> Result<SupervisedChild, SuperviseError> {
     #[cfg(all(test, unix))]
@@ -9032,6 +9286,7 @@ fn spawn_child(
         ring,
         capture_logs_dir,
         roster,
+        config_delivery,
         #[cfg(target_os = "linux")]
         cgroup_placement,
         SpawnRole::Plain,
@@ -9067,6 +9322,7 @@ fn spawn_child_in_slot(
     ring: &Arc<Mutex<StderrRing>>,
     capture_logs_dir: Option<&std::path::Path>,
     roster: &ChildRoster,
+    config_delivery: Option<config_delivery::SpawnDelivery<'_>>,
     #[cfg(target_os = "linux")] cgroup_placement: Option<&subc_cgroup::Placement>,
     role: SpawnRole,
     alternate_slot: bool,
@@ -9335,7 +9591,21 @@ fn spawn_child_in_slot(
     // Timestamp before the spawn call: on Unix the child can serve before that
     // call even returns. This conservative bound never labels an older child
     // as a replacement for a request received during process creation.
+    #[cfg(feature = "test-support")]
+    if let Some(delivery) = config_delivery {
+        delivery.pause_before_exec(spec)?;
+    }
     let spawned_at = Instant::now();
+    if let Some(delivery) = config_delivery {
+        delivery.admit(spec)?;
+    }
+    let delivery_context = config_delivery;
+    let config_delivery = config_delivery
+        .map(|delivery| delivery.spawned(spec, spawned_at, role))
+        .transpose()?
+        .flatten();
+    let delivery_registration =
+        delivery_context.map(|context| context.registration_guard(config_delivery.as_ref(), role));
     #[cfg(all(test, unix))]
     containment_tests::record_spawn_attempt(spec, &mut command);
     #[cfg(unix)]
@@ -9694,6 +9964,7 @@ fn spawn_child_in_slot(
         stderr_pump,
         stderr_ring: Arc::clone(ring),
         spawned_at,
+        config_delivery,
         registration_deadline: None,
         registration_watch: None,
         spawned_at_ms,
@@ -9728,6 +9999,9 @@ fn spawn_child_in_slot(
         containment::terminate_blocking(&roster.containment);
         let _ = supervised.child.start_kill();
         return Err(error);
+    }
+    if let Some(registration) = delivery_registration {
+        registration.commit();
     }
     Ok(supervised)
 }
@@ -10536,6 +10810,7 @@ fn spawn_and_mark_running(
             &runtime.stderr_ring,
             runtime.capture_logs_dir.as_deref(),
             &runtime.child_roster,
+            runtime.spawn_delivery(),
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
         )
@@ -17023,6 +17298,7 @@ mod cgroup_placement_tests {
                 &runtime.stderr_ring,
                 None,
                 &runtime.child_roster,
+                runtime.spawn_delivery(),
                 Some(&placement),
             )
             .unwrap()
@@ -17065,6 +17341,7 @@ mod cgroup_placement_tests {
             &runtime.stderr_ring,
             None,
             &fresh_roster,
+            None,
             Some(&placement),
         )
         .unwrap();
@@ -17078,6 +17355,7 @@ mod cgroup_placement_tests {
             &runtime.stderr_ring,
             None,
             &fresh_roster,
+            None,
             Some(&placement),
         )
         .unwrap();
@@ -17153,6 +17431,7 @@ mod cgroup_placement_tests {
             stderr_pump: None,
             stderr_ring: Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default()))),
             spawned_at: tokio::time::Instant::now(),
+            config_delivery: None,
             registration_deadline: None,
             registration_watch: None,
             spawned_at_ms: 0,
@@ -18244,6 +18523,7 @@ mod launch_nonce_descriptor_tests {
             &ring,
             None,
             &roster,
+            None,
             #[cfg(target_os = "linux")]
             None,
             role,

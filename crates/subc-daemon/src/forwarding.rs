@@ -651,6 +651,22 @@ impl ForwardingTable {
             .get(module_id)
             .map(|module| module.endpoint))
     }
+
+    pub(crate) fn config_delivery_sink(
+        &self,
+        module: &str,
+        connection: ConnectionId,
+    ) -> Result<Option<FrameSink>, ForwardingError> {
+        let inner = self.read_inner()?;
+        Ok(inner
+            .modules_by_id
+            .get(module)
+            .filter(|target| {
+                target.endpoint.connection_id == connection
+                    && !inner.closing_connections.contains(&connection)
+            })
+            .map(|target| target.sink.clone()))
+    }
     /// Keep a silent route diagnosable without letting a broken peer flood logs.
     /// Epoch and direction describe the dropped frame, but do not split its limit.
     pub(crate) fn warn_frame_drop(

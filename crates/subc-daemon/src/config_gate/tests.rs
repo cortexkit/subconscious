@@ -185,6 +185,14 @@ fn approval_stamp_is_desktop_only_and_full_view_is_digest_bound() {
     assert_eq!(view.digest, view.plan.digest().unwrap());
     assert!(serde_json::to_string(&view).unwrap().contains("program-v1"));
     assert!(serde_json::to_string(&view).unwrap().contains("approved"));
+    let wrong = subc_config::raw_digest(b"a different digest");
+    assert_eq!(
+        rig.gate
+            .begin_approval(&wrong, &mut rig.store, &rig.current, &facts(true))
+            .unwrap_err()
+            .code,
+        "plan_unknown"
+    );
     assert_eq!(
         rig.approve(&view, &facts(false)).unwrap_err().code,
         "approval_surface_unavailable"
@@ -199,14 +207,6 @@ fn approval_stamp_is_desktop_only_and_full_view_is_digest_bound() {
     );
     assert_eq!(
         rig.approve(&view, &facts(true)).unwrap_err().code,
-        "plan_unknown"
-    );
-    let wrong = subc_config::raw_digest(b"a different digest");
-    assert_eq!(
-        rig.gate
-            .begin_approval(&wrong, &mut rig.store, &rig.current, &facts(true))
-            .unwrap_err()
-            .code,
         "plan_unknown"
     );
 }

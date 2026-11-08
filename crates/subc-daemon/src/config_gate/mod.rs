@@ -47,6 +47,10 @@ impl GateError {
             "reviewed inputs or generation changed; plan again",
         )
     }
+
+    pub(crate) fn commit_timeout() -> Self {
+        Self::new("config_commit_timeout", "the post-answer commit window expired before durable publication; plan remains unapproved")
+    }
 }
 impl std::fmt::Display for GateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -392,6 +396,7 @@ impl ConfigGate {
             .map_err(|_| GateError::stale())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit(
         &mut self,
         digest: &Digest,
@@ -399,6 +404,7 @@ impl ConfigGate {
         store: &mut ConfigStore,
         current: &GateSnapshot,
         now_ms: u64,
+        before_publication: impl FnOnce() -> Result<()>,
     ) -> Result<u64> {
         let plan = self
             .plans
@@ -464,10 +470,12 @@ impl ConfigGate {
             delivery: plan.delivery.clone(),
         };
         let base_before = store.status().base_revision;
+        let observed = current.to_store()?;
+        before_publication()?;
         let result = if plan.recovery {
             store.recovery_exit(entry, snapshot, now_ms)
         } else {
-            store.commit_generation(entry, snapshot, current.to_store()?, now_ms)
+            store.commit_generation(entry, snapshot, observed, now_ms)
         };
         // The sealed store's external revision/digest anchor may fail to update
         // after a durable commit. The committed base makes the old plan stale;

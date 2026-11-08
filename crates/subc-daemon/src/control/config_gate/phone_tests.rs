@@ -54,17 +54,33 @@ impl Fixture {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/scratch")
             .join(format!(
-                "config-phone-{}-{}",
+                "config-phone-{}-{}-{}",
                 std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
             ));
         std::fs::create_dir_all(path.join("store")).unwrap();
         std::fs::create_dir_all(path.join("cortexkit")).unwrap();
         std::fs::copy("/bin/sh", path.join("program")).unwrap();
-        std::fs::write(path.join("subc.jsonc"), serde_json::to_vec(&json!({"version":1,"modules":{
-            "a":{"program":path.join("program")},
-            "callosum":{"program":path.join("program"),"args":["-c","sleep 600"],"reserved":true}
-        }})).unwrap()).unwrap();
+        // macOS rejects the copied platform shell at exec. Keep its signed
+        // system path so the phone fixture actually starts.
+        let phone_program = if cfg!(target_os = "macos") {
+            std::path::PathBuf::from("/bin/sh")
+        } else {
+            path.join("program")
+        };
+        std::fs::write(
+            path.join("subc.jsonc"),
+            serde_json::to_vec(&json!({"version":1,"modules":{
+                "a":{"program":path.join("program")},
+                "callosum":{"program":phone_program,"args":["-c","sleep 600"],"reserved":true}
+            }}))
+            .unwrap(),
+        )
+        .unwrap();
         std::fs::write(path.join("cortexkit/a.jsonc"), b"{\"limit\":1}").unwrap();
         let owner = Arc::new(RuntimeOwner::new(
             "phone-adapter".into(),
@@ -132,7 +148,7 @@ impl Fixture {
         let registry = Arc::new(Registry::default());
         let forwarding = Arc::new(crate::ForwardingTable::default());
         let handle = SupervisorHandle::new();
-        let supervisor = Supervisor::new(registry.clone(), RestartPolicy::default())
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
             .with_handle(handle.clone())
             .with_forwarding(forwarding.clone())
             .with_health_config(HealthConfig {
@@ -194,6 +210,24 @@ impl Fixture {
             )
             .unwrap();
         registry.publish_registration(PHONE).unwrap();
+        // Manual registration can precede confirmation that macOS has started
+        // the module. Its reportable pid is published after that confirmation.
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+        loop {
+            let status = module.status().unwrap();
+            if status.enabled
+                && status.process_alive
+                && status.registration_active
+                && status.pid.is_some()
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "phone fixture did not finish exec and registration: {status:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         std::fs::write(path.join("cortexkit/a.jsonc"), b"{\"limit\":2}").unwrap();
         let plan = owner
             .finish_plan(owner.prepare(PlanKind::Change).unwrap(), daemon_review)
@@ -244,7 +278,11 @@ impl Fixture {
     }
 
     async fn request(&mut self) -> (u64, ConsentRequest) {
-        let mut outbound = self.frames.recv().await.expect("phone request");
+        let mut outbound =
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.frames.recv())
+                .await
+                .expect("trusted active phone must receive the card")
+                .expect("phone request");
         assert_eq!(outbound.frame.header.ty, FrameType::Request);
         let request: ConsentRequest = serde_json::from_slice(&outbound.frame.body).unwrap();
         assert!(request.is_consistent());
@@ -522,4 +560,306 @@ async fn config_phone_relay_full_writer_queue_preserves_owned_withdrawal_and_blo
     worker.abort();
     let _ = worker.await;
     fixture.stop().await;
+}
+
+#[tokio::test]
+async fn config_phone_answer_commit_timeout_records_nothing_and_preserves_the_plan() {
+    let mut fixture = Fixture::new().await;
+    tokio::time::pause();
+    let operation = fixture.handler.supervisor.operation_lock();
+    let held = operation.lock().await;
+    let apply = fixture.apply();
+    let (correlation, request) = fixture.request().await;
+    fixture.answer(PHONE, correlation, &request);
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    let error = tokio::time::timeout(std::time::Duration::from_millis(100), apply)
+        .await
+        .expect("an answered card must not wait indefinitely for the commit locks")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code, "config_commit_timeout");
+    assert_eq!(fixture.owner.history().unwrap().0.len(), 1);
+    drop(held);
+    let facts = fixture
+        .handler
+        .config_approval_facts(&RouteCtx {
+            connection_id: CALLER,
+            egress: crate::FrameSink::new(mpsc::channel(1).0),
+        })
+        .await;
+    assert!(fixture
+        .owner
+        .begin_approval(&fixture.plan.digest, &facts)
+        .is_ok());
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn config_phone_answer_expiring_just_before_publication_records_nothing() {
+    let mut fixture = Fixture::new().await;
+    tokio::time::pause();
+    // Idle auto-advance must not outrun the blocking worker before it reaches
+    // the controlled boundary; only the test advances this clock.
+    let clock = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let (started, at_commit_point) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    fixture.owner.set_prepublication_hook(move || {
+        let _ = started.send(());
+        wait.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+    });
+    let apply = fixture.apply();
+    let (correlation, request) = fixture.request().await;
+    fixture.answer(PHONE, correlation, &request);
+    at_commit_point.await.unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    release.send(()).unwrap();
+    let error = apply.await.unwrap().unwrap_err();
+    assert_eq!(error.code, "config_commit_timeout");
+    assert_eq!(fixture.owner.history().unwrap().0.len(), 1);
+    clock.abort();
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn config_phone_answer_publication_started_before_deadline_returns_its_committed_result() {
+    let mut fixture = Fixture::new().await;
+    tokio::time::pause();
+    let clock = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let (started, publication) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    fixture.owner.set_publication_hook(move || {
+        let _ = started.send(());
+        wait.recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+    });
+    let apply = fixture.apply();
+    let (correlation, request) = fixture.request().await;
+    fixture.answer(PHONE, correlation, &request);
+    publication.await.unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        !apply.is_finished(),
+        "a started publication must not report a false timeout"
+    );
+    release.send(()).unwrap();
+    assert!(matches!(
+        apply.await.unwrap().unwrap(),
+        ConfigControlResponse::Applied { generation: 2 }
+    ));
+    assert_eq!(fixture.owner.history().unwrap().0.len(), 2);
+    clock.abort();
+    fixture.stop().await;
+}
+
+#[derive(Clone)]
+struct PendingPresence(Arc<PendingPresenceState>);
+
+struct PendingPresenceState {
+    done: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+    events: mpsc::UnboundedSender<&'static str>,
+}
+
+impl crate::operator_confirm::OperatorWithdraw for PendingPresence {
+    fn withdraw(&self, _: &str) {
+        let mut done = self.0.done.lock().unwrap();
+        if !*done {
+            *done = true;
+            let _ = self.0.events.send("withdrawn");
+            self.0.wake.notify_all();
+        }
+    }
+}
+
+impl crate::operator_confirm::OperatorProvider for PendingPresence {
+    fn config_gate_ready(&self) -> bool {
+        true
+    }
+
+    fn prompt(
+        &self,
+        _: &str,
+        _: Box<dyn FnOnce(Arc<dyn crate::operator_confirm::OperatorWithdraw>) + Send>,
+    ) -> crate::operator_confirm::ProviderResult {
+        let _ = self.0.events.send("unexpected generic prompt");
+        crate::operator_confirm::ProviderResult::Unavailable
+    }
+
+    fn prompt_gate(
+        &self,
+        _: &str,
+        started: Box<dyn FnOnce(Arc<dyn crate::operator_confirm::OperatorWithdraw>) + Send>,
+    ) -> crate::operator_confirm::ProviderResult {
+        started(Arc::new(self.clone()));
+        let _ = self.0.events.send("shown");
+        let mut done = self.0.done.lock().unwrap();
+        while !*done {
+            done = self.0.wake.wait(done).unwrap();
+        }
+        crate::operator_confirm::ProviderResult::Unavailable
+    }
+}
+
+async fn connection_approval_withdrawal(phone: bool, disconnect: bool) {
+    use crate::operator_confirm::OperatorWithdraw;
+    let mut fixture = Fixture::new().await;
+    let (events, mut presence_events) = mpsc::unbounded_channel();
+    let presence = PendingPresence(Arc::new(PendingPresenceState {
+        done: std::sync::Mutex::new(false),
+        wake: std::sync::Condvar::new(),
+        events,
+    }));
+    if !phone {
+        fixture.plan = fixture
+            .owner
+            .finish_plan(
+                fixture.owner.prepare(PlanKind::Change).unwrap(),
+                |old, new| {
+                    let mut changes = daemon_review(old, new)?;
+                    let mut field = subc_config::FieldChange::new(
+                        "a",
+                        "/limit",
+                        subc_config::RecordedValue::Value { value: json!(1) },
+                        subc_config::RecordedValue::Value { value: json!(2) },
+                        subc_config::ApplyKind::Live,
+                    );
+                    field.old_source = subc_config::Layer::User;
+                    field.new_source = subc_config::Layer::User;
+                    changes.fields = vec![field];
+                    Ok(changes)
+                },
+            )
+            .unwrap();
+        fixture.owner.set_os_prompt_policy_for_tests();
+        fixture
+            .handler
+            .forwarding
+            .operator_confirms()
+            .configure(Arc::new(presence.clone()), Default::default());
+    }
+    let router = Arc::new(crate::Router::with_control_handler(fixture.handler.clone()));
+    let (connection, socket, server) = crate::server::config_test_connection_loop(router);
+    fixture.handler.observed_peers.lock().unwrap().insert(
+        connection,
+        subc_protocol::peer::ObservedPeer::observed_uid(subc_os::effective_uid()),
+    );
+    if !phone {
+        let facts = fixture
+            .handler
+            .config_approval_facts(&RouteCtx {
+                connection_id: connection,
+                egress: crate::FrameSink::new(mpsc::channel(1).0),
+            })
+            .await;
+        assert!(facts.os_prompt_available);
+        let challenge = fixture
+            .owner
+            .begin_approval(&fixture.plan.digest, &facts)
+            .unwrap();
+        assert!(
+            matches!(challenge, ApprovalChallenge::OsPrompt { .. }),
+            "OS fixture must select the compact prompt"
+        );
+        fixture.owner.cancel_approval(challenge.attempt());
+    }
+    let mut socket = Some(socket);
+    let apply = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        0,
+        0,
+        881,
+        serde_json::to_vec(&ConfigControlRequest::Apply {
+            digest: fixture.plan.digest.clone(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    crate::write_frame(socket.as_mut().unwrap(), &apply)
+        .await
+        .unwrap();
+    let card = if phone {
+        Some(fixture.request().await)
+    } else {
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), presence_events.recv())
+                .await
+                .unwrap(),
+            Some("shown")
+        );
+        None
+    };
+    if disconnect {
+        drop(socket.take());
+    } else {
+        let cancel = Frame::build(FrameType::Cancel, control_flags(), 0, 0, 881, vec![]).unwrap();
+        crate::write_frame(socket.as_mut().unwrap(), &cancel)
+            .await
+            .unwrap();
+    }
+    let withdrawn = if let Some((correlation, _)) = &card {
+        tokio::time::timeout(std::time::Duration::from_secs(5), fixture.frames.recv())
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|frame| {
+                frame.frame.header.ty == FrameType::Cancel
+                    && frame.frame.header.corr == *correlation
+            })
+    } else {
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), presence_events.recv()).await,
+            Ok(Some("withdrawn"))
+        )
+    };
+    // Observe withdrawal before cleanup: disconnect the phone if withdrawal
+    // was absent, and always release the blocked OS provider. Neither cleanup
+    // action can change the earlier wire observation into a passing result.
+    if !withdrawn && phone {
+        fixture.owner.disconnected(PHONE);
+    }
+    presence.withdraw("test cleanup");
+    drop(socket);
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(fixture.owner.history().unwrap().0.len(), 1);
+    fixture.stop().await;
+    assert!(
+        withdrawn,
+        "connection_loop must withdraw a pending approval: phone={phone}, disconnect={disconnect}"
+    );
+}
+
+#[tokio::test]
+async fn config_connection_loop_os_cancel_withdraws_without_recording() {
+    connection_approval_withdrawal(false, false).await;
+}
+
+#[tokio::test]
+async fn config_connection_loop_os_disconnect_withdraws_without_recording() {
+    connection_approval_withdrawal(false, true).await;
+}
+
+#[tokio::test]
+async fn config_connection_loop_phone_cancel_withdraws_without_recording() {
+    connection_approval_withdrawal(true, false).await;
+}
+
+#[tokio::test]
+async fn config_connection_loop_phone_disconnect_withdraws_without_recording() {
+    connection_approval_withdrawal(true, true).await;
 }

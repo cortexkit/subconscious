@@ -9,6 +9,7 @@ mod tests;
 pub(super) struct ApprovalAttemptGuard {
     owner: std::sync::Weak<crate::config_gate::runtime::RuntimeOwner>,
     attempt: u64,
+    pub(super) commit_window: Option<Arc<crate::config_gate::runtime::ApprovalCommitWindow>>,
 }
 
 impl ApprovalAttemptGuard {
@@ -19,12 +20,16 @@ impl ApprovalAttemptGuard {
         Self {
             owner: Arc::downgrade(owner),
             attempt,
+            commit_window: None,
         }
     }
 }
 
 impl Drop for ApprovalAttemptGuard {
     fn drop(&mut self) {
+        if let Some(window) = &self.commit_window {
+            window.expire();
+        }
         if let Some(owner) = self.owner.upgrade() {
             owner.cancel_approval(self.attempt);
         }

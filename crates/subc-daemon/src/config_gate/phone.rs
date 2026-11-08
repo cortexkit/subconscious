@@ -9,6 +9,16 @@ pub(crate) struct PhoneWithdrawal {
 }
 
 impl OwnerState {
+    fn cancel_approval(&mut self, attempt: u64) {
+        if let Ok(digest) = self.gate.approval_digest(attempt) {
+            self.reviewed(&digest, Instant::now());
+        }
+        self.gate.cancel_approval(attempt);
+        self.phone_waiters.remove(&attempt);
+        self.approval_requests
+            .retain(|_, current| *current != attempt);
+    }
+
     pub(super) fn invalidate_phone(&mut self, connection: ConnectionId) {
         for digest in self.gate.phone_approval_digests(connection.get()) {
             self.reviewed(&digest, Instant::now());
@@ -30,6 +40,14 @@ impl OwnerState {
 }
 
 impl RuntimeOwner {
+    pub(super) fn drain_canceled_approvals(&self, state: &mut OwnerState) {
+        if let Ok(mut pending) = self.canceled_approvals.lock() {
+            for attempt in pending.drain(..) {
+                state.cancel_approval(attempt);
+            }
+        }
+    }
+
     /// The active generation's declaration and daemon entry, not a pending edit
     /// or the connection's claimed program. Program admission remains a separate
     /// supervisor check against the exact current registration.
@@ -99,16 +117,12 @@ impl RuntimeOwner {
     }
 
     pub(crate) fn cancel_approval(&self, attempt: u64) {
-        if let Ok(mut state) = self.inner.lock() {
-            if let Ok(digest) = state.gate.approval_digest(attempt) {
-                state.reviewed(&digest, Instant::now());
-            }
-            state.gate.cancel_approval(attempt);
-            state.phone_waiters.remove(&attempt);
-            state
-                .approval_requests
-                .retain(|_, current| *current != attempt);
+        if let Ok(mut state) = self.inner.try_lock() {
+            state.cancel_approval(attempt);
+        } else if let Ok(mut pending) = self.canceled_approvals.lock() {
+            pending.push(attempt);
         }
+        self.notify_delivery_changed();
     }
 
     pub(crate) fn track_approval_request(

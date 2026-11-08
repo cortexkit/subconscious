@@ -377,7 +377,15 @@ impl ConfigGate {
         facts: &ApprovalFacts,
         now_ms: u64,
     ) -> Result<u64> {
-        self.finish_approval_with_precommit(attempt, reply, store, current, facts, now_ms, || {})
+        self.finish_approval_with_precommit(
+            attempt,
+            reply,
+            store,
+            current,
+            facts,
+            now_ms,
+            || Ok(()),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -389,7 +397,7 @@ impl ConfigGate {
         current: &GateSnapshot,
         facts: &ApprovalFacts,
         now_ms: u64,
-        before_commit: impl FnOnce(),
+        before_commit: impl FnOnce() -> Result<()>,
     ) -> Result<u64> {
         let pending = self.attempts.remove(&attempt).ok_or_else(unavailable)?;
         if !facts.owner_uid || facts.connection != pending.caller {
@@ -443,8 +451,14 @@ impl ConfigGate {
             .get(&pending.digest)
             .ok_or_else(|| GateError::new("plan_unknown", "plan is absent or already applied"))?;
         Self::fresh(plan, store, current)?;
-        before_commit();
-        self.commit(&pending.digest, channel, store, current, now_ms)
+        self.commit(
+            &pending.digest,
+            channel,
+            store,
+            current,
+            now_ms,
+            before_commit,
+        )
     }
 
     /// Bind the transport's allocated correlation exactly once, before sending.

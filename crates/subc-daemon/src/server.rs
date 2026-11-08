@@ -933,6 +933,63 @@ async fn finish_connection_writer(
     }
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn config_test_connection_loop(
+    router: Arc<Router>,
+) -> (
+    crate::ConnectionId,
+    tokio::io::DuplexStream,
+    JoinHandle<Result<(), ConnectionError>>,
+) {
+    let mut connection = router.begin_connection();
+    let id = connection.id();
+    let close = connection.take_close_receiver();
+    router.record_local_connection(id);
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (mut read, mut write) = tokio::io::split(server);
+    let (sender, mut outgoing) = tokio::sync::mpsc::channel::<crate::router::OutboundFrame>(8);
+    let ctx = RouteCtx {
+        connection_id: id,
+        egress: crate::FrameSink::new(sender),
+    };
+    let writer = tokio::spawn(async move {
+        while let Some(mut outbound) = outgoing.recv().await {
+            if crate::write_frame(&mut write, &outbound.frame)
+                .await
+                .is_err()
+                || tokio::io::AsyncWriteExt::flush(&mut write).await.is_err()
+            {
+                break;
+            }
+            if let Some(flushed) = outbound.flushed.take() {
+                let _ = flushed.send(());
+            }
+        }
+    });
+    let task = tokio::spawn(async move {
+        let mut routes = JoinSet::new();
+        let mut approvals = JoinSet::new();
+        let result = connection_loop(
+            &mut read,
+            router,
+            ctx.clone(),
+            close,
+            &mut routes,
+            &mut approvals,
+            LocalOrigin::Local,
+        )
+        .await;
+        routes.shutdown().await;
+        approvals.shutdown().await;
+        drop(ctx);
+        drop(connection);
+        writer.abort();
+        let _ = writer.await;
+        result.map(|_| ())
+    });
+    (id, client, task)
+}
+
 async fn connection_loop<R>(
     read_half: &mut R,
     router: Arc<Router>,
@@ -1092,7 +1149,9 @@ where
             continue;
         }
 
-        if router.defers_privileged_control(&ctx, &frame) {
+        if router.defers_config_approval(&frame) || router.defers_privileged_control(&ctx, &frame) {
+            // Configuration prompts for the specific plan, not the generic
+            // privileged operation. Only task lifetime/reader scheduling is shared.
             let task_router = Arc::clone(&router);
             let task_ctx = ctx.clone();
             let started = Instant::now();

@@ -6,6 +6,10 @@ mod phone;
 
 /// Bound each immutable module review so an unanswered request cannot approve a plan.
 const CONFIG_REVIEW_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// After a phone answer, lock waits and freshness work have thirty seconds to
+/// reach durable publication. Publication already started returns its real result.
+const CONFIG_APPROVAL_COMMIT_TIMEOUT: Duration = Duration::from_secs(30);
 use crate::config_gate::{
     ApprovalChallenge, ApprovalFacts, ApprovalReply, GateError, PlanKind, PresenceDecision,
 };
@@ -46,6 +50,15 @@ impl PrivilegedRequest for ConfigControlRequest {
 }
 
 impl ControlHandler {
+    pub(crate) fn defers_config_approval(&self, frame: &Frame) -> bool {
+        frame.header.channel == 0
+            && frame.header.ty == FrameType::Request
+            && matches!(
+                serde_json::from_slice::<ConfigControlRequest>(&frame.body),
+                Ok(ConfigControlRequest::Apply { .. })
+            )
+    }
+
     pub(super) async fn handle_module_config_request(
         &self,
         ctx: &RouteCtx,
@@ -488,7 +501,7 @@ impl ControlHandler {
                         error
                     }
                 })?;
-                let _attempt_guard =
+                let mut attempt_guard =
                     phone::ApprovalAttemptGuard::new(&runtime, challenge.attempt());
                 runtime.track_approval_request(
                     challenge.attempt(),
@@ -518,16 +531,50 @@ impl ControlHandler {
                         .await?
                     }
                 };
-                let operation = self.supervisor.operation_lock();
-                let _operation = operation.lock().await;
                 let attempt = challenge.attempt();
-                let _module_gates = runtime.approval_commit_gates(attempt).await?;
-                let facts = self.config_approval_facts(ctx).await;
+                let window = matches!(challenge, ApprovalChallenge::Phone { .. }).then(|| {
+                    Arc::new(crate::config_gate::runtime::ApprovalCommitWindow::new(
+                        Instant::now() + CONFIG_APPROVAL_COMMIT_TIMEOUT,
+                    ))
+                });
+                attempt_guard.commit_window = window.clone();
+                let locks = async {
+                    let operation = self.supervisor.operation_lock().lock_owned().await;
+                    let module_gates = runtime.approval_commit_gates(attempt).await?;
+                    let facts = self.config_approval_facts(ctx).await;
+                    Ok::<_, GateError>((operation, module_gates, facts))
+                };
+                let (operation, module_gates, facts) = if let Some(window) = &window {
+                    timeout_at(window.deadline, locks)
+                        .await
+                        .map_err(|_| GateError::commit_timeout())??
+                } else {
+                    locks.await?
+                };
                 let now = now_ms();
-                let generation = config_work(runtime, move |owner| {
-                    owner.finish_approval(attempt, &facts, reply, now)
-                })
-                .await?;
+                let publish_window = window.clone();
+                let work = config_work(runtime, move |owner| {
+                    let _owned_gates = (operation, module_gates);
+                    owner.finish_approval_with_commit_window(
+                        attempt,
+                        &facts,
+                        reply,
+                        now,
+                        publish_window,
+                    )
+                });
+                tokio::pin!(work);
+                let generation = if let Some(window) = window {
+                    tokio::select! {
+                        result = &mut work => result?,
+                        _ = tokio::time::sleep_until(window.deadline) => {
+                            if window.expire() { return Err(GateError::commit_timeout()); }
+                            work.await?
+                        }
+                    }
+                } else {
+                    work.await?
+                };
                 Ok(ConfigControlResponse::Applied { generation })
             }
             request => {
@@ -633,6 +680,13 @@ impl ControlHandler {
     }
 
     async fn config_approval_facts(&self, ctx: &RouteCtx) -> ApprovalFacts {
+        let os_policy = crate::config_gate::os_prompt_policy_present();
+        #[cfg(test)]
+        let os_policy = os_policy
+            || self
+                .config_runtime
+                .as_ref()
+                .is_some_and(|owner| owner.os_prompt_policy_for_tests());
         let desktop = self
             .config_desktop_identity(ctx.connection_id)
             .unwrap_or(false);
@@ -643,7 +697,7 @@ impl ControlHandler {
             attested_operator_app: desktop && !cfg!(feature = "dev-desktop-approval"),
             os_prompt_available: config_os_prompt_available(
                 self.forwarding.operator_confirms().config_gate_ready(),
-                crate::config_gate::os_prompt_policy_present(),
+                os_policy,
             ),
             phone: self.config_phone_surface().await,
             caller: self.resolve_caller(ctx.connection_id).await,

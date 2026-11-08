@@ -924,6 +924,10 @@ impl Router {
         self.control.defers_privileged_control(ctx, frame)
     }
 
+    pub(crate) fn defers_config_approval(&self, frame: &Frame) -> bool {
+        self.control.defers_config_approval(frame)
+    }
+
     pub(crate) fn route_open_capacity_refusal(
         &self,
         ctx: &RouteCtx,
@@ -987,7 +991,8 @@ impl Router {
                 "routing control frame"
             );
             // The connection loop dispatches every control operation directly
-            // except `route.open`, activity writes and privileged requests. Each
+            // except `route.open`, activity writes, held config approvals and
+            // privileged requests. Each
             // task passes a timestamp captured before
             // spawn, so slow-dispatch timing includes scheduler delay but no
             // wait in an application-owned queue.

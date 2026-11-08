@@ -4,9 +4,18 @@
 
 - Relay immutable `consent/v1` approval cards only through the policy-enabled,
   admitted active phone module. Bind each card to its daemon-allocated request
-  correlation, bound the entire attempt to five minutes, and withdraw unanswered
+  correlation, bound the wait for an answer to five minutes, and withdraw unanswered
   or invalidated cards with channel-zero Cancel without closing the module's
   other routes.
+- Keep the caller's reader running during configuration approval, so channel-zero
+  Cancel and disconnect withdraw pending OS prompts and phone cards without
+  recording a generation. Configuration still prompts for the specific plan,
+  never a second generic privileged prompt.
+- After a phone answer, a separate 30 s bound covers everything up to the start
+  of durable publication. Expiry before that commit point refuses
+  `config_commit_timeout` and records no generation; publication that has started
+  completes and returns its real outcome, retaining its operation and module
+  locks even when the caller disconnects.
 - Build rollback plans from retained byte-exact configuration and freshly
   captured programs at the restored paths. Show when a program changed since
   the selected generation, preserve edited files as proposals, and refuse

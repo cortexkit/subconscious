@@ -27,6 +27,52 @@ pub struct RuntimeOwner {
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     delivery_changed: std::sync::Arc<tokio::sync::Notify>,
     route_policy_authority: Option<std::sync::Arc<dyn RoutePolicyAuthority>>,
+    canceled_approvals: Mutex<Vec<u64>>,
+    #[cfg(test)]
+    os_prompt_policy: std::sync::atomic::AtomicBool,
+}
+
+/// The post-answer deadline can withdraw queued work, but never a publication
+/// that has crossed the final commit point while holding its owned gates.
+pub(crate) struct ApprovalCommitWindow {
+    pub deadline: tokio::time::Instant,
+    phase: std::sync::atomic::AtomicU8,
+}
+
+impl ApprovalCommitWindow {
+    pub(crate) fn new(deadline: tokio::time::Instant) -> Self {
+        Self {
+            deadline,
+            phase: std::sync::atomic::AtomicU8::new(0),
+        }
+    }
+
+    pub(crate) fn expire(&self) -> bool {
+        self.phase
+            .compare_exchange(
+                0,
+                2,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn begin_publication(&self) -> Result<()> {
+        if tokio::time::Instant::now() >= self.deadline {
+            self.expire();
+            return Err(GateError::commit_timeout());
+        }
+        self.phase
+            .compare_exchange(
+                0,
+                1,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map(|_| ())
+            .map_err(|_| GateError::commit_timeout())
+    }
 }
 
 pub use route_policy::{
@@ -183,6 +229,10 @@ struct OwnerState {
     activity: Option<crate::activity::ActivityLedger>,
     installed_route_policies: BTreeMap<String, u64>,
     route_policy_receipts: BTreeMap<(String, u64), route_policy::PendingRoutePolicy>,
+    #[cfg(test)]
+    publication_hook: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    prepublication_hook: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl OwnerState {
@@ -391,11 +441,18 @@ impl RuntimeOwner {
                 activity: None,
                 installed_route_policies: BTreeMap::new(),
                 route_policy_receipts: BTreeMap::new(),
+                #[cfg(test)]
+                publication_hook: None,
+                #[cfg(test)]
+                prepublication_hook: None,
             }),
             capturer,
             module_gates: Mutex::new(HashMap::new()),
             delivery_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             route_policy_authority: None,
+            canceled_approvals: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            os_prompt_policy: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -427,6 +484,7 @@ impl RuntimeOwner {
         let mut guard = self.inner.lock().map(OwnerGuard).map_err(|_| {
             GateError::new("config_unavailable", "configuration owner lock is poisoned")
         })?;
+        self.drain_canceled_approvals(&mut guard);
         guard.expire_idle(Instant::now());
         Ok(guard)
     }
@@ -988,6 +1046,17 @@ impl RuntimeOwner {
         reply: ApprovalReply,
         now_ms: u64,
     ) -> Result<u64> {
+        self.finish_approval_with_commit_window(attempt, facts, reply, now_ms, None)
+    }
+
+    pub(crate) fn finish_approval_with_commit_window(
+        &self,
+        attempt: u64,
+        facts: &ApprovalFacts,
+        reply: ApprovalReply,
+        now_ms: u64,
+        window: Option<std::sync::Arc<ApprovalCommitWindow>>,
+    ) -> Result<u64> {
         let mut state = self.lock()?;
         let digest = state.gate.approval_digest(attempt)?;
         state.reviewed(&digest, Instant::now());
@@ -1011,7 +1080,12 @@ impl RuntimeOwner {
             }
         };
         let facts = state.with_desktop_view(&digest, facts);
+        self.drain_canceled_approvals(&mut state);
         let was_unstamped = state.store.status().state == StoreState::Unstamped;
+        #[cfg(test)]
+        let publication_hook = state.publication_hook.take();
+        #[cfg(test)]
+        let prepublication_hook = state.prepublication_hook.take();
         let OwnerState {
             gate,
             store,
@@ -1028,12 +1102,24 @@ impl RuntimeOwner {
             &facts,
             now_ms,
             || {
+                #[cfg(test)]
+                if let Some(hook) = prepublication_hook {
+                    hook();
+                }
+                if let Some(window) = window {
+                    window.begin_publication()?;
+                }
                 route_policy::restore_superseded(
                     route_policy_receipts,
                     installed_route_policies,
                     &modules,
                     delivery,
-                )
+                );
+                #[cfg(test)]
+                if let Some(hook) = publication_hook {
+                    hook();
+                }
+                Ok(())
             },
         );
         let stamped_files = was_unstamped
@@ -1055,6 +1141,28 @@ impl RuntimeOwner {
             state.desktop_views.retain(|_, (shown, _)| shown != &digest);
         }
         result
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_publication_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        self.inner.lock().unwrap().publication_hook = Some(Box::new(hook));
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_prepublication_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        self.inner.lock().unwrap().prepublication_hook = Some(Box::new(hook));
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_os_prompt_policy_for_tests(&self) {
+        self.os_prompt_policy
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn os_prompt_policy_for_tests(&self) -> bool {
+        self.os_prompt_policy
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn status(&self) -> Result<subc_control::config::ConfigStatus> {

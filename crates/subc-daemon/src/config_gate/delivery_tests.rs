@@ -1544,6 +1544,115 @@ async fn config_delivery_get_flush_timeout_fails_the_attempt_without_failing_the
     );
 }
 
+#[tokio::test]
+async fn config_delivery_get_releases_the_gate_and_discards_a_superseded_flush_receipt() {
+    let (rig, owner, handler, _receivers) = worker_fixture();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+    let context = crate::router::RouteCtx {
+        connection_id: INCUMBENT,
+        egress: crate::FrameSink::new(sender),
+    };
+    let frame = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Request,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        18,
+        serde_json::to_vec(&ConfigGetRequest::new()).unwrap(),
+    )
+    .unwrap();
+    let task = tokio::spawn(async move { handler.handle_control_frame(&context, frame).await });
+    let mut old = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let gate = owner.module_gate("a").unwrap();
+    let guard = gate
+        .try_lock()
+        .expect("config.get must not hold the module gate while the module writer is stalled");
+    approve(&rig, &owner, 2);
+    let fresh = owner
+        .module_get(INCUMBENT, "a", ConfigGetRequest::new())
+        .unwrap();
+    assert_eq!(fresh.pending.as_ref().unwrap().generation, 2);
+    owner
+        .module_view_delivered(INCUMBENT, "a", &fresh, tokio::time::Instant::now(), true)
+        .unwrap();
+    drop(guard);
+    old.flushed.take().unwrap().send(()).unwrap();
+    assert!(tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        applied(&owner, INCUMBENT, fresh.pending.as_ref().unwrap(), true).unwrap(),
+        AppliedDisposition::Active,
+        "a late generation-1 receipt must not replace the successfully served generation 2"
+    );
+    assert_eq!(
+        owner
+            .module_get(INCUMBENT, "a", ConfigGetRequest::new())
+            .unwrap()
+            .active
+            .unwrap()
+            .generation,
+        2
+    );
+}
+
+#[tokio::test]
+async fn config_delivery_hint_releases_the_gate_and_discards_a_superseded_flush_receipt() {
+    let (rig, owner, handler, mut receivers) = worker_fixture();
+    let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
+    let mut receiver = receivers.remove(0);
+    let mut old = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let gate = owner.module_gate("a").unwrap();
+    let guard = gate
+        .try_lock()
+        .expect("config.changed must not hold the module gate while the module writer is stalled");
+    approve(&rig, &owner, 2);
+    let fresh = owner
+        .module_get(INCUMBENT, "a", ConfigGetRequest::new())
+        .unwrap();
+    let fresh = fresh.pending.unwrap();
+    assert_eq!(fresh.generation, 2);
+    drop(guard);
+    old.flushed.take().unwrap().send(()).unwrap();
+    let mut current = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&current.frame.body).unwrap()["generation"],
+        2
+    );
+    let window = owner.delivery_window(INCUMBENT).unwrap().unwrap();
+    assert_eq!(
+        (window.generation, window.attempt),
+        (2, fresh.attempt.unwrap())
+    );
+    assert!(
+        !window.delivered,
+        "the old hint's receipt cannot deliver the new attempt"
+    );
+    current.flushed.take().unwrap().send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if owner.delivery_window(INCUMBENT).unwrap().unwrap().delivered {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
 #[derive(Default)]
 struct FakeRouteAuthority {
     policies: std::sync::Arc<std::sync::Mutex<Vec<super::super::ApprovedRoutePolicy>>>,

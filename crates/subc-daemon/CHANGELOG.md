@@ -41,6 +41,9 @@
 - Isolate each module's delivery write and acknowledgment deadlines. Observe
   supervised launches and first healthy probes, and bind promoted targets under
   the same module lock as forwarding cutover and registration promotion.
+- Release the module gate during writer flushes, then recheck the connection's
+  role, generation and attempt before accepting the receipt. Discard obsolete
+  receipts without overwriting a newer served view or a promoted child's catch-up.
 - Fence respawn until a spontaneous warm-up exit's configuration failure is
   recorded. Waiting spends no extra crash budget; intentional restarts preserve
   pending configuration, and a failed first generation stays stopped.

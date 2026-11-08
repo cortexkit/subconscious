@@ -848,13 +848,40 @@ impl RuntimeOwner {
                     "configuration connection has ended",
                 ));
             }
-            state.delivery.served.insert(
-                connection,
-                (
-                    reply.active.as_ref().map(|view| view.generation),
-                    reply.pending.as_ref().map(|view| view.generation),
-                ),
-            );
+            let body = state.store.body()?;
+            if body.stamped {
+                let versions = body
+                    .versions
+                    .iter()
+                    .find(|(tuple, _)| tuple.module == module && tuple.project.is_none())
+                    .map(|(_, versions)| versions.clone())
+                    .unwrap_or_default();
+                if reply
+                    .active
+                    .as_ref()
+                    .is_some_and(|view| versions.active != Some(view.generation))
+                    || reply.pending.as_ref().is_some_and(|view| {
+                        // A promoted child catches up to the durable active
+                        // vector through its own pending, child-local attempt.
+                        let catchup = versions.active == Some(view.generation)
+                            && state
+                                .delivery
+                                .attempts
+                                .get(&connection)
+                                .is_some_and(|bound| {
+                                    bound.catchup
+                                        && bound.generation == view.generation
+                                        && Some(bound.id) == view.attempt
+                                });
+                        versions.pending != Some(view.generation) && !catchup
+                    })
+                {
+                    return Err(GateError::new(
+                        "delivery_superseded",
+                        "configuration changed while its view was being written",
+                    ));
+                }
+            }
         }
         if active {
             if let Some(view) = &reply.pending {
@@ -863,6 +890,24 @@ impl RuntimeOwner {
                 }
             }
         }
+        let mut state = self.lock()?;
+        if !state
+            .declarations
+            .get(&connection)
+            .is_some_and(|(id, _)| id == module)
+        {
+            return Err(GateError::new(
+                "not_delivery_target",
+                "configuration connection has ended",
+            ));
+        }
+        state.delivery.served.insert(
+            connection,
+            (
+                reply.active.as_ref().map(|view| view.generation),
+                reply.pending.as_ref().map(|view| view.generation),
+            ),
+        );
         Ok(())
     }
     /// Completion is supplied by the supervisor after registration, the first
@@ -1063,25 +1108,32 @@ impl RuntimeOwner {
         written_at: tokio::time::Instant,
     ) -> Result<()> {
         let mut state = self.lock()?;
-        if let Some(bound) = state.delivery.attempts.get_mut(&connection) {
-            if bound.generation == generation && bound.id == attempt {
-                if bound
-                    .write_deadline
-                    .is_some_and(|deadline| written_at >= deadline)
-                    || bound
-                        .deadline
-                        .is_some_and(|deadline| written_at >= deadline)
-                {
-                    return Err(GateError::new(
-                        "delivery_expired",
-                        "configuration delivery timed out",
-                    ));
-                }
-                bound.delivered = true;
-                if !bound.transition.requires_spawn() && bound.deadline.is_none() {
-                    bound.deadline = Some(written_at + CONFIG_LIVE_ACK_TIMEOUT);
-                }
-            }
+        let bound = state
+            .delivery
+            .attempts
+            .get_mut(&connection)
+            .filter(|bound| bound.generation == generation && bound.id == attempt)
+            .ok_or_else(|| {
+                GateError::new(
+                    "delivery_superseded",
+                    "writer receipt no longer names the current delivery attempt",
+                )
+            })?;
+        if bound
+            .write_deadline
+            .is_some_and(|deadline| written_at >= deadline)
+            || bound
+                .deadline
+                .is_some_and(|deadline| written_at >= deadline)
+        {
+            return Err(GateError::new(
+                "delivery_expired",
+                "configuration delivery timed out",
+            ));
+        }
+        bound.delivered = true;
+        if !bound.transition.requires_spawn() && bound.deadline.is_none() {
+            bound.deadline = Some(written_at + CONFIG_LIVE_ACK_TIMEOUT);
         }
         Ok(())
     }

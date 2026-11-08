@@ -169,7 +169,7 @@ async fn module_worker(
             let Ok(gate) = owner.module_gate(module) else {
                 break;
             };
-            let _guard = gate.lock().await;
+            let mut _guard = gate.lock().await;
             if owner.delivery_exit_fence(module).ok().flatten().is_some() {
                 drop(_guard);
                 drop(control);
@@ -267,14 +267,38 @@ async fn module_worker(
                                     .map_or(Instant::now() + CONFIG_LIVE_ACK_TIMEOUT, |at| {
                                         at.min(Instant::now() + CONFIG_LIVE_ACK_TIMEOUT)
                                     });
-                                match timeout_at(flush_deadline, sink.send_flushed(frame)).await {
+                                drop(_guard);
+                                let flushed =
+                                    timeout_at(flush_deadline, sink.send_flushed(frame)).await;
+                                let flushed_at = Instant::now();
+                                _guard = gate.lock().await;
+                                let current = control
+                                    .config_delivery_target_current(
+                                        module,
+                                        registration.connection_id,
+                                        true,
+                                        0,
+                                    )
+                                    .unwrap_or(false)
+                                    && owner
+                                        .delivery_window(registration.connection_id)
+                                        .ok()
+                                        .flatten()
+                                        .is_some_and(|window| {
+                                            (window.generation, window.attempt)
+                                                == (pending.generation, attempt)
+                                        });
+                                if !current {
+                                    continue;
+                                }
+                                match flushed {
                                     Ok(Ok(())) => {
                                         if owner
                                             .delivery_written(
                                                 registration.connection_id,
                                                 pending.generation,
                                                 attempt,
-                                                Instant::now(),
+                                                flushed_at,
                                             )
                                             .is_err()
                                         {

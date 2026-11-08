@@ -50,6 +50,33 @@ impl PrivilegedRequest for ConfigControlRequest {
 }
 
 impl ControlHandler {
+    fn config_delivery_target_current(
+        &self,
+        module: &str,
+        connection: ConnectionId,
+        active: bool,
+        correlation: u64,
+    ) -> Result<bool, RouterError> {
+        if active {
+            Ok(self
+                .registry
+                .get_module(module)
+                .map_err(|error| RouterError::backend(0, correlation, error.to_string()))?
+                .is_some_and(|target| target.connection_id == connection)
+                && self
+                    .forwarding
+                    .active_module_endpoint(module)
+                    .map_err(RouterError::Forwarding)?
+                    .is_some_and(|target| target.connection_id == connection))
+        } else {
+            Ok(self
+                .registry
+                .get_candidate(module)
+                .map_err(|error| RouterError::backend(0, correlation, error.to_string()))?
+                .is_some_and(|target| target.connection_id == connection))
+        }
+    }
+
     pub(crate) fn defers_config_approval(&self, frame: &Frame) -> bool {
         frame.header.channel == 0
             && frame.header.ty == FrameType::Request
@@ -213,9 +240,29 @@ impl ControlHandler {
                                 deadline.min(tokio::time::Instant::now() + CONFIG_LIVE_ACK_TIMEOUT)
                             },
                         );
-                    match tokio::time::timeout_at(write_deadline, ctx.egress.send_flushed(response))
-                        .await
-                    {
+                    drop(_gate);
+                    let flushed =
+                        tokio::time::timeout_at(write_deadline, ctx.egress.send_flushed(response))
+                            .await;
+                    let flushed_at = tokio::time::Instant::now();
+                    let _gate = gate.lock().await;
+                    // A slow writer may finish after cutover or supersession.
+                    // Its receipt must not advance the replacement's attempt.
+                    if !self.config_delivery_target_current(
+                        &registration.manifest.module_id,
+                        connection,
+                        active,
+                        frame.header.corr,
+                    )? || selected.is_some_and(|selected| {
+                        runtime
+                            .delivery_window(connection)
+                            .ok()
+                            .flatten()
+                            .is_none_or(|window| selected != (window.generation, window.attempt))
+                    }) {
+                        return Ok(vec![]);
+                    }
+                    match flushed {
                         Ok(Ok(())) => {}
                         failed => {
                             if active {
@@ -237,16 +284,16 @@ impl ControlHandler {
                     }
                     let module = registration.manifest.module_id.clone();
                     let delivered = config_work(runtime.clone(), move |owner| {
-                        owner.module_view_delivered(
-                            connection,
-                            &module,
-                            &view,
-                            tokio::time::Instant::now(),
-                            active,
-                        )
+                        owner.module_view_delivered(connection, &module, &view, flushed_at, active)
                     })
                     .await;
                     if let Err(error) = delivered {
+                        if matches!(
+                            error.code.as_str(),
+                            "delivery_superseded" | "not_delivery_target"
+                        ) {
+                            return Ok(vec![]);
+                        }
                         if error.code == "delivery_expired" {
                             if active {
                                 if let Some((generation, attempt)) = selected {

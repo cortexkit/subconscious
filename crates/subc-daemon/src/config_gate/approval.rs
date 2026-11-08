@@ -342,6 +342,20 @@ impl ConfigGate {
         facts: &ApprovalFacts,
         now_ms: u64,
     ) -> Result<u64> {
+        self.finish_approval_with_precommit(attempt, reply, store, current, facts, now_ms, || {})
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn finish_approval_with_precommit(
+        &mut self,
+        attempt: u64,
+        reply: ApprovalReply,
+        store: &mut ConfigStore,
+        current: &GateSnapshot,
+        facts: &ApprovalFacts,
+        now_ms: u64,
+        before_commit: impl FnOnce(),
+    ) -> Result<u64> {
         let pending = self.attempts.remove(&attempt).ok_or_else(unavailable)?;
         if !facts.owner_uid || facts.connection != pending.caller {
             return Err(unavailable());
@@ -380,6 +394,12 @@ impl ConfigGate {
             }
             _ => return Err(unavailable()),
         }
+        let plan = self
+            .plans
+            .get(&pending.digest)
+            .ok_or_else(|| GateError::new("plan_unknown", "plan is absent or already applied"))?;
+        Self::fresh(plan, store, current)?;
+        before_commit();
         self.commit(&pending.digest, store, current, now_ms)
     }
 

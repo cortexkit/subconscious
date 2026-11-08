@@ -26,7 +26,13 @@ pub struct RuntimeOwner {
     capturer: ConfigCapturer,
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     delivery_changed: std::sync::Arc<tokio::sync::Notify>,
+    route_policy_authority: Option<std::sync::Arc<dyn RoutePolicyAuthority>>,
 }
+
+pub use route_policy::{
+    ApprovedRoutePolicy, RoutePolicyAuthority, RoutePolicyInstall, RoutePolicyInstallation,
+    RoutePolicyReceipt,
+};
 
 pub use delivery::{AppliedDisposition, DeliverySpawn};
 
@@ -159,6 +165,8 @@ struct OwnerState {
     declarations: HashMap<ConnectionId, (String, ConfigDeclareRequest)>,
     active_declarations: BTreeMap<String, ConnectionId>,
     activity: Option<crate::activity::ActivityLedger>,
+    installed_route_policies: BTreeMap<String, u64>,
+    route_policy_receipts: BTreeMap<(String, u64), route_policy::PendingRoutePolicy>,
 }
 
 impl OwnerState {
@@ -190,6 +198,7 @@ impl OwnerState {
                 }
             }
         }
+        self.commit_anchored_route_policies();
         self.anchor_retry.next()
     }
     fn with_desktop_view(&self, digest: &Digest, facts: &ApprovalFacts) -> ApprovalFacts {
@@ -278,6 +287,9 @@ mod tests;
 #[path = "delivery.rs"]
 pub(crate) mod delivery;
 
+#[path = "route_policy.rs"]
+mod route_policy;
+
 impl RuntimeOwner {
     #[cfg(feature = "test-support")]
     pub(crate) fn pause_spawn_before_exec(&self) -> Result<()> {
@@ -340,10 +352,13 @@ impl RuntimeOwner {
                 declarations: HashMap::new(),
                 active_declarations: BTreeMap::new(),
                 activity: None,
+                installed_route_policies: BTreeMap::new(),
+                route_policy_receipts: BTreeMap::new(),
             }),
             capturer,
             module_gates: Mutex::new(HashMap::new()),
             delivery_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            route_policy_authority: None,
         }
     }
 
@@ -790,6 +805,10 @@ impl RuntimeOwner {
             &current.diagnostic,
             review,
         )?;
+        if let Err(error) = self.check_route_policy_authority(&view.plan.changeset) {
+            gate.expire_plan(&view.digest);
+            return Err(error);
+        }
         gate.bind_delivery(&view.digest, delivery)?;
         state.reviewed(&view.digest, Instant::now());
         state
@@ -822,6 +841,20 @@ impl RuntimeOwner {
         Ok(challenge)
     }
 
+    /// Acquire only after interactive approval. Sorted module locks serialize
+    /// the final freshness check and publication with target changes at cutover.
+    pub(crate) async fn approval_commit_gates(
+        &self,
+        attempt: u64,
+    ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
+        let modules = self.lock()?.gate.approval_modules(attempt)?;
+        let mut guards = Vec::with_capacity(modules.len());
+        for module in modules {
+            guards.push(self.module_gate(&module)?.lock_owned().await);
+        }
+        Ok(guards)
+    }
+
     pub fn finish_approval(
         &self,
         attempt: u64,
@@ -847,9 +880,30 @@ impl RuntimeOwner {
         };
         let facts = state.with_desktop_view(&digest, facts);
         let was_unstamped = state.store.status().state == StoreState::Unstamped;
-        let OwnerState { gate, store, .. } = &mut *state;
-        let result =
-            gate.finish_approval(attempt, reply, store, &current.diagnostic, &facts, now_ms);
+        let OwnerState {
+            gate,
+            store,
+            route_policy_receipts,
+            installed_route_policies,
+            delivery,
+            ..
+        } = &mut *state;
+        let result = gate.finish_approval_with_precommit(
+            attempt,
+            reply,
+            store,
+            &current.diagnostic,
+            &facts,
+            now_ms,
+            || {
+                route_policy::restore_superseded(
+                    route_policy_receipts,
+                    installed_route_policies,
+                    &modules,
+                    delivery,
+                )
+            },
+        );
         let stamped_files = was_unstamped
             && state.store.body().is_ok_and(|body| {
                 body.generations

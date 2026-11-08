@@ -44,6 +44,7 @@ pub(super) struct DeliveryState {
     initial_generation: u64,
     children: HashMap<ConnectionId, DeliverySpawn>,
     healthy_children: HashSet<(ConnectionId, u64)>,
+    readiness_observed: HashSet<(ConnectionId, u64)>,
     unregistered_children: HashMap<(String, bool), DeliverySpawn>,
     recoveries: Vec<(ConnectionId, String, AppliedDisposition)>,
     exited: HashMap<String, ExitedDelivery>,
@@ -85,6 +86,26 @@ pub(crate) struct DeliveryWindow {
 }
 
 impl DeliveryState {
+    pub(super) fn invalidate_policy(&mut self, module: &str, generation: u64) {
+        for attempt in self
+            .attempts
+            .values_mut()
+            .filter(|attempt| attempt.module == module && attempt.generation == generation)
+        {
+            attempt.ready = false;
+        }
+    }
+    pub(super) fn observed_readiness(
+        &self,
+        module: &str,
+        generation: u64,
+        targets: &BTreeMap<String, ConnectionId>,
+    ) -> Option<ConnectionId> {
+        targets.get(module).copied().filter(|connection| {
+            self.readiness_observed.contains(&(*connection, generation))
+                || self.healthy_children.contains(&(*connection, generation))
+        })
+    }
     pub(super) fn declared(&mut self, connection: ConnectionId, module: &str, active: bool) {
         if let Some(spawn) = self.unregistered_children.remove(&(module.into(), active)) {
             self.children.insert(connection, spawn);
@@ -103,6 +124,8 @@ impl DeliveryState {
         self.stamp_running.remove(&connection);
         self.children.remove(&connection);
         self.healthy_children
+            .retain(|(child, _)| *child != connection);
+        self.readiness_observed
             .retain(|(child, _)| *child != connection);
     }
 
@@ -231,6 +254,7 @@ pub(super) fn bind_get(
                     .filter(|warmup| warmup.generation == pending.generation)
                     .map(|warmup| warmup.deadline);
             }
+            attempt.ready &= super::route_policy::ready(state, module, pending.generation)?;
             state.delivery.attempts.insert(connection, attempt);
         }
         pending.attempt = state
@@ -345,6 +369,7 @@ impl RuntimeOwner {
             return Ok(false);
         }
         if versions.pending == Some(exited.generation) {
+            state.restore_route_policy(&exited.module, exited.generation);
             let result = state
                 .store
                 .record_delivery(&tuple, exited.generation, false);
@@ -610,6 +635,7 @@ impl RuntimeOwner {
                     .healthy_children
                     .insert((connection, generation));
             }
+            let policy_ready = super::route_policy::ready(&mut state, module, generation)?;
             let Some(bound) = state
                 .delivery
                 .attempts
@@ -621,8 +647,14 @@ impl RuntimeOwner {
             if bound.transition.requires_spawn() && !started_for_generation {
                 return Ok(None);
             }
-            bound.ready = true;
-            bound.acknowledged.then_some(bound.id)
+            bound.ready = policy_ready;
+            let acknowledged = bound.ready && bound.acknowledged;
+            let id = bound.id;
+            state
+                .delivery
+                .readiness_observed
+                .insert((connection, generation));
+            acknowledged.then_some(id)
         };
         attempt
             .map(|attempt| {
@@ -716,10 +748,14 @@ impl RuntimeOwner {
         attempt.catchup = catchup;
         // Swap readiness completed before promotion. Its new target now gets
         // a full live ACK window, independently of the finished spawn budget.
-        attempt.ready = true;
+        attempt.ready = super::route_policy::ready(&mut state, module, generation)?;
         attempt.deadline = Some(cutover_at + CONFIG_LIVE_ACK_TIMEOUT);
         let assignment = (generation, attempt.id);
         state.delivery.attempts.insert(connection, attempt);
+        state
+            .delivery
+            .readiness_observed
+            .insert((connection, generation));
         Ok(Some(assignment))
     }
 
@@ -738,6 +774,9 @@ impl RuntimeOwner {
                 if bound
                     .write_deadline
                     .is_some_and(|deadline| written_at >= deadline)
+                    || bound
+                        .deadline
+                        .is_some_and(|deadline| written_at >= deadline)
                 {
                     return Err(GateError::new(
                         "delivery_expired",
@@ -860,7 +899,13 @@ impl RuntimeOwner {
             }
             return Ok(AppliedDisposition::WaitingForReadiness);
         }
+        if !ack {
+            state.restore_route_policy(module, bound.generation);
+        }
         let result = state.store.record_delivery(&tuple, bound.generation, ack);
+        if result.is_ok() && ack {
+            state.commit_route_policy(module, bound.generation);
+        }
         // A pending-anchor NACK has already restored memory. Discard its attempt
         // even though the durable failure must wait for the anchor retry.
         if result.is_ok() || !ack {

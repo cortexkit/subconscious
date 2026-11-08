@@ -164,6 +164,21 @@ async fn module_worker(
             if let Ok(view) = view {
                 if let Some(pending) = view.pending {
                     if let Some(attempt) = pending.attempt {
+                        if owner
+                            .route_policy_needed(module, pending.generation)
+                            .unwrap_or(true)
+                        {
+                            if let Err(error) = owner
+                                .install_approved_route_policy(module, pending.generation)
+                                .await
+                            {
+                                warn!(module_id=%module, %error, "approved route policy could not be installed");
+                                drop(_guard);
+                                drop(control);
+                                wake.notified().await;
+                                continue;
+                            }
+                        }
                         let window = owner
                             .delivery_window(registration.connection_id)
                             .ok()

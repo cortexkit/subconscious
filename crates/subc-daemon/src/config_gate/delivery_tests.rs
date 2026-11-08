@@ -475,22 +475,7 @@ fn approve_kinds(
     owner: &RuntimeOwner,
     kinds: &[subc_config::ApplyKind],
 ) -> ConfigPlanView {
-    write(rig, 2);
-    let plan = owner
-        .finish_plan(owner.prepare(PlanKind::Change).unwrap(), |old, new| {
-            let mut changeset = daemon_review(old, new)?;
-            for (index, kind) in kinds.iter().enumerate() {
-                changeset.fields.push(subc_config::FieldChange::new(
-                    "a",
-                    format!("/field{index}"),
-                    subc_config::RecordedValue::new(json!(1)),
-                    subc_config::RecordedValue::new(json!(2)),
-                    *kind,
-                ));
-            }
-            Ok(changeset)
-        })
-        .unwrap();
+    let plan = plan_kinds(rig, owner, kinds).unwrap();
     owner
         .desktop_view_delivered(ConnectionId::new(7), &plan)
         .unwrap();
@@ -506,6 +491,34 @@ fn approve_kinds(
     plan
 }
 
+fn plan_kinds(
+    rig: &Rig,
+    owner: &RuntimeOwner,
+    kinds: &[subc_config::ApplyKind],
+) -> super::super::super::Result<ConfigPlanView> {
+    write(rig, 2);
+    plan_kinds_from_disk(owner, kinds)
+}
+
+fn plan_kinds_from_disk(
+    owner: &RuntimeOwner,
+    kinds: &[subc_config::ApplyKind],
+) -> super::super::super::Result<ConfigPlanView> {
+    owner.finish_plan(owner.prepare(PlanKind::Change)?, |old, new| {
+        let mut changeset = daemon_review(old, new)?;
+        for (index, kind) in kinds.iter().enumerate() {
+            changeset.fields.push(subc_config::FieldChange::new(
+                "a",
+                format!("/field{index}"),
+                subc_config::RecordedValue::new(json!(1)),
+                subc_config::RecordedValue::new(json!(2)),
+                *kind,
+            ));
+        }
+        Ok(changeset)
+    })
+}
+
 fn assert_active(owner: &RuntimeOwner, connection: ConnectionId, generation: u64) {
     assert_eq!(
         owner
@@ -518,8 +531,10 @@ fn assert_active(owner: &RuntimeOwner, connection: ConnectionId, generation: u64
     );
 }
 
-fn mixed_waits_for_spawn(kinds: &[subc_config::ApplyKind], expected: &str) {
+async fn mixed_waits_for_spawn(kinds: &[subc_config::ApplyKind], expected: &str) {
     let (rig, owner) = rig();
+    let owner =
+        owner.with_route_policy_authority(std::sync::Arc::new(FakeRouteAuthority::default()));
     applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
     let plan = approve_kinds(&rig, &owner, kinds);
     let transition = &plan.plan.changeset.apply_plan["module_transitions"]["a"];
@@ -548,6 +563,9 @@ fn mixed_waits_for_spawn(kinds: &[subc_config::ApplyKind], expected: &str) {
     rig.declare(&owner, replacement.get());
     owner.registered(replacement, &spawn).unwrap();
     let view = pending(&owner, replacement);
+    if owner.route_policy_needed("a", 2).unwrap() {
+        owner.install_approved_route_policy("a", 2).await.unwrap();
+    }
     assert_eq!(
         applied(&owner, replacement, &view, true).unwrap(),
         AppliedDisposition::WaitingForReadiness
@@ -559,37 +577,41 @@ fn mixed_waits_for_spawn(kinds: &[subc_config::ApplyKind], expected: &str) {
     assert_active(&owner, replacement, 2);
 }
 
-#[test]
-fn config_delivery_mixed_next_supervision_and_route_rebind_wait_for_spawn() {
+#[tokio::test]
+async fn config_delivery_mixed_next_supervision_and_route_rebind_wait_for_spawn() {
     mixed_waits_for_spawn(
         &[
             subc_config::ApplyKind::RouteRebind,
             subc_config::ApplyKind::NextSupervision,
         ],
         "next_supervision",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn config_delivery_mixed_module_restart_and_next_supervision_wait_for_spawn() {
+#[tokio::test]
+async fn config_delivery_mixed_module_restart_and_next_supervision_wait_for_spawn() {
     mixed_waits_for_spawn(
         &[
             subc_config::ApplyKind::NextSupervision,
             subc_config::ApplyKind::ModuleRestart,
         ],
         "module_restart",
-    );
+    )
+    .await;
 }
 
-#[test]
-fn config_delivery_mixed_live_and_next_supervision_defer_live_fields_in_plan_and_activation() {
+#[tokio::test]
+async fn config_delivery_mixed_live_and_next_supervision_defer_live_fields_in_plan_and_activation()
+{
     mixed_waits_for_spawn(
         &[
             subc_config::ApplyKind::Live,
             subc_config::ApplyKind::NextSupervision,
         ],
         "next_supervision",
-    );
+    )
+    .await;
     let (rig, owner) = rig();
     let plan = approve_kinds(
         &rig,
@@ -607,9 +629,11 @@ fn config_delivery_mixed_live_and_next_supervision_defer_live_fields_in_plan_and
         .contains("waits for the module's next start"));
 }
 
-#[test]
-fn config_delivery_mixed_route_rebind_and_live_require_route_readiness_before_activation() {
+#[tokio::test]
+async fn config_delivery_mixed_route_rebind_and_live_require_route_readiness_before_activation() {
     let (rig, owner) = rig();
+    let owner =
+        owner.with_route_policy_authority(std::sync::Arc::new(FakeRouteAuthority::default()));
     applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
     let plan = approve_kinds(
         &rig,
@@ -629,10 +653,9 @@ fn config_delivery_mixed_route_rebind_and_live_require_route_readiness_before_ac
         AppliedDisposition::WaitingForReadiness
     );
     assert_active(&owner, INCUMBENT, 1);
-    assert_eq!(
-        owner.ready(INCUMBENT, "a", 2).unwrap(),
-        Some(AppliedDisposition::Active)
-    );
+    assert!(owner.ready(INCUMBENT, "a", 2).unwrap().is_none());
+    assert_active(&owner, INCUMBENT, 1);
+    owner.install_approved_route_policy("a", 2).await.unwrap();
     assert_active(&owner, INCUMBENT, 2);
 }
 
@@ -1452,4 +1475,421 @@ fn config_delivery_stamp_attempt_survives_transport_cleanup_until_its_process_ex
         1,
         "the later process exit must still fail its assigned stamp generation"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn config_delivery_get_flush_timeout_fails_the_attempt_without_failing_the_connection() {
+    let (_rig, owner, handler, _receivers) = worker_fixture();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+    let sink = crate::FrameSink::new(sender);
+    let context = crate::router::RouteCtx {
+        connection_id: INCUMBENT,
+        egress: sink.clone(),
+    };
+    let frame = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Request,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        17,
+        serde_json::to_vec(&ConfigGetRequest::new()).unwrap(),
+    )
+    .unwrap();
+    let task = tokio::spawn(async move { handler.handle_control_frame(&context, frame).await });
+    let mut outbound = receiver
+        .recv()
+        .await
+        .expect("config.get response was queued");
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert!(
+        task.await.unwrap().unwrap().is_empty(),
+        "a write timeout must not return the transport error which ends this connection"
+    );
+    assert!(outbound.flushed.take().unwrap().send(()).is_err());
+    assert!(!sink.is_closed());
+    assert_eq!(
+        owner
+            .module_get(INCUMBENT, "a", ConfigGetRequest::new())
+            .unwrap_err()
+            .code,
+        "config_gated"
+    );
+}
+
+#[derive(Default)]
+struct FakeRouteAuthority {
+    policies: std::sync::Arc<std::sync::Mutex<Vec<super::super::ApprovedRoutePolicy>>>,
+    live_stamps: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    new_open_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    reject: std::sync::atomic::AtomicBool,
+    events: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, u64)>>>,
+    on_commit: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+    on_restore: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+}
+
+struct FakePolicyReceipt {
+    policy: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    previous: u64,
+    generation: u64,
+    events: std::sync::Arc<std::sync::Mutex<Vec<(&'static str, u64)>>>,
+    on_commit: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+    on_restore: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+}
+
+impl super::super::RoutePolicyReceipt for FakePolicyReceipt {
+    fn commit(&mut self) {
+        if let Some(check) = &self.on_commit {
+            check(self.generation);
+        }
+        self.events
+            .lock()
+            .unwrap()
+            .push(("commit", self.generation));
+    }
+    fn restore(&mut self) {
+        if let Some(check) = &self.on_restore {
+            check(self.generation);
+        }
+        self.policy
+            .store(self.previous, std::sync::atomic::Ordering::SeqCst);
+        self.events
+            .lock()
+            .unwrap()
+            .push(("restore", self.generation));
+    }
+}
+
+impl FakeRouteAuthority {
+    fn receipt(&self, generation: u64) -> super::super::RoutePolicyInstallation {
+        super::super::RoutePolicyInstallation::new(Box::new(FakePolicyReceipt {
+            policy: self.new_open_generation.clone(),
+            previous: self
+                .new_open_generation
+                .load(std::sync::atomic::Ordering::SeqCst),
+            generation,
+            events: self.events.clone(),
+            on_commit: self.on_commit.clone(),
+            on_restore: self.on_restore.clone(),
+        }))
+    }
+}
+
+impl super::super::RoutePolicyAuthority for FakeRouteAuthority {
+    fn install_and_revoke<'a>(
+        &'a self,
+        policy: super::super::ApprovedRoutePolicy,
+    ) -> super::super::RoutePolicyInstall<'a> {
+        Box::pin(async move {
+            use std::sync::atomic::Ordering;
+            if self.reject.load(Ordering::SeqCst) {
+                return Err(super::super::super::GateError::new(
+                    "route_install_refused",
+                    "fake route authority refused installation",
+                ));
+            }
+            let receipt = self.receipt(policy.generation());
+            self.live_stamps.lock().unwrap().clear();
+            self.new_open_generation
+                .store(policy.generation(), Ordering::SeqCst);
+            self.policies.lock().unwrap().push(policy);
+            Ok(receipt)
+        })
+    }
+}
+
+#[test]
+fn config_delivery_route_obligations_are_refused_without_an_installer_even_under_stronger_transitions(
+) {
+    use subc_config::ApplyKind;
+    for stronger in [
+        None,
+        Some(ApplyKind::NextSupervision),
+        Some(ApplyKind::ModuleRestart),
+        Some(ApplyKind::DaemonRestart),
+    ] {
+        let (rig, owner) = rig();
+        applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+        let kinds: Vec<_> = std::iter::once(ApplyKind::RouteRebind)
+            .chain(stronger)
+            .collect();
+        let error = plan_kinds(&rig, &owner, &kinds).unwrap_err();
+        assert_eq!(error.code, "route_policy_authority_unavailable");
+        assert!(error.detail.contains("RoutePolicyAuthority is absent"));
+        assert!(error.detail.contains("routes and stamps"));
+        let mut state = owner.lock().unwrap();
+        assert_eq!(state.store.body().unwrap().last_generation, 1);
+    }
+}
+
+#[tokio::test]
+async fn config_delivery_route_authority_installs_saved_approved_bytes_and_revokes_stamps_before_activation(
+) {
+    use std::sync::{atomic::Ordering, Arc};
+    let (rig, owner) = rig();
+    let authority = Arc::new(FakeRouteAuthority::default());
+    authority.live_stamps.lock().unwrap().push(1);
+    authority.new_open_generation.store(1, Ordering::SeqCst);
+    let owner = owner.with_route_policy_authority(authority.clone());
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    let approved_bytes = std::fs::read(rig.path.join("subc.jsonc")).unwrap();
+    let plan = approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+    let view = pending(&owner, INCUMBENT);
+    assert!(owner.ready(INCUMBENT, "a", 2).unwrap().is_none());
+    assert_eq!(
+        applied(&owner, INCUMBENT, &view, true).unwrap(),
+        AppliedDisposition::WaitingForReadiness
+    );
+    assert_active(&owner, INCUMBENT, 1);
+    assert_eq!(authority.new_open_generation.load(Ordering::SeqCst), 1);
+    std::fs::write(rig.path.join("subc.jsonc"), b"unapproved on-disk edit").unwrap();
+    let gate = owner.module_gate("a").unwrap();
+    let _guard = gate.lock().await;
+    owner.install_approved_route_policy("a", 2).await.unwrap();
+    assert!(authority.live_stamps.lock().unwrap().is_empty());
+    assert_eq!(authority.new_open_generation.load(Ordering::SeqCst), 2);
+    assert_active(&owner, INCUMBENT, 2);
+    let policies = authority.policies.lock().unwrap();
+    assert_eq!(policies.len(), 1);
+    let policy = &policies[0];
+    assert_eq!((policy.module(), policy.generation()), ("a", 2));
+    assert_eq!(policy.plan_digest(), &plan.digest);
+    assert_eq!(
+        policy.delivery().daemon.as_ref().unwrap().bytes,
+        Some(approved_bytes)
+    );
+    assert!(policy
+        .changeset()
+        .fields
+        .iter()
+        .any(|field| field.apply == subc_config::ApplyKind::RouteRebind));
+}
+
+#[tokio::test]
+async fn config_delivery_route_authority_failure_cannot_be_counted_as_ready() {
+    use std::sync::{atomic::Ordering, Arc};
+    let (rig, owner) = rig();
+    let authority = Arc::new(FakeRouteAuthority::default());
+    let owner = owner.with_route_policy_authority(authority.clone());
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+    let view = pending(&owner, INCUMBENT);
+    owner.ready(INCUMBENT, "a", 2).unwrap();
+    assert_eq!(
+        applied(&owner, INCUMBENT, &view, true).unwrap(),
+        AppliedDisposition::WaitingForReadiness
+    );
+    authority.reject.store(true, Ordering::SeqCst);
+    assert_eq!(
+        owner
+            .install_approved_route_policy("a", 2)
+            .await
+            .unwrap_err()
+            .code,
+        "route_install_refused"
+    );
+    assert_active(&owner, INCUMBENT, 1);
+    assert_eq!(pending(&owner, INCUMBENT).generation, 2);
+}
+
+#[test]
+fn config_delivery_route_receipt_drop_restores_and_double_restore_is_a_noop_without_resurrecting_stamps(
+) {
+    use std::sync::atomic::Ordering;
+    let authority = FakeRouteAuthority::default();
+    authority.new_open_generation.store(77, Ordering::SeqCst);
+    authority.live_stamps.lock().unwrap().push(77);
+    {
+        let _receipt = authority.receipt(2);
+        authority.new_open_generation.store(2, Ordering::SeqCst);
+        authority.live_stamps.lock().unwrap().clear();
+    }
+    assert_eq!(
+        authority.new_open_generation.load(Ordering::SeqCst),
+        77,
+        "dropping an unresolved install restores captured pre-gate policy"
+    );
+    assert!(authority.live_stamps.lock().unwrap().is_empty());
+    assert_eq!(*authority.events.lock().unwrap(), vec![("restore", 2)]);
+    let mut receipt = authority.receipt(3);
+    authority.new_open_generation.store(3, Ordering::SeqCst);
+    receipt.restore();
+    receipt.restore();
+    drop(receipt);
+    assert_eq!(authority.new_open_generation.load(Ordering::SeqCst), 77);
+    assert_eq!(
+        *authority.events.lock().unwrap(),
+        vec![("restore", 2), ("restore", 3)]
+    );
+}
+
+#[tokio::test]
+async fn config_delivery_route_receipt_ack_commits_after_durable_publication_and_nack_restores_before_publication(
+) {
+    use std::sync::{atomic::Ordering, Arc};
+    for ack in [true, false] {
+        let (rig, owner) = rig();
+        let mut authority = FakeRouteAuthority::default();
+        authority.new_open_generation.store(1, Ordering::SeqCst);
+        let store_root = rig.path.join("store");
+        let read = move || {
+            let mut store = ConfigStore::open_digest_only_for_tests(
+                StoreRoot::from_service_definition(store_root.clone()).unwrap(),
+            );
+            store.body().unwrap().clone()
+        };
+        if ack {
+            authority.on_commit = Some(Arc::new(move |generation| {
+                let body = read();
+                assert_eq!(
+                    body.versions[0].1.active,
+                    Some(generation),
+                    "receipt commit must follow durable active publication"
+                );
+                assert!(body.versions[0].1.pending.is_none());
+            }));
+        } else {
+            authority.on_restore = Some(Arc::new(move |generation| {
+                let body = read();
+                assert_eq!(
+                    body.versions[0].1.pending,
+                    Some(generation),
+                    "policy restore must happen before publishing the failed generation"
+                );
+                assert!(!body.generations[&generation]
+                    .generation
+                    .never_redeliver
+                    .contains(&"a".into()));
+            }));
+        }
+        let authority = Arc::new(authority);
+        let owner = owner.with_route_policy_authority(authority.clone());
+        applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+        approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+        let view = pending(&owner, INCUMBENT);
+        owner.install_approved_route_policy("a", 2).await.unwrap();
+        owner.ready(INCUMBENT, "a", 2).unwrap();
+        applied(&owner, INCUMBENT, &view, ack).unwrap();
+        assert_eq!(
+            authority.new_open_generation.load(Ordering::SeqCst),
+            if ack { 2 } else { 1 }
+        );
+        assert_active(&owner, INCUMBENT, if ack { 2 } else { 1 });
+        assert_eq!(
+            *authority.events.lock().unwrap(),
+            vec![(if ack { "commit" } else { "restore" }, 2)]
+        );
+    }
+}
+
+#[tokio::test]
+async fn config_delivery_route_receipt_waits_for_the_ack_anchor_before_committing() {
+    use std::sync::Arc;
+    let rig = Rig::new();
+    write(&rig, 1);
+    let key = crate::config_store::TestStoreKey::default();
+    let authority = Arc::new(FakeRouteAuthority::default());
+    let owner =
+        sealed_owner(&rig, &key, "route-ack-anchor").with_route_policy_authority(authority.clone());
+    rig.declare(&owner, INCUMBENT.get());
+    rig.stamp(&owner);
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+    let view = pending(&owner, INCUMBENT);
+    owner.install_approved_route_policy("a", 2).await.unwrap();
+    owner.ready(INCUMBENT, "a", 2).unwrap();
+    key.fail_anchor(true);
+    assert_eq!(
+        applied(&owner, INCUMBENT, &view, true).unwrap_err().code,
+        "anchor_pending"
+    );
+    assert!(
+        authority.events.lock().unwrap().is_empty(),
+        "an unanchored ACK cannot commit the policy receipt"
+    );
+    assert!(owner.status().unwrap().anchor_pending);
+    assert_eq!(
+        owner.lock().unwrap().store.body().unwrap().versions[0]
+            .1
+            .active,
+        Some(1)
+    );
+    key.fail_anchor(false);
+    assert!(!owner.status().unwrap().anchor_pending);
+    assert_eq!(*authority.events.lock().unwrap(), vec![("commit", 2)]);
+}
+
+#[tokio::test]
+async fn config_delivery_route_receipt_is_retained_on_decline_and_restored_before_a_superseding_approval(
+) {
+    use std::sync::{atomic::Ordering, Arc};
+    for approve in [false, true] {
+        let (rig, owner) = rig();
+        let authority = Arc::new(FakeRouteAuthority::default());
+        authority.new_open_generation.store(1, Ordering::SeqCst);
+        let owner = owner.with_route_policy_authority(authority.clone());
+        applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+        approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+        let view = pending(&owner, INCUMBENT);
+        owner.install_approved_route_policy("a", 2).await.unwrap();
+        owner.ready(INCUMBENT, "a", 2).unwrap();
+        write(&rig, 3);
+        let next = plan_kinds_from_disk(&owner, &[subc_config::ApplyKind::RouteRebind]).unwrap();
+        owner
+            .desktop_view_delivered(ConnectionId::new(7), &next)
+            .unwrap();
+        let challenge = owner.begin_approval(&next.digest, &Rig::facts()).unwrap();
+        let decision = if approve {
+            super::super::super::PresenceDecision::InteractiveApproval
+        } else {
+            super::super::super::PresenceDecision::Declined
+        };
+        let result = owner.finish_approval(
+            challenge.attempt(),
+            &Rig::facts(),
+            ApprovalReply::Presence(decision),
+            3,
+        );
+        if approve {
+            assert_eq!(result.unwrap(), 3);
+            assert_eq!(authority.new_open_generation.load(Ordering::SeqCst), 1);
+            assert_eq!(*authority.events.lock().unwrap(), vec![("restore", 2)]);
+            assert_eq!(pending(&owner, INCUMBENT).generation, 3);
+        } else {
+            assert!(result.is_err());
+            assert_eq!(authority.new_open_generation.load(Ordering::SeqCst), 2);
+            assert!(authority.events.lock().unwrap().is_empty());
+            assert_eq!(
+                applied(&owner, INCUMBENT, &view, true).unwrap(),
+                AppliedDisposition::Active
+            );
+            assert_eq!(*authority.events.lock().unwrap(), vec![("commit", 2)]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn config_delivery_route_receipts_are_not_persisted_and_owner_drop_restores_before_reopen() {
+    use std::sync::{atomic::Ordering, Arc};
+    let (rig, owner) = rig();
+    let authority = Arc::new(FakeRouteAuthority::default());
+    authority.new_open_generation.store(1, Ordering::SeqCst);
+    let owner = owner.with_route_policy_authority(authority.clone());
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+    owner.install_approved_route_policy("a", 2).await.unwrap();
+    assert_eq!(authority.new_open_generation.load(Ordering::SeqCst), 2);
+    drop(owner);
+    assert_eq!(authority.new_open_generation.load(Ordering::SeqCst), 1);
+    let restarted = rig.owner("route-reopened");
+    rig.declare(&restarted, INCUMBENT.get());
+    let reply = restarted
+        .module_get(INCUMBENT, "a", ConfigGetRequest::new())
+        .unwrap();
+    assert_eq!(reply.active.unwrap().generation, 1);
+    assert_eq!(reply.pending.unwrap().generation, 2);
+    assert!(restarted.lock().unwrap().route_policy_receipts.is_empty());
+    assert!(restarted.route_policy_needed("a", 2).unwrap());
+    assert!(store_bytes(&rig)
+        .windows(b"receipt".len())
+        .all(|window| window != b"receipt"));
 }

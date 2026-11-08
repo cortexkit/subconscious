@@ -417,3 +417,123 @@ async fn config_desktop_failed_flush_revocation_and_disconnect_never_create_a_vi
         );
     }
 }
+
+#[cfg(all(feature = "dev-desktop-approval", target_os = "macos"))]
+#[tokio::test]
+async fn config_desktop_apply_prompts_before_waiting_for_the_cutover_gate_and_publishes_after_release(
+) {
+    use crate::operator_confirm::{OperatorProvider, OperatorWithdraw, ProviderResult};
+    struct Presence(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>);
+    impl OperatorProvider for Presence {
+        fn config_gate_ready(&self) -> bool {
+            true
+        }
+        fn prompt(
+            &self,
+            _: &str,
+            _: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
+        ) -> ProviderResult {
+            ProviderResult::Unavailable
+        }
+        fn prompt_gate(
+            &self,
+            _: &str,
+            _: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
+        ) -> ProviderResult {
+            self.0.lock().unwrap().take().unwrap().send(()).unwrap();
+            ProviderResult::Approved
+        }
+    }
+    let (scratch, owner, _) = review_fixture();
+    std::fs::create_dir_all(scratch.0.join("cortexkit")).unwrap();
+    std::fs::write(scratch.0.join("program"), b"captured program identity").unwrap();
+    std::fs::write(scratch.0.join("cortexkit/a.jsonc"), b"{}").unwrap();
+    std::fs::write(
+        scratch.0.join("subc.jsonc"),
+        serde_json::to_vec(&serde_json::json!({
+            "version":1,"modules":{"a":{"program":scratch.0.join("program")}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    owner.declare(ConnectionId::new(10), "a", subc_protocol::config::ConfigDeclareRequest::new(
+        serde_json::json!({"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{},"unevaluatedProperties":false,"x-ck-layers":["user"],"x-ck-apply":"live"}),
+        scratch.0.join("cortexkit/a.jsonc").to_string_lossy(), vec![]), true).unwrap();
+    let view = owner
+        .finish_plan(
+            owner.prepare(PlanKind::Stamp).unwrap(),
+            crate::config_gate::runtime::daemon_review,
+        )
+        .unwrap();
+    let registry = Arc::new(Registry::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new(registry.clone(), crate::supervise::RestartPolicy::default())
+        .with_handle(handle.clone());
+    let handler = Arc::new(
+        ControlHandler::new(registry)
+            .with_supervisor(handle)
+            .with_supervisor_rescan(supervisor, scratch.0.join("subc.jsonc"), None)
+            .with_config_runtime(owner.clone())
+            .with_dev_desktop_verifier(crate::config_gate::desktop::DevDesktopVerifier::Supplied(
+                Arc::new(Verifier(Arc::new(AtomicBool::new(true)))),
+            )),
+    );
+    let (prompted, prompt) = tokio::sync::oneshot::channel();
+    handler.forwarding.operator_confirms().configure(
+        Arc::new(Presence(std::sync::Mutex::new(Some(prompted)))),
+        crate::operator_confirm::OperatorLimits::default(),
+    );
+    let connection = ConnectionId::new(700);
+    owner_peer(&handler, connection);
+    owner.desktop_view_delivered(connection, &view).unwrap();
+    let (sender, _receiver) = tokio::sync::mpsc::channel(8);
+    let ctx = RouteCtx {
+        connection_id: connection,
+        egress: crate::FrameSink::new(sender),
+    };
+    let facts = handler.config_approval_facts(&ctx).await;
+    assert!(
+        facts.os_prompt_available,
+        "this adapter test requires the macOS presence policy branch"
+    );
+    let challenge = owner.begin_approval(&view.digest, &facts).unwrap();
+    let gates = owner
+        .approval_commit_gates(challenge.attempt())
+        .await
+        .unwrap();
+    assert_eq!(
+        gates.len(),
+        1,
+        "the reviewed module must hold a real cutover lock"
+    );
+    let request = Frame::build(
+        FrameType::Request,
+        Flags::new(false, Priority::Passive, false),
+        0,
+        0,
+        81,
+        serde_json::to_vec(&ConfigControlRequest::Apply {
+            digest: view.digest,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let mut apply = tokio::spawn(async move { handler.handle_control_frame(&ctx, request).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), prompt)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(100), &mut apply).await.is_err(),
+        "presence finishes without the module gate, but config.apply must not publish through an in-progress cutover");
+    drop(gates);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), apply)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.len(), 1);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response[0].body).unwrap(),
+        serde_json::json!({"op":"config.apply","generation":1})
+    );
+}

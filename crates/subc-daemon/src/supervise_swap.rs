@@ -207,12 +207,14 @@ async fn run_swap_inner(
         "swap candidate spawned; routing stays on the incumbent until it is ready"
     );
 
+    let config_deadline = config_candidate_deadline(runtime, &candidate);
     let warm = warm_candidate(
         module_id,
         registry,
         &mut candidate,
         incumbent_connection,
         ready_timeout,
+        config_deadline,
         commands,
         end,
     )
@@ -263,6 +265,7 @@ async fn run_swap_inner(
         runtime,
         registry,
         &forwarding,
+        config_deadline,
         candidate_connection,
     )
     .await
@@ -666,10 +669,11 @@ async fn warm_candidate(
     candidate: &mut SupervisedChild,
     incumbent_connection: ConnectionId,
     ready_timeout: Duration,
+    config_deadline: Option<Instant>,
     commands: &mut mpsc::Receiver<SupervisorCommand>,
     end: &mut SwapEnd,
 ) -> Warm {
-    let deadline = Instant::now() + ready_timeout;
+    let mut deadline = Instant::now() + ready_timeout;
     let mut registered: Option<ConnectionId> = None;
     loop {
         // Before the candidate registers, the candidate slot is the only
@@ -687,6 +691,22 @@ async fn warm_candidate(
         match registry.published_registration(slot) {
             Ok(Some(registration)) => {
                 registered = Some(registration.connection_id);
+                if registration
+                    .control_ops
+                    .iter()
+                    .any(|op| op == "config.review")
+                {
+                    if let Some(cap) = config_deadline {
+                        deadline = deadline.min(cap);
+                        if Instant::now() >= cap {
+                            return Warm::Failed(CandidateFailure {
+                                arm:SwapFailureArm::NeverReady,
+                                detail:"config_gated: candidate configuration warm-up deadline expired before readiness".into(),
+                                exit:None, connection:registered,
+                            });
+                        }
+                    }
+                }
                 if registration.ready {
                     return Warm::Ready(registration.connection_id);
                 }
@@ -779,6 +799,18 @@ async fn warm_candidate(
     }
 }
 
+fn config_candidate_deadline(
+    runtime: &SupervisorRuntimeConfig,
+    candidate: &SupervisedChild,
+) -> Option<Instant> {
+    runtime.config_delivery.as_ref().map(|_| {
+        candidate.spawned_at
+            + runtime.register_timeout
+            + runtime.health.deadline
+            + crate::config_gate::runtime::delivery::CONFIG_WARMUP_SLACK
+    })
+}
+
 /// Probe a ready candidate once, by endpoint, before promoting it.
 ///
 /// The same `health.check` the supervisor probes every module with, sent only
@@ -792,6 +824,7 @@ async fn probe_candidate(
     runtime: &SupervisorRuntimeConfig,
     registry: &Registry,
     forwarding: &ForwardingTable,
+    config_deadline: Option<Instant>,
     candidate_connection: ConnectionId,
 ) -> Result<(), CandidateFailure> {
     let unhealthy = |detail: String| CandidateFailure {
@@ -834,7 +867,10 @@ async fn probe_candidate(
             "the candidate's connection closed before its health probe".to_string(),
         ));
     };
-    match probe_endpoint_health(endpoint, runtime, None).await {
+    let deadline_cap = config_owned.then_some(config_deadline).flatten();
+    match probe_endpoint_health(endpoint, runtime, deadline_cap).await {
+        Ok(_) if deadline_cap.is_some_and(|cap| Instant::now() >= cap) => Err(unhealthy(
+            "config_gated: candidate configuration warm-up deadline expired before its first healthy probe finished".into())),
         Ok(report) if config_owned && report.status != HealthStatus::Ok => Err(unhealthy(
             "config_gated: configuration readiness requires a healthy, not degraded or failing, probe".into())),
         Ok(report) if report.status == HealthStatus::Failing => Err(unhealthy(format!(
@@ -1044,6 +1080,209 @@ async fn retire_incumbent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    struct ConfigTimingFixture {
+        dir: cortexkit_test_support::ScratchDir,
+        runtime: SupervisorRuntimeConfig,
+        registry: Arc<Registry>,
+        forwarding: Arc<ForwardingTable>,
+        child: SupervisedChild,
+        receiver: mpsc::Receiver<crate::router::OutboundFrame>,
+    }
+
+    #[cfg(unix)]
+    fn config_timing_fixture() -> ConfigTimingFixture {
+        let dir = cortexkit_test_support::ScratchDir::new("config-swap-deadline");
+        let owner = Arc::new(crate::config_gate::runtime::RuntimeOwner::new(
+            "swap-deadline".into(),
+            crate::config_store::ConfigStore::open_digest_only_for_tests(
+                crate::config_store::StoreRoot::from_service_definition(dir.join("store")).unwrap(),
+            ),
+            crate::config_gate::capture::ConfigCapturer {
+                daemon_path: dir.join("subc.jsonc"),
+                config_home: dir.to_path_buf(),
+                projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+            },
+        ));
+        let registry = Arc::new(Registry::default());
+        let forwarding = Arc::new(ForwardingTable::default());
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_config_runtime(owner)
+            .with_forwarding(forwarding.clone());
+        let mut runtime = supervisor.runtime_config();
+        runtime.register_timeout = Duration::from_secs(5);
+        runtime.health.deadline = Duration::from_secs(2);
+        let spec = ModuleSpec {
+            module_id: "timed".into(),
+            program: PathBuf::from("/bin/sleep"),
+            args: vec!["600".into()],
+            env: vec![],
+            reserved: false,
+            reserved_prefixes: vec![],
+            protocol: ModuleProtocol::None,
+            overlap: ModuleOverlap::Safe,
+            carry_containment: false,
+        };
+        let candidate = spawn_child(
+            &spec,
+            None,
+            runtime.supervisor_handle.as_ref(),
+            &runtime.stderr_ring,
+            None,
+            &runtime.child_roster,
+            runtime.spawn_delivery(),
+            #[cfg(target_os = "linux")]
+            None,
+        )
+        .unwrap();
+        let mut manifest =
+            subc_protocol::manifest::ModuleManifest::builder("timed", "1.0.0").build();
+        manifest.ready = Some(true);
+        registry
+            .register_candidate_with_control_ops(
+                manifest,
+                subc_protocol::PROTOCOL_VERSION,
+                ConnectionId::new(2),
+                vec![
+                    "config.review".into(),
+                    MODULE_CONTROL_OP_HEALTH_CHECK.into(),
+                ],
+            )
+            .unwrap();
+        let (sender, receiver) = mpsc::channel(8);
+        forwarding
+            .register_candidate_module_connection(
+                ConnectionId::new(2),
+                "timed".into(),
+                subc_protocol::PROTOCOL_VERSION,
+                subc_protocol::manifest::Concurrency::ModuleManaged,
+                FrameSink::new(sender),
+            )
+            .unwrap();
+        ConfigTimingFixture {
+            dir,
+            runtime,
+            registry,
+            forwarding,
+            child: candidate,
+            receiver,
+        }
+    }
+
+    #[cfg(unix)]
+    async fn finish_timing_child(mut candidate: SupervisedChild) {
+        candidate.start_kill().unwrap();
+        candidate.wait().await.unwrap();
+        candidate.finish_exit(false).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn config_delivery_swap_adapter_ready_uses_spawn_bound_and_rejects_the_exact_edge() {
+        let ConfigTimingFixture {
+            dir: _dir,
+            runtime,
+            registry,
+            mut child,
+            ..
+        } = config_timing_fixture();
+        let cap = config_candidate_deadline(&runtime, &child).unwrap();
+        assert_eq!(
+            cap.duration_since(child.spawned_at),
+            Duration::from_secs(17)
+        );
+        tokio::time::advance(Duration::from_secs(17) - Duration::from_nanos(1)).await;
+        let (_sender, mut commands) = mpsc::channel(8);
+        let mut end = SwapEnd::default();
+        assert!(matches!(
+            warm_candidate(
+                "timed",
+                &registry,
+                &mut child,
+                ConnectionId::new(1),
+                Duration::from_secs(60),
+                Some(cap),
+                &mut commands,
+                &mut end
+            )
+            .await,
+            Warm::Ready(_)
+        ));
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        let late = warm_candidate(
+            "timed",
+            &registry,
+            &mut child,
+            ConnectionId::new(1),
+            Duration::from_secs(60),
+            Some(cap),
+            &mut commands,
+            &mut end,
+        )
+        .await;
+        assert!(
+            matches!(late, Warm::Failed(failure) if failure.detail.contains("configuration warm-up deadline"))
+        );
+        finish_timing_child(child).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn config_delivery_swap_adapter_healthy_probe_cannot_extend_the_spawn_budget() {
+        let ConfigTimingFixture {
+            dir: _dir,
+            runtime,
+            registry,
+            forwarding,
+            child,
+            mut receiver,
+        } = config_timing_fixture();
+        let cap = config_candidate_deadline(&runtime, &child).unwrap();
+        tokio::time::advance(Duration::from_secs(15)).await;
+        for late in [false, true] {
+            let (runtime, registry, table) =
+                (runtime.clone(), registry.clone(), forwarding.clone());
+            let probe = tokio::spawn(async move {
+                probe_candidate(
+                    "timed",
+                    &runtime,
+                    &registry,
+                    &table,
+                    Some(cap),
+                    ConnectionId::new(2),
+                )
+                .await
+            });
+            let frame = receiver.recv().await.unwrap();
+            tokio::time::advance(if late {
+                Duration::from_nanos(1)
+            } else {
+                Duration::from_secs(2) - Duration::from_nanos(1)
+            })
+            .await;
+            forwarding
+                .complete_module_control_rpc(
+                    ConnectionId::new(2),
+                    frame.header.corr,
+                    Some(MODULE_CONTROL_OP_HEALTH_CHECK),
+                    ModuleControlRpcOutcome::Response(
+                        subc_protocol::session::ModuleControlResponse::HealthCheck {
+                            status: HealthStatus::Ok,
+                            detail: None,
+                            metrics: None,
+                        },
+                    ),
+                )
+                .unwrap();
+            assert_eq!(
+                probe.await.unwrap().is_err(),
+                late,
+                "only the healthy response strictly before the warm-up edge qualifies"
+            );
+        }
+        finish_timing_child(child).await;
+    }
 
     #[cfg(unix)]
     #[tokio::test]

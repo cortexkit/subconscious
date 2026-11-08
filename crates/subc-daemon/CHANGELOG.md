@@ -22,6 +22,13 @@
   recorded. Waiting spends no extra crash budget; intentional restarts preserve
   pending configuration, and a failed first generation stays stopped.
 
+- Refuse route-policy changes until a trusted policy installer is supplied.
+  Retain reversible installations until the generation is durably active, and
+  restore the captured policy before publishing a failed generation.
+- Serialize final approval publication with module cutover, after operator
+  presence. Bound swap configuration readiness from the original launch, and
+  leave connections open when a configuration response cannot flush in time.
+
 ## 0.41.9
 
 - Bind desktop approval to the complete immutable plan actually flushed to the

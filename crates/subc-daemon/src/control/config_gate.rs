@@ -187,11 +187,20 @@ impl ControlHandler {
                                 })?;
                         }
                     }
-                    match tokio::time::timeout(
-                        CONFIG_LIVE_ACK_TIMEOUT,
-                        ctx.egress.send_flushed(response),
-                    )
-                    .await
+                    let write_deadline = runtime
+                        .delivery_window(connection)
+                        .ok()
+                        .flatten()
+                        .filter(|window| selected == Some((window.generation, window.attempt)))
+                        .and_then(|window| window.deadline)
+                        .map_or(
+                            tokio::time::Instant::now() + CONFIG_LIVE_ACK_TIMEOUT,
+                            |deadline| {
+                                deadline.min(tokio::time::Instant::now() + CONFIG_LIVE_ACK_TIMEOUT)
+                            },
+                        );
+                    match tokio::time::timeout_at(write_deadline, ctx.egress.send_flushed(response))
+                        .await
                     {
                         Ok(Ok(())) => {}
                         failed => {
@@ -208,16 +217,12 @@ impl ControlHandler {
                             }
                             return match failed {
                                 Ok(Err(error)) => Err(error),
-                                _ => Err(RouterError::backend(
-                                    0,
-                                    frame.header.corr,
-                                    "configuration delivery timed out",
-                                )),
+                                _ => Ok(vec![]),
                             };
                         }
                     }
-                    let module = registration.manifest.module_id;
-                    config_work(runtime, move |owner| {
+                    let module = registration.manifest.module_id.clone();
+                    let delivered = config_work(runtime.clone(), move |owner| {
                         owner.module_view_delivered(
                             connection,
                             &module,
@@ -226,10 +231,28 @@ impl ControlHandler {
                             active,
                         )
                     })
-                    .await
-                    .map_err(|error| {
-                        RouterError::backend(0, frame.header.corr, error.to_string())
-                    })?;
+                    .await;
+                    if let Err(error) = delivered {
+                        if error.code == "delivery_expired" {
+                            if active {
+                                if let Some((generation, attempt)) = selected {
+                                    let _ = runtime.delivery_timeout(
+                                        connection,
+                                        &registration.manifest.module_id,
+                                        generation,
+                                        attempt,
+                                    );
+                                    runtime.notify_delivery_changed();
+                                }
+                            }
+                        } else {
+                            return Err(RouterError::backend(
+                                0,
+                                frame.header.corr,
+                                error.to_string(),
+                            ));
+                        }
+                    }
                     Ok(vec![])
                 } else {
                     Ok(vec![response])
@@ -491,8 +514,9 @@ impl ControlHandler {
                 };
                 let operation = self.supervisor.operation_lock();
                 let _operation = operation.lock().await;
-                let facts = self.config_approval_facts(ctx).await;
                 let attempt = challenge.attempt();
+                let _module_gates = runtime.approval_commit_gates(attempt).await?;
+                let facts = self.config_approval_facts(ctx).await;
                 let now = now_ms();
                 let generation = config_work(runtime, move |owner| {
                     owner.finish_approval(attempt, &facts, reply, now)

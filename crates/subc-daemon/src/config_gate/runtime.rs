@@ -168,6 +168,10 @@ struct OwnerState {
     // Only a successfully flushed complete plan on this connection can bind
     // its desktop approval. A later view replaces the connection's old view.
     desktop_views: BTreeMap<u64, (Digest, u64)>,
+    phone_waiters: BTreeMap<u64, tokio::sync::oneshot::Sender<()>>,
+    approval_requests: HashMap<(ConnectionId, u64), u64>,
+    phone_withdrawals: VecDeque<phone::PhoneWithdrawal>,
+    phone_withdrawing: HashMap<ConnectionId, usize>,
     delivery: delivery::DeliveryState,
     anchor_retry: super::anchor_retry::AnchorRetry,
     // Keep the original objects alive through approval so an unlinked file's
@@ -316,6 +320,9 @@ pub(crate) mod delivery;
 #[path = "route_policy.rs"]
 mod route_policy;
 
+#[path = "phone.rs"]
+mod phone;
+
 impl RuntimeOwner {
     #[cfg(feature = "test-support")]
     pub(crate) fn pause_spawn_before_exec(&self) -> Result<()> {
@@ -371,6 +378,10 @@ impl RuntimeOwner {
                 _writer_lock: None,
                 plan_deadlines: BTreeMap::new(),
                 desktop_views: BTreeMap::new(),
+                phone_waiters: BTreeMap::new(),
+                approval_requests: HashMap::new(),
+                phone_withdrawals: VecDeque::new(),
+                phone_withdrawing: HashMap::new(),
                 delivery: delivery::DeliveryState::new(initial_generation),
                 anchor_retry: super::anchor_retry::AnchorRetry::default(),
                 retained_plan_files: BTreeMap::new(),
@@ -475,12 +486,18 @@ impl RuntimeOwner {
     pub fn disconnected(&self, connection: ConnectionId) {
         self.notify_delivery_changed();
         if let Ok(mut state) = self.inner.lock() {
+            state.invalidate_phone(connection);
             state.desktop_views.remove(&connection.get());
             state.delivery.disconnected(connection);
             for digest in state.gate.connection_approval_digests(connection.get()) {
                 state.reviewed(&digest, Instant::now());
             }
-            state.gate.cancel_connection_approvals(connection.get());
+            for attempt in state.gate.cancel_connection_approvals(connection.get()) {
+                state.phone_waiters.remove(&attempt);
+            }
+            state
+                .approval_requests
+                .retain(|(caller, _), _| *caller != connection);
             state.declarations.remove(&connection);
             state
                 .active_declarations
@@ -956,7 +973,7 @@ impl RuntimeOwner {
         &self,
         attempt: u64,
     ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
-        let modules = self.lock()?.gate.approval_modules(attempt)?;
+        let modules = self.lock()?.gate.approval_gate_modules(attempt)?;
         let mut guards = Vec::with_capacity(modules.len());
         for module in modules {
             guards.push(self.module_gate(&module)?.lock_owned().await);

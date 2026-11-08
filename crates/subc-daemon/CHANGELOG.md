@@ -2,6 +2,11 @@
 
 ## 0.41.10
 
+- Relay immutable `consent/v1` approval cards only through the policy-enabled,
+  admitted active phone module. Bind each card to its daemon-allocated request
+  correlation, bound the entire attempt to five minutes, and withdraw unanswered
+  or invalidated cards with channel-zero Cancel without closing the module's
+  other routes.
 - Build rollback plans from retained byte-exact configuration and freshly
   captured programs at the restored paths. Show when a program changed since
   the selected generation, preserve edited files as proposals, and refuse

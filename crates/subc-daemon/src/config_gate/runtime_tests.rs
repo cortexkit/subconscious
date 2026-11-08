@@ -947,3 +947,64 @@ fn config_owner_open_approval_prevents_expiry_and_failed_reply_keeps_plan_for_an
     state.expire_idle(deadline);
     assert!(state.gate.plan_modules(&view.digest).is_err());
 }
+
+#[test]
+fn config_phone_disconnect_refreshes_the_preserved_plans_idle_deadline() {
+    let rig = Rig::new();
+    let path = rig.path.join("cortexkit/a.jsonc");
+    std::fs::write(
+        &path,
+        br#"{"credential":{"vault_ref":"safe-reference"},"limit":1}"#,
+    )
+    .unwrap();
+    let owner = rig.owner("phone-expiry");
+    rig.declare(&owner, 10);
+    rig.stamp(&owner);
+    std::fs::write(
+        &path,
+        br#"{"credential":{"vault_ref":"safe-reference"},"limit":2}"#,
+    )
+    .unwrap();
+    let view = owner
+        .finish_plan(owner.prepare(PlanKind::Change).unwrap(), daemon_review)
+        .unwrap();
+    let mut facts = Rig::facts();
+    facts.desktop_app = false;
+    facts.attested_operator_app = false;
+    facts.os_prompt_available = false;
+    facts.phone = Some(super::super::PhoneSurface {
+        module_id: "callosum".into(),
+        connection: 90,
+        spawn_generation: 1,
+        enabled_by_policy: true,
+        opted_in: true,
+        approved_declaration: true,
+        reserved: true,
+        nonce_verified: true,
+        program_admitted: true,
+        active_registration: true,
+    });
+    let challenge = owner.begin_approval(&view.digest, &facts).unwrap();
+    let mut invalidated = owner
+        .bind_phone_rpc(challenge.attempt(), ConnectionId::new(90), 12)
+        .unwrap();
+    let old_deadline = Instant::now() - Duration::from_secs(1);
+    owner
+        .inner
+        .lock()
+        .unwrap()
+        .plan_deadlines
+        .insert(view.digest.clone(), old_deadline);
+    owner.disconnected(ConnectionId::new(90));
+    assert_eq!(
+        invalidated.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+    );
+    let mut state = owner.inner.lock().unwrap();
+    assert!(!state.gate.has_open_approval(&view.digest));
+    state.expire_idle(old_deadline);
+    assert!(
+        state.gate.plan_modules(&view.digest).is_ok(),
+        "phone disconnect must start a new idle hour, not expire the just-withdrawn plan"
+    );
+}

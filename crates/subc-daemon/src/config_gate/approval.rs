@@ -4,6 +4,9 @@ use subc_config::{Digest, RecordedValue};
 use subc_protocol::consent::{ConsentRequest, ConsentResponse};
 
 use super::{ConfigGate, GateError, GateSnapshot, InputKey, PendingPlan, PlanKind, Result};
+
+/// One phone card may wait for five minutes, including its outbound write.
+pub const CONFIG_PHONE_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 use crate::config_store::ConfigStore;
 
 /// Observed facts from the active registration, its approved declaration/entry,
@@ -79,7 +82,7 @@ pub enum ApprovalChallenge {
     Phone {
         attempt: u64,
         connection: u64,
-        correlation: u64,
+        deadline: tokio::time::Instant,
         request: Box<ConsentRequest>,
     },
 }
@@ -123,6 +126,7 @@ pub(super) enum Surface {
     Phone {
         facts: PhoneSurface,
         request: Box<ConsentRequest>,
+        correlation: Option<u64>,
     },
 }
 pub(super) struct Attempt {
@@ -257,9 +261,27 @@ impl ConfigGate {
         self.plan_modules(&attempt.digest)
     }
 
-    pub(crate) fn cancel_connection_approvals(&mut self, connection: u64) {
+    pub(crate) fn approval_gate_modules(
+        &self,
+        attempt: u64,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let pending = self.attempts.get(&attempt).ok_or_else(unavailable)?;
+        let mut modules = self.plan_modules(&pending.digest)?;
+        if matches!(pending.surface, Surface::Phone { .. }) {
+            modules.insert("callosum".into());
+        }
+        Ok(modules)
+    }
+
+    pub(crate) fn cancel_connection_approvals(&mut self, connection: u64) -> Vec<u64> {
+        let ids = self
+            .attempts
+            .iter()
+            .filter_map(|(id, attempt)| (attempt.caller == connection).then_some(*id))
+            .collect();
         self.attempts
             .retain(|_, attempt| attempt.caller != connection);
+        ids
     }
     /// Select a required surface. Legacy `log` policy and operator-app shortcuts
     /// are deliberately absent: neither proves review of an immutable plan.
@@ -322,11 +344,12 @@ impl ConfigGate {
                 Surface::Phone {
                     facts: phone.clone(),
                     request: request.clone(),
+                    correlation: None,
                 },
                 ApprovalChallenge::Phone {
                     attempt: id,
                     connection: phone.connection,
-                    correlation: id,
+                    deadline: tokio::time::Instant::now() + CONFIG_PHONE_APPROVAL_TIMEOUT,
                     request,
                 },
             )
@@ -388,6 +411,7 @@ impl ConfigGate {
                 Surface::Phone {
                     facts: sent,
                     request,
+                    correlation: sent_correlation,
                 },
                 ApprovalReply::Phone {
                     connection,
@@ -400,7 +424,10 @@ impl ConfigGate {
                     .as_ref()
                     .filter(|phone| phone.trusted())
                     .ok_or_else(unavailable)?;
-                if current != sent || connection != sent.connection || correlation != attempt {
+                if current != sent
+                    || connection != sent.connection
+                    || Some(correlation) != *sent_correlation
+                {
                     return Err(unavailable());
                 }
                 let response = response.ok_or_else(declined)?;
@@ -418,6 +445,38 @@ impl ConfigGate {
         Self::fresh(plan, store, current)?;
         before_commit();
         self.commit(&pending.digest, channel, store, current, now_ms)
+    }
+
+    /// Bind the transport's allocated correlation exactly once, before sending.
+    /// Attempt ids and endpoint-scoped wire correlations are different counters.
+    pub(crate) fn bind_phone_rpc(
+        &mut self,
+        attempt: u64,
+        connection: u64,
+        correlation: u64,
+    ) -> Result<()> {
+        let pending = self.attempts.get_mut(&attempt).ok_or_else(unavailable)?;
+        match &mut pending.surface {
+            Surface::Phone {
+                facts,
+                correlation: bound,
+                ..
+            } if facts.connection == connection && bound.is_none() => {
+                *bound = Some(correlation);
+                Ok(())
+            }
+            _ => Err(unavailable()),
+        }
+    }
+
+    pub(crate) fn cancel_approval(&mut self, attempt: u64) {
+        self.attempts.remove(&attempt);
+    }
+
+    pub(crate) fn phone_approval_digests(&self, connection: u64) -> Vec<Digest> {
+        self.attempts.values().filter(|attempt| {
+            matches!(&attempt.surface, Surface::Phone { facts, .. } if facts.connection == connection)
+        }).map(|attempt| attempt.digest.clone()).collect()
     }
 
     /// The owner wakes each waiting client with surface-unavailable when the

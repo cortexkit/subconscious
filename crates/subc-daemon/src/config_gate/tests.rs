@@ -116,14 +116,17 @@ impl Rig {
         let reply = match &challenge {
             ApprovalChallenge::Phone {
                 connection,
-                correlation,
                 request,
                 ..
-            } => ApprovalReply::Phone {
-                connection: *connection,
-                correlation: *correlation,
-                response: Some(ConsentResponse::new(request, ConsentDecision::Approved)),
-            },
+            } => {
+                self.gate
+                    .bind_phone_rpc(challenge.attempt(), *connection, 0)?;
+                ApprovalReply::Phone {
+                    connection: *connection,
+                    correlation: 0,
+                    response: Some(ConsentResponse::new(request, ConsentDecision::Approved)),
+                }
+            }
             _ => ApprovalReply::Presence(PresenceDecision::InteractiveApproval),
         };
         self.gate.finish_approval(
@@ -371,12 +374,16 @@ fn approval_phone_reply_binds_connection_request_digest_vector_and_revision() {
         let ApprovalChallenge::Phone {
             attempt,
             mut connection,
-            mut correlation,
             request,
+            ..
         } = challenge
         else {
             panic!("phone card required")
         };
+        let mut correlation = 73;
+        rig.gate
+            .bind_phone_rpc(attempt, connection, correlation)
+            .unwrap();
         assert!(request.is_consistent());
         let mut response = ConsentResponse::new(&request, ConsentDecision::Approved);
         match fault {
@@ -416,6 +423,52 @@ fn approval_phone_reply_binds_connection_request_digest_vector_and_revision() {
 }
 
 #[test]
+fn approval_phone_cannot_complete_without_a_bound_wire_request() {
+    let mut rig = Rig::new();
+    rig.stamp();
+    rig.edit(layer("a", "user"), json!(20));
+    let view = rig.change(false);
+    let caller = facts(false);
+    let challenge = rig
+        .gate
+        .begin_approval(&view.digest, &mut rig.store, &rig.current, &caller)
+        .unwrap();
+    let ApprovalChallenge::Phone {
+        attempt,
+        connection,
+        request,
+        ..
+    } = challenge
+    else {
+        panic!("phone required")
+    };
+    assert_eq!(
+        rig.gate
+            .finish_approval(
+                attempt,
+                ApprovalReply::Phone {
+                    connection,
+                    correlation: attempt,
+                    response: Some(ConsentResponse::new(&request, ConsentDecision::Approved)),
+                },
+                &mut rig.store,
+                &rig.current,
+                &caller,
+                1
+            )
+            .unwrap_err()
+            .code,
+        "approval_surface_unavailable"
+    );
+    assert_eq!(rig.store.body().unwrap().last_generation, 1);
+    assert_eq!(
+        rig.approve(&view, &caller).unwrap(),
+        2,
+        "a rejected unbound answer must not consume the pending plan"
+    );
+}
+
+#[test]
 fn approval_unanswered_declined_and_disconnected_leave_plan_pending() {
     let mut rig = Rig::new();
     rig.stamp();
@@ -429,12 +482,15 @@ fn approval_unanswered_declined_and_disconnected_leave_plan_pending() {
     let ApprovalChallenge::Phone {
         attempt,
         connection,
-        correlation,
         ..
     } = challenge
     else {
         panic!("phone")
     };
+    let correlation = 0;
+    rig.gate
+        .bind_phone_rpc(attempt, connection, correlation)
+        .unwrap();
     assert_eq!(
         rig.gate
             .finish_approval(

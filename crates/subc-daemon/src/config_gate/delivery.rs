@@ -945,6 +945,7 @@ impl RuntimeOwner {
                 .get(&connection)
                 .is_some_and(|(id, _)| id == module)
             {
+                state.phone_target_changed(module, connection);
                 state.active_declarations.insert(module.into(), connection);
             }
             return Ok(None);
@@ -1020,6 +1021,7 @@ impl RuntimeOwner {
         let catchup = pending.is_none()
             && versions.active.is_some()
             && state.delivery.served.get(&connection) != Some(&vector);
+        state.phone_target_changed(module, connection);
         state.active_declarations.insert(id, connection);
         state.delivery.attempts.remove(&connection);
         let Some(generation) = pending.or_else(|| catchup.then_some(versions.active).flatten())

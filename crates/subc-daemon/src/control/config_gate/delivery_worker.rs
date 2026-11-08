@@ -32,6 +32,15 @@ impl ControlHandler {
                         break;
                     };
                     let next = owner.retry_anchor().ok().flatten();
+                    for withdrawal in owner.take_phone_withdrawals() {
+                        let owner = Arc::downgrade(owner);
+                        tasks.spawn(async move {
+                            let _ = withdrawal.sink.send_flushed(withdrawal.frame).await;
+                            if let Some(owner) = owner.upgrade() {
+                                owner.phone_withdrawn(withdrawal.connection);
+                            }
+                        });
+                    }
                     for exited in owner.delivery_exits().unwrap_or_default() {
                         let module = exited.module.clone();
                         if recording

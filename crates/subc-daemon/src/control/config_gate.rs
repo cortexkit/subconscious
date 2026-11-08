@@ -2,6 +2,7 @@ use subc_control::config::{ConfigControlRequest, ConfigControlResponse};
 
 use super::*;
 mod delivery_worker;
+mod phone;
 
 /// Bound each immutable module review so an unanswered request cannot approve a plan.
 const CONFIG_REVIEW_TIMEOUT: Duration = Duration::from_secs(30);
@@ -487,6 +488,13 @@ impl ControlHandler {
                         error
                     }
                 })?;
+                let _attempt_guard =
+                    phone::ApprovalAttemptGuard::new(&runtime, challenge.attempt());
+                runtime.track_approval_request(
+                    challenge.attempt(),
+                    ctx.connection_id,
+                    frame.header.corr,
+                )?;
                 let reply = match &challenge {
                     ApprovalChallenge::Desktop { .. } | ApprovalChallenge::OsPrompt { .. } => {
                         ApprovalReply::Presence(
@@ -494,11 +502,20 @@ impl ControlHandler {
                                 .await,
                         )
                     }
-                    ApprovalChallenge::Phone { .. } => {
-                        return Err(GateError::new(
-                            "approval_surface_unavailable",
-                            "phone approval relay is not connected",
-                        ))
+                    ApprovalChallenge::Phone {
+                        attempt,
+                        connection,
+                        deadline,
+                        request,
+                    } => {
+                        self.config_phone_rpc(
+                            &runtime,
+                            *attempt,
+                            ConnectionId::new(*connection),
+                            *deadline,
+                            request,
+                        )
+                        .await?
                     }
                 };
                 let operation = self.supervisor.operation_lock();
@@ -628,9 +645,69 @@ impl ControlHandler {
                 self.forwarding.operator_confirms().config_gate_ready(),
                 crate::config_gate::os_prompt_policy_present(),
             ),
-            phone: None,
+            phone: self.config_phone_surface().await,
             caller: self.resolve_caller(ctx.connection_id).await,
         }
+    }
+
+    // The caller holds Callosum's module gate while allocating its RPC or
+    // committing approval. This snapshot grants nothing until revalidated there.
+    async fn config_phone_surface(&self) -> Option<crate::config_gate::PhoneSurface> {
+        if !self.operator_app_policy.phone_enabled {
+            return None;
+        }
+        let runtime = self.config_runtime.as_ref()?;
+        let (_, registrations) = self.registry.list_modules_with_nonce_verification().ok()?;
+        let (registration, verified) = registrations
+            .into_iter()
+            .find(|(registration, _)| registration.manifest.module_id == "callosum")?;
+        if !verified
+            || !registration.ready
+            || !registration
+                .control_ops
+                .iter()
+                .any(|op| op == subc_protocol::consent::CONSENT_V1)
+        {
+            return None;
+        }
+        self.config_review_admission.check(&registration).ok()?;
+        let module = self.supervisor.get("callosum")?;
+        let status = module.status().ok()?;
+        let (spec, _) = module.configuration().ok()?;
+        let nonce = self.supervisor.spawn_launch_nonce_for("callosum")?;
+        if !self
+            .hello_launch_nonces
+            .lock()
+            .ok()?
+            .presented(registration.connection_id, Some(&nonce))
+            || !spec.reserved
+            || !status.enabled
+            || !status.process_alive
+            || !status.registration_active
+        {
+            return None;
+        }
+        let connection = registration.connection_id;
+        let approved = config_work(runtime.clone(), move |owner| {
+            owner.approved_phone_entry(connection)
+        })
+        .await
+        .ok()??;
+        if !approved.enabled || approved.module_spec() != spec {
+            return None;
+        }
+        Some(crate::config_gate::PhoneSurface {
+            module_id: "callosum".into(),
+            connection: connection.get(),
+            spawn_generation: status.spawn_generation,
+            enabled_by_policy: true,
+            opted_in: true,
+            approved_declaration: true,
+            reserved: true,
+            nonce_verified: true,
+            program_admitted: true,
+            active_registration: true,
+        })
     }
 
     async fn config_rpc(

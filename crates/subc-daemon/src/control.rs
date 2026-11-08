@@ -2068,12 +2068,15 @@ impl ControlHandler {
             }
             FrameType::Goodbye => self.handle_goodbye(ctx.connection_id),
             FrameType::Cancel => {
-                // A Cancel on channel 0 names a waiting operator.confirm or a
-                // subscription. Successful cancellation has no ordinary reply.
+                // A Cancel on channel 0 withdraws a held approval or subscription.
+                // Successful cancellation has no ordinary reply.
                 if self
                     .forwarding
                     .operator_confirms()
                     .cancel(ctx.connection_id, frame.header.corr)
+                    || self.config_runtime.as_ref().is_some_and(|owner| {
+                        owner.cancel_approval_request(ctx.connection_id, frame.header.corr)
+                    })
                     || self
                         .supervisor
                         .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)
@@ -7627,7 +7630,7 @@ impl ControlHandler {
     ) -> Result<Vec<Frame>, RouterError> {
         let mut secondary_error = None;
         let outcome = match frame.header.ty {
-            FrameType::Response => match serde_json::from_slice::<ControlOpProbe>(&frame.body) {
+            FrameType::Response => match module_control_response_probe(&frame.body) {
                 Ok(probe) if probe.op == "route.bind" => {
                     match serde_json::from_slice::<ModuleControlResponse>(&frame.body) {
                         Ok(ModuleControlResponse::RouteBindAck {}) => {
@@ -7939,6 +7942,21 @@ enum ControlRequestBodyError {
 #[derive(Debug, Deserialize)]
 struct ControlOpProbe {
     op: String,
+}
+
+fn module_control_response_probe(body: &[u8]) -> Result<ControlOpProbe, serde_json::Error> {
+    serde_json::from_slice(body).or_else(|original| {
+        #[derive(Deserialize)]
+        struct ConsentProbe {
+            protocol: String,
+        }
+        match serde_json::from_slice::<ConsentProbe>(body) {
+            Ok(probe) if probe.protocol == subc_protocol::consent::CONSENT_V1 => {
+                Ok(ControlOpProbe { op: probe.protocol })
+            }
+            _ => Err(original),
+        }
+    })
 }
 
 /// Channel-0 push ops this subc version understands. A push whose `op` is not in

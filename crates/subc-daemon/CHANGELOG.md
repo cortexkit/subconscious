@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.41.4
+
+- Clarify the separation between redacted diagnostic captures and approved raw
+  delivery bytes, which may contain vault reference strings but never secrets.
+
 ## 0.41.3
 
 - Add immutable configuration planning and approval over the durable store,

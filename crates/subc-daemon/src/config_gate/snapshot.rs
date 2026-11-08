@@ -33,7 +33,9 @@ impl InputKey {
 
 /// `state` binds raw bytes AND retained file identity, including an absent-file
 /// marker. `value` is the parsed, secret-redacted view used in plans and history.
-/// The capturer must not place a credential or a vault reference in plaintext.
+/// This diagnostic capture never contains a credential or vault reference in
+/// plaintext. Separate approved delivery bytes may contain reference strings;
+/// literal secret values are refused before a plan or generation is retained.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CapturedInput {
     pub state: InputState,

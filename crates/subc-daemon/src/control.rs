@@ -6824,7 +6824,13 @@ impl ControlHandler {
             let launch_changed = *current_spec != configured_module.module_spec();
             let configuration_changed =
                 launch_changed || *current_health != configured_module.health;
-            let enabled_changed = *current_enabled != configured_module.enabled;
+            // Applying a rescan also replaces the recorded config value, even
+            // when an operator already put the runtime in the requested state.
+            let enabled_changed = *current_enabled != configured_module.enabled
+                || self
+                    .capability_evaluator
+                    .configured_enabled(module_id)
+                    .is_some_and(|enabled| enabled != configured_module.enabled);
             if configuration_changed {
                 configuration_changes.insert(module_id.clone());
             }
@@ -6956,7 +6962,7 @@ impl ControlHandler {
         }
 
         for module_id in configured.keys() {
-            let Some((module, _, _, _)) = current.get(module_id) else {
+            let Some((module, _, _, current_enabled)) = current.get(module_id) else {
                 continue;
             };
             let configured_module = configured
@@ -6976,7 +6982,9 @@ impl ControlHandler {
                         )
                     })?;
             }
-            if enabled_changes.contains(module_id) {
+            // Config-only drift is applied by the evaluator's config update;
+            // do not turn it into a runtime start or stop.
+            if *current_enabled != configured_module.enabled {
                 // A rescan that starts or stops a module applies an operator's
                 // edit to the config, so the resulting outage was asked for.
                 self.route_outages.mark_operator_action(module_id);

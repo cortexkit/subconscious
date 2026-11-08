@@ -326,6 +326,45 @@ async fn enable_edits_report_start_and_stop_and_a_health_edit_reports_reload() {
 }
 
 #[tokio::test]
+async fn config_only_enabled_drift_reports_no_runtime_action() {
+    let dir = ScratchDir::new("rescan-checked-config-enabled");
+    let rig = Rig::new(&dir.join("subc.jsonc"), "config-enabled");
+    rig.write(&doc(json!({"module": entry(true)})));
+    rig.apply_file().await;
+    rig.send(ClientControlRequest::SupervisorSetEnabled {
+        module_id: "module".into(),
+        enabled: false,
+    })
+    .await;
+    assert!(!rig.enabled("module"));
+    assert_eq!(
+        rig.handler
+            .capability_evaluator
+            .configured_enabled("module"),
+        Some(true)
+    );
+
+    let candidate = doc(json!({"module": entry(false)}));
+    let preview = rig.preview(&candidate).await.unwrap();
+    assert_eq!(preview.enabled_changes, ["module"]);
+    assert_eq!(preview.unchanged, 0);
+    assert!(preview.module_actions.is_empty());
+    rig.write(&candidate);
+    let applied = rig.apply(preview.expect.unwrap()).await.unwrap();
+    assert_eq!(applied.enabled_changes, ["module"]);
+    assert!(!rig.enabled("module"));
+    assert_eq!(
+        rig.handler
+            .capability_evaluator
+            .configured_enabled("module"),
+        Some(false)
+    );
+    let second_preview = rig.preview(&candidate).await.unwrap();
+    assert!(second_preview.enabled_changes.is_empty());
+    assert_eq!(second_preview.unchanged, 1);
+}
+
+#[tokio::test]
 async fn a_candidate_with_a_changed_top_level_section_reports_restart_required() {
     let dir = ScratchDir::new("rescan-checked-section");
     let rig = Rig::new(&dir.join("subc.jsonc"), "section");

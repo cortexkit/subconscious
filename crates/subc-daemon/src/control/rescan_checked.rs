@@ -326,7 +326,7 @@ impl ControlHandler {
                     (RescanModuleActionKind::Start, Vec::new())
                 }
                 (Some((_, _, _, true)), None) => (RescanModuleActionKind::Stop, Vec::new()),
-                (Some(_), Some(configured)) if plan.enabled_changes.contains(module_id) => {
+                (Some((_, _, _, enabled)), Some(configured)) if *enabled != configured.enabled => {
                     if configured.enabled {
                         (RescanModuleActionKind::Start, Vec::new())
                     } else {

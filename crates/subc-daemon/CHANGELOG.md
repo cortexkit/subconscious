@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.41.1
+
+- Report recorded configuration enabled-state changes in rescan previews even
+  when the module is already in the requested runtime state.
+
 ## 0.41.0
 
 - Keep carried Unix children behind a serialized, bounded pre-exec admission

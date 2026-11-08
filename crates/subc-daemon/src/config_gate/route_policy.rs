@@ -206,7 +206,7 @@ impl RuntimeOwner {
     /// starts, if this generation requires one. Only saved approved bytes are
     /// passed to the policy adapter.
     pub(crate) async fn install_approved_route_policy(
-        &self,
+        self: &std::sync::Arc<Self>,
         module: &str,
         generation: u64,
     ) -> Result<()> {
@@ -216,45 +216,71 @@ impl RuntimeOwner {
                 "config_gated: RoutePolicyAuthority is absent",
             )
         })?;
-        let (policy, previous_generation) = {
-            let mut state = self.lock()?;
-            state.store.delivery_ready()?;
-            if ready(&mut state, module, generation)? {
-                return Ok(());
-            }
-            let body = state.store.body()?;
-            if !body.versions.iter().any(|(tuple, versions)| {
-                tuple.module == module
-                    && tuple.project.is_none()
-                    && (versions.pending == Some(generation) || versions.active == Some(generation))
-            }) {
-                return Err(GateError::new(
-                    "delivery_superseded",
-                    "route policy generation is no longer pending",
-                ));
-            }
-            let previous_generation = body
-                .versions
-                .iter()
-                .find(|(tuple, _)| tuple.module == module && tuple.project.is_none())
-                .and_then(|(_, versions)| versions.active);
-            let entry = body.generations.get(&generation).ok_or_else(|| {
-                GateError::new("config_gated", "approved route policy generation is absent")
-            })?;
-            (
-                ApprovedRoutePolicy {
-                    module: module.into(),
-                    generation,
-                    digest: entry.generation.plan_digest.clone(),
-                    changeset: entry.generation.changeset.clone(),
-                    delivery: entry.delivery.clone().ok_or_else(|| {
-                        GateError::new("config_gated", "approved route policy bytes are absent")
-                    })?,
-                },
-                previous_generation,
-            )
+        let module_id = module.to_owned();
+        let prepared = self
+            .on_blocking(move |owner| owner.prepare_route_policy(&module_id, generation))
+            .await?;
+        let Some((policy, previous_generation)) = prepared else {
+            return Ok(());
         };
         let installation = authority.install_and_revoke(policy).await?;
+        let module = module.to_owned();
+        self.on_blocking(move |owner| {
+            owner.finish_route_policy(&module, generation, previous_generation, installation)
+        })
+        .await
+    }
+
+    fn prepare_route_policy(
+        &self,
+        module: &str,
+        generation: u64,
+    ) -> Result<Option<(ApprovedRoutePolicy, Option<u64>)>> {
+        let mut state = self.lock()?;
+        state.store.delivery_ready()?;
+        if ready(&mut state, module, generation)? {
+            return Ok(None);
+        }
+        let body = state.store.body()?;
+        if !body.versions.iter().any(|(tuple, versions)| {
+            tuple.module == module
+                && tuple.project.is_none()
+                && (versions.pending == Some(generation) || versions.active == Some(generation))
+        }) {
+            return Err(GateError::new(
+                "delivery_superseded",
+                "route policy generation is no longer pending",
+            ));
+        }
+        let previous_generation = body
+            .versions
+            .iter()
+            .find(|(tuple, _)| tuple.module == module && tuple.project.is_none())
+            .and_then(|(_, versions)| versions.active);
+        let entry = body.generations.get(&generation).ok_or_else(|| {
+            GateError::new("config_gated", "approved route policy generation is absent")
+        })?;
+        Ok(Some((
+            ApprovedRoutePolicy {
+                module: module.into(),
+                generation,
+                digest: entry.generation.plan_digest.clone(),
+                changeset: entry.generation.changeset.clone(),
+                delivery: entry.delivery.clone().ok_or_else(|| {
+                    GateError::new("config_gated", "approved route policy bytes are absent")
+                })?,
+            },
+            previous_generation,
+        )))
+    }
+
+    fn finish_route_policy(
+        &self,
+        module: &str,
+        generation: u64,
+        previous_generation: Option<u64>,
+        installation: RoutePolicyInstallation,
+    ) -> Result<()> {
         {
             let mut state = self.lock()?;
             if !state

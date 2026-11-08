@@ -39,8 +39,27 @@ impl ControlHandler {
                     let Some(owner) = &control.config_runtime else {
                         break;
                     };
-                    let next = owner.retry_anchor().ok().flatten();
-                    for withdrawal in owner.take_phone_withdrawals() {
+                    let Ok((next, withdrawals, exits, pending, recoveries)) = owner
+                        .on_blocking(|owner| {
+                            let next = owner.retry_anchor().ok().flatten();
+                            let withdrawals = owner.take_phone_withdrawals();
+                            let exits = owner.delivery_exits().unwrap_or_default();
+                            let pending = owner
+                                .pending_config_restarts()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|(module, _)| {
+                                    owner.delivery_exit_fence(module).ok().flatten().is_none()
+                                })
+                                .collect::<Vec<_>>();
+                            let recoveries = owner.delivery_take_recoveries().unwrap_or_default();
+                            Ok((next, withdrawals, exits, pending, recoveries))
+                        })
+                        .await
+                    else {
+                        break;
+                    };
+                    for withdrawal in withdrawals {
                         let owner = Arc::downgrade(owner);
                         tasks.spawn(async move {
                             let _ = withdrawal.sink.send_flushed(withdrawal.frame).await;
@@ -49,7 +68,7 @@ impl ControlHandler {
                             }
                         });
                     }
-                    for exited in owner.delivery_exits().unwrap_or_default() {
+                    for exited in exits {
                         let module = exited.module.clone();
                         if recording
                             .lock()
@@ -67,12 +86,9 @@ impl ControlHandler {
                             });
                         }
                     }
-                    if let Ok(pending) = owner.pending_config_restarts() {
+                    {
                         restarting.retain(|entry| pending.contains(entry));
                         for (module, generation) in pending {
-                            if owner.delivery_exit_fence(&module).ok().flatten().is_some() {
-                                continue;
-                            }
                             if let Some(supervised) = control.supervisor.get(&module) {
                                 if restarting.insert((module.clone(), generation)) {
                                     tasks.spawn(async move {
@@ -112,9 +128,7 @@ impl ControlHandler {
                             tasks.spawn(module_worker(handler.clone(), registration, wake));
                         }
                     }
-                    for (connection, module, disposition) in
-                        owner.delivery_take_recoveries().unwrap_or_default()
-                    {
+                    for (connection, module, disposition) in recoveries {
                         if matches!(
                             disposition,
                             AppliedDisposition::Failed {
@@ -170,7 +184,14 @@ async fn module_worker(
                 break;
             };
             let mut _guard = gate.lock().await;
-            if owner.delivery_exit_fence(module).ok().flatten().is_some() {
+            if module_work(owner, module, |owner, module| {
+                owner.delivery_exit_fence(&module)
+            })
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+            {
                 drop(_guard);
                 drop(control);
                 wake.notified().await;
@@ -191,17 +212,24 @@ async fn module_worker(
             else {
                 break;
             };
-            let view = owner.module_get(
-                registration.connection_id,
-                module,
-                subc_protocol::config::ConfigGetRequest::new(),
-            );
+            let connection = registration.connection_id;
+            let view = module_work(owner, module, move |owner, module| {
+                owner.module_get(
+                    connection,
+                    &module,
+                    subc_protocol::config::ConfigGetRequest::new(),
+                )
+            })
+            .await;
             if let Ok(view) = view {
                 if let Some(pending) = view.pending {
                     if let Some(attempt) = pending.attempt {
-                        if owner
-                            .route_policy_needed(module, pending.generation)
-                            .unwrap_or(true)
+                        let generation = pending.generation;
+                        if module_work(owner, module, move |owner, module| {
+                            owner.route_policy_needed(&module, generation)
+                        })
+                        .await
+                        .unwrap_or(true)
                         {
                             if let Err(error) = owner
                                 .install_approved_route_policy(module, pending.generation)
@@ -214,8 +242,9 @@ async fn module_worker(
                                 continue;
                             }
                         }
-                        if let Ok(Some((generation, attempt))) =
-                            owner.policy_probe_due(registration.connection_id)
+                        if let Ok(Some((generation, attempt))) = owner
+                            .on_blocking(move |owner| owner.policy_probe_due(connection))
+                            .await
                         {
                             let supervised = control.supervisor.get(module);
                             drop(_guard);
@@ -235,7 +264,8 @@ async fn module_worker(
                             continue;
                         }
                         let window = owner
-                            .delivery_window(registration.connection_id)
+                            .on_blocking(move |owner| owner.delivery_window(connection))
+                            .await
                             .ok()
                             .flatten();
                         if window.is_some_and(|window| !window.delivered) {
@@ -256,12 +286,16 @@ async fn module_worker(
                                 .ok()
                             });
                             if let Some(frame) = frame {
-                                let _ = owner.delivery_write_started(
-                                    registration.connection_id,
-                                    pending.generation,
-                                    attempt,
-                                    Instant::now(),
-                                );
+                                let _ = owner
+                                    .on_blocking(move |owner| {
+                                        owner.delivery_write_started(
+                                            connection,
+                                            generation,
+                                            attempt,
+                                            Instant::now(),
+                                        )
+                                    })
+                                    .await;
                                 let flush_deadline = window
                                     .and_then(|window| window.deadline)
                                     .map_or(Instant::now() + CONFIG_LIVE_ACK_TIMEOUT, |at| {
@@ -281,7 +315,8 @@ async fn module_worker(
                                     )
                                     .unwrap_or(false)
                                     && owner
-                                        .delivery_window(registration.connection_id)
+                                        .on_blocking(move |owner| owner.delivery_window(connection))
+                                        .await
                                         .ok()
                                         .flatten()
                                         .is_some_and(|window| {
@@ -294,29 +329,30 @@ async fn module_worker(
                                 match flushed {
                                     Ok(Ok(())) => {
                                         if owner
-                                            .delivery_written(
-                                                registration.connection_id,
-                                                pending.generation,
-                                                attempt,
-                                                flushed_at,
-                                            )
+                                            .on_blocking(move |owner| {
+                                                owner.delivery_written(
+                                                    connection, generation, attempt, flushed_at,
+                                                )
+                                            })
+                                            .await
                                             .is_err()
                                         {
-                                            let _ = owner.delivery_timeout(
-                                                registration.connection_id,
-                                                module,
-                                                pending.generation,
-                                                attempt,
-                                            );
+                                            let _ =
+                                                module_work(owner, module, move |owner, module| {
+                                                    owner.delivery_timeout(
+                                                        connection, &module, generation, attempt,
+                                                    )
+                                                })
+                                                .await;
                                         }
                                     }
                                     _ => {
-                                        let _ = owner.delivery_timeout(
-                                            registration.connection_id,
-                                            module,
-                                            pending.generation,
-                                            attempt,
-                                        );
+                                        let _ = module_work(owner, module, move |owner, module| {
+                                            owner.delivery_timeout(
+                                                connection, &module, generation, attempt,
+                                            )
+                                        })
+                                        .await;
                                     }
                                 }
                                 owner.notify_delivery_changed();
@@ -326,17 +362,21 @@ async fn module_worker(
                 }
             }
             let window = owner
-                .delivery_window(registration.connection_id)
+                .on_blocking(move |owner| owner.delivery_window(connection))
+                .await
                 .ok()
                 .flatten();
             match window {
                 Some(window) if window.deadline.is_some_and(|at| Instant::now() >= at) => {
-                    let _ = owner.delivery_timeout(
-                        registration.connection_id,
-                        module,
-                        window.generation,
-                        window.attempt,
-                    );
+                    let _ = module_work(owner, module, move |owner, module| {
+                        owner.delivery_timeout(
+                            connection,
+                            &module,
+                            window.generation,
+                            window.attempt,
+                        )
+                    })
+                    .await;
                     owner.notify_delivery_changed();
                     None
                 }
@@ -366,7 +406,10 @@ async fn record_exit(
     };
     let recorded = {
         let _guard = gate.lock().await;
-        owner.delivery_record_exit(&exited)
+        let exited = exited.clone();
+        owner
+            .on_blocking(move |owner| owner.delivery_record_exit(&exited))
+            .await
     };
     // The exit fence still prevents respawn. The supervisor must be able to
     // take the module gate for an earlier command before answering this hold.
@@ -381,7 +424,11 @@ async fn record_exit(
                 }
             }
             let _guard = gate.lock().await;
-            if let Err(error) = owner.delivery_release_exit(&exited) {
+            let exited_token = exited.clone();
+            if let Err(error) = owner
+                .on_blocking(move |owner| owner.delivery_release_exit(&exited_token))
+                .await
+            {
                 warn!(module_id=%exited.module, %error, "configuration exit fence could not be released");
             }
         }
@@ -389,4 +436,15 @@ async fn record_exit(
             warn!(module_id=%exited.module, %error, "configuration exit failure could not be recorded")
         }
     }
+}
+
+async fn module_work<T: Send + 'static>(
+    owner: &Arc<crate::config_gate::runtime::RuntimeOwner>,
+    module: &str,
+    work: impl FnOnce(Arc<crate::config_gate::runtime::RuntimeOwner>, String) -> Result<T, GateError>
+        + Send
+        + 'static,
+) -> Result<T, GateError> {
+    let module = module.to_owned();
+    owner.on_blocking(move |owner| work(owner, module)).await
 }

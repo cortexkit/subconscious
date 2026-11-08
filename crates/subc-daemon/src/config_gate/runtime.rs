@@ -28,6 +28,11 @@ pub struct RuntimeOwner {
     delivery_changed: std::sync::Arc<tokio::sync::Notify>,
     route_policy_authority: Option<std::sync::Arc<dyn RoutePolicyAuthority>>,
     canceled_approvals: Mutex<Vec<u64>>,
+    // Reader and Drop callbacks must not wait behind a keychain or disk check.
+    // These short queues/indexes never perform store I/O while locked.
+    approval_request_index: Mutex<HashMap<(ConnectionId, u64), u64>>,
+    disconnected_pending: Mutex<Vec<ConnectionId>>,
+    phone_withdrawals: Mutex<phone::PhoneWithdrawals>,
     #[cfg(test)]
     os_prompt_policy: std::sync::atomic::AtomicBool,
 }
@@ -216,8 +221,6 @@ struct OwnerState {
     desktop_views: BTreeMap<u64, (Digest, u64)>,
     phone_waiters: BTreeMap<u64, tokio::sync::oneshot::Sender<()>>,
     approval_requests: HashMap<(ConnectionId, u64), u64>,
-    phone_withdrawals: VecDeque<phone::PhoneWithdrawal>,
-    phone_withdrawing: HashMap<ConnectionId, usize>,
     delivery: delivery::DeliveryState,
     anchor_retry: super::anchor_retry::AnchorRetry,
     // Keep the original objects alive through approval so an unlinked file's
@@ -374,6 +377,17 @@ mod route_policy;
 mod phone;
 
 impl RuntimeOwner {
+    /// Keep store I/O and waits for its synchronous owner lock off runtime threads.
+    pub(crate) async fn on_blocking<T: Send + 'static>(
+        self: &std::sync::Arc<Self>,
+        work: impl FnOnce(std::sync::Arc<Self>) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let owner = self.clone();
+        tokio::task::spawn_blocking(move || work(owner))
+            .await
+            .map_err(|_| GateError::new("config_unavailable", "configuration worker stopped"))?
+    }
+
     #[cfg(feature = "test-support")]
     pub(crate) fn pause_spawn_before_exec(&self) -> Result<()> {
         let hooks = self.lock()?.store.test_support().cloned();
@@ -430,8 +444,6 @@ impl RuntimeOwner {
                 desktop_views: BTreeMap::new(),
                 phone_waiters: BTreeMap::new(),
                 approval_requests: HashMap::new(),
-                phone_withdrawals: VecDeque::new(),
-                phone_withdrawing: HashMap::new(),
                 delivery: delivery::DeliveryState::new(initial_generation),
                 anchor_retry: super::anchor_retry::AnchorRetry::default(),
                 retained_plan_files: BTreeMap::new(),
@@ -451,6 +463,9 @@ impl RuntimeOwner {
             delivery_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             route_policy_authority: None,
             canceled_approvals: Mutex::new(Vec::new()),
+            approval_request_index: Mutex::new(HashMap::new()),
+            disconnected_pending: Mutex::new(Vec::new()),
+            phone_withdrawals: Mutex::new(phone::PhoneWithdrawals::default()),
             #[cfg(test)]
             os_prompt_policy: std::sync::atomic::AtomicBool::new(false),
         }
@@ -485,6 +500,7 @@ impl RuntimeOwner {
             GateError::new("config_unavailable", "configuration owner lock is poisoned")
         })?;
         self.drain_canceled_approvals(&mut guard);
+        self.drain_disconnections(&mut guard);
         guard.expire_idle(Instant::now());
         Ok(guard)
     }
@@ -543,23 +559,13 @@ impl RuntimeOwner {
 
     pub fn disconnected(&self, connection: ConnectionId) {
         self.notify_delivery_changed();
-        if let Ok(mut state) = self.inner.lock() {
-            state.invalidate_phone(connection);
-            state.desktop_views.remove(&connection.get());
-            state.delivery.disconnected(connection);
-            for digest in state.gate.connection_approval_digests(connection.get()) {
-                state.reviewed(&digest, Instant::now());
-            }
-            for attempt in state.gate.cancel_connection_approvals(connection.get()) {
-                state.phone_waiters.remove(&attempt);
-            }
-            state
-                .approval_requests
-                .retain(|(caller, _), _| *caller != connection);
-            state.declarations.remove(&connection);
-            state
-                .active_declarations
-                .retain(|_, current| *current != connection);
+        if let Ok(mut state) = self.inner.try_lock() {
+            state.disconnected(connection);
+        } else if let Ok(mut pending) = self.disconnected_pending.lock() {
+            pending.push(connection);
+        }
+        if let Ok(mut index) = self.approval_request_index.lock() {
+            index.retain(|(caller, _), _| *caller != connection);
         }
     }
 
@@ -1028,10 +1034,12 @@ impl RuntimeOwner {
     /// Acquire only after interactive approval. Sorted module locks serialize
     /// the final freshness check and publication with target changes at cutover.
     pub(crate) async fn approval_commit_gates(
-        &self,
+        self: &std::sync::Arc<Self>,
         attempt: u64,
     ) -> Result<Vec<tokio::sync::OwnedMutexGuard<()>>> {
-        let modules = self.lock()?.gate.approval_gate_modules(attempt)?;
+        let modules = self
+            .on_blocking(move |owner| owner.lock()?.gate.approval_gate_modules(attempt))
+            .await?;
         let mut guards = Vec::with_capacity(modules.len());
         for module in modules {
             guards.push(self.module_gate(&module)?.lock_owned().await);
@@ -1081,6 +1089,7 @@ impl RuntimeOwner {
         };
         let facts = state.with_desktop_view(&digest, facts);
         self.drain_canceled_approvals(&mut state);
+        self.drain_disconnections(&mut state);
         let was_unstamped = state.store.status().state == StoreState::Unstamped;
         #[cfg(test)]
         let publication_hook = state.publication_hook.take();

@@ -533,8 +533,9 @@ fn assert_active(owner: &RuntimeOwner, connection: ConnectionId, generation: u64
 
 async fn mixed_waits_for_spawn(kinds: &[subc_config::ApplyKind], expected: &str) {
     let (rig, owner) = rig();
-    let owner =
-        owner.with_route_policy_authority(std::sync::Arc::new(FakeRouteAuthority::default()));
+    let owner = std::sync::Arc::new(
+        owner.with_route_policy_authority(std::sync::Arc::new(FakeRouteAuthority::default())),
+    );
     applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
     let plan = approve_kinds(&rig, &owner, kinds);
     let transition = &plan.plan.changeset.apply_plan["module_transitions"]["a"];
@@ -632,8 +633,9 @@ async fn config_delivery_mixed_live_and_next_supervision_defer_live_fields_in_pl
 #[tokio::test]
 async fn config_delivery_mixed_route_rebind_and_live_require_route_readiness_before_activation() {
     let (rig, owner) = rig();
-    let owner =
-        owner.with_route_policy_authority(std::sync::Arc::new(FakeRouteAuthority::default()));
+    let owner = std::sync::Arc::new(
+        owner.with_route_policy_authority(std::sync::Arc::new(FakeRouteAuthority::default())),
+    );
     applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
     let plan = approve_kinds(
         &rig,
@@ -833,6 +835,17 @@ fn worker_fixture() -> (
     std::sync::Arc<crate::ControlHandler>,
     Vec<tokio::sync::mpsc::Receiver<crate::router::OutboundFrame>>,
 ) {
+    worker_fixture_with_key(None)
+}
+
+fn worker_fixture_with_key(
+    key: Option<&crate::config_store::TestStoreKey>,
+) -> (
+    Rig,
+    std::sync::Arc<RuntimeOwner>,
+    std::sync::Arc<crate::ControlHandler>,
+    Vec<tokio::sync::mpsc::Receiver<crate::router::OutboundFrame>>,
+) {
     use std::sync::Arc;
     let rig = Rig::new();
     write(&rig, 1);
@@ -849,7 +862,10 @@ fn worker_fixture() -> (
         .unwrap(),
     )
     .unwrap();
-    let owner = Arc::new(rig.owner("hint-worker"));
+    let owner = Arc::new(match key {
+        Some(key) => sealed_owner(&rig, key, "hint-worker"),
+        None => rig.owner("hint-worker"),
+    });
     rig.declare(&owner, INCUMBENT.get());
     owner
         .declare(
@@ -904,6 +920,106 @@ fn worker_fixture() -> (
     (rig, owner, handler, receivers)
 }
 
+#[tokio::test]
+async fn config_delivery_io_worker_checks_keychain_and_store_hash_off_the_runtime_thread() {
+    let key = crate::config_store::TestStoreKey::default();
+    let (_rig, owner, handler, mut receivers) = worker_fixture_with_key(Some(&key));
+    let threads = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    owner
+        .lock()
+        .unwrap()
+        .store
+        .observe_io_threads(threads.clone());
+    let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
+    tokio::time::timeout(Duration::from_secs(5), receivers[0].recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let seen = threads.lock().unwrap();
+    assert!(seen.iter().any(|(op, _)| *op == "keychain_load"));
+    assert!(seen.iter().any(|(op, _)| *op == "store_hash"));
+    assert!(seen.iter().all(|(_, thread)| *thread != std::thread::current().id()),
+        "the real delivery worker must never check sealed authority on the async runtime thread: {seen:?}");
+}
+
+#[tokio::test]
+async fn config_delivery_io_get_checks_keychain_and_store_hash_off_the_runtime_thread() {
+    let key = crate::config_store::TestStoreKey::default();
+    let (_rig, owner, handler, _) = worker_fixture_with_key(Some(&key));
+    let threads = std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    owner
+        .lock()
+        .unwrap()
+        .store
+        .observe_io_threads(threads.clone());
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+    let context = crate::router::RouteCtx {
+        connection_id: INCUMBENT,
+        egress: crate::FrameSink::new(sender),
+    };
+    let frame = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Request,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        19,
+        serde_json::to_vec(&ConfigGetRequest::new()).unwrap(),
+    )
+    .unwrap();
+    let task = tokio::spawn(async move { handler.handle_control_frame(&context, frame).await });
+    let mut response = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    response.flushed.take().unwrap().send(()).unwrap();
+    assert!(task.await.unwrap().unwrap().is_empty());
+    let seen = threads.lock().unwrap();
+    assert!(seen.iter().any(|(op, _)| *op == "keychain_load"));
+    assert!(seen.iter().any(|(op, _)| *op == "store_hash"));
+    assert!(seen.iter().all(|(_, thread)| *thread != std::thread::current().id()),
+        "the real get handler must never check sealed authority on the async runtime thread: {seen:?}");
+}
+
+#[test]
+fn config_callback_queues_are_independent_of_the_store_mutex() {
+    let (_rig, owner) = rig();
+    let owner = std::sync::Arc::new(owner);
+    owner
+        .approval_request_index
+        .lock()
+        .unwrap()
+        .insert((INCUMBENT, 91), 17);
+    let (sender, _) = tokio::sync::mpsc::channel(1);
+    let cancel = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Cancel,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        91,
+        vec![],
+    )
+    .unwrap();
+    let locked = owner.inner.lock().unwrap();
+    let callback_owner = owner.clone();
+    let (done, observed) = std::sync::mpsc::channel();
+    let callbacks = std::thread::spawn(move || {
+        assert!(callback_owner.cancel_approval_request(INCUMBENT, 91));
+        callback_owner.disconnected(INCUMBENT);
+        callback_owner.queue_phone_withdrawal(INCUMBENT, crate::FrameSink::new(sender), cancel);
+        done.send(()).unwrap();
+    });
+    let completed_while_locked = observed.recv_timeout(Duration::from_secs(1));
+    drop(locked);
+    callbacks.join().unwrap();
+    assert!(
+        completed_while_locked.is_ok(),
+        "reader and Drop callbacks must finish while the store mutex is still held"
+    );
+    assert!(!owner.lock().unwrap().declarations.contains_key(&INCUMBENT));
+    assert_eq!(owner.take_phone_withdrawals().len(), 1);
+    owner.phone_withdrawn(INCUMBENT);
+}
+
 struct WorkerGuard(tokio::task::JoinHandle<()>);
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
@@ -913,6 +1029,7 @@ impl Drop for WorkerGuard {
 
 #[tokio::test(start_paused = true)]
 async fn config_delivery_worker_isolates_stuck_flush_and_never_hints_undeclared_module() {
+    let _clock = hold_test_clock();
     let (_rig, owner, handler, mut receivers) = worker_fixture();
     let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
     let mut a = receivers.remove(0);
@@ -931,7 +1048,13 @@ async fn config_delivery_worker_isolates_stuck_flush_and_never_hints_undeclared_
         "config.changed"
     );
     delivered.flushed.take().unwrap().send(()).unwrap();
-    tokio::task::yield_now().await;
+    wait_for_blocking_delivery(|| {
+        owner
+            .delivery_window(ConnectionId::new(2))
+            .unwrap()
+            .is_some_and(|window| window.delivered)
+    })
+    .await;
     let reply = owner
         .module_get(ConnectionId::new(2), "b", ConfigGetRequest::new())
         .unwrap();
@@ -956,7 +1079,12 @@ async fn config_delivery_worker_isolates_stuck_flush_and_never_hints_undeclared_
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
     tokio::time::advance(Duration::from_secs(30)).await;
-    tokio::task::yield_now().await;
+    wait_for_blocking_delivery(|| {
+        owner
+            .module_get(INCUMBENT, "a", ConfigGetRequest::new())
+            .is_err()
+    })
+    .await;
     assert!(
         blocked.flushed.take().unwrap().send(()).is_err(),
         "late flush cannot resurrect the timed-out attempt"
@@ -981,13 +1109,20 @@ async fn config_delivery_worker_isolates_stuck_flush_and_never_hints_undeclared_
 
 #[tokio::test(start_paused = true)]
 async fn config_delivery_worker_flush_at_29_9_seconds_starts_a_full_ack_window() {
+    let _clock = hold_test_clock();
     let (_rig, owner, handler, mut receivers) = worker_fixture();
     let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
     let mut a = receivers.remove(0);
     let mut outbound = a.recv().await.unwrap();
     tokio::time::advance(Duration::from_millis(29_900)).await;
     outbound.flushed.take().unwrap().send(()).unwrap();
-    tokio::task::yield_now().await;
+    wait_for_blocking_delivery(|| {
+        owner
+            .delivery_window(INCUMBENT)
+            .unwrap()
+            .is_some_and(|window| window.delivered)
+    })
+    .await;
     let view = owner
         .module_get(INCUMBENT, "a", ConfigGetRequest::new())
         .unwrap()
@@ -1507,6 +1642,7 @@ fn config_delivery_stamp_attempt_survives_transport_cleanup_until_its_process_ex
 
 #[tokio::test(start_paused = true)]
 async fn config_delivery_get_flush_timeout_fails_the_attempt_without_failing_the_connection() {
+    let _clock = hold_test_clock();
     let (_rig, owner, handler, _receivers) = worker_fixture();
     let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
     let sink = crate::FrameSink::new(sender);
@@ -1766,7 +1902,7 @@ async fn config_delivery_route_authority_installs_saved_approved_bytes_and_revok
     let authority = Arc::new(FakeRouteAuthority::default());
     authority.live_stamps.lock().unwrap().push(1);
     authority.new_open_generation.store(1, Ordering::SeqCst);
-    let owner = owner.with_route_policy_authority(authority.clone());
+    let owner = std::sync::Arc::new(owner.with_route_policy_authority(authority.clone()));
     applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
     let approved_bytes = std::fs::read(rig.path.join("subc.jsonc")).unwrap();
     let plan = approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
@@ -1808,7 +1944,7 @@ async fn config_delivery_route_authority_failure_cannot_be_counted_as_ready() {
     use std::sync::{atomic::Ordering, Arc};
     let (rig, owner) = rig();
     let authority = Arc::new(FakeRouteAuthority::default());
-    let owner = owner.with_route_policy_authority(authority.clone());
+    let owner = std::sync::Arc::new(owner.with_route_policy_authority(authority.clone()));
     applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
     let view = pending(&owner, INCUMBENT);
@@ -1901,7 +2037,7 @@ async fn config_delivery_route_receipt_ack_commits_after_durable_publication_and
             }));
         }
         let authority = Arc::new(authority);
-        let owner = owner.with_route_policy_authority(authority.clone());
+        let owner = std::sync::Arc::new(owner.with_route_policy_authority(authority.clone()));
         applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
         approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
         let view = pending(&owner, INCUMBENT);
@@ -1927,8 +2063,9 @@ async fn config_delivery_route_receipt_waits_for_the_ack_anchor_before_committin
     write(&rig, 1);
     let key = crate::config_store::TestStoreKey::default();
     let authority = Arc::new(FakeRouteAuthority::default());
-    let owner =
-        sealed_owner(&rig, &key, "route-ack-anchor").with_route_policy_authority(authority.clone());
+    let owner = std::sync::Arc::new(
+        sealed_owner(&rig, &key, "route-ack-anchor").with_route_policy_authority(authority.clone()),
+    );
     rig.declare(&owner, INCUMBENT.get());
     rig.stamp(&owner);
     applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
@@ -1965,7 +2102,7 @@ async fn config_delivery_route_receipt_is_retained_on_decline_and_restored_befor
         let (rig, owner) = rig();
         let authority = Arc::new(FakeRouteAuthority::default());
         authority.new_open_generation.store(1, Ordering::SeqCst);
-        let owner = owner.with_route_policy_authority(authority.clone());
+        let owner = std::sync::Arc::new(owner.with_route_policy_authority(authority.clone()));
         applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
         approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
         let view = pending(&owner, INCUMBENT);
@@ -2012,7 +2149,7 @@ async fn config_delivery_route_receipts_are_not_persisted_and_owner_drop_restore
     let (rig, owner) = rig();
     let authority = Arc::new(FakeRouteAuthority::default());
     authority.new_open_generation.store(1, Ordering::SeqCst);
-    let owner = owner.with_route_policy_authority(authority.clone());
+    let owner = std::sync::Arc::new(owner.with_route_policy_authority(authority.clone()));
     applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
     owner.install_approved_route_policy("a", 2).await.unwrap();
@@ -2318,8 +2455,9 @@ fn config_delivery_swap_never_uses_cutover_as_a_missing_start_or_daemon_boundary
 #[tokio::test]
 async fn config_delivery_route_policy_install_does_not_reuse_pre_install_health() {
     let (rig, owner) = rig();
-    let owner =
-        owner.with_route_policy_authority(std::sync::Arc::new(FakeRouteAuthority::default()));
+    let owner = std::sync::Arc::new(
+        owner.with_route_policy_authority(std::sync::Arc::new(FakeRouteAuthority::default())),
+    );
     applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
     let view = pending(&owner, INCUMBENT);
@@ -2333,8 +2471,9 @@ async fn config_delivery_route_policy_install_does_not_reuse_pre_install_health(
 async fn config_delivery_route_health_reply_started_before_install_does_not_count_but_a_fresh_probe_does(
 ) {
     let (rig, owner) = rig();
-    let owner =
-        owner.with_route_policy_authority(std::sync::Arc::new(FakeRouteAuthority::default()));
+    let owner = std::sync::Arc::new(
+        owner.with_route_policy_authority(std::sync::Arc::new(FakeRouteAuthority::default())),
+    );
     applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
     let view = pending(&owner, INCUMBENT);
@@ -2358,7 +2497,7 @@ async fn config_delivery_route_unhealthy_fresh_probe_restores_policy_through_the
     let (rig, owner) = rig();
     let authority = Arc::new(FakeRouteAuthority::default());
     authority.new_open_generation.store(1, Ordering::SeqCst);
-    let owner = owner.with_route_policy_authority(authority.clone());
+    let owner = std::sync::Arc::new(owner.with_route_policy_authority(authority.clone()));
     applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
     pending(&owner, INCUMBENT);
@@ -2532,7 +2671,6 @@ async fn config_delivery_route_worker_requests_immediate_health_and_uses_deliver
                 1
             }
         );
-        registry.deregister_connection(INCUMBENT).unwrap();
         if answer != Some(HealthStatus::Ok) {
             wait_for_delivery_condition(|| {
                 module
@@ -2548,6 +2686,30 @@ async fn config_delivery_route_worker_requests_immediate_health_and_uses_deliver
         } else {
             assert_eq!(module.status().unwrap().restart_count, 0);
         }
+        registry.deregister_connection(INCUMBENT).unwrap();
         module.stop().await.unwrap();
     }
+}
+
+async fn wait_for_blocking_delivery(mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "blocking delivery completion was not observed"
+        );
+        // Keep the paused clock from automatically advancing ACK deadlines
+        // while an operating-system thread completes its store operation.
+        tokio::task::yield_now().await;
+    }
+}
+
+fn hold_test_clock() -> WorkerGuard {
+    // Blocking jobs are invisible to Tokio's idle-clock detection. Only the
+    // test's explicit advances, not disk/keychain scheduling, move time here.
+    WorkerGuard(tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    }))
 }

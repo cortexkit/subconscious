@@ -44,6 +44,10 @@
 - Release the module gate during writer flushes, then recheck the connection's
   role, generation and attempt before accepting the receipt. Discard obsolete
   receipts without overwriting a newer served view or a promoted child's catch-up.
+- Run delivery-worker, approval, route-policy and health-observation store work
+  on blocking workers. Keep reader cancellation, disconnect and phone withdrawal
+  queues independent of the store mutex, so they cannot park behind a keychain
+  load or a whole-store integrity check.
 - Fence respawn until a spontaneous warm-up exit's configuration failure is
   recorded. Waiting spends no extra crash budget; intentional restarts preserve
   pending configuration, and a failed first generation stays stopped.

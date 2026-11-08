@@ -8,7 +8,30 @@ pub(crate) struct PhoneWithdrawal {
     pub frame: subc_protocol::frame::Frame,
 }
 
+#[derive(Default)]
+pub(super) struct PhoneWithdrawals {
+    queued: VecDeque<PhoneWithdrawal>,
+    withdrawing: HashMap<ConnectionId, usize>,
+}
+
 impl OwnerState {
+    pub(super) fn disconnected(&mut self, connection: ConnectionId) {
+        self.invalidate_phone(connection);
+        self.desktop_views.remove(&connection.get());
+        self.delivery.disconnected(connection);
+        for digest in self.gate.connection_approval_digests(connection.get()) {
+            self.reviewed(&digest, Instant::now());
+        }
+        for attempt in self.gate.cancel_connection_approvals(connection.get()) {
+            self.phone_waiters.remove(&attempt);
+        }
+        self.approval_requests
+            .retain(|(caller, _), _| *caller != connection);
+        self.declarations.remove(&connection);
+        self.active_declarations
+            .retain(|_, current| *current != connection);
+    }
+
     fn cancel_approval(&mut self, attempt: u64) {
         if let Ok(digest) = self.gate.approval_digest(attempt) {
             self.reviewed(&digest, Instant::now());
@@ -46,6 +69,17 @@ impl RuntimeOwner {
                 state.cancel_approval(attempt);
             }
         }
+        if let Ok(mut index) = self.approval_request_index.lock() {
+            index.retain(|key, attempt| state.approval_requests.get(key) == Some(attempt));
+        }
+    }
+
+    pub(super) fn drain_disconnections(&self, state: &mut OwnerState) {
+        if let Ok(mut pending) = self.disconnected_pending.lock() {
+            for connection in pending.drain(..) {
+                state.disconnected(connection);
+            }
+        }
     }
 
     /// The active generation's declaration and daemon entry, not a pending edit
@@ -59,7 +93,11 @@ impl RuntimeOwner {
         Self::check_authority(&mut state, false)?;
         state.store.delivery_ready()?;
         if state.active_declarations.get("callosum") != Some(&connection)
-            || state.phone_withdrawing.contains_key(&connection)
+            || self
+                .phone_withdrawals
+                .lock()
+                .map(|queue| queue.withdrawing.contains_key(&connection))
+                .unwrap_or(true)
         {
             return Ok(None);
         }
@@ -142,15 +180,24 @@ impl RuntimeOwner {
         state
             .approval_requests
             .insert((caller, correlation), attempt);
+        self.approval_request_index
+            .lock()
+            .map_err(|_| {
+                GateError::new(
+                    "config_unavailable",
+                    "approval cancellation index is poisoned",
+                )
+            })?
+            .insert((caller, correlation), attempt);
         Ok(())
     }
 
     pub(crate) fn cancel_approval_request(&self, caller: ConnectionId, correlation: u64) -> bool {
         let attempt = self
-            .inner
+            .approval_request_index
             .lock()
             .ok()
-            .and_then(|state| state.approval_requests.get(&(caller, correlation)).copied());
+            .and_then(|index| index.get(&(caller, correlation)).copied());
         if let Some(attempt) = attempt {
             self.cancel_approval(attempt);
             true
@@ -168,9 +215,9 @@ impl RuntimeOwner {
         sink: crate::router::FrameSink,
         frame: subc_protocol::frame::Frame,
     ) {
-        if let Ok(mut state) = self.inner.lock() {
-            *state.phone_withdrawing.entry(connection).or_default() += 1;
-            state.phone_withdrawals.push_back(PhoneWithdrawal {
+        if let Ok(mut queue) = self.phone_withdrawals.lock() {
+            *queue.withdrawing.entry(connection).or_default() += 1;
+            queue.queued.push_back(PhoneWithdrawal {
                 connection,
                 sink,
                 frame,
@@ -180,18 +227,18 @@ impl RuntimeOwner {
     }
 
     pub(crate) fn take_phone_withdrawals(&self) -> Vec<PhoneWithdrawal> {
-        self.inner
+        self.phone_withdrawals
             .lock()
-            .map(|mut state| state.phone_withdrawals.drain(..).collect())
+            .map(|mut queue| queue.queued.drain(..).collect())
             .unwrap_or_default()
     }
 
     pub(crate) fn phone_withdrawn(&self, connection: ConnectionId) {
-        if let Ok(mut state) = self.inner.lock() {
-            if let Some(count) = state.phone_withdrawing.get_mut(&connection) {
+        if let Ok(mut queue) = self.phone_withdrawals.lock() {
+            if let Some(count) = queue.withdrawing.get_mut(&connection) {
                 *count -= 1;
                 if *count == 0 {
-                    state.phone_withdrawing.remove(&connection);
+                    queue.withdrawing.remove(&connection);
                 }
             }
         }

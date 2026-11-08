@@ -114,7 +114,11 @@ impl ControlHandler {
                     )
                     .map_err(|_| unavailable())?;
                 let binding = if pending.endpoint.connection_id == connection {
-                    runtime.bind_phone_rpc(attempt, connection, pending.corr)
+                    let corr = pending.corr;
+                    config_work(runtime.clone(), move |owner| {
+                        owner.bind_phone_rpc(attempt, connection, corr)
+                    })
+                    .await
                 } else {
                     Err(unavailable())
                 };

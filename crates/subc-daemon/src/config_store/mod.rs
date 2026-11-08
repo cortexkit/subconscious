@@ -301,6 +301,10 @@ struct UnanchoredAck {
     generation: u64,
 }
 
+#[cfg(test)]
+pub(crate) type IoThreads =
+    std::sync::Arc<std::sync::Mutex<Vec<(&'static str, std::thread::ThreadId)>>>;
+
 /// One instance per daemon, serialized by its gate lock. No method reads live
 /// configuration files. Diagnostic snapshots are validated and redacted; approved
 /// delivery bytes may contain vault reference names, never literal secret values.
@@ -321,10 +325,27 @@ pub struct ConfigStore {
     unanchored_ack: Option<UnanchoredAck>,
     #[cfg(test)]
     byte_limit: usize,
+    #[cfg(test)]
+    io_threads: Option<IoThreads>,
     #[cfg(feature = "test-support")]
     hooks: Option<testing::TestSupport>,
 }
 impl ConfigStore {
+    #[cfg(test)]
+    pub(crate) fn observe_io_threads(&mut self, threads: IoThreads) {
+        self.io_threads = Some(threads);
+    }
+
+    #[cfg(test)]
+    fn observe_io_thread(&self, operation: &'static str) {
+        if let Some(threads) = &self.io_threads {
+            threads
+                .lock()
+                .unwrap()
+                .push((operation, std::thread::current().id()));
+        }
+    }
+
     /// Unit tests never consult a host keychain, even on a signed test runner.
     #[cfg(test)]
     pub(crate) fn open_digest_only_for_tests(root: StoreRoot) -> Self {
@@ -362,6 +383,8 @@ impl ConfigStore {
             unanchored_ack: None,
             #[cfg(test)]
             byte_limit: STORE_BYTE_LIMIT,
+            #[cfg(test)]
+            io_threads: None,
             #[cfg(feature = "test-support")]
             hooks: None,
         };
@@ -529,6 +552,8 @@ impl ConfigStore {
     pub fn check(&mut self) -> Result<(), StoreError> {
         self.usable()?;
         if self.envelope.integrity == IntegrityMode::Sealed {
+            #[cfg(test)]
+            self.observe_io_thread("keychain_load");
             let valid = self.backend.load().ok().flatten().is_some_and(|key| {
                 let current = StoreAnchor {
                     revision: self.envelope.revision,
@@ -560,6 +585,8 @@ impl ConfigStore {
         if self.state == StoreState::Unstamped && self.pending_anchor.is_none() {
             return Ok(());
         }
+        #[cfg(test)]
+        self.observe_io_thread("store_hash");
         let actual = disk::read(&self.path()).map(|bytes| bytes.as_deref().map(hash));
         if !matches!(actual, Ok(digest) if digest == self.expected_digest) {
             self.state = StoreState::StoreUnverified;

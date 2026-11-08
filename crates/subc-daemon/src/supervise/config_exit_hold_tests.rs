@@ -34,14 +34,16 @@ async fn config_exit_hold_completes_behind_a_queued_config_restart_without_an_ac
     let exited = owner.delivery_exits().unwrap().pop().unwrap();
     module.config_apply_restart(1).await.unwrap();
 
-    // With no task processing supervisor commands, this first poll records the
-    // failure and queues the hold behind the restart. Scheduling cannot reorder them.
-    let mut recording = Box::pin(handler.record_config_exit_for_test(exited));
-    std::future::poll_fn(|cx| {
-        assert!(std::future::Future::poll(recording.as_mut(), cx).is_pending());
-        std::task::Poll::Ready(())
+    // No task processes supervisor commands until the recorder has queued its
+    // hold behind the restart. Waiting on the queue length fixes their order.
+    let recording = tokio::spawn(async move { handler.record_config_exit_for_test(exited).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while commands.len() < 2 {
+            tokio::task::yield_now().await;
+        }
     })
-    .await;
+    .await
+    .unwrap();
     assert!(owner.delivery_exit_fence("a").unwrap().is_some());
     let mut child = None;
     let drive = async {
@@ -72,7 +74,8 @@ async fn config_exit_hold_completes_behind_a_queued_config_restart_without_an_ac
         }
     };
     tokio::time::timeout(Duration::from_secs(1), async {
-        tokio::join!(recording, drive);
+        let (recorded, ()) = tokio::join!(recording, drive);
+        recorded.unwrap();
     })
     .await
     .expect("an earlier restart must not deadlock the exit hold behind the module gate");

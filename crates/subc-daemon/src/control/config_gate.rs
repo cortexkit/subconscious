@@ -214,24 +214,25 @@ impl ControlHandler {
                         .pending
                         .as_ref()
                         .and_then(|view| view.attempt.map(|attempt| (view.generation, attempt)));
-                    if active {
-                        if let Some((generation, attempt)) = selected {
-                            runtime
-                                .delivery_write_started(
-                                    connection,
-                                    generation,
-                                    attempt,
-                                    tokio::time::Instant::now(),
-                                )
-                                .map_err(|error| {
-                                    RouterError::backend(0, frame.header.corr, error.to_string())
-                                })?;
-                        }
-                    }
-                    let write_deadline = runtime
-                        .delivery_window(connection)
-                        .ok()
-                        .flatten()
+                    let window = runtime
+                        .on_blocking(move |owner| {
+                            if active {
+                                if let Some((generation, attempt)) = selected {
+                                    owner.delivery_write_started(
+                                        connection,
+                                        generation,
+                                        attempt,
+                                        tokio::time::Instant::now(),
+                                    )?;
+                                }
+                            }
+                            owner.delivery_window(connection)
+                        })
+                        .await
+                        .map_err(|error| {
+                            RouterError::backend(0, frame.header.corr, error.to_string())
+                        })?;
+                    let write_deadline = window
                         .filter(|window| selected == Some((window.generation, window.attempt)))
                         .and_then(|window| window.deadline)
                         .map_or(
@@ -246,6 +247,11 @@ impl ControlHandler {
                             .await;
                     let flushed_at = tokio::time::Instant::now();
                     let _gate = gate.lock().await;
+                    let current_window = runtime
+                        .on_blocking(move |owner| owner.delivery_window(connection))
+                        .await
+                        .ok()
+                        .flatten();
                     // A slow writer may finish after cutover or supersession.
                     // Its receipt must not advance the replacement's attempt.
                     if !self.config_delivery_target_current(
@@ -254,10 +260,7 @@ impl ControlHandler {
                         active,
                         frame.header.corr,
                     )? || selected.is_some_and(|selected| {
-                        runtime
-                            .delivery_window(connection)
-                            .ok()
-                            .flatten()
+                        current_window
                             .is_none_or(|window| selected != (window.generation, window.attempt))
                     }) {
                         return Ok(vec![]);
@@ -267,13 +270,13 @@ impl ControlHandler {
                         failed => {
                             if active {
                                 if let Some((generation, attempt)) = selected {
-                                    let _ = runtime.delivery_timeout(
-                                        connection,
-                                        &registration.manifest.module_id,
-                                        generation,
-                                        attempt,
-                                    );
-                                    runtime.notify_delivery_changed();
+                                    let module = registration.manifest.module_id.clone();
+                                    let _ = config_work(runtime.clone(), move |owner| {
+                                        owner.delivery_timeout(
+                                            connection, &module, generation, attempt,
+                                        )
+                                    })
+                                    .await;
                                 }
                             }
                             return match failed {
@@ -297,13 +300,13 @@ impl ControlHandler {
                         if error.code == "delivery_expired" {
                             if active {
                                 if let Some((generation, attempt)) = selected {
-                                    let _ = runtime.delivery_timeout(
-                                        connection,
-                                        &registration.manifest.module_id,
-                                        generation,
-                                        attempt,
-                                    );
-                                    runtime.notify_delivery_changed();
+                                    let module = registration.manifest.module_id.clone();
+                                    let _ = config_work(runtime.clone(), move |owner| {
+                                        owner.delivery_timeout(
+                                            connection, &module, generation, attempt,
+                                        )
+                                    })
+                                    .await;
                                 }
                             }
                         } else {
@@ -550,11 +553,13 @@ impl ControlHandler {
                 })?;
                 let mut attempt_guard =
                     phone::ApprovalAttemptGuard::new(&runtime, challenge.attempt());
-                runtime.track_approval_request(
-                    challenge.attempt(),
-                    ctx.connection_id,
-                    frame.header.corr,
-                )?;
+                let attempt = challenge.attempt();
+                let connection = ctx.connection_id;
+                let corr = frame.header.corr;
+                config_work(runtime.clone(), move |owner| {
+                    owner.track_approval_request(attempt, connection, corr)
+                })
+                .await?;
                 let reply = match &challenge {
                     ApprovalChallenge::Desktop { .. } | ApprovalChallenge::OsPrompt { .. } => {
                         ApprovalReply::Presence(
@@ -946,13 +951,13 @@ async fn config_work<T: Send + 'static>(
         + Send
         + 'static,
 ) -> std::result::Result<T, GateError> {
-    tokio::task::spawn_blocking(move || {
-        let result = work(runtime.clone());
-        runtime.notify_delivery_changed();
-        result
-    })
-    .await
-    .map_err(|_| GateError::new("config_unavailable", "configuration worker stopped"))?
+    runtime
+        .on_blocking(move |owner| {
+            let result = work(owner.clone());
+            owner.notify_delivery_changed();
+            result
+        })
+        .await
 }
 
 fn config_error_frame(frame: &Frame, error: GateError) -> Result<Frame, RouterError> {

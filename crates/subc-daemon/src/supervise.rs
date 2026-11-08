@@ -5156,9 +5156,14 @@ async fn run_health_probe_cycle(
     child: &mut Option<SupervisedChild>,
 ) {
     let now_ms = unix_ms_now();
-    let delivery_probe = runtime.config_delivery.as_ref().and_then(|delivery| {
-        delivery.health_probe(&spec.module_id, runtime.forwarding.as_deref(), registry)
-    });
+    let delivery_probe = match &runtime.config_delivery {
+        Some(delivery) => {
+            delivery
+                .health_probe(&spec.module_id, runtime.forwarding.as_deref(), registry)
+                .await
+        }
+        None => None,
+    };
     let http = (running_protocol(spec, snapshot) == ModuleProtocol::None)
         .then_some(runtime.health.http.as_deref())
         .flatten();
@@ -7423,7 +7428,8 @@ async fn supervise_loop(
                     active_child.drain_stderr(&spec.module_id).await;
 
                     if let (Some(delivery), Some(spawn)) = (&runtime.config_delivery, &active_child.config_delivery) {
-                        if let Err(error) = delivery.0.delivery_child_exited(spawn) {
+                        let spawn = spawn.clone();
+                        if let Err(error) = delivery.0.on_blocking(move |owner| owner.delivery_child_exited(&spawn)).await {
                             warn!(module_id=%spec.module_id, %error, "configuration exit observation failed");
                         }
                     }
@@ -7871,7 +7877,10 @@ async fn handle_supervisor_command(
             let guard = gate.lock().await;
             let pending = delivery
                 .0
-                .policy_probe_pending(connection, generation, attempt)
+                .on_blocking(move |owner| {
+                    owner.policy_probe_pending(connection, generation, attempt)
+                })
+                .await
                 .unwrap_or(false)
                 && child.is_some()
                 && registry
@@ -7903,20 +7912,27 @@ async fn handle_supervisor_command(
             let _guard = gate.lock().await;
             let spawn = child
                 .as_ref()
-                .and_then(|child| child.config_delivery.as_ref());
-            if (!supersedes_swap
-                && !owner
-                    .pending_config_restarts()
-                    .is_ok_and(|pending| pending.contains(&(spec.module_id.clone(), generation))))
-                || !owner
-                    .requires_fresher_spawn(&spec.module_id, spawn)
-                    .is_ok_and(|pending| pending == Some(generation))
+                .and_then(|child| child.config_delivery.clone());
+            let module = spec.module_id.clone();
+            let current = owner
+                .on_blocking(move |owner| {
+                    Ok((supersedes_swap
+                        || owner
+                            .pending_config_restarts()?
+                            .contains(&(module.clone(), generation)))
+                        && owner.requires_fresher_spawn(&module, spawn.as_ref())?
+                            == Some(generation))
+                })
+                .await
+                .unwrap_or(false);
+            if !current
                 || !lock_snapshot(snapshot).is_ok_and(|state| {
                     state.enabled && !state.respawn_pending && state.process_alive
                 })
             {
                 return true;
             }
+            drop(_guard);
             info!(module_id=%spec.module_id, config_generation=generation, "approved configuration restart preserves the crash budget");
             if let Err(error) = restart_child_with_budget_policy(
                 spec,

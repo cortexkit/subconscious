@@ -114,7 +114,12 @@ impl Drop for RegistrationGuard<'_> {
 
 impl ConfigDelivery {
     pub(super) async fn unfenced(&self, module: &str) {
-        if let Ok(Some(mut changed)) = self.0.delivery_exit_fence(module) {
+        let module = module.to_owned();
+        if let Ok(Some(mut changed)) = self
+            .0
+            .on_blocking(move |owner| owner.delivery_exit_fence(&module))
+            .await
+        {
             while *changed.borrow_and_update() {
                 if changed.changed().await.is_err() {
                     break;
@@ -145,13 +150,19 @@ impl ConfigDelivery {
         {
             return;
         }
-        if let Err(error) = self.0.registered(registration.connection_id, spawn) {
+        let connection = registration.connection_id;
+        let spawn = spawn.clone();
+        if let Err(error) = self
+            .0
+            .on_blocking(move |owner| owner.registered(connection, &spawn))
+            .await
+        {
             warn!(module_id=module, %error, "configuration registration observation failed");
         }
         self.0.notify_delivery_changed();
     }
 
-    pub(super) fn health_probe(
+    pub(super) async fn health_probe(
         &self,
         module: &str,
         forwarding: Option<&ForwardingTable>,
@@ -164,8 +175,10 @@ impl ConfigDelivery {
         {
             return None;
         }
+        let module = module.to_owned();
         self.0
-            .health_probe(registration.connection_id, module)
+            .on_blocking(move |owner| owner.health_probe(registration.connection_id, &module))
+            .await
             .ok()
             .flatten()
     }
@@ -196,7 +209,11 @@ impl ConfigDelivery {
         if !active {
             return owned_failure;
         }
-        let failed = match self.0.health_result(probe, healthy) {
+        let failed = match self
+            .0
+            .on_blocking(move |owner| owner.health_result(probe, healthy))
+            .await
+        {
             Ok(Some(
                 AppliedDisposition::Failed { .. } | AppliedDisposition::CatchupFailed { .. },
             )) => true,

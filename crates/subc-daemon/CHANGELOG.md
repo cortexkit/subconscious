@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.41.5
+
+- Raise the operating-system helper requirement with the co-bumped daemon.
+
 ## 0.41.4
 
 - Clarify the separation between redacted diagnostic captures and approved raw

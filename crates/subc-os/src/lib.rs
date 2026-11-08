@@ -88,7 +88,9 @@ mod durable_replace;
 mod retained_file;
 pub use durable_replace::durable_replace;
 #[cfg(any(unix, windows))]
-pub use retained_file::{retained_file_identity, RetainedFileIdentity};
+pub use retained_file::{
+    open_regular_nofollow, retained_file_identity, OpenRegularError, RetainedFileIdentity,
+};
 #[cfg(all(unix, feature = "test-support"))]
 pub mod fork_exec_test;
 pub mod host;

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.33
+
+- Open bounded configuration inputs without following the leaf or blocking on
+  substituted FIFOs. Verify regular-file type on the retained Unix or Windows
+  handle before returning it to a caller.
+
 ## 0.1.32
 
 - Expose file-object identity from a retained file handle on Unix and Windows.

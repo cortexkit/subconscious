@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.41.10
+
+- Bind user-scope generation delivery attempts to individual connections and
+  successful writer flushes. Preserve serial supersession, independent module
+  outcomes and promoted-child catch-up without replacing the stored active or
+  recovery generation for a module.
+- Keep an ACK's previous active vector visible until its store publication is
+  anchored. A NACK can override the unanchored ACK without losing another
+  module's independently acknowledged configuration.
+- Bind whole-generation apply precedence into the reviewed plan. Keep deferred
+  configuration bytes away from an old instance until the required supervision
+  or daemon boundary; approval never restarts the daemon itself.
+- Add a non-interactive pending-anchor retry schedule with bounded backoff and
+  state-change logging. Background control waiters no longer retain an embedded
+  daemon's configuration store after their owner is dropped.
+
 ## 0.41.9
 
 - Bind desktop approval to the complete immutable plan actually flushed to the

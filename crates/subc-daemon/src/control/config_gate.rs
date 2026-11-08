@@ -68,7 +68,7 @@ impl ControlHandler {
                 "module config operations require a registered connection",
             )?]);
         };
-        let module = registration.manifest.module_id;
+        let module = registration.manifest.module_id.clone();
         let gate = runtime
             .module_gate(&module)
             .map_err(|e| RouterError::backend(0, frame.header.corr, e.to_string()))?;
@@ -97,6 +97,7 @@ impl ControlHandler {
         }
         let body = frame.body.clone();
         let connection = ctx.connection_id;
+        let mut delivered_view = None;
         let result = match op {
             "config.declare" => {
                 let declaration = serde_json::from_slice(&body).map_err(|_| {
@@ -104,7 +105,7 @@ impl ControlHandler {
                 });
                 match declaration {
                     Ok(declaration) => {
-                        config_work(runtime, move |owner| {
+                        config_work(runtime.clone(), move |owner| {
                             owner.declare(connection, &module, declaration, active)?;
                             Ok(serde_json::json!({"op":"config.declare"}))
                         })
@@ -119,31 +120,73 @@ impl ControlHandler {
                 });
                 match request {
                     Ok(request) => {
-                        config_work(runtime, move |owner| {
-                            serde_json::to_value(owner.module_get(connection, &module, request)?)
-                                .map_err(|_| {
+                        let module_id = module.clone();
+                        match config_work(runtime.clone(), move |owner| {
+                            owner.module_get(connection, &module_id, request)
+                        })
+                        .await
+                        {
+                            Ok(reply) => {
+                                let encoded = serde_json::to_value(&reply).map_err(|_| {
                                     GateError::new(
                                         "config_unavailable",
                                         "could not encode config view",
                                     )
-                                })
-                        })
-                        .await
+                                });
+                                delivered_view = Some(reply);
+                                encoded
+                            }
+                            Err(error) => Err(error),
+                        }
                     }
                     Err(error) => Err(error),
                 }
             }
+            "config.applied" => {
+                match serde_json::from_slice::<subc_protocol::config::ConfigAppliedRequest>(&body) {
+                    Ok(request) => {
+                        config_work(runtime.clone(), move |owner| {
+                            owner.module_applied(connection, &module, request)?;
+                            Ok(serde_json::json!({"op":"config.applied"}))
+                        })
+                        .await
+                    }
+                    Err(_) => Err(GateError::new(
+                        "invalid_control_body",
+                        "malformed config.applied request",
+                    )),
+                }
+            }
             _ => Err(GateError::new(
-                "delivery_runtime_unavailable",
-                "generation acknowledgement adapter is not connected",
+                "invalid_control_body",
+                "unsupported module configuration operation",
             )),
         };
         match result {
-            Ok(response) => Ok(vec![control_response_body_frame(
-                &frame,
-                &response,
-                "module config response",
-            )?]),
+            Ok(response) => {
+                let response =
+                    control_response_body_frame(&frame, &response, "module config response")?;
+                if let Some(view) = delivered_view {
+                    ctx.egress.send_flushed(response).await?;
+                    let module = registration.manifest.module_id;
+                    config_work(runtime, move |owner| {
+                        owner.module_view_delivered(
+                            connection,
+                            &module,
+                            &view,
+                            tokio::time::Instant::now(),
+                            active,
+                        )
+                    })
+                    .await
+                    .map_err(|error| {
+                        RouterError::backend(0, frame.header.corr, error.to_string())
+                    })?;
+                    Ok(vec![])
+                } else {
+                    Ok(vec![response])
+                }
+            }
             Err(error) => Ok(vec![config_error_frame(&frame, error)?]),
         }
     }

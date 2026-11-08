@@ -19,6 +19,18 @@ keeps its last view and surfaces that refusal rather than exiting or reading
 unapproved files. Before stamping, a file view uses generation zero and status
 `unstamped`.
 
+## `config.changed` envelope
+
+The `config_changed.json` body is an unsolicited `PUSH` on channel 0, epoch 0,
+with correlation 0. It has no transport `RESPONSE`; `config.applied` is the
+separate report of a generation's outcome. The daemon sends this hint only to
+a module connection that has declared it accepts daemon-delivered configuration,
+never to undeclared modules or clients. The hint is not activation authority:
+`config.get` supplies the current immutable view, including after a lost hint
+or reconnect. A generation deferred until a supervision or daemon boundary is
+shown in operator status, but neither its bytes nor a hint are delivered to an
+old instance before that boundary.
+
 Unknown snapshot layers and view statuses never authorize activation. Unknown
 `config.applied` results decode but count as NACK, not ACK. Unknown consent
 decisions decode but never approve. Both positive and negative replies echo

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.164
+
+- Require subc-daemon 0.41.10 or newer for connection-bound configuration delivery
+  and pending ACK visibility until the authority-store anchor commits.
+
 ## 0.20.163
 
 - Require subc-daemon 0.41.9 or newer so configuration approval binds to a

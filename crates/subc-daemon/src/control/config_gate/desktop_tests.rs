@@ -3,6 +3,23 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[cfg(feature = "dev-desktop-approval")]
+#[tokio::test]
+async fn config_desktop_background_waiters_do_not_retain_the_config_store_owner() {
+    let (_scratch, owner, _view) = review_fixture();
+    let weak_owner = Arc::downgrade(&owner);
+    let handler =
+        Arc::new(ControlHandler::new(Arc::new(Registry::default())).with_config_runtime(owner));
+    handler.clone().spawn_capability_deadline_loop();
+    handler.clone().spawn_scope_expiry_loop();
+    drop(handler);
+    tokio::task::yield_now().await;
+    assert!(
+        weak_owner.upgrade().is_none(),
+        "background waiters must not retain the lifetime store lock after the daemon is dropped"
+    );
+}
+
 fn owner_peer(handler: &ControlHandler, connection: ConnectionId) {
     #[cfg(unix)]
     let observed = subc_protocol::peer::ObservedPeer::observed_uid(subc_os::effective_uid());

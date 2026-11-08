@@ -13,8 +13,15 @@ pub(super) struct MemoryKey {
     anchor: subc_os::config_keychain::AnchorState,
     fail: bool,
     denied: bool,
+    anchor_calls: usize,
 }
 impl MemoryKey {
+    pub(super) fn set_anchor_failure(&mut self, fail: bool) {
+        self.fail = fail;
+    }
+    pub(super) fn anchor_calls(&self) -> usize {
+        self.anchor_calls
+    }
     pub fn load(&self) -> Result<Option<KeychainState>, StoreError> {
         if self.denied {
             return Err(StoreError::new(
@@ -28,6 +35,7 @@ impl MemoryKey {
         }))
     }
     pub fn anchor(&mut self, pair: StoreAnchor, stamped: bool) -> Result<(), StoreError> {
+        self.anchor_calls += 1;
         if self.fail {
             return Err(StoreError::new(
                 StoreErrorCode::AnchorPending,
@@ -271,6 +279,144 @@ fn config_store_anchor_pending_blocks_writes_and_ack_but_restores_failure_in_mem
         .contains(&"sample".into()));
     // The failure is a separate anchored write, beyond the generation commit.
     assert_eq!(rig.key.lock().unwrap().anchor.high_water, 4);
+}
+
+fn ack_publication_pending() -> (Rig, ConfigStore) {
+    let rig = Rig::new();
+    let mut store = rig.open(true);
+    commit(&mut store, CommitKind::Stamp);
+    store.record_delivery(&tuple(), 1, true).unwrap();
+    commit(&mut store, CommitKind::Approved);
+    rig.key.lock().unwrap().fail = true;
+    error_code(
+        store.record_delivery(&tuple(), 2, true),
+        StoreErrorCode::AnchorPending,
+    );
+    assert!(store.status().anchor_pending);
+    (rig, store)
+}
+
+#[test]
+fn config_store_ack_publication_anchor_failure_keeps_previous_active_until_retry() {
+    let (rig, mut store) = ack_publication_pending();
+    let versions = &store.body().unwrap().versions[0].1;
+    assert_eq!(
+        versions.active,
+        Some(1),
+        "an unanchored ACK must not activate generation 2"
+    );
+    assert_eq!(versions.recovery, None);
+    assert_eq!(versions.pending, Some(2));
+    rig.key.lock().unwrap().fail = false;
+    store.retry_anchor().unwrap();
+    let versions = &store.body().unwrap().versions[0].1;
+    assert_eq!(
+        (versions.active, versions.recovery, versions.pending),
+        (Some(2), Some(1), None)
+    );
+    assert!(!store.status().anchor_pending);
+    let mut restarted = rig.open(true);
+    assert_eq!(restarted.body().unwrap().versions[0].1.active, Some(2));
+}
+
+#[test]
+fn config_store_ack_publication_anchor_failure_nack_overrides_the_unanchored_ack() {
+    let (rig, mut store) = ack_publication_pending();
+    error_code(
+        store.record_delivery(&tuple(), 2, false),
+        StoreErrorCode::AnchorPending,
+    );
+    let body = store.body().unwrap();
+    let versions = &body.versions[0].1;
+    assert_eq!(
+        (versions.active, versions.recovery, versions.pending),
+        (Some(1), None, None)
+    );
+    assert_eq!(
+        body.generations[&2].generation.never_redeliver,
+        vec!["sample"]
+    );
+    rig.key.lock().unwrap().fail = false;
+    store.retry_anchor().unwrap();
+    let mut restarted = rig.open(true);
+    let body = restarted.body().unwrap();
+    assert_eq!(body.versions[0].1.active, Some(1));
+    assert_eq!(body.versions[0].1.pending, None);
+    assert_eq!(
+        body.generations[&2].generation.never_redeliver,
+        vec!["sample"]
+    );
+}
+
+#[test]
+fn config_store_ack_publication_anchor_failure_other_module_nack_does_not_undo_ack() {
+    let rig = Rig::new();
+    let mut store = rig.open(true);
+    let other = Tuple {
+        module: "another".into(),
+        project: None,
+    };
+    let mut first = entry(CommitKind::Stamp);
+    first.tuples.insert(other.clone());
+    store
+        .commit_generation(first, snapshot(1, 1), snapshot(1, 1), 1)
+        .unwrap();
+    store.record_delivery(&tuple(), 1, true).unwrap();
+    store.record_delivery(&other, 1, true).unwrap();
+    let mut second = entry(CommitKind::Approved);
+    second.tuples.insert(other.clone());
+    store
+        .commit_generation(second, snapshot(2, 1), snapshot(2, 1), 2)
+        .unwrap();
+    rig.key.lock().unwrap().fail = true;
+    error_code(
+        store.record_delivery(&tuple(), 2, true),
+        StoreErrorCode::AnchorPending,
+    );
+    error_code(
+        store.record_delivery(&other, 2, false),
+        StoreErrorCode::AnchorPending,
+    );
+    assert_eq!(
+        store
+            .body()
+            .unwrap()
+            .versions
+            .iter()
+            .find(|(key, _)| key == &tuple())
+            .unwrap()
+            .1
+            .active,
+        Some(1)
+    );
+    rig.key.lock().unwrap().fail = false;
+    store.retry_anchor().unwrap();
+    let mut restarted = rig.open(true);
+    let body = restarted.body().unwrap();
+    let acked = &body
+        .versions
+        .iter()
+        .find(|(key, _)| key == &tuple())
+        .unwrap()
+        .1;
+    let nacked = &body
+        .versions
+        .iter()
+        .find(|(key, _)| key == &other)
+        .unwrap()
+        .1;
+    assert_eq!(
+        (acked.active, acked.recovery, acked.pending),
+        (Some(2), Some(1), None)
+    );
+    assert_eq!(
+        (nacked.active, nacked.recovery, nacked.pending),
+        (Some(1), None, None)
+    );
+    assert_eq!(
+        body.generations[&2].generation.never_redeliver,
+        vec!["another"]
+    );
 }
 
 #[test]

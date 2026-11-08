@@ -27,6 +27,77 @@ pub struct RuntimeOwner {
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
+pub use delivery::{AppliedDisposition, DeliverySpawn};
+
+/// Supervisor callbacks for the configuration delivery lifecycle. The caller
+/// supplies observed process events, never a module's claimed readiness.
+/// Target checks and promotion callbacks run under [`RuntimeOwner::module_gate`]
+/// across forwarding and registry changes. The spawn token binds a later
+/// registration to the approved generation and its original warm-up deadline.
+pub trait DeliveryObserver: Send + Sync {
+    fn spawned(
+        &self,
+        module: &str,
+        spawned_at: tokio::time::Instant,
+        register_timeout: std::time::Duration,
+        first_health_budget: std::time::Duration,
+    ) -> Result<Option<DeliverySpawn>>;
+    fn registered(&self, connection: ConnectionId, spawn: &DeliverySpawn) -> Result<()>;
+    fn ready(
+        &self,
+        connection: ConnectionId,
+        module: &str,
+        generation: u64,
+    ) -> Result<Option<AppliedDisposition>>;
+    fn promoted(
+        &self,
+        connection: ConnectionId,
+        module: &str,
+        cutover_at: tokio::time::Instant,
+    ) -> Result<Option<(u64, u64)>>;
+    /// Retry only the retained, non-interactive backend when its backoff is due.
+    /// `None` means there is no pending anchor and no timer should be armed.
+    fn retry_anchor(&self) -> Result<Option<tokio::time::Instant>>;
+}
+
+impl DeliveryObserver for RuntimeOwner {
+    fn spawned(
+        &self,
+        module: &str,
+        spawned_at: tokio::time::Instant,
+        register_timeout: std::time::Duration,
+        first_health_budget: std::time::Duration,
+    ) -> Result<Option<DeliverySpawn>> {
+        self.delivery_spawned(module, spawned_at, register_timeout, first_health_budget)
+    }
+
+    fn registered(&self, connection: ConnectionId, spawn: &DeliverySpawn) -> Result<()> {
+        self.delivery_child_registered(connection, spawn)
+    }
+
+    fn ready(
+        &self,
+        connection: ConnectionId,
+        module: &str,
+        generation: u64,
+    ) -> Result<Option<AppliedDisposition>> {
+        self.delivery_readiness_complete(connection, module, generation)
+    }
+
+    fn promoted(
+        &self,
+        connection: ConnectionId,
+        module: &str,
+        cutover_at: tokio::time::Instant,
+    ) -> Result<Option<(u64, u64)>> {
+        self.delivery_promoted(connection, module, cutover_at)
+    }
+
+    fn retry_anchor(&self) -> Result<Option<tokio::time::Instant>> {
+        self.poll_anchor_retry()
+    }
+}
+
 /// Keep a reviewed plan for one idle hour so the operator can read the full diff.
 const PLAN_IDLE_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 /// One shared sweep reclaims idle plans without allocating a timer per plan.
@@ -78,6 +149,8 @@ struct OwnerState {
     // Only a successfully flushed complete plan on this connection can bind
     // its desktop approval. A later view replaces the connection's old view.
     desktop_views: BTreeMap<u64, (Digest, u64)>,
+    delivery: delivery::DeliveryState,
+    anchor_retry: super::anchor_retry::AnchorRetry,
     // Keep the original objects alive through approval so an unlinked file's
     // inode/file id cannot be recycled to impersonate the reviewed input.
     retained_plan_files: BTreeMap<Digest, Vec<std::fs::File>>,
@@ -88,6 +161,36 @@ struct OwnerState {
 }
 
 impl OwnerState {
+    fn retry_anchor(&mut self, operator_command: bool) -> Option<tokio::time::Instant> {
+        let pending = self.store.status().anchor_pending;
+        let events = self.anchor_retry.poll(
+            pending,
+            tokio::time::Instant::now(),
+            operator_command,
+            || {
+                let error = self
+                    .store
+                    .retry_anchor()
+                    .err()
+                    .map(|error| error.to_string());
+                (self.store.status().anchor_pending, error)
+            },
+        );
+        for event in events {
+            match event {
+                super::anchor_retry::Event::Pending => {
+                    tracing::info!("configuration anchor became pending")
+                }
+                super::anchor_retry::Event::Failed(reason) => {
+                    tracing::warn!(%reason, "configuration anchor retry failed")
+                }
+                super::anchor_retry::Event::Recovered => {
+                    tracing::info!("configuration anchor recovered")
+                }
+            }
+        }
+        self.anchor_retry.next()
+    }
     fn with_desktop_view(&self, digest: &Digest, facts: &ApprovalFacts) -> ApprovalFacts {
         let mut checked = facts.clone();
         let bound = self
@@ -171,6 +274,9 @@ pub struct PreparedPlan {
 #[path = "runtime_tests.rs"]
 mod tests;
 
+#[path = "delivery.rs"]
+pub(crate) mod delivery;
+
 impl RuntimeOwner {
     /// Record the exact full response only after its writer flush succeeds and
     /// the adapter revalidates the same live desktop connection.
@@ -196,7 +302,8 @@ impl RuntimeOwner {
             .insert(connection.get(), (view.digest.clone(), view.base_revision));
         Ok(())
     }
-    pub fn new(incarnation: String, store: ConfigStore, capturer: ConfigCapturer) -> Self {
+    pub fn new(incarnation: String, mut store: ConfigStore, capturer: ConfigCapturer) -> Self {
+        let initial_generation = store.body().map(|body| body.last_generation).unwrap_or(0);
         Self {
             inner: Mutex::new(OwnerState {
                 gate: ConfigGate::new(incarnation),
@@ -204,6 +311,8 @@ impl RuntimeOwner {
                 _writer_lock: None,
                 plan_deadlines: BTreeMap::new(),
                 desktop_views: BTreeMap::new(),
+                delivery: delivery::DeliveryState::new(initial_generation),
+                anchor_retry: super::anchor_retry::AnchorRetry::default(),
                 retained_plan_files: BTreeMap::new(),
                 expired_plans: VecDeque::new(),
                 declarations: HashMap::new(),
@@ -242,6 +351,10 @@ impl RuntimeOwner {
     pub(crate) fn sweep_expired(&self) -> Result<()> {
         drop(self.lock()?);
         Ok(())
+    }
+
+    pub(crate) fn poll_anchor_retry(&self) -> Result<Option<tokio::time::Instant>> {
+        Ok(self.lock()?.retry_anchor(false))
     }
 
     pub(crate) fn set_activity(
@@ -289,6 +402,7 @@ impl RuntimeOwner {
     pub fn disconnected(&self, connection: ConnectionId) {
         if let Ok(mut state) = self.inner.lock() {
             state.desktop_views.remove(&connection.get());
+            state.delivery.disconnected(connection);
             for digest in state.gate.connection_approval_digests(connection.get()) {
                 state.reviewed(&digest, Instant::now());
             }
@@ -326,6 +440,12 @@ impl RuntimeOwner {
         }
         state.store.check()?;
         if state.store.status().state == StoreState::Unstamped {
+            if request.generation.is_some() || request.attempt.is_some() {
+                return Err(GateError::new(
+                    "config_gated",
+                    "unstamped reads have no assigned generation or delivery attempt",
+                ));
+            }
             let mut declarations = Self::declarations(&mut state)?;
             declarations.insert(module.into(), declaration);
             let mut captured = self
@@ -389,13 +509,26 @@ impl RuntimeOwner {
         };
         let active = view(versions.active, ConfigStatus::Active)?;
         let pending = view(versions.pending, ConfigStatus::Pending)?;
+        let transition = versions
+            .pending
+            .and_then(|id| body.generations.get(&id))
+            .map(|entry| super::apply::Transition::for_module(&entry.generation.changeset, module))
+            .transpose()?
+            .unwrap_or(super::apply::Transition::Live);
         if active.is_none() && pending.is_none() {
             return Err(GateError::new(
                 "config_gated",
                 "module has no active or deliverable generation",
             ));
         }
-        Ok(subc_protocol::config::ConfigGetReply::new(active, pending))
+        delivery::bind_get(
+            &mut state,
+            connection,
+            module,
+            &request,
+            subc_protocol::config::ConfigGetReply::new(active, pending),
+            transition,
+        )
     }
 
     fn declarations(state: &mut OwnerState) -> Result<BTreeMap<String, ConfigDeclareRequest>> {
@@ -435,6 +568,7 @@ impl RuntimeOwner {
     }
 
     fn check_authority(state: &mut OwnerState, recovery: bool) -> Result<()> {
+        state.retry_anchor(true);
         match state.store.check() {
             Ok(()) => Ok(()),
             Err(_)
@@ -679,9 +813,23 @@ impl RuntimeOwner {
             }
         };
         let facts = state.with_desktop_view(&digest, facts);
+        let was_unstamped = state.store.status().state == StoreState::Unstamped;
         let OwnerState { gate, store, .. } = &mut *state;
         let result =
             gate.finish_approval(attempt, reply, store, &current.diagnostic, &facts, now_ms);
+        let stamped_files = was_unstamped
+            && state.store.body().is_ok_and(|body| {
+                body.generations
+                    .get(&body.last_generation)
+                    .is_some_and(|entry| {
+                        entry.generation.plan_digest == digest
+                            && entry.kind == crate::config_store::CommitKind::Stamp
+                    })
+            });
+        if stamped_files {
+            let connections: Vec<_> = state.active_declarations.values().copied().collect();
+            state.delivery.remember_stamp_connections(connections);
+        }
         if result.is_ok() {
             state.plan_deadlines.remove(&digest);
             state.retained_plan_files.remove(&digest);
@@ -692,6 +840,7 @@ impl RuntimeOwner {
 
     pub fn status(&self) -> Result<subc_control::config::ConfigStatus> {
         let mut state = self.lock()?;
+        state.retry_anchor(true);
         let verified = state.store.check().is_ok();
         if verified
             && !state.store.status().anchor_pending
@@ -734,7 +883,23 @@ impl RuntimeOwner {
                 .collect();
             for (tuple, versions) in &body.versions {
                 if let Some(generation) = versions.pending {
-                    status.approved_but_inactive.push(serde_json::json!({"module_id":tuple.module,"project_id":tuple.project,"generation":generation}));
+                    let entry = body.generations.get(&generation);
+                    let transition = entry.and_then(|entry| {
+                        super::apply::Transition::for_module(
+                            &entry.generation.changeset,
+                            &tuple.module,
+                        )
+                        .ok()
+                    });
+                    status.approved_but_inactive.push(serde_json::json!({
+                        "module_id":tuple.module,"project_id":tuple.project,"generation":generation,
+                        "digest":entry.map(|entry| &entry.generation.plan_digest),
+                        "waiting_for":match transition {
+                            Some(super::apply::Transition::DaemonRestart) => "daemon_restart",
+                            Some(super::apply::Transition::NextSupervision) => "next_supervision",
+                            _ => "delivery",
+                        },
+                    }));
                 }
             }
         }
@@ -743,6 +908,7 @@ impl RuntimeOwner {
 
     pub fn history(&self) -> Result<(Vec<subc_config::Generation>, Vec<serde_json::Value>)> {
         let mut state = self.lock()?;
+        state.retry_anchor(true);
         state.store.check()?;
         let body = state.store.body()?;
         Ok((

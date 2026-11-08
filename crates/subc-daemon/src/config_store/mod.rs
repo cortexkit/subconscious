@@ -100,6 +100,22 @@ pub struct StoreActivity {
     pub detail: String,
 }
 
+/// Shared stand-in anchor for daemon-owner unit tests, never a host keychain.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct TestStoreKey(std::sync::Arc<std::sync::Mutex<tests::MemoryKey>>);
+
+#[cfg(test)]
+impl TestStoreKey {
+    pub(crate) fn fail_anchor(&self, fail: bool) {
+        self.0.lock().unwrap().set_anchor_failure(fail);
+    }
+
+    pub(crate) fn anchor_calls(&self) -> usize {
+        self.0.lock().unwrap().anchor_calls()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StoreStatus {
     pub state: StoreState,
@@ -279,6 +295,12 @@ impl Backend {
     }
 }
 
+struct UnanchoredAck {
+    visible: StoreBody,
+    tuple: Tuple,
+    generation: u64,
+}
+
 /// One instance per daemon, serialized by its gate lock. No method reads live
 /// configuration files. Diagnostic snapshots are validated and redacted; approved
 /// delivery bytes may contain vault reference names, never literal secret values.
@@ -293,6 +315,10 @@ pub struct ConfigStore {
     warnings: Vec<String>,
     activities: Vec<StoreActivity>,
     deferred_failure: Option<StoreBody>,
+    // The approved-store file containing the ACK has been atomically renamed,
+    // but that ACK is not activation authority until the keychain anchor commits.
+    // Readers and a competing NACK use the previous pending/active vector.
+    unanchored_ack: Option<UnanchoredAck>,
     #[cfg(test)]
     byte_limit: usize,
     #[cfg(feature = "test-support")]
@@ -303,6 +329,10 @@ impl ConfigStore {
     #[cfg(test)]
     pub(crate) fn open_digest_only_for_tests(root: StoreRoot) -> Self {
         Self::load(root, Backend::Unsupported)
+    }
+    #[cfg(test)]
+    pub(crate) fn open_sealed_for_tests(root: StoreRoot, key: TestStoreKey) -> Self {
+        Self::load(root, Backend::Memory(key.0))
     }
     /// Reads only; the first stamp creates the directory and file. Caller must
     /// hold its daemon single-writer/start lock until this instance is dropped.
@@ -329,6 +359,7 @@ impl ConfigStore {
             warnings: Vec::new(),
             activities: Vec::new(),
             deferred_failure: None,
+            unanchored_ack: None,
             #[cfg(test)]
             byte_limit: STORE_BYTE_LIMIT,
             #[cfg(feature = "test-support")]
@@ -545,6 +576,7 @@ impl ConfigStore {
         Ok(self
             .deferred_failure
             .as_ref()
+            .or(self.unanchored_ack.as_ref().map(|ack| &ack.visible))
             .unwrap_or(&self.envelope.body))
     }
     pub fn status(&mut self) -> StoreStatus {
@@ -585,6 +617,53 @@ impl ConfigStore {
             self.backend.anchor(pair, stamped)?;
             self.pending_anchor = None;
             self.pending_prior_anchor = None;
+            if let Some(ack) = self.unanchored_ack.take() {
+                // A different module may fail while this ACK is unanchored.
+                // Preserve that failure without discarding the now-anchored ACK.
+                if let Some(failure) = self.deferred_failure.as_mut() {
+                    let still_pending = failure.versions.iter().any(|(tuple, versions)| {
+                        tuple == &ack.tuple && versions.pending == Some(ack.generation)
+                    });
+                    let failed_module =
+                        failure
+                            .generations
+                            .get(&ack.generation)
+                            .is_some_and(|entry| {
+                                entry.generation.never_redeliver.contains(&ack.tuple.module)
+                            });
+                    if still_pending && !failed_module {
+                        if let Some((_, approved)) = self
+                            .envelope
+                            .body
+                            .versions
+                            .iter()
+                            .find(|(tuple, _)| tuple == &ack.tuple)
+                        {
+                            if let Some((_, visible)) = failure
+                                .versions
+                                .iter_mut()
+                                .find(|(tuple, _)| tuple == &ack.tuple)
+                            {
+                                *visible = approved.clone();
+                            }
+                        }
+                        if let Some(entry) = failure.generations.get_mut(&ack.generation) {
+                            entry
+                                .generation
+                                .module_states
+                                .insert(ack.tuple.module, subc_config::GenerationState::Active);
+                            if !entry
+                                .generation
+                                .module_states
+                                .values()
+                                .any(|state| *state == subc_config::GenerationState::Failed)
+                            {
+                                entry.outcome = "active".into();
+                            }
+                        }
+                    }
+                }
+            }
             self.state = if stamped {
                 StoreState::Stamped
             } else {
@@ -863,6 +942,7 @@ impl ConfigStore {
         self.pending_anchor = None;
         self.pending_prior_anchor = None;
         self.deferred_failure = None;
+        self.unanchored_ack = None;
         self.publish(body, true, now_ms)?;
         self.warnings
             .push("Recovery reset history and generation ids; continuity is not guaranteed".into());
@@ -906,8 +986,10 @@ impl ConfigStore {
         let mut body = self
             .deferred_failure
             .as_ref()
+            .or(self.unanchored_ack.as_ref().map(|ack| &ack.visible))
             .unwrap_or(&self.envelope.body)
             .clone();
+        let before_ack = ack.then(|| body.clone());
         let Some((_, versions)) = body.versions.iter_mut().find(|(t, _)| t == tuple) else {
             return Ok(());
         };
@@ -954,7 +1036,15 @@ impl ConfigStore {
                 "failure restored in memory; durable mark pending",
             ));
         }
-        self.publish(body, false, wall_time_ms())
+        let result = self.publish(body, false, wall_time_ms());
+        if ack && result.is_err() && self.pending_anchor.is_some() {
+            self.unanchored_ack = before_ack.map(|visible| UnanchoredAck {
+                visible,
+                tuple: tuple.clone(),
+                generation,
+            });
+        }
+        result
     }
 
     pub fn rollback_configuration(&mut self, generation: u64) -> Result<Snapshot, StoreError> {

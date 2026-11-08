@@ -5,6 +5,8 @@
 //! store and supervisor commit locks, recaptures files at completion, and uses
 //! only the committed snapshot for delivery. No client text is approval input.
 
+mod anchor_retry;
+mod apply;
 mod approval;
 pub mod capture;
 pub mod desktop;
@@ -258,6 +260,7 @@ impl ConfigGate {
             "previous": approved.to_store()?,
             "snapshot": candidate.to_store()?,
         });
+        apply::bind_plan(&mut changeset)?;
         let mut plan = Plan::new(
             base_revision,
             base_generation,

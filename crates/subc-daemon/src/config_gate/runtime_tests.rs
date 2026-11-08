@@ -9,6 +9,9 @@ struct Rig {
     declaration: ConfigDeclareRequest,
 }
 
+#[path = "delivery_tests.rs"]
+mod delivery_tests;
+
 fn desktop_plan() -> (Rig, RuntimeOwner, ConfigPlanView) {
     let rig = Rig::new();
     std::fs::write(

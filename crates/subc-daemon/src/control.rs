@@ -1367,12 +1367,15 @@ impl ControlHandler {
     /// Wake at each candidate's own deadline so a stalled fresh exec emits its
     /// requirement event without depending on an operator polling a status command.
     pub fn spawn_capability_deadline_loop(self: Arc<Self>) {
+        let handler = Arc::downgrade(&self);
+        let evaluator = self.capability_evaluator.clone();
         tokio::spawn(async move {
             loop {
-                self.capability_evaluator
-                    .wait_for_change_or_deadline()
-                    .await;
-                self.refresh_capability_requirements();
+                evaluator.wait_for_change_or_deadline().await;
+                let Some(handler) = handler.upgrade() else {
+                    break;
+                };
+                handler.refresh_capability_requirements();
             }
         });
     }
@@ -1383,19 +1386,29 @@ impl ControlHandler {
     /// scope change instead of ticking, so a daemon without deadlines never
     /// wakes for expiry.
     pub(crate) fn spawn_scope_expiry_loop(self: Arc<Self>) {
+        let handler = Arc::downgrade(&self);
+        let deadline_added = self.scope_deadline_added.clone();
         tokio::spawn(async move {
             loop {
-                let has_deadlines = self
-                    .scopes
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .has_deadlines();
+                let has_deadlines = {
+                    let Some(handler) = handler.upgrade() else {
+                        break;
+                    };
+                    let scopes = handler
+                        .scopes
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    scopes.has_deadlines()
+                };
                 if !has_deadlines {
-                    self.scope_deadline_added.notified().await;
+                    deadline_added.notified().await;
                     continue;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                if let Err(error) = self.sweep_expired_scopes() {
+                let Some(handler) = handler.upgrade() else {
+                    break;
+                };
+                if let Err(error) = handler.sweep_expired_scopes() {
                     warn!(%error, "scope expiry sweep failed");
                 }
             }

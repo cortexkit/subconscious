@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.20.162
+
+- Raise the daemon dependency floor for bounded authority-store publication and
+  protected daemon configuration history.
+
 ## 0.20.161
 
 - Accept a single absolute `ck-subc --config-store-root` service argument while

@@ -18,9 +18,7 @@ pub enum PausePoint {
     SwapBeforePromotion,
 }
 
-// Authority includes retained generations, but never an unbounded input stream.
-// There is no aggregate store-size limit in the format; cap reads at 64 MiB.
-const STORE_READ_LIMIT: u64 = 64 * 1024 * 1024;
+use super::STORE_BYTE_LIMIT;
 
 #[cfg(test)]
 #[path = "disk_tests.rs"]
@@ -34,8 +32,10 @@ pub(super) fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
         }
         Err(error) => return Err(io::Error::other(error)),
     };
-    if file.metadata()?.len() > STORE_READ_LIMIT {
-        return Err(io::Error::other("store exceeds the 64 MiB read limit"));
+    if file.metadata()?.len() > STORE_BYTE_LIMIT as u64 {
+        return Err(io::Error::other(
+            "store exceeds the 64 MiB STORE_BYTE_LIMIT",
+        ));
     }
     #[cfg(unix)]
     {
@@ -51,9 +51,11 @@ pub(super) fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
     #[cfg(windows)]
     subc_os::windows_acl::verify_owner_only(&file)?;
     let mut bytes = Vec::new();
-    (&mut file).take(STORE_READ_LIMIT).read_to_end(&mut bytes)?;
+    (&mut file)
+        .take(STORE_BYTE_LIMIT as u64)
+        .read_to_end(&mut bytes)?;
     let length = file.metadata()?.len();
-    if length > STORE_READ_LIMIT || length != bytes.len() as u64 {
+    if length > STORE_BYTE_LIMIT as u64 || length != bytes.len() as u64 {
         return Err(io::Error::other("store changed or exceeded its read limit"));
     }
     Ok(Some(bytes))

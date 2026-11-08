@@ -59,6 +59,7 @@ impl From<StoreError> for GateError {
             Code::StoreUnverified => "store_unverified",
             Code::StoreMissing => "store_missing",
             Code::StoreTampered => "store_tampered",
+            Code::StoreTooLarge => "store_too_large",
             Code::AnchorPending => "anchor_pending",
             Code::GenerationPruned => "generation_pruned",
             Code::GenerationMissing => "generation_missing",

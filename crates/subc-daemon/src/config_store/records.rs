@@ -92,9 +92,9 @@ pub struct StoreBody {
 }
 
 impl StoreBody {
-    /// Keep a generation if any tuple still needs it. The global empty-tuple
-    /// bucket bounds daemon-only generations such as stamp and unstamp too.
-    pub(super) fn prune(&mut self, now_ms: u64) {
+    /// Module tuple pointers and distinct approved daemon inputs retain their
+    /// active/recovery versions even when recent history must be discarded.
+    pub(super) fn protected_generations(&self) -> BTreeSet<u64> {
         let mut keep = BTreeSet::new();
         for (_, versions) in &self.versions {
             keep.extend(
@@ -103,6 +103,41 @@ impl StoreBody {
                     .flatten(),
             );
         }
+        let mut daemon_versions = Vec::new();
+        for (&id, entry) in self.generations.iter().rev() {
+            if daemon_versions.len() == 2 {
+                break;
+            }
+            if entry.kind == CommitKind::Development || entry.generation.development {
+                continue;
+            }
+            let Some(daemon) = entry
+                .delivery
+                .as_ref()
+                .and_then(|delivery| delivery.daemon.as_ref())
+            else {
+                continue;
+            };
+            let Some(input) = entry.generation.input_vector.inputs.get("subc.jsonc") else {
+                // Without a bound input identity, dropping this carrier could
+                // discard a distinct approved version. Keep it rather than guess.
+                keep.insert(id);
+                continue;
+            };
+            let version = (input, &daemon.digest);
+            if !daemon_versions.contains(&version) {
+                daemon_versions.push(version);
+                keep.insert(id);
+            }
+        }
+        keep
+    }
+
+    /// The empty-tuple bucket also bounds daemon-only history; protected daemon
+    /// active/recovery carriers do not consume its recent-history allowance.
+    pub(super) fn prune(&mut self, now_ms: u64) {
+        let protected = self.protected_generations();
+        let mut keep = protected.clone();
         let tuples: BTreeSet<_> = self
             .generations
             .values()
@@ -115,12 +150,7 @@ impl StoreBody {
                     Some(tuple) => entry.tuples.contains(tuple),
                     None => entry.tuples.is_empty(),
                 };
-                if !belongs
-                    || self
-                        .versions
-                        .iter()
-                        .any(|(_, v)| [v.active, v.recovery, v.pending].contains(&Some(id)))
-                {
+                if !belongs || protected.contains(&id) {
                     continue;
                 }
                 if recent < RECENT_HISTORY_LIMIT {
@@ -136,7 +166,26 @@ impl StoreBody {
             .filter(|id| !keep.contains(id))
             .collect();
         for id in removed {
-            let entry = self.generations.remove(&id).expect("listed generation");
+            self.prune_generation(id, now_ms);
+        }
+    }
+
+    pub(super) fn prune_oldest(&mut self, now_ms: u64) -> bool {
+        let protected = self.protected_generations();
+        let Some(id) = self
+            .generations
+            .keys()
+            .copied()
+            .find(|id| !protected.contains(id))
+        else {
+            return false;
+        };
+        self.prune_generation(id, now_ms);
+        true
+    }
+
+    fn prune_generation(&mut self, id: u64, now_ms: u64) {
+        if let Some(entry) = self.generations.remove(&id) {
             self.pruned.insert(
                 id,
                 PrunedGeneration {

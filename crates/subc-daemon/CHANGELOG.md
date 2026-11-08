@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.41.8
+
+- Share the 64 MiB authority-store read and publication bound. Before publishing,
+  prune the oldest unprotected history into permanent audit summaries, or refuse
+  `store_too_large` without changing committed bytes when protected versions do
+  not fit.
+- Protect the daemon's two most recent distinct approved input versions, ignoring
+  development generations and duplicate carriers, alongside module tuple heads
+  in both recent-count and byte-pressure pruning.
+
 ## 0.41.7
 
 - Own immutable configuration captures and approval state behind one serialized

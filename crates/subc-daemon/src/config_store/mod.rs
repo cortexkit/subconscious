@@ -31,7 +31,17 @@ use subc_os::config_keychain::{
 
 pub const STORE_FORMAT_VERSION: u32 = 1;
 pub const STORE_FILE: &str = "approved.json";
+/// Bound both reads and publications so a successful commit remains readable.
+pub const STORE_BYTE_LIMIT: usize = 64 * 1024 * 1024;
 const KEYCHAIN_SERVICE: &str = "com.cortexkit.subc.config-gate";
+
+fn wall_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+        })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreState {
@@ -46,6 +56,7 @@ pub enum StoreErrorCode {
     StoreUnverified,
     StoreMissing,
     StoreTampered,
+    StoreTooLarge,
     AnchorPending,
     GenerationPruned,
     GenerationMissing,
@@ -282,6 +293,8 @@ pub struct ConfigStore {
     warnings: Vec<String>,
     activities: Vec<StoreActivity>,
     deferred_failure: Option<StoreBody>,
+    #[cfg(test)]
+    byte_limit: usize,
     #[cfg(feature = "test-support")]
     hooks: Option<testing::TestSupport>,
 }
@@ -316,6 +329,8 @@ impl ConfigStore {
             warnings: Vec::new(),
             activities: Vec::new(),
             deferred_failure: None,
+            #[cfg(test)]
+            byte_limit: STORE_BYTE_LIMIT,
             #[cfg(feature = "test-support")]
             hooks: None,
         };
@@ -577,7 +592,7 @@ impl ConfigStore {
             };
         }
         if let Some(body) = self.deferred_failure.take() {
-            if let Err(error) = self.publish(body.clone(), false) {
+            if let Err(error) = self.publish(body.clone(), false, wall_time_ms()) {
                 self.deferred_failure = Some(body);
                 return Err(error);
             }
@@ -625,7 +640,7 @@ impl ConfigStore {
         })
     }
 
-    fn publish(&mut self, body: StoreBody, fresh: bool) -> Result<(), StoreError> {
+    fn publish(&mut self, body: StoreBody, fresh: bool, now_ms: u64) -> Result<(), StoreError> {
         if self.pending_anchor.is_some() {
             return Err(StoreError::new(
                 StoreErrorCode::AnchorPending,
@@ -651,15 +666,34 @@ impl ConfigStore {
             mac: None,
         };
         let mut prior_anchor = None;
-        if sealed {
+        let key = if sealed {
             let key = self
                 .backend
                 .load()?
                 .ok_or_else(|| StoreError::new(StoreErrorCode::StoreUnverified, "key missing"))?;
             prior_anchor = Some(key.anchor);
-            envelope.mac = Some(envelope.authenticate(&key.key)?);
-        }
-        let bytes = serde_json::to_vec(&envelope).map_err(StoreError::serialization)?;
+            Some(key)
+        } else {
+            None
+        };
+        #[cfg(test)]
+        let limit = self.byte_limit;
+        #[cfg(not(test))]
+        let limit = STORE_BYTE_LIMIT;
+        let bytes = loop {
+            envelope.mac = key
+                .as_ref()
+                .map(|key| envelope.authenticate(&key.key))
+                .transpose()?;
+            let bytes = serde_json::to_vec(&envelope).map_err(StoreError::serialization)?;
+            if bytes.len() <= limit {
+                break bytes;
+            }
+            if !envelope.body.prune_oldest(now_ms) {
+                return Err(StoreError::new(StoreErrorCode::StoreTooLarge,
+                    format!("candidate exceeds STORE_BYTE_LIMIT ({limit} bytes); active, recovery and pending versions cannot be pruned")));
+            }
+        };
         if let Err(error) = disk::publish(&self.path(), &bytes, |point| {
             #[cfg(feature = "test-support")]
             if let Some(hooks) = &self.hooks {
@@ -765,7 +799,7 @@ impl ConfigStore {
         }
         let proposal_changed = body.rebase_proposal()?;
         body.prune(now_ms);
-        self.publish(body, kind == CommitKind::Stamp)?;
+        self.publish(body, kind == CommitKind::Stamp, now_ms)?;
         if proposal_changed {
             self.proposal_activity();
         }
@@ -829,7 +863,7 @@ impl ConfigStore {
         self.pending_anchor = None;
         self.pending_prior_anchor = None;
         self.deferred_failure = None;
-        self.publish(body, true)?;
+        self.publish(body, true, now_ms)?;
         self.warnings
             .push("Recovery reset history and generation ids; continuity is not guaranteed".into());
         Ok(1)
@@ -849,7 +883,7 @@ impl ConfigStore {
         let changed = body.rebase_proposal()?;
         let identity_changed = body.proposal != self.envelope.body.proposal;
         if self.state == StoreState::Stamped && identity_changed {
-            self.publish(body, false)?;
+            self.publish(body, false, wall_time_ms())?;
         } else if self.state == StoreState::Unstamped {
             self.envelope.body = body;
         }
@@ -920,7 +954,7 @@ impl ConfigStore {
                 "failure restored in memory; durable mark pending",
             ));
         }
-        self.publish(body, false)
+        self.publish(body, false, wall_time_ms())
     }
 
     pub fn rollback_configuration(&mut self, generation: u64) -> Result<Snapshot, StoreError> {
@@ -959,7 +993,7 @@ impl ConfigStore {
             return Ok(false);
         }
         entry.outcome = "resumed".into();
-        self.publish(body, false)?;
+        self.publish(body, false, wall_time_ms())?;
         Ok(true)
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 use std::fs;
 use std::{
     collections::BTreeSet,
@@ -496,6 +497,270 @@ fn config_store_atomic_owner_only_and_failed_staging_keeps_previous() {
             0o700
         );
     }
+}
+
+fn byte_limit_entry(kind: CommitKind) -> HistoryEntry {
+    let mut entry = entry(kind);
+    entry.configuration.insert(
+        "history-padding".into(),
+        RecordedValue::new(serde_json::json!("p".repeat(4096))),
+    );
+    entry
+}
+
+fn daemon_byte_limit_entry(kind: CommitKind, version: &str, padding: usize) -> HistoryEntry {
+    use subc_protocol::config::{ConfigLayer, ConfigLayerSnapshot};
+    let mut entry = entry(kind);
+    entry.tuples.clear();
+    entry.generation.development = kind == CommitKind::Development;
+    entry.generation.input_vector = InputVector::new(BTreeMap::from([(
+        "subc.jsonc".into(),
+        subc_config::InputState::Present {
+            digest: raw_digest(format!("bound-file-{version}").as_bytes()),
+        },
+    )]));
+    let bytes = format!(
+        "// config version {version}\n{{\"version\":1,\"modules\":{{}}}}\n{}",
+        " ".repeat(padding)
+    )
+    .into_bytes();
+    entry.delivery = Some(DeliverySnapshot {
+        daemon: Some(ConfigLayerSnapshot::file(
+            "subc",
+            ConfigLayer::User,
+            "/approved/subc.jsonc",
+            Some(bytes),
+        )),
+        modules: BTreeMap::new(),
+        declarations: BTreeMap::new(),
+    });
+    entry
+}
+
+#[test]
+fn config_store_byte_limit_prunes_recent_history_before_publish_and_stays_readable() {
+    let rig = Rig::new();
+    let mut store = rig.open(false);
+    store
+        .commit_generation(
+            byte_limit_entry(CommitKind::Stamp),
+            snapshot(1, 1),
+            snapshot(1, 1),
+            10,
+        )
+        .unwrap();
+    store.record_delivery(&tuple(), 1, true).unwrap();
+    store
+        .commit_generation(
+            byte_limit_entry(CommitKind::Approved),
+            snapshot(1, 1),
+            snapshot(1, 1),
+            11,
+        )
+        .unwrap();
+    store.record_delivery(&tuple(), 2, true).unwrap();
+    store
+        .commit_generation(
+            byte_limit_entry(CommitKind::Approved),
+            snapshot(1, 1),
+            snapshot(1, 1),
+            12,
+        )
+        .unwrap();
+    let limit = rig.bytes().len() + 512;
+    store.byte_limit = limit;
+    let id = store
+        .commit_generation(
+            byte_limit_entry(CommitKind::Approved),
+            snapshot(1, 1),
+            snapshot(1, 1),
+            42,
+        )
+        .unwrap();
+    assert_eq!(id, 4);
+    assert!(
+        rig.bytes().len() <= limit,
+        "publication exceeded its configured limit"
+    );
+    let body = store.body().unwrap();
+    assert_eq!(
+        body.generations.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2, 4]
+    );
+    assert_eq!(body.pruned[&3].plan_digest, raw_digest(b"approved-plan"));
+    assert_eq!(body.pruned[&3].approval_id, "approval");
+    assert_eq!(body.pruned[&3].pruned_at_ms, 42);
+    let mut restarted = rig.open(false);
+    let reopened = restarted.body().unwrap();
+    assert_eq!(reopened.versions[0].1.active, Some(2));
+    assert_eq!(reopened.versions[0].1.recovery, Some(1));
+    assert_eq!(reopened.versions[0].1.pending, Some(4));
+    assert!(reopened.pruned.contains_key(&3));
+}
+
+#[test]
+fn config_store_byte_limit_refuses_unprunable_candidate_without_changing_bytes_or_anchor() {
+    let rig = Rig::new();
+    let mut store = rig.open(true);
+    commit(&mut store, CommitKind::Stamp);
+    store.record_delivery(&tuple(), 1, true).unwrap();
+    let before = rig.bytes();
+    let anchor = rig.key.lock().unwrap().anchor;
+    let body_before = serde_json::to_value(store.body().unwrap()).unwrap();
+    store.byte_limit = before.len() + 512;
+    let error = store
+        .commit_generation(
+            byte_limit_entry(CommitKind::Approved),
+            snapshot(2, 1),
+            snapshot(2, 1),
+            45,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, StoreErrorCode::StoreTooLarge);
+    assert!(error.detail.contains("STORE_BYTE_LIMIT"));
+    assert!(error.detail.contains(&store.byte_limit.to_string()));
+    assert_eq!(
+        crate::config_gate::GateError::from(error).code,
+        "store_too_large"
+    );
+    assert_eq!(rig.bytes(), before);
+    assert_eq!(rig.key.lock().unwrap().anchor, anchor);
+    assert_eq!(
+        serde_json::to_value(store.body().unwrap()).unwrap(),
+        body_before
+    );
+    store.delivery_ready().unwrap();
+    assert_eq!(rig.open(true).body().unwrap().last_generation, 1);
+}
+
+#[test]
+fn config_store_byte_limit_first_daemon_stamp_cannot_prune_its_own_snapshot() {
+    let rig = Rig::new();
+    let mut store = rig.open(false);
+    store.byte_limit = 1024;
+    let entry = daemon_byte_limit_entry(CommitKind::Stamp, "A", 4096);
+    let raw = entry
+        .delivery
+        .as_ref()
+        .unwrap()
+        .daemon
+        .as_ref()
+        .unwrap()
+        .bytes
+        .clone();
+    error_code(
+        store.commit_generation(entry.clone(), snapshot(1, 1), snapshot(1, 1), 1),
+        StoreErrorCode::StoreTooLarge,
+    );
+    assert!(!store.path().exists());
+    assert!(store.body().unwrap().generations.is_empty());
+    store.byte_limit = STORE_BYTE_LIMIT;
+    store
+        .commit_generation(entry, snapshot(1, 1), snapshot(1, 1), 2)
+        .unwrap();
+    let mut restarted = rig.open(false);
+    let body = restarted.body().unwrap();
+    assert_eq!(
+        body.generations[&1]
+            .delivery
+            .as_ref()
+            .unwrap()
+            .daemon
+            .as_ref()
+            .unwrap()
+            .bytes,
+        raw
+    );
+    assert!(body.pruned.is_empty());
+}
+
+#[test]
+fn config_store_byte_limit_second_daemon_change_keeps_active_and_recovery() {
+    let rig = Rig::new();
+    let mut store = rig.open(false);
+    store
+        .commit_generation(
+            daemon_byte_limit_entry(CommitKind::Stamp, "A", 4096),
+            snapshot(1, 1),
+            snapshot(1, 1),
+            1,
+        )
+        .unwrap();
+    store
+        .commit_generation(
+            byte_limit_entry(CommitKind::Development),
+            snapshot(1, 1),
+            snapshot(1, 1),
+            2,
+        )
+        .unwrap();
+    let limit = rig.bytes().len() + 4096;
+    store.byte_limit = limit;
+    store
+        .commit_generation(
+            daemon_byte_limit_entry(CommitKind::Approved, "B", 4096),
+            snapshot(2, 1),
+            snapshot(2, 1),
+            3,
+        )
+        .unwrap();
+    assert!(rig.bytes().len() <= limit);
+    let body = store.body().unwrap();
+    assert_eq!(
+        body.generations.keys().copied().collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    assert!(body.pruned.contains_key(&2));
+    assert_eq!(body.protected_generations(), BTreeSet::from([1, 3]));
+    assert_eq!(
+        rig.open(false).body().unwrap().protected_generations(),
+        BTreeSet::from([1, 3])
+    );
+}
+
+#[test]
+fn config_store_byte_limit_groups_daemon_versions_across_rollbacks_and_module_only_carriers() {
+    let mut body = StoreBody::default();
+    for (id, version, module_only) in [
+        (1, "A", false),
+        (2, "B", false),
+        (3, "B", true),
+        (4, "A", false),
+        (5, "A", true),
+    ] {
+        let mut entry = daemon_byte_limit_entry(
+            if id == 1 {
+                CommitKind::Stamp
+            } else {
+                CommitKind::Approved
+            },
+            version,
+            0,
+        );
+        entry.generation.id = id;
+        if module_only {
+            entry.tuples.insert(tuple());
+        }
+        body.generations.insert(id, entry);
+    }
+    for id in 6..36 {
+        let mut entry = daemon_byte_limit_entry(CommitKind::Development, "C", 0);
+        entry.generation.id = id;
+        body.generations.insert(id, entry);
+    }
+    assert_eq!(body.protected_generations(), BTreeSet::from([3, 5]));
+    body.prune(50);
+    assert!(body.generations.contains_key(&3));
+    assert!(body.generations.contains_key(&5));
+    assert!(!body.generations.contains_key(&4));
+    while body.prune_oldest(60) {}
+    assert_eq!(
+        body.generations.keys().copied().collect::<Vec<_>>(),
+        vec![3, 5]
+    );
+    assert_eq!(body.pruned[&1].generation, 1);
+    assert_eq!(body.pruned[&2].generation, 2);
+    assert_eq!(body.pruned[&4].generation, 4);
 }
 
 #[test]

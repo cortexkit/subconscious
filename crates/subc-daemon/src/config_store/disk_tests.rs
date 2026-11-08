@@ -83,7 +83,7 @@ fn config_store_disk_refuses_symlink_as_unverified() {
 fn config_store_disk_refuses_one_byte_over_limit_as_unverified() {
     let rig = Rig::new();
     rig.file(super::super::STORE_FILE)
-        .set_len(STORE_READ_LIMIT + 1)
+        .set_len(STORE_BYTE_LIMIT as u64 + 1)
         .unwrap();
     assert!(read(&rig.path())
         .unwrap_err()

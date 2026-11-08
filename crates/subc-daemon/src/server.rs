@@ -1136,13 +1136,9 @@ where
     }
 }
 
-/// Send one frame so that a connection ending immediately afterwards still
-/// delivers it: on Unix, wait for the writer's flush acknowledgement; elsewhere
-/// queue it, because those writers carry no acknowledgement.
+/// Send a refusal before ending the connection. Unix waits for a writer flush;
+/// other platforms retain their existing queue-only refusal policy.
 async fn send_refusal(sink: &FrameSink, frame: crate::Frame) -> Result<(), RouterError> {
-    // The flush acknowledgement comes from the writer's `write_frame`, which
-    // only the Unix builds expose; on Windows the refusal is queued for the pipe
-    // writer instead.
     #[cfg(unix)]
     {
         sink.send_flushed(frame).await

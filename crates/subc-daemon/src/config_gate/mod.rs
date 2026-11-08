@@ -7,6 +7,7 @@
 
 mod approval;
 pub mod capture;
+pub mod desktop;
 pub(crate) mod review;
 pub mod runtime;
 mod snapshot;

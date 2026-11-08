@@ -924,11 +924,20 @@ impl ControlHandler {
         &self,
         peer: &subc_os::local_peer::CapturedPeer,
     ) -> Option<crate::operator_apps::OperatorAppStamp> {
-        use subc_os::local_peer::ObservedPeer as OsPeer;
-
         if !self.operator_app_policy.windows_enabled {
             return None;
         }
+        self.config_windows_launch_identity(peer)
+    }
+
+    /// Review identity is independent of the shortcut-delivery switch. The
+    /// retained verified launch incarnation must still match the pipe client.
+    #[cfg(windows)]
+    pub(crate) fn config_windows_launch_identity(
+        &self,
+        peer: &subc_os::local_peer::CapturedPeer,
+    ) -> Option<crate::operator_apps::OperatorAppStamp> {
+        use subc_os::local_peer::ObservedPeer as OsPeer;
         let app = self.operator_app_policy.app_id()?;
         let OsPeer::Observed(observation) = peer.observation() else {
             return None;

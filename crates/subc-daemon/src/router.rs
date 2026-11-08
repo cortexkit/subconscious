@@ -433,7 +433,6 @@ impl FrameSink {
     /// The local endpoint uses it the same way for its clients-only refusal: the
     /// connection closes right after the refusal is sent, so the writer must
     /// flush it first.
-    #[cfg(unix)]
     pub async fn send_flushed(&self, frame: Frame) -> Result<(), RouterError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let charge = self
@@ -999,6 +998,19 @@ impl Router {
                 .handle_control_frame_timed(ctx, frame, dispatch_started_at)
                 .await?;
             for response in responses {
+                if let Some(view) = self
+                    .control
+                    .config_desktop_review_response(ctx.connection_id, &response)
+                {
+                    self.observe_connection_wait(
+                        ctx,
+                        "reply_egress",
+                        self.control
+                            .deliver_config_desktop_review(ctx, response, view),
+                    )
+                    .await?;
+                    continue;
+                }
                 self.observe_connection_wait(ctx, "reply_egress", ctx.egress.send(response))
                     .await?;
             }

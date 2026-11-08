@@ -75,6 +75,9 @@ struct OwnerState {
     store: ConfigStore,
     _writer_lock: Option<crate::config_store::StoreWriterLock>,
     plan_deadlines: BTreeMap<Digest, Instant>,
+    // Only a successfully flushed complete plan on this connection can bind
+    // its desktop approval. A later view replaces the connection's old view.
+    desktop_views: BTreeMap<u64, (Digest, u64)>,
     // Keep the original objects alive through approval so an unlinked file's
     // inode/file id cannot be recycled to impersonate the reviewed input.
     retained_plan_files: BTreeMap<Digest, Vec<std::fs::File>>,
@@ -85,6 +88,25 @@ struct OwnerState {
 }
 
 impl OwnerState {
+    fn with_desktop_view(&self, digest: &Digest, facts: &ApprovalFacts) -> ApprovalFacts {
+        let mut checked = facts.clone();
+        let bound = self
+            .desktop_views
+            .get(&facts.connection)
+            .is_some_and(|(shown, revision)| {
+                shown == digest
+                    && self
+                        .gate
+                        .plans
+                        .get(digest)
+                        .is_some_and(|plan| plan.view.base_revision == *revision)
+            });
+        if !bound {
+            checked.desktop_app = false;
+            checked.attested_operator_app = false;
+        }
+        checked
+    }
     fn expire_idle(&mut self, now: Instant) {
         let expired: Vec<_> = self
             .plan_deadlines
@@ -95,6 +117,7 @@ impl OwnerState {
         for digest in expired {
             self.plan_deadlines.remove(&digest);
             self.retained_plan_files.remove(&digest);
+            self.desktop_views.retain(|_, (shown, _)| shown != &digest);
             if self.gate.expire_plan(&digest) {
                 self.expired_plans.push_back(digest);
                 if self.expired_plans.len() > EXPIRED_PLAN_IDS {
@@ -149,6 +172,30 @@ pub struct PreparedPlan {
 mod tests;
 
 impl RuntimeOwner {
+    /// Record the exact full response only after its writer flush succeeds and
+    /// the adapter revalidates the same live desktop connection.
+    pub(crate) fn desktop_view_delivered(
+        &self,
+        connection: ConnectionId,
+        view: &subc_control::config::ConfigPlanView,
+    ) -> Result<()> {
+        let mut state = self.lock()?;
+        let plan = state
+            .gate
+            .plans
+            .get(&view.digest)
+            .ok_or_else(|| GateError::new("plan_unknown", "plan is absent or expired"))?;
+        if plan.view != *view {
+            return Err(GateError::new(
+                "plan_stale",
+                "delivered view differs from the immutable plan",
+            ));
+        }
+        state
+            .desktop_views
+            .insert(connection.get(), (view.digest.clone(), view.base_revision));
+        Ok(())
+    }
     pub fn new(incarnation: String, store: ConfigStore, capturer: ConfigCapturer) -> Self {
         Self {
             inner: Mutex::new(OwnerState {
@@ -156,6 +203,7 @@ impl RuntimeOwner {
                 store,
                 _writer_lock: None,
                 plan_deadlines: BTreeMap::new(),
+                desktop_views: BTreeMap::new(),
                 retained_plan_files: BTreeMap::new(),
                 expired_plans: VecDeque::new(),
                 declarations: HashMap::new(),
@@ -240,6 +288,7 @@ impl RuntimeOwner {
 
     pub fn disconnected(&self, connection: ConnectionId) {
         if let Ok(mut state) = self.inner.lock() {
+            state.desktop_views.remove(&connection.get());
             for digest in state.gate.connection_approval_digests(connection.get()) {
                 state.reviewed(&digest, Instant::now());
             }
@@ -599,8 +648,9 @@ impl RuntimeOwner {
         let current = self
             .capture_modules(&mut state, &modules)
             .map_err(|_| GateError::stale())?;
+        let facts = state.with_desktop_view(digest, facts);
         let OwnerState { gate, store, .. } = &mut *state;
-        let challenge = gate.begin_approval(digest, store, &current.diagnostic, facts)?;
+        let challenge = gate.begin_approval(digest, store, &current.diagnostic, &facts)?;
         state.reviewed(digest, Instant::now());
         Ok(challenge)
     }
@@ -628,12 +678,14 @@ impl RuntimeOwner {
                 return Err(error);
             }
         };
+        let facts = state.with_desktop_view(&digest, facts);
         let OwnerState { gate, store, .. } = &mut *state;
         let result =
-            gate.finish_approval(attempt, reply, store, &current.diagnostic, facts, now_ms);
+            gate.finish_approval(attempt, reply, store, &current.diagnostic, &facts, now_ms);
         if result.is_ok() {
             state.plan_deadlines.remove(&digest);
             state.retained_plan_files.remove(&digest);
+            state.desktop_views.retain(|_, (shown, _)| shown != &digest);
         }
         result
     }
@@ -666,6 +718,11 @@ impl RuntimeOwner {
         status.base_revision = store_status.base_revision;
         status.anchor_pending = store_status.anchor_pending;
         status.warnings = store_status.warnings;
+        if cfg!(feature = "dev-desktop-approval") {
+            status
+                .development_switches
+                .push("dev-desktop-approval".into());
+        }
         if let Ok(body) = state.store.body() {
             status.pending_proposals = u64::from(body.proposal.is_some());
             status.gated_modules = body

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.41.9
+
+- Bind desktop approval to the complete immutable plan actually flushed to the
+  same live connection. Recheck its digest/revision and desktop identity after
+  presence; replacement, disconnect, expiry and consumption discard the binding.
+- Recognize trusted desktop identity separately from an operator app's permission
+  to skip ordinary prompts. Code signing, the minimum admitted signed version
+  and, on Windows, the exact verified process retained in the daemon's launch
+  record are still required. Development recognition requires a verifier object
+  supplied through the daemon's Rust constructor; the shipped daemon leaves
+  `dev_desktop_verifier_unspecified` refused.
+- Report which trusted desktop, phone and interactive OS confirmation methods
+  are available. Attempt OS confirmation only when its provider is ready and,
+  on Linux, the per-user polkit policy is installed.
+
 ## 0.41.8
 
 - Share the 64 MiB authority-store read and publication bound. Before publishing,

@@ -423,6 +423,11 @@ pub struct ControlHandler {
     caller_endpoints: Arc<Mutex<HashMap<ConnectionId, (SocketAddr, SocketAddr)>>>,
     build_class_warned: Arc<Mutex<HashSet<ConnectionId>>>,
     observed_peers: Arc<Mutex<HashMap<ConnectionId, ObservedPeer>>>,
+    captured_peers: Arc<Mutex<HashMap<ConnectionId, subc_os::local_peer::CapturedPeer>>>,
+    config_desktop_stamps:
+        Arc<Mutex<HashMap<ConnectionId, crate::operator_apps::OperatorAppStamp>>>,
+    #[cfg(feature = "dev-desktop-approval")]
+    dev_desktop_verifier: crate::config_gate::desktop::DevDesktopVerifier,
     local_connections: Arc<Mutex<HashSet<ConnectionId>>>,
     pub(crate) operator_app_policy: crate::operator_apps::OperatorAppPolicy,
     pub(crate) operator_apps:
@@ -1050,6 +1055,10 @@ impl ControlHandler {
             caller_endpoints: Arc::new(Mutex::new(HashMap::new())),
             build_class_warned: Arc::new(Mutex::new(HashSet::new())),
             observed_peers: Arc::new(Mutex::new(HashMap::new())),
+            captured_peers: Arc::new(Mutex::new(HashMap::new())),
+            config_desktop_stamps: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "dev-desktop-approval")]
+            dev_desktop_verifier: Default::default(),
             local_connections: Arc::new(Mutex::new(HashSet::new())),
             operator_app_policy: Default::default(),
             operator_apps: Arc::new(Mutex::new(HashMap::new())),
@@ -1878,6 +1887,21 @@ impl ControlHandler {
         peer: subc_os::local_peer::CapturedPeer,
     ) {
         self.record_observed_peer(connection, peer.observation().clone());
+        let identity = self.operator_app_policy.config_identity(peer.clone());
+        #[cfg(windows)]
+        let identity = identity.or_else(|| self.config_windows_launch_identity(&peer));
+        if let Some(identity) = identity {
+            // Keep the connect-time launch incarnation. Looking it up afresh
+            // from a numeric pipe-client PID could match a later reused PID.
+            self.config_desktop_stamps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(connection, identity);
+        }
+        self.captured_peers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(connection, peer.clone());
         #[cfg(windows)]
         if let Some(stamp) = self.stamp_windows_launch(&peer) {
             self.operator_apps
@@ -2253,6 +2277,14 @@ impl ControlHandler {
             .unwrap_or_else(|p| p.into_inner())
             .remove(&connection_id);
         self.observed_peers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&connection_id);
+        self.captured_peers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&connection_id);
+        self.config_desktop_stamps
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&connection_id);

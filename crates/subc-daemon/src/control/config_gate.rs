@@ -156,6 +156,107 @@ impl ControlHandler {
         self
     }
 
+    /// Development surface identity is supplied by the daemon constructor, not
+    /// selected by a connection, config file or startup argument.
+    #[cfg(feature = "dev-desktop-approval")]
+    pub fn with_dev_desktop_verifier(
+        mut self,
+        verifier: crate::config_gate::desktop::DevDesktopVerifier,
+    ) -> Self {
+        self.dev_desktop_verifier = verifier;
+        self
+    }
+
+    fn config_desktop_identity(
+        &self,
+        connection: ConnectionId,
+    ) -> std::result::Result<bool, GateError> {
+        if !self.config_owner_connection(connection) {
+            return Ok(false);
+        }
+        #[cfg(feature = "dev-desktop-approval")]
+        {
+            let peer = self
+                .captured_peers
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&connection)
+                .cloned();
+            self.dev_desktop_verifier.verify(peer.as_ref())
+        }
+        #[cfg(not(feature = "dev-desktop-approval"))]
+        {
+            Ok(self
+                .config_desktop_stamps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&connection)
+                .is_some_and(|stamp| stamp.revalidate_with_launches(&self.launch_table)))
+        }
+    }
+
+    pub(crate) fn config_desktop_review_response(
+        &self,
+        connection: ConnectionId,
+        response: &Frame,
+    ) -> Option<subc_control::config::ConfigPlanView> {
+        if self.config_runtime.is_none() || response.header.ty != FrameType::Response {
+            return None;
+        }
+        let probe: ControlOpProbe = serde_json::from_slice(&response.body).ok()?;
+        if !matches!(
+            probe.op.as_str(),
+            "config.plan" | "config.stamp" | "config.unstamp" | "config.rollback"
+        ) || !matches!(self.config_desktop_identity(connection), Ok(true))
+        {
+            return None;
+        }
+        match serde_json::from_slice::<ConfigControlResponse>(&response.body).ok()? {
+            ConfigControlResponse::Plan { view }
+            | ConfigControlResponse::Stamp { view }
+            | ConfigControlResponse::Unstamp { view }
+            | ConfigControlResponse::Rollback { view } => Some(view),
+            _ => None,
+        }
+    }
+
+    pub(crate) async fn config_desktop_review_delivered(
+        &self,
+        connection: ConnectionId,
+        view: subc_control::config::ConfigPlanView,
+    ) {
+        if !matches!(self.config_desktop_identity(connection), Ok(true)) {
+            return;
+        }
+        let Some(runtime) = self.config_runtime.clone() else {
+            return;
+        };
+        let peers = self.captured_peers.clone();
+        let _ = config_work(runtime, move |owner| {
+            // Lock order is captured peers, then owner. Cleanup removes the
+            // peer before dropping the owner's receipt, so a delayed writer
+            // acknowledgement cannot resurrect a disconnected connection.
+            let peers = peers.lock().unwrap_or_else(|p| p.into_inner());
+            if !peers.contains_key(&connection) {
+                return Ok(());
+            }
+            owner.desktop_view_delivered(connection, &view)
+        })
+        .await;
+    }
+
+    pub(crate) async fn deliver_config_desktop_review(
+        &self,
+        ctx: &RouteCtx,
+        response: Frame,
+        view: subc_control::config::ConfigPlanView,
+    ) -> Result<(), RouterError> {
+        ctx.egress.send_flushed(response).await?;
+        self.config_desktop_review_delivered(ctx.connection_id, view)
+            .await;
+        Ok(())
+    }
+
     pub fn with_config_review_admission(
         mut self,
         admission: Arc<dyn crate::config_gate::ReviewAdmission>,
@@ -243,8 +344,16 @@ impl ControlHandler {
         match request {
             ConfigControlRequest::Status {} => {
                 let mut status = config_work(runtime, |owner| owner.status()).await?;
-                status.missing_approval_surfaces.push("desktop_app".into());
-                status.missing_approval_surfaces.push("phone".into());
+                let facts = self.config_approval_facts(ctx).await;
+                status
+                    .missing_approval_surfaces
+                    .extend(crate::config_gate::missing_surfaces(
+                        &facts,
+                        matches!(status.state.as_str(), "store_missing" | "store_unverified"),
+                    ));
+                if let Err(error) = self.config_desktop_identity(ctx.connection_id) {
+                    status.missing_approval_surfaces.push(error.code);
+                }
                 Ok(ConfigControlResponse::Status { status })
             }
             ConfigControlRequest::History {} => {
@@ -265,7 +374,16 @@ impl ControlHandler {
                 let challenge = config_work(runtime.clone(), move |owner| {
                     owner.begin_approval(&digest, &facts)
                 })
-                .await?;
+                .await
+                .map_err(|error| {
+                    if error.code == "approval_surface_unavailable" {
+                        self.config_desktop_identity(ctx.connection_id)
+                            .err()
+                            .unwrap_or(error)
+                    } else {
+                        error
+                    }
+                })?;
                 let reply = match &challenge {
                     ApprovalChallenge::Desktop { .. } | ApprovalChallenge::OsPrompt { .. } => {
                         ApprovalReply::Presence(
@@ -394,12 +512,18 @@ impl ControlHandler {
     }
 
     async fn config_approval_facts(&self, ctx: &RouteCtx) -> ApprovalFacts {
+        let desktop = self
+            .config_desktop_identity(ctx.connection_id)
+            .unwrap_or(false);
         ApprovalFacts {
             connection: ctx.connection_id.get(),
             owner_uid: self.config_owner_connection(ctx.connection_id),
-            desktop_app: false,
-            attested_operator_app: false,
-            os_prompt_available: false,
+            desktop_app: desktop,
+            attested_operator_app: desktop && !cfg!(feature = "dev-desktop-approval"),
+            os_prompt_available: config_os_prompt_available(
+                self.forwarding.operator_confirms().config_gate_ready(),
+                crate::config_gate::os_prompt_policy_present(),
+            ),
             phone: None,
             caller: self.resolve_caller(ctx.connection_id).await,
         }
@@ -530,6 +654,10 @@ impl ControlHandler {
     }
 }
 
+fn config_os_prompt_available(provider_ready: bool, policy_present: bool) -> bool {
+    provider_ready && policy_present
+}
+
 async fn config_work<T: Send + 'static>(
     runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
     work: impl FnOnce(Arc<crate::config_gate::runtime::RuntimeOwner>) -> std::result::Result<T, GateError>
@@ -562,3 +690,6 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod desktop_tests;

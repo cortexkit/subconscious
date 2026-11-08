@@ -125,6 +125,8 @@ pub struct BootstrapConfig {
     /// Only a service-definition argument may name this authority store. An
     /// embedded daemon with no explicit root never opens an installation store.
     config_store_root: Option<PathBuf>,
+    #[cfg(feature = "dev-desktop-approval")]
+    dev_desktop_verifier: crate::config_gate::desktop::DevDesktopVerifier,
     configured_port: Option<u16>,
     /// Daemon-wide route.bind relay budget in milliseconds (the fallback for
     /// any module without a per-module override). `None` = built-in default
@@ -176,6 +178,16 @@ pub struct BootstrapConfig {
 }
 
 impl BootstrapConfig {
+    /// Supply development identity verification directly from a trusted test or
+    /// embedding caller. No environment or startup argument selects a verifier.
+    #[cfg(feature = "dev-desktop-approval")]
+    pub fn with_dev_desktop_verifier(
+        mut self,
+        verifier: crate::config_gate::desktop::DevDesktopVerifier,
+    ) -> Self {
+        self.dev_desktop_verifier = verifier;
+        self
+    }
     pub fn with_config_store_root(mut self, root: PathBuf) -> Result<Self, BootstrapError> {
         crate::config_store::StoreRoot::from_service_definition(root.clone())
             .map_err(|e| BootstrapError::ConfigStore(e.to_string()))?;
@@ -217,6 +229,8 @@ impl BootstrapConfig {
             activity_config: daemon_config::ActivityConfig::default(),
             daemon_config_path: None,
             config_store_root: None,
+            #[cfg(feature = "dev-desktop-approval")]
+            dev_desktop_verifier: Default::default(),
             configured_port: None,
             route_bind_relay_default_ms: None,
             reserved_capabilities: BTreeMap::new(),
@@ -678,6 +692,8 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let activity_config = config.activity_config;
     let daemon_config_path = config.daemon_config_path.clone();
     let config_store_root = config.config_store_root.clone();
+    #[cfg(feature = "dev-desktop-approval")]
+    let dev_desktop_verifier = config.dev_desktop_verifier.clone();
     let configured_port = config.configured_port;
     let route_bind_relay_default_ms = config.route_bind_relay_default_ms;
     let reserved_capabilities = config.reserved_capabilities.clone();
@@ -708,6 +724,8 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 activity_config,
                 daemon_config_path,
                 config_store_root,
+                #[cfg(feature = "dev-desktop-approval")]
+                dev_desktop_verifier,
                 configured_port,
                 route_bind_relay_default_ms,
                 reserved_capabilities,
@@ -862,6 +880,8 @@ async fn serve_bound_daemon(
     activity_config: daemon_config::ActivityConfig,
     daemon_config_path: Option<PathBuf>,
     config_store_root: Option<PathBuf>,
+    #[cfg(feature = "dev-desktop-approval")]
+    dev_desktop_verifier: crate::config_gate::desktop::DevDesktopVerifier,
     configured_port: Option<u16>,
     route_bind_relay_default_ms: Option<u64>,
     reserved_capabilities: BTreeMap<String, String>,
@@ -1099,6 +1119,10 @@ async fn serve_bound_daemon(
     }
     if let Some(runtime) = config_runtime {
         control = control.with_config_runtime(runtime);
+    }
+    #[cfg(feature = "dev-desktop-approval")]
+    {
+        control = control.with_dev_desktop_verifier(dev_desktop_verifier);
     }
     if let Some(ms) = route_bind_relay_default_ms {
         // A daemon-wide config value overrides the built-in default; a

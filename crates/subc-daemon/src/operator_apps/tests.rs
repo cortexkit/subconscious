@@ -72,6 +72,33 @@ mod macos {
     }
 
     #[test]
+    fn config_desktop_macos_identity_keeps_signature_and_floor_without_prompt_exemption() {
+        let root = cortexkit_test_support::ScratchDir::new("config-desktop-identity");
+        let mut identity = policy();
+        identity.macos_enabled = false;
+        for (label, identifier, version, accepted) in [
+            ("good", "io.cortexkit.alfonso.fixture", "1.2.10", true),
+            ("lower", "io.cortexkit.alfonso.fixture", "1.2.9", false),
+            ("wrong", "io.cortexkit.other.fixture", "1.2.10", false),
+        ] {
+            let mut fixture =
+                SignedPeerFixture::new(&root.join(label), identifier, Some(version), true, None);
+            let (_stream, peer) = fixture.connect();
+            assert!(identity.stamp(peer.clone()).is_none());
+            assert!(OperatorAppPolicy::default()
+                .config_identity(peer.clone())
+                .is_none());
+            let review = identity.config_identity(peer);
+            assert_eq!(review.is_some(), accepted, "{label}");
+            if let Some(review) = review {
+                assert!(review.revalidate());
+                drop(fixture);
+                assert!(!review.revalidate());
+            }
+        }
+    }
+
+    #[test]
     fn macos_native_requirement_floor_and_restart() {
         let root = cortexkit_test_support::ScratchDir::new("operator-app");
         let mut fixture = SignedPeerFixture::new(

@@ -79,6 +79,30 @@ struct Fixture {
     handler: Arc<ControlHandler>,
     supervisor: SupervisorHandle,
 }
+
+#[test]
+fn config_desktop_provider_readiness_is_explicit_and_stuck_workers_are_unavailable() {
+    struct Ready(bool);
+    impl OperatorProvider for Ready {
+        fn config_gate_ready(&self) -> bool {
+            self.0
+        }
+        fn prompt(
+            &self,
+            _: &str,
+            _: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
+        ) -> ProviderResult {
+            panic!("readiness must never ask for presence")
+        }
+    }
+    let confirms = OperatorConfirms::default();
+    confirms.configure(Arc::new(Ready(false)), OperatorLimits::default());
+    assert!(!confirms.config_gate_ready());
+    confirms.configure(Arc::new(Ready(true)), OperatorLimits::default());
+    assert!(confirms.config_gate_ready());
+    confirms.lock().stuck = true;
+    assert!(!confirms.config_gate_ready());
+}
 struct Module {
     ctx: RouteCtx,
     rx: mpsc::Receiver<OutboundFrame>,

@@ -8,6 +8,151 @@ struct Rig {
     path: std::path::PathBuf,
     declaration: ConfigDeclareRequest,
 }
+
+fn desktop_plan() -> (Rig, RuntimeOwner, ConfigPlanView) {
+    let rig = Rig::new();
+    std::fs::write(
+        rig.path.join("cortexkit/a.jsonc"),
+        br#"{"credential":{"vault_ref":"safe-reference"}}"#,
+    )
+    .unwrap();
+    let owner = rig.owner("desktop-view");
+    rig.declare(&owner, 10);
+    let plan = owner
+        .finish_plan(owner.prepare(PlanKind::Stamp).unwrap(), daemon_review)
+        .unwrap();
+    (rig, owner, plan)
+}
+
+#[test]
+fn config_desktop_owner_requires_exact_full_view_on_the_same_connection() {
+    let (_rig, owner, plan) = desktop_plan();
+    let refused = || {
+        owner
+            .begin_approval(&plan.digest, &Rig::facts())
+            .unwrap_err()
+            .code
+    };
+    assert_eq!(refused(), "approval_surface_unavailable");
+    let mut forged = plan.clone();
+    forged.plan.changeset.apply_plan = json!({"omitted_effects":true});
+    assert_eq!(
+        owner
+            .desktop_view_delivered(ConnectionId::new(7), &forged)
+            .unwrap_err()
+            .code,
+        "plan_stale"
+    );
+    assert_eq!(refused(), "approval_surface_unavailable");
+    owner
+        .desktop_view_delivered(ConnectionId::new(8), &plan)
+        .unwrap();
+    assert_eq!(refused(), "approval_surface_unavailable");
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    assert!(matches!(
+        owner.begin_approval(&plan.digest, &Rig::facts()).unwrap(),
+        ApprovalChallenge::Desktop { .. }
+    ));
+}
+
+#[test]
+fn config_desktop_owner_rechecks_replaced_view_after_presence() {
+    let (_rig, owner, plan) = desktop_plan();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let attempt = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
+    let other = owner
+        .finish_plan(owner.prepare(PlanKind::Stamp).unwrap(), |old, new| {
+            let mut review = daemon_review(old, new)?;
+            review
+                .policy_changes
+                .push(json!({"reviewed_variant":"second plan"}));
+            Ok(review)
+        })
+        .unwrap();
+    assert_ne!(other.digest, plan.digest);
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &other)
+        .unwrap();
+    assert_eq!(
+        owner
+            .finish_approval(
+                attempt.attempt(),
+                &Rig::facts(),
+                ApprovalReply::Presence(super::super::PresenceDecision::InteractiveApproval),
+                1
+            )
+            .unwrap_err()
+            .code,
+        "approval_surface_unavailable"
+    );
+    assert_eq!(owner.status().unwrap().state, "unstamped");
+    assert!(owner.history().unwrap().0.is_empty());
+    // A failed attempt leaves the old immutable plan reviewable, not approved.
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    assert!(owner.begin_approval(&plan.digest, &Rig::facts()).is_ok());
+}
+
+#[test]
+fn config_desktop_owner_disconnect_expiry_and_consumption_clear_full_view_receipts() {
+    let (_rig, owner, plan) = desktop_plan();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let attempt = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
+    owner.disconnected(ConnectionId::new(7));
+    assert_eq!(
+        owner
+            .finish_approval(
+                attempt.attempt(),
+                &Rig::facts(),
+                ApprovalReply::Presence(super::super::PresenceDecision::InteractiveApproval),
+                1
+            )
+            .unwrap_err()
+            .code,
+        "approval_surface_unavailable"
+    );
+    assert_eq!(
+        owner
+            .begin_approval(&plan.digest, &Rig::facts())
+            .unwrap_err()
+            .code,
+        "approval_surface_unavailable"
+    );
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    {
+        let mut state = owner.inner.lock().unwrap();
+        let deadline = state.plan_deadlines[&plan.digest];
+        state.expire_idle(deadline);
+        assert!(state.desktop_views.is_empty());
+    }
+    let replacement = owner
+        .finish_plan(owner.prepare(PlanKind::Stamp).unwrap(), daemon_review)
+        .unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &replacement)
+        .unwrap();
+    let attempt = owner
+        .begin_approval(&replacement.digest, &Rig::facts())
+        .unwrap();
+    owner
+        .finish_approval(
+            attempt.attempt(),
+            &Rig::facts(),
+            ApprovalReply::Presence(super::super::PresenceDecision::InteractiveApproval),
+            1,
+        )
+        .unwrap();
+    assert!(owner.inner.lock().unwrap().desktop_views.is_empty());
+}
 impl Rig {
     fn new() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -84,6 +229,9 @@ impl Rig {
     fn stamp(&self, owner: &RuntimeOwner) -> u64 {
         let prepared = owner.prepare(PlanKind::Stamp).unwrap();
         let plan = owner.finish_plan(prepared, daemon_review).unwrap();
+        owner
+            .desktop_view_delivered(ConnectionId::new(7), &plan)
+            .unwrap();
         let challenge = owner.begin_approval(&plan.digest, &Self::facts()).unwrap();
         owner
             .finish_approval(
@@ -213,6 +361,9 @@ fn config_owner_recaptures_file_identity_after_presence_before_committing() {
     rig.declare(&owner, 10);
     let prepared = owner.prepare(PlanKind::Stamp).unwrap();
     let plan = owner.finish_plan(prepared, daemon_review).unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
     let challenge = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
     std::fs::write(rig.path.join("replacement.jsonc"), bytes).unwrap();
     std::fs::rename(
@@ -299,6 +450,9 @@ fn config_owner_unrelated_invalid_layer_does_not_stale_a_reviewed_module() {
     )
     .unwrap();
     let plan = owner.finish_plan(prepared, daemon_review).unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
     let challenge = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
     assert_eq!(
         owner
@@ -337,6 +491,9 @@ fn config_owner_failed_fresh_capture_consumes_the_approval_attempt() {
     rig.declare(&owner, 10);
     let plan = owner
         .finish_plan(owner.prepare(PlanKind::Stamp).unwrap(), daemon_review)
+        .unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
         .unwrap();
     let challenge = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
     std::fs::write(
@@ -398,6 +555,9 @@ fn config_owner_recovery_refuses_changes_but_can_plan_and_commit_restamp() {
     let plan = owner
         .finish_plan(owner.prepare(PlanKind::Stamp).unwrap(), daemon_review)
         .unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
     let challenge = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
     owner
         .finish_approval(
@@ -444,6 +604,9 @@ fn config_owner_idle_expiry_frees_plans_and_names_recent_expirations() {
         .finish_plan(owner.prepare(PlanKind::Stamp).unwrap(), daemon_review)
         .unwrap();
     assert_eq!(replacement.digest, view.digest);
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &replacement)
+        .unwrap();
     assert!(owner
         .begin_approval(&replacement.digest, &Rig::facts())
         .is_ok());
@@ -513,6 +676,9 @@ fn config_owner_open_approval_prevents_expiry_and_failed_reply_keeps_plan_for_an
     rig.declare(&owner, 10);
     let view = owner
         .finish_plan(owner.prepare(PlanKind::Stamp).unwrap(), daemon_review)
+        .unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &view)
         .unwrap();
     let challenge = owner.begin_approval(&view.digest, &Rig::facts()).unwrap();
     {

@@ -38,6 +38,7 @@ impl PhoneSurface {
 /// Built from daemon-observed peer/app state, never deserialized from a request.
 /// An unattested connection must still be identified as the desktop app under
 /// the development feature; arbitrary owner-uid clients are not desktop apps.
+#[derive(Clone)]
 pub struct ApprovalFacts {
     pub connection: u64,
     pub owner_uid: bool,

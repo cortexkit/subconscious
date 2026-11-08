@@ -77,6 +77,11 @@ impl std::fmt::Display for DeclineKey {
 /// returns only when its prompt has ended. Publishing is allowed to be delayed:
 /// the daemon's timeout also covers setup and a delayed handle is still withdrawn.
 pub trait OperatorProvider: Send + Sync + 'static {
+    /// Whether this provider can attempt strict interactive configuration
+    /// presence. Readiness is not approval; the prompt result is authoritative.
+    fn config_gate_ready(&self) -> bool {
+        false
+    }
     fn prompt(
         &self,
         text: &str,
@@ -159,6 +164,9 @@ impl OperatorWithdraw for OsWithdraw {
 }
 
 impl OperatorProvider for OsProvider {
+    fn config_gate_ready(&self) -> bool {
+        cfg!(any(target_os = "macos", windows, target_os = "linux"))
+    }
     fn prompt_gate(
         &self,
         text: &str,
@@ -626,6 +634,10 @@ impl Default for OperatorConfirms {
     }
 }
 impl OperatorConfirms {
+    pub(crate) fn config_gate_ready(&self) -> bool {
+        let state = self.lock();
+        !state.stuck && state.provider.config_gate_ready()
+    }
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }

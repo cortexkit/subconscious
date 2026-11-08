@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.20.163
+
+- Require subc-daemon 0.41.9 or newer so configuration approval binds to a
+  complete plan delivered to a verified desktop and requires interactive OS
+  confirmation. No development identity verifier is shipped.
+
 ## 0.20.162
 
 - Raise the daemon dependency floor for bounded authority-store publication and

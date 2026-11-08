@@ -243,7 +243,16 @@ impl OperatorAppPolicy {
     }
 
     pub(crate) fn stamp(&self, peer: CapturedPeer) -> Option<OperatorAppStamp> {
-        if !self.macos_enabled || !cfg!(target_os = "macos") {
+        if !self.macos_enabled {
+            return None;
+        }
+        self.config_identity(peer)
+    }
+
+    /// A trusted full-diff surface needs the same process identity and release
+    /// floor, but never gains the operator-app prompt exemption from this check.
+    pub(crate) fn config_identity(&self, peer: CapturedPeer) -> Option<OperatorAppStamp> {
+        if !cfg!(target_os = "macos") {
             return None;
         }
         let app = self.app.id?;

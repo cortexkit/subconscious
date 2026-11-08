@@ -227,6 +227,7 @@ fn live_subscriptions_preserve_event_reader_boundaries() {
     let participant = grants::issued_grant(&account, "runner-one", "credential", &[]).unwrap();
     let authority = grants::issued_grant(&account, "prefrontal-core", "credential", &[]).unwrap();
     let flow = grants::issued_grant(&account, "basal", "credential", &[]).unwrap();
+    let routing = grants::issued_grant(&account, "prefrontal-routing", "credential", &[]).unwrap();
     for (grant, allowed, refused) in [
         (
             &participant,
@@ -255,6 +256,22 @@ fn live_subscriptions_preserve_event_reader_boundaries() {
                 "ck.box_livefixture.live.*.step.finished.v1",
             ],
             vec!["ck.otheraccount.live.runner-one.step.finished.v1"],
+        ),
+        (
+            &routing,
+            vec![
+                "ck.box_livefixture.live.insula.quota_sampled.v1",
+                "ck.box_livefixture.live.broca.step.finished.v1",
+                "ck.box_livefixture.live.thalamus-harness.step.finished.v1",
+            ],
+            vec![
+                "ck.box_livefixture.live.broca.run.v1",
+                "ck.box_livefixture.live.thalamus-harness.run.v1",
+                "ck.box_livefixture.live.thalamus.step.finished.v1",
+                "ck.box_livefixture.live.thalamus-pi.step.finished.v1",
+                "ck.box_livefixture.live.magic-context.compaction.started.v1",
+                "ck.box_livefixture.live.*.step.finished.v1",
+            ],
         ),
     ] {
         for subject in allowed {

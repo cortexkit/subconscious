@@ -26,7 +26,9 @@ allow magic-context subscribe ck.box_goldenfixture.live.thalamus-harness.compact
 allow magic-context subscribe ck.box_goldenfixture.live.thalamus-pi.compaction.>
 allow magic-context subscribe ck.box_goldenfixture.live.thalamus.compaction.>
 allow prefrontal-routing publish ck.box_goldenfixture.live.prefrontal-routing.>
+allow prefrontal-routing subscribe ck.box_goldenfixture.live.broca.step.finished.v1
 allow prefrontal-routing subscribe ck.box_goldenfixture.live.insula.>
+allow prefrontal-routing subscribe ck.box_goldenfixture.live.thalamus-harness.step.finished.v1
 allow thalamus publish ck.box_goldenfixture.live.thalamus.>
 allow thalamus subscribe ck.box_goldenfixture.live.magic-context.compaction.>
 allow thalamus-harness publish ck.box_goldenfixture.live.thalamus-harness.>
@@ -55,3 +57,4 @@ expect-refused thalamus-harness publish ck.box_goldenfixture.live.insula.quota_s
 expect-refused thalamus-pi publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused thalamus-pi publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
 expect-refused participant subscribe ck.box_goldenfixture.live.ckbus.step.finished.v1 no-event-reader
+expect-refused prefrontal-routing subscribe ck.box_goldenfixture.live.broca.run.v1 foreign-live-subscribe

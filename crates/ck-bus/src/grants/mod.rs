@@ -372,7 +372,8 @@ pub fn system_account_grant(
 /// the flow engine's `_INBOX.<flow_engine_module>.>`, and the system user's
 /// `_INBOX.<system_credential>.>`, exactly as in the committed reference document. The
 /// `expect-refused` lines preserve the naming crate's expectations for the same fixture
-/// and add their live counterparts and a non-reader's refused live subscription.
+/// and add their live counterparts, a non-reader's refused live subscription, and
+/// a routing reader's refused subscription outside its exact subscription filters.
 /// The result is checked with the same validator the naming crate applies to its
 /// golden, so a partial-token wildcard or a `deny` line
 /// never leaves this function.
@@ -473,6 +474,9 @@ pub fn render_fixture_document(fixture: GoldenFixture) -> Result<String, GrantRe
     output.push_str(&format!(
         "expect-refused participant subscribe {live_prefix}{}.step.finished.v1 no-event-reader\n",
         fixture.module_id
+    ));
+    output.push_str(&format!(
+        "expect-refused prefrontal-routing subscribe {live_prefix}broca.run.v1 foreign-live-subscribe\n"
     ));
     validate_document(&output, &account)?;
     Ok(output)

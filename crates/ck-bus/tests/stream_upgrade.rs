@@ -590,7 +590,14 @@ async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_du
         (
             streams.event.clone(),
             "m_prefrontal-routing",
-            vec![format!("ck.{}.event.insula.>", names.account())],
+            vec![
+                format!("ck.{}.event.insula.>", names.account()),
+                format!("ck.{}.event.broca.step.finished.v1", names.account()),
+                format!(
+                    "ck.{}.event.thalamus-harness.step.finished.v1",
+                    names.account()
+                ),
+            ],
         ),
         (
             streams.event.clone(),
@@ -961,7 +968,14 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
         ),
         (
             "m_prefrontal-routing",
-            vec![format!("ck.{}.event.insula.>", plane.names.account())],
+            vec![
+                format!("ck.{}.event.insula.>", plane.names.account()),
+                format!("ck.{}.event.broca.step.finished.v1", plane.names.account()),
+                format!(
+                    "ck.{}.event.thalamus-harness.step.finished.v1",
+                    plane.names.account()
+                ),
+            ],
         ),
         (
             "m_magic-context",
@@ -1118,6 +1132,58 @@ async fn bootstrap_updates_event_filters_and_limits_in_place_preserving_ack_floo
         .unwrap();
     drop(plane.bootstrap().await);
     assert_eq!(plane.cursor("m_prefrontal-core").await, before);
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn bootstrap_widens_routing_step_filters_in_place_preserving_delivered_position() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    drop(plane.bootstrap().await);
+    let durable = "m_prefrontal-routing";
+    let mut old = plane.consumer(durable).await.cached_info().config.clone();
+    old.filter_subjects.clear();
+    old.filter_subject = format!("ck.{}.event.insula.>", plane.names.account());
+    plane
+        .js
+        .update_consumer_on_stream(old, &plane.names.streams().event)
+        .await
+        .unwrap();
+    let sequence = plane.store_event("insula", "signal").await;
+    assert_eq!(plane.ack_one(durable).await, sequence);
+    let broca = plane.store_event("broca", "step.finished").await;
+    let harness = plane.store_event("thalamus-harness", "step.finished").await;
+    let before = plane.cursor(durable).await;
+    assert_eq!(before["num_pending"], 0);
+
+    drop(plane.bootstrap().await);
+    let after = plane.cursor(durable).await;
+    assert_eq!(
+        plane
+            .consumer(durable)
+            .await
+            .get_info()
+            .await
+            .unwrap()
+            .config
+            .filter_subjects,
+        vec![
+            format!("ck.{}.event.insula.>", plane.names.account()),
+            format!("ck.{}.event.broca.step.finished.v1", plane.names.account()),
+            format!(
+                "ck.{}.event.thalamus-harness.step.finished.v1",
+                plane.names.account()
+            ),
+        ]
+    );
+    for field in ["created", "ack_floor", "delivered", "num_ack_pending"] {
+        assert_eq!(after[field], before[field], "{durable} must keep {field}");
+    }
+    assert_eq!(after["num_pending"], 2);
+    assert_eq!(plane.ack_one(durable).await, broca);
+    assert_eq!(plane.ack_one(durable).await, harness);
     plane.server.stop().await;
 }
 

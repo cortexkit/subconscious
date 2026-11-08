@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.4
+
+- Adopt cortexkit-bus-naming 0.3.1 so `prefrontal-routing` can read the exact
+  `broca.step.finished.v1` and `thalamus-harness.step.finished.v1` events and live
+  hints for per-model speed statistics. Bootstrap updates its existing event
+  durable's filters in place, preserving its delivered position; other live
+  subjects remain refused.
+
 ## 0.5.3
 
 - Test only: the revocation tests' severed-socket check waits for the client's

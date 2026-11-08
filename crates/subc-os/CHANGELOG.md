@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.31
+
+- Add `durable_replace` for already-synced files: rename plus parent-directory
+  sync on Unix, and write-through replacement on Windows without a weaker
+  fallback. Configuration authority publication uses this flush boundary.
+
 ## 0.1.30
 
 - Add the safe `config_keychain` API for a team-signed macOS daemon's sealing

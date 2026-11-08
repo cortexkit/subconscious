@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.41.2
+
+- Add the configuration store engine: owner-only atomic publication, sealed
+  content MACs and anchors, digest-only integrity checks, recovery exits and
+  revision high-water handling. Approval and delivery remain blocked while an
+  anchor update is pending.
+- Persist generation history, protected active/recovery/pending versions, prune
+  audit records and snapshot-based proposals rebased on generation commits.
+- Add isolated file-key, root, failure and pause hooks behind `test-support`
+  and the development executable-name check.
+
 ## 0.41.1
 
 - Explicitly accept subc-presence's non-interactive policy authorization for legacy privileged-operation prompts and module `operator.confirm` requests, preserving their existing behavior.

@@ -18,9 +18,8 @@ use windows_sys::Win32::{
         WAIT_TIMEOUT,
     },
     Storage::FileSystem::{
-        FileAttributeTagInfo, FileIdInfo, GetFileInformationByHandleEx,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_ID_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
     },
     System::{
         Diagnostics::ToolHelp::{
@@ -35,6 +34,7 @@ use windows_sys::Win32::{
     },
 };
 
+use crate::retained_file_identity as identity;
 use crate::{MemoryKind, Observation, Process, ResourceUsage};
 
 /// A Windows file object identity, not a content hash. All sixteen ID bytes matter.
@@ -116,26 +116,6 @@ fn open_image(path: &Path) -> io::Result<File> {
         ));
     }
     Ok(file)
-}
-
-fn identity(file: &File) -> io::Result<WindowsFileIdentity> {
-    let mut info: FILE_ID_INFO = Default::default();
-    // SAFETY: file owns a live handle; the output buffer has the FileIdInfo layout and size.
-    if unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            FileIdInfo,
-            (&mut info as *mut FILE_ID_INFO).cast(),
-            size_of::<FILE_ID_INFO>() as u32,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(WindowsFileIdentity {
-        volume_serial_number: info.VolumeSerialNumber,
-        file_id: info.FileId.Identifier,
-    })
 }
 
 impl ExecutableCapture {

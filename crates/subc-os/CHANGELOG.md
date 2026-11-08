@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.32
+
+- Expose file-object identity from a retained file handle on Unix and Windows.
+  Share the complete Windows volume/file-id query with executable capture.
+
 ## 0.1.31
 
 - Add `durable_replace` for already-synced files: rename plus parent-directory

@@ -84,7 +84,11 @@ pub mod boot_id;
 pub mod child_exit;
 pub mod config_keychain;
 mod durable_replace;
+#[cfg(any(unix, windows))]
+mod retained_file;
 pub use durable_replace::durable_replace;
+#[cfg(any(unix, windows))]
+pub use retained_file::{retained_file_identity, RetainedFileIdentity};
 #[cfg(all(unix, feature = "test-support"))]
 pub mod fork_exec_test;
 pub mod host;

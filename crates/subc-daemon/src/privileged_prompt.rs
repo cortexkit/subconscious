@@ -69,6 +69,37 @@ fn sanitize(text: &str) -> String {
         .collect()
 }
 
+/// Gate descriptions must survive the legacy sanitizer and target limit intact.
+/// Only the OS-observed requester path may lose a suffix to fit the prompt.
+pub(crate) fn gate_prompt_text(
+    description: &str,
+    targets: &[&str],
+    caller: &CallerIdentity,
+) -> Option<String> {
+    if sanitize(description) != description
+        || targets
+            .iter()
+            .any(|target| target.chars().count() > TARGET_LIMIT || sanitize(target) != *target)
+    {
+        return None;
+    }
+    let text = match caller.pid().zip(caller.executable()) {
+        Some((pid, path)) => {
+            let prefix = format!("{description} — requested by pid {pid} (");
+            let budget = SUMMARY_LIMIT.checked_sub(prefix.chars().count() + 1)?;
+            if budget < 3 {
+                return None;
+            }
+            format!(
+                "{prefix}{})",
+                shorten_path(&sanitize(&path.to_string_lossy()), budget)
+            )
+        }
+        None => format!("{description} — requested by an unidentified local process"),
+    };
+    (text.chars().count() <= SUMMARY_LIMIT).then_some(text)
+}
+
 fn forbidden(c: char) -> bool {
     // The operator.confirm API rejects control and invisible format characters
     // in operator_confirm::valid_summary. Replace those and other invisible

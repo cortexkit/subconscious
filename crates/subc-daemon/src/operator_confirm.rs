@@ -82,6 +82,16 @@ pub trait OperatorProvider: Send + Sync + 'static {
         text: &str,
         publish: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
     ) -> ProviderResult;
+
+    /// Configuration approval requires an interactive response. Providers that
+    /// distinguish policy grants override this instead of reusing legacy approval.
+    fn prompt_gate(
+        &self,
+        text: &str,
+        publish: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
+    ) -> ProviderResult {
+        self.prompt(text, publish)
+    }
 }
 
 /// Called on a blocking thread, never while a daemon lock is held.
@@ -149,6 +159,25 @@ impl OperatorWithdraw for OsWithdraw {
 }
 
 impl OperatorProvider for OsProvider {
+    fn prompt_gate(
+        &self,
+        text: &str,
+        publish: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
+    ) -> ProviderResult {
+        #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+        {
+            gate_os_outcome(subc_presence::prompt(
+                text,
+                Box::new(move |handle| publish(Arc::new(OsWithdraw(handle)))),
+            ))
+        }
+        #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
+        {
+            let _ = (text, publish);
+            ProviderResult::Unavailable
+        }
+    }
+
     fn prompt(
         &self,
         text: &str,
@@ -211,9 +240,73 @@ fn os_outcome(outcome: subc_presence::Outcome) -> ProviderResult {
     }
 }
 
+#[cfg(any(target_os = "macos", windows, target_os = "linux"))]
+fn gate_os_outcome(outcome: subc_presence::Outcome) -> ProviderResult {
+    match outcome {
+        subc_presence::Outcome::AuthorizedWithoutPrompt => ProviderResult::Unavailable,
+        other => os_outcome(other),
+    }
+}
+
 #[cfg(all(test, any(target_os = "macos", windows, target_os = "linux")))]
 mod os_outcome_tests {
     use super::*;
+
+    #[test]
+    fn config_gate_os_outcomes_require_interactive_confirmation() {
+        use crate::config_gate::PresenceDecision as Gate;
+        use subc_presence::{LocalAuthenticationFailure as Failure, Outcome as Os};
+        for (outcome, expected) in [
+            (Os::Approved, Gate::InteractiveApproval),
+            (Os::AuthorizedWithoutPrompt, Gate::Unavailable),
+            (Os::Declined, Gate::Declined),
+            (Os::NoPresence, Gate::Unavailable),
+            (Os::SetupRequired, Gate::Unavailable),
+            (Os::UnsupportedPlatform, Gate::Unavailable),
+            (Os::ProviderError, Gate::Unavailable),
+            (
+                Os::ProviderErrorWithReason { reason: "no_agent" },
+                Gate::Unavailable,
+            ),
+            (
+                Os::LocalAuthenticationError {
+                    failure: Failure::Declined,
+                    domain: "LA".into(),
+                    code: -2,
+                },
+                Gate::Declined,
+            ),
+            (
+                Os::LocalAuthenticationError {
+                    failure: Failure::NoPresence,
+                    domain: "LA".into(),
+                    code: -4,
+                },
+                Gate::Unavailable,
+            ),
+            (
+                Os::LocalAuthenticationError {
+                    failure: Failure::ProviderError,
+                    domain: "LA".into(),
+                    code: -1,
+                },
+                Gate::Unavailable,
+            ),
+        ] {
+            assert_eq!(
+                Gate::from_operator_outcome(&Outcome::from_provider(gate_os_outcome(outcome))),
+                expected
+            );
+        }
+        assert_eq!(
+            Gate::from_operator_outcome(&Outcome::declined("backoff")),
+            Gate::Declined
+        );
+        assert_eq!(
+            Gate::from_operator_outcome(&Outcome::unavailable("queue_full")),
+            Gate::Unavailable
+        );
+    }
 
     #[test]
     fn policy_authorization_still_approves_legacy_prompts() {
@@ -381,6 +474,16 @@ impl Outcome {
     }
 }
 
+impl crate::config_gate::PresenceDecision {
+    pub(crate) fn from_operator_outcome(outcome: &Outcome) -> Self {
+        match outcome.code {
+            "confirmed" => Self::InteractiveApproval,
+            error_codes::OPERATOR_DECLINED => Self::Declined,
+            _ => Self::Unavailable,
+        }
+    }
+}
+
 fn retry_after_ms(remaining: Duration) -> u64 {
     let whole_milliseconds = remaining.as_millis();
     let rounded_milliseconds =
@@ -434,6 +537,7 @@ enum RequestKind {
 }
 
 struct Request {
+    gate_presence: bool,
     id: u64,
     module_id: String,
     summary: String,
@@ -653,6 +757,7 @@ impl OperatorConfirms {
             module_id,
             summary: request.summary,
             principal,
+            gate_presence: false,
             kind: RequestKind::Module(ModuleRouteKey {
                 endpoint: binding.module_endpoint,
                 channel: binding.module_channel,
@@ -687,6 +792,35 @@ impl OperatorConfirms {
         caller: String,
         key: DeclineKey,
         shortcut: Option<ShortcutContext>,
+    ) -> Outcome {
+        self.approve_client(ctx, frame, operation, text, caller, key, shortcut, false)
+            .await
+    }
+
+    pub(crate) async fn approve_config_gate(
+        self: &Arc<Self>,
+        ctx: &RouteCtx,
+        frame: &Frame,
+        text: String,
+        caller: String,
+        key: DeclineKey,
+    ) -> Outcome {
+        // Never accept an operator-app shortcut as config review.
+        self.approve_client(ctx, frame, "config.apply", text, caller, key, None, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn approve_client(
+        self: &Arc<Self>,
+        ctx: &RouteCtx,
+        frame: &Frame,
+        operation: &str,
+        text: String,
+        caller: String,
+        key: DeclineKey,
+        shortcut: Option<ShortcutContext>,
+        gate_presence: bool,
     ) -> Outcome {
         let (answer, receive) = oneshot::channel();
         let id = {
@@ -727,6 +861,7 @@ impl OperatorConfirms {
                 summary: text.clone(),
                 principal: caller,
                 text,
+                gate_presence,
                 kind: RequestKind::Privileged {
                     answer: Mutex::new(Some(answer)),
                     key,
@@ -1097,10 +1232,12 @@ impl OperatorConfirms {
                         let publish_to = Arc::clone(&this);
                         let id = request.id;
                         let result = tokio::task::spawn_blocking(move || {
-                            provider.prompt(
-                                &request.text,
-                                Box::new(move |handle| publish_to.publish(id, handle)),
-                            )
+                            let publish = Box::new(move |handle| publish_to.publish(id, handle));
+                            if request.gate_presence {
+                                provider.prompt_gate(&request.text, publish)
+                            } else {
+                                provider.prompt(&request.text, publish)
+                            }
                         })
                         .await
                         .unwrap_or(ProviderResult::Unavailable);

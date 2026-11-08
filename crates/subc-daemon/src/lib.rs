@@ -20,6 +20,7 @@ mod cgroup_recovery;
 mod child_resources;
 mod child_roster;
 mod clock;
+pub mod config_gate;
 pub mod config_store;
 pub mod control;
 pub mod daemon_config;

@@ -6,6 +6,64 @@ use crate::operator_confirm::shortcut::{Gate, Hooks, ShortcutContext};
 use cortexkit_test_support::ScratchDir;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+async fn config_gate_prompt_with_legacy_authority(attested: bool) {
+    let dir = ScratchDir::new("config-gate-prompt");
+    let prompts = Arc::new(AtomicUsize::new(0));
+    let mut f = Fixture::new(
+        Arc::new(Prompts(prompts.clone())),
+        OperatorLimits::default(),
+    );
+    let incarnation = publish_self(&f.handler.launch_table);
+    f.handler = Arc::new(
+        (*f.handler)
+            .clone()
+            .with_activity_ledger(dir.path(), "gate-presence".into())
+            .with_privileged_operator_prompt(if attested {
+                crate::daemon_config::PrivilegedOperatorPrompt::Enforce
+            } else {
+                crate::daemon_config::PrivilegedOperatorPrompt::Log
+            }),
+    );
+    let (client, _rx) = ctx_fn(901);
+    if attested {
+        Arc::get_mut(&mut f.handler)
+            .unwrap()
+            .operator_app_policy
+            .windows_enabled = true;
+        let stamp = launch_stamp(incarnation);
+        assert!(ShortcutContext::eligible_stamp(
+            &f.handler.operator_app_policy,
+            &f.handler.launch_table,
+            Some(&stamp)
+        ));
+        f.handler
+            .operator_apps
+            .lock()
+            .unwrap()
+            .insert(client.connection_id, stamp);
+    }
+    let challenge = crate::config_gate::ApprovalChallenge::Desktop {
+        attempt: 1,
+        prompt: "Approve config plan sha256:0123456789abcdef".into(),
+    };
+    let decision = f
+        .handler
+        .confirm_config_gate_presence(&client, &restart(91), &challenge)
+        .await;
+    assert_eq!(decision, crate::config_gate::PresenceDecision::Declined);
+    assert_eq!(prompts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn config_gate_log_policy_still_prompts() {
+    config_gate_prompt_with_legacy_authority(false).await;
+}
+
+#[tokio::test]
+async fn config_gate_attested_shortcut_still_prompts() {
+    config_gate_prompt_with_legacy_authority(true).await;
+}
+
 struct Prompts(Arc<AtomicUsize>);
 impl OperatorProvider for Prompts {
     fn prompt(

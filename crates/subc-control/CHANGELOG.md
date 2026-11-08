@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.35.1
+
+- Add standalone config-gate client requests, plan views, status and responses;
+  preserve the legacy exhaustive control enums and require capability opt-in.
+
 ## 0.35.0
 
 - Breaking: `ClientControlRequest::RouteOpen` gains `busy_refusals: Option<bool>` and `ClientControlResponse::RouteOpen` gains `request_window: Option<usize>` and `watch_window: Option<usize>`. The request member and both reply members are omitted on the wire when absent; older peers decode unchanged. Upgrade callers together.

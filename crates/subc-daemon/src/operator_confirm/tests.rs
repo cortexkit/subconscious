@@ -2604,3 +2604,112 @@ async fn privileged_cooldown_refuses_queued_requests_from_that_executable_only()
         "{captured}"
     );
 }
+#[tokio::test]
+async fn config_gate_and_legacy_prompts_share_decline_cooldown() {
+    for gate_first in [false, true] {
+        let f = Fixture::new(
+            Arc::new(Immediate(ProviderResult::Declined)),
+            OperatorLimits::default(),
+        );
+        let (client, _rx) = ctx_fn(999);
+        let key = DeclineKey::Executable(PathBuf::from("/test-only/operator"));
+        let confirms = f.forwarding.operator_confirms();
+        for corr in 0..3 {
+            let outcome = if gate_first {
+                confirms
+                    .approve_config_gate(
+                        &client,
+                        &restart(corr),
+                        "Approve config plan".into(),
+                        "direct".into(),
+                        key.clone(),
+                    )
+                    .await
+            } else {
+                confirms
+                    .approve_privileged_with_shortcut(
+                        &client,
+                        &restart(corr),
+                        "supervisor.restart",
+                        "Restart module".into(),
+                        "direct".into(),
+                        key.clone(),
+                        None,
+                    )
+                    .await
+            };
+            assert_eq!(outcome.reason, "person");
+        }
+        let outcome = if gate_first {
+            confirms
+                .approve_privileged_with_shortcut(
+                    &client,
+                    &restart(4),
+                    "supervisor.restart",
+                    "Restart module".into(),
+                    "direct".into(),
+                    key,
+                    None,
+                )
+                .await
+        } else {
+            confirms
+                .approve_config_gate(
+                    &client,
+                    &restart(4),
+                    "Approve config plan".into(),
+                    "direct".into(),
+                    key,
+                )
+                .await
+        };
+        assert_eq!(outcome.code, error_codes::OPERATOR_DECLINED);
+        assert_eq!(outcome.reason, "backoff");
+    }
+}
+#[tokio::test]
+async fn config_gate_queue_uses_strict_presence_provider_not_legacy_policy_grants() {
+    struct SplitProvider;
+    impl OperatorProvider for SplitProvider {
+        fn prompt(
+            &self,
+            _: &str,
+            _: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
+        ) -> ProviderResult {
+            ProviderResult::Approved
+        }
+        fn prompt_gate(
+            &self,
+            _: &str,
+            _: Box<dyn FnOnce(Arc<dyn OperatorWithdraw>) + Send>,
+        ) -> ProviderResult {
+            ProviderResult::Unavailable
+        }
+    }
+    let f = Fixture::new(Arc::new(SplitProvider), OperatorLimits::default());
+    let (client, _rx) = ctx_fn(997);
+    let challenge = crate::config_gate::ApprovalChallenge::OsPrompt {
+        attempt: 1,
+        prompt: "Set a /v from 10 to 11; live".into(),
+    };
+    assert_eq!(
+        f.handler
+            .confirm_config_gate_presence(&client, &restart(1), &challenge)
+            .await,
+        crate::config_gate::PresenceDecision::Unavailable
+    );
+    let outcome = f
+        .forwarding
+        .operator_confirms()
+        .approve_privileged_with_shortcut(
+            &client,
+            &restart(2),
+            "supervisor.restart",
+            "Restart module".into(),
+            "direct".into(),
+            DeclineKey::Connection(client.connection_id),
+            None,
+        )
+        .await;
+    assert_eq!(outcome.code, "confirmed");
+}

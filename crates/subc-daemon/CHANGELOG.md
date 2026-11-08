@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.41.3
+
+- Add immutable configuration planning and approval over the durable store,
+  read-set freshness, reverse-configuration rollback and bound consent/v1 cards.
+- Require desktop review for stamps and consent-module changes, lossless small
+  OS prompts, and interactive presence even for attested operator apps. Share
+  legacy prompt cooldowns without inheriting log mode or operator-app shortcuts.
+- Add the separate `dev-desktop-approval` feature. Configuration client dispatch
+  returns `config_gate_inactive` until runtime snapshot and delivery wiring is
+  installed; the config capability is not yet advertised.
+
 ## 0.41.2
 
 - Add the configuration store engine: owner-only atomic publication, sealed

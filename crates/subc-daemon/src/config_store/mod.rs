@@ -281,6 +281,11 @@ pub struct ConfigStore {
     hooks: Option<testing::TestSupport>,
 }
 impl ConfigStore {
+    /// Unit tests never consult a host keychain, even on a signed test runner.
+    #[cfg(test)]
+    pub(crate) fn open_digest_only_for_tests(root: StoreRoot) -> Self {
+        Self::load(root, Backend::Unsupported)
+    }
     /// Reads only; the first stamp creates the directory and file. Caller must
     /// hold its daemon single-writer/start lock until this instance is dropped.
     pub fn open(root: StoreRoot) -> Self {

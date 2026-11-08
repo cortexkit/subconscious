@@ -124,6 +124,8 @@ impl std::fmt::Debug for ConsumerIdentity {
 /// connectors module (plexus). A reserved name for something that will never be
 /// built here reads as a roadmap commitment to anyone surveying the protocol,
 /// and it recruited exactly that misunderstanding from an outside contributor.
+pub mod config;
+
 pub mod ops {
     pub const SERVER: &str = "server.";
     pub const CATALOG: &str = "catalog.";

@@ -125,7 +125,18 @@ const SUBC_CONTROL_OPS: &[&str] = &[
 /// verbatim and scripts read that output, so a new name there would change it.
 /// A malformed body for one of these is still refused `invalid_control_body`
 /// rather than as an unknown op.
-const SUBC_UNADVERTISED_CONTROL_OPS: &[&str] = &[ops::SUPERVISOR_RESCAN_CHECKED];
+const SUBC_UNADVERTISED_CONTROL_OPS: &[&str] = &[
+    ops::SUPERVISOR_RESCAN_CHECKED,
+    "config.status",
+    "config.plan",
+    "config.apply",
+    "config.stamp",
+    "config.unstamp",
+    "config.history",
+    "config.rollback",
+];
+
+mod config_gate;
 
 mod rescan_checked;
 use rescan_checked::{RescanMode, RescanPlan};
@@ -2044,6 +2055,12 @@ impl ControlHandler {
                 // This additive operation is not part of the existing exhaustive
                 // module-control enum. Probe the op before decoding that enum.
                 let op = serde_json::from_slice::<ControlOpProbe>(&frame.body).ok();
+                if op
+                    .as_ref()
+                    .is_some_and(|probe| config_gate::is_config_op(&probe.op))
+                {
+                    return self.handle_config_gate_request(ctx, frame).await;
+                }
                 if op
                     .as_ref()
                     .is_some_and(|probe| probe.op == ops::ACTIVITY_RECORD)
@@ -7933,8 +7950,18 @@ type TestCallerLookup =
     Arc<dyn Fn(Option<(SocketAddr, SocketAddr)>) -> CallerIdentity + Send + Sync>;
 
 /// Every new client operation needs an explicit privilege decision here.
-fn privileged_operation(request: &ClientControlRequest) -> Option<PrivilegedOperation<'_>> {
-    match request {
+fn privileged_operation(request: &impl PrivilegedRequest) -> Option<PrivilegedOperation<'_>> {
+    request.privileged_operation()
+}
+
+trait PrivilegedRequest {
+    fn privileged_operation(&self) -> Option<PrivilegedOperation<'_>>;
+}
+
+impl PrivilegedRequest for ClientControlRequest {
+    fn privileged_operation(&self) -> Option<PrivilegedOperation<'_>> {
+        let request = self;
+        match request {
         ClientControlRequest::SupervisorRestart { module_id, .. } => {
             Some(PrivilegedOperation::Restart { module_id })
         }
@@ -7986,6 +8013,7 @@ fn privileged_operation(request: &ClientControlRequest) -> Option<PrivilegedOper
         | ClientControlRequest::SupervisorTerminals { .. }
         | ClientControlRequest::SupervisorSpawnSnapshot {}
         | ClientControlRequest::SupervisorSpawnSubscribe { .. } => None,
+    }
     }
 }
 

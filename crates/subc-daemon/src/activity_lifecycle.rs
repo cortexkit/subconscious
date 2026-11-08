@@ -217,6 +217,17 @@ impl ActivityLedger {
         );
     }
 
+    pub(crate) fn config_store_activity(&self, activity: crate::config_store::StoreActivity) {
+        self.enqueue_lifecycle_with_summary(
+            activity.event,
+            None,
+            Principal::Direct,
+            serde_json::Map::new(),
+            None,
+            Some(&activity.detail),
+        );
+    }
+
     pub(crate) fn module_rescanned(
         &self,
         added: &[String],

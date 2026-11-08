@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.41.7
+
+- Own immutable configuration captures and approval state behind one serialized
+  daemon owner. Retain approved raw layer bytes alongside redacted diagnostic
+  snapshots, validate module reviews, and connect configuration control to a
+  config-store root explicitly supplied by its caller.
+- Keep configuration-store control inactive in embedded daemons unless their
+  caller supplies a config-store root. Drain queued configuration-store
+  activities through the daemon's activity ledger.
+- Hold a per-store lifetime writer lock independent of discovery paths, expire
+  idle plans after one hour, and preserve the approved old schema's redaction
+  and apply policy across declaration transitions.
+
 ## 0.41.6
 
 - Read the configuration authority store through a no-follow, nonblocking

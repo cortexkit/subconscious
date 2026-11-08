@@ -8,6 +8,8 @@
 //! stopped-daemon edits and replay are the documented digest-only limitation.
 
 mod disk;
+mod writer_lock;
+pub use writer_lock::{StoreWriterLock, WriterLockError};
 mod records;
 #[cfg(feature = "test-support")]
 pub mod testing;
@@ -120,7 +122,9 @@ impl StoreRoot {
             .join("cortexkit")
             .join("config");
         #[cfg(not(windows))]
-        let path = crate::daemon_config::default_data_home()
+        let path = subc_os::real_user_home_dir()?
+            .join(".local")
+            .join("share")
             .join("cortexkit")
             .join("config");
         Self::from_service_definition(path)
@@ -265,7 +269,8 @@ impl Backend {
 }
 
 /// One instance per daemon, serialized by its gate lock. No method reads live
-/// configuration files: only a caller's validated, redacted snapshots enter here.
+/// configuration files. Diagnostic snapshots are validated and redacted; approved
+/// delivery bytes may contain vault reference names, never literal secret values.
 pub struct ConfigStore {
     root: StoreRoot,
     backend: Backend,

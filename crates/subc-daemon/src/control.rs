@@ -364,6 +364,8 @@ const ROUTE_OPEN_NOT_SERVING_REASONS: &[&str] = &[
 #[derive(Clone)]
 pub struct ControlHandler {
     registry: Arc<Registry>,
+    config_runtime: Option<Arc<crate::config_gate::runtime::RuntimeOwner>>,
+    config_review_admission: Arc<dyn crate::config_gate::ReviewAdmission>,
     activity: Option<crate::activity::ActivityLedger>,
     activity_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
     forwarding: Arc<ForwardingTable>,
@@ -1001,6 +1003,8 @@ impl ControlHandler {
         let route_outages = forwarding.route_outages();
         Self {
             registry,
+            config_runtime: None,
+            config_review_admission: Arc::new(crate::config_gate::MissingReviewAdmission),
             activity: None,
             activity_streams: Arc::new(Mutex::new(HashMap::new())),
             forwarding,
@@ -2055,6 +2059,14 @@ impl ControlHandler {
                 // This additive operation is not part of the existing exhaustive
                 // module-control enum. Probe the op before decoding that enum.
                 let op = serde_json::from_slice::<ControlOpProbe>(&frame.body).ok();
+                if let Some(probe) = op
+                    .as_ref()
+                    .filter(|probe| config_gate::is_module_config_op(&probe.op))
+                {
+                    return self
+                        .handle_module_config_request(ctx, frame, &probe.op)
+                        .await;
+                }
                 if op
                     .as_ref()
                     .is_some_and(|probe| config_gate::is_config_op(&probe.op))
@@ -2262,6 +2274,9 @@ impl ControlHandler {
         connection_id: ConnectionId,
         requested_reason: RegistrationEndReason,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        if let Some(runtime) = &self.config_runtime {
+            runtime.disconnected(connection_id);
+        }
         let end_reason = if requested_reason == RegistrationEndReason::ConnectionClosed {
             self.registry
                 .get_module_by_connection(connection_id)?
@@ -7211,6 +7226,13 @@ impl ControlHandler {
                 }
 
                 match timeout_at(deadline, receiver).await {
+                    Ok(Ok(ModuleControlRpcOutcome::RawResponse(_))) => {
+                        Ok(vec![control_error_frame(
+                            &frame,
+                            "invalid_control_body",
+                            "health.check returned an unexpected config response",
+                        )?])
+                    }
                     Ok(Ok(ModuleControlRpcOutcome::Response(response))) => {
                         guard.disarm();
                         let Some(report) = response.health_report() else {
@@ -7592,13 +7614,16 @@ impl ControlHandler {
                     }
                 }
                 Ok(probe) => {
-                    let outcome = match serde_json::from_slice::<ModuleControlResponse>(&frame.body)
-                    {
-                        Ok(response) => ModuleControlRpcOutcome::Response(response),
-                        Err(err) => ModuleControlRpcOutcome::MalformedResponse(format!(
-                            "malformed {} response body: {err}",
-                            probe.op
-                        )),
+                    let outcome = if matches!(probe.op.as_str(), "config.review" | "consent/v1") {
+                        ModuleControlRpcOutcome::RawResponse(frame.body.clone())
+                    } else {
+                        match serde_json::from_slice::<ModuleControlResponse>(&frame.body) {
+                            Ok(response) => ModuleControlRpcOutcome::Response(response),
+                            Err(err) => ModuleControlRpcOutcome::MalformedResponse(format!(
+                                "malformed {} response body: {err}",
+                                probe.op
+                            )),
+                        }
                     };
                     let completion = self
                         .forwarding

@@ -216,6 +216,38 @@ impl PendingPlan {
 }
 
 impl ConfigGate {
+    pub(crate) fn has_open_approval(&self, digest: &Digest) -> bool {
+        self.attempts
+            .values()
+            .any(|attempt| &attempt.digest == digest)
+    }
+
+    pub(crate) fn approval_digest(&self, attempt: u64) -> Result<Digest> {
+        self.attempts
+            .get(&attempt)
+            .map(|attempt| attempt.digest.clone())
+            .ok_or_else(unavailable)
+    }
+
+    pub(crate) fn connection_approval_digests(&self, connection: u64) -> Vec<Digest> {
+        self.attempts
+            .values()
+            .filter(|attempt| attempt.caller == connection)
+            .map(|attempt| attempt.digest.clone())
+            .collect()
+    }
+    pub(crate) fn approval_modules(
+        &self,
+        attempt: u64,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        let attempt = self.attempts.get(&attempt).ok_or_else(unavailable)?;
+        self.plan_modules(&attempt.digest)
+    }
+
+    pub(crate) fn cancel_connection_approvals(&mut self, connection: u64) {
+        self.attempts
+            .retain(|_, attempt| attempt.caller != connection);
+    }
     /// Select a required surface. Legacy `log` policy and operator-app shortcuts
     /// are deliberately absent: neither proves review of an immutable plan.
     pub fn begin_approval(

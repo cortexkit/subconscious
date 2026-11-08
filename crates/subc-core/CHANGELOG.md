@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.20.161
+
+- Accept a single absolute `ck-subc --config-store-root` service argument while
+  refusing relative, duplicated and otherwise unknown startup arguments. Without
+  that argument the daemon opens no configuration authority store.
+
 ## 0.20.160
 
 - Require subc-daemon 0.41 and subc-os 0.1.29 so opted-in modules keep their process

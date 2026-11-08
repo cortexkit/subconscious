@@ -56,33 +56,27 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
     // just the two recognised ones. Handling --help and --version early while
     // letting anything else fall through leaves the original defect for every OTHER
     // argument -- a typo, a flag copied from another tool, a stale invocation -- all
-    // of which would silently START A DAEMON. The daemon takes no arguments, so the
-    // complete rule is: recognise the two probes, refuse everything else, and only
-    // then bootstrap.
-    if let Some(unknown) = args
-        .iter()
-        .find(|arg| *arg != "--help" && *arg != "-h" && *arg != "help" && *arg != "--version")
-    {
-        eprintln!(
-            "ck-subc: unexpected argument '{}'\n\nck-subc takes no arguments; \
-             it is started by launchd and reads subc.jsonc from the XDG config \
-             directory. Use `ck` to inspect or control a running daemon, or \
-             `ck-subc --help`.",
-            unknown.to_string_lossy()
-        );
-        process::exit(2);
-    }
+    // of which would silently START A DAEMON. Only probes and the service-pinned
+    // config-store argument are recognized before bootstrap can write anything.
+    let config_store_root = match parse_config_store_root(&args) {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!("ck-subc: {error}\nRun ck-subc --help for accepted arguments.");
+            process::exit(2);
+        }
+    };
     if args
         .iter()
         .any(|arg| arg == "--help" || arg == "-h" || arg == "help")
     {
         println!(
             "ck-subc {} — the CortexKit subc daemon\n\n\
-             Started by launchd; it takes no arguments and reads its configuration\n\
+             Started by the service manager; reads its configuration\n\
              from subc.jsonc under the XDG config directory.\n\n\
               flags:\n  \
                 --version   print the version and exit\n  \
                 --build-info print offline core version and build identity as JSON\n  \
+                --config-store-root <absolute path> service-pinned configuration authority store\n  \
                 --help      print this and exit\n\n\
              To inspect or control a running daemon use `ck` (`ck module list`,\n\
              `ck health`, `ck daemon`). Running this binary directly starts a daemon.",
@@ -129,6 +123,10 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
     let daemon = async {
         let config = subc_daemon::bootstrap::BootstrapConfig::from_env_for_daemon_binary()?
             .with_cgroup_placement(placement);
+        let config = match config_store_root {
+            Some(root) => config.with_config_store_root(root)?,
+            None => config,
+        };
         let config = config.with_privacy_trampoline(privacy_trampoline);
         #[cfg(feature = "test-support")]
         let config = match std::env::var("SUBC_TEST_SHUTDOWN_INTENT_WINDOW_MS") {
@@ -154,6 +152,36 @@ async fn daemon_main(args: Vec<std::ffi::OsString>) {
     // kill_on_drop, so a destructor would be a second, unbounded-order kill
     // path next to the deliberate one. Process exit closes the descriptors.
     process::exit(0);
+}
+
+fn parse_config_store_root(
+    args: &[std::ffi::OsString],
+) -> Result<Option<std::path::PathBuf>, String> {
+    let mut root = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--config-store-root" {
+            if root.is_some() {
+                return Err("--config-store-root may be given only once".into());
+            }
+            let path = args
+                .next()
+                .ok_or("--config-store-root requires an absolute path")?;
+            let path = std::path::PathBuf::from(path);
+            if !path.is_absolute() {
+                return Err("--config-store-root requires an absolute path".into());
+            }
+            let parent = path
+                .parent()
+                .ok_or("--config-store-root requires a readable parent")?;
+            std::fs::read_dir(parent)
+                .map_err(|_| "--config-store-root requires a readable parent")?;
+            root = Some(path);
+        } else if !matches!(arg.to_str(), Some("--help" | "-h" | "help" | "--version")) {
+            return Err(format!("unexpected argument '{}'", arg.to_string_lossy()));
+        }
+    }
+    Ok(root)
 }
 
 /// The binary uses the caller's cgroup in production; test harnesses can opt out
@@ -266,6 +294,48 @@ fn install_panic_hook() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_store_root_parser_accepts_absolute_service_argument() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("isolated-config-store");
+        assert_eq!(
+            super::parse_config_store_root(&[
+                "--config-store-root".into(),
+                path.clone().into_os_string()
+            ])
+            .unwrap(),
+            Some(path)
+        );
+        assert_eq!(super::parse_config_store_root(&[]).unwrap(), None);
+        assert!(super::parse_config_store_root(&["status".into()]).is_err());
+    }
+
+    #[test]
+    fn config_store_root_parser_refuses_relative_path() {
+        assert!(super::parse_config_store_root(&[
+            "--config-store-root".into(),
+            "relative/config".into()
+        ])
+        .unwrap_err()
+        .contains("absolute"));
+    }
+
+    #[test]
+    fn config_store_root_parser_refuses_duplicate_argument() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("isolated-config-store")
+            .into_os_string();
+        assert!(super::parse_config_store_root(&[
+            "--config-store-root".into(),
+            path.clone(),
+            "--config-store-root".into(),
+            path
+        ])
+        .unwrap_err()
+        .contains("only once"));
+    }
     use std::{
         fs,
         sync::Arc,

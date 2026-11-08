@@ -102,6 +102,7 @@ fn tuple() -> Tuple {
 }
 fn entry(kind: CommitKind) -> HistoryEntry {
     HistoryEntry {
+        delivery: None,
         generation: Generation::new(
             0,
             raw_digest(b"approved-plan"),

@@ -63,6 +63,7 @@ fn main() {
         CommitKind::Approved
     };
     let entry = HistoryEntry {
+        delivery: None,
         generation: Generation::new(
             0,
             raw_digest(b"fixture-plan"),

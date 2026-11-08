@@ -6,7 +6,11 @@
 //! only the committed snapshot for delivery. No client text is approval input.
 
 mod approval;
+pub mod capture;
+pub(crate) mod review;
+pub mod runtime;
 mod snapshot;
+mod strict_json;
 
 pub use approval::*;
 pub use snapshot::{CapturedInput, GateSnapshot, InputKey};
@@ -66,6 +70,25 @@ impl From<StoreError> for GateError {
     }
 }
 
+/// The supervisor's program-admission adapter supplies this authority. A module
+/// registration and a schema declaration alone never admit its running code.
+pub trait ReviewAdmission: Send + Sync {
+    fn check(&self, registration: &crate::registry::ModuleRegistration) -> Result<()>;
+}
+
+pub(crate) struct MissingReviewAdmission;
+impl ReviewAdmission for MissingReviewAdmission {
+    fn check(&self, registration: &crate::registry::ModuleRegistration) -> Result<()> {
+        Err(GateError::new(
+            "program_admission_unavailable",
+            format!(
+                "{}: running program review admission is not connected",
+                registration.manifest.module_id
+            ),
+        ))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanKind {
     Change,
@@ -92,6 +115,7 @@ struct PendingPlan {
     changed: BTreeSet<InputKey>,
     callosum_entry_changed: bool,
     recovery: bool,
+    delivery: Option<crate::config_store::DeliverySnapshot>,
 }
 
 /// Memory-only plans cannot be replayed across a daemon restart. A successful
@@ -104,6 +128,20 @@ pub struct ConfigGate {
 }
 
 impl ConfigGate {
+    pub(crate) fn plan_modules(&self, digest: &Digest) -> Result<BTreeSet<String>> {
+        self.plans
+            .get(digest)
+            .map(|plan| plan.modules.clone())
+            .ok_or_else(|| GateError::new("plan_unknown", "plan is absent or already applied"))
+    }
+
+    pub(crate) fn cancel_attempt(&mut self, attempt: u64) {
+        self.attempts.remove(&attempt);
+    }
+
+    pub(crate) fn expire_plan(&mut self, digest: &Digest) -> bool {
+        self.plans.remove(digest).is_some()
+    }
     pub fn new(incarnation: String) -> Self {
         Self {
             incarnation,
@@ -237,9 +275,25 @@ impl ConfigGate {
                 changed,
                 callosum_entry_changed,
                 recovery,
+                delivery: None,
             },
         );
         Ok(view)
+    }
+
+    /// Attach daemon-reviewed raw inputs without exposing them in diagnostic
+    /// plans. The saved file identities and byte digests still bind the bytes
+    /// captured for review.
+    pub(crate) fn bind_delivery(
+        &mut self,
+        digest: &Digest,
+        delivery: crate::config_store::DeliverySnapshot,
+    ) -> Result<()> {
+        self.plans
+            .get_mut(digest)
+            .ok_or_else(|| GateError::new("plan_unknown", "plan is absent or already applied"))?
+            .delivery = Some(delivery);
+        Ok(())
     }
 
     /// Capture program identities for the reverse configuration's launch specs
@@ -351,6 +405,7 @@ impl ConfigGate {
             outcome: "approved".into(),
             tuples,
             configuration: snapshot.clone(),
+            delivery: plan.delivery.clone(),
         };
         let base_before = store.status().base_revision;
         let result = if plan.recovery {

@@ -345,8 +345,7 @@ pub(crate) struct ModuleDrainTarget {
     pub excluded_subscriptions: u32,
 }
 
-/// One registered module connection, as [`ForwardingTable::module_connections`]
-/// reports it: enough to send it a frame and then close it.
+/// One registered module connection, with its endpoint-bound output sink.
 #[cfg(unix)]
 #[derive(Debug, Clone)]
 pub(crate) struct ModuleConnectionTarget {
@@ -412,6 +411,7 @@ pub(crate) struct PendingModuleControlRpc {
 
 #[derive(Debug, Clone)]
 pub(crate) enum ModuleControlRpcOutcome {
+    RawResponse(Vec<u8>),
     Response(ModuleControlResponse),
     Rejected(ErrorBody),
     ModuleGone(String),
@@ -641,6 +641,16 @@ struct FrameDropWarning {
 type ChannelDropWarnings = HashMap<(u16, &'static str), FrameDropWarning>;
 
 impl ForwardingTable {
+    pub(crate) fn active_module_endpoint(
+        &self,
+        module_id: &str,
+    ) -> Result<Option<ModuleEndpointId>, ForwardingError> {
+        Ok(self
+            .read_inner()?
+            .modules_by_id
+            .get(module_id)
+            .map(|module| module.endpoint))
+    }
     /// Keep a silent route diagnosable without letting a broken peer flood logs.
     /// Epoch and direction describe the dropped frame, but do not split its limit.
     pub(crate) fn warn_frame_drop(

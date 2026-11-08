@@ -5394,6 +5394,9 @@ async fn await_health_probe(
     }
 
     match timeout_at(deadline, receiver).await {
+        Ok(Ok(ModuleControlRpcOutcome::RawResponse(_))) => Err(HealthProbeError::bad_answer(
+            "health.check returned an unexpected config response",
+        )),
         // Each arm records WHAT WAS OBSERVED. Four of them are the module
         // demonstrably answering -- rejected, non-health, malformed, wrong op --
         // and those prove it is alive even though the probe failed.

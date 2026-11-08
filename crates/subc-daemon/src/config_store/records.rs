@@ -38,6 +38,13 @@ pub enum CommitKind {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeliverySnapshot {
+    pub daemon: Option<subc_protocol::config::ConfigLayerSnapshot>,
+    pub modules: BTreeMap<String, subc_protocol::config::ConfigView>,
+    pub declarations: BTreeMap<String, subc_protocol::config::ConfigDeclareRequest>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub generation: Generation,
     pub kind: CommitKind,
@@ -46,6 +53,10 @@ pub struct HistoryEntry {
     pub tuples: BTreeSet<Tuple>,
     /// Approved configuration only; program bytes are never rollback artifacts.
     pub configuration: Snapshot,
+    /// Approved byte-exact inputs for delivery, never diagnostic plan/history
+    /// output. Vault reference strings are allowed; literal secrets are not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<DeliverySnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

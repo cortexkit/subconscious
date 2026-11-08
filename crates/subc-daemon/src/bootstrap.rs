@@ -122,6 +122,9 @@ pub struct BootstrapConfig {
     privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt,
     activity_config: daemon_config::ActivityConfig,
     daemon_config_path: Option<PathBuf>,
+    /// Only a service-definition argument may name this authority store. An
+    /// embedded daemon with no explicit root never opens an installation store.
+    config_store_root: Option<PathBuf>,
     configured_port: Option<u16>,
     /// Daemon-wide route.bind relay budget in milliseconds (the fallback for
     /// any module without a per-module override). `None` = built-in default
@@ -173,6 +176,18 @@ pub struct BootstrapConfig {
 }
 
 impl BootstrapConfig {
+    pub fn with_config_store_root(mut self, root: PathBuf) -> Result<Self, BootstrapError> {
+        crate::config_store::StoreRoot::from_service_definition(root.clone())
+            .map_err(|e| BootstrapError::ConfigStore(e.to_string()))?;
+        let parent = root.parent().ok_or_else(|| {
+            BootstrapError::ConfigStore("config store root needs a parent directory".into())
+        })?;
+        std::fs::read_dir(parent).map_err(|e| {
+            BootstrapError::ConfigStore(format!("config store parent is unreadable: {e}"))
+        })?;
+        self.config_store_root = Some(root);
+        Ok(self)
+    }
     /// Shorten restart intent validity in daemon integration fixtures.
     #[cfg(feature = "test-support")]
     pub fn with_shutdown_intent_window(mut self, window: Duration) -> Self {
@@ -201,6 +216,7 @@ impl BootstrapConfig {
             privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt::default(),
             activity_config: daemon_config::ActivityConfig::default(),
             daemon_config_path: None,
+            config_store_root: None,
             configured_port: None,
             route_bind_relay_default_ms: None,
             reserved_capabilities: BTreeMap::new(),
@@ -661,6 +677,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let privileged_operator_prompt = config.privileged_operator_prompt;
     let activity_config = config.activity_config;
     let daemon_config_path = config.daemon_config_path.clone();
+    let config_store_root = config.config_store_root.clone();
     let configured_port = config.configured_port;
     let route_bind_relay_default_ms = config.route_bind_relay_default_ms;
     let reserved_capabilities = config.reserved_capabilities.clone();
@@ -690,6 +707,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 privileged_operator_prompt,
                 activity_config,
                 daemon_config_path,
+                config_store_root,
                 configured_port,
                 route_bind_relay_default_ms,
                 reserved_capabilities,
@@ -843,6 +861,7 @@ async fn serve_bound_daemon(
     privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt,
     activity_config: daemon_config::ActivityConfig,
     daemon_config_path: Option<PathBuf>,
+    config_store_root: Option<PathBuf>,
     configured_port: Option<u16>,
     route_bind_relay_default_ms: Option<u64>,
     reserved_capabilities: BTreeMap<String, String>,
@@ -917,6 +936,54 @@ async fn serve_bound_daemon(
         "{:032x}",
         u128::from_be_bytes(bound.connection_info.daemon_id)
     );
+    let config_runtime = if let Some(root) = config_store_root {
+        let path = daemon_config_path.clone().ok_or_else(|| {
+            BootstrapError::ConfigStore(
+                "an explicit daemon config path is required with a config store".into(),
+            )
+        })?;
+        let config_home = daemon_config::default_config_home();
+        let incarnation = daemon_incarnation.clone();
+        Some(Arc::new(
+            tokio::task::spawn_blocking(move || {
+                let (root, writer_lock) = crate::config_store::StoreWriterLock::acquire(&root)
+                    .map_err(io::Error::other)?;
+                crate::config_gate::runtime::RuntimeOwner::new(
+                    incarnation,
+                    crate::config_store::ConfigStore::open(root),
+                    crate::config_gate::capture::ConfigCapturer {
+                        daemon_path: path,
+                        config_home,
+                        projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+                    },
+                )
+                .retain_writer_lock(writer_lock)
+                .map_err(io::Error::other)
+            })
+            .await
+            .map_err(|e| BootstrapError::ConfigStore(e.to_string()))?
+            .map_err(|e| BootstrapError::ConfigStore(e.to_string()))?,
+        ))
+    } else {
+        None
+    };
+    let _config_plan_sweep = config_runtime.as_ref().map(|runtime| {
+        let runtime = Arc::downgrade(runtime);
+        AbortOnDrop::new(tokio::spawn(async move {
+            let mut interval =
+                tokio::time::interval(crate::config_gate::runtime::PLAN_SWEEP_INTERVAL);
+            loop {
+                interval.tick().await;
+                let Some(runtime) = runtime.upgrade() else {
+                    break;
+                };
+                match tokio::task::spawn_blocking(move || runtime.sweep_expired()).await {
+                    Ok(Ok(())) => {}
+                    result => tracing::warn!(?result, "configuration plan expiry sweep failed"),
+                }
+            }
+        }))
+    });
     let supervisor = Supervisor::new(Arc::clone(&registry), RestartPolicy::default())
         .with_process_liveness(process_liveness.clone())
         .with_forwarding(Arc::clone(&forwarding))
@@ -1029,6 +1096,9 @@ async fn serve_bound_daemon(
     if let Some(run_dir) = activity_run_dir {
         control =
             control.with_activity_ledger_config(&run_dir, daemon_incarnation, activity_config);
+    }
+    if let Some(runtime) = config_runtime {
+        control = control.with_config_runtime(runtime);
     }
     if let Some(ms) = route_bind_relay_default_ms {
         // A daemon-wide config value overrides the built-in default; a
@@ -1889,6 +1959,7 @@ fn non_empty_os_var(key: &str) -> Option<OsString> {
 /// ordinary daemon-discovery races or stale filesystem state.
 #[derive(Debug)]
 pub enum BootstrapError {
+    ConfigStore(String),
     /// The bound server could not authenticate its own readiness probe.
     StartupNotServing,
     #[cfg(unix)]
@@ -1960,6 +2031,7 @@ impl From<ServerError> for BootstrapError {
 impl fmt::Display for BootstrapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ConfigStore(error) => write!(f, "configuration store startup refused: {error}"),
             Self::StartupNotServing => write!(f, "bound daemon did not authenticate its readiness probe; connection file was not published"),
             #[cfg(unix)]
             Self::Signal(error) => write!(f, "failed to register SIGTERM handler: {error}"),
@@ -2039,6 +2111,7 @@ impl fmt::Display for BootstrapError {
 impl Error for BootstrapError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::ConfigStore(_) => None,
             Self::StartupNotServing => None,
             #[cfg(unix)]
             Self::Signal(source) => Some(source),

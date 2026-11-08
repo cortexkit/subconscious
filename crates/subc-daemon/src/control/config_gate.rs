@@ -1,7 +1,12 @@
-use subc_control::config::ConfigControlRequest;
+use subc_control::config::{ConfigControlRequest, ConfigControlResponse};
 
 use super::*;
-use crate::config_gate::{ApprovalChallenge, PresenceDecision};
+
+/// Bound each immutable module review so an unanswered request cannot approve a plan.
+const CONFIG_REVIEW_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::config_gate::{
+    ApprovalChallenge, ApprovalFacts, ApprovalReply, GateError, PlanKind, PresenceDecision,
+};
 
 pub(super) fn is_config_op(op: &str) -> bool {
     matches!(
@@ -14,6 +19,10 @@ pub(super) fn is_config_op(op: &str) -> bool {
             | "config.history"
             | "config.rollback"
     )
+}
+
+pub(super) fn is_module_config_op(op: &str) -> bool {
+    matches!(op, "config.declare" | "config.get" | "config.applied")
 }
 
 impl PrivilegedRequest for ConfigControlRequest {
@@ -35,6 +44,126 @@ impl PrivilegedRequest for ConfigControlRequest {
 }
 
 impl ControlHandler {
+    pub(super) async fn handle_module_config_request(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+        op: &str,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let Some(runtime) = self.config_runtime.clone() else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "config_gate_inactive",
+                "no config store configured",
+            )?]);
+        };
+        let registration = self
+            .registry
+            .get_module_by_connection(ctx.connection_id)
+            .map_err(|error| RouterError::backend(0, frame.header.corr, error.to_string()))?;
+        let Some(registration) = registration else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "not_registered",
+                "module config operations require a registered connection",
+            )?]);
+        };
+        let module = registration.manifest.module_id;
+        let gate = runtime
+            .module_gate(&module)
+            .map_err(|e| RouterError::backend(0, frame.header.corr, e.to_string()))?;
+        let _gate = gate.lock().await;
+        let active = self
+            .registry
+            .get_module(&module)
+            .map_err(|error| RouterError::backend(0, frame.header.corr, error.to_string()))?
+            .is_some_and(|r| r.connection_id == ctx.connection_id)
+            && self
+                .forwarding
+                .active_module_endpoint(&module)
+                .map_err(RouterError::Forwarding)?
+                .is_some_and(|target| target.connection_id == ctx.connection_id);
+        let candidate = self
+            .registry
+            .get_candidate(&module)
+            .map_err(|error| RouterError::backend(0, frame.header.corr, error.to_string()))?
+            .is_some_and(|r| r.connection_id == ctx.connection_id);
+        if !active && !candidate {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "not_delivery_target",
+                "connection is no longer the active or candidate delivery target",
+            )?]);
+        }
+        let body = frame.body.clone();
+        let connection = ctx.connection_id;
+        let result = match op {
+            "config.declare" => {
+                let declaration = serde_json::from_slice(&body).map_err(|_| {
+                    GateError::new("invalid_control_body", "malformed config.declare request")
+                });
+                match declaration {
+                    Ok(declaration) => {
+                        config_work(runtime, move |owner| {
+                            owner.declare(connection, &module, declaration, active)?;
+                            Ok(serde_json::json!({"op":"config.declare"}))
+                        })
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            "config.get" => {
+                let request = serde_json::from_slice(&body).map_err(|_| {
+                    GateError::new("invalid_control_body", "malformed config.get request")
+                });
+                match request {
+                    Ok(request) => {
+                        config_work(runtime, move |owner| {
+                            serde_json::to_value(owner.module_get(connection, &module, request)?)
+                                .map_err(|_| {
+                                    GateError::new(
+                                        "config_unavailable",
+                                        "could not encode config view",
+                                    )
+                                })
+                        })
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            _ => Err(GateError::new(
+                "delivery_runtime_unavailable",
+                "generation acknowledgement adapter is not connected",
+            )),
+        };
+        match result {
+            Ok(response) => Ok(vec![control_response_body_frame(
+                &frame,
+                &response,
+                "module config response",
+            )?]),
+            Err(error) => Ok(vec![config_error_frame(&frame, error)?]),
+        }
+    }
+    pub fn with_config_runtime(
+        mut self,
+        runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
+    ) -> Self {
+        let _ = runtime.set_activity(self.activity.clone());
+        self.config_runtime = Some(runtime);
+        self
+    }
+
+    pub fn with_config_review_admission(
+        mut self,
+        admission: Arc<dyn crate::config_gate::ReviewAdmission>,
+    ) -> Self {
+        self.config_review_admission = admission;
+        self
+    }
+
     pub(super) async fn handle_config_gate_request(
         &self,
         ctx: &RouteCtx,
@@ -51,14 +180,330 @@ impl ControlHandler {
             }
         };
         debug_assert!(privileged_operation(&request).is_none());
-        // No config capability is advertised until the runtime owner connects
-        // snapshots, authority-store commits and supervisor delivery together.
-        let _ = ctx;
-        Ok(vec![control_error_frame(
-            &frame,
-            "config_gate_inactive",
-            "configuration gate runtime is not connected",
-        )?])
+        let Some(runtime) = self.config_runtime.clone() else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "config_gate_inactive",
+                "no config store configured",
+            )?]);
+        };
+        if !self.config_owner_connection(ctx.connection_id) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "owner_required",
+                "configuration control requires a kernel-observed owner-user connection",
+            )?]);
+        }
+        let result = self
+            .execute_config_request(ctx, &frame, runtime, request)
+            .await;
+        match result {
+            Ok(response) => Ok(vec![control_response_body_frame(
+                &frame,
+                &response,
+                "ConfigControlResponse",
+            )?]),
+            Err(error) => Ok(vec![config_error_frame(&frame, error)?]),
+        }
+    }
+
+    fn config_owner_connection(&self, connection: ConnectionId) -> bool {
+        let peers = self
+            .observed_peers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let Some(peer) = peers.get(&connection) else {
+            return false;
+        };
+        #[cfg(unix)]
+        {
+            peer.uid == Some(subc_os::effective_uid())
+        }
+        #[cfg(windows)]
+        {
+            subc_os::named_pipe::current_user_sid_string()
+                .ok()
+                .as_ref()
+                .is_some_and(|sid| peer.sid.as_ref() == Some(sid))
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = peer;
+            false
+        }
+    }
+
+    async fn execute_config_request(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+        runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
+        request: ConfigControlRequest,
+    ) -> std::result::Result<ConfigControlResponse, GateError> {
+        match request {
+            ConfigControlRequest::Status {} => {
+                let mut status = config_work(runtime, |owner| owner.status()).await?;
+                status.missing_approval_surfaces.push("desktop_app".into());
+                status.missing_approval_surfaces.push("phone".into());
+                Ok(ConfigControlResponse::Status { status })
+            }
+            ConfigControlRequest::History {} => {
+                let (generations, pruned) = config_work(runtime, |owner| owner.history()).await?;
+                Ok(ConfigControlResponse::History {
+                    generations,
+                    pruned,
+                })
+            }
+            ConfigControlRequest::Apply { digest } => {
+                if self.rescan.is_none() {
+                    return Err(GateError::new(
+                        "supervisor_reconcile_unavailable",
+                        "configuration commit requires the supervisor owner",
+                    ));
+                }
+                let facts = self.config_approval_facts(ctx).await;
+                let challenge = config_work(runtime.clone(), move |owner| {
+                    owner.begin_approval(&digest, &facts)
+                })
+                .await?;
+                let reply = match &challenge {
+                    ApprovalChallenge::Desktop { .. } | ApprovalChallenge::OsPrompt { .. } => {
+                        ApprovalReply::Presence(
+                            self.confirm_config_gate_presence(ctx, frame, &challenge)
+                                .await,
+                        )
+                    }
+                    ApprovalChallenge::Phone { .. } => {
+                        return Err(GateError::new(
+                            "approval_surface_unavailable",
+                            "phone approval relay is not connected",
+                        ))
+                    }
+                };
+                let operation = self.supervisor.operation_lock();
+                let _operation = operation.lock().await;
+                let facts = self.config_approval_facts(ctx).await;
+                let attempt = challenge.attempt();
+                let now = now_ms();
+                let generation = config_work(runtime, move |owner| {
+                    owner.finish_approval(attempt, &facts, reply, now)
+                })
+                .await?;
+                Ok(ConfigControlResponse::Applied { generation })
+            }
+            request => {
+                let kind = match request {
+                    ConfigControlRequest::Plan {} => PlanKind::Change,
+                    ConfigControlRequest::Stamp {} => PlanKind::Stamp,
+                    ConfigControlRequest::Unstamp {} => PlanKind::Unstamp,
+                    ConfigControlRequest::Rollback { generation } => PlanKind::Rollback(generation),
+                    _ => {
+                        return Err(GateError::new(
+                            "unsupported_control_frame",
+                            "unknown configuration operation",
+                        ))
+                    }
+                };
+                let prepared =
+                    config_work(runtime.clone(), move |owner| owner.prepare(kind)).await?;
+                let mut fields = Vec::new();
+                for (module, captured) in &prepared.candidate.modules {
+                    if !prepared.review_modules.contains(module) {
+                        continue;
+                    }
+                    let registration = self
+                        .registry
+                        .get_module(module)
+                        .map_err(|_| {
+                            GateError::new("config_unavailable", "registry is unavailable")
+                        })?
+                        .ok_or_else(|| {
+                            GateError::new(
+                                "module_review_unavailable",
+                                format!("{module}: no active reviewer"),
+                            )
+                        })?;
+                    self.config_review_admission.check(&registration)?;
+                    if !registration
+                        .control_ops
+                        .iter()
+                        .any(|op| op == "config.review")
+                    {
+                        return Err(GateError::new(
+                            "module_review_unavailable",
+                            format!("{module}: config.review is not opted in"),
+                        ));
+                    }
+                    let base = prepared.bases.get(module);
+                    let request = subc_protocol::config::ConfigReviewRequest::new(
+                        base.map_or(0, |b| b.generation),
+                        captured.view.layers.clone(),
+                        base.cloned(),
+                    );
+                    let bytes = serde_json::to_vec(&request).map_err(|_| {
+                        GateError::new("config_unavailable", "could not encode immutable review")
+                    })?;
+                    let reply = self
+                        .config_rpc(
+                            &runtime,
+                            module,
+                            registration.connection_id,
+                            "config.review",
+                            bytes,
+                        )
+                        .await?;
+                    let reply = serde_json::from_slice(&reply).map_err(|_| {
+                        GateError::new(
+                            "module_review_invalid",
+                            format!("{module}: malformed config.review reply"),
+                        )
+                    })?;
+                    fields.extend(crate::config_gate::review::checked_fields(
+                        module,
+                        &captured.schema,
+                        base,
+                        prepared.base_schemas.get(module),
+                        &captured.view,
+                        reply,
+                    )?);
+                }
+                let view = config_work(runtime, move |owner| {
+                    owner.finish_plan(prepared, move |old, new| {
+                        let mut changeset = crate::config_gate::runtime::daemon_review(old, new)?;
+                        changeset.fields = fields;
+                        let mut effects: std::collections::BTreeMap<String,std::collections::BTreeMap<String,Vec<String>>> = Default::default();
+                        for field in &changeset.fields {
+                            let kind = serde_json::to_value(field.apply).map_err(|_| GateError::new("schema_invalid", "could not encode apply kind"))?.as_str().ok_or_else(|| GateError::new("schema_invalid","apply kind is not a string"))?.to_owned();
+                            effects.entry(field.module_id.clone()).or_default().entry(kind).or_default().push(field.path.clone());
+                        }
+                        if changeset.fields.iter().any(|field| field.apply != subc_config::ApplyKind::Live) {
+                            changeset.apply_plan = serde_json::json!({"daemon_effects":changeset.apply_plan,"modules":effects});
+                        }
+                        Ok(changeset)
+                    })
+                })
+                .await?;
+                Ok(match kind {
+                    PlanKind::Change => ConfigControlResponse::Plan { view },
+                    PlanKind::Stamp => ConfigControlResponse::Stamp { view },
+                    PlanKind::Unstamp => ConfigControlResponse::Unstamp { view },
+                    PlanKind::Rollback(_) => ConfigControlResponse::Rollback { view },
+                })
+            }
+        }
+    }
+
+    async fn config_approval_facts(&self, ctx: &RouteCtx) -> ApprovalFacts {
+        ApprovalFacts {
+            connection: ctx.connection_id.get(),
+            owner_uid: self.config_owner_connection(ctx.connection_id),
+            desktop_app: false,
+            attested_operator_app: false,
+            os_prompt_available: false,
+            phone: None,
+            caller: self.resolve_caller(ctx.connection_id).await,
+        }
+    }
+
+    async fn config_rpc(
+        &self,
+        runtime: &Arc<crate::config_gate::runtime::RuntimeOwner>,
+        module: &str,
+        expected_connection: ConnectionId,
+        op: &str,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, GateError> {
+        let gate = runtime.module_gate(module)?;
+        let pending = {
+            let _gate = gate.lock().await;
+            let registration = self
+                .registry
+                .get_module(module)
+                .map_err(|_| GateError::new("config_unavailable", "registry unavailable"))?
+                .ok_or_else(|| {
+                    GateError::new(
+                        "module_review_unavailable",
+                        format!("{module}: no active target"),
+                    )
+                })?;
+            let pending = self
+                .forwarding
+                .begin_module_control_rpc_for(module, op, Instant::now() + CONFIG_REVIEW_TIMEOUT)
+                .map_err(|_| {
+                    GateError::new(
+                        "module_review_unavailable",
+                        format!("{module}: target unavailable"),
+                    )
+                })?;
+            if pending.endpoint.connection_id != registration.connection_id
+                || registration.connection_id != expected_connection
+            {
+                let _ = self
+                    .forwarding
+                    .cancel_module_control_rpc(pending.endpoint, pending.corr);
+                return Err(GateError::new(
+                    "not_delivery_target",
+                    "registry and forwarding targets differ",
+                ));
+            }
+            pending
+        };
+        let PendingModuleControlRpc {
+            endpoint,
+            module_sink,
+            negotiated_ver,
+            corr,
+            receiver,
+        } = pending;
+        let mut guard = ModuleControlRpcGuard::new(self.forwarding.clone(), endpoint, corr);
+        let deadline = Instant::now() + CONFIG_REVIEW_TIMEOUT;
+        let frame = Frame::build_with_version(
+            negotiated_ver,
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            corr,
+            bytes,
+        )
+        .map_err(|_| GateError::new("config_unavailable", "could not encode config request"))?;
+        timeout_at(deadline, module_sink.send(frame))
+            .await
+            .map_err(|_| {
+                GateError::new(
+                    "config_review_timeout",
+                    format!("{module}: config.review exceeded its 30-second deadline; plan remains unapproved"),
+                )
+            })?
+            .map_err(|_| {
+                GateError::new(
+                    "module_review_unavailable",
+                    format!("{module}: target disconnected"),
+                )
+            })?;
+        let outcome = timeout_at(deadline, receiver)
+            .await
+            .map_err(|_| {
+                GateError::new(
+                    "config_review_timeout",
+                    format!("{module}: config.review exceeded its 30-second deadline; plan remains unapproved"),
+                )
+            })?
+            .map_err(|_| {
+                GateError::new(
+                    "module_review_unavailable",
+                    format!("{module}: target disconnected"),
+                )
+            })?;
+        guard.disarm();
+        match outcome {
+            ModuleControlRpcOutcome::RawResponse(bytes) => Ok(bytes),
+            ModuleControlRpcOutcome::DeadlineElapsed => Err(GateError::new("config_review_timeout",format!("{module}: config.review exceeded its 30-second deadline; plan remains unapproved"))),
+            _ => Err(GateError::new(
+                "module_review_unavailable",
+                format!("{module}: config request was not answered"),
+            )),
+        }
     }
 
     /// Execute only the presence part of an engine-selected challenge. The
@@ -83,6 +528,36 @@ impl ControlHandler {
             .await;
         PresenceDecision::from_operator_outcome(&outcome)
     }
+}
+
+async fn config_work<T: Send + 'static>(
+    runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
+    work: impl FnOnce(Arc<crate::config_gate::runtime::RuntimeOwner>) -> std::result::Result<T, GateError>
+        + Send
+        + 'static,
+) -> std::result::Result<T, GateError> {
+    tokio::task::spawn_blocking(move || work(runtime))
+        .await
+        .map_err(|_| GateError::new("config_unavailable", "configuration worker stopped"))?
+}
+
+fn config_error_frame(frame: &Frame, error: GateError) -> Result<Frame, RouterError> {
+    control_error_body_frame(
+        frame,
+        ErrorBody {
+            code: error.code,
+            message: error.detail,
+            detail: None,
+        },
+    )
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 #[cfg(test)]

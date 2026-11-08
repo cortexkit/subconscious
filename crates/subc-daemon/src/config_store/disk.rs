@@ -1,5 +1,7 @@
+#[cfg(unix)]
+use std::fs::File;
 use std::{
-    fs::{self, File},
+    fs,
     io::{self, Read, Write},
     path::Path,
 };
@@ -16,16 +18,25 @@ pub enum PausePoint {
     SwapBeforePromotion,
 }
 
+// Authority includes retained generations, but never an unbounded input stream.
+// There is no aggregate store-size limit in the format; cap reads at 64 MiB.
+const STORE_READ_LIMIT: u64 = 64 * 1024 * 1024;
+
+#[cfg(test)]
+#[path = "disk_tests.rs"]
+mod tests;
+
 pub(super) fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match fs::symlink_metadata(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-        Ok(meta) if !meta.is_file() => {
-            return Err(io::Error::other("store is not an ordinary file"))
+    let mut file = match subc_os::open_regular_nofollow(path) {
+        Ok(file) => file,
+        Err(subc_os::OpenRegularError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(None)
         }
-        _ => {}
+        Err(error) => return Err(io::Error::other(error)),
+    };
+    if file.metadata()?.len() > STORE_READ_LIMIT {
+        return Err(io::Error::other("store exceeds the 64 MiB read limit"));
     }
-    let mut file = File::open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -40,7 +51,11 @@ pub(super) fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
     #[cfg(windows)]
     subc_os::windows_acl::verify_owner_only(&file)?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    (&mut file).take(STORE_READ_LIMIT).read_to_end(&mut bytes)?;
+    let length = file.metadata()?.len();
+    if length > STORE_READ_LIMIT || length != bytes.len() as u64 {
+        return Err(io::Error::other("store changed or exceeded its read limit"));
+    }
     Ok(Some(bytes))
 }
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.41.6
+
+- Read the configuration authority store through a no-follow, nonblocking
+  regular-file handle and enforce a 64 MiB read bound. Refuse substituted
+  symlinks, FIFOs and oversized files as unverified stores.
+
 ## 0.41.5
 
 - Raise the operating-system helper requirement with the co-bumped daemon.

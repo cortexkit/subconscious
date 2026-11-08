@@ -10,6 +10,14 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep_until, timeout_at, Instant};
 
 impl ControlHandler {
+    #[cfg(all(test, unix))]
+    pub(crate) async fn record_config_exit_for_test(
+        self: &Arc<Self>,
+        exited: crate::config_gate::runtime::delivery::ExitedDelivery,
+    ) {
+        record_exit(Arc::downgrade(self), exited).await;
+    }
+
     /// The bootstrap task owns this handle and aborts it at daemon teardown.
     /// The configuration delivery coordinator and its idle module tasks hold
     /// weak control-handler references, so they cannot retain the config store's
@@ -332,8 +340,13 @@ async fn record_exit(
     let Ok(gate) = owner.module_gate(&exited.module) else {
         return;
     };
-    let _guard = gate.lock().await;
-    match owner.delivery_record_exit(&exited) {
+    let recorded = {
+        let _guard = gate.lock().await;
+        owner.delivery_record_exit(&exited)
+    };
+    // The exit fence still prevents respawn. The supervisor must be able to
+    // take the module gate for an earlier command before answering this hold.
+    match recorded {
         Ok(hold) => {
             if hold {
                 if let Some(module) = control.supervisor.get(&exited.module) {
@@ -343,6 +356,7 @@ async fn record_exit(
                     }
                 }
             }
+            let _guard = gate.lock().await;
             if let Err(error) = owner.delivery_release_exit(&exited) {
                 warn!(module_id=%exited.module, %error, "configuration exit fence could not be released");
             }

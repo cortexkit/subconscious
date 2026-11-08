@@ -1186,6 +1186,32 @@ fn supervised_fixture(
 }
 
 #[cfg(unix)]
+impl RuntimeOwner {
+    pub(crate) fn unactivated_supervisor_fixture_for_test() -> (
+        impl Drop,
+        std::sync::Arc<Self>,
+        crate::supervise::Supervisor,
+        std::sync::Arc<crate::ControlHandler>,
+        crate::supervise::ModuleSpec,
+    ) {
+        let (rig, owner, supervisor, handler) = supervised_fixture(false);
+        let path = rig.path.join("subc.jsonc");
+        let (config, _) = crate::daemon_config::parse_with_activity(
+            &std::fs::read_to_string(&path).unwrap(),
+            &path,
+        )
+        .unwrap();
+        let spec = config
+            .modules
+            .into_iter()
+            .find(|entry| entry.module_id == "a")
+            .unwrap()
+            .module_spec();
+        (rig, owner, supervisor, handler, spec)
+    }
+}
+
+#[cfg(unix)]
 async fn wait_for_delivery_condition(mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !condition() {

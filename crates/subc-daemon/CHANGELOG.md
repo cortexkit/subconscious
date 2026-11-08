@@ -44,6 +44,8 @@
 - Fence respawn until a spontaneous warm-up exit's configuration failure is
   recorded. Waiting spends no extra crash budget; intentional restarts preserve
   pending configuration, and a failed first generation stays stopped.
+  Exit reconciliation releases the module gate before waiting for supervisor
+  commands, so an earlier queued restart cannot deadlock the stopped-state hold.
 
 - Refuse route-policy changes until a trusted policy installer is supplied.
   Retain reversible installations until the generation is durably active, and

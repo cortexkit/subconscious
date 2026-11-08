@@ -65,6 +65,8 @@ mod admission;
 #[cfg(all(test, windows))]
 mod carried_job_tests;
 mod config_delivery;
+#[cfg(all(test, unix))]
+mod config_exit_hold_tests;
 pub(crate) mod containment;
 #[cfg(all(test, unix))]
 mod containment_tests;

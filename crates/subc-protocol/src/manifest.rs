@@ -35,6 +35,9 @@ pub const MAX_CONFIRM_OPERATIONS: usize = 256;
 #[non_exhaustive]
 pub struct ModuleManifest {
     pub module_id: String,
+    /// Human-readable module name. Apps fall back to `module_id` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub module_version: String,
     pub protocol_ver: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,6 +187,7 @@ pub struct ModuleManifest {
 #[derive(Debug, Clone)]
 pub struct ModuleManifestBuilder {
     module_id: String,
+    display_name: Option<String>,
     module_version: String,
     protocol_ver: u8,
     trust_tier: Option<TrustTier>,
@@ -217,6 +221,7 @@ impl ModuleManifest {
     ) -> ModuleManifestBuilder {
         ModuleManifestBuilder {
             module_id: module_id.into(),
+            display_name: None,
             module_version: module_version.into(),
             protocol_ver: PROTOCOL_VERSION,
             trust_tier: None,
@@ -255,6 +260,15 @@ impl ModuleManifest {
 }
 
 impl ModuleManifestBuilder {
+    /// Sets an optional display name, refusing invalid text without normalizing it.
+    pub fn display_name(mut self, display_name: Option<String>) -> Result<Self, DisplayNameError> {
+        if let Some(value) = &display_name {
+            validate_display_name(value)?;
+        }
+        self.display_name = display_name;
+        Ok(self)
+    }
+
     /// Overrides the linked protocol version for compatibility fixtures.
     pub fn protocol_ver(mut self, protocol_ver: u8) -> Self {
         self.protocol_ver = protocol_ver;
@@ -378,6 +392,7 @@ impl ModuleManifestBuilder {
     pub fn build(self) -> ModuleManifest {
         ModuleManifest {
             module_id: self.module_id,
+            display_name: self.display_name,
             module_version: self.module_version,
             protocol_ver: self.protocol_ver,
             trust_tier: self.trust_tier,
@@ -421,6 +436,8 @@ impl ModuleManifestBuilder {
 #[derive(Deserialize)]
 struct ModuleManifestWire {
     module_id: String,
+    #[serde(default)]
+    display_name: Option<String>,
     module_version: String,
     protocol_ver: u8,
     #[serde(default)]
@@ -476,6 +493,8 @@ impl<'de> Deserialize<'de> for ModuleManifest {
             .transpose()
             .map_err(D::Error::custom)?;
         let mut builder = Self::builder(wire.module_id, wire.module_version)
+            .display_name(wire.display_name)
+            .map_err(D::Error::custom)?
             .protocol_ver(wire.protocol_ver)
             .trust_tier(wire.trust_tier);
         if let Some(ready) = wire.ready {
@@ -616,6 +635,49 @@ impl RichUiDescriptor {
             self.bytes,
             u64::from(self.chunks),
         )
+    }
+}
+
+/// A malformed display name, reported without echoing untrusted text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayNameError(&'static str);
+
+impl fmt::Display for DisplayNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid manifest display_name: {}", self.0)
+    }
+}
+
+impl std::error::Error for DisplayNameError {}
+
+/// Validates display text without trimming or truncating it.
+///
+/// Names contain 1–40 Unicode scalar values, are already trimmed, and contain
+/// neither Unicode Cc controls nor bidi formatting characters.
+pub fn validate_display_name(value: &str) -> Result<(), DisplayNameError> {
+    if value.trim() != value || !(1..=40).contains(&value.chars().count()) {
+        return Err(DisplayNameError(
+            "must be trimmed text of 1 to 40 characters",
+        ));
+    }
+    if value.chars().any(|ch| {
+        ch.is_control()
+            || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    }) {
+        return Err(DisplayNameError("must not contain control or bidi formatting characters"));
+    }
+    Ok(())
+}
+
+/// Checks the display name before HELLO decoding, retaining malformed-field context.
+pub fn validate_hello_display_name(hello: &Value) -> Result<(), DisplayNameError> {
+    match hello
+        .get("manifest")
+        .and_then(|manifest| manifest.get("display_name"))
+    {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(value)) => validate_display_name(value),
+        Some(_) => Err(DisplayNameError("must be a string")),
     }
 }
 
@@ -2878,6 +2940,7 @@ mod tests {
 
         assert_eq!(manifest.module_id, "builder-defaults");
         assert_eq!(manifest.module_version, "2.0.0");
+        assert_eq!(manifest.display_name, None);
         assert_eq!(manifest.protocol_ver, PROTOCOL_VERSION);
         assert_eq!(manifest.trust_tier, None);
         assert!(manifest.provides.is_empty());
@@ -2889,6 +2952,7 @@ mod tests {
 
         let encoded = serde_json::to_value(&manifest).expect("builder manifest serializes");
         for optional in [
+            "display_name",
             "trust_tier",
             "consumes",
             "bindings",
@@ -2909,6 +2973,8 @@ mod tests {
     #[test]
     fn fully_populated_builder_manifest_matches_the_literal_wire_golden() {
         let manifest = ModuleManifest::builder("full-builder", "2.0.0")
+            .display_name(Some("Example".to_string()))
+            .unwrap()
             .trust_tier(Some(TrustTier::Reviewed))
             .bindings(Some(Bindings {
                 storage: StorageBinding {
@@ -2968,8 +3034,74 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&manifest).expect("builder manifest serializes"),
             include_bytes!("../tests/golden/module_manifest_builder_full.json"),
-            "the builder must preserve the prior fully populated literal wire bytes"
+            "the builder must match the fully populated manifest wire bytes"
         );
+    }
+
+    #[test]
+    fn display_name_validator_enforces_scalar_bounds_and_safe_text() {
+        for valid in [
+            "Routing".to_string(),
+            "名".repeat(40),
+            "a".repeat(40),
+            "e\u{301}".repeat(20),
+        ] {
+            assert!(validate_display_name(&valid).is_ok(), "{valid:?}");
+        }
+        let mut invalid = vec![
+            "".to_string(),
+            "a".repeat(41),
+            "名".repeat(41),
+            " Routing".to_string(),
+            "Routing ".to_string(),
+            "\u{2003}Routing".to_string(),
+            "a\nb".to_string(),
+            "a\u{0085}b".to_string(),
+            "a\u{007f}b".to_string(),
+        ];
+        for code in [0x061c, 0x200e, 0x200f]
+            .into_iter()
+            .chain(0x202a..=0x202e)
+            .chain(0x2066..=0x2069)
+        {
+            invalid.push(format!("a{}b", char::from_u32(code).unwrap()));
+        }
+        let accepted: Vec<_> = invalid
+            .iter()
+            .filter(|value| validate_display_name(value).is_ok())
+            .collect();
+        assert!(
+            accepted.is_empty(),
+            "invalid display names accepted: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn display_name_builder_refuses_invalid_value() {
+        let error = ModuleManifest::builder("provider", "1.0.0")
+            .display_name(Some(" Routing".to_string()))
+            .unwrap_err();
+        assert!(error.to_string().contains("display_name"));
+    }
+
+    #[test]
+    fn display_name_manifest_round_trips_and_keeps_unknown_fields_lenient() {
+        let manifest = ModuleManifest::builder("provider", "1.0.0")
+            .display_name(Some("Routing".to_string()))
+            .unwrap()
+            .build();
+        let mut wire = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(wire["display_name"], "Routing");
+        wire["future_manifest_field"] = json!(true);
+        assert_eq!(
+            serde_json::from_value::<ModuleManifest>(wire.clone()).unwrap(),
+            manifest
+        );
+        wire["display_name"] = json!("bad\nname");
+        assert!(serde_json::from_value::<ModuleManifest>(wire)
+            .unwrap_err()
+            .to_string()
+            .contains("display_name"));
     }
 
     #[test]

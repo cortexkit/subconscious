@@ -390,6 +390,24 @@ final class ClientWireRevisionTests: XCTestCase {
         XCTAssertTrue(transport.bytes.isEmpty)
     }
 
+    func testCatalogListReadsDisplayNameAndToleratesAbsence() throws {
+        let transport = ScriptedTransport()
+        try transport.append(makeFrame(
+            ty: .response,
+            channel: 0,
+            epoch: 0,
+            corr: 1,
+            json: ["modules": [
+                ["module_id": "named-provider", "display_name": "Routing", "roles": [], "control_ops": [], "future_field": true],
+                ["module_id": "legacy-provider", "roles": [], "control_ops": []],
+            ]]
+        ))
+        let modules = try SubcClient(transport: transport).catalogList()
+        XCTAssertEqual(modules.count, 2)
+        XCTAssertEqual(modules[0].displayName, "Routing")
+        XCTAssertNil(modules[1].displayName)
+    }
+
     func testCatalogListReturnsDeclaredBusEvents() throws {
         let transport = ScriptedTransport()
         try transport.append(makeFrame(

@@ -63,6 +63,11 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
     }
     assert_golden("catalog_entry", &catalog_entry());
     assert_golden(
+        "catalog_entry_display_name",
+        &CatalogEntry::new("named-provider", vec![], vec![])
+            .with_display_name(Some("Routing".to_string())),
+    );
+    assert_golden(
         "catalog_entry_with_role_declarations",
         &CatalogEntry::new("role-test", vec![], vec![]).with_role_declarations(
             serde_json::from_value(serde_json::json!({

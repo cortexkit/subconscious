@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.5
+
+- Add optional `ModuleManifest::display_name`, a fallible builder setter, and shared display-name validation for trimmed, bounded plain text. The manifest remains non-exhaustive and unknown top-level fields remain lenient.
+
 ## 0.34.4
 
 - Add `route_busy`, its credit snapshot detail and the trusted same-route retry predicate. Pin route-open, route-death and same-route decisions in the shared golden tables.

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.1
+
+- Expose optional `CatalogEntry.display_name` from module manifests. Apps fall back to `module_id` when absent; older catalog replies remain compatible.
+
 ## 0.24.0
 
 - Bound local admission by the request deadline, refusing to write with less

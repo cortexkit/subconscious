@@ -2002,6 +2002,9 @@ pub enum PollKind {
 #[non_exhaustive]
 pub struct CatalogEntry {
     pub module_id: String,
+    /// Module-declared human-readable name. Apps fall back to `module_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// Whether the registered module currently accepts new route binds.
     ///
     /// This is the module's EFFECTIVE readiness: its own declared readiness
@@ -2099,6 +2102,13 @@ pub struct CatalogEntry {
 }
 
 impl CatalogEntry {
+    /// Sets the optional module-declared display name.
+    #[must_use]
+    pub fn with_display_name(mut self, display_name: Option<String>) -> Self {
+        self.display_name = display_name;
+        self
+    }
+
     /// Construct an entry with its required fields and wire-compatible defaults.
     #[must_use]
     pub fn new(
@@ -2109,6 +2119,7 @@ impl CatalogEntry {
         Self {
             module_id: module_id.into(),
             ready: default_true(),
+            display_name: None,
             not_ready: None,
             module_version: None,
             provenance: None,

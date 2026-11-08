@@ -325,6 +325,22 @@ describe("daemon-originated control pushes", () => {
 });
 
 describe("SubcClient capability resolution", () => {
+  test("catalogList reads display_name and tolerates its absence", async () => {
+    const { connFile } = tempConnectionFile();
+    const entry: CatalogEntry = { ...catalogEntry("named-provider", undefined), display_name: "Routing" };
+    const legacy = catalogEntry("legacy-provider", undefined);
+    const daemon = await startFakeDaemon({ stats: newStats(), catalogModules: [entry, legacy] });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile });
+    try {
+      const modules = await client.catalogList();
+      expect(modules.find((module) => module.module_id === "named-provider")?.display_name).toBe("Routing");
+      expect(modules.find((module) => module.module_id === "legacy-provider")).not.toHaveProperty("display_name");
+    } finally {
+      client.close();
+    }
+  });
+
   test("catalogList preserves declared build provenance and omits undeclared provenance", async () => {
     const { connFile } = tempConnectionFile();
     const provenance: ManifestProvenance = {

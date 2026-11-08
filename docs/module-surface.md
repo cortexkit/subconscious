@@ -121,6 +121,15 @@ the daemon predates it, never that the machine has none.
 `ModuleManifest` (`crates/subc-protocol/src/manifest.rs`) declares:
 
 - `module_id`, `module_version`, `protocol_ver`.
+- Optional `display_name`: the module's human-readable plain-text name, mirrored
+  on every `catalog.list` entry for that registration. Apps fall back to the bare
+  `module_id` when absent. A name must already be trimmed and contain 1–40 Unicode
+  scalar values, no Unicode control characters (general category Cc), and no bidi
+  formatting characters U+061C, U+200E, U+200F, U+202A–U+202E or U+2066–U+2069.
+  Names are never silently trimmed or truncated. The protocol builder rejects
+  invalid names; HELLO refuses them with `invalid_manifest` and a message naming
+  `display_name`. Unknown top-level manifest fields remain ignored, so older
+  daemons accept manifests containing this field but drop the name.
 - `provides`: roles the module serves. The set is closed:
   `tool_provider` (tools with schemas, execution mode and concurrency),
   `management_surface` (operations, config schema, observability),

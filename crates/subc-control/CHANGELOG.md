@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.35.1
+
+- Add optional `CatalogEntry::display_name` and `with_display_name`. Absence preserves existing catalog JSON; non-exhaustive construction keeps the Rust API additive. Require protocol 0.34.5.
+
 ## 0.35.0
 
 - Breaking: `ClientControlRequest::RouteOpen` gains `busy_refusals: Option<bool>` and `ClientControlResponse::RouteOpen` gains `request_window: Option<usize>` and `watch_window: Option<usize>`. The request member and both reply members are omitted on the wire when absent; older peers decode unchanged. Upgrade callers together.

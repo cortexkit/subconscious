@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.20.161
+
+- Ship daemon 0.41.2 with validated optional module display names in `catalog.list`, and cover registration and catalog projection with an isolated child-daemon integration test. Refresh co-bumped wire-crate requirements.
+
 ## 0.20.160
 
 - Require subc-daemon 0.41 and subc-os 0.1.29 so opted-in modules keep their process

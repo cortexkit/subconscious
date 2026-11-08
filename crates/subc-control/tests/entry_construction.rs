@@ -28,6 +28,32 @@ fn catalog_constructor_matches_wire_defaults() {
 }
 
 #[test]
+fn catalog_display_name_reads_present_and_absent_fields() {
+    let entry: CatalogEntry = serde_json::from_value(json!({
+        "module_id": "named-provider", "display_name": "Routing",
+        "roles": [], "control_ops": [], "future_field": true
+    }))
+    .unwrap();
+    assert_eq!(entry.display_name.as_deref(), Some("Routing"));
+    assert_eq!(
+        serde_json::to_value(&entry).unwrap()["display_name"],
+        "Routing"
+    );
+    let absent = entry.with_display_name(None);
+    assert!(serde_json::to_value(&absent)
+        .unwrap()
+        .get("display_name")
+        .is_none());
+    assert_eq!(
+        serde_json::from_value::<CatalogEntry>(json!({
+            "module_id": "named-provider", "roles": [], "control_ops": []
+        }))
+        .unwrap(),
+        absent
+    );
+}
+
+#[test]
 fn catalog_provenance_uses_manifest_shape_and_keeps_catalog_decoding_lenient() {
     let provenance_bytes = br#"{"build_git_sha":"0123456789abcdef0123456789abcdef01234567","build_lock_digest":"abababababababababababababababababababababababababababababababab","wire_crate_version":"0.34.0","store_schema_version":"7","launch_nonce_source":"fd"}"#;
     let provenance: ManifestProvenance = serde_json::from_slice(provenance_bytes).unwrap();

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.34.3
+
+- Require protocol 0.34.5 and control 0.35.1, exposing the additive optional display name through the re-exported `CatalogEntry`.
+
 ## 0.34.2
 
 0.34.1 was tagged in the repository but never published; its change ships here.

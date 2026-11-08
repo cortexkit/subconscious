@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.41.2
+
+- Refuse HELLO manifests with invalid `display_name` as malformed manifests and mirror accepted names in `catalog.list`. Require protocol 0.34.5 and control 0.35.1.
+
 ## 0.41.1
 
 - Report recorded configuration enabled-state changes in rescan previews even

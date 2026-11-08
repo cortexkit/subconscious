@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Read optional `CatalogEntry.displayName` from `catalog.list`; absent names
+  remain nil so apps can fall back to the bare `moduleId`.
+
 - Tag session subscriptions only when the route negotiated credit windows;
   older daemons keep the original subscription frame flags.
 - Opt in to route credit refusals. Only trusted

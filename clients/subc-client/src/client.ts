@@ -198,6 +198,8 @@ export interface CatalogRichUiDescriptor {
 
 export interface CatalogEntry {
   module_id: string;
+  /** Module-declared name; apps fall back to module_id when absent. */
+  display_name?: string;
   /** Build provenance from the registered manifest; absent when undeclared or on older daemons. */
   provenance?: ManifestProvenance;
   roles: unknown[];

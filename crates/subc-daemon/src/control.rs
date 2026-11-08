@@ -22,10 +22,11 @@ use subc_protocol::{
     error_codes,
     manifest::{
         validate_hello_capability_grammar, validate_hello_confirm_operations,
-        validate_hello_event_declarations, validate_hello_flow_operations,
-        validate_hello_rich_ui_descriptor, validate_hello_role_declarations,
-        validate_hello_self_signal_declarations, CapabilityDeclarations, CapabilityNeed,
-        Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
+        validate_hello_display_name, validate_hello_event_declarations,
+        validate_hello_flow_operations, validate_hello_rich_ui_descriptor,
+        validate_hello_role_declarations, validate_hello_self_signal_declarations,
+        CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
+        ProviderRole,
     },
     peer::{ObservedPeer, RouteBindPeer, OBSERVED_PEER_CAPABILITY, OPERATOR_APP_CAPABILITY},
     scope::{
@@ -2537,6 +2538,13 @@ impl ControlHandler {
                 )?])
             }
         };
+        if let Err(err) = validate_hello_display_name(&hello_value) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_manifest",
+                err.to_string(),
+            )?]);
+        }
         if let Err(err) = validate_hello_capability_grammar(&hello_value) {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -4416,6 +4424,7 @@ impl ControlHandler {
                     registration.control_ops,
                 )
                 .with_ready(not_ready.is_none())
+                .with_display_name(registration.manifest.display_name)
                 .with_not_ready(not_ready)
                 .with_module_version(Some(registration.manifest.module_version))
                 .with_provenance(registration.manifest.provenance)
@@ -9782,6 +9791,51 @@ mod tests {
         assert_eq!(registration.state, ChannelState::Active);
         assert_eq!(registration.connection_id, conn);
         assert_eq!(registration.control_ops, module_baseline_control_ops());
+        assert!(registration.manifest.display_name.is_none());
+    }
+
+    #[test]
+    fn hello_display_name_refuses_invalid_manifest_by_field() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        for (index, invalid) in [
+            json!(""),
+            json!("a".repeat(41)),
+            json!(" Routing"),
+            json!("a\nb"),
+            json!("a\u{202e}b"),
+            json!(7),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let module_id = format!("bad-display-name-{index}");
+            let mut body = serde_json::to_value(ModuleHelloBody {
+                manifest: manifest(&module_id, PROTOCOL_VERSION),
+                protocol_ver: PROTOCOL_VERSION,
+                control_ops: None,
+                launch_nonce: None,
+            })
+            .unwrap();
+            body["manifest"]["display_name"] = invalid;
+            let hello = Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                7,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            let response = handler
+                .handle_control(ConnectionId::new(100 + index as u64), hello)
+                .unwrap();
+            assert_eq!(response[0].header.ty, FrameType::Error);
+            let error = parse_error(&response[0]);
+            assert_eq!(error["code"], "invalid_manifest");
+            assert!(error["message"].as_str().unwrap().contains("display_name"));
+            assert!(registry.get_module(&module_id).unwrap().is_none());
+        }
     }
 
     #[test]

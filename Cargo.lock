@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.34.2"
+version = "0.34.3"
 dependencies = [
  "async-trait",
  "cortexkit-paths",
@@ -2862,7 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.35.0"
+version = "0.35.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2871,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.160"
+version = "0.20.161"
 dependencies = [
  "async-trait",
  "base64",
@@ -2909,7 +2909,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.41.1"
+version = "0.41.2"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -3021,7 +3021,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.34.4"
+version = "0.34.5"
 dependencies = [
  "serde",
  "serde_json",

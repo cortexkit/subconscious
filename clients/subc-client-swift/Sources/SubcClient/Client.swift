@@ -21,6 +21,8 @@ public struct CatalogRichUiDescriptor {
 
 public struct CatalogEntry {
     public let moduleId: String
+    /// Module-declared name; apps fall back to moduleId when absent.
+    public let displayName: String?
     public let roles: [String]
     public let controlOps: [String]
     public let events: [CatalogEventDeclaration]?
@@ -159,6 +161,7 @@ public final class SubcClient {
         return modules.map { module in
             CatalogEntry(
                 moduleId: module["module_id"] as? String ?? "?",
+                displayName: module["display_name"] as? String,
                 roles: rolesOf(module["roles"]),
                 controlOps: module["control_ops"] as? [String] ?? [],
                 events: eventsOf(module["events"]),

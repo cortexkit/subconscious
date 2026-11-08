@@ -233,6 +233,24 @@ impl CapturedConfiguration {
         }
         handles
     }
+
+    /// A rollback may restore a path different from the current configuration's
+    /// path. Bind both programs in the observed read set without restoring any
+    /// historical executable bytes or trusting a historical file identity.
+    pub(crate) fn capture_programs(&mut self, keys: &[InputKey]) -> Result<()> {
+        for key in keys {
+            if self.diagnostic.inputs.contains_key(key) {
+                continue;
+            }
+            let InputKey::Program { path, .. } = key else {
+                unreachable!()
+            };
+            let (file, captured) = capture_program(Path::new(path))?;
+            self.diagnostic.inputs.insert(key.clone(), captured);
+            self._program_handles.push(file);
+        }
+        Ok(())
+    }
 }
 
 impl ConfigCapturer {
@@ -257,6 +275,90 @@ impl ConfigCapturer {
         selected: Option<&BTreeSet<String>>,
     ) -> Result<CapturedConfiguration> {
         let daemon = CapturedFile::open(&self.daemon_path)?;
+        self.capture_layers(daemon, declarations, selected, CapturedFile::open)
+    }
+
+    /// Re-evaluate saved raw configuration rather than today's edited files.
+    /// Program capture still opens the files at the restored configured paths.
+    pub(crate) fn capture_retained(
+        &self,
+        target: &GateSnapshot,
+        delivery: &crate::config_store::DeliverySnapshot,
+    ) -> Result<CapturedConfiguration> {
+        let invalid = || {
+            GateError::new(
+                "rollback_snapshot_unavailable",
+                "retained raw configuration is absent or inconsistent",
+            )
+        };
+        let retained_file = |layer: &ConfigLayerSnapshot, key: &InputKey| -> Result<CapturedFile> {
+            let path = layer.path.as_ref().ok_or_else(invalid)?;
+            let input = target.inputs.get(key).ok_or_else(invalid)?;
+            if layer.bytes.as_deref().map(subc_config::raw_digest) != layer.digest {
+                return Err(invalid());
+            }
+            Ok(CapturedFile {
+                path: path.into(),
+                bytes: layer.bytes.clone(),
+                state: input.state.clone(),
+                _file: None,
+            })
+        };
+        let daemon = retained_file(
+            delivery.daemon.as_ref().ok_or_else(invalid)?,
+            &InputKey::Daemon,
+        )?;
+        if daemon.path != self.daemon_path || daemon.bytes.is_none() {
+            return Err(invalid());
+        }
+        let mut files = BTreeMap::new();
+        for (module, view) in &delivery.modules {
+            let [layer] = view.layers.as_slice() else {
+                return Err(invalid());
+            };
+            if layer.layer != ConfigLayer::User
+                || layer.module_id != *module
+                || layer.project_id.is_some()
+                || layer.workspace_id.is_some()
+            {
+                return Err(invalid());
+            }
+            let path = layer.path.as_ref().ok_or_else(invalid)?;
+            let file = retained_file(
+                layer,
+                &InputKey::Layer {
+                    module: module.clone(),
+                    path: path.clone(),
+                },
+            )?;
+            files.insert(file.path.clone(), file);
+        }
+        let captured = self.capture_layers(daemon, &delivery.declarations, None, |path| {
+            files.remove(path).ok_or_else(invalid)
+        })?;
+        if !files.is_empty()
+            || target
+                .inputs
+                .iter()
+                .filter(|(key, _)| !key.is_program())
+                .ne(captured
+                    .diagnostic
+                    .inputs
+                    .iter()
+                    .filter(|(key, _)| !key.is_program()))
+        {
+            return Err(invalid());
+        }
+        Ok(captured)
+    }
+
+    fn capture_layers(
+        &self,
+        daemon: CapturedFile,
+        declarations: &BTreeMap<String, ConfigDeclareRequest>,
+        selected: Option<&BTreeSet<String>>,
+        mut layer_file: impl FnMut(&Path) -> Result<CapturedFile>,
+    ) -> Result<CapturedConfiguration> {
         let doc = daemon.parse()?;
         if let Some(bytes) = &daemon.bytes {
             crate::daemon_config::parse_with_activity(
@@ -349,7 +451,7 @@ impl ConfigCapturer {
             let schema = Schema::new(declaration.schema.clone()).map_err(|refusal| {
                 GateError::new("schema_invalid", format!("{module}: {}", refusal.path))
             })?;
-            let file = CapturedFile::open(&expected)?;
+            let file = layer_file(&expected)?;
             let value = file.parse()?;
             refuse_expansions(&value, module, "")?;
             // Record even invalid literals through the schema projection first;
@@ -452,7 +554,13 @@ fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
             "covered program path must be absolute",
         ));
     }
-    let resolved = std::fs::canonicalize(path).map_err(capture_error)?;
+    let resolved = std::fs::canonicalize(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            GateError::new("program_missing", "configured program file is absent")
+        } else {
+            capture_error(error)
+        }
+    })?;
     let file = subc_os::open_regular_nofollow(&resolved).map_err(capture_error)?;
     let before = file.metadata().map_err(capture_error)?;
     if !before.is_file() {

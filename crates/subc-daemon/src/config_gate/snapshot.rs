@@ -122,14 +122,15 @@ impl GateSnapshot {
         Ok(InputVector::new(inputs))
     }
 
-    pub(super) fn restore_programs_from(&mut self, current: &Self) {
-        self.inputs.retain(|key, _| !key.is_program());
-        self.inputs.extend(
-            current
-                .inputs
-                .iter()
-                .filter(|(key, _)| key.is_program())
-                .map(|(key, value)| (key.clone(), value.clone())),
-        );
+    pub(super) fn restore_programs_from(&mut self, current: &Self) -> Result<()> {
+        for (key, identity) in self.inputs.iter_mut().filter(|(key, _)| key.is_program()) {
+            *identity = current.inputs.get(key).cloned().ok_or_else(|| {
+                GateError::new(
+                    "program_missing",
+                    "restored program path has no current captured identity",
+                )
+            })?;
+        }
+        Ok(())
     }
 }

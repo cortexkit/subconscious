@@ -290,6 +290,247 @@ fn config_owner_raw_credential_reference_survives_commit_restart_and_get_byte_ex
 }
 
 #[test]
+fn config_owner_rollback_retains_raw_layers_and_recaptures_the_restored_program_path() {
+    let rig = Rig::new();
+    let raw = b"{ // saved rollback input\r\n\"credential\":{\"vault_ref\":\"old-reference\"},\"limit\":2,}\r\n";
+    std::fs::write(rig.path.join("cortexkit/a.jsonc"), raw).unwrap();
+    let owner = rig.owner("rollback");
+    rig.declare(&owner, 10);
+    assert_eq!(rig.stamp(&owner), 1);
+    let recorded = owner
+        .inner
+        .lock()
+        .unwrap()
+        .store
+        .rollback_configuration(1)
+        .unwrap();
+    let recorded = super::super::GateSnapshot::from_store(&recorded).unwrap();
+    std::fs::write(
+        rig.path.join("program"),
+        b"current replacement at restored path",
+    )
+    .unwrap();
+    let current_daemon = serde_json::to_vec(
+        &json!({"version":1,"modules":{"a":{"program":rig.path.join("program"),"args":["--proposal"]}}}),
+    )
+    .unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"), &current_daemon).unwrap();
+    let current_layer = br#"{"credential":{"vault_ref":"unapproved-reference"},"limit":99}"#;
+    std::fs::write(rig.path.join("cortexkit/a.jsonc"), current_layer).unwrap();
+    let prepared = owner.prepare(PlanKind::Rollback(1)).unwrap();
+    let key = super::super::InputKey::Program {
+        module: "a".into(),
+        path: rig.path.join("program").to_string_lossy().into_owned(),
+    };
+    let current_identity = prepared.candidate.diagnostic.inputs[&key].clone();
+    assert_ne!(current_identity, recorded.inputs[&key]);
+    assert_eq!(
+        prepared.candidate.modules["a"].view.layers[0]
+            .bytes
+            .as_deref(),
+        Some(raw.as_slice())
+    );
+    let plan = owner.finish_plan(prepared, daemon_review).unwrap();
+    let difference = &plan.plan.changeset.apply_plan["rollback_programs"][0];
+    assert_eq!(difference["reason"], "program changed since that version");
+    assert_eq!(
+        difference["approved_then"],
+        serde_json::to_value(&recorded.inputs[&key]).unwrap()
+    );
+    assert_eq!(
+        difference["on_disk_now"],
+        serde_json::to_value(&current_identity).unwrap()
+    );
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let challenge = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
+    assert_eq!(
+        owner
+            .finish_approval(
+                challenge.attempt(),
+                &Rig::facts(),
+                ApprovalReply::Presence(super::super::PresenceDecision::InteractiveApproval),
+                2
+            )
+            .unwrap(),
+        2
+    );
+    let snapshot = owner.approved_snapshot().unwrap();
+    assert_eq!(
+        snapshot.modules["a"].layers[0].bytes.as_deref(),
+        Some(raw.as_slice())
+    );
+    let restored_daemon = snapshot.daemon.as_ref().unwrap().bytes.as_ref().unwrap();
+    let doc = crate::daemon_config::parse_with_activity(
+        std::str::from_utf8(restored_daemon).unwrap(),
+        rig.path.join("subc.jsonc"),
+    );
+    assert!(doc.is_ok());
+    let daemon_doc: serde_json::Value = serde_json::from_slice(restored_daemon).unwrap();
+    assert_eq!(
+        daemon_doc["modules"]["a"]["program"],
+        rig.path.join("program").to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        std::fs::read(rig.path.join("subc.jsonc")).unwrap(),
+        current_daemon
+    );
+    assert_eq!(
+        std::fs::read(rig.path.join("cortexkit/a.jsonc")).unwrap(),
+        current_layer
+    );
+    assert!(owner
+        .inner
+        .lock()
+        .unwrap()
+        .store
+        .body()
+        .unwrap()
+        .proposal
+        .is_some());
+    let commands = owner.approved_rollback_commands(2).unwrap();
+    assert_eq!(commands.generation, 2);
+    assert_eq!(commands.daemon.bytes, snapshot.daemon.unwrap().bytes);
+    assert_eq!(
+        commands.programs["a"].path,
+        rig.path.join("program").to_string_lossy()
+    );
+    assert_eq!(commands.programs["a"].identity, current_identity);
+}
+
+#[test]
+fn config_owner_rollback_path_change_is_refused_until_command_admission_is_installed() {
+    let rig = Rig::new();
+    std::fs::write(
+        rig.path.join("cortexkit/a.jsonc"),
+        br#"{"credential":{"vault_ref":"approved-reference"}}"#,
+    )
+    .unwrap();
+    let owner = rig.owner("rollback-command");
+    rig.declare(&owner, 10);
+    rig.stamp(&owner);
+    std::fs::write(rig.path.join("other-program"), b"new configured program").unwrap();
+    std::fs::write(
+        rig.path.join("subc.jsonc"),
+        serde_json::to_vec(
+            &json!({"version":1,"modules":{"a":{"program":rig.path.join("other-program")}}}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        owner.prepare(PlanKind::Rollback(1)).err().unwrap().code,
+        "rollback_command_authority_unavailable"
+    );
+    assert_eq!(owner.history().unwrap().0.len(), 1);
+}
+
+#[test]
+fn config_owner_rollback_freshness_reopens_layers_daemon_and_the_restored_program() {
+    for changed in ["program", "cortexkit/a.jsonc", "subc.jsonc"] {
+        let rig = Rig::new();
+        std::fs::write(
+            rig.path.join("cortexkit/a.jsonc"),
+            br#"{"credential":{"vault_ref":"approved-reference"}}"#,
+        )
+        .unwrap();
+        let owner = rig.owner("rollback-freshness");
+        rig.declare(&owner, 10);
+        rig.stamp(&owner);
+        std::fs::write(rig.path.join("program"), b"replacement shown in rollback").unwrap();
+        let prepared = owner.prepare(PlanKind::Rollback(1)).unwrap();
+        let plan = owner.finish_plan(prepared, daemon_review).unwrap();
+        owner
+            .desktop_view_delivered(ConnectionId::new(7), &plan)
+            .unwrap();
+        let challenge = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
+        let bytes: &[u8] = match changed {
+            "program" => b"replaced after review",
+            "cortexkit/a.jsonc" => {
+                br#"{"credential":{"vault_ref":"approved-reference"},"limit":8}"#
+            }
+            _ => br#"{"version":1,"modules":{}}"#,
+        };
+        std::fs::write(rig.path.join(changed), bytes).unwrap();
+        assert_eq!(
+            owner
+                .finish_approval(
+                    challenge.attempt(),
+                    &Rig::facts(),
+                    ApprovalReply::Presence(super::super::PresenceDecision::InteractiveApproval),
+                    2
+                )
+                .unwrap_err()
+                .code,
+            "plan_stale",
+            "{changed}"
+        );
+        assert_eq!(owner.history().unwrap().0.len(), 1);
+    }
+}
+
+#[test]
+fn config_owner_rollback_missing_program_is_named_and_creates_no_generation() {
+    let rig = Rig::new();
+    std::fs::write(
+        rig.path.join("cortexkit/a.jsonc"),
+        br#"{"credential":{"vault_ref":"approved-reference"}}"#,
+    )
+    .unwrap();
+    let owner = rig.owner("rollback-missing");
+    rig.declare(&owner, 10);
+    rig.stamp(&owner);
+    std::fs::remove_file(rig.path.join("program")).unwrap();
+    assert_eq!(
+        owner.prepare(PlanKind::Rollback(1)).err().unwrap().code,
+        "program_missing"
+    );
+    assert_eq!(owner.history().unwrap().0.len(), 1);
+}
+
+#[test]
+fn config_owner_rollback_absent_layer_stays_absent_in_delivery_after_restart() {
+    let mut rig = Rig::new();
+    rig.declaration.schema["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("credential");
+    let owner = rig.owner("rollback-absence");
+    rig.declare(&owner, 10);
+    rig.stamp(&owner);
+    std::fs::write(rig.path.join("program"), b"replacement under the same path").unwrap();
+    let proposal = br#"{"limit":8}"#;
+    std::fs::write(rig.path.join("cortexkit/a.jsonc"), proposal).unwrap();
+    let prepared = owner.prepare(PlanKind::Rollback(1)).unwrap();
+    assert_eq!(prepared.candidate.modules["a"].view.layers[0].bytes, None);
+    let plan = owner.finish_plan(prepared, daemon_review).unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let challenge = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
+    owner
+        .finish_approval(
+            challenge.attempt(),
+            &Rig::facts(),
+            ApprovalReply::Presence(super::super::PresenceDecision::InteractiveApproval),
+            2,
+        )
+        .unwrap();
+    drop(owner);
+    let reopened = rig.owner("rollback-absence-reopened");
+    let commands = reopened.approved_rollback_commands(2).unwrap();
+    assert_eq!(commands.generation, 2);
+    let saved = reopened.approved_snapshot().unwrap();
+    assert_eq!(saved.modules["a"].layers[0].bytes, None);
+    assert_eq!(saved.modules["a"].layers[0].digest, None);
+    assert_eq!(
+        std::fs::read(rig.path.join("cortexkit/a.jsonc")).unwrap(),
+        proposal
+    );
+}
+
+#[test]
 fn config_owner_requires_declaration_once_before_get() {
     let rig = Rig::new();
     let owner = rig.owner("declaration");

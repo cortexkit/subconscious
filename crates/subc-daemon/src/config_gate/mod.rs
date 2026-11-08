@@ -180,6 +180,7 @@ impl ConfigGate {
         if self.plans.len() >= 64 {
             return Err(GateError::new("config_busy", "too many pending plans"));
         }
+        let mut rollback_programs = Vec::new();
         if let PlanKind::Rollback(id) = kind {
             let target = GateSnapshot::from_store(&store.rollback_configuration(id)?)?;
             if target
@@ -191,6 +192,17 @@ impl ConfigGate {
                 return Err(GateError::invalid(
                     "rollback must reverse the target configuration",
                 ));
+            }
+            for (key, now) in candidate.inputs.iter().filter(|(key, _)| key.is_program()) {
+                if target.inputs.get(key) != Some(now) {
+                    rollback_programs.push(serde_json::json!({
+                        "module_id":key.module(),
+                        "input":key,
+                        "reason":"program changed since that version",
+                        "approved_then":target.inputs.get(key),
+                        "on_disk_now":now,
+                    }));
+                }
             }
         }
         let (base_revision, base_generation, approved, active) = if recovery {
@@ -244,6 +256,21 @@ impl ConfigGate {
             .filter_map(|key| key.module().map(str::to_owned))
             .collect();
         let mut changeset = review(&approved, &candidate)?;
+        for difference in &rollback_programs {
+            if let Some(module) = difference["module_id"].as_str() {
+                modules.insert(module.to_owned());
+                changeset
+                    .launch_manifests
+                    .entry(module.to_owned())
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                    .ok_or_else(|| GateError::invalid("launch manifest must be an object"))?
+                    .insert(
+                        "program_changed_since_target".into(),
+                        serde_json::Value::Bool(true),
+                    );
+            }
+        }
         modules.extend(changeset.fields.iter().map(|field| field.module_id.clone()));
         modules.extend(changeset.launch_manifests.keys().cloned());
         if matches!(kind, PlanKind::Stamp | PlanKind::Unstamp) {
@@ -259,6 +286,9 @@ impl ConfigGate {
             "previous": approved.to_store()?,
             "snapshot": candidate.to_store()?,
         });
+        if matches!(kind, PlanKind::Rollback(_)) {
+            changeset.apply_plan["rollback_programs"] = serde_json::Value::Array(rollback_programs);
+        }
         apply::bind_plan(&mut changeset)?;
         let mut plan = Plan::new(
             base_revision,
@@ -285,6 +315,25 @@ impl ConfigGate {
         Ok(view)
     }
 
+    fn plan_program_keys(&self, digest: &Digest) -> Result<Vec<InputKey>> {
+        let plan = self
+            .plans
+            .get(digest)
+            .ok_or_else(|| GateError::new("plan_unknown", "plan is absent or already applied"))?;
+        Ok(plan
+            .snapshot
+            .inputs
+            .keys()
+            .filter(|key| {
+                key.is_program()
+                    && key
+                        .module()
+                        .is_some_and(|module| plan.modules.contains(module))
+            })
+            .cloned()
+            .collect())
+    }
+
     /// Attach daemon-reviewed raw inputs without exposing them in diagnostic
     /// plans. The saved file identities and byte digests still bind the bytes
     /// captured for review.
@@ -301,7 +350,8 @@ impl ConfigGate {
     }
 
     /// Capture program identities for the reverse configuration's launch specs
-    /// at plan time. No executable bytes or historical identities are restored.
+    /// at the restored paths at plan time. No executable bytes or historical
+    /// identities are restored.
     pub fn rollback(
         &mut self,
         store: &mut ConfigStore,
@@ -311,7 +361,7 @@ impl ConfigGate {
         review: impl FnOnce(&GateSnapshot, &GateSnapshot) -> Result<Changeset>,
     ) -> Result<ConfigPlanView> {
         let mut target = GateSnapshot::from_store(&store.rollback_configuration(generation)?)?;
-        target.restore_programs_from(current_programs);
+        target.restore_programs_from(current_programs)?;
         self.plan(
             store,
             PlanKind::Rollback(generation),

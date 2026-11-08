@@ -2,6 +2,11 @@
 
 ## 0.41.10
 
+- Build rollback plans from retained byte-exact configuration and freshly
+  captured programs at the restored paths. Show when a program changed since
+  the selected generation, preserve edited files as proposals, and refuse
+  path-changing rollback until the supervisor selects and launches programs
+  from the approved rollback inputs at the restored paths.
 - Under `dev-desktop-approval` only, accept same-user local complete desktop
   reviews without app verification, while retaining OS presence and writer
   receipts. Persist `unverified_development_desktop` explicitly in status and

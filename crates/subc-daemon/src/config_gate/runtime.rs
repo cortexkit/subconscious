@@ -290,6 +290,20 @@ pub struct PreparedPlan {
     active_generations: BTreeMap<crate::config_store::Tuple, Option<u64>>,
     touched_modules: BTreeSet<String>,
     read_set: subc_config::InputVector,
+    program_keys: Vec<super::InputKey>,
+    observed_handles: Vec<std::fs::File>,
+}
+
+/// Immutable command inputs for the supervisor's approved rollback admission.
+pub struct ApprovedRollbackCommands {
+    pub generation: u64,
+    pub daemon: ConfigLayerSnapshot,
+    pub programs: BTreeMap<String, ApprovedRollbackProgram>,
+}
+
+pub struct ApprovedRollbackProgram {
+    pub path: String,
+    pub identity: super::CapturedInput,
 }
 
 #[cfg(test)]
@@ -652,19 +666,54 @@ impl RuntimeOwner {
             &mut state,
             matches!(kind, PlanKind::Stamp | PlanKind::Unstamp),
         )?;
-        let candidate = self.capture(&mut state)?;
-        if candidate.daemon.bytes.is_none() {
+        let observed = self.capture(&mut state)?;
+        if observed.daemon.bytes.is_none() {
             return Err(GateError::new("config_missing", "subc.jsonc is absent"));
         }
-        if matches!(kind, PlanKind::Rollback(_)) {
-            return Err(GateError::new(
-                "rollback_delivery_unavailable",
-                "reverse delivery capture is not connected",
-            ));
-        }
         if state.store.status().state == StoreState::Stamped {
-            state.store.observe(candidate.diagnostic.to_store()?)?;
+            state.store.observe(observed.diagnostic.to_store()?)?;
         }
+        let rollback = if let PlanKind::Rollback(id) = kind {
+            let target = super::GateSnapshot::from_store(&state.store.rollback_configuration(id)?)?;
+            let delivery = state
+                .store
+                .body()?
+                .generations
+                .get(&id)
+                .and_then(|entry| entry.delivery.as_ref())
+                .ok_or_else(|| {
+                    GateError::new(
+                        "rollback_snapshot_unavailable",
+                        "retained raw configuration is absent",
+                    )
+                })?;
+            Some((self.capturer.capture_retained(&target, delivery)?, target))
+        } else {
+            None
+        };
+        let (candidate, mut observed, target) = if let Some((candidate, target)) = rollback {
+            let programs = |snapshot: &super::GateSnapshot| -> BTreeMap<String, String> {
+                snapshot
+                    .inputs
+                    .keys()
+                    .filter_map(|key| match key {
+                        super::InputKey::Program { module, path } => {
+                            Some((module.clone(), path.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            };
+            if programs(&candidate.diagnostic) != programs(&observed.diagnostic) {
+                return Err(GateError::new(
+                    "rollback_command_authority_unavailable",
+                    "restored program paths require approved supervisor command reconciliation",
+                ));
+            }
+            (candidate, Some(observed), Some(target))
+        } else {
+            (observed, None, None)
+        };
         let base_revision = state.store.status().base_revision;
         let old = if state.store.status().state == StoreState::Stamped {
             super::GateSnapshot::from_store(&state.store.body()?.approved)?
@@ -681,12 +730,50 @@ impl RuntimeOwner {
             touched_modules.extend(candidate.diagnostic.modules());
             touched_modules.extend(old.modules());
         }
+        if let Some(target) = target {
+            touched_modules.extend(
+                candidate
+                    .diagnostic
+                    .inputs
+                    .iter()
+                    .filter(|(key, value)| {
+                        key.is_program() && target.inputs.get(*key) != Some(*value)
+                    })
+                    .filter_map(|(key, _)| key.module().map(str::to_owned)),
+            );
+        }
         let review_modules: BTreeSet<String> = touched_modules
             .iter()
             .filter(|module| candidate.modules.contains_key(*module))
             .cloned()
             .collect();
-        let read_set = candidate.diagnostic.read_set(&touched_modules)?;
+        let program_keys: Vec<_> = candidate
+            .diagnostic
+            .inputs
+            .keys()
+            .filter(|key| {
+                key.is_program()
+                    && key
+                        .module()
+                        .is_some_and(|module| touched_modules.contains(module))
+            })
+            .cloned()
+            .collect();
+        let read_set = if let Some(observed) = &mut observed {
+            observed.capture_programs(&program_keys)?;
+            if program_keys.iter().any(|key| {
+                observed.diagnostic.inputs.get(key) != candidate.diagnostic.inputs.get(key)
+            }) {
+                return Err(GateError::stale());
+            }
+            observed.diagnostic.read_set(&touched_modules)?
+        } else {
+            candidate.diagnostic.read_set(&touched_modules)?
+        };
+        let observed_handles = observed
+            .as_mut()
+            .map(CapturedConfiguration::take_handles)
+            .unwrap_or_default();
         let mut bases = BTreeMap::new();
         let mut base_schemas = BTreeMap::new();
         let mut active_generations = BTreeMap::new();
@@ -752,6 +839,8 @@ impl RuntimeOwner {
             active_generations,
             touched_modules,
             read_set,
+            program_keys,
+            observed_handles,
         })
     }
 
@@ -777,8 +866,11 @@ impl RuntimeOwner {
         } else {
             BTreeMap::new()
         };
-        let current = self
+        let mut current = self
             .capture_modules(&mut state, &prepared.touched_modules)
+            .map_err(|_| GateError::stale())?;
+        current
+            .capture_programs(&prepared.program_keys)
             .map_err(|_| GateError::stale())?;
         if state.store.status().base_revision != prepared.base_revision
             || active_generations != prepared.active_generations
@@ -808,7 +900,8 @@ impl RuntimeOwner {
                 .map(|(module, captured)| (module.clone(), captured.declaration.clone()))
                 .collect(),
         };
-        let handles = prepared.candidate.take_handles();
+        let mut handles = prepared.candidate.take_handles();
+        handles.append(&mut prepared.observed_handles);
         let OwnerState { gate, store, .. } = &mut *state;
         let view = gate.plan(
             store,
@@ -843,8 +936,12 @@ impl RuntimeOwner {
         }
         Self::check_authority(&mut state, true)?;
         let modules = state.gate.plan_modules(digest)?;
-        let current = self
+        let program_keys = state.gate.plan_program_keys(digest)?;
+        let mut current = self
             .capture_modules(&mut state, &modules)
+            .map_err(|_| GateError::stale())?;
+        current
+            .capture_programs(&program_keys)
             .map_err(|_| GateError::stale())?;
         let facts = state.with_desktop_view(digest, facts);
         let OwnerState { gate, store, .. } = &mut *state;
@@ -878,11 +975,17 @@ impl RuntimeOwner {
         let digest = state.gate.approval_digest(attempt)?;
         state.reviewed(&digest, Instant::now());
         let modules = state.gate.approval_modules(attempt)?;
+        let program_keys = state.gate.plan_program_keys(&digest)?;
         // Reopen inputs after the operator's interactive confirmation, immediately
         // before freshness checking and atomic publication of the saved plan.
         let current = match Self::check_authority(&mut state, true).and_then(|_| {
-            self.capture_modules(&mut state, &modules)
-                .map_err(|_| GateError::stale())
+            let mut current = self
+                .capture_modules(&mut state, &modules)
+                .map_err(|_| GateError::stale())?;
+            current
+                .capture_programs(&program_keys)
+                .map_err(|_| GateError::stale())?;
+            Ok(current)
         }) {
             Ok(current) => current,
             Err(error) => {
@@ -1052,5 +1155,55 @@ impl RuntimeOwner {
             .next_back()
             .and_then(|entry| entry.delivery.clone())
             .ok_or_else(|| GateError::new("config_gated", "approved delivery snapshot is absent"))
+    }
+
+    /// Read the saved rollback, never today's edited files. This is not spawn
+    /// authorization: admission must select an eligible module generation and
+    /// launch exactly the returned identity under that module's gate lock.
+    /// Re-check the file identity at spawn and refuse `plan_stale` if it changed
+    /// since approval. Path-changing rollback plans remain refused until the
+    /// supervisor uses these approved inputs to select and launch programs at
+    /// the restored paths.
+    pub fn approved_rollback_commands(&self, generation: u64) -> Result<ApprovedRollbackCommands> {
+        let mut state = self.lock()?;
+        state.store.delivery_ready()?;
+        let configuration = state.store.rollback_configuration(generation)?;
+        let entry = &state.store.body()?.generations[&generation];
+        if entry.kind != crate::config_store::CommitKind::Rollback {
+            return Err(GateError::new(
+                "rollback_generation_required",
+                "generation is not an approved rollback",
+            ));
+        }
+        let daemon = entry
+            .delivery
+            .as_ref()
+            .and_then(|snapshot| snapshot.daemon.clone())
+            .ok_or_else(|| {
+                GateError::new(
+                    "rollback_snapshot_unavailable",
+                    "approved rollback command input is absent",
+                )
+            })?;
+        let snapshot = super::GateSnapshot::from_store(&configuration)?;
+        let mut programs = BTreeMap::new();
+        for (key, identity) in snapshot.inputs {
+            if let super::InputKey::Program { module, path } = key {
+                if programs
+                    .insert(module, ApprovedRollbackProgram { path, identity })
+                    .is_some()
+                {
+                    return Err(GateError::new(
+                        "rollback_snapshot_unavailable",
+                        "rollback contains conflicting program identities",
+                    ));
+                }
+            }
+        }
+        Ok(ApprovedRollbackCommands {
+            generation,
+            daemon,
+            programs,
+        })
     }
 }

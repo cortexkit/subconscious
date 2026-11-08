@@ -7,6 +7,9 @@
   correlation, bound the wait for an answer to five minutes, and withdraw unanswered
   or invalidated cards with channel-zero Cancel without closing the module's
   other routes.
+  Pending cards also observe the consent module's actual process identity and
+  active registration: process exits and swap cutovers withdraw them even when
+  the module does not advertise `config.review` or have a pending generation.
 - Keep the caller's reader running during configuration approval, so channel-zero
   Cancel and disconnect withdraw pending OS prompts and phone cards without
   recording a generation. Configuration still prompts for the specific plan,

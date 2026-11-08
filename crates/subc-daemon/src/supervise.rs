@@ -1522,6 +1522,7 @@ struct SpawnEventState {
     generations: HashMap<String, u64>,
     events: VecDeque<SpawnEvent>,
     subscribers: HashMap<SpawnSubscriberKey, SpawnSubscriber>,
+    process_changes: HashMap<String, tokio::sync::watch::Sender<u64>>,
 }
 
 impl Default for SpawnEventState {
@@ -1534,6 +1535,7 @@ impl Default for SpawnEventState {
             generations: HashMap::new(),
             events: VecDeque::new(),
             subscribers: HashMap::new(),
+            process_changes: HashMap::new(),
         }
     }
 }
@@ -1560,6 +1562,9 @@ impl SpawnEventFeed {
         state.generations.clear();
         state.events.clear();
         state.subscribers.clear();
+        for changed in state.process_changes.values() {
+            changed.send_replace(0);
+        }
     }
 
     fn cursor(state: &SpawnEventState) -> SpawnCursor {
@@ -1685,6 +1690,12 @@ impl SpawnEventFeed {
             exit_code,
             exit_signal,
         };
+        state
+            .process_changes
+            .retain(|_, changed| changed.receiver_count() > 0);
+        if let Some(changed) = state.process_changes.get(&event.module_id) {
+            changed.send_replace(state.seq);
+        }
         state.events.push_back(event.clone());
         while state.events.len() > state.capacity {
             state.events.pop_front();
@@ -2255,6 +2266,38 @@ impl SupervisorHandle {
 
     pub(crate) fn spawn_snapshot(&self) -> SpawnSnapshot {
         self.spawn_events.snapshot()
+    }
+
+    /// Subscribe before reading the bound process. A coalesced wake is enough:
+    /// readers compare its exact generation and PID, not the last event kind.
+    pub(crate) fn subscribe_process_changes(
+        &self,
+        module: &str,
+    ) -> tokio::sync::watch::Receiver<u64> {
+        let mut state = self
+            .spawn_events
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        state
+            .process_changes
+            .retain(|_, changed| changed.receiver_count() > 0);
+        let seq = state.seq;
+        state
+            .process_changes
+            .entry(module.into())
+            .or_insert_with(|| tokio::sync::watch::channel(seq).0)
+            .subscribe()
+    }
+
+    pub(crate) fn current_spawn(&self, module: &str) -> Option<LiveSpawn> {
+        self.spawn_events
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .live
+            .get(module)
+            .cloned()
     }
 
     pub(crate) fn subscribe_spawns(

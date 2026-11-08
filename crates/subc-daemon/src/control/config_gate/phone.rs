@@ -93,8 +93,16 @@ impl ControlHandler {
             )
         };
         let exchange = async {
+            // Consent does not require config.review or a pending generation.
+            // Observe the real process feed and active registration directly,
+            // including deliberate exits and consent-only swap cutovers.
+            let mut process_changes = self.supervisor.subscribe_process_changes("callosum");
+            let mut registration_changes = self
+                .registry
+                .subscribe_module_changes("callosum")
+                .map_err(|_| unavailable())?;
             let gate = runtime.module_gate("callosum")?;
-            let (pending, invalidated) = {
+            let (pending, invalidated, spawn) = {
                 let _gate = gate.lock().await;
                 if self
                     .config_phone_surface()
@@ -105,6 +113,10 @@ impl ControlHandler {
                 {
                     return Err(unavailable());
                 }
+                let spawn = self
+                    .supervisor
+                    .current_spawn("callosum")
+                    .ok_or_else(unavailable)?;
                 let pending = self
                     .forwarding
                     .begin_module_control_rpc_for(
@@ -131,7 +143,7 @@ impl ControlHandler {
                         return Err(error);
                     }
                 };
-                (pending, invalidated)
+                (pending, invalidated, spawn)
             };
             let PendingModuleControlRpc {
                 endpoint,
@@ -181,9 +193,34 @@ impl ControlHandler {
                     response,
                 })
             };
+            let lifecycle_invalidated = async {
+                loop {
+                    if self.supervisor.current_spawn("callosum").as_ref() != Some(&spawn)
+                        || self
+                            .registry
+                            .get_module("callosum")
+                            .ok()
+                            .flatten()
+                            .is_none_or(|registration| registration.connection_id != connection)
+                        || self
+                            .forwarding
+                            .active_module_endpoint("callosum")
+                            .ok()
+                            .flatten()
+                            .is_none_or(|current| current != endpoint)
+                    {
+                        return;
+                    }
+                    tokio::select! {
+                        result = process_changes.changed() => { if result.is_err() { return; } },
+                        result = registration_changes.changed() => { if result.is_err() { return; } },
+                    }
+                }
+            };
             tokio::select! {
                 biased;
                 _ = invalidated => Err(unavailable()),
+                _ = lifecycle_invalidated => Err(unavailable()),
                 result = timeout_at(deadline, response) => match result {
                     Ok(reply) => reply,
                     Err(_) => Ok(ApprovalReply::Phone { connection: connection.get(), correlation: corr, response: None }),

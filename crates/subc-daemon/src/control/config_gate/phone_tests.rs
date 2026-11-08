@@ -19,6 +19,9 @@ use tokio::sync::mpsc;
 const PHONE: ConnectionId = ConnectionId::new(90);
 const CALLER: ConnectionId = ConnectionId::new(7);
 
+#[path = "phone_lifecycle_tests.rs"]
+mod lifecycle_tests;
+
 struct Scratch(std::path::PathBuf);
 impl Drop for Scratch {
     fn drop(&mut self) {
@@ -50,6 +53,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::build(false).await
+    }
+
+    async fn build(lifecycle: bool) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/scratch")
@@ -76,7 +83,8 @@ impl Fixture {
             path.join("subc.jsonc"),
             serde_json::to_vec(&json!({"version":1,"modules":{
                 "a":{"program":path.join("program")},
-                "callosum":{"program":phone_program,"args":["-c","sleep 600"],"reserved":true}
+                "callosum":{"program":phone_program,"args":["-c","sleep 600"],"reserved":true,
+                    "overlap": if lifecycle { "safe" } else { "exclusive" }}
             }}))
             .unwrap(),
         )
@@ -156,6 +164,11 @@ impl Fixture {
                 ..Default::default()
             })
             .with_drain_timeout(std::time::Duration::from_millis(10));
+        let supervisor = if lifecycle {
+            supervisor.with_config_runtime(owner.clone())
+        } else {
+            supervisor
+        };
         let (config, _) = crate::daemon_config::parse_with_activity(
             &std::fs::read_to_string(path.join("subc.jsonc")).unwrap(),
             path.join("subc.jsonc"),
@@ -167,7 +180,11 @@ impl Fixture {
             .find(|entry| entry.module_id == "callosum")
             .unwrap()
             .module_spec();
-        let module = supervisor.spawn(spec).unwrap();
+        let module = if lifecycle {
+            supervisor.spawn_async(spec).await.unwrap()
+        } else {
+            supervisor.spawn(spec).unwrap()
+        };
         let nonce = handle.spawn_launch_nonce_for("callosum").unwrap();
         let handler = Arc::new(
             ControlHandler::with_forwarding(registry.clone(), forwarding.clone())

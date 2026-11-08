@@ -776,7 +776,7 @@ impl ChildRoster {
         }
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, unix))]
     pub(crate) fn live_count_for_test(&self) -> usize {
         self.live().len()
     }

@@ -144,6 +144,9 @@ impl ControlHandler {
                                 AppliedDisposition::Failed { restore: None, .. }
                             );
                             tasks.spawn(async move {
+                                // Restarting after a rejected configuration
+                                // spends one crash-budget entry: the module
+                                // failed. An approved restart spends none.
                                 if let Err(error) = supervised.config_delivery_failed(connection, hold).await {
                                     warn!(module_id=%module, %error, "configuration delivery recovery request failed");
                                 }

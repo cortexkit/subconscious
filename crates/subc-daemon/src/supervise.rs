@@ -8116,6 +8116,9 @@ async fn handle_supervisor_command(
                 return true;
             }
             runtime.recovery_is_daemon = true;
+            // With a recoverable generation, delivery-failure recovery spends
+            // one crash-budget entry: the module rejected its configuration.
+            // Approved configuration restarts spend none.
             if hold {
                 let notice = begin_forwarding_drain_if_configured(
                     spec,

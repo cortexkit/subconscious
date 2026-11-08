@@ -32,6 +32,9 @@
 - Keep an ACK's previous active vector visible until its store publication is
   anchored. A NACK can override the unanchored ACK without losing another
   module's independently acknowledged configuration.
+  No delivery bypasses an earlier pending anchor; after repair, a failure not
+  yet anchored may return at most once per daemon start, never within the same
+  run and never after its failed mark is anchored.
 - Bind whole-generation apply precedence into the reviewed plan. Keep deferred
   configuration bytes away from an old instance until the required supervision
   or daemon boundary; approval never restarts the daemon itself.
@@ -68,9 +71,16 @@
   leave connections open when a configuration response cannot flush in time.
 
 - Apply approved module restarts without clearing or spending the crash budget.
+  Delivery-failure recovery spends one crash-budget entry because the module
+  rejected its configuration; it is not an approved configuration restart.
   A candidate launched before a newer required start is abandoned without
   cutover; one replacement uses the current configured command. Retain the
   successful supersession outcome in daemon-local status.
+- Keep default `server.describe` configuration capabilities disabled, even with
+  a local store installed. Refusals for missing authoritative project-membership
+  validation, active-scope usage tracking or approved-program launch selection
+  happen before any plan, approval or generation is written. Observing the
+  on-disk proposal before those refusals is allowed and does not approve it.
 - Require route-rebind readiness from a health probe begun after policy
   installation. Queue an immediate ordinary supervisor probe, bind its result
   to the child and policy installation, and recover once on failure or timeout.

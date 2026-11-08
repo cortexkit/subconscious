@@ -322,17 +322,38 @@ async fn config_delivery_anchor_retry_makes_nack_durable_and_is_idle_after_recov
 
 #[tokio::test(start_paused = true)]
 async fn config_delivery_anchor_pending_restart_before_failure_anchor_may_redeliver_once() {
+    let durable_body = |rig: &Rig| -> crate::config_store::StoreBody {
+        let envelope: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(rig.path.join("store").join(crate::config_store::STORE_FILE)).unwrap(),
+        )
+        .unwrap();
+        serde_json::from_value(envelope["body"].clone()).unwrap()
+    };
     let (rig, key, owner) = nack_while_anchor_pending();
+    // This read does not consult the owner's deferred in-memory failure. The
+    // daemon dies while the durable bytes still permit generation 2.
+    let before_crash = durable_body(&rig);
+    assert_eq!(before_crash.versions[0].1.pending, Some(2));
+    assert!(!before_crash.generations[&2]
+        .generation
+        .never_redeliver
+        .contains(&"a".into()));
     drop(owner);
     let restarted = sealed_owner(&rig, &key, "before-anchor-retry");
     rig.declare(&restarted, 30);
-    assert_eq!(
-        restarted
-            .module_get(ConnectionId::new(30), "a", ConfigGetRequest::new())
-            .unwrap_err()
-            .code,
-        "anchor_pending"
-    );
+    for _ in 0..3 {
+        assert_eq!(
+            restarted
+                .module_get(ConnectionId::new(30), "a", ConfigGetRequest::new())
+                .unwrap_err()
+                .code,
+            "anchor_pending"
+        );
+        assert!(restarted
+            .delivery_window(ConnectionId::new(30))
+            .unwrap()
+            .is_none());
+    }
     key.fail_anchor(false);
     let due = restarted.retry_anchor().unwrap().unwrap();
     tokio::time::advance(due - tokio::time::Instant::now()).await;
@@ -346,22 +367,92 @@ async fn config_delivery_anchor_pending_restart_before_failure_anchor_may_redeli
         view.generation, 2,
         "R5 permits one redelivery when the in-memory failure was never anchored"
     );
+    let attempt = view
+        .attempt
+        .expect("the new connection owns a new bound attempt");
+    for _ in 0..3 {
+        assert_eq!(
+            restarted
+                .module_get(ConnectionId::new(30), "a", ConfigGetRequest::new())
+                .unwrap()
+                .pending
+                .unwrap()
+                .attempt,
+            Some(attempt)
+        );
+    }
+    key.fail_anchor(true);
     assert_eq!(
-        applied(&restarted, ConnectionId::new(30), &view, false).unwrap(),
-        AppliedDisposition::Failed {
-            generation: 2,
-            restore: Some(1),
-            keep_running: false
-        }
+        applied(&restarted, ConnectionId::new(30), &view, false)
+            .unwrap_err()
+            .code,
+        "anchor_pending"
     );
-    drop(restarted);
-    let final_owner = sealed_owner(&rig, &key, "after-durable-nack");
-    rig.declare(&final_owner, 40);
-    assert!(final_owner
-        .module_get(ConnectionId::new(40), "a", ConfigGetRequest::new())
+    let unanchored_failure = durable_body(&rig);
+    assert_eq!(unanchored_failure.versions[0].1.active, Some(1));
+    assert_eq!(unanchored_failure.versions[0].1.pending, None);
+    assert_eq!(
+        restarted.delivery_take_recoveries().unwrap(),
+        vec![(
+            ConnectionId::new(30),
+            "a".into(),
+            AppliedDisposition::Failed {
+                generation: 2,
+                restore: Some(1),
+                keep_running: false,
+            },
+        )]
+    );
+    assert_eq!(
+        unanchored_failure.generations[&2]
+            .generation
+            .never_redeliver,
+        vec!["a"]
+    );
+    for _ in 0..3 {
+        assert_eq!(
+            restarted
+                .module_get(ConnectionId::new(30), "a", ConfigGetRequest::new())
+                .unwrap_err()
+                .code,
+            "anchor_pending"
+        );
+        assert!(restarted
+            .delivery_window(ConnectionId::new(30))
+            .unwrap()
+            .is_none());
+    }
+    key.fail_anchor(false);
+    if let Some(due) = restarted.retry_anchor().unwrap() {
+        tokio::time::advance(due.saturating_duration_since(tokio::time::Instant::now())).await;
+        assert!(restarted.retry_anchor().unwrap().is_none());
+    }
+    assert!(restarted
+        .module_get(ConnectionId::new(30), "a", ConfigGetRequest::new())
         .unwrap()
         .pending
         .is_none());
+    drop(restarted);
+    for connection in [40, 50] {
+        let final_owner = sealed_owner(&rig, &key, &format!("after-durable-nack-{connection}"));
+        rig.declare(&final_owner, connection);
+        assert!(final_owner
+            .module_get(ConnectionId::new(connection), "a", ConfigGetRequest::new())
+            .unwrap()
+            .pending
+            .is_none());
+        assert!(final_owner
+            .delivery_window(ConnectionId::new(connection))
+            .unwrap()
+            .is_none());
+    }
+    let anchored_failure = durable_body(&rig);
+    assert_eq!(anchored_failure.versions[0].1.active, Some(1));
+    assert_eq!(
+        anchored_failure.generations[&2].generation.never_redeliver,
+        vec!["a"]
+    );
+    assert_eq!(anchored_failure.generations[&2].outcome, "failed");
 }
 
 #[tokio::test(start_paused = true)]

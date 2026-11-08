@@ -748,6 +748,10 @@ impl RuntimeOwner {
 
     /// Run from a blocking worker: capture and store publication may touch disk
     /// and the platform keychain. No transport wait takes place under this lock.
+    /// Preflight may record the proposal observed on disk. Refusals for missing
+    /// authoritative project membership, active-scope usage or approved-program
+    /// launch selection happen before any plan, approval or generation is
+    /// written. A proposal neither approves nor records the refused plan.
     pub fn prepare(&self, kind: PlanKind) -> Result<PreparedPlan> {
         let mut state = self.lock()?;
         Self::check_authority(

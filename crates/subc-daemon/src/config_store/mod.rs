@@ -1021,6 +1021,12 @@ impl ConfigStore {
     /// ACK/NACK for a superseded generation changes nothing. A failure restores
     /// the active pointer immediately, even if its durable mark must wait for an
     /// anchor retry. ACKs never change memory while an anchor is pending.
+    ///
+    /// Nothing is delivered while an earlier anchor is pending. Once repaired,
+    /// an unanchored NACKed generation may return at most once per daemon start,
+    /// never within one run and never after its failure is anchored. The crash
+    /// window and persistent-keychain-failure proof is
+    /// `config_delivery_anchor_pending_restart_before_failure_anchor_may_redeliver_once`.
     pub fn record_delivery(
         &mut self,
         tuple: &Tuple,

@@ -10997,6 +10997,50 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "dev-desktop-approval"))]
+    fn server_describe_default_build_advertises_no_config_capability() {
+        let assert_default = |handler: &ControlHandler| {
+            let request = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                79,
+                serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap(),
+            )
+            .unwrap();
+            let responses = handler.handle_server_describe(request).unwrap();
+            assert_eq!(responses.len(), 1);
+            let response: Value = serde_json::from_slice(&responses[0].body).unwrap();
+            assert_eq!(response["op"], "server.describe");
+            let capabilities = response["capabilities"]
+                .as_array()
+                .expect("capability array");
+            assert!(
+                !capabilities.is_empty(),
+                "exercise an actual describe response, not an empty fixture"
+            );
+            assert!(
+                capabilities
+                    .iter()
+                    .all(|capability| !capability.as_str().unwrap().starts_with("config.")),
+                "a default build must not announce configuration authority: {capabilities:?}"
+            );
+        };
+        assert_default(&ControlHandler::new(Arc::new(Registry::default())));
+        #[cfg(unix)]
+        {
+            // A local store does not prove that project-membership validation,
+            // active-scope usage tracking and approved-program launch selection
+            // are connected. Defaults must not advertise that authority.
+            let (_rig, _owner, _supervisor, handler, _spec) =
+                crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test(
+                );
+            assert_default(&handler);
+        }
+    }
+
+    #[test]
     fn server_describe_surfaces_required_capability_verdict_fields() {
         let registry = Arc::new(Registry::default());
         let handler = ControlHandler::new(Arc::clone(&registry)).with_capability_config(

@@ -426,8 +426,6 @@ pub struct ControlHandler {
     captured_peers: Arc<Mutex<HashMap<ConnectionId, subc_os::local_peer::CapturedPeer>>>,
     config_desktop_stamps:
         Arc<Mutex<HashMap<ConnectionId, crate::operator_apps::OperatorAppStamp>>>,
-    #[cfg(feature = "dev-desktop-approval")]
-    dev_desktop_verifier: crate::config_gate::desktop::DevDesktopVerifier,
     local_connections: Arc<Mutex<HashSet<ConnectionId>>>,
     pub(crate) operator_app_policy: crate::operator_apps::OperatorAppPolicy,
     pub(crate) operator_apps:
@@ -1057,8 +1055,6 @@ impl ControlHandler {
             observed_peers: Arc::new(Mutex::new(HashMap::new())),
             captured_peers: Arc::new(Mutex::new(HashMap::new())),
             config_desktop_stamps: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(feature = "dev-desktop-approval")]
-            dev_desktop_verifier: Default::default(),
             local_connections: Arc::new(Mutex::new(HashSet::new())),
             operator_app_policy: Default::default(),
             operator_apps: Arc::new(Mutex::new(HashMap::new())),

@@ -36,8 +36,9 @@ impl PhoneSurface {
 }
 
 /// Built from daemon-observed peer/app state, never deserialized from a request.
-/// An unattested connection must still be identified as the desktop app under
-/// the development feature; arbitrary owner-uid clients are not desktop apps.
+/// Under the development feature, a same-user local connection may present a
+/// complete desktop review without app attestation. Its channel records that
+/// weaker check explicitly; OS presence is still required.
 #[derive(Clone)]
 pub struct ApprovalFacts {
     pub connection: u64,
@@ -50,9 +51,18 @@ pub struct ApprovalFacts {
 }
 impl ApprovalFacts {
     fn desktop(&self) -> bool {
-        self.owner_uid
-            && (self.attested_operator_app
-                || (cfg!(feature = "dev-desktop-approval") && self.desktop_app))
+        self.desktop_channel().is_some()
+    }
+    fn desktop_channel(&self) -> Option<subc_config::ApprovalChannel> {
+        if !self.owner_uid {
+            None
+        } else if self.attested_operator_app {
+            Some(subc_config::ApprovalChannel::AttestedDesktop)
+        } else if cfg!(feature = "dev-desktop-approval") && self.desktop_app {
+            Some(subc_config::ApprovalChannel::UnverifiedDevelopmentDesktop)
+        } else {
+            None
+        }
     }
 }
 
@@ -106,7 +116,9 @@ pub enum ApprovalReply {
 }
 
 pub(super) enum Surface {
-    Desktop,
+    Desktop {
+        channel: subc_config::ApprovalChannel,
+    },
     Os,
     Phone {
         facts: PhoneSurface,
@@ -271,7 +283,7 @@ impl ConfigGate {
         }
         self.next_attempt = self.next_attempt.checked_add(1).ok_or_else(unavailable)?;
         let id = self.next_attempt;
-        let (surface, challenge) = if facts.desktop() {
+        let (surface, challenge) = if let Some(channel) = facts.desktop_channel() {
             if !facts.os_prompt_available {
                 return Err(unavailable());
             }
@@ -279,7 +291,7 @@ impl ConfigGate {
                 gate_prompt_text(&format!("Approve config plan {digest}"), &[], &facts.caller)
                     .ok_or_else(unavailable)?;
             (
-                Surface::Desktop,
+                Surface::Desktop { channel },
                 ApprovalChallenge::Desktop {
                     attempt: id,
                     prompt,
@@ -360,14 +372,18 @@ impl ConfigGate {
         if !facts.owner_uid || facts.connection != pending.caller {
             return Err(unavailable());
         }
-        match (&pending.surface, reply) {
-            (Surface::Desktop, ApprovalReply::Presence(decision)) => {
-                if !facts.desktop() {
+        let channel = match (&pending.surface, reply) {
+            (Surface::Desktop { channel }, ApprovalReply::Presence(decision)) => {
+                if facts.desktop_channel() != Some(*channel) {
                     return Err(unavailable());
                 }
                 presence(decision)?;
+                *channel
             }
-            (Surface::Os, ApprovalReply::Presence(decision)) => presence(decision)?,
+            (Surface::Os, ApprovalReply::Presence(decision)) => {
+                presence(decision)?;
+                subc_config::ApprovalChannel::OsPrompt
+            }
             (
                 Surface::Phone {
                     facts: sent,
@@ -391,16 +407,17 @@ impl ConfigGate {
                 if !response.approves(request) {
                     return Err(declined());
                 }
+                subc_config::ApprovalChannel::PhoneCard
             }
             _ => return Err(unavailable()),
-        }
+        };
         let plan = self
             .plans
             .get(&pending.digest)
             .ok_or_else(|| GateError::new("plan_unknown", "plan is absent or already applied"))?;
         Self::fresh(plan, store, current)?;
         before_commit();
-        self.commit(&pending.digest, store, current, now_ms)
+        self.commit(&pending.digest, channel, store, current, now_ms)
     }
 
     /// The owner wakes each waiting client with surface-unavailable when the

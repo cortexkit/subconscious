@@ -62,6 +62,7 @@ pub struct HistoryEntry {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrunedGeneration {
     pub generation: u64,
+    pub approval_channel: subc_config::ApprovalChannel,
     pub plan_digest: Digest,
     pub approval_id: String,
     pub outcome: String,
@@ -190,6 +191,7 @@ impl StoreBody {
                 id,
                 PrunedGeneration {
                     generation: id,
+                    approval_channel: entry.generation.approval_channel,
                     plan_digest: entry.generation.plan_digest,
                     approval_id: entry.approval_id,
                     outcome: entry.outcome,

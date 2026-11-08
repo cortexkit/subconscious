@@ -238,10 +238,33 @@ pub enum GenerationState {
     Failed,
 }
 
+/// The review surface actually checked for an approval, not a claim supplied by
+/// its requester. Development desktop review never implies app attestation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalChannel {
+    OsPrompt,
+    PhoneCard,
+    AttestedDesktop,
+    UnverifiedDevelopmentDesktop,
+}
+
+impl ApprovalChannel {
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::OsPrompt => "OS prompt",
+            Self::PhoneCard => "phone card",
+            Self::AttestedDesktop => "attested desktop",
+            Self::UnverifiedDevelopmentDesktop => "development desktop (unverified)",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Generation {
     pub id: u64,
+    pub approval_channel: ApprovalChannel,
     pub plan_digest: Digest,
     pub input_vector: InputVector,
     pub declaration_digests: BTreeMap<String, Digest>,
@@ -254,12 +277,14 @@ pub struct Generation {
 impl Generation {
     pub fn new(
         id: u64,
+        approval_channel: ApprovalChannel,
         plan_digest: Digest,
         input_vector: InputVector,
         changeset: Changeset,
     ) -> Self {
         Self {
             id,
+            approval_channel,
             plan_digest,
             input_vector,
             changeset,
@@ -269,6 +294,49 @@ impl Generation {
             never_redeliver: Vec::new(),
             development: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod approval_channel_tests {
+    use super::*;
+
+    #[test]
+    fn approval_channel_is_required_closed_and_preserves_unverified_wording() {
+        for (channel, wire, words) in [
+            (ApprovalChannel::OsPrompt, "os_prompt", "OS prompt"),
+            (ApprovalChannel::PhoneCard, "phone_card", "phone card"),
+            (
+                ApprovalChannel::AttestedDesktop,
+                "attested_desktop",
+                "attested desktop",
+            ),
+            (
+                ApprovalChannel::UnverifiedDevelopmentDesktop,
+                "unverified_development_desktop",
+                "development desktop (unverified)",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(channel).unwrap(), wire);
+            assert_eq!(channel.description(), words);
+            let generation = Generation::new(
+                1,
+                channel,
+                crate::raw_digest(b"plan"),
+                InputVector::default(),
+                Changeset::new(),
+            );
+            let mut encoded = serde_json::to_value(&generation).unwrap();
+            assert_eq!(
+                serde_json::from_value::<Generation>(encoded.clone()).unwrap(),
+                generation
+            );
+            encoded.as_object_mut().unwrap().remove("approval_channel");
+            assert!(serde_json::from_value::<Generation>(encoded).is_err());
+        }
+        assert!(
+            serde_json::from_str::<ApprovalChannel>("\"verified_development_desktop\"").is_err()
+        );
     }
 }
 

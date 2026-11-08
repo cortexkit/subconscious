@@ -972,6 +972,22 @@ impl RuntimeOwner {
                 .push("dev-desktop-approval".into());
         }
         if let Ok(body) = state.store.body() {
+            status.approval_channels = body
+                .generations
+                .iter()
+                .map(|(id, entry)| {
+                    subc_control::config::ConfigApprovalRecord::new(
+                        *id,
+                        entry.generation.approval_channel,
+                    )
+                })
+                .chain(body.pruned.iter().map(|(id, entry)| {
+                    subc_control::config::ConfigApprovalRecord::new(*id, entry.approval_channel)
+                }))
+                .collect();
+            status
+                .approval_channels
+                .sort_by_key(|record| record.generation);
             status.pending_proposals = u64::from(body.proposal.is_some());
             status.gated_modules = body
                 .versions

@@ -2,6 +2,10 @@
 
 ## 0.41.10
 
+- Under `dev-desktop-approval` only, accept same-user local complete desktop
+  reviews without app verification, while retaining OS presence and writer
+  receipts. Persist `unverified_development_desktop` explicitly in status and
+  history; production builds still require desktop attestation.
 - Bind user-scope generation delivery attempts to individual connections and
   successful writer flushes. Preserve serial supersession, independent module
   outcomes and promoted-child catch-up without replacing the stored active or

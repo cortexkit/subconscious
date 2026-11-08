@@ -202,6 +202,12 @@ fn approval_stamp_is_desktop_only_and_full_view_is_digest_bound() {
     assert_eq!(
         rig.store.body().unwrap().generations[&1]
             .generation
+            .approval_channel,
+        subc_config::ApprovalChannel::AttestedDesktop
+    );
+    assert_eq!(
+        rig.store.body().unwrap().generations[&1]
+            .generation
             .plan_digest,
         view.digest
     );
@@ -400,6 +406,12 @@ fn approval_phone_reply_binds_connection_request_digest_vector_and_revision() {
             .is_err());
         assert_eq!(rig.store.body().unwrap().last_generation, 1);
         assert_eq!(rig.approve(&view, &facts(false)).unwrap(), 2);
+        assert_eq!(
+            rig.store.body().unwrap().generations[&2]
+                .generation
+                .approval_channel,
+            subc_config::ApprovalChannel::PhoneCard
+        );
     }
 }
 
@@ -572,6 +584,12 @@ fn approval_os_prompt_exact_boundary_and_lossless_sanitizer() {
                 .unwrap();
             assert_eq!(challenge.prompt().unwrap().chars().count(), 200);
             assert_eq!(rig.approve(&view, &caller).unwrap(), 2);
+            assert_eq!(
+                rig.store.body().unwrap().generations[&2]
+                    .generation
+                    .approval_channel,
+                subc_config::ApprovalChannel::OsPrompt
+            );
         } else {
             assert_eq!(
                 rig.approve(&view, &caller).unwrap_err().code,

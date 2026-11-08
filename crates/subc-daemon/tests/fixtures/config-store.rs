@@ -66,6 +66,7 @@ fn main() {
         delivery: None,
         generation: Generation::new(
             0,
+            subc_config::ApprovalChannel::OsPrompt,
             raw_digest(b"fixture-plan"),
             InputVector::default(),
             Changeset::new(),

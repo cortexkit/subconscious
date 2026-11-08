@@ -270,17 +270,6 @@ impl ControlHandler {
         self
     }
 
-    /// Development surface identity is supplied by the daemon constructor, not
-    /// selected by a connection, config file or startup argument.
-    #[cfg(feature = "dev-desktop-approval")]
-    pub fn with_dev_desktop_verifier(
-        mut self,
-        verifier: crate::config_gate::desktop::DevDesktopVerifier,
-    ) -> Self {
-        self.dev_desktop_verifier = verifier;
-        self
-    }
-
     fn config_desktop_identity(
         &self,
         connection: ConnectionId,
@@ -290,13 +279,13 @@ impl ControlHandler {
         }
         #[cfg(feature = "dev-desktop-approval")]
         {
-            let peer = self
-                .captured_peers
+            // Requesting and receiving the complete immutable review is the
+            // development caller's desktop presentation, not app attestation.
+            Ok(self
+                .local_connections
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .get(&connection)
-                .cloned();
-            self.dev_desktop_verifier.verify(peer.as_ref())
+                .contains(&connection))
         }
         #[cfg(not(feature = "dev-desktop-approval"))]
         {

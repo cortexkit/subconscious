@@ -114,6 +114,7 @@ fn entry(kind: CommitKind) -> HistoryEntry {
         delivery: None,
         generation: Generation::new(
             0,
+            subc_config::ApprovalChannel::OsPrompt,
             raw_digest(b"approved-plan"),
             InputVector::default(),
             Changeset::new(),
@@ -129,6 +130,33 @@ fn commit(store: &mut ConfigStore, kind: CommitKind) -> u64 {
     store
         .commit_generation(entry(kind), snapshot(1, 1), snapshot(1, 1), 12)
         .unwrap()
+}
+
+#[test]
+fn config_store_approval_channels_survive_restart_without_becoming_verified() {
+    use subc_config::ApprovalChannel;
+    for channel in [
+        ApprovalChannel::OsPrompt,
+        ApprovalChannel::PhoneCard,
+        ApprovalChannel::AttestedDesktop,
+        ApprovalChannel::UnverifiedDevelopmentDesktop,
+    ] {
+        let rig = Rig::new();
+        let mut store = rig.open(false);
+        let mut approved = entry(CommitKind::Stamp);
+        approved.generation.approval_channel = channel;
+        store
+            .commit_generation(approved, snapshot(1, 1), snapshot(1, 1), 12)
+            .unwrap();
+        drop(store);
+        let mut reopened = rig.open(false);
+        assert_eq!(
+            reopened.body().unwrap().generations[&1]
+                .generation
+                .approval_channel,
+            channel
+        );
+    }
 }
 fn error_code<T: std::fmt::Debug>(result: Result<T, StoreError>, code: StoreErrorCode) {
     assert_eq!(result.unwrap_err().code, code);

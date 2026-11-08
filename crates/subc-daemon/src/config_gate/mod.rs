@@ -9,7 +9,6 @@ mod anchor_retry;
 mod apply;
 mod approval;
 pub mod capture;
-pub mod desktop;
 pub(crate) mod review;
 pub mod runtime;
 mod snapshot;
@@ -346,6 +345,7 @@ impl ConfigGate {
     fn commit(
         &mut self,
         digest: &Digest,
+        approval_channel: subc_config::ApprovalChannel,
         store: &mut ConfigStore,
         current: &GateSnapshot,
         now_ms: u64,
@@ -357,6 +357,7 @@ impl ConfigGate {
         Self::fresh(plan, store, current)?;
         let mut generation = Generation::new(
             0,
+            approval_channel,
             digest.clone(),
             plan.view.plan.input_vector.clone(),
             plan.view.plan.changeset.clone(),

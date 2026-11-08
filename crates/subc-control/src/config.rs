@@ -2,7 +2,7 @@
 //! approved; a terminal's claim to have displayed a diff grants no authority.
 
 use serde::{Deserialize, Serialize};
-pub use subc_config::{Digest, Generation, Plan};
+pub use subc_config::{ApprovalChannel, Digest, Generation, Plan};
 
 pub const CONFIG_GATE_CAPABILITY: &str = "config.gate";
 
@@ -61,10 +61,28 @@ impl ConfigPlanView {
     }
 }
 
+/// The durable review channel for a retained or pruned generation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ConfigApprovalRecord {
+    pub generation: u64,
+    pub channel: ApprovalChannel,
+}
+
+impl ConfigApprovalRecord {
+    pub fn new(generation: u64, channel: ApprovalChannel) -> Self {
+        Self {
+            generation,
+            channel,
+        }
+    }
+}
+
 /// Diagnostic strings are extensible; they never grant approval authority.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct ConfigStatus {
+    pub approval_channels: Vec<ConfigApprovalRecord>,
     pub state: String,
     pub integrity: String,
     pub revision: u64,
@@ -106,6 +124,36 @@ pub enum ConfigControlResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_wire_status_and_history_preserve_unverified_approval_channel() {
+        use super::*;
+        let channel = ApprovalChannel::UnverifiedDevelopmentDesktop;
+        let mut status = ConfigStatus::default();
+        status
+            .approval_channels
+            .push(ConfigApprovalRecord::new(1, channel));
+        let generation = Generation::new(
+            1,
+            channel,
+            subc_config::raw_digest(b"plan"),
+            subc_config::InputVector::default(),
+            subc_config::Changeset::new(),
+        );
+        for response in [
+            ConfigControlResponse::Status { status },
+            ConfigControlResponse::History {
+                generations: vec![generation],
+                pruned: vec![],
+            },
+        ] {
+            let encoded = serde_json::to_string(&response).unwrap();
+            assert!(encoded.contains("unverified_development_desktop"));
+            assert_eq!(
+                serde_json::from_str::<ConfigControlResponse>(&encoded).unwrap(),
+                response
+            );
+        }
+    }
     use super::*;
     use serde_json::json;
 

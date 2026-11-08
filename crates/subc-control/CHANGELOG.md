@@ -2,6 +2,7 @@
 
 ## 0.35.1
 
+- Expose each generation's approval channel in config status and history.
 - Add standalone config-gate client requests, plan views, status and responses;
   preserve the legacy exhaustive control enums and require capability opt-in.
 

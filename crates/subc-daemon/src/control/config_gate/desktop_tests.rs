@@ -1,6 +1,5 @@
 use super::*;
-#[cfg(feature = "dev-desktop-approval")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[cfg(feature = "dev-desktop-approval")]
@@ -21,6 +20,7 @@ async fn config_desktop_background_waiters_do_not_retain_the_config_store_owner(
 }
 
 fn owner_peer(handler: &ControlHandler, connection: ConnectionId) {
+    handler.record_local_connection(connection);
     #[cfg(unix)]
     let observed = subc_protocol::peer::ObservedPeer::observed_uid(subc_os::effective_uid());
     #[cfg(windows)]
@@ -48,18 +48,13 @@ fn config_desktop_os_presence_requires_both_provider_and_policy() {
 
 #[cfg(feature = "dev-desktop-approval")]
 #[test]
-fn config_desktop_owner_uid_with_development_feature_and_no_verifier_is_refused() {
+fn config_desktop_development_accepts_owner_local_review_without_app_verification() {
     let handler = ControlHandler::new(Arc::new(Registry::default()));
     let connection = ConnectionId::new(700);
     owner_peer(&handler, connection);
     assert!(handler.config_owner_connection(connection));
-    assert_eq!(
-        handler
-            .config_desktop_identity(connection)
-            .unwrap_err()
-            .code,
-        "dev_desktop_verifier_unspecified"
-    );
+    assert!(handler.config_desktop_identity(connection).unwrap());
+    assert!(handler.config_desktop_stamps.lock().unwrap().is_empty());
 }
 
 #[cfg(not(feature = "dev-desktop-approval"))]
@@ -133,21 +128,9 @@ fn config_desktop_windows_connection_keeps_its_launch_incarnation_without_prompt
 }
 
 #[cfg(feature = "dev-desktop-approval")]
-struct Verifier(Arc<AtomicBool>);
-#[cfg(feature = "dev-desktop-approval")]
-impl crate::config_gate::desktop::DesktopVerifier for Verifier {
-    fn verify(&self, _: &subc_os::local_peer::CapturedPeer) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-}
-
-#[cfg(feature = "dev-desktop-approval")]
 #[tokio::test]
-async fn config_desktop_typed_verifier_is_not_an_owner_or_presence_bypass_and_is_rechecked() {
-    let live = Arc::new(AtomicBool::new(true));
-    let handler = ControlHandler::new(Arc::new(Registry::default())).with_dev_desktop_verifier(
-        crate::config_gate::desktop::DevDesktopVerifier::Supplied(Arc::new(Verifier(live.clone()))),
-    );
+async fn config_desktop_development_requires_a_same_user_local_peer_and_rechecks_it() {
+    let handler = ControlHandler::new(Arc::new(Registry::default()));
     let connection = ConnectionId::new(700);
     let (tx, _rx) = tokio::sync::mpsc::channel(8);
     let ctx = RouteCtx {
@@ -163,9 +146,22 @@ async fn config_desktop_typed_verifier_is_not_an_owner_or_presence_bypass_and_is
         facts.os_prompt_available,
         crate::config_gate::os_prompt_policy_present()
     );
-    live.store(false, Ordering::Release);
-    assert!(!handler.config_approval_facts(&ctx).await.desktop_app);
-    live.store(true, Ordering::Release);
+    handler
+        .local_connections
+        .lock()
+        .unwrap()
+        .remove(&connection);
+    assert!(
+        !handler.config_approval_facts(&ctx).await.desktop_app,
+        "same-user TCP is not the local endpoint"
+    );
+    handler.record_local_connection(connection);
+    handler.observed_peers.lock().unwrap().remove(&connection);
+    assert!(
+        !handler.config_approval_facts(&ctx).await.desktop_app,
+        "local without kernel owner credentials is not same-user"
+    );
+    owner_peer(&handler, connection);
     handler.cleanup_connection(connection).unwrap();
     assert!(!handler.config_desktop_identity(connection).unwrap());
     assert!(!handler
@@ -175,16 +171,13 @@ async fn config_desktop_typed_verifier_is_not_an_owner_or_presence_bypass_and_is
         .contains_key(&connection));
 }
 
-#[cfg(feature = "dev-desktop-approval")]
 struct Scratch(std::path::PathBuf);
-#[cfg(feature = "dev-desktop-approval")]
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-#[cfg(feature = "dev-desktop-approval")]
 fn review_fixture() -> (
     Scratch,
     Arc<crate::config_gate::runtime::RuntimeOwner>,
@@ -225,6 +218,29 @@ fn review_fixture() -> (
     (Scratch(path), owner, view)
 }
 
+#[cfg(not(feature = "dev-desktop-approval"))]
+#[tokio::test]
+async fn config_desktop_without_development_switch_refuses_same_user_local_review() {
+    let (_scratch, owner, view) = review_fixture();
+    let handler =
+        ControlHandler::new(Arc::new(Registry::default())).with_config_runtime(owner.clone());
+    let connection = ConnectionId::new(700);
+    owner_peer(&handler, connection);
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let ctx = RouteCtx {
+        connection_id: connection,
+        egress: crate::FrameSink::new(tx),
+    };
+    let mut facts = handler.config_approval_facts(&ctx).await;
+    facts.os_prompt_available = true;
+    assert!(!facts.desktop_app && !facts.attested_operator_app);
+    assert_eq!(
+        owner.begin_approval(&view.digest, &facts).unwrap_err().code,
+        "approval_surface_unavailable"
+    );
+    assert!(owner.history().unwrap().0.is_empty());
+}
+
 #[cfg(feature = "dev-desktop-approval")]
 fn stamp_response(view: subc_control::config::ConfigPlanView) -> Frame {
     let request = Frame::build(
@@ -246,7 +262,7 @@ fn stamp_response(view: subc_control::config::ConfigPlanView) -> Frame {
 
 #[cfg(feature = "dev-desktop-approval")]
 #[tokio::test]
-async fn config_desktop_status_names_unspecified_verifier_and_missing_surfaces() {
+async fn config_desktop_status_names_development_switch_without_claiming_attestation() {
     let (_scratch, owner, _view) = review_fixture();
     let handler = ControlHandler::new(Arc::new(Registry::default())).with_config_runtime(owner);
     let connection = ConnectionId::new(700);
@@ -278,11 +294,11 @@ async fn config_desktop_status_names_unspecified_verifier_and_missing_surfaces()
     assert!(status
         .missing_approval_surfaces
         .iter()
-        .any(|name| name == "dev_desktop_verifier_unspecified"));
+        .all(|name| name != "dev_desktop_verifier_unspecified"));
     assert!(status
         .missing_approval_surfaces
         .iter()
-        .any(|name| name.starts_with("desktop")));
+        .all(|name| !name.starts_with("desktop")));
     assert!(status
         .missing_approval_surfaces
         .iter()
@@ -294,11 +310,7 @@ async fn config_desktop_status_names_unspecified_verifier_and_missing_surfaces()
 async fn config_desktop_complete_response_binds_only_after_successful_writer_flush() {
     let (_scratch, owner, view) = review_fixture();
     let handler = Arc::new(
-        ControlHandler::new(Arc::new(Registry::default()))
-            .with_config_runtime(owner.clone())
-            .with_dev_desktop_verifier(crate::config_gate::desktop::DevDesktopVerifier::Supplied(
-                Arc::new(Verifier(Arc::new(AtomicBool::new(true)))),
-            )),
+        ControlHandler::new(Arc::new(Registry::default())).with_config_runtime(owner.clone()),
     );
     let connection = ConnectionId::new(700);
     owner_peer(&handler, connection);
@@ -344,10 +356,30 @@ async fn config_desktop_complete_response_binds_only_after_successful_writer_flu
         .unwrap()
         .unwrap()
         .unwrap();
-    assert!(matches!(
-        owner.begin_approval(&view.digest, &facts).unwrap(),
-        ApprovalChallenge::Desktop { .. }
-    ));
+    let challenge = owner.begin_approval(&view.digest, &facts).unwrap();
+    assert!(matches!(challenge, ApprovalChallenge::Desktop { .. }));
+    owner
+        .finish_approval(
+            challenge.attempt(),
+            &facts,
+            crate::config_gate::ApprovalReply::Presence(PresenceDecision::InteractiveApproval),
+            1,
+        )
+        .unwrap();
+    assert_eq!(
+        owner.history().unwrap().0[0].approval_channel,
+        subc_config::ApprovalChannel::UnverifiedDevelopmentDesktop
+    );
+    assert_eq!(
+        owner
+            .status()
+            .unwrap()
+            .approval_channels
+            .iter()
+            .find(|record| record.generation == 1)
+            .map(|record| record.channel),
+        Some(subc_config::ApprovalChannel::UnverifiedDevelopmentDesktop)
+    );
 }
 
 #[cfg(feature = "dev-desktop-approval")]
@@ -355,15 +387,8 @@ async fn config_desktop_complete_response_binds_only_after_successful_writer_flu
 async fn config_desktop_failed_flush_revocation_and_disconnect_never_create_a_view_receipt() {
     for end in ["failed-write", "revoked", "disconnected"] {
         let (_scratch, owner, view) = review_fixture();
-        let live = Arc::new(AtomicBool::new(true));
         let handler = Arc::new(
-            ControlHandler::new(Arc::new(Registry::default()))
-                .with_config_runtime(owner.clone())
-                .with_dev_desktop_verifier(
-                    crate::config_gate::desktop::DevDesktopVerifier::Supplied(Arc::new(Verifier(
-                        live.clone(),
-                    ))),
-                ),
+            ControlHandler::new(Arc::new(Registry::default())).with_config_runtime(owner.clone()),
         );
         let connection = ConnectionId::new(700);
         owner_peer(&handler, connection);
@@ -396,7 +421,7 @@ async fn config_desktop_failed_flush_revocation_and_disconnect_never_create_a_vi
                 drop(outbound.flushed.take());
             }
             "revoked" => {
-                live.store(false, Ordering::Release);
+                handler.observed_peers.lock().unwrap().remove(&connection);
                 outbound.flushed.take().unwrap().send(()).unwrap();
             }
             "disconnected" => {
@@ -473,10 +498,7 @@ async fn config_desktop_apply_prompts_before_waiting_for_the_cutover_gate_and_pu
         ControlHandler::new(registry)
             .with_supervisor(handle)
             .with_supervisor_rescan(supervisor, scratch.0.join("subc.jsonc"), None)
-            .with_config_runtime(owner.clone())
-            .with_dev_desktop_verifier(crate::config_gate::desktop::DevDesktopVerifier::Supplied(
-                Arc::new(Verifier(Arc::new(AtomicBool::new(true)))),
-            )),
+            .with_config_runtime(owner.clone()),
     );
     let (prompted, prompt) = tokio::sync::oneshot::channel();
     handler.forwarding.operator_confirms().configure(
@@ -535,5 +557,13 @@ async fn config_desktop_apply_prompts_before_waiting_for_the_cutover_gate_and_pu
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&response[0].body).unwrap(),
         serde_json::json!({"op":"config.apply","generation":1})
+    );
+    assert_eq!(
+        owner.history().unwrap().0[0].approval_channel,
+        subc_config::ApprovalChannel::UnverifiedDevelopmentDesktop
+    );
+    assert_eq!(
+        owner.status().unwrap().approval_channels[0].channel,
+        subc_config::ApprovalChannel::UnverifiedDevelopmentDesktop
     );
 }

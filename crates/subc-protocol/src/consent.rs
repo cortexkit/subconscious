@@ -53,7 +53,9 @@ impl ConsentRequest {
     /// and answers only a consistent request, so a card can never display one
     /// plan while its approval binds another.
     pub fn is_consistent(&self) -> bool {
-        self.plan.digest().is_ok_and(|digest| digest == self.plan_digest)
+        self.plan
+            .digest()
+            .is_ok_and(|digest| digest == self.plan_digest)
             && self.base_revision == self.plan.base_revision
             && self.input_vector == self.plan.input_vector
     }

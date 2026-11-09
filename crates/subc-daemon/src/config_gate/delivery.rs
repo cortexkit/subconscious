@@ -766,7 +766,7 @@ impl RuntimeOwner {
     pub(crate) fn set_spawn_preflight_hook_for_test(&self, hook: impl FnOnce() + Send + 'static) {
         *self.spawn_preflight_hook.lock().unwrap() = Some(Box::new(hook));
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, unix))]
     pub(crate) fn unregistered_spawn_count_for_test(&self) -> usize {
         self.lock().unwrap().delivery.unregistered_children.len()
     }

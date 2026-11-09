@@ -68,6 +68,8 @@ mod async_spawn_tests;
 mod carried_job_tests;
 mod config_delivery;
 mod config_exit_failure;
+#[cfg(all(test, unix))]
+mod program_binding_tests;
 #[cfg(all(test, windows))]
 mod program_binding_windows_tests;
 pub use config_exit_failure::ModuleStopReason;
@@ -245,6 +247,7 @@ fn probe_privacy_trampoline(path: &std::path::Path) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn privacy_command(
     spec: &ModuleSpec,
+    binding: &SpawnProgramBinding,
     roster: &ChildRoster,
 ) -> Result<
     (
@@ -263,34 +266,17 @@ fn privacy_command(
         }
     };
     let trampoline = roster.privacy_trampoline().map_err(failure)?;
-    // Resolve PATH with the same environment the Command will receive. For
-    // scripts retain the existing orphan-identity rule: the kernel chooses
+    // For scripts retain the existing orphan-identity rule: the kernel chooses
     // the interpreter, and its observed image is the one recorded. Do not
     // duplicate the kernel's shebang/PATH interpreter resolution in Rust.
-    let program = if spec.program.components().count() == 1 && !spec.program.is_absolute() {
-        let path = spec
-            .env
-            .iter()
-            .find(|(key, _)| key == "PATH")
-            .map(|(_, value)| std::ffi::OsString::from(value))
-            .or_else(|| std::env::var_os("PATH"))
-            .unwrap_or_else(|| "/usr/bin:/bin".into());
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(&spec.program))
-            .find(|path| path.is_file())
-            .unwrap_or_else(|| spec.program.clone())
-    } else {
-        spec.program.clone()
-    };
-    let expected = subc_os::file_identity(&program);
+    let expected = Some(binding.identity);
     let trampoline_image = subc_os::file_identity(&trampoline);
     let script = {
-        use std::io::Read;
+        use std::os::unix::fs::FileExt;
         let mut prefix = [0u8; 2];
-        std::fs::File::open(&program)
-            .is_ok_and(|mut file| file.read_exact(&mut prefix).is_ok() && &prefix == b"#!")
+        binding._file.read_exact_at(&mut prefix, 0).is_ok() && &prefix == b"#!"
     };
-    if expected.is_none() || expected == subc_os::file_identity(&trampoline) {
+    if expected == trampoline_image {
         return Err(failure(
             "privacy identity module executable is missing or is the trampoline itself".to_string(),
         ));
@@ -303,7 +289,7 @@ fn privacy_command(
     command
         .arg("__disclaim-exec")
         .arg(ack.fd().to_string())
-        .arg(&program);
+        .arg(&binding.path);
     Ok((
         command,
         Some(PrivacyExec {
@@ -9868,7 +9854,11 @@ impl SpawnProgramBinding {
                         true
                     }
                 })
-                .unwrap_or_else(|| spec.program.clone())
+                .ok_or_else(|| SuperviseError::Spawn {
+                    program: spec.program.clone(),
+                    source: io::Error::new(io::ErrorKind::NotFound, "executable not found in PATH"),
+                    cgroup_path: None,
+                })?
         };
         let resolved = std::fs::canonicalize(&path).map_err(|source| SuperviseError::Spawn {
             program: spec.program.clone(),
@@ -10092,8 +10082,6 @@ fn prepare_child_in_slot(
     };
     #[cfg(not(target_os = "linux"))]
     let _ = alternate_slot;
-    #[cfg(target_os = "macos")]
-    let (mut command, privacy_exec, exec_ack) = privacy_command(spec, roster)?;
     #[cfg(windows)]
     let image_capture = windows_spawn_capture(spec).map_err(|source| SuperviseError::Spawn {
         program: spec.program.clone(),
@@ -10109,9 +10097,17 @@ fn prepare_child_in_slot(
         None
     };
     #[cfg(not(windows))]
-    let program_binding = asynchronous
+    let program_binding = (asynchronous || cfg!(target_os = "macos"))
         .then(|| SpawnProgramBinding::capture(spec))
         .transpose()?;
+    #[cfg(target_os = "macos")]
+    let (mut command, privacy_exec, exec_ack) = privacy_command(
+        spec,
+        program_binding
+            .as_ref()
+            .expect("macOS captures every launch"),
+        roster,
+    )?;
     #[cfg(windows)]
     let mut command = Command::new(image_capture.path());
     #[cfg(not(any(target_os = "macos", windows)))]

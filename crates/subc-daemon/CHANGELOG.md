@@ -2,6 +2,10 @@
 
 ## 0.41.10
 
+- Build macOS privacy-trampoline commands from the same retained regular file
+  used for launch validation, including shebang inspection. Resolve PATH once,
+  honor its last override and executable permissions, and refuse absent names
+  instead of falling back to the working directory.
 - Relay immutable `consent/v1` approval cards only through the policy-enabled,
   admitted active phone module. Bind each card to its daemon-allocated request
   correlation, bound the wait for an answer to five minutes, and withdraw unanswered

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.2
+
+- Test-only: accept a pre-fetched, SHA-256-verified published ck-auth archive so Linux CI can cache the pinned release without changing bootstrap coverage. Cache the pinned nats-server archive in CI as well, with checksum verification and download retries on cache misses.
+
 ## 0.21.1
 
 - Refresh the daemon, control, Rust-client and UI requirements for extensible supervisor resources. CLI and executable behavior is unchanged.

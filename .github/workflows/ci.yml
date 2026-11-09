@@ -221,6 +221,12 @@ jobs:
       # before extraction, so a replaced upstream asset fails here loudly
       # instead of changing what the test measures. Windows skips A1 by design
       # (the row records a1-signal-unix-only), so it needs no install.
+      - name: Cache pinned nats-server archive
+        if: ${{ matrix.os == 'ubuntu' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/nats-server.tar.gz
+          key: nats-server-linux-amd64-5d2c51caca950333aba84911df7d377f826f3a59ec36061c6539105084f65c92
       - name: Install nats-server (ck-bus A1 rows)
         if: ${{ matrix.os == 'ubuntu' }}
         shell: bash
@@ -229,7 +235,10 @@ jobs:
           v=v2.15.0
           sum=5d2c51caca950333aba84911df7d377f826f3a59ec36061c6539105084f65c92
           tgz="$RUNNER_TEMP/nats-server.tar.gz"
-          curl -fsSL -o "$tgz" "https://github.com/nats-io/nats-server/releases/download/$v/nats-server-$v-linux-amd64.tar.gz"
+          if ! echo "$sum  $tgz" | sha256sum --check --status; then
+            rm -f "$tgz"
+            curl -fsSL --retry 6 --retry-delay 10 --retry-all-errors -o "$tgz" "https://github.com/nats-io/nats-server/releases/download/$v/nats-server-$v-linux-amd64.tar.gz"
+          fi
           echo "$sum  $tgz" | sha256sum -c -
           tar -xzf "$tgz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/nats-server-$v-linux-amd64" >> "$GITHUB_PATH"
@@ -405,13 +414,27 @@ jobs:
             SUBC_POLKIT_TEST_PASSWORD=polkit-fixture-password \
             "$runnable/linux_polkit" "$test_name" --exact --nocapture
 
+      - name: Cache pinned ck-auth archive
+        if: ${{ !cancelled() && matrix.os == 'ubuntu' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ck-auth.zip
+          key: ck-auth-linux-x64-64245680ce56fd31dd07813a2100d065aba4cce5b98ab29245ea3f2bfb7892fa
       # The ignored download test is mandatory here; guard discovery and the run count.
       - name: Published claustrum bootstrap
         if: ${{ !cancelled() && matrix.os == 'ubuntu' }}
         timeout-minutes: 10
         shell: bash
+        env:
+          SUBC_TEST_CK_AUTH_ZIP: ${{ runner.temp }}/ck-auth.zip
         run: |
           set -euo pipefail
+          sum=64245680ce56fd31dd07813a2100d065aba4cce5b98ab29245ea3f2bfb7892fa
+          if ! echo "$sum  $SUBC_TEST_CK_AUTH_ZIP" | sha256sum --check --status; then
+            rm -f "$SUBC_TEST_CK_AUTH_ZIP"
+            curl -fsSL --retry 6 --retry-delay 10 --retry-all-errors -o "$SUBC_TEST_CK_AUTH_ZIP" "https://github.com/cortexkit/claustrum/releases/download/v0.3.0/ck-auth-linux-x64.zip"
+          fi
+          echo "$sum  $SUBC_TEST_CK_AUTH_ZIP" | sha256sum -c -
           test_binary="$(
             cargo test -p subc-core --lib --no-run --locked --message-format=json |
               jq -ers '

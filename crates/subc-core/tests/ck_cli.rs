@@ -4873,6 +4873,9 @@ async fn module_status_with_tree_using(mut read: impl FnMut() -> Output, json: b
         let stdout = text(&output.stdout);
         // Each status reply has its own bounded read. A prior ready reply
         // cannot make a later omitted measurement into a numeric zero.
+        // The running-image check is bounded too: a fresh reply can still say
+        // `not_yet_measured`, so the text form waits for a settled verdict in
+        // the same reply whose bytes the caller pins.
         let ready = if json {
             serde_json::from_slice::<Value>(&output.stdout)
                 .ok()
@@ -4897,6 +4900,9 @@ async fn module_status_with_tree_using(mut read: impl FnMut() -> Output, json: b
                     line.starts_with("  memory including child processes: ")
                         && line.contains("[source: ")
                 })
+                && !stdout
+                    .lines()
+                    .any(|line| line == "  running image: unknown (not_yet_measured)")
         };
         if !output.status.success() || ready {
             return output;
@@ -4921,6 +4927,37 @@ async fn module_status_byte_fixture_waits_for_the_tree_in_its_own_reply() {
         assert_eq!(calls,2,"the bytes being pinned need a measured tree, not an earlier RPC's promise");
         assert_eq!(output.stdout,ready.as_bytes());
     }
+}
+
+#[tokio::test]
+async fn module_status_byte_fixture_waits_for_the_running_image_verdict_in_its_own_reply() {
+    let status = ck_command().arg("--help").output().unwrap().status;
+    let tree = "  cpu including child processes: ≥0 ms\n  memory including child processes: 1 MiB [source: process_tree]\n";
+    let pending = format!("{tree}  running image: unknown (not_yet_measured)\n");
+    let ready = format!("{tree}  running image: matches file at spawned path\n");
+    let mut calls = 0;
+    let output = module_status_with_tree_using(
+        || {
+            calls += 1;
+            Output {
+                status,
+                stdout: if calls == 1 {
+                    pending.clone()
+                } else {
+                    ready.clone()
+                }
+                .into_bytes(),
+                stderr: Vec::new(),
+            }
+        },
+        false,
+    )
+    .await;
+    assert_eq!(
+        calls, 2,
+        "a reply whose image check is still pending is not the one to pin"
+    );
+    assert_eq!(output.stdout, ready.as_bytes());
 }
 
 async fn module_list_with_image_verdict_using(

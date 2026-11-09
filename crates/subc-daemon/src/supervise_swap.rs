@@ -808,7 +808,45 @@ async fn warm_candidate(
     end: &mut SwapEnd,
 ) -> Warm {
     let requeue_start = end.requeue.len();
-    let outcome=async {
+    let outcome = warm_candidate_until_outcome(
+        module_id,
+        registry,
+        candidate,
+        incumbent_connection,
+        ready_timeout,
+        config_deadline,
+        config_delivery,
+        commands,
+        end,
+    )
+    .await;
+    if matches!(outcome, Warm::Superseded { .. }) {
+        // The superseded branch queues its freshly checked generation instead.
+        let deferred = end.requeue.split_off(requeue_start);
+        end.requeue.extend(
+            deferred
+                .into_iter()
+                .filter(|command| !matches!(command, SupervisorCommand::ConfigApplyRestart { .. })),
+        );
+    }
+    outcome
+}
+
+/// The warm-up loop proper. Every return path leaves any configuration
+/// restart it consumed in `end.requeue`; [`warm_candidate`] drops those again
+/// when the outcome is `Superseded`, whose caller queues a fresher generation.
+#[allow(clippy::too_many_arguments)]
+async fn warm_candidate_until_outcome(
+    module_id: &str,
+    registry: &Registry,
+    candidate: &mut SupervisedChild,
+    incumbent_connection: ConnectionId,
+    ready_timeout: Duration,
+    config_deadline: Option<Instant>,
+    config_delivery: Option<&super::config_delivery::ConfigDelivery>,
+    commands: &mut mpsc::Receiver<SupervisorCommand>,
+    end: &mut SwapEnd,
+) -> Warm {
     let mut deadline = Instant::now() + ready_timeout;
     let mut registered: Option<ConnectionId> = None;
     let mut config_restart_pending = false;
@@ -949,12 +987,15 @@ async fn warm_candidate(
                     // revalidates it against the current spawn before acting.
                     end.requeue.push(command);
                     #[cfg(test)]
-                    if let Some(delivery)=config_delivery {
-                        let pause=delivery.0.warm_restart_pause.lock().unwrap().take();
-                        if let Some(pause)=pause {let _=pause.reached.send(());let _=pause.resume.await;}
+                    if let Some(delivery) = config_delivery {
+                        let pause = delivery.0.warm_restart_pause.lock().unwrap().take();
+                        if let Some(pause) = pause {
+                            let _ = pause.reached.send(());
+                            let _ = pause.resume.await;
+                        }
                     }
-                    config_restart_pending=true;
-                    next_config_check=Instant::now();
+                    config_restart_pending = true;
+                    next_config_check = Instant::now();
                     continue;
                 }
                 if let Some(command) = serve_command_while_warming(module_id, command, end,config_delivery.is_some_and(|delivery|delivery.0.module_is_gated(module_id))) {
@@ -964,17 +1005,6 @@ async fn warm_candidate(
             _ = sleep(poll) => {}
         }
     }
-    }.await;
-    if matches!(outcome, Warm::Superseded { .. }) {
-        // The superseded branch queues its freshly checked generation instead.
-        let deferred = end.requeue.split_off(requeue_start);
-        end.requeue.extend(
-            deferred
-                .into_iter()
-                .filter(|command| !matches!(command, SupervisorCommand::ConfigApplyRestart { .. })),
-        );
-    }
-    outcome
 }
 
 fn config_candidate_deadline(

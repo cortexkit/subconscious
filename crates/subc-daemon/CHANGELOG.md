@@ -2,6 +2,11 @@
 
 ## 0.41.10
 
+- Release Windows program write-exclusion handles once HELLO acknowledges a
+  normal launch or the warmed replacement in a blue/green swap, including
+  sink-backed connections whose acknowledgement is queued instead of returned
+  as a frame.
+
 - Classify stable malformed or oversized program captures as definite refusals,
   preserve transient capture deferral, and do not misclassify an unchanged
   approved symlink. Refusal-list capacity cannot remove records that keep a

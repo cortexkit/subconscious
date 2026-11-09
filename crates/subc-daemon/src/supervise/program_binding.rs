@@ -41,6 +41,14 @@ impl Drop for ProgramBindingPublication {
 }
 
 impl SupervisorHandle {
+    #[cfg(all(test, windows))]
+    pub(crate) fn candidate_launch_nonce_for_test(&self, module: &str) -> Option<String> {
+        self.swaps
+            .lock()
+            .ok()?
+            .get(module)
+            .map(|swap| swap.candidate_nonce.clone())
+    }
     #[cfg(windows)]
     pub(crate) fn program_hello_accepted(&self, module: &str, nonce: &str) {
         let live = self

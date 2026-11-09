@@ -2513,31 +2513,7 @@ impl ControlHandler {
         egress: Option<crate::router::FrameSink>,
         frame: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
-        #[cfg(windows)]
-        let binding = serde_json::from_slice::<serde_json::Value>(&frame.body)
-            .ok()
-            .and_then(|value| {
-                Some((
-                    value
-                        .get("manifest")?
-                        .get("module_id")?
-                        .as_str()?
-                        .to_owned(),
-                    value.get("launch_nonce")?.as_str()?.to_owned(),
-                ))
-            });
-        let result = self.handle_hello_checked(connection_id, egress, frame);
-        #[cfg(windows)]
-        if result.as_ref().is_ok_and(|frames| {
-            frames
-                .iter()
-                .any(|frame| frame.header.ty == FrameType::HelloAck)
-        }) {
-            if let Some((module, nonce)) = binding {
-                self.supervisor.program_hello_accepted(&module, &nonce);
-            }
-        }
-        result
+        self.handle_hello_checked(connection_id, egress, frame)
     }
 
     fn handle_hello_checked(
@@ -2851,6 +2827,8 @@ impl ControlHandler {
                 negotiated_ver,
                 control_ops,
                 hello_ack,
+                #[cfg(windows)]
+                hello.launch_nonce.as_deref(),
             );
         }
         // Registered unpublished: the module id is claimed, so a duplicate HELLO
@@ -2996,6 +2974,12 @@ impl ControlHandler {
             "module registered"
         );
 
+        #[cfg(windows)]
+        if let Some(nonce) = hello.launch_nonce.as_deref() {
+            self.supervisor
+                .program_hello_accepted(&registration.manifest.module_id, nonce);
+        }
+
         Ok(reply)
     }
 
@@ -3025,6 +3009,7 @@ impl ControlHandler {
         negotiated_ver: u8,
         control_ops: Vec<String>,
         hello_ack: Frame,
+        #[cfg(windows)] launch_nonce: Option<&str>,
     ) -> Result<Vec<Frame>, RouterError> {
         let module_id = manifest.module_id.clone();
         let registration = match self.registry.register_unpublished_verified_candidate_with_control_ops(
@@ -3112,6 +3097,10 @@ impl ControlHandler {
             connection_id = connection_id.get(),
             "swap candidate registered; not routable until cutover"
         );
+        #[cfg(windows)]
+        if let Some(nonce) = launch_nonce {
+            self.supervisor.program_hello_accepted(&module_id, nonce);
+        }
         Ok(reply)
     }
 

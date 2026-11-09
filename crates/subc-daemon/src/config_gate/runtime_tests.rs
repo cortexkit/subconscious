@@ -23,14 +23,17 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     .unwrap();
     let covered = rig.path.join("covered.txt");
     std::fs::write(&covered, b"approved").unwrap();
-    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":program,"args":["-t","127.0.0.1"],"protocol":"subc","program_files":[covered]}}})).unwrap()).unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":program,"args":["-t","127.0.0.1"],"protocol":"subc","overlap":"safe","program_files":[covered]}}})).unwrap()).unwrap();
     let owner = Arc::new(rig.owner("windows-handle-lifetime"));
     rig.stamp(&owner);
     let registry = Arc::new(crate::Registry::default());
+    let forwarding = Arc::new(crate::ForwardingTable::default());
     let handle = SupervisorHandle::new();
     let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
         .with_handle(handle.clone())
-        .with_config_runtime(owner.clone());
+        .with_config_runtime(owner.clone())
+        .with_forwarding(forwarding.clone())
+        .with_drain_timeout(std::time::Duration::from_millis(20));
     let spec = crate::daemon_config::load(rig.path.join("subc.jsonc"))
         .unwrap()
         .unwrap()
@@ -41,11 +44,13 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     let excluded = before.as_ref().err().and_then(|error| error.raw_os_error());
     drop(before);
     let nonce = handle.spawn_launch_nonce_for("a").unwrap();
-    let handler = crate::ControlHandler::new(registry.clone())
-        .with_supervisor(handle)
+    let handler = crate::ControlHandler::with_forwarding(registry.clone(), forwarding)
+        .with_supervisor(handle.clone())
         .with_config_runtime(owner);
+    let mut manifest = subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build();
+    manifest.ready = Some(true);
     let hello = subc_protocol::ModuleHelloBody {
-        manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+        manifest,
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
         launch_nonce: Some(nonce),
@@ -63,8 +68,16 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     let mut invalid: serde_json::Value = serde_json::from_slice(&malformed.body).unwrap();
     invalid["protocol_ver"] = json!(0);
     malformed.body = serde_json::to_vec(&invalid).unwrap();
+    let (rejected_tx, mut rejected_rx) = tokio::sync::mpsc::channel(8);
     let rejected = handler
-        .handle_control(ConnectionId::new(778), malformed)
+        .handle_control_frame(
+            &crate::router::RouteCtx {
+                connection_id: ConnectionId::new(778),
+                egress: crate::FrameSink::new(rejected_tx),
+            },
+            malformed,
+        )
+        .await
         .unwrap();
     let after_rejection = std::fs::OpenOptions::new().write(true).open(&covered);
     let still_excluded = after_rejection
@@ -73,11 +86,86 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         .and_then(|error| error.raw_os_error());
     drop(after_rejection);
     let connection = ConnectionId::new(777);
-    let reply = handler.handle_control(connection, frame).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let reply = handler
+        .handle_control_frame(
+            &crate::router::RouteCtx {
+                connection_id: connection,
+                egress: crate::FrameSink::new(tx),
+            },
+            frame,
+        )
+        .await
+        .unwrap();
+    let ack = rx.try_recv().unwrap();
     let after = std::fs::OpenOptions::new().write(true).open(&covered);
     let released = after.is_ok();
     drop(after);
-    let _ = registry.deregister_connection(connection);
+    let swapping = {
+        let module = module.clone();
+        tokio::spawn(async move { module.swap(Some(std::time::Duration::from_secs(5))).await })
+    };
+    let candidate_nonce = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(nonce) = handle.candidate_launch_nonce_for_test("a") {
+                if handle.has_program_binding("a", &nonce)
+                    && handle.wait_program_binding("a", &nonce).await
+                {
+                    break nonce;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let before_candidate_ack = std::fs::OpenOptions::new().write(true).open(&covered);
+    let candidate_excluded = before_candidate_ack
+        .as_ref()
+        .err()
+        .and_then(|error| error.raw_os_error());
+    drop(before_candidate_ack);
+    let mut candidate_hello = hello;
+    candidate_hello.launch_nonce = Some(candidate_nonce);
+    let candidate_frame = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        2,
+        serde_json::to_vec(&candidate_hello).unwrap(),
+    )
+    .unwrap();
+    let candidate_connection = ConnectionId::new(779);
+    let (candidate_tx, mut candidate_rx) = tokio::sync::mpsc::channel(8);
+    let candidate_reply = handler
+        .handle_control_frame(
+            &crate::router::RouteCtx {
+                connection_id: candidate_connection,
+                egress: crate::FrameSink::new(candidate_tx),
+            },
+            candidate_frame,
+        )
+        .await
+        .unwrap();
+    let candidate_ack = candidate_rx.try_recv().unwrap();
+    let after_candidate_ack = std::fs::OpenOptions::new().write(true).open(&covered);
+    let candidate_released = after_candidate_ack.is_ok();
+    drop(after_candidate_ack);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while registry
+            .get_module("a")
+            .unwrap()
+            .is_none_or(|registration| registration.connection_id != candidate_connection)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    handler.cleanup_connection(connection).unwrap();
+    let outcome = swapping.await.unwrap();
+    handler.cleanup_connection(candidate_connection).unwrap();
     module.stop().await.unwrap();
     assert_eq!(
         excluded,
@@ -90,10 +178,26 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         Some(32),
         "a refused HELLO must not release the child's write-exclusion witness"
     );
-    assert_eq!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
+    assert!(rejected_rx.try_recv().is_err());
+    assert!(
+        reply.is_empty(),
+        "production forwarding queues the ACK rather than returning it"
+    );
+    assert_eq!(ack.frame.header.ty, subc_protocol::FrameType::HelloAck);
     assert!(
         released,
         "successful HELLO releases the Windows write-exclusion handles"
+    );
+    assert!(outcome.is_ok(), "{outcome:?}");
+    assert_eq!(candidate_excluded, Some(32));
+    assert!(candidate_reply.is_empty());
+    assert_eq!(
+        candidate_ack.frame.header.ty,
+        subc_protocol::FrameType::HelloAck
+    );
+    assert!(
+        candidate_released,
+        "a production swap-candidate ACK must release its strict handles too"
     );
 }
 

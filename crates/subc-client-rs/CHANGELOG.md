@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.38.2
+
+- Route and handle closes are now cancel-safe: dropping a close during a drain or
+  writer-capacity wait still settles pending requests and queues exactly one
+  GOODBYE. Abandoned closes use the connection's ordered retirement queue and keep
+  the channel occupied until GOODBYE is queued or the connection dies.
+
 ## 0.38.1
 
 - Route closes now wait for writer capacity before returning, so callers may release

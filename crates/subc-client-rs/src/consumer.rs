@@ -2839,6 +2839,13 @@ impl SubcConsumer {
     /// over-call on session-end). NOT a permanent tombstone — a later `call()` for the
     /// same key opens a fresh route. The close-beats-reopen guard ensures a close that
     /// races an in-flight route.open WINS (the opened channel is GOODBYE'd, not cached).
+    ///
+    /// # Cancel safety
+    /// Once the cached route is removed, dropping this future abandons any drain
+    /// wait but still settles pending requests and queues its GOODBYE in the
+    /// background. The handle stays installed until GOODBYE is queued, unless the
+    /// connection dies. Cancellation does not queue a second GOODBYE if the close
+    /// already completed.
     pub async fn close_route(
         &self,
         target: RouteTarget,
@@ -2860,6 +2867,12 @@ impl SubcConsumer {
 
     /// Close exactly this route handle. A stale connection token fails locally and emits no frame.
     /// `opts.scope` must be `None`: the handle already selects exactly one route.
+    ///
+    /// # Cancel safety
+    /// After the handle is validated and its route removed, dropping this future
+    /// abandons any drain wait but still settles pending requests and queues its
+    /// GOODBYE in the background. The handle is uninstalled after queueing, or when
+    /// the connection dies; a completed close never queues a second GOODBYE on drop.
     pub async fn close_handle(
         &self,
         handle: &RouteHandle,
@@ -5595,29 +5608,25 @@ impl Shared {
         opts: &CloseRouteOptions,
     ) -> Result<(), CallError> {
         self.validate_current_handle(handle)?;
-        let routes = {
+        let route = {
             let mut inner = self.lock_inner();
             inner
                 .route_end_reasons
                 .insert(handle.channel, (RouteEndReason::ClosedByCaller, true));
-            inner
-                .remove_route_by_handle(handle)
-                .into_iter()
-                .collect::<Vec<_>>()
+            inner.remove_route_by_handle(handle)
         };
+        let mut closing = RouteCloseGuard::new(
+            Arc::clone(self),
+            handle,
+            route,
+            "route closed by close_handle",
+        );
         if opts.drain {
             self.drain_channel(handle, opts.drain_timeout).await;
         }
-        for route in routes {
-            route.close();
-        }
-        self.fail_channel_pending(
-            handle,
-            "route closed by close_handle",
-            RouteEndReason::ClosedByCaller,
-        );
+        closing.close_pending();
         self.queue_route_goodbye(handle).await;
-        self.uninstall_route_handle(handle);
+        closing.finish();
         Ok(())
     }
 
@@ -5645,28 +5654,30 @@ impl Shared {
         let Some(route) = route else {
             return;
         };
+        let handle = route.handle;
+        let mut closing = RouteCloseGuard::new(
+            Arc::clone(self),
+            handle,
+            Some(route),
+            "route closed by close_route",
+        );
 
         if opts.drain {
             // Wait for in-flight UNARY requests on this channel to settle naturally,
             // bounded by drain_timeout, before tearing the route down.
-            self.drain_channel(route.handle, opts.drain_timeout).await;
+            self.drain_channel(handle, opts.drain_timeout).await;
         }
 
         // Closing the semaphore makes any not-yet-sent acquire() return Err -> the
         // caller classifies it NotSent. Already-sent pending requests are settled
         // at-most-once (OutcomeUnknown if the writer accepted their bytes).
-        route.close();
-        self.fail_channel_pending(
-            route.handle,
-            "route closed by close_route",
-            RouteEndReason::ClosedByCaller,
-        );
+        closing.close_pending();
 
         // Fail pending requests and release their slots before waiting for the
         // writer. Keep the ingress handle installed until GOODBYE is queued,
         // preventing channel reuse from overtaking the old route's teardown.
-        self.queue_route_goodbye(route.handle).await;
-        self.uninstall_route_handle(route.handle);
+        self.queue_route_goodbye(handle).await;
+        closing.finish();
     }
 
     fn uninstall_route_handle(&self, handle: RouteHandle) {
@@ -5944,6 +5955,68 @@ struct SubscriptionRetry {
     deadline: Instant,
     delay: Duration,
     position: Arc<SubscriptionPosition>,
+}
+
+struct RouteCloseGuard {
+    shared: Arc<Shared>,
+    handle: RouteHandle,
+    route: Option<RouteState>,
+    reason: &'static str,
+    finished: bool,
+}
+
+impl RouteCloseGuard {
+    fn new(
+        shared: Arc<Shared>,
+        handle: RouteHandle,
+        route: Option<RouteState>,
+        reason: &'static str,
+    ) -> Self {
+        Self {
+            shared,
+            handle,
+            route,
+            reason,
+            finished: false,
+        }
+    }
+
+    fn close_pending(&self) {
+        if let Some(route) = &self.route {
+            route.close();
+        }
+        self.shared
+            .fail_channel_pending(self.handle, self.reason, RouteEndReason::ClosedByCaller);
+    }
+
+    fn finish(&mut self) {
+        self.shared.uninstall_route_handle(self.handle);
+        self.finished = true;
+    }
+}
+
+impl Drop for RouteCloseGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // An abandoned drain must not leave requests or their in-flight permits
+        // waiting on the caller. Retirement owns GOODBYE admission once the close is dropped.
+        self.close_pending();
+        let mut inner = self.shared.lock_inner();
+        if inner.closed
+            || inner.generation != self.handle.connection_token()
+            || inner.writer.is_none()
+            || inner.route_epochs.get(&self.handle.channel) != Some(&self.handle)
+        {
+            return;
+        }
+        inner.retired_routes.insert(self.handle);
+        inner.retirement_goodbyes.insert(self.handle);
+        // Reaping tries synchronous admission first; otherwise the connection's
+        // FIFO flusher keeps the handle installed until its GOODBYE is queued.
+        inner.reap_retired_route(self.handle);
+    }
 }
 
 struct OpeningGuard {
@@ -7602,6 +7675,7 @@ mod tests {
 
     mod busy_refusals_tests;
     mod not_sent_tests;
+    mod route_close_tests;
     mod route_deadline_tests;
 
     #[derive(Clone)]

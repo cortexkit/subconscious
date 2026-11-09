@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.36.1
+
+- Add optional display-only `agent_name` on agent, run and worker remote claims, and `flow_name` on flow claims, with builders preserving existing constructors. Names follow `peer_name`'s 1–80 Unicode scalar plain-text rule; decoding drops invalid names without rejecting the claim. Absent names are omitted, never serialized as null.
+- Add `RemoteClaim::same_identity` and `FederatedAttributes::same_identity` for comparisons excluding only remote display names. Structural equality still detects display changes.
+
 ## 0.36.0
 
 - Add federated scope kinds, typed paired-peer attributes and strict remote claims, shared validation, and the `scope-federated/v1` capability. Non-federated attributes omit the new member.

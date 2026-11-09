@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Federated scope management replies preserve optional `agent_name` and `flow_name` for display only. They arrive already validated by the daemon; generic dictionary decoding remains unchanged, with no new typed scope API.
+
 - Read optional `CatalogEntry.displayName` from `catalog.list`; absent names
   remain nil so apps can fall back to the bare `moduleId`.
 

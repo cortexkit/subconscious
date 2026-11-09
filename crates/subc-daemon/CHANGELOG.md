@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.44.3
+
+- Adopt protocol 0.36.1 remote display names. Drop invalid names at decode; accept same-epoch name-only updates and serve the new name without invalidating in-flight binds, draining routes or losing service history. Pairing-roster and claim identity facts remain fixed for the epoch.
+
 ## 0.44.2
 
 - Serve `supervisor.list` resources from committed measurements without walking processes inside the list's diagnostics budget. Lists older than two seconds request a single background refresh; minute samples serialize with refreshes and use their own completed walk. No refresh timer runs without list callers.

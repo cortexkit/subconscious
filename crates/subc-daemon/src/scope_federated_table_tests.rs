@@ -1,5 +1,5 @@
 use super::*;
-use subc_protocol::scope::{FederatedAttributes, FederatedPeerClass};
+use subc_protocol::scope::{FederatedAttributes, FederatedPeerClass, RemoteClaim};
 
 const FED: &str = "callosum";
 
@@ -21,6 +21,63 @@ fn change(table: &mut ScopeTable, owner: &str, delta: bool, record: ScopeRecord)
             .unwrap()
     } else {
         sync(table, owner, conn(1), 2, vec![record])
+    }
+}
+
+#[test]
+fn federated_claim_renames_keep_epoch_identity_and_serve_the_new_name() {
+    for delta in [false, true] {
+        for (claim, field) in [
+            (RemoteClaim::agent("agent"), "agent_name"),
+            (RemoteClaim::run("agent"), "agent_name"),
+            (RemoteClaim::worker("owner", "a".repeat(64), Some("agent".into())), "agent_name"),
+            (RemoteClaim::flow("flow", 1, "install", "a".repeat(64)), "flow_name"),
+        ] {
+            let mut record = federated(1);
+            record.attributes.federated.as_mut().unwrap().remote_claim = Some(claim);
+            let mut wire = serde_json::to_value(record).unwrap();
+            wire["attributes"]["federated"]["remote_claim"][field] = serde_json::json!("Original");
+            let mut table = table();
+            sync(&mut table, FED, conn(1), 1, vec![serde_json::from_value(wire.clone()).unwrap()]);
+            let before = describe(&table, FED, "f").stamp.unwrap();
+            let selector = ScopeSelector::new(reserved(FED), "f", Some(1));
+            let before_tag = table.admit(&reserved(FED), "target", &selector, true).unwrap().tag;
+            wire["attributes"]["federated"]["remote_claim"][field] = serde_json::json!("Renamed");
+            let changed = change(&mut table, FED, delta, serde_json::from_value(wire).unwrap());
+            assert_eq!(changed.results[0].outcome, ScopeRecordOutcome::Unchanged);
+            assert!(changed.tag_changes.is_empty());
+            assert!(changed.ended.is_empty());
+            let after = describe(&table, FED, "f").stamp.unwrap();
+            assert_eq!(table.admit(&reserved(FED), "target", &selector, true).unwrap().tag, before_tag);
+            assert_eq!(after.scope_epoch, before.scope_epoch);
+            assert_eq!(serde_json::to_value(after).unwrap()["attributes"]["federated"]["remote_claim"][field], "Renamed");
+        }
+    }
+}
+
+#[test]
+fn federated_sync_and_apply_drop_invalid_claim_names_without_refusing_claims() {
+    for delta in [false, true] {
+        for (claim, field) in [
+            (RemoteClaim::agent("agent"), "agent_name"),
+            (RemoteClaim::run("agent"), "agent_name"),
+            (RemoteClaim::worker("owner", "a".repeat(64), Some("agent".into())), "agent_name"),
+            (RemoteClaim::flow("flow", 1, "install", "a".repeat(64)), "flow_name"),
+        ] {
+            for name in ["".to_string(), "x".repeat(81), "bad\nname".into(), "\u{202e}".into()] {
+                let mut table = table();
+                sync(&mut table, FED, conn(1), 1, vec![]);
+                let mut record = federated(1);
+                record.attributes.federated.as_mut().unwrap().remote_claim = Some(claim.clone());
+                let mut wire = serde_json::to_value(record).unwrap();
+                wire["attributes"]["federated"]["remote_claim"][field] = serde_json::json!(name);
+                let result = change(&mut table, FED, delta, serde_json::from_value(wire).unwrap());
+                assert_eq!(result.results[0].outcome, ScopeRecordOutcome::Created);
+                let stamp = describe(&table, FED, "f").stamp.unwrap();
+                assert_eq!(stamp.attributes.federated.as_ref().unwrap().remote_claim.as_ref(), Some(&claim));
+                assert!(serde_json::to_value(stamp).unwrap()["attributes"]["federated"]["remote_claim"].get(field).is_none());
+            }
+        }
     }
 }
 

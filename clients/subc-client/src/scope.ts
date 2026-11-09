@@ -1,9 +1,10 @@
 import type { Principal } from "./provider.js";
 
+/** Names are display-only, never identity. Invalid names are omitted on the wire. */
 export type RemoteClaim =
-  | { kind: "agent" | "run"; agent_id: string }
-  | { kind: "worker"; owner_module_id: string; worker_ref: string; on_behalf_of?: string | null }
-  | { kind: "flow"; flow_id: string; flow_version: number; flow_install_id: string; flow_code_hash: string };
+  | { kind: "agent" | "run"; agent_id: string; agent_name?: string }
+  | { kind: "worker"; owner_module_id: string; worker_ref: string; on_behalf_of?: string | null; agent_name?: string }
+  | { kind: "flow"; flow_id: string; flow_version: number; flow_install_id: string; flow_code_hash: string; flow_name?: string };
 
 export interface FederatedAttributes {
   peer_class: "computer" | "phone" | "sim" | "unknown";
@@ -155,6 +156,13 @@ export function scopeRecordWire(record: ScopeRecord): object {
   };
 }
 
+// Match peer_name's Unicode scalar count and control/bidi exclusions in Rust.
+function displayName(value: unknown): string | undefined {
+  if (typeof value !== "string" || [...value].length < 1 || [...value].length > 80
+    || /[\p{Cc}\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069\uD800-\uDFFF]/u.test(value)) return undefined;
+  return value;
+}
+
 function federatedWire(facts: FederatedAttributes): object {
   fields(facts, ["peer_class", "peer_fingerprint", "pairing_id", "peer_name", "remote_claim"]);
   const claim = facts.remote_claim;
@@ -163,17 +171,17 @@ function federatedWire(facts: FederatedAttributes): object {
     if (typeof claim !== "object" || Array.isArray(claim)) throw new TypeError("remote_claim must be an object");
     switch (claim.kind) {
       case "agent": case "run":
-        fields(claim, ["kind", "agent_id"]);
-        remote_claim = { kind: claim.kind, agent_id: claim.agent_id };
+        fields(claim, ["kind", "agent_id", "agent_name"]);
+        remote_claim = { kind: claim.kind, agent_id: claim.agent_id, agent_name: displayName(claim.agent_name) };
         break;
       case "worker":
-        fields(claim, ["kind", "owner_module_id", "worker_ref", "on_behalf_of"]);
-        remote_claim = { kind: claim.kind, owner_module_id: claim.owner_module_id, worker_ref: claim.worker_ref, on_behalf_of: claim.on_behalf_of ?? undefined };
+        fields(claim, ["kind", "owner_module_id", "worker_ref", "on_behalf_of", "agent_name"]);
+        remote_claim = { kind: claim.kind, owner_module_id: claim.owner_module_id, worker_ref: claim.worker_ref, on_behalf_of: claim.on_behalf_of ?? undefined, agent_name: displayName(claim.agent_name) };
         break;
       case "flow":
-        fields(claim, ["kind", "flow_id", "flow_version", "flow_install_id", "flow_code_hash"]);
+        fields(claim, ["kind", "flow_id", "flow_version", "flow_install_id", "flow_code_hash", "flow_name"]);
         if (claim.flow_version < 1) throw new TypeError("flow_version must be positive");
-        remote_claim = { kind: claim.kind, flow_id: claim.flow_id, flow_version: scopeInteger(claim.flow_version), flow_install_id: claim.flow_install_id, flow_code_hash: claim.flow_code_hash };
+        remote_claim = { kind: claim.kind, flow_id: claim.flow_id, flow_version: scopeInteger(claim.flow_version), flow_install_id: claim.flow_install_id, flow_code_hash: claim.flow_code_hash, flow_name: displayName(claim.flow_name) };
         break;
       default: throw new TypeError("unknown remote claim kind");
     }

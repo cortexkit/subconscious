@@ -354,6 +354,21 @@ final class ClientWireRevisionTests: XCTestCase {
         XCTAssertEqual(extra["enabled"] as? Bool, true)
     }
 
+    func testScopeDescribeGoldenReplyPreservesFederatedDisplayNames() throws {
+        for (kind, field, name) in [
+            ("agent", "agent_name", "Remote Agent"),
+            ("flow", "flow_name", "Remote Flow")
+        ] {
+            let reply = try scopeDescribeGoldenReply("scope-describe-federated-\(kind)")
+            let scope = try XCTUnwrap(reply["scope"] as? [String: Any])
+            let attributes = try XCTUnwrap(scope["attributes"] as? [String: Any])
+            let facts = try XCTUnwrap(attributes["federated"] as? [String: Any])
+            let claim = try XCTUnwrap(facts["remote_claim"] as? [String: Any])
+            XCTAssertEqual(claim["kind"] as? String, kind)
+            XCTAssertEqual(claim[field] as? String, name)
+        }
+    }
+
     func testScopeDescribeLegacyGoldenReplyHasNoDeadline() throws {
         let reply = try scopeDescribeGoldenReply("scope-describe-legacy")
         let scope = try XCTUnwrap(reply["scope"] as? [String: Any])

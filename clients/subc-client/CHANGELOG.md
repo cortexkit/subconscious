@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.24.3
+
+- Add optional display-only `agent_name` and `flow_name` remote-claim input fields. Omit invalid names without refusing the claim: the same 1–80 Unicode scalar plain-text rule as `peer_name`, excluding controls and bidi formatting. Names never identify a caller. Generic management replies remain unmodified; the daemon validates names before serving them.
+
 ## 0.24.2
 
 - Reject non-object non-null `remote_claim` inputs rather than silently dropping falsy values. Null and undefined both omit the claim, matching Rust. Shared Rust/TypeScript request fixtures cover all claim kinds and absence.

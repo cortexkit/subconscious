@@ -27,6 +27,31 @@ async fn federated_rig(provides: &[&str]) -> Rig {
 }
 
 #[tokio::test]
+async fn federated_display_renames_keep_bound_routes_live_and_refresh_new_stamps() {
+    for claim in [
+        RemoteClaim::agent("agent"),
+        RemoteClaim::run("agent"),
+        RemoteClaim::worker("owner", "a".repeat(64), Some("agent".into())),
+        RemoteClaim::flow("flow", 1, "install", "a".repeat(64)),
+    ] {
+        let field = if matches!(claim, RemoteClaim::Flow { .. }) { "flow_name" } else { "agent_name" };
+        let named = |name| {
+            if field == "flow_name" { claim.clone().with_flow_name(name) }
+            else { claim.clone().with_agent_name(name) }
+        };
+        let mut rig = federated_rig(&[SCOPE_FEDERATED_CAPABILITY]).await;
+        rig.sync(vec![federated("claim", 1, Some(named("Original")))]).await;
+        let route = rig.bound(Some(AFT), PLEXUS, Some(rig_selector("claim", Some(1)))).await;
+        rig.sync(vec![federated("claim", 1, Some(named("Renamed")))]).await;
+        assert!(rig.live(&route));
+        let refreshed = rig.bound(Some(AFT), PLEXUS, Some(rig_selector("claim", Some(1)))).await;
+        let stamp = serde_json::to_value(refreshed.stamp().unwrap()).unwrap();
+        assert_eq!(stamp["attributes"]["federated"]["remote_claim"][field], "Renamed");
+        assert!(rig.live(&route));
+    }
+}
+
+#[tokio::test]
 async fn federated_capability_membership_is_frozen_for_active_and_candidate_connections() {
     for candidate in [false, true] {
         for declared in [false, true] {

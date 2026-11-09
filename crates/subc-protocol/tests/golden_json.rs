@@ -1760,17 +1760,15 @@ fn federated_scope_requests_match_typescript_goldens() {
     use subc_protocol::session::ModuleControlRequestFromModule;
     for (claim, sync_fixture, apply_fixture) in [
         (
-            Some(RemoteClaim::flow(
-                "flow",
-                9_007_199_254_740_991,
-                "install",
-                "b".repeat(64),
-            )),
+            Some(
+                RemoteClaim::flow("flow", 9_007_199_254_740_991, "install", "b".repeat(64))
+                    .with_flow_name("Remote Flow"),
+            ),
             include_str!("../../../clients/subc-client/tests/golden/scope-sync-federated.json"),
             include_str!("../../../clients/subc-client/tests/golden/scope-apply-federated.json"),
         ),
         (
-            Some(RemoteClaim::agent("remote-agent")),
+            Some(RemoteClaim::agent("remote-agent").with_agent_name("Remote Agent")),
             include_str!(
                 "../../../clients/subc-client/tests/golden/scope-sync-federated-agent.json"
             ),
@@ -1779,11 +1777,10 @@ fn federated_scope_requests_match_typescript_goldens() {
             ),
         ),
         (
-            Some(RemoteClaim::worker(
-                "worker-owner",
-                "c".repeat(64),
-                Some("remote-agent".into()),
-            )),
+            Some(
+                RemoteClaim::worker("worker-owner", "c".repeat(64), Some("remote-agent".into()))
+                    .with_agent_name("Delegating Agent"),
+            ),
             include_str!(
                 "../../../clients/subc-client/tests/golden/scope-sync-federated-worker.json"
             ),
@@ -1792,7 +1789,7 @@ fn federated_scope_requests_match_typescript_goldens() {
             ),
         ),
         (
-            Some(RemoteClaim::run("remote-agent")),
+            Some(RemoteClaim::run("remote-agent").with_agent_name("Remote Agent")),
             include_str!("../../../clients/subc-client/tests/golden/scope-sync-federated-run.json"),
             include_str!(
                 "../../../clients/subc-client/tests/golden/scope-apply-federated-run.json"

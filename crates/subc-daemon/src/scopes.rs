@@ -34,11 +34,12 @@ use subc_protocol::{
     error_codes,
     manifest::CapabilityDeclarations,
     scope::{
-        ParentState, ScopeAttributes, ScopeEnd, ScopeEndOutcome, ScopeEndResult, ScopeEnded,
-        ScopeKind, ScopeParent, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
-        ScopeStamp, ScopeStatus, AGENT_RUN_SCOPES_CAPABILITY, FLOW_SCOPES_CAPABILITY,
-        MAX_CARRIER_TARGETS, MAX_LIVE_SCOPES_PER_OWNER, MAX_SCOPE_ATTRIBUTE_BYTES,
-        MAX_SCOPE_EXPIRY_AHEAD_MS, MAX_SCOPE_TOMBSTONES_PER_OWNER, WORKER_RUNS_CAPABILITY,
+        FederatedAttributes, ParentState, ScopeAttributes, ScopeEnd, ScopeEndOutcome,
+        ScopeEndResult, ScopeEnded, ScopeKind, ScopeParent, ScopeRecord, ScopeRecordOutcome,
+        ScopeRecordResult, ScopeSelector, ScopeStamp, ScopeStatus, AGENT_RUN_SCOPES_CAPABILITY,
+        FLOW_SCOPES_CAPABILITY, MAX_CARRIER_TARGETS, MAX_LIVE_SCOPES_PER_OWNER,
+        MAX_SCOPE_ATTRIBUTE_BYTES, MAX_SCOPE_EXPIRY_AHEAD_MS, MAX_SCOPE_TOMBSTONES_PER_OWNER,
+        WORKER_RUNS_CAPABILITY,
     },
     Principal, RouteCloseReason,
 };
@@ -48,6 +49,35 @@ use crate::registry::ConnectionId;
 /// The code a malformed sync body is refused with, the same one the control
 /// plane uses for any body that does not parse.
 const INVALID_CONTROL_BODY: &str = "invalid_control_body";
+
+fn same_federated_identity(
+    a: Option<&FederatedAttributes>,
+    b: Option<&FederatedAttributes>,
+) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.same_identity(b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Display renames refresh the stored record without changing the [`ScopeTag`]
+/// fence used to validate in-flight binds.
+/// Preserve structural equality for every other field, including future fields.
+fn same_record_identity(a: &ScopeRecord, b: &ScopeRecord) -> bool {
+    if a == b {
+        return true;
+    }
+    if !same_federated_identity(
+        a.attributes.federated.as_ref(),
+        b.attributes.federated.as_ref(),
+    ) {
+        return false;
+    }
+    let mut comparable = a.clone();
+    comparable.attributes.federated = b.attributes.federated.clone();
+    comparable == *b
+}
 
 /// The launch nonce each module connection presented in its HELLO, kept so the
 /// scope table can tell whether a connection belongs to its module's current
@@ -1174,7 +1204,7 @@ impl ScopeTable {
             };
             let version = match held {
                 Some(held)
-                    if held.record == record
+                    if same_record_identity(&held.record, &record)
                         && held.parent_state == parent_state
                         && held.owner_authorized == owner_authorized =>
                 {
@@ -1492,7 +1522,10 @@ impl ScopeTable {
         }
         if held.is_some_and(|held| {
             held.record.scope_epoch == record.scope_epoch
-                && held.record.attributes.federated != record.attributes.federated
+                && !same_federated_identity(
+                    held.record.attributes.federated.as_ref(),
+                    record.attributes.federated.as_ref(),
+                )
         }) {
             return Some((
                 error_codes::SCOPE_FEDERATED_CHANGED,

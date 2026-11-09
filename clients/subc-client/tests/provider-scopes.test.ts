@@ -32,7 +32,7 @@ const federated: ScopeRecord = {
   scope_ref: "peer", scope_epoch: 1, kind: "federated",
   attributes: { federated: {
     peer_class: "computer", peer_fingerprint: "a".repeat(32), pairing_id: "pair:1", peer_name: "Peer",
-    remote_claim: { kind: "flow", flow_id: "flow", flow_version: Number.MAX_SAFE_INTEGER, flow_install_id: "install", flow_code_hash: "b".repeat(64) },
+    remote_claim: { kind: "flow", flow_id: "flow", flow_version: Number.MAX_SAFE_INTEGER, flow_install_id: "install", flow_code_hash: "b".repeat(64), flow_name: "Remote Flow" },
   } },
 };
 function withClaim(remote_claim: RemoteClaim | null | undefined): ScopeRecord {
@@ -40,9 +40,9 @@ function withClaim(remote_claim: RemoteClaim | null | undefined): ScopeRecord {
 }
 const federatedNull = withClaim(null);
 const federatedClaimCases = [
-  ["federated-agent", withClaim({ kind: "agent", agent_id: "remote-agent" })],
-  ["federated-worker", withClaim({ kind: "worker", owner_module_id: "worker-owner", worker_ref: "c".repeat(64), on_behalf_of: "remote-agent" })],
-  ["federated-run", withClaim({ kind: "run", agent_id: "remote-agent" })],
+  ["federated-agent", withClaim({ kind: "agent", agent_id: "remote-agent", agent_name: "Remote Agent" })],
+  ["federated-worker", withClaim({ kind: "worker", owner_module_id: "worker-owner", worker_ref: "c".repeat(64), on_behalf_of: "remote-agent", agent_name: "Delegating Agent" })],
+  ["federated-run", withClaim({ kind: "run", agent_id: "remote-agent", agent_name: "Remote Agent" })],
   ["federated-claimless", withClaim(undefined)],
   ["federated-claimless", federatedNull],
 ] as const;
@@ -90,6 +90,18 @@ async function sent(writes: Frame[], count = 1) {
 }
 
 describe("provider scope control", () => {
+  test("federated names are optional and invalid display names are dropped on every claim kind", () => {
+    for (const claim of [
+      { kind: "agent", agent_id: "agent" }, { kind: "run", agent_id: "agent" },
+      { kind: "worker", owner_module_id: "owner", worker_ref: "a".repeat(64), on_behalf_of: "agent" },
+      { kind: "flow", flow_id: "flow", flow_version: 1, flow_install_id: "install", flow_code_hash: "a".repeat(64) },
+    ] as const) {
+      const key = claim.kind === "flow" ? "flow_name" : "agent_name";
+      const encoded = (name: unknown) => JSON.parse(JSON.stringify(scopeRecordWire(withClaim({ ...claim, [key]: name } as RemoteClaim)))).attributes.federated.remote_claim;
+      for (const name of ["Name", "é".repeat(80), "🦀".repeat(80)]) expect(encoded(name)).toEqual({ ...claim, [key]: name });
+      for (const name of [undefined, null, "", "x".repeat(81), "\n", "\u007f", "\u0085", "\u061c", "\u200e", "\u202e", "\u2069", "\ud800", 7, {}]) expect(encoded(name)).toEqual(claim);
+    }
+  });
   for (const remote_claim of [false, 0, "", true, 1, "agent", []]) {
     test(`federated refuses non-object remote_claim ${JSON.stringify(remote_claim)}`, () => {
       const record = { ...federated, attributes: { federated: { ...federated.attributes!.federated!, remote_claim } } } as unknown as ScopeRecord;

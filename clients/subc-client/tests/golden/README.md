@@ -1,6 +1,6 @@
 # Scope request byte fixtures
 
-The four `scope-*.json` files were generated from the repository's Rust
+The `scope-*.json` files were generated from the repository's Rust
 `subc_protocol::session::ModuleControlRequestFromModule` type, using a temporary
 Cargo harness under `target/scratch/`. No Rust source in the repository was
 changed. Each input was decoded into that enum and written with
@@ -20,3 +20,7 @@ read its JSON into `ModuleControlRequestFromModule`, then write it back with
 `serde_json::to_vec`. Change example values in the TypeScript test and fixture
 input together when adding coverage; never derive the expected bytes from the
 TypeScript encoder being tested.
+
+Federated claim fixtures include `agent_name` or `flow_name` on each named claim
+kind. Their identity fields are unchanged; the names were added to the harness
+inputs and serialized through Rust again. Claimless fixtures remain unchanged.

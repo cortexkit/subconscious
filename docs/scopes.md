@@ -149,16 +149,26 @@ list explicit `targets`; an untargeted entry is `scope_carrier_targets_invalid`.
 
 | Claim kind | Required members | Optional members |
 |---|---|---|
-| `agent` | `agent_id`: opaque token | none |
-| `worker` | `owner_module_id`: registered module-id syntax; `worker_ref`: exactly 64 lowercase hex | `on_behalf_of`: opaque token, display only |
-| `run` | `agent_id`: opaque token | none |
-| `flow` | `flow_id`, `flow_install_id`: opaque tokens; `flow_version`: integer 1..9007199254740991; `flow_code_hash`: exactly 64 lowercase hex | none |
+| `agent` | `agent_id`: opaque token | `agent_name`: claimed agent's display name |
+| `worker` | `owner_module_id`: registered module-id syntax; `worker_ref`: exactly 64 lowercase hex | `on_behalf_of`: opaque token, display only; `agent_name`: display name of the agent identified by `on_behalf_of`, not the worker |
+| `run` | `agent_id`: opaque token | `agent_name`: claimed agent's display name |
+| `flow` | `flow_id`, `flow_install_id`: opaque tokens; `flow_version`: integer 1..9007199254740991; `flow_code_hash`: exactly 64 lowercase hex | `flow_name`: flow's display name |
 
 Opaque tokens use subc's 1–256 printable non-space ASCII byte rule. Module ids use the same
 validation as registration: nonempty, at most 255 UTF-8 bytes, not `.` or `..`, no path
-separators or controls. Every object refuses unknown members. Invalid fields refuse the whole
-sync or apply as `invalid_control_body`. All federated facts, including display name and claim,
-are fixed for an epoch; changing them is `scope_federated_changed`. Use a higher epoch instead.
+separators or controls. Every object refuses unknown members. Invalid identity fields refuse the whole
+sync or apply as `invalid_control_body`. Pairing-roster facts (including `peer_name`) and claim
+identity fields are fixed for an epoch; changing them is `scope_federated_changed`. Use a higher epoch instead.
+
+Remote `agent_name` and `flow_name` are optional plain text with the same 1–80 Unicode
+scalar-value bound and control/bidi exclusions as `peer_name`. Absent names are omitted,
+never emitted as null. Receivers drop an invalid name (including a non-string or null) and
+keep the claim; a bad display name never refuses the scope or sync. Names are display-only:
+never use them in caller identity, mismatch checks, grant keys or consent subjects.
+In Rust, use `RemoteClaim::same_identity` to ask whether claims identify the same caller;
+ordinary equality still detects display changes. A name may change within an epoch. The
+daemon serves the new name without changing the internal scope-version fence used to validate
+in-flight binds, or closing routes.
 
 The daemon advertises `scope-federated/v1` in HELLO_ACK and `server.describe`.
 Membership in a module's declaration is fixed at HELLO for that connection's lifetime.
@@ -971,7 +981,7 @@ caller may re-open within its own deadline.
 | `target_flow_unsupported` | `route.open`, admission and relay re-check | a flow scope's target provides neither `call-modes/v1` nor `flow-scopes/v1` | no |
 | `target_federated_unsupported` | `route.open`, admission and relay re-check | a federated flow or run claim targets a module without `scope-federated/v1` | no |
 | `scope_federated_unsupported` | `scope.describe` | the reader lacks `scope-federated/v1` for the federated owner | no |
-| `scope_federated_changed` | per upsert in sync or apply | paired-peer facts or the remote claim changed within an epoch | no |
+| `scope_federated_changed` | per upsert in sync or apply | paired-peer facts or remote claim identity changed within an epoch (not remote display names) | no |
 | `catalog_update_frozen_capability` | `catalog.update` | adding or removing `scope-federated/v1` on the same connection; re-register to change it | no |
 | `target_agent_run_unsupported` | `route.open`, admission and relay re-check | an agent run's target provides neither `call-modes/v1` nor `agent-run-scopes/v1`, or the run delegates and the target lacks `call-modes/v1`, or a worker run's target lacks `worker-runs/v1` | no |
 | `scope_unsupported` | carrier, before opening | the daemon does not advertise `scopes/v1` | no |

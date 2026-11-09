@@ -38,12 +38,15 @@ fn maximal_federated_record_fits_scope_attribute_budget() {
         "p".repeat(256),
         "🛰".repeat(80),
     )
-    .with_remote_claim(Some(RemoteClaim::flow(
-        "f".repeat(256),
-        9_007_199_254_740_991,
-        "i".repeat(256),
-        "b".repeat(64),
-    )));
+    .with_remote_claim(Some(
+        RemoteClaim::flow(
+            "f".repeat(256),
+            9_007_199_254_740_991,
+            "i".repeat(256),
+            "b".repeat(64),
+        )
+        .with_flow_name("🛰".repeat(80)),
+    ));
     facts.validate().unwrap();
     let record = ScopeRecord::new("peer", 1, ScopeKind::Federated)
         .with_attributes(ScopeAttributes::new().with_federated(Some(facts)));
@@ -54,6 +57,7 @@ fn maximal_federated_record_fits_scope_attribute_budget() {
         ),
         ("record", serde_json::to_vec(&record).unwrap()),
     ] {
+        println!("maximal federated {label}: {} bytes", bytes.len());
         assert!(
             bytes.len() <= MAX_SCOPE_ATTRIBUTE_BYTES,
             "{label}: {} bytes exceeds {MAX_SCOPE_ATTRIBUTE_BYTES}",

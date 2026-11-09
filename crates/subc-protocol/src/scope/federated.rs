@@ -12,6 +12,8 @@ pub enum FederatedPeerClass {
 }
 
 /// Identity asserted by the paired stack, not a local agent identity.
+/// Optional names are display-only. Use [`RemoteClaim::same_identity`] to compare
+/// callers without treating a display rename as a change of identity.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 #[non_exhaustive]
@@ -22,7 +24,15 @@ pub enum RemoteClaim {
     /// let _ = RemoteClaim::Agent { agent_id: "agent".into() };
     /// ```
     #[non_exhaustive]
-    Agent { agent_id: String },
+    Agent {
+        agent_id: String,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_name",
+            skip_serializing_if = "Option::is_none"
+        )]
+        agent_name: Option<String>,
+    },
     /// Construct with [`RemoteClaim::worker`] so future fields can be added.
     /// ```compile_fail
     /// use subc_protocol::scope::RemoteClaim;
@@ -34,6 +44,13 @@ pub enum RemoteClaim {
         worker_ref: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on_behalf_of: Option<String>,
+        /// Display name of the agent identified by `on_behalf_of`, not the worker.
+        #[serde(
+            default,
+            deserialize_with = "deserialize_name",
+            skip_serializing_if = "Option::is_none"
+        )]
+        agent_name: Option<String>,
     },
     /// Construct with [`RemoteClaim::run`] so future fields can be added.
     /// ```compile_fail
@@ -41,7 +58,15 @@ pub enum RemoteClaim {
     /// let _ = RemoteClaim::Run { agent_id: "agent".into() };
     /// ```
     #[non_exhaustive]
-    Run { agent_id: String },
+    Run {
+        agent_id: String,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_name",
+            skip_serializing_if = "Option::is_none"
+        )]
+        agent_name: Option<String>,
+    },
     /// Construct with [`RemoteClaim::flow`] so future fields can be added.
     /// ```compile_fail
     /// use subc_protocol::scope::RemoteClaim;
@@ -53,13 +78,38 @@ pub enum RemoteClaim {
         flow_version: u64,
         flow_install_id: String,
         flow_code_hash: String,
+        #[serde(
+            default,
+            deserialize_with = "deserialize_name",
+            skip_serializing_if = "Option::is_none"
+        )]
+        flow_name: Option<String>,
     },
 }
 
 impl RemoteClaim {
+    /// Whether these claims identify the same caller. Compares every field except
+    /// the display names, so a field added later counts as identity unless it is
+    /// cleared here too. Ordinary equality remains structural.
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.without_names() == other.without_names()
+    }
+
+    fn without_names(&self) -> Self {
+        let mut claim = self.clone();
+        match &mut claim {
+            Self::Agent { agent_name, .. }
+            | Self::Run { agent_name, .. }
+            | Self::Worker { agent_name, .. } => *agent_name = None,
+            Self::Flow { flow_name, .. } => *flow_name = None,
+        }
+        claim
+    }
+
     pub fn agent(agent_id: impl Into<String>) -> Self {
         Self::Agent {
             agent_id: agent_id.into(),
+            agent_name: None,
         }
     }
 
@@ -72,12 +122,14 @@ impl RemoteClaim {
             owner_module_id: owner_module_id.into(),
             worker_ref: worker_ref.into(),
             on_behalf_of,
+            agent_name: None,
         }
     }
 
     pub fn run(agent_id: impl Into<String>) -> Self {
         Self::Run {
             agent_id: agent_id.into(),
+            agent_name: None,
         }
     }
 
@@ -92,20 +144,48 @@ impl RemoteClaim {
             flow_version,
             flow_install_id: flow_install_id.into(),
             flow_code_hash: flow_code_hash.into(),
+            flow_name: None,
         }
     }
 
-    /// Check canonical claim fields, including the shared opaque-token bounds.
+    /// Set the claimed agent's display name (or the worker's `on_behalf_of` agent).
+    /// Invalid names are dropped. Has no effect on flow claims.
+    #[must_use]
+    pub fn with_agent_name(mut self, name: impl Into<String>) -> Self {
+        match &mut self {
+            Self::Agent { agent_name, .. }
+            | Self::Run { agent_name, .. }
+            | Self::Worker { agent_name, .. } => *agent_name = valid_name(name.into()),
+            Self::Flow { .. } => {}
+        }
+        self
+    }
+
+    /// Set the flow's display name. Invalid names are dropped.
+    /// Has no effect on agent, run or worker claims.
+    #[must_use]
+    pub fn with_flow_name(mut self, name: impl Into<String>) -> Self {
+        if let Self::Flow { flow_name, .. } = &mut self {
+            *flow_name = valid_name(name.into());
+        }
+        self
+    }
+
+    /// Check identity fields, including the shared opaque-token bounds.
+    /// Display names never invalidate a claim; decoders drop invalid names.
     pub fn validate(&self) -> Result<(), String> {
         let token = |name, value: &str| {
             crate::tool_call::validate_opaque_field(name, value).map_err(|e| e.to_string())
         };
         match self {
-            Self::Agent { agent_id } | Self::Run { agent_id } => token("agent_id", agent_id),
+            Self::Agent { agent_id, .. } | Self::Run { agent_id, .. } => {
+                token("agent_id", agent_id)
+            }
             Self::Worker {
                 owner_module_id,
                 worker_ref,
                 on_behalf_of,
+                ..
             } => {
                 crate::manifest::validate_module_id(owner_module_id).map_err(|e| e.to_string())?;
                 hex("worker_ref", worker_ref, 64)?;
@@ -119,6 +199,7 @@ impl RemoteClaim {
                 flow_version,
                 flow_install_id,
                 flow_code_hash,
+                ..
             } => {
                 token("flow_id", flow_id)?;
                 super::validate_flow_version(*flow_version).map_err(str::to_string)?;
@@ -127,6 +208,19 @@ impl RemoteClaim {
             }
         }
     }
+}
+
+fn valid_name(name: String) -> Option<String> {
+    crate::manifest::validate_plain_text(&name, 80)
+        .ok()
+        .map(|()| name)
+}
+
+fn deserialize_name<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_str().and_then(|name| valid_name(name.to_owned())))
 }
 
 /// Facts from the local pairing roster. Fixed for the scope's epoch.
@@ -143,6 +237,18 @@ pub struct FederatedAttributes {
 }
 
 impl FederatedAttributes {
+    /// Compare the facts fixed for an epoch, ignoring only the remote claim's
+    /// display names. Every other field counts, including any added later;
+    /// `peer_name` is a fixed pairing-roster fact, not a display name here.
+    pub fn same_identity(&self, other: &Self) -> bool {
+        let without_names = |facts: &Self| {
+            let mut facts = facts.clone();
+            facts.remote_claim = facts.remote_claim.as_ref().map(RemoteClaim::without_names);
+            facts
+        };
+        without_names(self) == without_names(other)
+    }
+
     pub fn new(
         peer_class: FederatedPeerClass,
         peer_fingerprint: String,
@@ -206,24 +312,108 @@ mod tests {
     }
 
     #[test]
+    fn federated_claim_names_are_optional_lossy_display_only() {
+        for (claim, field) in [
+            (RemoteClaim::agent("agent"), "agent_name"),
+            (RemoteClaim::run("agent"), "agent_name"),
+            (
+                RemoteClaim::worker("mcp:module", "a".repeat(64), Some("agent".into())),
+                "agent_name",
+            ),
+            (
+                RemoteClaim::flow("flow", 1, "install", "a".repeat(64)),
+                "flow_name",
+            ),
+        ] {
+            let original = serde_json::to_value(&claim).unwrap();
+            assert!(original.get(field).is_none());
+            let built = if field == "flow_name" {
+                claim.clone().with_flow_name("Name")
+            } else {
+                claim.clone().with_agent_name("Name")
+            };
+            assert_eq!(serde_json::to_value(built).unwrap()[field], "Name");
+            let invalid_built = if field == "flow_name" {
+                claim.clone().with_flow_name("\n")
+            } else {
+                claim.clone().with_agent_name("\n")
+            };
+            assert_eq!(serde_json::to_value(invalid_built).unwrap(), original);
+            for name in ["Agent".to_string(), "é".repeat(80), "🦀".repeat(80)] {
+                let mut wire = original.clone();
+                wire[field] = json!(name);
+                let decoded: RemoteClaim = serde_json::from_value(wire.clone()).unwrap();
+                decoded.validate().unwrap();
+                assert_eq!(serde_json::to_value(&decoded).unwrap(), wire);
+                assert_ne!(
+                    decoded, claim,
+                    "structural equality must detect display changes"
+                );
+                assert!(decoded.same_identity(&claim));
+            }
+            for invalid in [
+                json!(""),
+                json!("x".repeat(81)),
+                json!("\n"),
+                json!("\u{007f}"),
+                json!("\u{0085}"),
+                json!("\u{061c}"),
+                json!("\u{202e}"),
+                json!("\u{2069}"),
+                json!(null),
+                json!(7),
+                json!({"name": "Agent"}),
+            ] {
+                let mut wire = original.clone();
+                wire[field] = invalid;
+                let decoded: RemoteClaim = serde_json::from_value(wire).unwrap();
+                decoded.validate().unwrap();
+                assert_eq!(serde_json::to_value(&decoded).unwrap(), original);
+                assert_eq!(decoded, claim);
+            }
+            for (key, value) in original.as_object().unwrap() {
+                if key == "kind" {
+                    continue;
+                }
+                let mut changed = original.clone();
+                changed[key] = if let Some(n) = value.as_u64() {
+                    json!(n + 1)
+                } else {
+                    json!(format!("other{}", value.as_str().unwrap()))
+                };
+                let changed: RemoteClaim = serde_json::from_value(changed).unwrap();
+                assert!(
+                    !claim.same_identity(&changed),
+                    "{key} must remain identity-bearing"
+                );
+            }
+        }
+        assert!(!RemoteClaim::agent("agent").same_identity(&RemoteClaim::run("agent")));
+    }
+
+    #[test]
     fn federated_claim_roundtrips_and_enforces_every_field_bound() {
         for claim in [
             RemoteClaim::Agent {
                 agent_id: "a".repeat(256),
+                agent_name: None,
             },
             RemoteClaim::Run {
                 agent_id: "a".repeat(256),
+                agent_name: None,
             },
             RemoteClaim::Worker {
                 owner_module_id: "mcp:module".into(),
                 worker_ref: "a".repeat(64),
                 on_behalf_of: Some("a".repeat(256)),
+                agent_name: None,
             },
             RemoteClaim::Flow {
                 flow_id: "a".repeat(256),
                 flow_version: 9_007_199_254_740_991,
                 flow_install_id: "b".repeat(256),
                 flow_code_hash: "f".repeat(64),
+                flow_name: None,
             },
         ] {
             claim.validate().unwrap();

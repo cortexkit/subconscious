@@ -479,7 +479,7 @@ dependencies = [
  "subc-control 0.38.1",
  "subc-daemon",
  "subc-jsonc",
- "subc-protocol 0.36.0",
+ "subc-protocol 0.36.1",
  "subc-transport",
  "syn 2.0.118",
  "tempfile",
@@ -501,7 +501,7 @@ dependencies = [
  "serde_json",
  "subc-client-rs",
  "subc-control 0.38.1",
- "subc-protocol 0.36.0",
+ "subc-protocol 0.36.1",
  "tempfile",
  "tokio",
 ]
@@ -525,7 +525,7 @@ dependencies = [
  "subc-control 0.38.1",
  "subc-jsonc",
  "subc-os",
- "subc-protocol 0.36.0",
+ "subc-protocol 0.36.1",
  "subc-transport",
  "tokio",
  "unicode-width 0.2.2",
@@ -679,7 +679,7 @@ dependencies = [
  "subc-client-rs",
  "subc-control 0.38.1",
  "subc-os",
- "subc-protocol 0.36.0",
+ "subc-protocol 0.36.1",
  "subc-transport",
  "tempfile",
  "tokio",
@@ -1741,7 +1741,7 @@ dependencies = [
  "subc-client-rs",
  "subc-jobobject",
  "subc-jsonc",
- "subc-protocol 0.36.0",
+ "subc-protocol 0.36.1",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2852,7 +2852,7 @@ dependencies = [
  "socket2",
  "subc-control 0.38.1",
  "subc-os",
- "subc-protocol 0.36.0",
+ "subc-protocol 0.36.1",
  "subc-transport",
  "syn 2.0.118",
  "tokio",
@@ -2877,7 +2877,7 @@ version = "0.38.1"
 dependencies = [
  "serde",
  "serde_json",
- "subc-protocol 0.36.0",
+ "subc-protocol 0.36.1",
 ]
 
 [[package]]
@@ -2908,7 +2908,7 @@ dependencies = [
  "subc-jsonc",
  "subc-os",
  "subc-presence",
- "subc-protocol 0.36.0",
+ "subc-protocol 0.36.1",
  "subc-transport",
  "tempfile",
  "terminal_size",
@@ -2920,7 +2920,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.44.2"
+version = "0.44.3"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -2943,7 +2943,7 @@ dependencies = [
  "subc-jsonc",
  "subc-os",
  "subc-presence",
- "subc-protocol 0.36.0",
+ "subc-protocol 0.36.1",
  "subc-transport",
  "subc-uptime",
  "subtle",
@@ -2959,7 +2959,7 @@ dependencies = [
  "cortexkit-test-support",
  "serde_json",
  "subc-daemon",
- "subc-protocol 0.36.0",
+ "subc-protocol 0.36.1",
  "subc-transport",
  "tokio",
 ]
@@ -2998,7 +2998,7 @@ dependencies = [
  "subc-daemon",
  "subc-jsonc",
  "subc-os",
- "subc-protocol 0.36.0",
+ "subc-protocol 0.36.1",
  "subc-transport",
  "tokio",
  "tracing",
@@ -3043,7 +3043,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.36.0"
+version = "0.36.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3061,7 +3061,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-os",
- "subc-protocol 0.36.0",
+ "subc-protocol 0.36.1",
  "subtle",
  "tokio",
 ]

@@ -10,6 +10,44 @@ struct Rig {
 }
 
 #[test]
+fn config_recovery_plan_does_not_validate_a_separate_pre_capture_read() {
+    let rig = Rig::new();
+    let owner = rig.owner("single-captured-daemon");
+    let path = rig.path.join("subc.jsonc");
+    std::fs::write(
+        &path,
+        br#"{"version":1,"modules":{},"port":"invalid-port"}"#,
+    )
+    .unwrap();
+    let captured = br#"{"version":1,"modules":{}}"#;
+    *owner.prepare_capture_hook.lock().unwrap() = Some(Box::new(move || {
+        std::fs::write(path, captured).unwrap();
+    }));
+    let prepared = owner
+        .prepare(PlanKind::Stamp)
+        .expect("only the captured daemon bytes are authoritative for the plan");
+    assert_eq!(
+        prepared.candidate.daemon.bytes.as_deref(),
+        Some(captured.as_slice())
+    );
+}
+
+#[test]
+fn config_recovery_plan_validates_the_exact_captured_daemon_bytes() {
+    let rig = Rig::new();
+    let owner = rig.owner("captured-daemon-validation");
+    let path = rig.path.join("subc.jsonc");
+    *owner.prepare_capture_hook.lock().unwrap() = Some(Box::new(move || {
+        std::fs::write(path, br#"{"version":1,"modules":{},"port":"invalid-port"}"#).unwrap();
+    }));
+    let error = owner
+        .prepare(PlanKind::Stamp)
+        .err()
+        .expect("an invalid captured daemon config must not produce a plan");
+    assert_eq!(error.code, "invalid_daemon_config");
+}
+
+#[test]
 fn config_recovery_get_keeps_only_active_memory_and_refuses_declare() {
     let rig = Rig::new();
     let raw = br#"{"credential":{"vault_ref":"approved"},"limit":2}"#;
@@ -227,7 +265,7 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     let candidate_nonce = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if let Some(nonce) = handle.candidate_launch_nonce_for_test("a") {
-                if handle.has_program_binding("a", &nonce)
+                if handle.has_live_verified_program_binding("a", &nonce)
                     && handle.wait_program_binding("a", &nonce).await
                 {
                     break nonce;
@@ -1141,6 +1179,9 @@ fn config_owner_recovery_refuses_changes_but_can_plan_and_commit_restamp() {
             1,
         )
         .unwrap();
+    assert!(owner.is_recovering());
+    assert_eq!(owner.status().unwrap().state, "store_unverified");
+    owner.complete_authority_exit(1).unwrap();
     assert_eq!(owner.status().unwrap().state, "stamped");
 }
 

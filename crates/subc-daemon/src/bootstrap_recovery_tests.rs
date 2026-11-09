@@ -226,6 +226,17 @@ impl crate::config_gate::ReviewAdmission for Admitted {
 
 fn adapt_control(mut handler: ControlHandler) -> ControlHandler {
     handler = handler.with_config_os_prompt_policy_for_tests();
+    handler = handler.with_recovery_exit_test_hook(|step| {
+        let root = PathBuf::from(std::env::var_os("RECOVERY_ROOT").unwrap());
+        if step == 1 && root.join("fail-exit-step").exists() {
+            std::fs::write(root.join("exit-step-completed"), b"1").unwrap();
+            return Err(crate::config_gate::GateError::new(
+                "rescan_failed",
+                "injected failure after first successful reconcile step",
+            ));
+        }
+        Ok(())
+    });
     let app = "test.desktop";
     handler = handler
         .with_test_operator_app_policy(crate::operator_apps::TestOperatorAppPolicy {
@@ -509,8 +520,17 @@ async fn config_recovery_spawned_defaults_and_os_unstamp_write_a_fresh_store() {
         assert_eq!(applied["generation"], 1, "{applied}");
         let status = rpc(&mut client, json!({"op":"config.status"})).await;
         assert_eq!(status["status"]["state"], "unstamped");
-        let modules = rpc(&mut client, json!({"op":"supervisor.list"})).await;
-        assert_eq!(modules["modules"][0]["live"], true, "{modules}");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let modules = rpc(&mut client, json!({"op":"supervisor.list"})).await;
+                if modules["modules"][0]["live"] == true {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("unstamp must automatically release the enabled held actor");
         let body: Value = serde_json::from_slice(&rig.retained().unwrap()).unwrap();
         assert_eq!(body["revision"], 2);
         assert_eq!(body["body"]["generations"].as_object().unwrap().len(), 1);
@@ -519,6 +539,118 @@ async fn config_recovery_spawned_defaults_and_os_unstamp_write_a_fresh_store() {
             .contains("Config files become authoritative again"));
         drop(daemon);
     }
+}
+
+#[cfg(feature = "dev-desktop-approval")]
+#[tokio::test]
+async fn config_recovery_spawned_unstamp_reconciles_changed_existing_actor_while_held() {
+    let _serial = DAEMONS.lock().await;
+    let rig = Rig::new(true);
+    let daemon = rig.start().await;
+    let mut client = rig.local().await;
+    assert_eq!(apply(&mut client, "config.stamp").await["generation"], 1);
+    let path = rig.dir.join("subc.jsonc");
+    let mut doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    doc["modules"]["held-fixture"]["args"] = json!(["3599"]);
+    std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    rig.reject_store(false);
+    assert_eq!(
+        rpc(&mut client, json!({"op":"config.status"})).await["status"]["state"],
+        "store_unverified"
+    );
+    let applied = apply(&mut client, "config.unstamp").await;
+    assert_eq!(applied["generation"], 1, "{applied}");
+    assert_eq!(
+        rpc(&mut client, json!({"op":"config.status"})).await["status"]["state"],
+        "unstamped"
+    );
+    drop(daemon);
+}
+
+#[cfg(feature = "dev-desktop-approval")]
+#[tokio::test]
+async fn config_recovery_spawned_partial_exit_failure_keeps_the_hold_and_retries() {
+    let _serial = DAEMONS.lock().await;
+    let rig = Rig::new(true);
+    rig.seed();
+    rig.reject_store(false);
+    std::fs::write(rig.dir.join("fail-exit-step"), b"fail").unwrap();
+    let daemon = rig.start().await;
+    let mut client = rig.local().await;
+    let applied = apply(&mut client, "config.stamp").await;
+    assert_eq!(applied["code"], "rescan_failed", "{applied}");
+    assert!(
+        rig.dir.join("exit-step-completed").exists(),
+        "the injected error must follow a successful supervision step"
+    );
+    let modules = rpc(&mut client, json!({"op":"supervisor.list"})).await;
+    assert_eq!(modules["modules"].as_array().unwrap().len(), 1, "{modules}");
+    assert_eq!(
+        rpc(&mut client, json!({"op":"config.plan"})).await["code"],
+        "config_gated"
+    );
+    assert_eq!(
+        modules["modules"][0]["live"], false,
+        "a partially reconciled exit must not start modules"
+    );
+    let status = rpc(&mut client, json!({"op":"config.status"})).await;
+    assert_eq!(status["status"]["state"], "store_unverified", "{status}");
+    std::fs::remove_file(rig.dir.join("fail-exit-step")).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = rpc(&mut client, json!({"op":"config.status"})).await;
+            if status["status"]["state"] == "stamped" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the retained exit marker must be retried without another approval");
+    let modules = rpc(&mut client, json!({"op":"supervisor.list"})).await;
+    assert_eq!(modules["modules"].as_array().unwrap().len(), 2, "{modules}");
+    drop(daemon);
+}
+
+#[cfg(feature = "dev-desktop-approval")]
+#[tokio::test]
+async fn config_recovery_spawned_stamped_exit_installs_reserved_capabilities_before_hello() {
+    let _serial = DAEMONS.lock().await;
+    let rig = Rig::new(true);
+    let path = rig.dir.join("subc.jsonc");
+    let mut doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    doc["reserved_capabilities"] = json!({"recovery-test/v1":"reserved-fixture"});
+    std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    rig.seed();
+    rig.reject_store(false);
+    let daemon = rig.start().await;
+    let mut client = rig.local().await;
+    let applied = apply(&mut client, "config.stamp").await;
+    assert_eq!(applied["generation"], 1, "{applied}");
+    let mut claimant = rig.tcp().await;
+    let mut manifest =
+        subc_protocol::manifest::ModuleManifest::builder("unconfigured-claimant", "1.0.0").build();
+    manifest.capabilities = Some(subc_protocol::manifest::CapabilityDeclarations {
+        provides: vec!["recovery-test/v1".into()],
+        requires: vec![],
+        must_never_reach: vec![],
+    });
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest,
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: None,
+    };
+    send(
+        &mut claimant,
+        FrameType::Hello,
+        79,
+        serde_json::to_value(hello).unwrap(),
+    )
+    .await;
+    let refused: Value = serde_json::from_slice(&receive(&mut claimant).await.body).unwrap();
+    assert_eq!(refused["code"], "reserved_capability", "{refused}");
+    drop(daemon);
 }
 
 #[cfg(feature = "dev-desktop-approval")]

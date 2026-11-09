@@ -2,6 +2,12 @@
 
 ## 0.41.10
 
+- Keep committed recovery exits held and retryable until all supervision,
+  capability-reservation and activity configuration succeeds. Validate the exact
+  captured daemon document and inherit loaded/default bootstrap fields whole.
+  Retain bounded negative binding records after child exit so neither normal
+  HELLO nor recovery can mistake a dead nonce for an unbound legacy launch.
+
 - Keep missing or unverified configuration stores in recovery: bind the control
   plane from built-in defaults, hold all future supervised launches and retries,
   admit only already-bound supervised launch nonces, and refuse other control

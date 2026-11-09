@@ -7,6 +7,7 @@ use crate::supervise::ModuleSpec;
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct AdmissionCache {
     state: StoreState,
+    file_authoritative: bool,
     modules: BTreeMap<String, ModuleAdmission>,
     fenced: BTreeSet<String>,
 }
@@ -76,6 +77,7 @@ impl AdmissionCache {
         let (state, body) = store.loaded_admission_state();
         let mut cache = Self {
             state,
+            file_authoritative: state == StoreState::Unstamped,
             modules: BTreeMap::new(),
             fenced: BTreeSet::new(),
         };
@@ -228,6 +230,20 @@ impl SpawnAdmission {
 }
 
 impl RuntimeOwner {
+    /// A committed unstamp permits its definition reconciliation while the
+    /// separate recovery admission hold still prevents every child spawn.
+    pub(crate) fn file_configuration_is_gated(&self, module: &str) -> bool {
+        self.admission
+            .read()
+            .map(|cache| {
+                !cache.file_authoritative
+                    && match cache.state {
+                        StoreState::Stamped => cache.modules.contains_key(module),
+                        _ => true,
+                    }
+            })
+            .unwrap_or(true)
+    }
     pub(crate) fn module_is_gated(&self, module: &str) -> bool {
         self.admission
             .read()

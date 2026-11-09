@@ -1,7 +1,19 @@
 use super::*;
 
-pub(super) type ProgramBindings = Arc<Mutex<HashMap<(String, String), ProgramBindingEntry>>>;
+#[derive(Debug, Default)]
+pub(super) struct ProgramBindingRecords {
+    active: HashMap<(String, String), ProgramBindingEntry>,
+    retired: HashMap<String, ProgramBindingEntry>,
+    configured: HashSet<String>,
+}
+type ProgramBindingTable = Mutex<ProgramBindingRecords>;
+pub(super) type ProgramBindings = Arc<ProgramBindingTable>;
 
+// A negative record must survive child death: no record means an ungated legacy
+// launch, so erasing it would let the dead child's nonce bypass image checks.
+// Keep one retired record per module until its next spawn or removal. During
+// swap warm-up, the running child and its replacement keep separate active bindings.
+// Configured-owner metadata survives unstamp so a later exit still records refusal.
 #[derive(Clone, Debug)]
 pub(super) struct ProgramBindingEntry {
     receiver: tokio::sync::watch::Receiver<Option<bool>>,
@@ -12,9 +24,33 @@ pub(super) struct ProgramBindingEntry {
 pub(super) struct ProgramBindingPublication {
     signal: Arc<tokio::sync::watch::Sender<Option<bool>>>,
     live: Arc<Mutex<std::sync::Weak<content_binding::LiveProgramBinding>>>,
+    bindings: std::sync::Weak<ProgramBindingTable>,
+    key: (String, String),
 }
 
 impl ProgramBindingPublication {
+    pub(super) fn retire(&self) {
+        self.signal.send_replace(Some(false));
+        if let Some(bindings) = self.bindings.upgrade() {
+            let mut bindings = bindings
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if bindings.active.get(&self.key).map_or_else(
+                || bindings.configured.contains(&self.key.0),
+                |entry| Arc::ptr_eq(&entry.live, &self.live),
+            ) {
+                bindings.active.remove(&self.key);
+                let (_, receiver) = tokio::sync::watch::channel(Some(false));
+                bindings.retired.insert(
+                    self.key.0.clone(),
+                    ProgramBindingEntry {
+                        receiver,
+                        live: Arc::new(Mutex::new(std::sync::Weak::new())),
+                    },
+                );
+            }
+        }
+    }
     pub(super) fn verify(&self) -> Result<(), crate::config_gate::GateError> {
         let result = self
             .live
@@ -47,7 +83,7 @@ mod tests;
 impl Drop for ProgramBindingPublication {
     fn drop(&mut self) {
         if Arc::strong_count(&self.signal) == 1 {
-            self.signal.send_replace(Some(false));
+            self.retire();
         }
     }
 }
@@ -62,9 +98,10 @@ impl SupervisorHandle {
         owner.install_binding_retirement(key, move || {
             if let Some(bindings) = bindings.upgrade() {
                 let retired = std::mem::take(
-                    &mut *bindings
+                    &mut bindings
                         .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .active,
                 );
                 #[cfg(windows)]
                 for entry in retired.values() {
@@ -92,6 +129,7 @@ impl SupervisorHandle {
             .ok()
             .and_then(|bindings| {
                 bindings
+                    .active
                     .get(&(module.to_owned(), nonce.to_owned()))
                     .cloned()
             })
@@ -100,8 +138,35 @@ impl SupervisorHandle {
             live.hello_accepted();
         }
     }
-    pub(crate) fn has_program_binding(&self, module: &str, nonce: &str) -> bool {
-        self.program_binding(module, nonce).is_some()
+    pub(crate) fn has_program_binding_record(&self, module: &str) -> bool {
+        self.program_bindings
+            .lock()
+            .map(|records| {
+                records.retired.contains_key(module)
+                    || records.active.keys().any(|(owner, _)| owner == module)
+            })
+            .unwrap_or(true)
+    }
+    pub(crate) fn has_live_verified_program_binding(&self, module: &str, nonce: &str) -> bool {
+        self.program_bindings
+            .lock()
+            .ok()
+            .and_then(|records| {
+                records
+                    .active
+                    .get(&(module.to_owned(), nonce.to_owned()))
+                    .map(|entry| *entry.receiver.borrow() == Some(true))
+            })
+            .unwrap_or(false)
+    }
+    pub(super) fn remove_program_binding_records(&self, module: &str) {
+        let mut records = self
+            .program_bindings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        records.active.retain(|(owner, _), _| owner != module);
+        records.retired.remove(module);
+        records.configured.remove(module);
     }
     pub(crate) fn check_current_program_binding(
         &self,
@@ -118,6 +183,7 @@ impl SupervisorHandle {
             .program_bindings
             .lock()
             .map_err(|_| refused())?
+            .active
             .get(&(module.to_owned(), nonce.to_owned()))
             .cloned()
             .ok_or_else(refused)?;
@@ -143,12 +209,10 @@ impl SupervisorHandle {
                 "review requires the current admitted supervised child",
             )
         };
-        if !self.spawned_consumer_authorized(module, nonce)
-            || !self.program_binding_verified(module, nonce)
-        {
+        if !self.spawned_consumer_authorized(module, nonce) {
             return Err(refused());
         }
-        if self.has_program_binding(module, nonce) {
+        if self.has_program_binding_record(module) {
             self.check_current_program_binding(module, nonce)?;
         }
         let child = self.get(module).ok_or_else(refused)?;
@@ -209,12 +273,15 @@ impl SupervisorHandle {
         }?;
         let (sender, receiver) = tokio::sync::watch::channel(None);
         let mut bindings = self.program_bindings.lock().ok()?;
+        bindings.configured.insert(module.to_owned());
+        bindings.retired.remove(module);
         if role == SpawnRole::Plain {
-            bindings.retain(|(owner, _), _| owner != module);
+            bindings.active.retain(|(owner, _), _| owner != module);
         }
         let live = Arc::new(Mutex::new(std::sync::Weak::new()));
-        bindings.insert(
-            (module.to_owned(), nonce),
+        let key = (module.to_owned(), nonce);
+        bindings.active.insert(
+            key.clone(),
             ProgramBindingEntry {
                 receiver,
                 live: live.clone(),
@@ -223,6 +290,8 @@ impl SupervisorHandle {
         Some(ProgramBindingPublication {
             signal: Arc::new(sender),
             live,
+            bindings: Arc::downgrade(&self.program_bindings),
+            key,
         })
     }
 
@@ -231,10 +300,11 @@ impl SupervisorHandle {
         module: &str,
         nonce: &str,
     ) -> Option<tokio::sync::watch::Receiver<Option<bool>>> {
-        self.program_bindings
-            .lock()
-            .ok()?
+        let records = self.program_bindings.lock().ok()?;
+        records
+            .active
             .get(&(module.to_owned(), nonce.to_owned()))
+            .or_else(|| records.retired.get(module))
             .map(|entry| entry.receiver.clone())
     }
 
@@ -250,10 +320,5 @@ impl SupervisorHandle {
                 return false;
             }
         }
-    }
-
-    pub(crate) fn program_binding_verified(&self, module: &str, nonce: &str) -> bool {
-        self.program_binding(module, nonce)
-            .is_none_or(|binding| *binding.borrow() == Some(true))
     }
 }

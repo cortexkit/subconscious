@@ -450,6 +450,11 @@ impl SupervisedChild {
     }
 
     async fn finish_exit(&mut self, carry: bool) -> io::Result<()> {
+        // Revoke HELLO authority as soon as exit is observed, before any
+        // container cleanup awaits. A retained nonce cannot revive this child.
+        if let Some(binding) = self._program_binding.take() {
+            binding.retire();
+        }
         if self.child.container().is_some() {
             if !carry {
                 self.child.terminate_container().await;
@@ -2937,6 +2942,7 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(module_id);
+        self.remove_program_binding_records(module_id);
         removed
     }
 
@@ -8754,7 +8760,7 @@ async fn handle_supervisor_command(
             if runtime
                 .config_delivery
                 .as_ref()
-                .is_some_and(|delivery| delivery.0.module_is_gated(&spec.module_id))
+                .is_some_and(|delivery| delivery.0.file_configuration_is_gated(&spec.module_id))
             {
                 let _ = reply.send(Err(SuperviseError::ConfigHeld {
                     module_id: spec.module_id.clone(),

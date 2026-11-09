@@ -56,5 +56,27 @@ async fn config_admission_post_exec_unattached_binding_never_publishes_ready() {
     );
     assert!(registry.get_module("binding-probe").unwrap().is_none());
     drop(publication);
-    assert!(!handle.program_binding_verified("binding-probe", "nonce"));
+    assert!(!handle.has_live_verified_program_binding("binding-probe", "nonce"));
+}
+
+#[test]
+fn config_recovery_binding_tombstones_are_bounded_and_replaced_by_spawn() {
+    let handle = SupervisorHandle::new();
+    for index in 0..4 {
+        let nonce = format!("retired-{index}");
+        handle.set_spawn_nonce("bounded", nonce.clone());
+        let publication = handle
+            .begin_program_binding("bounded", SpawnRole::Plain)
+            .unwrap();
+        assert!(handle.program_bindings.lock().unwrap().retired.is_empty());
+        drop(publication);
+        let records = handle.program_bindings.lock().unwrap();
+        assert!(records.active.is_empty());
+        assert_eq!(records.retired.len(), 1);
+        drop(records);
+        assert!(handle.has_program_binding_record("bounded"));
+        assert!(!handle.has_live_verified_program_binding("bounded", &nonce));
+    }
+    handle.retire("bounded");
+    assert!(!handle.has_program_binding_record("bounded"));
 }

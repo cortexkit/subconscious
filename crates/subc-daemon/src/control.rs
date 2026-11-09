@@ -451,6 +451,8 @@ pub struct ControlHandler {
     pub(crate) app_open_test_platform: Option<crate::operator_apps::AppOpenPlatform>,
     #[cfg(test)]
     pub(crate) app_open_test_launch: Option<fn() -> Result<u32, crate::app_open::AppOpenRefusal>>,
+    #[cfg(test)]
+    recovery_exit_test_after_step: Option<fn(usize) -> Result<(), crate::config_gate::GateError>>,
     /// Test-only Windows signature and flash hooks. Production builds carry
     /// neither: with the publisher unset, the production table never reaches
     /// verification, and the default attention hook only logs.
@@ -1072,6 +1074,8 @@ impl ControlHandler {
             app_open_test_platform: None,
             #[cfg(test)]
             app_open_test_launch: None,
+            #[cfg(test)]
+            recovery_exit_test_after_step: None,
             #[cfg(windows)]
             windows_verify: None,
             #[cfg(windows)]
@@ -2602,7 +2606,9 @@ impl ControlHandler {
                     .and_then(|value| value.as_str())
                     .is_some_and(|nonce| {
                         self.supervisor.spawned_consumer_authorized(module, nonce)
-                            && self.supervisor.has_program_binding(module, nonce)
+                            && self
+                                .supervisor
+                                .has_live_verified_program_binding(module, nonce)
                     })
             {
                 return Ok(vec![control_error_frame(
@@ -2624,7 +2630,7 @@ impl ControlHandler {
                         .and_then(|value| value.as_str())
                         .is_some_and(|nonce| {
                             self.supervisor.spawned_consumer_authorized(module, nonce)
-                                && self.supervisor.has_program_binding(module, nonce)
+                                && self.supervisor.has_program_binding_record(module)
                         }))
             {
                 return Ok(vec![control_error_frame(
@@ -2643,7 +2649,7 @@ impl ControlHandler {
                 .get("launch_nonce")
                 .and_then(|value| value.as_str()),
         ) {
-            let binding = self.supervisor.has_program_binding(module, nonce);
+            let binding = self.supervisor.has_program_binding_record(module);
             let required = self
                 .config_runtime
                 .as_ref()
@@ -2807,10 +2813,17 @@ impl ControlHandler {
             .config_runtime
             .as_ref()
             .is_some_and(|owner| owner.is_recovering());
+        // Both entry paths (handle_control -> handle_hello and
+        // handle_control_frame_timed -> spawn_blocking) enter this same
+        // handle_hello_checked function. Its fresh, fail-closed store check
+        // precedes parsing and this publication-gate check; this cached read
+        // also observes any recovery transition published during that work.
         if recovering
             && !hello.launch_nonce.as_deref().is_some_and(|nonce| {
                 self.supervisor.spawned_consumer_authorized(module, nonce)
-                    && self.supervisor.has_program_binding(module, nonce)
+                    && self
+                        .supervisor
+                        .has_live_verified_program_binding(module, nonce)
             })
         {
             return Ok(vec![control_error_frame(
@@ -2827,7 +2840,7 @@ impl ControlHandler {
                 .is_some_and(|owner| owner.check_module_hold(module).is_err())
                 || !hello.launch_nonce.as_deref().is_some_and(|nonce| {
                     self.supervisor.spawned_consumer_authorized(module, nonce)
-                        && self.supervisor.has_program_binding(module, nonce)
+                        && self.supervisor.has_program_binding_record(module)
                 }))
         {
             return Ok(vec![control_error_frame(
@@ -2839,7 +2852,7 @@ impl ControlHandler {
         if let Some(nonce) = hello.launch_nonce.as_deref() {
             if required
                 || (self.config_runtime.is_none()
-                    && self.supervisor.has_program_binding(module, nonce))
+                    && self.supervisor.has_program_binding_record(module))
             {
                 if let Err(error) = self.supervisor.check_current_program_binding(module, nonce) {
                     let code = if error.code == "program_refused" {

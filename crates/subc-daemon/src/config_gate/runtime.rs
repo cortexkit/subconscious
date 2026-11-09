@@ -60,6 +60,8 @@ pub struct RuntimeOwner {
     begin_approval_completions: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     desktop_receipt_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    prepare_capture_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(all(test, unix))]
     approval_claim_pause: Mutex<Option<ApprovalClaimPause>>,
 }
@@ -676,6 +678,8 @@ impl RuntimeOwner {
             begin_approval_completions: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             desktop_receipt_hook: Mutex::new(None),
+            #[cfg(test)]
+            prepare_capture_hook: Mutex::new(None),
             #[cfg(all(test, unix))]
             approval_claim_pause: Mutex::new(None),
         }
@@ -1071,20 +1075,9 @@ impl RuntimeOwner {
             &mut state,
             matches!(kind, PlanKind::Stamp | PlanKind::Unstamp),
         )?;
-        if matches!(kind, PlanKind::Stamp | PlanKind::Unstamp) {
-            crate::daemon_config::load_with_activity(&self.capturer.daemon_path)
-                .map_err(|error| {
-                    GateError::new(
-                        "invalid_daemon_config",
-                        format!("supervisor rescan rejected daemon config: {error}"),
-                    )
-                })?
-                .ok_or_else(|| {
-                    GateError::new(
-                        "invalid_daemon_config",
-                        "subc.jsonc is absent; refusing to rescan",
-                    )
-                })?;
+        #[cfg(test)]
+        if let Some(hook) = self.prepare_capture_hook.lock().unwrap().take() {
+            hook();
         }
         let observed = self.capture(&mut state)?;
         if observed.daemon.bytes.is_none() {
@@ -1093,7 +1086,7 @@ impl RuntimeOwner {
                 "subc.jsonc is absent; refusing to rescan",
             ));
         }
-        if state.store.status().state == StoreState::Stamped {
+        if !state.recovery_exit_hold && state.store.status().state == StoreState::Stamped {
             state.store.observe(observed.diagnostic.to_store()?)?;
         }
         let rollback = if let PlanKind::Rollback(id) = kind {
@@ -1648,6 +1641,7 @@ impl RuntimeOwner {
         state.retry_anchor(true);
         let verified = state.store.check().is_ok();
         if verified
+            && !state.recovery_exit_hold
             && !state.store.status().anchor_pending
             && state.store.status().state == StoreState::Stamped
         {
@@ -1663,6 +1657,12 @@ impl RuntimeOwner {
             StoreState::StoreUnverified => "store_unverified",
         }
         .into();
+        if state.recovery_exit_hold {
+            status.state = "store_unverified".into();
+            status
+                .warnings
+                .push("approved recovery exit is waiting for reconciliation".into());
+        }
         status.integrity = match store_status.integrity {
             crate::config_store::IntegrityMode::DigestOnly => "digest_only",
             crate::config_store::IntegrityMode::Sealed => "sealed",
@@ -1671,7 +1671,7 @@ impl RuntimeOwner {
         status.revision = store_status.revision;
         status.base_revision = store_status.base_revision;
         status.anchor_pending = store_status.anchor_pending;
-        status.warnings = store_status.warnings;
+        status.warnings.extend(store_status.warnings);
         if cfg!(feature = "dev-desktop-approval") {
             status
                 .development_switches

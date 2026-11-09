@@ -359,14 +359,16 @@ impl ConfigCapturer {
         selected: Option<&BTreeSet<String>>,
         mut layer_file: impl FnMut(&Path) -> Result<CapturedFile>,
     ) -> Result<CapturedConfiguration> {
-        let doc = daemon.parse()?;
+        let invalid_daemon =
+            || GateError::new("invalid_daemon_config", "captured subc.jsonc is invalid");
+        let doc = daemon.parse().map_err(|_| invalid_daemon())?;
         let mut launch_specs = BTreeMap::new();
         if let Some(bytes) = &daemon.bytes {
             let (config, _) = crate::daemon_config::parse_with_activity(
-                std::str::from_utf8(bytes).map_err(capture_error)?,
+                std::str::from_utf8(bytes).map_err(|_| invalid_daemon())?,
                 &self.daemon_path,
             )
-            .map_err(capture_error)?;
+            .map_err(|_| invalid_daemon())?;
             launch_specs.extend(
                 config
                     .modules

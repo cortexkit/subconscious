@@ -1,6 +1,14 @@
 use super::*;
 
 impl ControlHandler {
+    #[cfg(all(test, feature = "test-support", unix))]
+    pub(crate) fn with_recovery_exit_test_hook(
+        mut self,
+        hook: fn(usize) -> std::result::Result<(), GateError>,
+    ) -> Self {
+        self.recovery_exit_test_after_step = Some(hook);
+        self
+    }
     pub(in crate::control) async fn recovery_request_refusal(
         &self,
         ctx: &RouteCtx,
@@ -68,19 +76,21 @@ impl ControlHandler {
             self.supervisor
                 .apply_identity_configuration(&module.module_spec());
         }
-        config_work(owner, move |owner| {
-            owner.complete_authority_exit(generation)
-        })
-        .await?;
         let configured = config
             .modules
             .iter()
             .map(|module| (module.module_id.clone(), module.enabled))
             .collect::<Vec<_>>();
+        self.capability_evaluator
+            .configure(configured, config.reserved_capabilities);
+        self.configure_activity(activity)
+            .await
+            .map_err(|error| GateError::new("activity_config_failed", error))?;
         if stamped {
-            // Existing actors consume approved transitions through delivery;
-            // daemon-level settings remain inactive until the next start.
-            for module in config.modules {
+            // Existing module processes receive approved configuration changes
+            // through the configuration-delivery worker, not file rescans.
+            // Listener changes remain inactive until the next daemon start.
+            for (index, module) in config.modules.into_iter().enumerate() {
                 if self.supervisor.get(&module.module_id).is_none() {
                     context
                         .supervisor
@@ -96,6 +106,12 @@ impl ControlHandler {
                         .await
                         .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
                 }
+                #[cfg(test)]
+                if let Some(hook) = self.recovery_exit_test_after_step {
+                    hook(index + 1)?;
+                }
+                #[cfg(not(test))]
+                let _ = index;
             }
         } else {
             self.reconcile_supervised_modules(
@@ -106,11 +122,15 @@ impl ControlHandler {
             )
             .await
             .map_err(|error| GateError::new("rescan_failed", error))?;
-            self.capability_evaluator
-                .configure(configured, config.reserved_capabilities);
-            let _ = self.configure_activity(activity).await;
         }
         self.refresh_capability_requirements();
+        // complete_authority_exit releases admission and clears the pending
+        // recovery-exit marker. Earlier failure leaves both the hold and marker
+        // intact for the configuration-delivery coordinator to retry.
+        config_work(owner, move |owner| {
+            owner.complete_authority_exit(generation)
+        })
+        .await?;
         Ok(())
     }
 }

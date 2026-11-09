@@ -126,6 +126,10 @@ pub struct BootstrapConfig {
     /// embedded daemon with no explicit root never opens an installation store.
     config_store_root: Option<PathBuf>,
     defer_file_load: bool,
+    // Test-only stand-in for an additional field supplied by the file loader.
+    // Authority selection must carry it without knowing its name.
+    #[cfg(test)]
+    file_derived_test_probe: Option<Vec<String>>,
     #[cfg(all(test, feature = "test-support"))]
     test_store_factory:
         Option<fn(crate::config_store::StoreRoot) -> crate::config_store::ConfigStore>,
@@ -224,6 +228,8 @@ impl BootstrapConfig {
             daemon_config_path: None,
             config_store_root: None,
             defer_file_load: false,
+            #[cfg(test)]
+            file_derived_test_probe: None,
             #[cfg(all(test, feature = "test-support"))]
             test_store_factory: None,
             #[cfg(all(test, feature = "test-support"))]
@@ -421,7 +427,7 @@ impl BootstrapConfig {
 
         let (connection_file_path, connection_file_source) =
             connection_file_path_with_source(non_empty_os_var("XDG_RUNTIME_DIR"));
-        Ok(Self::new(connection_file_path, port)
+        let config = Self::new(connection_file_path, port)
             .with_configured_modules(configured_modules)
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
@@ -431,7 +437,14 @@ impl BootstrapConfig {
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
             .with_reserved_capabilities(reserved_capabilities)
             .with_daemon_config_source(daemon_config_path, config_port)
-            .with_connection_file_source(connection_file_source))
+            .with_connection_file_source(connection_file_source);
+        #[cfg(test)]
+        let config = {
+            let mut config = config;
+            config.file_derived_test_probe = Some(config.scope_authority_owners.clone());
+            config
+        };
+        Ok(config)
     }
 
     pub fn with_daemon_config_path(
@@ -780,7 +793,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
 // Keep authority selection before binding listeners or constructing control
 // authorization. Recovery must remain reachable even with invalid live files.
 fn load_bootstrap_authority(
-    mut config: BootstrapConfig,
+    config: BootstrapConfig,
     store: Option<&mut crate::config_store::ConfigStore>,
 ) -> Result<BootstrapConfig, BootstrapError> {
     let recovery = store.is_some_and(|store| {
@@ -790,37 +803,52 @@ fn load_bootstrap_authority(
                 | crate::config_store::StoreState::StoreMissing
         )
     });
-    if recovery {
-        config.port = DEFAULT_SUBC_PORT;
-        config.configured_port = None;
-        config.configured_modules.clear();
-        config.storage_config = None;
-        config.admission_facts = AdmissionFactsConfig::default();
-        config.scope_authority_owners = daemon_config::default_scope_authority_owners();
-        config.privileged_operator_prompt = daemon_config::PrivilegedOperatorPrompt::default();
-        config.activity_config = daemon_config::ActivityConfig::default();
-        config.route_bind_relay_default_ms = None;
-        config.reserved_capabilities.clear();
-        config.watchdog_config = DaemonSelfWatchdogConfig::default();
+    let authority = if recovery {
+        BootstrapConfig::new(&config.connection_file_path, DEFAULT_SUBC_PORT)
     } else if config.defer_file_load {
-        let loaded = BootstrapConfig::from_env_with_daemon_config_path(
+        BootstrapConfig::from_env_with_daemon_config_path(
             config
                 .daemon_config_path
                 .as_ref()
                 .expect("binary config path"),
-        )?;
-        config.port = loaded.port;
-        config.configured_port = loaded.configured_port;
-        config.configured_modules = loaded.configured_modules;
-        config.storage_config = loaded.storage_config;
-        config.admission_facts = loaded.admission_facts;
-        config.scope_authority_owners = loaded.scope_authority_owners;
-        config.privileged_operator_prompt = loaded.privileged_operator_prompt;
-        config.activity_config = loaded.activity_config;
-        config.route_bind_relay_default_ms = loaded.route_bind_relay_default_ms;
-        config.reserved_capabilities = loaded.reserved_capabilities;
-    }
-    Ok(config)
+        )?
+    } else {
+        return Ok(config);
+    };
+    // Only installation paths and explicit binary arguments override authority.
+    // New file-derived fields are inherited whole from the selected authority.
+    Ok(BootstrapConfig {
+        connection_file_path: config.connection_file_path,
+        connection_file_source: config.connection_file_source,
+        daemon_ver: config.daemon_ver,
+        daemon_config_path: config.daemon_config_path,
+        config_store_root: config.config_store_root,
+        defer_file_load: config.defer_file_load,
+        operator_queue_wait: config.operator_queue_wait,
+        operator_timeout: config.operator_timeout,
+        operator_stuck_grace: config.operator_stuck_grace,
+        watchdog_config: config.watchdog_config,
+        cgroup_placement: config.cgroup_placement,
+        capture_logs_dir: config.capture_logs_dir,
+        terminal_journal_path: config.terminal_journal_path,
+        machine_id_path: config.machine_id_path,
+        local_listener: config.local_listener,
+        live_children_path: config.live_children_path,
+        privacy_trampoline: config.privacy_trampoline,
+        #[cfg(feature = "test-support")]
+        shutdown_intent_window: config.shutdown_intent_window,
+        #[cfg(feature = "test-support")]
+        operator_script: config.operator_script,
+        #[cfg(feature = "test-support")]
+        operator_events: config.operator_events,
+        #[cfg(all(test, windows))]
+        profile_override: config.profile_override,
+        #[cfg(all(test, feature = "test-support"))]
+        test_store_factory: config.test_store_factory,
+        #[cfg(all(test, feature = "test-support"))]
+        test_control: config.test_control,
+        ..authority
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -2308,6 +2336,33 @@ mod tests {
     }
 
     #[test]
+    fn config_recovery_bootstrap_preserves_all_loaded_fields_and_only_argument_overrides() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let scratch = unique_temp_dir("bootstrap-loaded-fields");
+        let file = scratch.join("subc.jsonc");
+        std::fs::write(
+            &file,
+            br#"{"version":1,"modules":{},"scope_authority_owners":["file-owner"]}"#,
+        )
+        .unwrap();
+        let mut config = BootstrapConfig::new(scratch.join("connection.json"), 0)
+            .with_daemon_config_source(file.clone(), None);
+        config.defer_file_load = true;
+        config.operator_timeout = Duration::from_secs(7);
+        let selected = load_bootstrap_authority(config, None).unwrap();
+        assert_eq!(
+            selected.file_derived_test_probe,
+            Some(vec!["file-owner".into()])
+        );
+        assert_eq!(selected.operator_timeout, Duration::from_secs(7));
+        assert_eq!(selected.daemon_config_path, Some(file));
+        assert_eq!(
+            selected.connection_file_path,
+            scratch.join("connection.json")
+        );
+    }
+
+    #[test]
     fn config_recovery_bootstrap_ignores_invalid_live_file_and_poisoned_settings() {
         let scratch = unique_temp_dir("recovery-bootstrap");
         let root = scratch.join("store");
@@ -2331,7 +2386,9 @@ mod tests {
             .with_scope_authority_owners(vec!["untrusted".into()])
             .with_reserved_capabilities(BTreeMap::from([("untrusted".into(), "untrusted".into())]));
         config.defer_file_load = true;
+        config.file_derived_test_probe = Some(vec!["untrusted".into()]);
         let config = load_bootstrap_authority(config, Some(&mut store)).unwrap();
+        assert_eq!(config.file_derived_test_probe, None);
         assert_eq!(config.port, DEFAULT_SUBC_PORT);
         assert!(config.configured_modules.is_empty());
         assert_eq!(

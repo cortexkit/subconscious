@@ -792,13 +792,13 @@ async fn config_admission_swap_cutover_does_not_park_stop_behind_owner_publicati
         let module = module.clone();
         tokio::spawn(async move { module.swap(Some(Duration::from_secs(5))).await })
     };
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let candidate_nonce = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Some(nonce) = handle.candidate_launch_nonce_for_test("a") {
-                if handle.has_program_binding("a", &nonce)
+                if handle.has_live_verified_program_binding("a", &nonce)
                     && handle.wait_program_binding("a", &nonce).await
                 {
-                    break;
+                    break nonce;
                 }
             }
             tokio::task::yield_now().await;
@@ -870,6 +870,48 @@ async fn config_admission_swap_cutover_does_not_park_stop_behind_owner_publicati
         stopped.is_ok(),
         "the module gate parked stop behind blocking owner publication"
     );
+    assert!(handle.has_program_binding_record("a"));
+    assert!(!handle.has_live_verified_program_binding("a", &candidate_nonce));
+    let handler = crate::ControlHandler::new(registry.clone())
+        .with_supervisor(handle)
+        .with_config_runtime(owner.clone());
+    for recovery in [false, true] {
+        if recovery {
+            std::fs::write(
+                rig.path.join("store").join(crate::config_store::STORE_FILE),
+                b"tampered",
+            )
+            .unwrap();
+            assert!(owner.check_recovery().unwrap());
+        }
+        let hello = subc_protocol::ModuleHelloBody {
+            manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+            protocol_ver: subc_protocol::PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: Some(candidate_nonce.clone()),
+        };
+        let frame = subc_protocol::Frame::build(
+            subc_protocol::FrameType::Hello,
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&hello).unwrap(),
+        )
+        .unwrap();
+        let reply = handler
+            .handle_control(ConnectionId::new(772), frame)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&reply[0].body).unwrap()["code"],
+            if recovery {
+                "config_gated"
+            } else {
+                "reserved_module"
+            }
+        );
+        assert!(registry.get_module("a").unwrap().is_none());
+    }
 }
 
 #[tokio::test]
@@ -1386,7 +1428,7 @@ async fn config_admission_exited_before_binding_keeps_its_real_exit_without_admi
     assert_eq!(status.state, ModuleState::Failed);
     assert_eq!(status.spawn_generation, 1);
     assert!(!status.process_alive);
-    assert!(!handle.program_binding_verified("a", &nonce));
+    assert!(!handle.has_live_verified_program_binding("a", &nonce));
 }
 
 #[cfg(target_os = "linux")]
@@ -1554,6 +1596,111 @@ async fn config_admission_hello_accepts_only_the_approved_current_native_image()
     registry.deregister_connection(connection).unwrap();
     module.stop().await.unwrap();
     assert_eq!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
+}
+
+#[tokio::test]
+async fn config_recovery_dead_child_retires_binding_while_its_nonce_remains_current() {
+    for mode in 0..3 {
+        let recovery = mode == 1;
+        let rig = rig();
+        wire_fixture_document(&rig, json!(["600"]));
+        let owner = Arc::new(rig.owner("dead-child-hello"));
+        rig.stamp(&owner);
+        let handle = SupervisorHandle::new();
+        let registry = Arc::new(crate::Registry::default());
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone())
+            .with_config_runtime(owner.clone());
+        let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+        let nonce = handle.spawn_launch_nonce_for("a").unwrap();
+        assert!(handle.wait_program_binding("a", &nonce).await);
+        if recovery {
+            std::fs::write(
+                rig.path.join("store").join(crate::config_store::STORE_FILE),
+                b"tampered",
+            )
+            .unwrap();
+            assert!(owner.check_recovery().unwrap());
+        }
+        if mode == 2 {
+            approve(&rig, &owner, PlanKind::Unstamp);
+            assert!(!handle.has_program_binding_record("a"));
+        }
+        module.stop().await.unwrap();
+        assert_eq!(handle.spawn_nonce("a"), Some(nonce.clone()));
+        assert!(
+            handle.has_program_binding_record("a"),
+            "retirement must keep the legacy fallback closed"
+        );
+        assert!(!handle.has_live_verified_program_binding("a", &nonce));
+        let handler = crate::ControlHandler::new(registry.clone())
+            .with_supervisor(handle)
+            .with_config_runtime(owner);
+        let hello = subc_protocol::ModuleHelloBody {
+            manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+            protocol_ver: subc_protocol::PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: Some(nonce),
+        };
+        let frame = subc_protocol::Frame::build(
+            subc_protocol::FrameType::Hello,
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&hello).unwrap(),
+        )
+        .unwrap();
+        let reply = handler
+            .handle_control(ConnectionId::new(447), frame)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&reply[0].body).unwrap()["code"],
+            if recovery {
+                "config_gated"
+            } else {
+                "program_refused"
+            }
+        );
+        assert!(registry.get_module("a").unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn config_recovery_direct_hello_rechecks_store_instead_of_trusting_cached_state() {
+    let rig = rig();
+    let owner = Arc::new(rig.owner("fresh-direct-hello"));
+    rig.stamp(&owner);
+    std::fs::write(
+        rig.path.join("store").join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    let registry = Arc::new(crate::Registry::default());
+    let handler = crate::ControlHandler::new(registry.clone()).with_config_runtime(owner);
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder("unconfigured", "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: None,
+    };
+    let frame = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&hello).unwrap(),
+    )
+    .unwrap();
+    let reply = handler
+        .handle_control(ConnectionId::new(446), frame)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&reply[0].body).unwrap()["code"],
+        "config_gated"
+    );
+    assert!(registry.get_module("unconfigured").unwrap().is_none());
 }
 
 #[tokio::test]
@@ -2046,11 +2193,12 @@ async fn config_admission_unstamp_restores_unreserved_hello_without_a_synthetic_
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
     reported_pid(&module).await;
     let old_nonce = handle.spawn_launch_nonce_for("a").unwrap();
-    assert!(handle.has_program_binding("a", &old_nonce));
+    assert!(handle.has_program_binding_record("a"));
     module.stop().await.unwrap();
     approve(&rig, &owner, PlanKind::Unstamp);
+    assert!(handle.has_program_binding_record("a"));
     assert!(
-        !handle.has_program_binding("a", &old_nonce),
+        !handle.has_live_verified_program_binding("a", &old_nonce),
         "unstamp retained a retired content witness"
     );
     let handler = crate::ControlHandler::new(registry.clone())
@@ -2064,6 +2212,13 @@ async fn config_admission_unstamp_restores_unreserved_hello_without_a_synthetic_
         reply[0].header.ty,
         subc_protocol::FrameType::HelloAck,
         "unstamp must restore the configured unreserved policy"
+    );
+    let refused = handler
+        .handle_control(ConnectionId::new(704), module_hello(Some(old_nonce)))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&refused[0].body).unwrap()["code"],
+        "program_refused"
     );
 }
 

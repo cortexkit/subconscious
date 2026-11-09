@@ -61,13 +61,17 @@ impl RuntimeOwner {
             .map_err(|error| GateError::new("invalid_daemon_config", error.to_string()))
     }
 
-    /// Reservations are installed before releasing the global launch/HELLO
-    /// hold. The supervisor can then reconcile only the committed exit's bytes.
+    /// Release admission only after all committed-exit reconciliation succeeds.
     pub(crate) fn complete_authority_exit(&self, generation: u64) -> Result<()> {
         let mut state = self.lock()?;
         if state.authority_exit != Some(generation) {
             return Err(GateError::stale());
         }
+        // Actors created under the recovery hold may not have been observed by
+        // the coordinator yet. Queue their ordinary admission release here.
+        let modules =
+            crate::config_gate::GateSnapshot::from_store(&state.store.body()?.approved)?.modules();
+        state.admission_releases.extend(modules);
         state.authority_exit = None;
         state.recovery_exit_hold = false;
         let unstamped = state.store.loaded_admission_state().0 == StoreState::Unstamped;

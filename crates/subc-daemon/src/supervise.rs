@@ -735,16 +735,26 @@ impl SupervisedChild {
     fn start_admission_kill(&mut self) -> io::Result<()> {
         #[cfg(windows)]
         let result = {
-            let image = self
+            // Preserve the leader's distinctive status before ending the whole
+            // container/job; descendants must not wait for exit finalization.
+            let result = self
                 .spawned_file_identity
                 .as_ref()
                 .and_then(|identity| identity.windows_image.as_ref())
-                .ok_or_else(|| io::Error::other("admission child handle unavailable"))?;
-            // Kill the retained leader with a distinctive status before job
-            // cleanup can use its ordinary code 1. finish_exit ends the helpers.
-            image
-                .process()
-                .terminate_with_exit_code(admission_exit::WINDOWS_ADMISSION_KILL_EXIT_CODE as u32)
+                .ok_or_else(|| io::Error::other("admission child handle unavailable"))
+                .and_then(|image| {
+                    image.process().terminate_with_exit_code(
+                        admission_exit::WINDOWS_ADMISSION_KILL_EXIT_CODE as u32,
+                    )
+                });
+            if let Some(container) = self.child.container() {
+                container.hard_kill();
+            } else if let Some(job) = &self.job {
+                if let Err(error) = job.lock().unwrap_or_else(|p| p.into_inner()).terminate() {
+                    debug!(%error, "job termination failed after admission leader termination");
+                }
+            }
+            result
         };
         #[cfg(not(windows))]
         let result = self.start_kill().map(|()| true);
@@ -19466,6 +19476,7 @@ mod job_containment_tests {
     /// one place: whether the child is contained.
     struct Fixture {
         _dir: ScratchDir,
+        _roster: ChildRoster,
         module_id: String,
         grandchild: u32,
         child: Option<SupervisedChild>,
@@ -19476,6 +19487,10 @@ mod job_containment_tests {
     }
 
     fn fixture(label: &str, module_id: &str) -> Fixture {
+        fixture_with_carry(label, module_id, false)
+    }
+
+    fn fixture_with_carry(label: &str, module_id: &str, carry_containment: bool) -> Fixture {
         let dir = ScratchDir::new(label);
         let pid_file = dir.join("grandchild.pid");
         let supervisor = Supervisor::new_for_test(
@@ -19502,13 +19517,14 @@ mod job_containment_tests {
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::Subc,
             overlap: Default::default(),
-            carry_containment: false,
+            carry_containment,
         };
         let child = spawn_and_mark_running(&spec, &runtime, &snapshot)
             .expect("spawn the supervised fixture");
         let grandchild = read_grandchild_pid(&pid_file);
         Fixture {
             _dir: dir,
+            _roster: runtime.child_roster.clone(),
             module_id: module_id.to_string(),
             grandchild,
             child: Some(child),
@@ -19517,6 +19533,53 @@ mod job_containment_tests {
             terminal_ring: Arc::clone(&runtime.terminal_ring),
             spawn_events: SpawnEventFeed::default(),
         }
+    }
+
+    async fn assert_admission_kill_reaps_grandchild(carry: bool) {
+        let label = if carry {
+            "admission-kill-carried-tree"
+        } else {
+            "admission-kill-plain-tree"
+        };
+        let mut fixture = fixture_with_carry(label, label, carry);
+        let descendant = subc_os::Process::open(fixture.grandchild)
+            .unwrap()
+            .expect("the stub descendant must be alive before admission kill");
+        assert!(descendant.observe().is_some());
+        let child = fixture.child.as_mut().unwrap();
+        assert_eq!(child.child.container().is_some(), carry);
+        assert_eq!(child.job.is_some(), !carry);
+
+        child.start_admission_kill().unwrap();
+        assert!(child.admission_kill_sent);
+        let status = timeout(Duration::from_secs(10), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(admission_exit::WINDOWS_ADMISSION_KILL_EXIT_CODE),
+            "containment teardown must preserve the leader's distinctive status"
+        );
+        // Keep the child and its job/container alive: later exit finalization or
+        // handle drop must not be what makes the descendant-death claim pass.
+        assert!(
+            descendant.wait_for_exit(Duration::from_secs(10)).unwrap(),
+            "admission kill left a descendant running before exit finalization"
+        );
+        assert_eq!(child.child.container().is_some(), carry);
+        assert_eq!(child.job.is_some(), !carry);
+        child.finish_exit(false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admission_kill_reaps_grandchild_with_plain_job() {
+        assert_admission_kill_reaps_grandchild(false).await;
+    }
+
+    #[tokio::test]
+    async fn admission_kill_reaps_grandchild_with_carried_job() {
+        assert_admission_kill_reaps_grandchild(true).await;
     }
 
     impl Fixture {

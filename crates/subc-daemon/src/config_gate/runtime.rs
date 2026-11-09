@@ -48,6 +48,14 @@ pub struct RuntimeOwner {
     begin_approval_completions: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     desktop_receipt_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(all(test, unix))]
+    approval_claim_pause: Mutex<Option<ApprovalClaimPause>>,
+}
+
+#[cfg(all(test, unix))]
+struct ApprovalClaimPause {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 /// The post-answer deadline can withdraw queued work, but never a publication
@@ -520,6 +528,8 @@ impl RuntimeOwner {
             begin_approval_completions: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             desktop_receipt_hook: Mutex::new(None),
+            #[cfg(all(test, unix))]
+            approval_claim_pause: Mutex::new(None),
         }
     }
 
@@ -1203,12 +1213,6 @@ impl RuntimeOwner {
         if let Some(hook) = state.after_approval_drain_hook.take() {
             hook();
         }
-        if self.approval_request_index.is_poisoned() {
-            return Err(GateError::new(
-                "config_unavailable",
-                "approval cancellation index is poisoned",
-            ));
-        }
         let was_unstamped = state.store.status().state == StoreState::Unstamped;
         #[cfg(test)]
         let publication_hook = state.publication_hook.take();
@@ -1237,7 +1241,17 @@ impl RuntimeOwner {
                 if let Some(window) = window {
                     window.begin_publication()?;
                 }
-                cancellation.claim_publication()?;
+                {
+                    // Serialize the publication claim with cancellation-index
+                    // health, then release the index before any store work.
+                    let _index = self.approval_request_index.lock().map_err(|_| {
+                        GateError::new(
+                            "config_unavailable",
+                            "approval cancellation index is poisoned",
+                        )
+                    })?;
+                    cancellation.claim_publication()?;
+                }
                 route_policy::restore_superseded(
                     route_policy_receipts,
                     installed_route_policies,
@@ -1299,6 +1313,31 @@ impl RuntimeOwner {
             panic!("injected approval index poison");
         }));
         assert!(poisoned.is_err());
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn pause_next_approval_claim_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached, observed) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        *self.approval_claim_pause.lock().unwrap() = Some(ApprovalClaimPause {
+            reached,
+            release: wait,
+        });
+        (observed, release)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) async fn pause_approval_claim_for_test(&self) {
+        let pause = self.approval_claim_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            pause.release.await.unwrap();
+        }
     }
 
     #[cfg(all(test, unix))]

@@ -90,13 +90,16 @@ impl ControlHandler {
         &self,
         ctx: &RouteCtx,
         frame: &Frame,
-    ) -> Option<crate::config_gate::runtime::ApprovalRequestGuard> {
+    ) -> std::result::Result<Option<crate::config_gate::runtime::ApprovalRequestGuard>, GateError>
+    {
         if self.defers_config_approval(frame) {
             if let Some(owner) = &self.config_runtime {
-                return owner.reserve_approval_request(ctx.connection_id, frame.header.corr);
+                return owner
+                    .reserve_approval_request(ctx.connection_id, frame.header.corr)
+                    .map(Some);
             }
         }
-        None
+        Ok(None)
     }
 
     pub(super) fn cancel_config_approval(&self, caller: ConnectionId, correlation: u64) -> bool {
@@ -561,6 +564,8 @@ impl ControlHandler {
             ConfigControlRequest::Apply { digest } => {
                 let connection = ctx.connection_id;
                 let corr = frame.header.corr;
+                #[cfg(all(test, unix))]
+                runtime.pause_approval_claim_for_test().await;
                 let request_guard = runtime.claim_approval_request(connection, corr)?;
                 if self.rescan.is_none() {
                     return Err(GateError::new(

@@ -9832,7 +9832,15 @@ impl SpawnProgramBinding {
                 .find(|(key, _)| key == "PATH")
                 .map(|(_, path)| std::ffi::OsString::from(path))
                 .or_else(|| std::env::var_os("PATH"))
-                .unwrap_or_default();
+                .unwrap_or_else(|| {
+                    if cfg!(target_os = "macos") {
+                        // Match Darwin's spawn search when PATH is absent, not
+                        // the current-directory search of an explicitly empty PATH.
+                        "/usr/bin:/bin".into()
+                    } else {
+                        Default::default()
+                    }
+                });
             std::env::split_paths(&path)
                 .map(|dir| dir.join(&spec.program))
                 .find(|path| {

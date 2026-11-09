@@ -21,7 +21,7 @@ impl crate::operator_confirm::OperatorProvider for ApprovedPresence {
     }
 }
 
-async fn os_fixture() -> Fixture {
+pub(super) async fn os_fixture() -> Fixture {
     let mut fixture = Fixture::new().await;
     fixture.plan = fixture
         .owner

@@ -13,6 +13,10 @@
   own cleanup before dispatch, including authorization refusals and unpolled tasks.
   Send phone withdrawal only after the card was enqueued, and record at most
   one late-cancellation diagnostic per attempt.
+- Check cancellation-index health under its lock at the publication claim, and
+  refuse duplicate in-flight Apply correlations before dispatch so they cannot
+  cancel the original caller's attempt. Match Darwin's default executable search
+  path when neither the module nor daemon environment supplies PATH.
 - Relay immutable `consent/v1` approval cards only through the policy-enabled,
   admitted active phone module. Bind each card to its daemon-allocated request
   correlation, bound the wait for an answer to five minutes, and withdraw unanswered

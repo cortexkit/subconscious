@@ -943,7 +943,10 @@ impl Router {
         &self,
         ctx: &RouteCtx,
         frame: &Frame,
-    ) -> Option<crate::config_gate::runtime::ApprovalRequestGuard> {
+    ) -> Result<
+        Option<crate::config_gate::runtime::ApprovalRequestGuard>,
+        crate::config_gate::GateError,
+    > {
         self.control.reserve_config_approval(ctx, frame)
     }
 

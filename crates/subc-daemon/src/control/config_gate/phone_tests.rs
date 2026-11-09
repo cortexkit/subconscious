@@ -23,6 +23,8 @@ const CALLER: ConnectionId = ConnectionId::new(7);
 mod cancel_r2_tests;
 #[path = "phone_cancel_r3_tests.rs"]
 mod cancel_r3_tests;
+#[path = "phone_cancel_r4_tests.rs"]
+mod cancel_r4_tests;
 #[path = "phone_lifecycle_tests.rs"]
 mod lifecycle_tests;
 

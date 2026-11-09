@@ -106,14 +106,22 @@ impl RuntimeOwner {
         self: &Arc<Self>,
         caller: ConnectionId,
         correlation: u64,
-    ) -> Option<ApprovalRequestGuard> {
-        let mut index = self.approval_request_index.lock().ok()?;
+    ) -> Result<ApprovalRequestGuard> {
+        let mut index = self.approval_request_index.lock().map_err(|_| {
+            GateError::new(
+                "config_unavailable",
+                "approval cancellation index is poisoned",
+            )
+        })?;
         let std::collections::hash_map::Entry::Vacant(entry) = index.entry((caller, correlation))
         else {
-            return None;
+            return Err(GateError::new(
+                "config_busy",
+                "approval request correlation is already pending",
+            ));
         };
         let request = entry.insert(Arc::default()).clone();
-        Some(ApprovalRequestGuard {
+        Ok(ApprovalRequestGuard {
             owner: Arc::downgrade(self),
             caller,
             correlation,

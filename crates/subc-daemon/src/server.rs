@@ -1150,7 +1150,26 @@ where
         }
 
         if router.defers_config_approval(&frame) || router.defers_privileged_control(&ctx, &frame) {
-            let reservation = router.reserve_config_approval(&ctx, &frame);
+            let reservation = match router.reserve_config_approval(&ctx, &frame) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    ctx.egress
+                        .send(
+                            crate::control::control_error_body_frame(
+                                &frame,
+                                subc_protocol::ErrorBody {
+                                    code: error.code,
+                                    message: error.detail,
+                                    detail: None,
+                                },
+                            )
+                            .map_err(ConnectionError::Router)?,
+                        )
+                        .await
+                        .map_err(ConnectionError::Router)?;
+                    continue;
+                }
+            };
             // Configuration prompts for the specific plan, not the generic
             // privileged operation. Only task lifetime/reader scheduling is shared.
             let task_router = Arc::clone(&router);

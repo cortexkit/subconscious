@@ -166,3 +166,66 @@ async fn config_spawn_macos_path_skips_non_executable_regular_files() {
 async fn config_spawn_macos_path_last_override_matches_the_executed_program() {
     path_launch(true).await;
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn config_spawn_macos_unset_path_capture_matches_default_path_execution() {
+    const CHILD: &str = "SUBC_TEST_UNSET_PATH_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let root = Scratch::new("macos-binding-unset-path");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "supervise::program_binding_tests::config_spawn_macos_unset_path_capture_matches_default_path_execution", "--nocapture"])
+            .env(CHILD, "1")
+            .env_remove("PATH")
+            .current_dir(&*root)
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "PATH-unset subprocess failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the subprocess must run the named test"
+        );
+        return;
+    }
+
+    use std::os::unix::fs::PermissionsExt;
+    assert!(std::env::var_os("PATH").is_none());
+    let root = std::env::current_dir().unwrap();
+    let decoy = root.join("sleep");
+    std::fs::write(&decoy, "#!/bin/sh\nexit 17\n").unwrap();
+    std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut spec = spec("sleep".into(), vec![]);
+    spec.args = vec!["600".into()];
+    let binding = SpawnProgramBinding::capture(&spec).unwrap();
+    let supervisor = Supervisor::new_for_test(
+        Arc::new(Registry::default()),
+        RestartPolicy::new(0, Duration::ZERO),
+    );
+    let module = supervisor.spawn_async(spec).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < deadline {
+        if module.status().unwrap().pid.is_some() || module.state().unwrap() == ModuleState::Failed
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let observed = module
+        .status()
+        .unwrap()
+        .pid
+        .and_then(observe_spawned_image)
+        .and_then(|image| image.executable);
+    module.stop().await.unwrap();
+    let system_program = subc_os::file_identity(std::path::Path::new("/bin/sleep")).unwrap();
+    assert_eq!(
+        observed,
+        Some(system_program),
+        "the actual exec must use Darwin's default search path"
+    );
+    assert_eq!(binding.identity, system_program, "capture must use the same default search path as exec when PATH is unset, not bind the cwd decoy");
+}

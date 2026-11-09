@@ -8393,7 +8393,10 @@ pub(crate) fn control_error_frame(
 /// as proof that its request never reached a module. Response, push,
 /// goodbye and relay-request frames keep the plain control flags in their
 /// own builders.
-fn control_error_body_frame(frame: &Frame, error: ErrorBody) -> Result<Frame, RouterError> {
+pub(crate) fn control_error_body_frame(
+    frame: &Frame,
+    error: ErrorBody,
+) -> Result<Frame, RouterError> {
     control_error_frame_with_flags(frame, error, daemon_error_flags())
 }
 

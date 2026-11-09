@@ -64,7 +64,7 @@ subc-presence = { path = "../subc-presence", version = "0.2.1" }
 # SIGTERM for `protocol: "none"` teardown. This crate forbids unsafe code, so
 # `libc::kill` is not reachable from here; rustix wraps the same syscall safely
 # and is already in the tree via subc-transport.
-rustix = { version = "1", default-features = false, features = ["process"] }
+rustix = { version = "1", default-features = false, features = ["process", "fs"] }
 
 [dev-dependencies]
 subc-os = { path = "../subc-os", version = "0.1.33", features = ["test-support"] }

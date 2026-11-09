@@ -60,6 +60,11 @@
   launch attempt and executable identity under the module gate immediately before
   creating a child; a changed witness refuses `plan_stale`. Cancelled preparation
   drops its launch reservation without ever creating a process.
+  Capture executable identity from a retained nonblocking regular-file handle,
+  preserving original symlink launch names while refusing FIFO and symlink
+  substitutions. Use native volume/file identity on Windows and effective-user
+  executable access for PATH search. Own new Linux cgroup cleanup before any
+  fallible admission or command preparation.
 - Fence respawn until a spontaneous warm-up exit's configuration failure is
   recorded. Waiting spends no extra crash budget; intentional restarts preserve
   pending configuration, and a failed first generation stays stopped.

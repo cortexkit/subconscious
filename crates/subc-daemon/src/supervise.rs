@@ -68,6 +68,8 @@ mod async_spawn_tests;
 mod carried_job_tests;
 mod config_delivery;
 mod config_exit_failure;
+#[cfg(all(test, windows))]
+mod program_binding_windows_tests;
 pub use config_exit_failure::ModuleStopReason;
 #[cfg(all(test, unix))]
 mod config_exit_hold_tests;
@@ -9822,11 +9824,18 @@ struct SpawnProgramBinding {
     // Keep the inode alive if the configured name is replaced while preparation
     // is suspended, so replacement cannot pass through inode reuse.
     _file: std::fs::File,
-    identity: subc_os::FileIdentity,
+    identity: subc_os::RetainedFileIdentity,
 }
 
 impl SpawnProgramBinding {
     fn capture(spec: &ModuleSpec) -> Result<Self, SuperviseError> {
+        Self::capture_after_resolution(spec, |_| {})
+    }
+
+    fn capture_after_resolution(
+        spec: &ModuleSpec,
+        before_open: impl FnOnce(&std::path::Path),
+    ) -> Result<Self, SuperviseError> {
         let path = if spec.program.is_absolute() || spec.program.components().count() > 1 {
             spec.program.clone()
         } else {
@@ -9840,15 +9849,47 @@ impl SpawnProgramBinding {
                 .unwrap_or_default();
             std::env::split_paths(&path)
                 .map(|dir| dir.join(&spec.program))
-                .find(|path| path.is_file())
+                .find(|path| {
+                    if !path.is_file() {
+                        return false;
+                    }
+                    #[cfg(unix)]
+                    {
+                        rustix::fs::accessat(
+                            rustix::fs::CWD,
+                            path,
+                            rustix::fs::Access::EXEC_OK,
+                            rustix::fs::AtFlags::EACCESS,
+                        )
+                        .is_ok()
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        true
+                    }
+                })
                 .unwrap_or_else(|| spec.program.clone())
         };
-        let file = std::fs::File::open(&path).map_err(|source| SuperviseError::Spawn {
+        let resolved = std::fs::canonicalize(&path).map_err(|source| SuperviseError::Spawn {
             program: spec.program.clone(),
             source,
             cgroup_path: None,
         })?;
-        let identity = subc_os::file_identity(&path).ok_or_else(|| spawn_plan_stale(spec))?;
+        before_open(&resolved);
+        // Resolving links does not open their target. The descriptor open must
+        // remain nonblocking and no-follow if that resolved name is substituted.
+        let file =
+            subc_os::open_regular_nofollow(&resolved).map_err(|source| SuperviseError::Spawn {
+                program: spec.program.clone(),
+                source: io::Error::other(source),
+                cgroup_path: None,
+            })?;
+        let identity =
+            subc_os::retained_file_identity(&file).map_err(|source| SuperviseError::Spawn {
+                program: spec.program.clone(),
+                source,
+                cgroup_path: None,
+            })?;
         Ok(Self {
             path,
             _file: file,
@@ -9856,7 +9897,18 @@ impl SpawnProgramBinding {
         })
     }
     fn current(&self) -> bool {
-        subc_os::file_identity(&self.path) == Some(self.identity)
+        #[cfg(unix)]
+        {
+            subc_os::file_identity(&self.path) == Some(self.identity)
+        }
+        #[cfg(windows)]
+        {
+            std::fs::canonicalize(&self.path)
+                .ok()
+                .and_then(|path| subc_os::open_regular_nofollow(&path).ok())
+                .and_then(|file| subc_os::retained_file_identity(&file).ok())
+                == Some(self.identity)
+        }
     }
 }
 
@@ -10131,6 +10183,14 @@ fn prepare_child_in_slot(
         })?;
     #[cfg(not(target_os = "linux"))]
     let cgroup_path: Option<PathBuf> = None;
+    // Own a newly created directory before any fallible admission or command
+    // preparation. Existing carried containment must never be removed here.
+    #[cfg(target_os = "linux")]
+    let cgroup_cleanup = PreparedCgroup(
+        cgroup_placement
+            .filter(|_| carried.is_none())
+            .map(|placement| (placement.clone(), cgroup_name.clone())),
+    );
     #[cfg(unix)]
     let mut admission_gate = if carrying {
         Some(
@@ -10149,12 +10209,7 @@ fn prepare_child_in_slot(
     exec_ack.install(command.as_std_mut());
     #[cfg(target_os = "linux")]
     if let Some(path) = &cgroup_path {
-        if let Err(error) = apply_cgroup_placement(&mut command, spec, path) {
-            if let Some(placement) = cgroup_placement.filter(|_| carried.is_none()) {
-                remove_module_cgroup(placement, &cgroup_name);
-            }
-            return Err(error);
-        }
+        apply_cgroup_placement(&mut command, spec, path)?;
     }
 
     let output_sink = if let Some(logs_dir) = capture_logs_dir {
@@ -10274,11 +10329,7 @@ fn prepare_child_in_slot(
         #[cfg(target_os = "linux")]
         cgroup_placement: cgroup_placement.cloned(),
         #[cfg(target_os = "linux")]
-        cgroup_cleanup: PreparedCgroup(
-            cgroup_placement
-                .filter(|_| carried.is_none())
-                .map(|placement| (placement.clone(), cgroup_name.clone())),
-        ),
+        cgroup_cleanup,
         #[cfg(target_os = "linux")]
         cgroup_name,
         cgroup_path,

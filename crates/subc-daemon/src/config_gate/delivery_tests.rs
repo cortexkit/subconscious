@@ -1934,6 +1934,18 @@ async fn config_delivery_supervisor_pre_hello_crash_defers_respawn_without_spend
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn config_delivery_supervisor_pre_hello_crash_after_unavailable_witness_spends_budget() {
+    crash_after_unavailable_image("after_content_witness_check").await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn config_delivery_supervisor_pre_hello_crash_after_unavailable_initial_image_spends_budget()
+{
+    crash_after_unavailable_image("after_spawn_image_sample").await;
+}
+
+#[cfg(target_os = "linux")]
+async fn crash_after_unavailable_image(unavailable_stage: &'static str) {
     use std::io::Write;
     let (rig, owner, supervisor, _handler) = supervised_fixture_with_program(
         true,
@@ -1955,12 +1967,14 @@ async fn config_delivery_supervisor_pre_hello_crash_after_unavailable_witness_sp
         match stage {
             // Model a transient /proc image read failure while the real program
             // is blocked on its release pipe, not yet waitable as an exited child.
-            "after_content_witness_check" => {
-                assert!(subc_os::child_exit::observe(pid.unwrap()).unwrap().is_none());
+            stage if stage == unavailable_stage => {
+                assert!(subc_os::child_exit::observe(pid.unwrap())
+                    .unwrap()
+                    .is_none());
                 checked_hook.store(true, std::sync::atomic::Ordering::SeqCst);
                 false
             }
-            "before_content_witness_kill" => {
+            "before_content_witness_kill" | "before_initial_image_kill" => {
                 assert!(checked_hook.load(std::sync::atomic::Ordering::SeqCst));
                 writeln!(std::fs::File::create(&release).unwrap(), "crash").unwrap();
                 // Finish the program's own exit before the supervisor can signal
@@ -1981,8 +1995,7 @@ async fn config_delivery_supervisor_pre_hello_crash_after_unavailable_witness_sp
     });
     let module = supervisor.spawn(supervised_spec(&rig, "a")).unwrap();
     wait_for_supervised_stage(&module, "unavailable-witness crash defers recovery", || {
-        owner.delivery_exit_fence("a").unwrap().is_some()
-            && module.state().unwrap() == crate::supervise::ModuleState::Restarting
+        module.state().unwrap() == crate::supervise::ModuleState::Restarting
     })
     .await;
     assert!(checked.load(std::sync::atomic::Ordering::SeqCst));
@@ -1994,6 +2007,7 @@ async fn config_delivery_supervisor_pre_hello_crash_after_unavailable_witness_sp
     assert_eq!(status.lifetime_restarts, 1);
     assert!(!status.process_alive);
     assert_eq!(status.last_exit.unwrap().code, Some(23));
+    assert!(owner.delivery_exit_fence("a").unwrap().is_some());
     assert_eq!(
         std::fs::read_to_string(rig.path.join("a.launches"))
             .unwrap()

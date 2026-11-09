@@ -10939,6 +10939,16 @@ fn launch_child_in_slot(
     // observer also waits for the kernel's first-exec flag to clear.
     #[cfg(not(windows))]
     let recorded_image = observe_spawned_image(pid);
+    #[cfg(all(test, target_os = "linux"))]
+    let recorded_image = if roster.admission_event_for_test(
+        &spec.module_id,
+        "after_spawn_image_sample",
+        Some(pid),
+    ) {
+        recorded_image
+    } else {
+        None
+    };
     #[cfg(target_os = "linux")]
     // An exited child cannot receive HELLO service and has no readable /proc/exe.
     // Keep its real exit for the supervisor instead of turning a crash into a hold.
@@ -10950,6 +10960,12 @@ fn launch_child_in_slot(
         .is_some_and(|expected| recorded_image.and_then(|image| image.executable) != Some(expected))
         && !exited_before_binding
     {
+        #[cfg(all(test, target_os = "linux"))]
+        assert!(roster.admission_event_for_test(
+            &spec.module_id,
+            "before_initial_image_kill",
+            Some(pid),
+        ));
         kill_module_cgroup(cgroup_placement, &cgroup_name);
         kill_and_reap_rejected_child(&mut child, group_target.clone());
         if recorded_image.and_then(|image| image.executable).is_none() {

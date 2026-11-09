@@ -360,12 +360,19 @@ impl ConfigCapturer {
         mut layer_file: impl FnMut(&Path) -> Result<CapturedFile>,
     ) -> Result<CapturedConfiguration> {
         let doc = daemon.parse()?;
+        let mut launch_specs = BTreeMap::new();
         if let Some(bytes) = &daemon.bytes {
-            crate::daemon_config::parse_with_activity(
+            let (config, _) = crate::daemon_config::parse_with_activity(
                 std::str::from_utf8(bytes).map_err(capture_error)?,
                 &self.daemon_path,
             )
             .map_err(capture_error)?;
+            launch_specs.extend(
+                config
+                    .modules
+                    .into_iter()
+                    .map(|module| (module.module_id.clone(), module.module_spec())),
+            );
             refuse_expansions(&doc, "subc", "")?;
         }
         let mut program_handles = Vec::new();
@@ -400,16 +407,13 @@ impl ConfigCapturer {
                 if selected.is_some_and(|modules| !modules.contains(module)) {
                     continue;
                 }
-                if let Some(program) = entry.get("program").and_then(Value::as_str) {
-                    let (file, captured) = capture_program(Path::new(program))?;
-                    diagnostic.inputs.insert(
-                        InputKey::Program {
-                            module: module.clone(),
-                            path: program.into(),
-                        },
-                        captured,
-                    );
-                    program_handles.push(file);
+                if let Some(spec) = launch_specs.get(module) {
+                    let covered = super::program::program_files(entry)?;
+                    let launch = super::program::capture(spec, &covered).map_err(|error| {
+                        GateError::new(&error.code, format!("{module}: {}", error.detail))
+                    })?;
+                    diagnostic.inputs.extend(launch.inputs);
+                    program_handles.extend(launch.files);
                 }
             }
         }
@@ -546,7 +550,7 @@ fn redact_launch_values(value: &Value) -> Result<Value> {
     }
 }
 
-fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
+pub(crate) fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
     use sha2::{Digest as _, Sha256};
     if !path.is_absolute() {
         return Err(GateError::new(

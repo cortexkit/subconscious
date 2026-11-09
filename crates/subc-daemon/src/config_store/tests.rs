@@ -1081,3 +1081,27 @@ fn config_store_unanchored_mac_covers_unknown_fields_and_exact_body_bytes() {
     rig.replace(original.as_bytes());
     assert_eq!(rig.open(true).status().state, StoreState::Stamped);
 }
+
+#[test]
+fn config_admission_durable_program_refusal_is_inside_the_authenticated_store() {
+    let rig = Rig::new();
+    let mut store = rig.open(true);
+    commit(&mut store, CommitKind::Stamp);
+    let identity = raw_digest(b"refused-image");
+    store
+        .record_program_refusal("sample", raw_digest(b"approved-image"), identity.clone())
+        .unwrap();
+    let original = String::from_utf8(rig.bytes()).unwrap();
+    let old = serde_json::to_string(&identity).unwrap();
+    let forged = serde_json::to_string(&raw_digest(b"forged-refusal")).unwrap();
+    assert_eq!(original.matches(&old).count(), 1);
+    rig.replace(original.replacen(&old, &forged, 1).as_bytes());
+    assert_eq!(
+        store.check().unwrap_err().code,
+        StoreErrorCode::StoreTampered
+    );
+    drop(store);
+    assert_eq!(rig.open(true).status().state, StoreState::StoreUnverified);
+    rig.replace(original.as_bytes());
+    assert_eq!(rig.open(true).status().state, StoreState::Stamped);
+}

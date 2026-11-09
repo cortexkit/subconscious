@@ -2,6 +2,30 @@
 
 ## 0.41.10
 
+- Admit every supervised launch against approved configuration and covered program
+  files. Resolve executable and supported shebang interpreters once, bind the
+  executed image to the retained hash witness, and withhold HELLO service until
+  that binding passes. Show interpreter-only coverage without inferring code from
+  arguments. Linux and Windows refuse bare program names when PATH is absent.
+- Hold refused modules without respawns, slow retries, critical-spawn alerts or
+  additional crash-budget entries. Keep existing processes serving, preserve the
+  pending-exit fence, defer contended admission without blocking supervisor
+  commands, and resume enabled held modules after approval. Persist at most 256
+  refused program identities in the integrity-covered store, pruning oldest first
+  and clearing a module's entries when its approved program base changes.
+- Launch rollback commands at their restored paths and recheck their current
+  identities. For module-owned route policy, wait for the configuration ACK before
+  revoking old routes and their scope-admission stamps with the existing reload
+  close reason; require a fresh health probe before activation. Refuse
+  daemon-owned route-policy fields.
+- Advertise `config.gate` only with an installed configuration runtime, and verify
+  the reviewer's active connection, launch nonce and live executable identity
+  before sending configuration or consent reviews. Wire spawn and swap test
+  pauses and defer tamper activity emission until module gates have been released.
+- Refuse a stamped wrapper whose observed spawn image replaces its covered
+  interpreter with another executable. Configure the final executable directly,
+  or keep the covered wrapper alive while running the other program as a child.
+
 - Build macOS privacy-trampoline commands from the same retained regular file
   used for launch validation, including shebang inspection. Resolve PATH once,
   honor its last override and executable permissions, and refuse absent names
@@ -36,9 +60,8 @@
   locks even when the caller disconnects.
 - Build rollback plans from retained byte-exact configuration and freshly
   captured programs at the restored paths. Show when a program changed since
-  the selected generation, preserve edited files as proposals, and refuse
-  path-changing rollback until the supervisor selects and launches programs
-  from the approved rollback inputs at the restored paths.
+  the selected generation, preserve edited files as proposals, and
+  select programs from the approved rollback inputs at their restored paths.
 - Under `dev-desktop-approval` only, accept same-user local complete desktop
   reviews without app verification, while retaining OS presence and writer
   receipts. Persist `unverified_development_desktop` explicitly in status and

@@ -167,25 +167,40 @@ async fn run_swap_inner(
     let candidate_alternate = !lock_snapshot(snapshot)
         .map(|state| state.in_alternate_slot)
         .unwrap_or(false);
-    let mut candidate = match spawn_child_in_slot_async(
-        spec,
-        runtime,
-        SpawnRole::SwapCandidate,
-        candidate_alternate,
-    )
-    .await
-    {
-        Ok(candidate) => candidate,
-        Err(err) => {
-            handle.close_swap(module_id);
-            warn!(module_id, error = %err, "swap candidate failed to spawn; incumbent untouched");
-            let _ = reply.send(Err(SuperviseError::SwapFailed {
-                module_id: module_id.to_string(),
-                arm: SwapFailureArm::SpawnFailed,
-                detail: err.to_string(),
-                candidate_exit: None,
-            }));
-            return;
+    let mut candidate = loop {
+        match spawn_child_in_slot_async(
+            spec,
+            runtime,
+            SpawnRole::SwapCandidate,
+            candidate_alternate,
+        )
+        .await
+        {
+            Ok(candidate) => break candidate,
+            Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
+                if wait_for_config_gate(runtime, module_id, commands, end).await {
+                    continue;
+                }
+                handle.close_swap(module_id);
+                let _ = reply.send(Err(SuperviseError::SwapFailed {
+                    module_id: module_id.to_owned(),
+                    arm: SwapFailureArm::Interrupted,
+                    detail: "swap interrupted while configuration publication was pending".into(),
+                    candidate_exit: None,
+                }));
+                return;
+            }
+            Err(err) => {
+                handle.close_swap(module_id);
+                warn!(module_id, error = %err, "swap candidate failed to spawn; incumbent untouched");
+                let _ = reply.send(Err(SuperviseError::SwapFailed {
+                    module_id: module_id.to_string(),
+                    arm: SwapFailureArm::SpawnFailed,
+                    detail: err.to_string(),
+                    candidate_exit: None,
+                }));
+                return;
+            }
         }
     };
     #[cfg(target_os = "macos")]
@@ -326,7 +341,21 @@ async fn run_swap_inner(
         None => None,
     };
     let config_guard = match config_gate {
-        Some(gate) => Some(gate.lock_owned().await),
+        Some(gate) => loop {
+            if let Ok(guard) = gate.clone().try_lock_owned() {
+                break Some(guard);
+            }
+            if !wait_for_config_gate(runtime, module_id, commands, end).await {
+                abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
+                let _ = reply.send(Err(SuperviseError::SwapFailed {
+                    module_id: module_id.to_owned(),
+                    arm: SwapFailureArm::Interrupted,
+                    detail: "swap interrupted before configuration cutover".into(),
+                    candidate_exit: None,
+                }));
+                return;
+            }
+        },
         None => None,
     };
     let config_opted_in = registry
@@ -403,6 +432,20 @@ async fn run_swap_inner(
     // the registry names the candidate, forwarding already routes to it, so
     // nothing that reads the registry (catalog.list, the health prober) is ever
     // ahead of where routes go.
+    if let Some(error) = config_owner
+        .as_ref()
+        .and_then(|owner| owner.check_module_hold(module_id).err())
+    {
+        drop(config_guard);
+        abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
+        let _ = reply.send(Err(SuperviseError::SwapFailed {
+            module_id: module_id.to_owned(),
+            arm: SwapFailureArm::CandidateUnhealthy,
+            detail: format!("config_gated: {error}"),
+            candidate_exit: None,
+        }));
+        return;
+    }
     let forwarding_cutover = match forwarding.cutover_candidate(module_id) {
         Ok(Some(cutover)) => cutover,
         Ok(None) | Err(_) => {
@@ -436,6 +479,12 @@ async fn run_swap_inner(
             .await
         {
             warn!(module_id, %error, "swap test pause failed");
+        }
+    }
+    #[cfg(feature = "test-support")]
+    if let Some(owner) = &config_owner {
+        if let Err(error) = owner.pause_swap_before_promotion() {
+            warn!(module_id, %error, "swap promotion test pause failed");
         }
     }
     let promoted = match registry.promote_candidate(module_id) {
@@ -604,6 +653,32 @@ async fn dispatch_retirement(
 /// enabled module is answered as the no-op it is. A configuration update is
 /// answered at once and applied when the swap ends, since the swap is using the
 /// spec it replaces.
+async fn wait_for_config_gate(
+    runtime: &SupervisorRuntimeConfig,
+    module: &str,
+    commands: &mut mpsc::Receiver<SupervisorCommand>,
+    end: &mut SwapEnd,
+) -> bool {
+    let Some(delivery) = &runtime.config_delivery else {
+        return true;
+    };
+    let Ok(gate) = delivery.0.module_gate(module) else {
+        return false;
+    };
+    loop {
+        tokio::select! {
+            guard = gate.lock() => { drop(guard); return true; }
+            command = commands.recv() => {
+                let Some(command) = command else { return false; };
+                if let Some(interrupt) = serve_command_while_warming(module, command, end) {
+                    end.requeue.push(interrupt);
+                    return false;
+                }
+            }
+        }
+    }
+}
+
 fn serve_command_while_warming(
     module_id: &str,
     command: SupervisorCommand,

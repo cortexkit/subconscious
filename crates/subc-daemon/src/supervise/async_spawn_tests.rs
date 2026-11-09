@@ -20,8 +20,7 @@ async fn config_spawn_async_fifo_executable_refuses_without_stranding_the_gate()
     fifo_at(&program);
     let mut launch = tokio::spawn(async move { supervisor.spawn_async(spec).await });
     let prompt = tokio::time::timeout(Duration::from_millis(250), &mut launch).await;
-    let refused_promptly =
-        matches!(&prompt, Ok(Ok(Err(error))) if error.to_string().contains("regular"));
+    let refused_promptly = matches!(&prompt, Ok(Ok(Ok(module))) if module.status().is_ok_and(|status| !status.process_alive && status.state == ModuleState::Stopped));
     if prompt.is_err() {
         launch.abort();
         let _ = launch.await;
@@ -40,7 +39,7 @@ async fn config_spawn_async_fifo_executable_refuses_without_stranding_the_gate()
     assert_eq!(owner.unregistered_spawn_count_for_test(), 0);
     assert!(gate.try_lock().is_ok());
     assert!(
-        refused_promptly,
+        refused_promptly && owner.module_is_gated("a"),
         "a FIFO executable must refuse as non-regular without blocking its module gate"
     );
 }
@@ -185,8 +184,8 @@ async fn config_spawn_symlinked_executable_keeps_the_original_launch_name() {
 
 #[tokio::test]
 async fn config_spawn_admission_refusal_removes_its_prepared_cgroup() {
-    let (_rig, _owner, mut supervisor, _handler, mut spec) =
-        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+    let (_rig, _owner, mut supervisor, _handler, spec) =
+        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_with_carry_for_test(true);
     let root = cortexkit_test_support::ScratchDir::new("spawn-admission-cgroup");
     std::fs::write(root.join("cgroup.procs"), b"").unwrap();
     let placement = subc_cgroup::prepare_at(&root).unwrap().unwrap();
@@ -194,7 +193,6 @@ async fn config_spawn_admission_refusal_removes_its_prepared_cgroup() {
     let modules = probe.parent().unwrap().to_path_buf();
     placement.remove_module("probe").unwrap();
     supervisor.cgroup_placement = Some(placement);
-    spec.carry_containment = true;
     let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let observed = seen.clone();
     supervisor
@@ -252,17 +250,22 @@ async fn config_spawn_async_cancel_during_preflight_creates_no_child_or_slot() {
     launch.abort();
     assert!(launch.await.unwrap_err().is_cancelled());
     release.send(()).unwrap();
-    // The blocking preparation owns the gate until its abandoned result and
-    // reservation guard are dropped. Acquiring it observes that cleanup point.
-    let _prepared = tokio::time::timeout(Duration::from_secs(5), gate.lock())
-        .await
-        .unwrap();
+    // Preparation no longer owns a module gate. Its abandoned reservation must
+    // still disappear before another launch can use the module's slot.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while owner.unregistered_spawn_count_for_test() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(gate.try_lock().is_ok());
     assert_eq!(owner.unregistered_spawn_count_for_test(), 0);
     assert_eq!(roster.live_count_for_test(), 0);
 }
 
 #[tokio::test]
-async fn config_spawn_async_program_replaced_during_preflight_is_plan_stale() {
+async fn config_spawn_async_program_replaced_during_preflight_is_held() {
     let (_rig, owner, supervisor, _handler, spec) =
         crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
     let roster = supervisor.child_roster.clone();
@@ -277,14 +280,12 @@ async fn config_spawn_async_program_replaced_during_preflight_is_plan_stale() {
     std::fs::copy(&program, &replacement).unwrap();
     std::fs::rename(replacement, &program).unwrap();
     release.send(()).unwrap();
-    let error = match launch.await.unwrap() {
-        Err(error) => error,
-        Ok(module) => {
-            module.stop().await.unwrap();
-            panic!("plan_stale was required, but the replaced program was launched");
-        }
-    };
-    assert!(error.to_string().contains("plan_stale"), "{error}");
+    let module = launch.await.unwrap().unwrap();
+    let status = module.status().unwrap();
+    assert!(!status.process_alive);
+    assert_eq!(status.state, ModuleState::Stopped);
+    assert!(owner.module_is_gated(&status.module_id));
+    module.stop().await.unwrap();
     assert_eq!(owner.unregistered_spawn_count_for_test(), 0);
     assert_eq!(roster.live_count_for_test(), 0);
 }

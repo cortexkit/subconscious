@@ -331,6 +331,17 @@ pub struct ConfigStore {
     hooks: Option<testing::TestSupport>,
 }
 impl ConfigStore {
+    /// A verified loaded view for gate-locked admission. The owner performs
+    /// `check` outside the module gate before preparing the launch witness.
+    pub(crate) fn loaded_admission_state(&self) -> (StoreState, &StoreBody) {
+        (
+            self.state,
+            self.deferred_failure
+                .as_ref()
+                .or(self.unanchored_ack.as_ref().map(|ack| &ack.visible))
+                .unwrap_or(&self.envelope.body),
+        )
+    }
     /// Recheck a launch witness after a full authority check on a blocking
     /// worker. This is only loaded state, never a replacement for `check`.
     pub(crate) fn loaded_module_generation(&self, module: &str) -> Option<u64> {
@@ -645,6 +656,42 @@ impl ConfigStore {
     pub fn take_activities(&mut self) -> Vec<StoreActivity> {
         std::mem::take(&mut self.activities)
     }
+    pub(crate) fn record_program_refusal(
+        &mut self,
+        module: &str,
+        approved_base: subc_config::Digest,
+        refused_identity: subc_config::Digest,
+    ) -> Result<(), StoreError> {
+        self.delivery_ready()?;
+        if self.state != StoreState::Stamped {
+            return Ok(());
+        }
+        let refusal = ProgramRefusal {
+            module: module.into(),
+            approved_base,
+            refused_identity,
+        };
+        if self.envelope.body.program_refusals.contains(&refusal) {
+            return Ok(());
+        }
+        let mut body = self.envelope.body.clone();
+        body.program_refusals.push(refusal);
+        if body.program_refusals.len() > PROGRAM_REFUSAL_LIMIT {
+            body.program_refusals.remove(0);
+        }
+        let result = self.publish(body, false, wall_time_ms());
+        if result.is_ok()
+            || result
+                .as_ref()
+                .is_err_and(|error| error.code == StoreErrorCode::AnchorPending)
+        {
+            self.activities.push(StoreActivity {
+                event: "config.refused",
+                detail: format!("{module}: program_refused; covered identity is not approved"),
+            });
+        }
+        result
+    }
     /// No approval/delivery may rely on a pending revision before this succeeds.
     pub fn delivery_ready(&mut self) -> Result<(), StoreError> {
         self.check()?;
@@ -900,6 +947,16 @@ impl ConfigStore {
         // configuration vector. Their tuple pointers remain untouched.
         if kind != CommitKind::Development {
             body.approved = approved;
+            if kind == CommitKind::Unstamp {
+                body.program_refusals.clear();
+            } else if !body.program_refusals.is_empty() {
+                let snapshot = crate::config_gate::GateSnapshot::from_store(&body.approved)
+                    .map_err(StoreError::serialization)?;
+                body.program_refusals.retain(|refusal| {
+                    crate::config_gate::program::approved_base(&snapshot, &refusal.module)
+                        == refusal.approved_base
+                });
+            }
             for tuple in &entry.tuples {
                 let index = body
                     .versions

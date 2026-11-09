@@ -22,11 +22,16 @@ use crate::{
 };
 
 pub struct RuntimeOwner {
+    #[cfg(feature = "test-support")]
+    test_hooks: Option<crate::config_store::testing::TestSupport>,
+    #[cfg(test)]
+    spawn_exec_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    admission: std::sync::RwLock<admission::AdmissionCache>,
     inner: Mutex<OwnerState>,
     capturer: ConfigCapturer,
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     delivery_changed: std::sync::Arc<tokio::sync::Notify>,
-    route_policy_authority: Option<std::sync::Arc<dyn RoutePolicyAuthority>>,
+    route_policy_authority: std::sync::OnceLock<std::sync::Arc<dyn RoutePolicyAuthority>>,
     canceled_approvals: Mutex<Vec<u64>>,
     // Reader and Drop callbacks must not wait behind a keychain or disk check.
     // These short queues/indexes never perform store I/O while locked.
@@ -251,6 +256,9 @@ struct OwnerState {
     declarations: HashMap<ConnectionId, (String, ConfigDeclareRequest)>,
     active_declarations: BTreeMap<String, ConnectionId>,
     activity: Option<crate::activity::ActivityLedger>,
+    refused_generations: BTreeMap<String, Digest>,
+    admission_holds: Vec<String>,
+    admission_releases: Vec<String>,
     installed_route_policies: BTreeMap<String, u64>,
     route_policy_receipts: BTreeMap<(String, u64), route_policy::PendingRoutePolicy>,
     #[cfg(test)]
@@ -338,7 +346,12 @@ impl OwnerState {
     }
 }
 
-struct OwnerGuard<'a>(std::sync::MutexGuard<'a, OwnerState>);
+struct OwnerGuard<'a>(
+    std::sync::MutexGuard<'a, OwnerState>,
+    &'a std::sync::RwLock<admission::AdmissionCache>,
+    &'a tokio::sync::Notify,
+    &'a Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+);
 impl std::ops::Deref for OwnerGuard<'_> {
     type Target = OwnerState;
     fn deref(&self) -> &Self::Target {
@@ -352,9 +365,46 @@ impl std::ops::DerefMut for OwnerGuard<'_> {
 }
 impl Drop for OwnerGuard<'_> {
     fn drop(&mut self) {
-        if let Some(ledger) = self.0.activity.clone() {
+        let next = admission::AdmissionCache::from_state(&self.0);
+        if let Ok(mut cache) = self.1.write() {
+            let (holds, releases) = next.transitions_from(&cache);
+            let changed = !holds.is_empty() || !releases.is_empty();
+            self.0.admission_holds.extend(holds);
+            self.0.admission_releases.extend(releases);
+            *cache = next;
+            if changed {
+                self.2.notify_one();
+            }
+        }
+        let Some(ledger) = self.0.activity.clone() else {
+            return;
+        };
+        let Ok(gates) = self.3.try_lock() else {
+            return;
+        };
+        let held: Vec<_> = gates
+            .values()
+            .filter(|gate| gate.try_lock().is_err())
+            .cloned()
+            .collect();
+        drop(gates);
+        if held.is_empty() {
             for activity in self.0.store.take_activities() {
                 ledger.config_store_activity(activity);
+            }
+        } else if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let activities = self.0.store.take_activities();
+            if !activities.is_empty() {
+                runtime.spawn(async move {
+                    // No store mutex follows the activity into this task. Drop
+                    // each gate before waiting for another, then publish the log.
+                    for gate in held {
+                        drop(gate.lock_owned().await);
+                    }
+                    for activity in activities {
+                        ledger.config_store_activity(activity);
+                    }
+                });
             }
         }
     }
@@ -393,8 +443,11 @@ mod tests;
 #[path = "delivery.rs"]
 pub(crate) mod delivery;
 
+#[path = "admission.rs"]
+mod admission;
 #[path = "route_policy.rs"]
 mod route_policy;
+pub(crate) use admission::SpawnAdmission;
 
 #[path = "approval_request.rs"]
 mod approval_request;
@@ -416,8 +469,7 @@ impl RuntimeOwner {
 
     #[cfg(feature = "test-support")]
     pub(crate) fn pause_spawn_before_exec(&self) -> Result<()> {
-        let hooks = self.lock()?.store.test_support().cloned();
-        if let Some(hooks) = hooks {
+        if let Some(hooks) = &self.test_hooks {
             hooks
                 .pause_spawn_before_exec()
                 .map_err(|error| GateError::new("config_test_pause", error.to_string()))?;
@@ -427,8 +479,7 @@ impl RuntimeOwner {
 
     #[cfg(feature = "test-support")]
     pub(crate) fn pause_swap_before_promotion(&self) -> Result<()> {
-        let hooks = self.lock()?.store.test_support().cloned();
-        if let Some(hooks) = hooks {
+        if let Some(hooks) = &self.test_hooks {
             hooks
                 .pause_swap_before_promotion()
                 .map_err(|error| GateError::new("config_test_pause", error.to_string()))?;
@@ -480,7 +531,13 @@ impl RuntimeOwner {
     }
     pub fn new(incarnation: String, mut store: ConfigStore, capturer: ConfigCapturer) -> Self {
         let initial_generation = store.body().map(|body| body.last_generation).unwrap_or(0);
+        let admission = std::sync::RwLock::new(admission::AdmissionCache::from_store(&store));
         Self {
+            #[cfg(feature = "test-support")]
+            test_hooks: store.test_support().cloned(),
+            #[cfg(test)]
+            spawn_exec_hook: Mutex::new(None),
+            admission,
             inner: Mutex::new(OwnerState {
                 gate: ConfigGate::new(incarnation),
                 store,
@@ -496,6 +553,9 @@ impl RuntimeOwner {
                 declarations: HashMap::new(),
                 active_declarations: BTreeMap::new(),
                 activity: None,
+                refused_generations: BTreeMap::new(),
+                admission_holds: Vec::new(),
+                admission_releases: Vec::new(),
                 installed_route_policies: BTreeMap::new(),
                 route_policy_receipts: BTreeMap::new(),
                 #[cfg(test)]
@@ -508,7 +568,7 @@ impl RuntimeOwner {
             capturer,
             module_gates: Mutex::new(HashMap::new()),
             delivery_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
-            route_policy_authority: None,
+            route_policy_authority: std::sync::OnceLock::new(),
             canceled_approvals: Mutex::new(Vec::new()),
             approval_request_index: Mutex::new(HashMap::new()),
             disconnected_pending: Mutex::new(Vec::new()),
@@ -558,9 +618,20 @@ impl RuntimeOwner {
     }
 
     fn lock(&self) -> Result<OwnerGuard<'_>> {
-        let mut guard = self.inner.lock().map(OwnerGuard).map_err(|_| {
-            GateError::new("config_unavailable", "configuration owner lock is poisoned")
-        })?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map(|guard| {
+                OwnerGuard(
+                    guard,
+                    &self.admission,
+                    &self.delivery_changed,
+                    &self.module_gates,
+                )
+            })
+            .map_err(|_| {
+                GateError::new("config_unavailable", "configuration owner lock is poisoned")
+            })?;
         self.drain_canceled_approvals(&mut guard);
         self.drain_disconnections(&mut guard);
         self.drain_abandoned_spawns(&mut guard);
@@ -793,6 +864,17 @@ impl RuntimeOwner {
     }
 
     fn check_authority(state: &mut OwnerState, recovery: bool) -> Result<()> {
+        if let Err(error) = state.store.check() {
+            return if recovery
+                && matches!(
+                    state.store.loaded_admission_state().0,
+                    StoreState::StoreUnverified | StoreState::StoreMissing
+                ) {
+                Ok(())
+            } else {
+                Err(error.into())
+            };
+        }
         state.retry_anchor(true);
         match state.store.check() {
             Ok(()) => Ok(()),
@@ -847,24 +929,6 @@ impl RuntimeOwner {
             None
         };
         let (candidate, mut observed, target) = if let Some((candidate, target)) = rollback {
-            let programs = |snapshot: &super::GateSnapshot| -> BTreeMap<String, String> {
-                snapshot
-                    .inputs
-                    .keys()
-                    .filter_map(|key| match key {
-                        super::InputKey::Program { module, path } => {
-                            Some((module.clone(), path.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect()
-            };
-            if programs(&candidate.diagnostic) != programs(&observed.diagnostic) {
-                return Err(GateError::new(
-                    "rollback_command_authority_unavailable",
-                    "restored program paths require approved supervisor command reconciliation",
-                ));
-            }
             (candidate, Some(observed), Some(target))
         } else {
             (observed, None, None)
@@ -1387,6 +1451,23 @@ impl RuntimeOwner {
                 .push("dev-desktop-approval".into());
         }
         if let Ok(body) = state.store.body() {
+            if let Ok(snapshot) = super::GateSnapshot::from_store(&body.approved) {
+                for (key, input) in &snapshot.inputs {
+                    if let (
+                        super::InputKey::Program { module, .. },
+                        subc_config::RecordedValue::Value { value },
+                    ) = (key, &input.value)
+                    {
+                        if value.get("coverage").and_then(serde_json::Value::as_str)
+                            == Some("interpreter only covered")
+                        {
+                            status
+                                .warnings
+                                .push(format!("{module}: interpreter only covered"));
+                        }
+                    }
+                }
+            }
             status.approval_channels = body
                 .generations
                 .iter()
@@ -1404,13 +1485,6 @@ impl RuntimeOwner {
                 .approval_channels
                 .sort_by_key(|record| record.generation);
             status.pending_proposals = u64::from(body.proposal.is_some());
-            status.gated_modules = body
-                .versions
-                .iter()
-                .map(|(tuple, _)| tuple.module.clone())
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect();
             for (tuple, versions) in &body.versions {
                 if let Some(generation) = versions.pending {
                     let entry = body.generations.get(&generation);
@@ -1433,6 +1507,7 @@ impl RuntimeOwner {
                 }
             }
         }
+        status.gated_modules = admission::AdmissionCache::from_state(&state).held_modules();
         Ok(status)
     }
 

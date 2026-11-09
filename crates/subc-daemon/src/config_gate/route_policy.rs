@@ -86,6 +86,10 @@ impl Drop for RoutePolicyInstallation {
 /// authority from the durable active generation, or from the configuration files
 /// used before approval was enabled when no active generation has been recorded.
 pub trait RoutePolicyAuthority: Send + Sync {
+    /// Module-owned bind policy is installed by the module's delivery ACK.
+    fn requires_module_ack(&self) -> bool {
+        false
+    }
     fn install_and_revoke<'a>(&'a self, policy: ApprovedRoutePolicy) -> RoutePolicyInstall<'a>;
 }
 
@@ -184,13 +188,17 @@ pub(super) fn ready(state: &mut OwnerState, module: &str, generation: u64) -> Re
 }
 
 impl RuntimeOwner {
-    pub fn with_route_policy_authority(mut self, authority: Arc<dyn RoutePolicyAuthority>) -> Self {
-        self.route_policy_authority = Some(authority);
+    pub fn with_route_policy_authority(self, authority: Arc<dyn RoutePolicyAuthority>) -> Self {
+        let _ = self.route_policy_authority.set(authority);
         self
     }
 
+    pub(crate) fn install_module_route_authority(&self, authority: Arc<dyn RoutePolicyAuthority>) {
+        let _ = self.route_policy_authority.set(authority);
+    }
+
     pub(super) fn check_route_policy_authority(&self, changeset: &Changeset) -> Result<()> {
-        if self.route_policy_authority.is_none()
+        if self.route_policy_authority.get().is_none()
             && changeset
                 .fields
                 .iter()
@@ -198,6 +206,16 @@ impl RuntimeOwner {
         {
             return Err(GateError::new("route_policy_authority_unavailable",
                 "config_gated: RoutePolicyAuthority is absent; approved route policy cannot be installed and affected routes and stamps cannot be revoked"));
+        }
+        if self
+            .route_policy_authority
+            .get()
+            .is_some_and(|authority| authority.requires_module_ack())
+            && changeset.fields.iter().any(|field| {
+                field.apply == subc_config::ApplyKind::RouteRebind && field.module_id == "subc"
+            })
+        {
+            return Err(GateError::new("daemon_route_policy_authority_unavailable", "daemon-owned route_rebind policy is not supported; scope authority changes require daemon restart"));
         }
         Ok(())
     }
@@ -210,12 +228,26 @@ impl RuntimeOwner {
         module: &str,
         generation: u64,
     ) -> Result<()> {
-        let authority = self.route_policy_authority.as_ref().ok_or_else(|| {
+        let authority = self.route_policy_authority.get().ok_or_else(|| {
             GateError::new(
                 "route_policy_authority_unavailable",
                 "config_gated: RoutePolicyAuthority is absent",
             )
         })?;
+        if authority.requires_module_ack() {
+            let module_id = module.to_owned();
+            if !self
+                .on_blocking(move |owner| {
+                    Ok(owner
+                        .lock()?
+                        .delivery
+                        .policy_acknowledged(&module_id, generation))
+                })
+                .await?
+            {
+                return Ok(());
+            }
+        }
         let module_id = module.to_owned();
         let prepared = self
             .on_blocking(move |owner| owner.prepare_route_policy(&module_id, generation))

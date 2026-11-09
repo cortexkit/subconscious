@@ -2739,6 +2739,45 @@ impl ForwardingTable {
         Ok(released)
     }
 
+    /// Revoke old bind decisions atomically, including binds still in flight.
+    /// The provider stays available: its acknowledged config governs new binds.
+    pub(crate) fn rebind_module_policy(
+        &self,
+        module_id: &str,
+    ) -> Result<(Vec<EndpointRoute>, Vec<GoodbyeTarget>), ForwardingError> {
+        let mut inner = self.write_inner()?;
+        let module = inner
+            .modules_by_id
+            .get(module_id)
+            .cloned()
+            .ok_or(ForwardingError::NoModuleConnection)?;
+        let endpoint = module.endpoint;
+        if inner.draining_endpoints.contains_key(&endpoint) {
+            return Err(ForwardingError::ModuleReloading {
+                module_id: module_id.to_owned(),
+            });
+        }
+        let target = begin_drain_locked(&mut inner, module_id, module, RouteCloseReason::Reload);
+        let routes = endpoint_routes_locked(&inner, endpoint);
+        let mut goodbyes = target.abandoned_bindings;
+        for route in &routes {
+            let target = &route.goodbye_target;
+            if let RouteRelease::Removed(module) = release_client_route_locked(
+                &mut inner,
+                ClientRouteKey {
+                    connection_id: target.connection_id,
+                    channel: target.channel,
+                },
+                target.epoch,
+            ) {
+                goodbyes.push(module);
+                goodbyes.push(target.clone());
+            }
+        }
+        inner.draining_endpoints.remove(&endpoint);
+        Ok((routes, goodbyes))
+    }
+
     /// Enumerate one endpoint's current routes without contacting the module.
     ///
     /// The read lock makes this safe while the endpoint drains: the returned

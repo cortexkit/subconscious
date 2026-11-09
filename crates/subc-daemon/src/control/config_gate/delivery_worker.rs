@@ -39,26 +39,61 @@ impl ControlHandler {
                     let Some(owner) = &control.config_runtime else {
                         break;
                     };
-                    let Ok((next, withdrawals, exits, pending, recoveries)) = owner
-                        .on_blocking(|owner| {
-                            let next = owner.retry_anchor().ok().flatten();
-                            let withdrawals = owner.take_phone_withdrawals();
-                            let exits = owner.delivery_exits().unwrap_or_default();
-                            let pending = owner
-                                .pending_config_restarts()
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter(|(module, _)| {
-                                    owner.delivery_exit_fence(module).ok().flatten().is_none()
-                                })
-                                .collect::<Vec<_>>();
-                            let recoveries = owner.delivery_take_recoveries().unwrap_or_default();
-                            Ok((next, withdrawals, exits, pending, recoveries))
-                        })
-                        .await
+                    let Ok((next, withdrawals, exits, pending, recoveries, holds, releases)) =
+                        owner
+                            .on_blocking(|owner| {
+                                let next = owner.retry_anchor().ok().flatten();
+                                let withdrawals = owner.take_phone_withdrawals();
+                                let exits = owner.delivery_exits().unwrap_or_default();
+                                let pending = owner
+                                    .pending_config_restarts()
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .filter(|(module, _)| {
+                                        owner.delivery_exit_fence(module).ok().flatten().is_none()
+                                    })
+                                    .collect::<Vec<_>>();
+                                let recoveries =
+                                    owner.delivery_take_recoveries().unwrap_or_default();
+                                let (holds, releases) = owner.take_admission_transitions()?;
+                                Ok((
+                                    next,
+                                    withdrawals,
+                                    exits,
+                                    pending,
+                                    recoveries,
+                                    holds,
+                                    releases,
+                                ))
+                            })
+                            .await
                     else {
                         break;
                     };
+                    for module in holds {
+                        if let Some(supervised) = control
+                            .supervisor
+                            .get(&module)
+                            .filter(|_| owner.check_module_hold(&module).is_err())
+                        {
+                            tasks.spawn(async move {
+                                let _ = supervised.config_exit_hold().await;
+                            });
+                        }
+                    }
+                    for module in releases {
+                        if let Some(supervised) =
+                            control.supervisor.get(&module).filter(|supervised| {
+                                supervised
+                                    .status()
+                                    .is_ok_and(|status| status.enabled && !status.process_alive)
+                            })
+                        {
+                            tasks.spawn(async move {
+                                let _ = supervised.set_enabled(true).await;
+                            });
+                        }
+                    }
                     for withdrawal in withdrawals {
                         let owner = Arc::downgrade(owner);
                         tasks.spawn(async move {

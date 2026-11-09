@@ -228,7 +228,16 @@ pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
     subc_os::start_time(pid)
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(target_os = "macos")]
+pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
+    subc_os::Process::open(pid)
+        .ok()
+        .flatten()?
+        .observe()
+        .map(|image| image.start_time)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub(crate) fn process_start_time(_pid: u32) -> Option<u64> {
     None
 }

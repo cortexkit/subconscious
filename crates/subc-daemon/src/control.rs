@@ -136,6 +136,9 @@ const SUBC_UNADVERTISED_CONTROL_OPS: &[&str] = &[
     "config.rollback",
 ];
 
+#[cfg(test)]
+#[path = "control/config_advertisement_tests.rs"]
+mod config_advertisement_tests;
 mod config_gate;
 mod scope_expiry;
 
@@ -367,6 +370,7 @@ pub struct ControlHandler {
     registry: Arc<Registry>,
     config_runtime: Option<Arc<crate::config_gate::runtime::RuntimeOwner>>,
     config_review_admission: Arc<dyn crate::config_gate::ReviewAdmission>,
+    config_review_admission_is_default: bool,
     activity: Option<crate::activity::ActivityLedger>,
     activity_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
     forwarding: Arc<ForwardingTable>,
@@ -1009,6 +1013,7 @@ impl ControlHandler {
             registry,
             config_runtime: None,
             config_review_admission: Arc::new(crate::config_gate::MissingReviewAdmission),
+            config_review_admission_is_default: true,
             activity: None,
             activity_streams: Arc::new(Mutex::new(HashMap::new())),
             forwarding,
@@ -2015,6 +2020,30 @@ impl ControlHandler {
         match frame.header.ty {
             FrameType::Ping => Ok(vec![pong(&frame)?]),
             FrameType::Hello => {
+                if let Ok(hello) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
+                    if let (Some(module), Some(nonce)) = (
+                        hello
+                            .get("manifest")
+                            .and_then(|value| value.get("module_id"))
+                            .and_then(|value| value.as_str()),
+                        hello.get("launch_nonce").and_then(|value| value.as_str()),
+                    ) {
+                        if !self.supervisor.wait_program_binding(module, nonce).await {
+                            self.forwarding.request_connection_close(
+                                ctx.connection_id,
+                                CloseReason::new(
+                                    "program_refused",
+                                    "the spawned program binding failed",
+                                ),
+                            );
+                            return Ok(vec![control_error_frame(
+                                &frame,
+                                "program_refused",
+                                "the spawned program binding failed",
+                            )?]);
+                        }
+                    }
+                }
                 self.handle_hello(ctx.connection_id, Some(ctx.egress.clone()), frame)
             }
             FrameType::Goodbye => self.handle_goodbye(ctx.connection_id),
@@ -2502,6 +2531,51 @@ impl ControlHandler {
                 )?])
             }
         };
+        if let Some(module) = hello_value
+            .get("manifest")
+            .and_then(|value| value.get("module_id"))
+            .and_then(|value| value.as_str())
+        {
+            if self
+                .config_runtime
+                .as_ref()
+                .is_some_and(|owner| owner.module_is_gated(module))
+                && !hello_value
+                    .get("launch_nonce")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|nonce| self.supervisor.spawned_consumer_authorized(module, nonce))
+            {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "reserved_module",
+                    "a gated identity belongs only to its supervised child",
+                )?]);
+            }
+        }
+        if let (Some(module), Some(nonce)) = (
+            hello_value
+                .get("manifest")
+                .and_then(|value| value.get("module_id"))
+                .and_then(|value| value.as_str()),
+            hello_value
+                .get("launch_nonce")
+                .and_then(|value| value.as_str()),
+        ) {
+            if !self.supervisor.program_binding_verified(module, nonce) {
+                self.forwarding.request_connection_close(
+                    connection_id,
+                    CloseReason::new(
+                        "program_refused",
+                        "the spawned program binding is not verified",
+                    ),
+                );
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "program_refused",
+                    "the spawned program binding is not verified",
+                )?]);
+            }
+        }
         if let Err(err) = validate_hello_capability_grammar(&hello_value) {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -3022,6 +3096,41 @@ impl ControlHandler {
         request: ClientControlRequest,
         route_open_timings: &mut Option<RouteOpenTimings>,
     ) -> Result<Vec<Frame>, RouterError> {
+        if let Some(owner) = &self.config_runtime {
+            let module = match &request {
+                ClientControlRequest::SupervisorRestart { module_id, .. }
+                | ClientControlRequest::SupervisorReload { module_id }
+                | ClientControlRequest::SupervisorSwap { module_id, .. }
+                | ClientControlRequest::SupervisorSetEnabled {
+                    module_id,
+                    enabled: true,
+                } => Some(module_id.as_str()),
+                _ => None,
+            };
+            let rescan = matches!(
+                &request,
+                ClientControlRequest::SupervisorRescan { preview: false }
+                    | ClientControlRequest::SupervisorRescanChecked { preview: false, .. }
+            );
+            let held = if module.is_some() || rescan {
+                let module = module.map(str::to_owned);
+                owner
+                    .on_blocking(move |owner| owner.checked_admission_hold(module.as_deref()))
+                    .await
+            } else {
+                Ok(())
+            };
+            if let Err(error) = held {
+                if error.code != "config_delivery_deferred" {
+                    let code = if error.code == "store_tampered" {
+                        "store_tampered"
+                    } else {
+                        "config_gated"
+                    };
+                    return Ok(vec![control_error_frame(&frame, code, error.detail)?]);
+                }
+            }
+        }
         if let Some(operation) = privileged_operation(&request) {
             let caller = self.resolve_caller(ctx.connection_id).await;
             let op = client_control_request_op(&request);
@@ -6261,6 +6370,9 @@ impl ControlHandler {
             self.route_outages
                 .operator_action_ended_unrefused(&module_id);
             let (code, message) = match err {
+                crate::supervise::SuperviseError::ConfigHeld { .. } => {
+                    ("config_gated", err.to_string())
+                }
                 crate::supervise::SuperviseError::Disabled { .. } => {
                     ("module_disabled", err.to_string())
                 }
@@ -6325,6 +6437,7 @@ impl ControlHandler {
             use crate::supervise::SuperviseError;
             let message = err.to_string();
             let error = match err {
+                SuperviseError::ConfigHeld { .. } => ErrorBody::new("config_gated", message),
                 SuperviseError::Disabled { .. } => ErrorBody::new("module_disabled", message),
                 SuperviseError::SwapRefused { reason, .. } => ErrorBody {
                     code: "swap_refused".to_string(),
@@ -6389,6 +6502,9 @@ impl ControlHandler {
             self.route_outages
                 .operator_action_ended_unrefused(&module_id);
             let (code, message) = match err {
+                crate::supervise::SuperviseError::ConfigHeld { .. } => {
+                    ("config_gated", err.to_string())
+                }
                 crate::supervise::SuperviseError::Disabled { .. } => {
                     ("module_disabled", err.to_string())
                 }
@@ -6978,7 +7094,11 @@ impl ControlHandler {
                     .operator_action_ended_unrefused(&module_id);
                 return Ok(vec![control_error_frame(
                     &frame,
-                    "target_unavailable",
+                    if matches!(err, crate::supervise::SuperviseError::ConfigHeld { .. }) {
+                        "config_gated"
+                    } else {
+                        "target_unavailable"
+                    },
                     format!("failed to set module_id '{module_id}' enabled={enabled}: {err}"),
                 )?]);
             }

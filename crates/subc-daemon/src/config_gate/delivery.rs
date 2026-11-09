@@ -10,6 +10,31 @@ use crate::config_store::Tuple;
 pub(crate) const CONFIG_LIVE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONFIG_WARMUP_SLACK: Duration = Duration::from_secs(10);
 
+fn allocate_spawn(
+    state: &mut OwnerState,
+    module: &str,
+    at: tokio::time::Instant,
+    register: Duration,
+    health: Duration,
+) -> Result<DeliverySpawn> {
+    let generation = state
+        .store
+        .loaded_module_generation(module)
+        .ok_or_else(|| GateError::new("config_gated", "configuration store is in recovery"))?;
+    state.delivery.next_spawn = state.delivery.next_spawn.checked_add(1).ok_or_else(|| {
+        GateError::new(
+            "delivery_spawn_exhausted",
+            "delivery spawn identifiers exhausted",
+        )
+    })?;
+    Ok(DeliverySpawn {
+        id: state.delivery.next_spawn,
+        module: module.into(),
+        generation,
+        deadline: at + register + health + CONFIG_WARMUP_SLACK,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct Attempt {
     module: String,
@@ -36,6 +61,9 @@ pub struct DeliverySpawn {
 }
 
 impl DeliverySpawn {
+    pub(crate) fn module(&self) -> &str {
+        &self.module
+    }
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -59,6 +87,20 @@ pub(super) struct DeliveryState {
     // Transport cleanup may precede the process-exit observation. Retain the
     // last active child's assigned generation, not an unattempted deferred one.
     last_target_attempt: HashMap<String, (u64, u64)>,
+}
+
+impl DeliveryState {
+    pub(super) fn started_at_generation(&self) -> u64 {
+        self.initial_generation
+    }
+    pub(super) fn policy_acknowledged(&self, module: &str, generation: u64) -> bool {
+        self.attempts.values().any(|attempt| {
+            attempt.module == module && attempt.generation == generation && attempt.acknowledged
+        })
+    }
+    pub(super) fn fenced_modules(&self) -> impl Iterator<Item = String> + '_ {
+        self.exited.keys().cloned()
+    }
 }
 
 /// Captured before a health RPC; only the same child and installed policy may
@@ -577,6 +619,16 @@ impl RuntimeOwner {
             .iter()
             .find(|(tuple, _)| tuple.module == spawn.module && tuple.project.is_none())
             .and_then(|(_, versions)| versions.pending);
+        let pending = pending.filter(|generation| {
+            state
+                .store
+                .loaded_admission_state()
+                .1
+                .generations
+                .get(generation)
+                .and_then(|entry| entry.delivery.as_ref())
+                .is_some_and(|delivery| delivery.declarations.contains_key(&spawn.module))
+        });
         if let Some(generation) = pending.filter(|generation| {
             *generation == spawn.generation
                 || state.delivery.last_target_attempt.get(&spawn.module)
@@ -751,10 +803,6 @@ impl RuntimeOwner {
                 && !state.delivery.exited.contains_key(&spawn.module),
         ))
     }
-    pub(crate) fn delivery_wait_for_owner(&self) -> Result<()> {
-        drop(self.lock()?);
-        Ok(())
-    }
     #[cfg(test)]
     pub(crate) fn pause_spawn_preflight_for_test(&self) {
         let hook = self.spawn_preflight_hook.lock().unwrap().take();
@@ -778,14 +826,24 @@ impl RuntimeOwner {
         health: Duration,
         active: bool,
     ) -> Result<Option<DeliverySpawn>> {
-        let spawn = self.delivery_spawned(module, at, register, health)?;
-        if let Some(spawn) = &spawn {
-            self.lock()?
-                .delivery
-                .unregistered_children
-                .insert((module.into(), active), spawn.clone());
-        }
-        Ok(spawn)
+        let mut state = OwnerGuard(
+            self.inner.try_lock().map_err(|_| {
+                GateError::new(
+                    "config_delivery_deferred",
+                    "configuration publication is busy",
+                )
+            })?,
+            &self.admission,
+            &self.delivery_changed,
+            &self.module_gates,
+        );
+        state.store.check()?;
+        let spawn = allocate_spawn(&mut state, module, at, register, health)?;
+        state
+            .delivery
+            .unregistered_children
+            .insert((module.into(), active), spawn.clone());
+        Ok(Some(spawn))
     }
     pub(crate) fn delivery_take_recoveries(
         &self,
@@ -863,27 +921,15 @@ impl RuntimeOwner {
         first_health_budget: Duration,
     ) -> Result<Option<DeliverySpawn>> {
         let mut state = self.lock()?;
-        let generation = state
-            .store
-            .body()?
-            .versions
-            .iter()
-            .find(|(tuple, _)| tuple.module == module && tuple.project.is_none())
-            .and_then(|(_, versions)| versions.pending.or(versions.active))
-            .unwrap_or(0);
-        let deadline = spawned_at + register_timeout + first_health_budget + CONFIG_WARMUP_SLACK;
-        state.delivery.next_spawn = state.delivery.next_spawn.checked_add(1).ok_or_else(|| {
-            GateError::new(
-                "delivery_spawn_exhausted",
-                "delivery spawn identifiers exhausted",
-            )
-        })?;
-        Ok(Some(DeliverySpawn {
-            id: state.delivery.next_spawn,
-            module: module.into(),
-            generation,
-            deadline,
-        }))
+        state.store.check()?;
+        allocate_spawn(
+            &mut state,
+            module,
+            spawned_at,
+            register_timeout,
+            first_health_budget,
+        )
+        .map(Some)
     }
 
     pub(crate) fn delivery_child_registered(

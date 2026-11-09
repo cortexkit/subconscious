@@ -9,6 +9,9 @@ struct Rig {
     declaration: ConfigDeclareRequest,
 }
 
+#[cfg(unix)]
+#[path = "admission_tests.rs"]
+mod admission_tests;
 #[path = "delivery_tests.rs"]
 mod delivery_tests;
 
@@ -159,7 +162,12 @@ fn config_desktop_owner_disconnect_expiry_and_consumption_clear_full_view_receip
 impl Rig {
     fn new() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
+        let root =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/scratch");
+        std::fs::create_dir_all(&root).unwrap();
+        #[cfg(windows)]
+        let root = std::fs::canonicalize(root).unwrap();
+        let path = root.join(format!(
             "subc-owner-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -400,7 +408,7 @@ fn config_owner_rollback_retains_raw_layers_and_recaptures_the_restored_program_
 }
 
 #[test]
-fn config_owner_rollback_path_change_is_refused_until_command_admission_is_installed() {
+fn config_admission_rollback_path_change_selects_the_restored_command() {
     let rig = Rig::new();
     std::fs::write(
         rig.path.join("cortexkit/a.jsonc"),
@@ -419,10 +427,15 @@ fn config_owner_rollback_path_change_is_refused_until_command_admission_is_insta
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(
-        owner.prepare(PlanKind::Rollback(1)).err().unwrap().code,
-        "rollback_command_authority_unavailable"
-    );
+    let prepared = owner.prepare(PlanKind::Rollback(1)).unwrap();
+    assert!(prepared
+        .candidate
+        .diagnostic
+        .inputs
+        .contains_key(&super::super::InputKey::Program {
+            module: "a".into(),
+            path: rig.path.join("program").to_string_lossy().into_owned(),
+        }));
     assert_eq!(owner.history().unwrap().0.len(), 1);
 }
 
@@ -484,7 +497,7 @@ fn config_owner_rollback_missing_program_is_named_and_creates_no_generation() {
     std::fs::remove_file(rig.path.join("program")).unwrap();
     assert_eq!(
         owner.prepare(PlanKind::Rollback(1)).err().unwrap().code,
-        "program_missing"
+        "program_refused"
     );
     assert_eq!(owner.history().unwrap().0.len(), 1);
 }

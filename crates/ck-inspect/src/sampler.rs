@@ -115,16 +115,21 @@ async fn atos_with(
     load: u64,
     addresses: Vec<u64>,
     deadline: tokio::time::Instant,
-) -> Option<String> {
+) -> Result<String, crate::sample::SymbolizerError> {
+    use crate::sample::SymbolizerError;
     if tokio::time::Instant::now() >= deadline {
-        return None;
+        return Err(SymbolizerError::DeadlineBeforeStart);
     }
     let dir = tempfile::Builder::new()
         .prefix("ck-inspect-atos-")
         .tempdir()
-        .ok()?;
+        .map_err(|_| SymbolizerError::Failed)?;
     let output_path = dir.path().join("symbols.txt");
-    let output = std::fs::File::create(&output_path).ok()?;
+    let output = std::fs::File::create(&output_path).map_err(|_| SymbolizerError::Failed)?;
+    // Creating the output file can spend the last of the shared deadline too.
+    if tokio::time::Instant::now() >= deadline {
+        return Err(SymbolizerError::DeadlineBeforeStart);
+    }
     let mut child = tokio::process::Command::new(path)
         .arg("-o")
         .arg(dwarf)
@@ -141,24 +146,34 @@ async fn atos_with(
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .ok()?;
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                SymbolizerError::Missing
+            } else {
+                SymbolizerError::Failed
+            }
+        })?;
     match tokio::time::timeout_at(deadline, child.wait()).await {
         Ok(Ok(status)) if status.success() => {}
-        _ => {
+        result => {
             // Only the symbolizer is ours to kill, never the inspected process.
             // Do not await reaping after the deadline: the outer profile timeout
             // must still receive the successfully sampled, unresolved stacks.
             let _ = child.start_kill();
-            return None;
+            return Err(if result.is_err() {
+                SymbolizerError::DeadlineMidRun
+            } else {
+                SymbolizerError::Failed
+            });
         }
     }
     let mut text = String::new();
     std::fs::File::open(output_path)
-        .ok()?
+        .map_err(|_| SymbolizerError::Failed)?
         .take(1024 * 1024)
         .read_to_string(&mut text)
-        .ok()?;
-    Some(text)
+        .map_err(|_| SymbolizerError::Failed)?;
+    Ok(text)
 }
 
 pub(crate) async fn capture(
@@ -199,6 +214,10 @@ pub(crate) async fn capture(
         Err("unsupported platform")
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "symbolization_tests.rs"]
+mod symbolization_tests;
 
 #[cfg(all(test, unix))]
 mod tests {

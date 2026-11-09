@@ -7,7 +7,9 @@ mod profile;
 mod sample;
 mod sampler;
 
-pub use profile::{Profile, Stack, Thread};
+pub use profile::{
+    Profile, Stack, Symbolization, SymbolizationReason, SymbolizationStatus, Thread,
+};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};

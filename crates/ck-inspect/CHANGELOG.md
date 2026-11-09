@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1
+
+- Add optional per-image macOS profile `symbolization` outcomes with distinct-frame counts and fixed failure reasons. Preserve offset frames and successful profiles on symbolization failures; distinguish an exhausted deadline before launch from a killed symbolizer in info-level stderr diagnostics without debug-file paths or stacks.
+- Include symbolization outcomes in the existing 16 KiB reply budget, truncating them last. The reply field is additive and optional: readers must ignore unknown object members. Existing typed replies accept absent outcomes and unknown members; Linux replies are unchanged.
+
 ## 0.4.0
 
 - Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.

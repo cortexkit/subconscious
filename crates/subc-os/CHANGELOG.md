@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.32
+
+- Enumerate Windows process creation identities with their parent and program names, and compare them against retained process handles instead of the adjustable wall clock. Clock rollback can no longer silently drop live processes; PID reuse remains explicit uncertainty.
+
 ## 0.1.31
 
 - Distinguish confirmed process exits from unreadable identities during Linux and macOS tree walks. Drop exited children instead of invalidating their parent's reading, without counting an exited child's CPU beside its parent's reaped counter. Unknown identities and PID reuse still reject the related tree.

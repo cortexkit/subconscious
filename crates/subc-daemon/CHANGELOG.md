@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.44.4
+
+- Use clock-independent Windows process snapshots so a backward wall-clock adjustment cannot hide live agent-command roots or silently reduce their resource trees. Add native Windows coverage for declaring a live contained command after clock rollback.
+
 ## 0.44.3
 
 - Adopt protocol 0.36.1 remote display names. Drop invalid names at decode; accept same-epoch name-only updates and serve the new name without invalidating in-flight binds, draining routes or losing service history. Pairing-roster and claim identity facts remain fixed for the epoch.

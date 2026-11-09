@@ -5,6 +5,21 @@ use std::io;
 
 use crate::{MemoryKind, ResourceUsage};
 
+#[cfg(feature = "test-support")]
+std::thread_local! {
+    static TEST_WALL_CLOCK: std::cell::Cell<Option<std::time::SystemTime>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+fn wall_clock_now() -> std::time::SystemTime {
+    #[cfg(feature = "test-support")]
+    if let Some(now) = TEST_WALL_CLOCK.get() {
+        return now;
+    }
+    std::time::SystemTime::now()
+}
+
 /// A process identity and its observed parent, session, program and resources.
 #[derive(Debug, Clone)]
 pub struct ProcessMember {
@@ -56,6 +71,21 @@ pub struct ProcessTable {
 }
 
 impl ProcessTable {
+    /// Override only this thread's snapshot wall clock, restoring it on unwind.
+    /// Native process creation times and the monotonic clock are not changed.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn with_test_wall_clock<T>(now: std::time::SystemTime, operation: impl FnOnce() -> T) -> T {
+        struct Restore(Option<std::time::SystemTime>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_WALL_CLOCK.set(self.0);
+            }
+        }
+        let _restore = Restore(TEST_WALL_CLOCK.replace(Some(now)));
+        operation()
+    }
+
     /// Inject a complete or explicitly unreadable snapshot for downstream
     /// accounting tests. This constructor is absent from normal library builds.
     #[cfg(feature = "test-support")]
@@ -83,24 +113,21 @@ impl ProcessTable {
     /// Read all visible processes once. Unreadable identities are retained as
     /// uncertainty, so a related tree cannot silently become a partial sum.
     pub fn read() -> io::Result<Self> {
+        Self::read_entries(entries)
+    }
+
+    fn read_entries(enumerate: impl FnOnce() -> io::Result<Vec<Entry>>) -> io::Result<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let revision = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let observed_at_ms = std::time::SystemTime::now()
+        let observed_at_ms = wall_clock_now()
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
             .unwrap_or(0);
         let started_at = std::time::Instant::now();
-        #[cfg(windows)]
-        let snapshot_started = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(io::Error::other)?
-            .as_nanos()
-            / 100
-            + 116_444_736_000_000_000;
         let mut members = BTreeMap::new();
         let mut unreadable = BTreeMap::new();
-        for (pid, parent, name, expected_start) in entries()? {
+        for (pid, parent, name, expected_start) in enumerate()? {
             let parent = parent.or_else(|| crate::parent_pid(pid));
             #[cfg(unix)]
             let session_id = {
@@ -132,10 +159,6 @@ impl ProcessTable {
                 }
                 continue;
             };
-            #[cfg(windows)]
-            if u128::from(start_time) > snapshot_started {
-                continue;
-            }
             let Some(start_time_ms) = crate::start_time_ms_from_native(start_time) else {
                 unreadable.insert(pid, (parent, session_id));
                 continue;
@@ -529,7 +552,7 @@ fn entries() -> io::Result<Vec<Entry>> {
     crate::windows::process_entries().map(|entries| {
         entries
             .into_iter()
-            .map(|(pid, parent, name)| (pid, parent, name, None))
+            .map(|(pid, parent, name, start)| (pid, parent, name, Some(start)))
             .collect()
     })
 }
@@ -546,6 +569,44 @@ fn entries() -> io::Result<Vec<Entry>> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[cfg(windows)]
+    #[test]
+    fn wall_clock_rollback_keeps_the_live_process_in_the_table() {
+        let pid = std::process::id();
+        let process = crate::Process::open(pid).unwrap().unwrap();
+        let start = process.observe().unwrap().start_time;
+        let table = ProcessTable::with_test_wall_clock(std::time::UNIX_EPOCH, || {
+            ProcessTable::read().unwrap()
+        });
+        assert_eq!(process.observe().unwrap().start_time, start);
+        assert!(
+            !table.unreadable.contains_key(&pid),
+            "the readable live process must not be classified as unreadable"
+        );
+        assert_eq!(
+            table.process(pid).map(|member| member.start_time),
+            Some(start),
+            "a wall clock earlier than process creation must not hide a live identity"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reused_enumerated_pid_is_retained_as_uncertainty() {
+        let pid = std::process::id();
+        let process = crate::Process::open(pid).unwrap().unwrap();
+        let start = process.observe().unwrap().start_time;
+        let mut rows = entries().unwrap();
+        let row = rows.iter_mut().find(|row| row.0 == pid).unwrap();
+        assert_eq!(row.3, Some(start));
+        row.3 = Some(start - 1);
+        let table = ProcessTable::read_entries(|| Ok(rows)).unwrap();
+        assert_eq!(process.observe().unwrap().start_time, start);
+        assert!(table.process(pid).is_none());
+        assert!(table.unreadable.contains_key(&pid));
+        assert_eq!(table.identity_alive(pid, start), None);
+    }
 
     fn member(
         pid: u32,

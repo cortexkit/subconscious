@@ -94,6 +94,54 @@ mod stopped_group_tests {
     use super::*;
 
     #[test]
+    fn wall_clock_rollback_keeps_a_declared_live_root() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        // An open pipe keeps the command alive throughout declaration.
+        let mut command = std::process::Command::new("cmd.exe");
+        command
+            .args(["/D", "/C", "more"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null());
+        let contained = subc_jobobject::spawn_contained(&mut command).unwrap();
+        let child = Child(contained.child);
+        let owner = Arc::new(Mutex::new(contained.job));
+        let pid = child.0.id();
+        let root = AgentCommandRoot {
+            pid,
+            start_time_ms: subc_os::process_start_time_ms(pid).unwrap(),
+        };
+        let process = subc_os::Process::open(pid).unwrap().unwrap();
+        let start = process.observe().unwrap().start_time;
+        assert_eq!(subc_os::parent_pid(pid), Some(std::process::id()));
+        let tracker = Tracker::default();
+        ProcessTable::with_test_wall_clock(std::time::UNIX_EPOCH, || {
+            tracker.declare(
+                "test-module",
+                std::process::id(),
+                1,
+                crate::subtree_resources::Target::Job(Arc::downgrade(&owner)),
+                Declaration {
+                    started: vec![root],
+                    ..Declaration::default()
+                },
+            );
+        });
+        assert_eq!(process.observe().unwrap().start_time, start);
+        assert!(
+            tracker.state.lock().unwrap().modules["test-module"]
+                .roots
+                .contains_key(&root),
+            "a wall clock earlier than creation must not reject a live child declaration"
+        );
+    }
+
+    #[test]
     fn stopped_windows_command_emits_no_agent_groups() {
         let table = ProcessTable::read().unwrap();
         let member = table.process(std::process::id()).unwrap();

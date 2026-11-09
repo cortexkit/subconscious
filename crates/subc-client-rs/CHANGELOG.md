@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.34.3
+
+- Add optional `ModuleHandler` configuration hooks: declare once, review immutable
+  snapshots, apply complete views, and observe wire-named delivery/refusal states.
+  Existing handlers advertise and send no new operations. Only a daemon without
+  `config.gate` invokes the opted-in module's legacy file-reader hook.
+- Retain the last view on `config_gated` and `not_delivery_target`, expose a typed
+  no-approved-config detail when no view exists, and retry `anchor_pending`
+  reports on the next change hint. Configuration work does not block the reader,
+  health checks, drain hooks or stop. Re-export shared schema helpers for reviews.
+
 ## 0.34.2
 
 0.34.1 was tagged in the repository but never published; its change ships here.

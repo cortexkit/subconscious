@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.34.2"
+version = "0.34.3"
 dependencies = [
  "async-trait",
  "cortexkit-paths",
@@ -2850,6 +2850,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "socket2",
+ "subc-config",
  "subc-control",
  "subc-os",
  "subc-protocol",

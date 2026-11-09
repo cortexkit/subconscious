@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod activity;
+pub mod config;
 pub mod consumer;
 mod operator_app;
 pub mod policy_cache;
@@ -481,6 +482,7 @@ struct ModuleHandleShared {
     /// with the pools the module's handler declares, before serving starts.
     dispatch_pools: Mutex<Arc<DispatchPools>>,
     catalog_send: tokio::sync::Mutex<()>,
+    config: config::Session,
     inner: Mutex<ModuleHandleState>,
 }
 
@@ -491,6 +493,7 @@ struct ModuleHandleState {
     pending_operator_confirms: HashMap<u64, oneshot::Sender<Frame>>,
     pending_activity_records: HashMap<u64, oneshot::Sender<Frame>>,
     pending_scope_served_by: HashMap<u64, oneshot::Sender<Frame>>,
+    pending_config_calls: HashMap<u64, oneshot::Sender<Frame>>,
     current_provides: Option<Vec<ProviderRole>>,
     catalog_changes: VecDeque<CatalogChange>,
     closed: bool,
@@ -557,6 +560,7 @@ impl ModuleHandle {
                 close_token,
                 dispatch_pools: Mutex::new(Arc::new(DispatchPools::new(RequestPools::new()))),
                 catalog_send: tokio::sync::Mutex::new(()),
+                config: config::Session::default(),
                 inner: Mutex::new(ModuleHandleState {
                     writer: Some(writer),
                     next_corr: Some(HELLO_CORR + 1),
@@ -564,6 +568,7 @@ impl ModuleHandle {
                     pending_operator_confirms: HashMap::new(),
                     pending_activity_records: HashMap::new(),
                     pending_scope_served_by: HashMap::new(),
+                    pending_config_calls: HashMap::new(),
                     current_provides: None,
                     catalog_changes: VecDeque::new(),
                     closed: false,
@@ -1286,6 +1291,15 @@ impl ModuleHandle {
     }
 
     fn handle_control_reply(&self, frame: Frame) -> bool {
+        let config_reply = self
+            .shared
+            .lock_inner()
+            .pending_config_calls
+            .remove(&frame.header.corr);
+        if let Some(reply) = config_reply {
+            let _ = reply.send(frame);
+            return true;
+        }
         let served_by_reply = self
             .shared
             .lock_inner()
@@ -1451,6 +1465,7 @@ impl ModuleHandleShared {
             inner.pending_operator_confirms.clear();
             inner.pending_activity_records.clear();
             inner.pending_scope_served_by.clear();
+            inner.pending_config_calls.clear();
             inner
                 .pending_catalog_updates
                 .drain()
@@ -1790,6 +1805,49 @@ pub trait ModuleHandler: Send + Sync + 'static {
     /// Called once after HELLO_ACK so the module can inspect the ack body for
     /// negotiated capabilities and any storage descriptor supplied by the daemon.
     async fn on_hello_ack(&self, _ack: &ModuleHelloAckBody) {}
+
+    /// Opt in once per connection. The SDK advertises `config.review`, declares
+    /// these locations, and fetches immutable views before calling `config_apply`.
+    /// Returning `None` leaves the existing module wire and file reader unchanged.
+    fn config_declaration(&self) -> Option<config::ConfigDeclareRequest> {
+        None
+    }
+
+    /// Pure review of supplied snapshots and base. Do not read mutable files,
+    /// environment, network or secrets here. Runs off the connection reader.
+    async fn config_review(
+        &self,
+        _request: config::ConfigReviewRequest,
+    ) -> config::ConfigReviewReply {
+        config::ConfigReviewReply::new(
+            vec![],
+            vec![config::ConfigReviewRefusal::new(
+                "value_invalid",
+                vec![],
+                vec!["module has no config review implementation".into()],
+            )],
+        )
+    }
+
+    /// Atomically apply a complete view, or leave the previous view intact and
+    /// return secret-free NACK reasons. Readiness is included in a successful
+    /// return. Runs off the reader; health and drain hooks remain independent.
+    async fn config_apply(&self, _view: config::ConfigView) -> Result<(), Vec<String>> {
+        Err(vec!["module has no config apply implementation".into()])
+    }
+
+    /// Use the module's existing file reader. Called only for an opted-in module
+    /// whose HELLO_ACK lacks `config.gate`, never after a gate refusal.
+    async fn config_files(&self) {}
+
+    /// Observe wire status and refusals without ending the serving connection.
+    async fn on_config_state(&self, _state: config::ConfigState) {}
+
+    /// Observe transport, malformed-reply and other config errors. These never
+    /// authorize a file fallback or end the module connection.
+    async fn on_config_error(&self, error: config::ConfigError) {
+        tracing::warn!(%error, "module configuration request failed");
+    }
 
     /// Decide a route.bind. This hook is decision-only and must not emit route traffic.
     async fn on_bind(&self, _req: &RouteBindRequest) -> BindDecision {
@@ -2475,11 +2533,12 @@ where
     let connection_runtime = tokio::runtime::Handle::current();
     let mut writer = tokio::spawn(drain_writer(write_half, rx));
     let handler = Arc::new(handler);
+    let declaration = handler.config_declaration();
 
     let mut hello_ack = None;
     let provides = manifest.provides.clone();
     let handshake = async {
-        send_hello(&tx, manifest).await?;
+        send_hello(&tx, manifest, declaration.is_some()).await?;
         // A validated ACK means the daemon accepted the module, even while the
         // module's callback is pending. Keep that boundary when the writer wins.
         hello_ack = Some(expect_hello_ack(&mut read_half).await?);
@@ -2557,6 +2616,9 @@ where
         connection_runtime,
     );
     handle.shared.lock_inner().current_provides = Some(provides);
+    if let Some(declaration) = declaration {
+        let _ = handle.shared.config.declaration.set(declaration);
+    }
     let serve_future = connection_serve_future_with_options(
         read_half,
         tx,
@@ -2617,6 +2679,7 @@ where
         // reconnect task or in-flight reconnect gate; a supervisor that needs
         // recovery starts a fresh serve_with_handle invocation.
         let dispatcher = RequestDispatcher::with_pools(serve_handle.dispatch_pools());
+        config::start(serve_handle.clone(), Arc::clone(&handler), &dispatcher);
         let mut writer_finished = writer_end.is_some();
         let mut loop_result = if let Some(end) = writer_end {
             end
@@ -2638,6 +2701,7 @@ where
             loop_result = writer_connection_end((&mut writer).await);
         }
         let deadline = Instant::now() + options.writer_drain_timeout;
+        serve_handle.shared.config.stop.cancel();
         dispatcher.wait_for_draining_hooks_to_start().await;
         dispatcher.tasks.close();
         if matches!(loop_result, Ok(ConnectionEnd::Closed))
@@ -2857,6 +2921,9 @@ where
             Ok(true)
         }
         FrameType::Push if frame.header.channel == 0 => {
+            if config::changed(&frame, &module_handle) {
+                return Ok(true);
+            }
             handle_control_push(&frame, handler, &dispatcher);
             Ok(true)
         }
@@ -3222,6 +3289,15 @@ async fn handle_control_request<H>(
 where
     H: ModuleHandler,
 {
+    if config::review(
+        &frame,
+        egress,
+        Arc::clone(&handler),
+        &dispatcher,
+        &module_handle,
+    ) {
+        return Ok(());
+    }
     // A control request this SDK cannot decode (most likely a newer daemon's
     // field or operation) is refused on its own correlation id, and the
     // connection stays up. Returning the decode error would end the serve loop,
@@ -3400,6 +3476,7 @@ where
 async fn send_hello(
     egress: &mpsc::Sender<Frame>,
     mut manifest: ModuleManifest,
+    config_gate: bool,
 ) -> Result<(), SubcModuleError> {
     let launch_nonce = match retained_launch_nonce() {
         Some(retained) => Some(retained),
@@ -3408,10 +3485,14 @@ async fn send_hello(
             .map(|nonce| nonce.value().to_string()),
     };
     stamp_launch_nonce_source(&mut manifest, launch_nonce.as_deref());
+    let mut control_ops = vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()];
+    if config_gate {
+        control_ops.push(config::CONFIG_REVIEW_OP.to_owned());
+    }
     let body = serde_json::to_vec(&ModuleHelloBody {
         manifest,
         protocol_ver: PROTOCOL_VERSION,
-        control_ops: Some(vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()]),
+        control_ops: Some(control_ops),
         launch_nonce,
     })
     .map_err(SubcModuleError::Json)?;

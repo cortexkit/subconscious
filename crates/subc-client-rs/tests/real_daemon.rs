@@ -6601,3 +6601,6 @@ mod capability_deny;
 
 #[path = "real_daemon/binary_replies.rs"]
 mod binary_replies;
+
+#[path = "real_daemon/config_gate.rs"]
+mod config_gate;

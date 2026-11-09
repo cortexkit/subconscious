@@ -1,5 +1,11 @@
 # subc-client-rs
 
+Opt-in modules can use the `config` module's documented `ModuleHandler` hooks to
+declare, review and apply daemon-provided configuration. Its compile-checked
+counter sample shows the complete adoption in fewer than 60 lines. Gate refusals
+never authorize reading local files; `config_files` runs only with an older daemon
+whose HELLO_ACK lacks `config.gate`.
+
 Rust module serving and consumer APIs for the Subconscious daemon.
 
 ## Slow startup without blocking the daemon connection

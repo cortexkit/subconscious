@@ -1719,9 +1719,23 @@ fn supervised_fixture_with_carry(
     crate::supervise::Supervisor,
     std::sync::Arc<crate::ControlHandler>,
 ) {
+    supervised_fixture_with_program(has_active, carry_containment, b"#!/bin/sh\nprintf 'started\\n' >> \"$2\"\nif [ ! -e \"$1\" ]; then : > \"$1\"; exit 23; fi\nwhile :; do /bin/sleep 600; done\n")
+}
+
+#[cfg(unix)]
+fn supervised_fixture_with_program(
+    has_active: bool,
+    carry_containment: bool,
+    program: &[u8],
+) -> (
+    Rig,
+    std::sync::Arc<RuntimeOwner>,
+    crate::supervise::Supervisor,
+    std::sync::Arc<crate::ControlHandler>,
+) {
     use std::{os::unix::fs::PermissionsExt, sync::Arc};
     let rig = Rig::new();
-    std::fs::write(rig.path.join("program"), b"#!/bin/sh\nprintf 'started\\n' >> \"$2\"\nif [ ! -e \"$1\" ]; then : > \"$1\"; exit 23; fi\nwhile :; do /bin/sleep 600; done\n").unwrap();
+    std::fs::write(rig.path.join("program"), program).unwrap();
     std::fs::set_permissions(
         rig.path.join("program"),
         std::fs::Permissions::from_mode(0o700),
@@ -1915,6 +1929,88 @@ async fn config_delivery_supervisor_pre_hello_crash_defers_respawn_without_spend
     );
     module.stop().await.unwrap();
     other.stop().await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn config_delivery_supervisor_pre_hello_crash_after_unavailable_witness_spends_budget() {
+    use std::io::Write;
+    let (rig, owner, supervisor, _handler) = supervised_fixture_with_program(
+        true,
+        false,
+        b"#!/bin/sh\nprintf 'started\\n' >> \"$2\"\nread -r release < \"$1\"\nexit 23\n",
+    );
+    let release = rig.path.join("a.seen");
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&release)
+        .status()
+        .unwrap()
+        .success());
+    let checked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let checked_hook = checked.clone();
+    supervisor.set_admission_hook_for_test(move |module, stage, pid| {
+        if module != "a" {
+            return true;
+        }
+        match stage {
+            // Model a transient /proc image read failure while the real program
+            // is blocked on its release pipe, not yet waitable as an exited child.
+            "after_content_witness_check" => {
+                assert!(subc_os::child_exit::observe(pid.unwrap()).unwrap().is_none());
+                checked_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                false
+            }
+            "before_content_witness_kill" => {
+                assert!(checked_hook.load(std::sync::atomic::Ordering::SeqCst));
+                writeln!(std::fs::File::create(&release).unwrap(), "crash").unwrap();
+                // Finish the program's own exit before the supervisor can signal
+                // it. WNOWAIT observes the status without stealing its reap.
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    if let Some(exit) = subc_os::child_exit::observe(pid.unwrap()).unwrap() {
+                        assert_eq!(exit.code(), Some(23));
+                        break;
+                    }
+                    assert!(std::time::Instant::now() < deadline, "program did not exit");
+                    std::thread::yield_now();
+                }
+                true
+            }
+            _ => true,
+        }
+    });
+    let module = supervisor.spawn(supervised_spec(&rig, "a")).unwrap();
+    wait_for_supervised_stage(&module, "unavailable-witness crash defers recovery", || {
+        owner.delivery_exit_fence("a").unwrap().is_some()
+            && module.state().unwrap() == crate::supervise::ModuleState::Restarting
+    })
+    .await;
+    assert!(checked.load(std::sync::atomic::Ordering::SeqCst));
+    let status = module.status().unwrap();
+    assert_eq!(
+        status.restart_count, 1,
+        "a real exit 23 after exec spends one entry even when its witness was unavailable"
+    );
+    assert_eq!(status.lifetime_restarts, 1);
+    assert!(!status.process_alive);
+    assert_eq!(status.last_exit.unwrap().code, Some(23));
+    assert_eq!(
+        std::fs::read_to_string(rig.path.join("a.launches"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "the exit fence must prevent a second exec"
+    );
+    let probe = crate::supervise::Supervisor::new(
+        std::sync::Arc::new(crate::Registry::default()),
+        crate::supervise::RestartPolicy::default(),
+    )
+    .with_config_runtime(owner.clone());
+    let deferred = probe.spawn(supervised_spec(&rig, "a")).unwrap();
+    assert_eq!(deferred.status().unwrap().restart_count, 0);
+    deferred.stop().await.unwrap();
+    module.stop().await.unwrap();
 }
 
 #[cfg(unix)]

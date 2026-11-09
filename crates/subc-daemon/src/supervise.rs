@@ -11283,6 +11283,19 @@ fn launch_child_in_slot(
             )),
             _ => Ok(()),
         };
+        #[cfg(all(test, target_os = "linux"))]
+        let checked = if roster.admission_event_for_test(
+            &spec.module_id,
+            "after_content_witness_check",
+            Some(pid),
+        ) {
+            checked
+        } else {
+            Err(crate::config_gate::GateError::new(
+                "config_delivery_deferred",
+                "current process image is unavailable",
+            ))
+        };
         if let Err(error) = checked {
             if let Some(binding) = &mut supervised._program_binding {
                 binding.reject();
@@ -11293,6 +11306,12 @@ fn launch_child_in_slot(
                 || supervised.child.try_wait().ok().flatten().is_none()
             {
                 supervised.spawn_failure = Some(format!("{}: {}", error.code, error.detail));
+                #[cfg(all(test, target_os = "linux"))]
+                assert!(roster.admission_event_for_test(
+                    &spec.module_id,
+                    "before_content_witness_kill",
+                    Some(pid),
+                ));
                 #[cfg(target_os = "linux")]
                 kill_module_cgroup(supervised.cgroup_placement.as_ref(), &supervised.module_id);
                 let _ = supervised.start_kill();

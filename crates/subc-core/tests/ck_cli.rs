@@ -531,7 +531,9 @@ fn ckni_json_wins_over_each_plain_table_and_versions_the_piped_ck_payload() {
         let mut legacy: Value = serde_json::from_slice(&ck.stdout).unwrap();
         if args == ["module", "list"] {
             // The two requests observe the daemon at different instants. Keep
-            // field names and kinds in the comparison, but not live counters.
+            // field names and kinds in the comparison, but not live counters,
+            // nor the time each reading was measured: a background refresh can
+            // commit a newer reading between the two requests.
             for value in [&mut versioned, &mut legacy] {
                 for field in ["memory_bytes", "cpu_user_ms", "cpu_system_ms", "swap_bytes"] {
                     if let Some(counter) = value["daemon"]["resources"].get_mut(field) {
@@ -539,6 +541,7 @@ fn ckni_json_wins_over_each_plain_table_and_versions_the_piped_ck_payload() {
                         *counter = json!("<resource_counters>");
                     }
                 }
+                mask_measured_at(value);
             }
         }
         if args == ["activity"] {
@@ -546,6 +549,29 @@ fn ckni_json_wins_over_each_plain_table_and_versions_the_piped_ck_payload() {
         } else {
             assert_eq!(versioned, legacy);
         }
+    }
+}
+
+/// Replace every `measured_at_ms` in a module-list reply (daemon row, module
+/// trees, agent commands) with a placeholder, after checking it is still a
+/// millisecond time.
+fn mask_measured_at(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, field) in map.iter_mut() {
+                if key == "measured_at_ms" {
+                    assert!(
+                        field.is_u64(),
+                        "measured_at_ms must remain a millisecond time"
+                    );
+                    *field = json!("<measured_at_ms>");
+                } else {
+                    mask_measured_at(field);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(mask_measured_at),
+        _ => {}
     }
 }
 

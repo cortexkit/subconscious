@@ -22,6 +22,8 @@ use crate::{
 };
 
 pub struct RuntimeOwner {
+    #[cfg(test)]
+    pub(crate) swap_preflight_attempts: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "test-support")]
     test_hooks: Option<crate::config_store::testing::TestSupport>,
     #[cfg(test)]
@@ -32,6 +34,7 @@ pub struct RuntimeOwner {
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     delivery_changed: std::sync::Arc<tokio::sync::Notify>,
     route_policy_authority: std::sync::OnceLock<std::sync::Arc<dyn RoutePolicyAuthority>>,
+    binding_retirements: Mutex<BTreeMap<usize, Box<dyn Fn() + Send + Sync>>>,
     canceled_approvals: Mutex<Vec<u64>>,
     // Reader and Drop callbacks must not wait behind a keychain or disk check.
     // These short queues/indexes never perform store I/O while locked.
@@ -55,6 +58,52 @@ pub struct RuntimeOwner {
     desktop_receipt_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(all(test, unix))]
     approval_claim_pause: Mutex<Option<ApprovalClaimPause>>,
+}
+
+/// An in-memory cutover transaction. It is borrowed only for synchronous
+/// forwarding, registry and delivery-target publication under one module gate.
+pub(crate) struct SwapConfiguration<'a> {
+    owner: &'a RuntimeOwner,
+    state: OwnerGuard<'a>,
+}
+
+impl SwapConfiguration<'_> {
+    pub(crate) fn before_cutover(
+        &mut self,
+        module: &str,
+        connection: ConnectionId,
+        spawn: Option<&DeliverySpawn>,
+    ) -> Result<Option<u64>> {
+        match self.state.store.loaded_admission_state().0 {
+            StoreState::Unstamped => return Ok(None),
+            StoreState::Stamped => {}
+            _ => {
+                return Err(GateError::new(
+                    "config_gated",
+                    "configuration store is in recovery",
+                ))
+            }
+        }
+        let newer = RuntimeOwner::requires_fresher_spawn_loaded(&self.state, module, spawn)?;
+        if newer.is_none() {
+            self.owner.module_get_locked(
+                &mut self.state,
+                connection,
+                module,
+                subc_protocol::config::ConfigGetRequest::new(),
+                false,
+            )?;
+        }
+        Ok(newer)
+    }
+    pub(crate) fn promoted(
+        &mut self,
+        module: &str,
+        connection: ConnectionId,
+        at: tokio::time::Instant,
+    ) -> Result<()> {
+        RuntimeOwner::promote_loaded(&mut self.state, connection, module, at).map(|_| ())
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -545,6 +594,8 @@ impl RuntimeOwner {
         let initial_generation = store.body().map(|body| body.last_generation).unwrap_or(0);
         let admission = std::sync::RwLock::new(admission::AdmissionCache::from_store(&store));
         Self {
+            #[cfg(test)]
+            swap_preflight_attempts: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-support")]
             test_hooks: store.test_support().cloned(),
             #[cfg(test)]
@@ -581,6 +632,7 @@ impl RuntimeOwner {
             module_gates: Mutex::new(HashMap::new()),
             delivery_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             route_policy_authority: std::sync::OnceLock::new(),
+            binding_retirements: Mutex::new(BTreeMap::new()),
             canceled_approvals: Mutex::new(Vec::new()),
             approval_request_index: Mutex::new(HashMap::new()),
             disconnected_pending: Mutex::new(Vec::new()),
@@ -611,6 +663,17 @@ impl RuntimeOwner {
             .lock()
             .map_err(|_| GateError::new("config_unavailable", "module gate lock is poisoned"))?;
         Ok(gates.entry(module.into()).or_default().clone())
+    }
+
+    pub(crate) fn install_binding_retirement(
+        &self,
+        key: usize,
+        retire: impl Fn() + Send + Sync + 'static,
+    ) {
+        self.binding_retirements
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, Box::new(retire));
     }
 
     pub(crate) fn delivery_notifications(&self) -> std::sync::Arc<tokio::sync::Notify> {
@@ -649,6 +712,38 @@ impl RuntimeOwner {
         self.drain_abandoned_spawns(&mut guard);
         guard.expire_idle(Instant::now());
         Ok(guard)
+    }
+
+    pub(crate) fn try_swap_configuration(&self) -> Result<SwapConfiguration<'_>> {
+        let state = self.inner.try_lock().map_err(|_| {
+            GateError::new(
+                "config_delivery_deferred",
+                "configuration publication is busy or unavailable",
+            )
+        })?;
+        Ok(SwapConfiguration {
+            owner: self,
+            state: OwnerGuard(
+                state,
+                &self.admission,
+                &self.delivery_changed,
+                &self.module_gates,
+            ),
+        })
+    }
+
+    pub(crate) fn try_requires_fresher_spawn(
+        &self,
+        module: &str,
+        spawn: Option<&DeliverySpawn>,
+    ) -> Result<Option<u64>> {
+        let state = self.inner.try_lock().map_err(|_| {
+            GateError::new(
+                "config_delivery_deferred",
+                "configuration publication is busy or unavailable",
+            )
+        })?;
+        Self::requires_fresher_spawn_loaded(&state, module, spawn)
     }
 
     pub(crate) fn sweep_expired(&self) -> Result<()> {
@@ -729,6 +824,17 @@ impl RuntimeOwner {
         request: subc_protocol::config::ConfigGetRequest,
     ) -> Result<subc_protocol::config::ConfigGetReply> {
         let mut state = self.lock()?;
+        self.module_get_locked(&mut state, connection, module, request, true)
+    }
+
+    fn module_get_locked(
+        &self,
+        state: &mut OwnerState,
+        connection: ConnectionId,
+        module: &str,
+        request: subc_protocol::config::ConfigGetRequest,
+        check_store: bool,
+    ) -> Result<subc_protocol::config::ConfigGetReply> {
         let declaration = state
             .declarations
             .get(&connection)
@@ -746,15 +852,17 @@ impl RuntimeOwner {
                 format!("{module}: project layer registry is not connected"),
             ));
         }
-        state.store.check()?;
-        if state.store.status().state == StoreState::Unstamped {
+        if check_store {
+            state.store.check()?;
+        }
+        if state.store.loaded_admission_state().0 == StoreState::Unstamped {
             if request.generation.is_some() || request.attempt.is_some() {
                 return Err(GateError::new(
                     "config_gated",
                     "unstamped reads have no assigned generation or delivery attempt",
                 ));
             }
-            let mut declarations = Self::declarations(&mut state)?;
+            let mut declarations = Self::declarations(state)?;
             declarations.insert(module.into(), declaration);
             let mut captured = self
                 .capturer
@@ -766,8 +874,14 @@ impl RuntimeOwner {
                 .view;
             return Ok(subc_protocol::config::ConfigGetReply::new(Some(view), None));
         }
-        state.store.delivery_ready()?;
-        let body = state.store.body()?;
+        if check_store {
+            state.store.delivery_ready()?;
+        }
+        let body = if check_store {
+            state.store.body()?
+        } else {
+            state.store.loaded_admission_state().1
+        };
         let tuple = crate::config_store::Tuple {
             module: module.into(),
             project: None,
@@ -829,8 +943,11 @@ impl RuntimeOwner {
                 "module has no active or deliverable generation",
             ));
         }
+        if !check_store {
+            return Ok(subc_protocol::config::ConfigGetReply::new(active, pending));
+        }
         delivery::bind_get(
-            &mut state,
+            state,
             connection,
             module,
             &request,
@@ -1359,6 +1476,21 @@ impl RuntimeOwner {
             state.plan_deadlines.remove(&digest);
             state.retained_plan_files.remove(&digest);
             state.desktop_views.retain(|_, (shown, _)| shown != &digest);
+        }
+        let unstamped = result.is_ok() && state.store.status().state == StoreState::Unstamped;
+        drop(state);
+        if unstamped {
+            // Retire only after releasing the store mutex: a running-image
+            // check holds the ProgramLaunch mutex while recording a refusal,
+            // and retiring Windows handles takes that same mutex.
+            for retire in self
+                .binding_retirements
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+            {
+                retire();
+            }
         }
         result
     }

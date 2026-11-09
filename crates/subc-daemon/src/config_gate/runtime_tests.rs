@@ -1213,3 +1213,54 @@ fn config_phone_disconnect_refreshes_the_preserved_plans_idle_deadline() {
         "phone disconnect must start a new idle hour, not expire the just-withdrawn plan"
     );
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn config_admission_windows_protocol_none_keeps_binding_until_child_exit() {
+    use crate::supervise::{RestartPolicy, Supervisor};
+    use std::sync::Arc;
+    let rig = Rig::new();
+    let program = rig.path.join("program.exe");
+    std::fs::copy(
+        std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/ping.exe"),
+        &program,
+    )
+    .unwrap();
+    let covered = rig.path.join("covered.txt");
+    std::fs::write(&covered, b"approved").unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":program,"args":["-t","127.0.0.1"],"protocol":"none","program_files":[covered]}}})).unwrap()).unwrap();
+    let owner = Arc::new(rig.owner("windows-no-hello"));
+    rig.stamp(&owner);
+    let supervisor = Supervisor::new_for_test(
+        Arc::new(crate::Registry::default()),
+        RestartPolicy::default(),
+    )
+    .with_config_runtime(owner);
+    let spec = crate::daemon_config::load(rig.path.join("subc.jsonc"))
+        .unwrap()
+        .unwrap()
+        .modules[0]
+        .module_spec();
+    let module = supervisor.spawn_async(spec).await.unwrap();
+    let alive = module.status().unwrap().process_alive;
+    let excluded = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&covered)
+        .err()
+        .and_then(|error| error.raw_os_error());
+    module.stop().await.unwrap();
+    let released = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&covered)
+        .is_ok();
+    assert!(alive);
+    assert_eq!(
+        excluded,
+        Some(32),
+        "a child without HELLO retains its Windows content witness until exit"
+    );
+    assert!(
+        released,
+        "a reaped child cannot keep a write-exclusion handle alive"
+    );
+}

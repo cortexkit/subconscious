@@ -758,6 +758,40 @@ async fn config_admission_ack_expired_before_revocation_closes_no_routes() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn config_admission_route_rebind_rechecks_deadline_after_forwarding_write_wait() {
+    let (_rig, owner, forwarding, view) = acknowledged_route_fixture();
+    let locked = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let unlock = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let locker = {
+        let (forwarding, locked, unlock) = (forwarding.clone(), locked.clone(), unlock.clone());
+        std::thread::spawn(move || {
+            forwarding.with_forwarding_write_lock_for_test(|| {
+                locked.wait();
+                unlock.wait();
+            })
+        })
+    };
+    locked.wait();
+    let hold = std::sync::Arc::new(std::sync::Barrier::new(2));
+    forwarding.pause_policy_rebind_before_write(hold.clone());
+    let runtime = tokio::runtime::Handle::current();
+    let installation = std::thread::spawn(move || {
+        runtime.block_on(owner.install_approved_route_policy("a", view.generation))
+    });
+    hold.wait();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    hold.wait();
+    unlock.wait();
+    locker.join().unwrap();
+    let _ = installation.join().unwrap();
+    assert_eq!(
+        forwarding.active_binding_count().unwrap(),
+        1,
+        "a deadline crossed while awaiting forwarding publication must revoke no routes"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn config_admission_route_rebind_nack_and_timeout_close_nothing() {
     for timed_out in [false, true] {
         let (rig, owner) = rig();

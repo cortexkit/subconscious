@@ -747,6 +747,131 @@ async fn config_admission_registered_actor_serves_commands_while_its_gate_is_hel
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn config_admission_swap_cutover_does_not_park_stop_behind_owner_publication() {
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let path = rig.path.join("subc.jsonc");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    document["modules"]["a"]["overlap"] = json!("safe");
+    std::fs::write(path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let owner = Arc::new(rig.owner("swap-owner-busy"));
+    rig.stamp(&owner);
+    let registry = Arc::new(crate::Registry::default());
+    let forwarding = Arc::new(crate::ForwardingTable::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_forwarding(forwarding.clone())
+        .with_config_runtime(owner.clone())
+        .with_drain_timeout(Duration::from_millis(20));
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    let mut manifest = subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build();
+    manifest.ready = Some(true);
+    registry
+        .register_with_control_ops(
+            manifest.clone(),
+            subc_protocol::PROTOCOL_VERSION,
+            ConnectionId::new(770),
+            vec![],
+        )
+        .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    forwarding
+        .register_module_connection(
+            ConnectionId::new(770),
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(tx),
+        )
+        .unwrap();
+    let swapping = {
+        let module = module.clone();
+        tokio::spawn(async move { module.swap(Some(Duration::from_secs(5))).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(nonce) = handle.candidate_launch_nonce_for_test("a") {
+                if handle.has_program_binding("a", &nonce)
+                    && handle.wait_program_binding("a", &nonce).await
+                {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let guard = owner.lock().unwrap();
+    registry
+        .register_candidate_with_control_ops(
+            manifest,
+            subc_protocol::PROTOCOL_VERSION,
+            ConnectionId::new(771),
+            vec!["config.review".into(), "health.check".into()],
+        )
+        .unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    forwarding
+        .register_candidate_module_connection(
+            ConnectionId::new(771),
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(tx),
+        )
+        .unwrap();
+    let probe = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    forwarding
+        .complete_module_control_rpc(
+            ConnectionId::new(771),
+            probe.header.corr,
+            Some("health.check"),
+            crate::forwarding::ModuleControlRpcOutcome::Response(
+                subc_protocol::session::ModuleControlResponse::HealthCheck {
+                    status: subc_protocol::session::HealthStatus::Ok,
+                    detail: None,
+                    metrics: None,
+                },
+            ),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while owner
+            .swap_preflight_attempts
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    registry
+        .deregister_connection(ConnectionId::new(770))
+        .unwrap();
+    registry
+        .deregister_connection(ConnectionId::new(771))
+        .unwrap();
+    let stopped = tokio::time::timeout(Duration::from_millis(500), module.stop()).await;
+    drop(guard);
+    let _ = swapping.await.unwrap();
+    if stopped.is_err() {
+        let _ = module.stop().await;
+    }
+    assert!(
+        stopped.is_ok(),
+        "the module gate parked stop behind blocking owner publication"
+    );
+}
+
 #[tokio::test]
 async fn config_admission_exit_observation_does_not_park_commands_behind_the_owner_mutex() {
     let rig = rig();
@@ -832,6 +957,61 @@ async fn config_admission_rollback_executes_the_current_restored_path_and_rechec
     assert_eq!(
         owner.prepare_spawn(&spec(&rig)).err().unwrap().code,
         "program_refused"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn config_admission_post_exec_hashes_a_protocol_none_child() {
+    let rig = rig();
+    let owner = Arc::new(rig.owner("post-exec-none"));
+    rig.stamp(&owner);
+    let program = rig.path.join("program");
+    let identity =
+        subc_os::retained_file_identity(&std::fs::File::open(&program).unwrap()).unwrap();
+    owner.set_spawn_exec_hook_for_test(move || {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&program)
+            .unwrap()
+            .write_all(b"unapproved same-inode bytes")
+            .unwrap();
+        assert_eq!(
+            subc_os::retained_file_identity(&std::fs::File::open(&program).unwrap()).unwrap(),
+            identity
+        );
+    });
+    let supervisor = Supervisor::new_for_test(
+        Arc::new(crate::Registry::default()),
+        RestartPolicy::default(),
+    )
+    .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    let held = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = module.status().unwrap();
+            if owner.check_module_hold("a").is_err()
+                && status.state == ModuleState::Stopped
+                && !status.process_alive
+            {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    module.stop().await.unwrap();
+    let status =
+        held.expect("a protocol:none child with unapproved content was never checked after exec");
+    assert_eq!(status.restart_count, 0);
+    assert_eq!(
+        owner
+            .take_activities()
+            .iter()
+            .filter(|activity| activity.event == "config.refused")
+            .count(),
+        1
     );
 }
 
@@ -1410,7 +1590,7 @@ async fn config_admission_unsigned_macos_program_is_held_before_any_spawn() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn config_admission_hello_hashes_the_running_image_after_a_same_inode_rewrite() {
+async fn config_admission_hello_cannot_publish_after_post_exec_same_inode_refusal() {
     use std::io::Write;
     let rig = rig();
     wire_fixture_document(&rig, json!(["600"]));
@@ -1431,8 +1611,58 @@ async fn config_admission_hello_hashes_the_running_image_after_a_same_inode_rewr
         .with_handle(handle.clone())
         .with_config_runtime(owner.clone());
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
-    assert!(module.status().unwrap().process_alive);
-    refused_content_hello(&rig, owner, handle, registry, module).await;
+    let nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    let handler = crate::ControlHandler::new(registry.clone())
+        .with_supervisor(handle)
+        .with_config_runtime(owner);
+    let reply = handler
+        .handle_control(ConnectionId::new(730), module_hello(Some(nonce)))
+        .unwrap();
+    module.stop().await.unwrap();
+    assert_ne!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
+    assert!(registry.get_module("a").unwrap().is_none());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn config_admission_post_exec_checks_protocol_none_covered_files_after_privacy_ack() {
+    let rig = rig();
+    let covered = rig.path.join("covered.txt");
+    std::fs::write(&covered, b"approved").unwrap();
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(rig.path.join("subc.jsonc")).unwrap()).unwrap();
+    document["modules"]["a"]["program_files"] = json!([covered]);
+    std::fs::write(
+        rig.path.join("subc.jsonc"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+    let owner = Arc::new(rig.owner("post-privacy-content"));
+    rig.stamp(&owner);
+    owner.set_spawn_exec_hook_for_test(move || std::fs::write(covered, b"not approved").unwrap());
+    let supervisor = Supervisor::new_for_test(
+        Arc::new(crate::Registry::default()),
+        RestartPolicy::default(),
+    )
+    .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    let held = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = module.status().unwrap();
+            if owner.check_module_hold("a").is_err()
+                && status.state == ModuleState::Stopped
+                && !status.process_alive
+            {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    module.stop().await.unwrap();
+    let status =
+        held.expect("a protocol:none child skipped its covered-file check after privacy exec");
+    assert_eq!(status.restart_count, 0);
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1586,6 +1816,97 @@ fn module_hello(nonce: Option<String>) -> subc_protocol::Frame {
 }
 
 #[tokio::test]
+async fn config_admission_hello_publication_rechecks_across_stamp_hold_and_new_spawn() {
+    for transition in ["stamp", "hold", "new_spawn"] {
+        let rig = rig();
+        wire_fixture_document(&rig, json!(["600"]));
+        let owner = Arc::new(rig.owner(transition));
+        let registry = Arc::new(crate::Registry::default());
+        let handle = SupervisorHandle::new();
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone())
+            .with_config_runtime(owner.clone());
+        let module = if transition == "stamp" {
+            None
+        } else {
+            rig.stamp(&owner);
+            Some(supervisor.spawn_async(spec(&rig)).await.unwrap())
+        };
+        if let Some(module) = &module {
+            reported_pid(module).await;
+        }
+        let nonce = if module.is_some() {
+            Some(handle.spawn_launch_nonce_for("a").unwrap())
+        } else {
+            None
+        };
+        if let Some(nonce) = &nonce {
+            assert!(tokio::time::timeout(
+                Duration::from_secs(5),
+                handle.wait_program_binding("a", nonce)
+            )
+            .await
+            .unwrap());
+        }
+        let hold = Arc::new(std::sync::Barrier::new(2));
+        let handler = crate::ControlHandler::new(registry.clone())
+            .with_supervisor(handle.clone())
+            .with_config_runtime(owner.clone())
+            .with_hello_before_publication_hold(hold.clone());
+        let pending = std::thread::spawn(move || {
+            handler
+                .handle_control(ConnectionId::new(760), module_hello(nonce))
+                .unwrap()
+        });
+        hold.wait();
+        let mut replacement = None;
+        match transition {
+            "stamp" => {
+                rig.stamp(&owner);
+            }
+            "hold" => {
+                let base = crate::config_gate::program::approved_base(
+                    &crate::config_gate::GateSnapshot::from_store(
+                        &owner.lock().unwrap().store.body().unwrap().approved,
+                    )
+                    .unwrap(),
+                    "a",
+                );
+                owner
+                    .record_program_refusal(
+                        "a",
+                        &base,
+                        subc_config::raw_digest(b"held during hello"),
+                    )
+                    .unwrap();
+            }
+            _ => {
+                module.as_ref().unwrap().stop().await.unwrap();
+                replacement = Some(supervisor.spawn_async(spec(&rig)).await.unwrap());
+            }
+        }
+        hold.wait();
+        let reply = pending.join().unwrap();
+        if let Some(module) = replacement {
+            module.stop().await.unwrap();
+        }
+        if let Some(module) = module {
+            module.stop().await.unwrap();
+        }
+        let admitted = registry.get_module("a").unwrap().is_some();
+        registry
+            .deregister_connection(ConnectionId::new(760))
+            .unwrap();
+        assert_ne!(
+            reply[0].header.ty,
+            subc_protocol::FrameType::HelloAck,
+            "a HELLO crossed {transition} without rechecking publication authority"
+        );
+        assert!(!admitted, "{transition} published the stale HELLO");
+    }
+}
+
+#[tokio::test]
 async fn config_admission_stopped_gated_identity_refuses_impostors_without_a_live_spawn() {
     let rig = rig();
     wire_fixture_document(&rig, json!(["600"]));
@@ -1650,8 +1971,14 @@ async fn config_admission_unstamp_restores_unreserved_hello_without_a_synthetic_
         .with_config_runtime(owner.clone());
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
     reported_pid(&module).await;
+    let old_nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    assert!(handle.has_program_binding("a", &old_nonce));
     module.stop().await.unwrap();
     approve(&rig, &owner, PlanKind::Unstamp);
+    assert!(
+        !handle.has_program_binding("a", &old_nonce),
+        "unstamp retained a retired content witness"
+    );
     let handler = crate::ControlHandler::new(registry.clone())
         .with_supervisor(handle)
         .with_config_runtime(owner);

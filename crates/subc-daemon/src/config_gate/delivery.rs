@@ -595,7 +595,15 @@ impl RuntimeOwner {
     ) -> Result<Option<u64>> {
         let mut state = self.lock()?;
         state.store.delivery_ready()?;
-        let body = state.store.body()?;
+        Self::requires_fresher_spawn_loaded(&state, module, spawn)
+    }
+
+    pub(super) fn requires_fresher_spawn_loaded(
+        state: &OwnerState,
+        module: &str,
+        spawn: Option<&DeliverySpawn>,
+    ) -> Result<Option<u64>> {
+        let body = state.store.loaded_admission_state().1;
         let pending = body
             .versions
             .iter()
@@ -1118,7 +1126,16 @@ impl RuntimeOwner {
     ) -> Result<Option<(u64, u64)>> {
         let mut state = self.lock()?;
         state.store.delivery_ready()?;
-        if state.store.status().state == crate::config_store::StoreState::Unstamped {
+        Self::promote_loaded(&mut state, connection, module, cutover_at)
+    }
+
+    pub(super) fn promote_loaded(
+        state: &mut OwnerState,
+        connection: ConnectionId,
+        module: &str,
+        cutover_at: tokio::time::Instant,
+    ) -> Result<Option<(u64, u64)>> {
+        if state.store.loaded_admission_state().0 == crate::config_store::StoreState::Unstamped {
             if state
                 .declarations
                 .get(&connection)
@@ -1144,7 +1161,7 @@ impl RuntimeOwner {
             module: module.into(),
             project: None,
         };
-        let body = state.store.body()?;
+        let body = state.store.loaded_admission_state().1;
         let versions = body
             .versions
             .iter()
@@ -1213,10 +1230,11 @@ impl RuntimeOwner {
         // a full live ACK window, independently of the finished spawn budget.
         // A route obligation still needs its own post-install probe: the
         // candidate's earlier HEALTHY did not bind the installed policy epoch.
-        attempt.ready = super::route_policy::ready(&mut state, module, generation)?
+        attempt.ready = super::route_policy::ready_loaded(state, module, generation)
             && !state
                 .store
-                .body()?
+                .loaded_admission_state()
+                .1
                 .generations
                 .get(&generation)
                 .is_some_and(|entry| {

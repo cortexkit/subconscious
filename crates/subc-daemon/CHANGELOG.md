@@ -2,6 +2,15 @@
 
 ## 0.41.10
 
+- Recheck live content after every gated exec, including children without HELLO,
+  and refuse a ready binding when the running process's approved content cannot
+  be verified.
+  Serialize HELLO's final checks with registration publication and retire content
+  bindings after unstamp. Route revocation rechecks the exact ACK and deadline
+  under the forwarding write lock. Swap cutover uses synchronous loaded-state
+  checks without awaiting the configuration owner; deferred attempts back off
+  while stop and child exit remain selectable.
+
 - Release Windows program write-exclusion handles once HELLO acknowledges a
   normal launch or the warmed replacement in a blue/green swap, including
   sink-backed connections whose acknowledgement is queued instead of returned

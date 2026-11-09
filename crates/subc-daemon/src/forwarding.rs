@@ -612,6 +612,8 @@ pub(crate) type ConnectionCloseReceiver = oneshot::Receiver<CloseReason>;
 /// Dynamic forwarding state shared by the control plane and data-plane router.
 #[derive(Debug, Default)]
 pub struct ForwardingTable {
+    #[cfg(test)]
+    policy_rebind_before_write: Mutex<Option<Arc<std::sync::Barrier>>>,
     inner: Arc<RwLock<ForwardingInner>>,
     frame_drop_warnings: Mutex<HashMap<ConnectionId, ChannelDropWarnings>>,
     #[cfg(feature = "test-support")]
@@ -631,6 +633,8 @@ pub struct ForwardingTable {
     /// see one outage per module, or each would log its own opening line.
     route_outages: Arc<crate::route_outage::RouteOutageTracker>,
 }
+
+pub(crate) type PolicyRevocation = (Vec<EndpointRoute>, Vec<GoodbyeTarget>);
 
 #[derive(Debug)]
 struct FrameDropWarning {
@@ -2744,13 +2748,25 @@ impl ForwardingTable {
     pub(crate) fn rebind_module_policy(
         &self,
         module_id: &str,
-    ) -> Result<(Vec<EndpointRoute>, Vec<GoodbyeTarget>), ForwardingError> {
+        expected_connection: Option<ConnectionId>,
+        authorized: impl FnOnce() -> bool,
+    ) -> Result<Option<PolicyRevocation>, ForwardingError> {
+        #[cfg(test)]
+        if let Some(hold) = self.policy_rebind_before_write.lock().unwrap().take() {
+            hold.wait();
+            hold.wait();
+        }
         let mut inner = self.write_inner()?;
         let module = inner
             .modules_by_id
             .get(module_id)
             .cloned()
             .ok_or(ForwardingError::NoModuleConnection)?;
+        if expected_connection.is_some_and(|connection| module.endpoint.connection_id != connection)
+            || !authorized()
+        {
+            return Ok(None);
+        }
         let endpoint = module.endpoint;
         if inner.draining_endpoints.contains_key(&endpoint) {
             return Err(ForwardingError::ModuleReloading {
@@ -2775,7 +2791,18 @@ impl ForwardingTable {
             }
         }
         inner.draining_endpoints.remove(&endpoint);
-        Ok((routes, goodbyes))
+        Ok(Some((routes, goodbyes)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_policy_rebind_before_write(&self, hold: Arc<std::sync::Barrier>) {
+        *self.policy_rebind_before_write.lock().unwrap() = Some(hold);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_forwarding_write_lock_for_test(&self, work: impl FnOnce()) {
+        let _guard = self.write_inner().unwrap();
+        work();
     }
 
     /// Enumerate one endpoint's current routes without contacting the module.

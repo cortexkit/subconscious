@@ -255,7 +255,7 @@ impl RuntimeOwner {
             std::mem::take(&mut state.admission_releases),
         ))
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_spawn_exec_hook_for_test(&self, hook: impl FnOnce() + Send + 'static) {
         *self.spawn_exec_hook.lock().unwrap() = Some(Box::new(hook));
     }

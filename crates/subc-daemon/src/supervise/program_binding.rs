@@ -15,10 +15,22 @@ pub(super) struct ProgramBindingPublication {
 }
 
 impl ProgramBindingPublication {
-    pub(super) fn verify(&mut self) {
-        self.signal.send_replace(Some(true));
+    pub(super) fn verify(&self) -> Result<(), crate::config_gate::GateError> {
+        let result = self
+            .live
+            .lock()
+            .ok()
+            .and_then(|binding| binding.upgrade())
+            .ok_or_else(|| {
+                crate::config_gate::GateError::new(
+                    "config_delivery_deferred",
+                    "live program witness is unavailable",
+                )
+            })
+            .and_then(|live| live.check());
+        self.signal.send_replace(Some(result.is_ok()));
+        result
     }
-    #[cfg(target_os = "macos")]
     pub(super) fn reject(&mut self) {
         self.signal.send_replace(Some(false));
     }
@@ -41,7 +53,30 @@ impl Drop for ProgramBindingPublication {
 }
 
 impl SupervisorHandle {
-    #[cfg(all(test, windows))]
+    pub(crate) fn install_binding_retirement(
+        &self,
+        owner: &crate::config_gate::runtime::RuntimeOwner,
+    ) {
+        let key = Arc::as_ptr(&self.program_bindings) as usize;
+        let bindings = Arc::downgrade(&self.program_bindings);
+        owner.install_binding_retirement(key, move || {
+            if let Some(bindings) = bindings.upgrade() {
+                let retired = std::mem::take(
+                    &mut *bindings
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                );
+                #[cfg(windows)]
+                for entry in retired.values() {
+                    if let Some(live) = entry.live.lock().ok().and_then(|live| live.upgrade()) {
+                        live.hello_accepted();
+                    }
+                }
+                drop(retired);
+            }
+        });
+    }
+    #[cfg(all(test, any(windows, target_os = "linux")))]
     pub(crate) fn candidate_launch_nonce_for_test(&self, module: &str) -> Option<String> {
         self.swaps
             .lock()

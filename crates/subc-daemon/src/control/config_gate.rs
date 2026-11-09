@@ -364,6 +364,7 @@ impl ControlHandler {
         mut self,
         runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
     ) -> Self {
+        self.supervisor.install_binding_retirement(&runtime);
         let _ = runtime.set_activity(self.activity.clone());
         runtime.install_module_route_authority(Arc::new(route_policy::ModuleRouteAuthority(
             self.clone(),

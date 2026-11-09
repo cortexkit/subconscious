@@ -1,11 +1,11 @@
 use super::*;
 
 #[tokio::test]
-async fn config_admission_hello_stays_unregistered_until_its_spawn_binding_passes() {
+async fn config_admission_post_exec_unattached_binding_never_publishes_ready() {
     let handle = SupervisorHandle::new();
     handle.set_spawn_nonce("binding-probe", "nonce".into());
     handle.set_reserved_nonce("binding-probe", "nonce".into());
-    let mut publication = handle
+    let publication = handle
         .begin_program_binding("binding-probe", SpawnRole::Plain)
         .unwrap();
     let registry = Arc::new(Registry::default());
@@ -41,8 +41,11 @@ async fn config_admission_hello_stays_unregistered_until_its_spawn_binding_passe
             .await
             .is_err()
     );
-    publication.verify();
-    assert!(waiting.await);
+    let _ = publication.verify();
+    assert!(
+        !waiting.await,
+        "a missing live witness must never publish a verified binding"
+    );
     let unbound = handler
         .handle_control(crate::ConnectionId::new(2), frame)
         .unwrap();

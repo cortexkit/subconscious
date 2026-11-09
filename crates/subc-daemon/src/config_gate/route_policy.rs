@@ -18,6 +18,9 @@ pub struct ApprovedRoutePolicy {
 }
 
 impl ApprovedRoutePolicy {
+    pub(crate) fn connection(&self) -> Option<ConnectionId> {
+        self.authorization.map(|(connection, _, _)| connection)
+    }
     pub fn module(&self) -> &str {
         &self.module
     }
@@ -180,13 +183,19 @@ pub(super) fn required(changeset: &Changeset, module: &str) -> bool {
 }
 
 pub(super) fn ready(state: &mut OwnerState, module: &str, generation: u64) -> Result<bool> {
+    state.store.body()?;
+    Ok(ready_loaded(state, module, generation))
+}
+
+pub(super) fn ready_loaded(state: &OwnerState, module: &str, generation: u64) -> bool {
     let required = state
         .store
-        .body()?
+        .loaded_admission_state()
+        .1
         .generations
         .get(&generation)
         .is_some_and(|entry| required(&entry.generation.changeset, module));
-    Ok(!required || state.installed_route_policies.get(module) == Some(&generation))
+    !required || state.installed_route_policies.get(module) == Some(&generation)
 }
 
 impl RuntimeOwner {
@@ -297,7 +306,18 @@ impl RuntimeOwner {
         if !self.route_policy_authorized(&policy)? {
             return Ok(());
         }
-        let installation = authority.install_and_revoke(policy).await?;
+        let installation = match authority.install_and_revoke(policy).await {
+            Ok(installation) => installation,
+            Err(error) => {
+                let module_id = module.to_owned();
+                self.on_blocking(move |owner| {
+                    owner.lock()?.restore_route_policy(&module_id, generation);
+                    Ok(())
+                })
+                .await?;
+                return Err(error);
+            }
+        };
         let module = module.to_owned();
         self.on_blocking(move |owner| {
             owner.finish_route_policy(&module, generation, previous_generation, installation)

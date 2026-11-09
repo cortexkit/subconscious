@@ -22,24 +22,33 @@ impl RoutePolicyAuthority for ModuleRouteAuthority {
 
     fn install_and_revoke<'a>(&'a self, policy: ApprovedRoutePolicy) -> RoutePolicyInstall<'a> {
         Box::pin(async move {
-            if !self
-                .1
-                .upgrade()
-                .ok_or_else(|| GateError::new("config_gated", "configuration authority is absent"))?
-                .route_policy_authorized(&policy)?
-            {
-                return Err(GateError::new(
-                    "delivery_superseded",
-                    "route policy ACK is no longer current or has expired",
-                ));
-            }
+            let owner = self.1.upgrade().ok_or_else(|| {
+                GateError::new("config_gated", "configuration authority is absent")
+            })?;
             // RuntimeOwner calls this only after the target's configuration ACK.
             // The module owns bind policy; the daemon invalidates old decisions.
-            let (routes, goodbyes) = self
+            let mut authorization_error = None;
+            let revoked = self
                 .0
                 .forwarding
-                .rebind_module_policy(policy.module())
+                .rebind_module_policy(policy.module(), policy.connection(), || {
+                    match owner.route_policy_authorized(&policy) {
+                        Ok(authorized) => authorized,
+                        Err(error) => {
+                            authorization_error = Some(error);
+                            false
+                        }
+                    }
+                })
                 .map_err(|error| GateError::new("route_policy_revoke_failed", error))?;
+            let Some((routes, goodbyes)) = revoked else {
+                return Err(authorization_error.unwrap_or_else(|| {
+                    GateError::new(
+                        "delivery_superseded",
+                        "route policy ACK is no longer current or has expired",
+                    )
+                }));
+            };
             send_route_control_pushes(
                 &self.0.forwarding,
                 routes,

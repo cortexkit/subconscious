@@ -340,24 +340,6 @@ async fn run_swap_inner(
         },
         None => None,
     };
-    let config_guard = match config_gate {
-        Some(gate) => loop {
-            if let Ok(guard) = gate.clone().try_lock_owned() {
-                break Some(guard);
-            }
-            if !wait_for_config_gate(runtime, module_id, commands, end).await {
-                abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
-                let _ = reply.send(Err(SuperviseError::SwapFailed {
-                    module_id: module_id.to_owned(),
-                    arm: SwapFailureArm::Interrupted,
-                    detail: "swap interrupted before configuration cutover".into(),
-                    candidate_exit: None,
-                }));
-                return;
-            }
-        },
-        None => None,
-    };
     let config_opted_in = registry
         .registration(RegistrationSlot::Connection(candidate_connection))
         .ok()
@@ -368,187 +350,98 @@ async fn run_swap_inner(
                 .iter()
                 .any(|op| op == "config.review")
         });
-    if let Some(owner) = config_owner.as_ref().filter(|_| config_opted_in) {
-        let module = module_id.to_owned();
-        let spawn = candidate.config_delivery.clone();
-        let current = owner
-            .on_blocking(move |owner| {
-                let newer = owner.requires_fresher_spawn(&module, spawn.as_ref())?;
-                if newer.is_none() {
-                    owner.module_get(
-                        candidate_connection,
-                        &module,
-                        subc_protocol::config::ConfigGetRequest::new(),
-                    )?;
+    let (forwarding_cutover, promoted) = loop {
+        match try_config_cutover(
+            module_id,
+            config_owner.as_ref(),
+            config_gate.as_ref(),
+            config_opted_in,
+            candidate.config_delivery.as_ref(),
+            candidate_connection,
+            registry,
+            &forwarding,
+        ) {
+            Ok(cutover) => break cutover,
+            Err(CutoverDeferred::Busy) => {
+                let retry = tokio::select! {
+                    ready=wait_for_config_gate(runtime,module_id,commands,end)=>ready,
+                    _=candidate.wait()=>false,
+                    _=async {match child.as_mut() {Some(incumbent)=>{let _=incumbent.wait().await;},None=>std::future::pending::<()>().await}}=>false,
+                };
+                if retry {
+                    continue;
                 }
-                Ok(newer)
-            })
-            .await;
-        if let Ok(Some(generation)) = current {
-            drop(config_guard);
-            abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
-            update_snapshot(snapshot, Some(module_id), |state| {
-                state.swap_outcome = Some(SwapOutcome::SupersededByConfigRestart)
-            })
-            .ok();
-            end.requeue.push(SupervisorCommand::ConfigApplyRestart {
-                generation,
-                supersedes_swap: true,
-            });
-            let _ = reply.send(Ok(SwapOutcome::SupersededByConfigRestart));
-            return;
-        }
-        if let Err(error) = current {
-            drop(config_guard);
-            let failure = CandidateFailure {
-                arm: SwapFailureArm::CandidateUnhealthy,
-                detail: format!("config_gated: {error}"),
-                exit: None,
-                connection: Some(candidate_connection),
-            };
-            abandon_candidate(
-                module_id,
-                registry,
-                &forwarding,
-                &handle,
-                candidate,
-                Some(&failure),
-            )
-            .await;
-            let _ = reply.send(Err(failure.into_error(module_id)));
-            return;
-        }
-    }
-
-    // CUTOVER. Forwarding first, then the registry: two calls under two locks,
-    // so there is a moment when they disagree, and the order decides which way.
-    // Every route.open reads the registry and then reserves its relay under the
-    // forwarding write lock, and the reservation alone picks the process. With
-    // forwarding first, a route.open in the gap reads the incumbent's
-    // registration and is relayed to the candidate, which is ready (that is
-    // what was just waited for) and is the process the module now is. Nothing
-    // can land on a process that is not serving: before the forwarding write
-    // it lands on the incumbent, after it on the candidate. And from the moment
-    // the registry names the candidate, forwarding already routes to it, so
-    // nothing that reads the registry (catalog.list, the health prober) is ever
-    // ahead of where routes go.
-    if let Some(error) = config_owner
-        .as_ref()
-        .and_then(|owner| owner.check_module_hold(module_id).err())
-    {
-        drop(config_guard);
-        abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
-        let _ = reply.send(Err(SuperviseError::SwapFailed {
-            module_id: module_id.to_owned(),
-            arm: SwapFailureArm::CandidateUnhealthy,
-            detail: format!("config_gated: {error}"),
-            candidate_exit: None,
-        }));
-        return;
-    }
-    let forwarding_cutover = match forwarding.cutover_candidate(module_id) {
-        Ok(Some(cutover)) => cutover,
-        Ok(None) | Err(_) => {
-            drop(config_guard);
-            // The candidate's forwarding entry is gone, so its connection was
-            // torn down just now. Nothing was promoted; the incumbent is still
-            // the active endpoint.
-            let failure = CandidateFailure {
-                arm: SwapFailureArm::CutoverLost,
-                detail: "the candidate's connection closed just before cutover".to_string(),
-                exit: None,
-                connection: Some(candidate_connection),
-            };
-            abandon_candidate(
-                module_id,
-                registry,
-                &forwarding,
-                &handle,
-                candidate,
-                Some(&failure),
-            )
-            .await;
-            let _ = reply.send(Err(failure.into_error(module_id)));
-            return;
-        }
-    };
-    #[cfg(feature = "test-support")]
-    if let Some(owner) = &config_owner {
-        if let Err(error) = owner
-            .on_blocking(|owner| owner.pause_swap_before_promotion())
-            .await
-        {
-            warn!(module_id, %error, "swap test pause failed");
-        }
-    }
-    #[cfg(feature = "test-support")]
-    if let Some(owner) = &config_owner {
-        if let Err(error) = owner.pause_swap_before_promotion() {
-            warn!(module_id, %error, "swap promotion test pause failed");
-        }
-    }
-    let promoted = match registry.promote_candidate(module_id) {
-        Ok(Some(cutover)) => cutover.promoted,
-        Ok(None) | Err(_) => {
-            drop(config_guard);
-            // Forwarding promoted the candidate and the registry could not: its
-            // registration went away between the two calls, so the process that
-            // was just made the active endpoint is gone and the incumbent sits in
-            // forwarding's superseded slot. There is no way back to the incumbent
-            // from here, so fall back to a plain restart, which stops the
-            // incumbent and spawns a fresh process. It is a restart the operator
-            // asked for, so it spends no crash budget either.
-            error!(
-                module_id,
-                "swap candidate vanished between forwarding cutover and registry promotion; falling back to a plain restart"
-            );
-            let failure = CandidateFailure {
-                arm: SwapFailureArm::CutoverLost,
-                detail: "the candidate's registration closed during cutover; the module is being restarted plainly".to_string(),
-                exit: None,
-                connection: Some(candidate_connection),
-            };
-            abandon_candidate(
-                module_id,
-                registry,
-                &forwarding,
-                &handle,
-                candidate,
-                Some(&failure),
-            )
-            .await;
-            let _ = reply.send(Err(failure.into_error(module_id)));
-            if let Err(err) = restart_child(
-                spec,
-                runtime,
-                registry,
-                process_liveness,
-                snapshot,
-                child,
-                runtime.drain_timeout,
-            )
-            .await
-            {
-                warn!(module_id, error = %err, "plain restart after a lost swap cutover failed");
-                fail_snapshot(snapshot, Some(module_id), None, &FailureContext::operator());
+                abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
+                let _ = reply.send(Err(SuperviseError::SwapFailed {
+                    module_id: module_id.into(),
+                    arm: SwapFailureArm::Interrupted,
+                    detail: "swap interrupted before configuration cutover".into(),
+                    candidate_exit: None,
+                }));
+                return;
             }
-            return;
+            Err(CutoverDeferred::NewGeneration(generation)) => {
+                abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
+                update_snapshot(snapshot, Some(module_id), |state| {
+                    state.swap_outcome = Some(SwapOutcome::SupersededByConfigRestart)
+                })
+                .ok();
+                end.requeue.push(SupervisorCommand::ConfigApplyRestart {
+                    generation,
+                    supersedes_swap: true,
+                });
+                let _ = reply.send(Ok(SwapOutcome::SupersededByConfigRestart));
+                return;
+            }
+            Err(failed) => {
+                let restart = matches!(failed, CutoverDeferred::RegistryLost);
+                let failure = CandidateFailure {
+                    arm: if matches!(failed, CutoverDeferred::Refused(_)) {
+                        SwapFailureArm::CandidateUnhealthy
+                    } else {
+                        SwapFailureArm::CutoverLost
+                    },
+                    detail: match failed {
+                        CutoverDeferred::Refused(error) => format!("config_gated: {error}"),
+                        CutoverDeferred::RegistryLost => {
+                            "the candidate registration closed during cutover; restarting plainly"
+                                .into()
+                        }
+                        _ => "the candidate connection closed just before cutover".into(),
+                    },
+                    exit: None,
+                    connection: Some(candidate_connection),
+                };
+                abandon_candidate(
+                    module_id,
+                    registry,
+                    &forwarding,
+                    &handle,
+                    candidate,
+                    Some(&failure),
+                )
+                .await;
+                let _ = reply.send(Err(failure.into_error(module_id)));
+                if restart {
+                    if let Err(error) = restart_child(
+                        spec,
+                        runtime,
+                        registry,
+                        process_liveness,
+                        snapshot,
+                        child,
+                        runtime.drain_timeout,
+                    )
+                    .await
+                    {
+                        warn!(module_id,%error,"plain restart after a lost swap cutover failed");
+                        fail_snapshot(snapshot, Some(module_id), None, &FailureContext::operator());
+                    }
+                }
+                return;
+            }
         }
     };
-
-    if let Some(owner) = config_owner.as_ref().filter(|_| config_opted_in) {
-        use crate::config_gate::runtime::DeliveryObserver;
-        let module = module_id.to_owned();
-        let at = Instant::now();
-        if let Err(error) = owner
-            .on_blocking(move |owner| owner.promoted(candidate_connection, &module, at))
-            .await
-        {
-            warn!(module_id, %error, "promoted configuration target is gated");
-        }
-        owner.notify_delivery_changed();
-    }
-    drop(config_guard);
 
     // The candidate is the module now: its nonce is the module's nonce, the
     // control plane's capability state is recomputed from its manifest (its
@@ -642,24 +535,117 @@ async fn dispatch_retirement(
     });
 }
 
-/// Answer one module command that arrived while the candidate warmed, or hand
-/// it back when it must interrupt the swap.
-///
-/// A stop, disable or retire interrupts: the operator's intent wins over a
-/// swap, as it does over a pending crash respawn, and it must not wait out the
-/// readiness budget. It is returned so the swap can kill its candidate and the
-/// loop can then carry it out on the incumbent. Restart, reload and a second
-/// swap are refused with a typed error rather than queued; enabling an already
-/// enabled module is answered as the no-op it is. An ungated configuration update
-/// is answered at once and applied when the swap ends, since the swap is using
-/// the spec it replaces. File updates are refused without queueing while the
-/// daemon uses approved configuration instead of live file authority.
+enum CutoverDeferred {
+    Busy,
+    NewGeneration(u64),
+    Refused(crate::config_gate::GateError),
+    ForwardingLost,
+    RegistryLost,
+}
+
+/// Publish forwarding first, registry second and the config ACK target last.
+/// Both configuration guards are acquired without waiting, and only verified
+/// in-memory bytes are read until both guards have been released.
+#[allow(clippy::too_many_arguments)]
+fn try_config_cutover(
+    module: &str,
+    owner: Option<&Arc<crate::config_gate::runtime::RuntimeOwner>>,
+    gate: Option<&Arc<tokio::sync::Mutex<()>>>,
+    opted_in: bool,
+    spawn: Option<&crate::config_gate::runtime::DeliverySpawn>,
+    connection: ConnectionId,
+    registry: &Registry,
+    forwarding: &ForwardingTable,
+) -> Result<
+    (
+        crate::forwarding::ForwardingCutover,
+        crate::registry::ModuleRegistration,
+    ),
+    CutoverDeferred,
+> {
+    let _gate = gate
+        .map(|gate| {
+            gate.clone()
+                .try_lock_owned()
+                .map_err(|_| CutoverDeferred::Busy)
+        })
+        .transpose()?;
+    if let Some(owner) = owner {
+        owner.check_module_hold(module).map_err(|error| {
+            if error.code == "config_delivery_deferred" {
+                CutoverDeferred::Busy
+            } else {
+                CutoverDeferred::Refused(error)
+            }
+        })?;
+    }
+    let mut configuration = if let Some(owner) = owner.filter(|_| opted_in) {
+        #[cfg(test)]
+        owner
+            .swap_preflight_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(
+            owner
+                .try_swap_configuration()
+                .map_err(|_| CutoverDeferred::Busy)?,
+        )
+    } else {
+        None
+    };
+    if let Some(configuration) = &mut configuration {
+        if let Some(generation) = configuration
+            .before_cutover(module, connection, spawn)
+            .map_err(CutoverDeferred::Refused)?
+        {
+            return Err(CutoverDeferred::NewGeneration(generation));
+        }
+    }
+    let forwarded = forwarding
+        .cutover_candidate(module)
+        .ok()
+        .flatten()
+        .ok_or(CutoverDeferred::ForwardingLost)?;
+    #[cfg(feature = "test-support")]
+    if let Some(owner) = owner {
+        if let Err(error) = owner.pause_swap_before_promotion() {
+            warn!(module,%error,"swap promotion test pause failed");
+        }
+    }
+    let promoted = registry
+        .promote_candidate(module)
+        .ok()
+        .flatten()
+        .ok_or(CutoverDeferred::RegistryLost)?
+        .promoted;
+    if let Some(configuration) = &mut configuration {
+        if let Err(error) = configuration.promoted(module, connection, Instant::now()) {
+            warn!(module,%error,"promoted configuration target is gated");
+        }
+    }
+    drop(configuration);
+    if let Some(owner) = owner {
+        owner.notify_delivery_changed();
+    }
+    Ok((forwarded, promoted))
+}
+
 async fn wait_for_config_gate(
     runtime: &SupervisorRuntimeConfig,
     module: &str,
     commands: &mut mpsc::Receiver<SupervisorCommand>,
     end: &mut SwapEnd,
 ) -> bool {
+    let backoff = tokio::time::sleep(CONFIG_ADMISSION_RETRY_DELAY);
+    tokio::pin!(backoff);
+    loop {
+        tokio::select! {
+            _=&mut backoff=>break,
+            command=commands.recv()=>{
+                let Some(command)=command else {return false;};
+                if let Some(interrupt)=serve_command_while_warming(module,command,end,runtime.config_delivery.as_ref().is_some_and(|delivery|delivery.0.module_is_gated(module))) {end.requeue.push(interrupt);return false;}
+            }
+        }
+    }
     let Some(delivery) = &runtime.config_delivery else {
         return true;
     };
@@ -680,6 +666,10 @@ async fn wait_for_config_gate(
     }
 }
 
+/// Answer non-interrupting commands while a swap waits, or return a stop,
+/// disable, retire, configuration restart or configuration hold command for
+/// the module loop to apply.
+/// Live file updates cannot replace the configuration saved by operator approval.
 fn serve_command_while_warming(
     module_id: &str,
     command: SupervisorCommand,
@@ -816,7 +806,23 @@ async fn warm_candidate(
 ) -> Warm {
     let mut deadline = Instant::now() + ready_timeout;
     let mut registered: Option<ConnectionId> = None;
+    let mut config_restart_pending = false;
+    let mut next_config_check = Instant::now();
     loop {
+        if config_restart_pending && Instant::now() >= next_config_check {
+            if let Some(delivery) = config_delivery {
+                match delivery
+                    .0
+                    .try_requires_fresher_spawn(module_id, candidate.config_delivery.as_ref())
+                {
+                    Ok(Some(generation)) => return Warm::Superseded { generation },
+                    Ok(None) => config_restart_pending = false,
+                    Err(_) => next_config_check = Instant::now() + CONFIG_ADMISSION_RETRY_DELAY,
+                }
+            } else {
+                config_restart_pending = false;
+            }
+        }
         // Before the candidate registers, the candidate slot is the only
         // place to look for it; once it has, its connection names it exactly.
         let slot = match registered {
@@ -932,13 +938,8 @@ async fn warm_candidate(
                     return Warm::Interrupted { command: None, connection: registered };
                 };
                 if matches!(command, SupervisorCommand::ConfigApplyRestart { .. }) {
-                    if let Some(delivery) = config_delivery {
-                        let module = module_id.to_owned();
-                        let spawn = candidate.config_delivery.clone();
-                        if let Ok(Some(generation)) = delivery.0.on_blocking(move |owner| owner.requires_fresher_spawn(&module, spawn.as_ref())).await {
-                            return Warm::Superseded { generation };
-                        }
-                    }
+                    config_restart_pending=true;
+                    next_config_check=Instant::now();
                     continue;
                 }
                 if let Some(command) = serve_command_while_warming(module_id, command, end,config_delivery.is_some_and(|delivery|delivery.0.module_is_gated(module_id))) {
@@ -1349,6 +1350,34 @@ mod tests {
             child: candidate,
             receiver,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn config_admission_swap_retry_has_a_bounded_backoff_even_when_gate_is_free() {
+        let fixture = config_timing_fixture();
+        let (_tx, mut commands) = mpsc::channel(8);
+        let mut end = SwapEnd::default();
+        let mut wait = Box::pin(wait_for_config_gate(
+            &fixture.runtime,
+            "timed",
+            &mut commands,
+            &mut end,
+        ));
+        for advance in [Duration::ZERO, Duration::from_millis(99)] {
+            tokio::time::advance(advance).await;
+            std::future::poll_fn(|cx| {
+                assert!(
+                    std::future::Future::poll(wait.as_mut(), cx).is_pending(),
+                    "a free gate must not spin configuration-deferred candidate launches"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(wait.await);
+        finish_timing_child(fixture.child).await;
     }
 
     #[cfg(unix)]

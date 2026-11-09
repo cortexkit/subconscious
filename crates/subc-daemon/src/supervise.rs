@@ -163,6 +163,7 @@ pub(crate) const SPAWN_SUBSCRIBER_LAGGED_CODE: &str = "spawn_subscriber_lagged";
 
 #[cfg(target_os = "macos")]
 struct PrivacyExec {
+    content_check: Option<tokio::task::JoinHandle<Result<(), crate::config_gate::GateError>>>,
     gated: bool,
     admission_binding: Option<ProgramBindingPublication>,
     reader: tokio::io::unix::AsyncFd<std::io::PipeReader>,
@@ -302,6 +303,7 @@ fn privacy_command(
         Some(PrivacyExec {
             gated: false,
             admission_binding: None,
+            content_check: None,
             reader,
             deadline: tokio::time::Instant::now() + Duration::from_secs(5),
             expected,
@@ -462,6 +464,14 @@ impl SupervisedChild {
 
     #[cfg(target_os = "macos")]
     async fn confirm_privacy_exec(&mut self) {
+        if self
+            .privacy_exec
+            .as_ref()
+            .is_some_and(|pending| pending.content_check.is_some())
+        {
+            self.finish_privacy_content_check().await;
+            return;
+        }
         let Some(pending) = &mut self.privacy_exec else {
             return;
         };
@@ -593,15 +603,60 @@ impl SupervisedChild {
                 }
             },
         };
+        if cause.is_none() && self.report_ready.get().is_some() && pending.gated {
+            let publication = pending.admission_binding.clone();
+            let live = self.live_program_binding.clone();
+            self.privacy_exec
+                .as_mut()
+                .expect("pending exec")
+                .content_check = Some(tokio::task::spawn_blocking(move || {
+                match (publication, live) {
+                    (Some(publication), _) => publication.verify(),
+                    (None, Some(live)) => live.check(),
+                    _ => Err(crate::config_gate::GateError::new(
+                        "config_delivery_deferred",
+                        "live program witness is unavailable",
+                    )),
+                }
+            }));
+            self.finish_privacy_content_check().await;
+        } else {
+            self.finish_privacy_exec(cause);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn finish_privacy_content_check(&mut self) {
+        let result = self
+            .privacy_exec
+            .as_mut()
+            .expect("pending exec")
+            .content_check
+            .as_mut()
+            .expect("pending content check")
+            .await;
+        let cause = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error))
+                if error.code != "program_refused"
+                    && self.child.try_wait().ok().flatten().is_some() =>
+            {
+                None
+            }
+            Ok(Err(error)) => Some(format!("{}: {}", error.code, error.detail)),
+            Err(error) => Some(format!(
+                "config_delivery_deferred: content check stopped: {error}"
+            )),
+        };
+        self.finish_privacy_exec(cause);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn finish_privacy_exec(&mut self, cause: Option<String>) {
         let mut pending = self.privacy_exec.take().expect("pending exec");
         if cause.is_some() {
             if let Some(binding) = &mut pending.admission_binding {
                 binding.reject();
-            }
-        }
-        if cause.is_none() && self.report_ready.get().is_some() {
-            if let Some(binding) = &mut pending.admission_binding {
-                binding.verify();
             }
         }
         // Exec confirmation describes launch success, not roster retirement.
@@ -613,13 +668,18 @@ impl SupervisedChild {
         });
         if let Some(cause) = cause {
             warn!(module_id = %pending.module_id, pid = self.pid, %cause, "privacy identity trampoline refused module spawn");
-            self.spawn_failure = Some(if pending.gated && cause.contains("executable mismatch") {
-                format!("program_refused: {cause}")
-            } else if pending.gated {
-                format!("config_delivery_deferred: {cause}")
-            } else {
-                cause
-            });
+            self.spawn_failure = Some(
+                if pending.gated
+                    && (cause.contains("executable mismatch")
+                        || cause.starts_with("program_refused:"))
+                {
+                    format!("program_refused: {cause}")
+                } else if pending.gated {
+                    format!("config_delivery_deferred: {cause}")
+                } else {
+                    cause
+                },
+            );
             // No image is admitted on failure. Reach the entire fresh process
             // group, including a module which spawned a helper before refusal.
             if let Some(container) = self.child.container() {
@@ -3275,6 +3335,9 @@ impl Supervisor {
         mut self,
         owner: Arc<crate::config_gate::runtime::RuntimeOwner>,
     ) -> Self {
+        if let Some(handle) = &self.supervisor_handle {
+            handle.install_binding_retirement(&owner);
+        }
         self.config_delivery = Some(config_delivery::ConfigDelivery(owner));
         self
     }
@@ -3318,6 +3381,9 @@ impl Supervisor {
     }
 
     pub fn with_handle(mut self, supervisor_handle: SupervisorHandle) -> Self {
+        if let Some(delivery) = &self.config_delivery {
+            supervisor_handle.install_binding_retirement(&delivery.0);
+        }
         self.spawn_events = supervisor_handle.spawn_events.clone();
         self.supervisor_handle = Some(supervisor_handle);
         self
@@ -7701,7 +7767,7 @@ async fn supervise_loop(
                     let delivery=runtime.config_delivery.clone();
                     let exited_spawn=active_child.spawned_at;
                     let spawn=active_child.config_delivery.clone();
-                    let refusal=active_child.spawn_failure.as_deref().filter(|detail|detail.starts_with("program_refused:")).zip(active_child.admission_base.clone()).map(|(detail,base)|(base,subc_config::raw_digest(detail.as_bytes())));
+                    let refusal=active_child.spawn_failure.as_deref().filter(|detail|detail.starts_with("program_refused:") && !active_child.live_program_binding.as_ref().is_some_and(|binding|binding.is_refused())).zip(active_child.admission_base.clone()).map(|(detail,base)|(base,subc_config::raw_digest(detail.as_bytes())));
                     let module_id=spec.module_id.clone();
                     // Publication may own the store mutex for local durable I/O.
                     // Keep commands selectable until the child's exit is recorded;
@@ -11194,11 +11260,6 @@ fn launch_child_in_slot(
             publication.attach(live);
         }
     }
-    if binding_ready {
-        if let Some(binding) = &mut supervised._program_binding {
-            binding.verify();
-        }
-    }
     #[cfg(unix)]
     if let Some(admitted) = admitted.take() {
         admitted.disarm();
@@ -11208,6 +11269,44 @@ fn launch_child_in_slot(
         containment::terminate_blocking(&roster.containment);
         let _ = supervised.child.start_kill();
         return Err(error);
+    }
+    if binding_ready {
+        let checked = match (
+            &supervised._program_binding,
+            &supervised.live_program_binding,
+        ) {
+            (Some(binding), _) => binding.verify(),
+            (None, Some(live)) => live.check(),
+            _ if supervised.admission_base.is_some() => Err(crate::config_gate::GateError::new(
+                "config_delivery_deferred",
+                "live program witness is unavailable",
+            )),
+            _ => Ok(()),
+        };
+        if let Err(error) = checked {
+            if let Some(binding) = &mut supervised._program_binding {
+                binding.reject();
+            }
+            // Reap through the normal child-reaping path, retaining the real exit record and
+            // its roster ownership. A refusal must also end any helpers.
+            if error.code == "program_refused"
+                || supervised.child.try_wait().ok().flatten().is_none()
+            {
+                supervised.spawn_failure = Some(format!("{}: {}", error.code, error.detail));
+                #[cfg(target_os = "linux")]
+                kill_module_cgroup(supervised.cgroup_placement.as_ref(), &supervised.module_id);
+                let _ = supervised.start_kill();
+                #[cfg(unix)]
+                if supervised.child.container().is_none() {
+                    if let Some(group) = rustix::process::Pid::from_raw(pid as i32) {
+                        let _ = rustix::process::kill_process_group(
+                            group,
+                            rustix::process::Signal::KILL,
+                        );
+                    }
+                }
+            }
+        }
     }
     if let Some(registration) = delivery_registration {
         registration.commit();

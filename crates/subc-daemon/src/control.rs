@@ -504,6 +504,8 @@ pub struct ControlHandler {
     /// runs the HELLO on its own thread.
     #[cfg(test)]
     hello_registry_to_forwarding_hold: Option<Arc<std::sync::Barrier>>,
+    #[cfg(test)]
+    hello_before_publication_hold: Option<Arc<std::sync::Barrier>>,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -1096,6 +1098,8 @@ impl ControlHandler {
             route_bind_relay_sent_hold: None,
             #[cfg(test)]
             hello_registry_to_forwarding_hold: None,
+            #[cfg(test)]
+            hello_before_publication_hold: None,
         }
     }
 
@@ -1243,6 +1247,15 @@ impl ControlHandler {
             hold.wait();
             hold.wait();
         }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_hello_before_publication_hold(
+        mut self,
+        hold: Arc<std::sync::Barrier>,
+    ) -> Self {
+        self.hello_before_publication_hold = Some(hold);
+        self
     }
 
     pub fn with_process_liveness(
@@ -2052,7 +2065,9 @@ impl ControlHandler {
                 let span = tracing::Span::current();
                 tokio::task::spawn_blocking(move || {
                     tracing::dispatcher::with_default(&dispatcher, || {
-                        span.in_scope(|| handler.handle_hello(connection, Some(egress), frame))
+                        span.in_scope(|| {
+                            handler.handle_hello_checked(connection, Some(egress), frame, true)
+                        })
                     })
                 })
                 .await
@@ -2507,13 +2522,14 @@ impl ControlHandler {
         );
     }
 
+    #[cfg(test)]
     fn handle_hello(
         &self,
         connection_id: ConnectionId,
         egress: Option<crate::router::FrameSink>,
         frame: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
-        self.handle_hello_checked(connection_id, egress, frame)
+        self.handle_hello_checked(connection_id, egress, frame, false)
     }
 
     fn handle_hello_checked(
@@ -2521,6 +2537,7 @@ impl ControlHandler {
         connection_id: ConnectionId,
         sink: Option<crate::FrameSink>,
         frame: Frame,
+        wait_for_gate: bool,
     ) -> Result<Vec<Frame>, RouterError> {
         debug!(
             connection_id = connection_id.get(),
@@ -2712,6 +2729,77 @@ impl ControlHandler {
                 )?])
             }
         };
+
+        #[cfg(test)]
+        if let Some(hold) = &self.hello_before_publication_hold {
+            hold.wait();
+            hold.wait();
+        }
+
+        // Registration and forwarding publication use the same module gate as
+        // stamp, hold entry and spawning. Recheck after taking it; a HELLO may
+        // have been parsed before any of those transitions completed.
+        let _publication_gate = if let Some(owner) = &self.config_runtime {
+            let gate = owner
+                .module_gate(&hello.manifest.module_id)
+                .map_err(|error| RouterError::backend(0, frame.header.corr, error.to_string()))?;
+            Some(if wait_for_gate {
+                gate.blocking_lock_owned()
+            } else {
+                match gate.try_lock_owned() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            "config_delivery_deferred",
+                            "module admission is busy",
+                        )?])
+                    }
+                }
+            })
+        } else {
+            None
+        };
+        let module = &hello.manifest.module_id;
+        let required = self
+            .config_runtime
+            .as_ref()
+            .is_some_and(|owner| owner.module_is_gated(module));
+        if required
+            && (self
+                .config_runtime
+                .as_ref()
+                .is_some_and(|owner| owner.check_module_hold(module).is_err())
+                || !hello.launch_nonce.as_deref().is_some_and(|nonce| {
+                    self.supervisor.spawned_consumer_authorized(module, nonce)
+                        && self.supervisor.has_program_binding(module, nonce)
+                }))
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "reserved_module",
+                "a gated identity belongs only to its supervised child",
+            )?]);
+        }
+        if let Some(nonce) = hello.launch_nonce.as_deref() {
+            if required
+                || (self.config_runtime.is_none()
+                    && self.supervisor.has_program_binding(module, nonce))
+            {
+                if let Err(error) = self.supervisor.check_current_program_binding(module, nonce) {
+                    let code = if error.code == "program_refused" {
+                        "program_refused"
+                    } else {
+                        "config_delivery_deferred"
+                    };
+                    self.forwarding.request_connection_close(
+                        connection_id,
+                        CloseReason::new(code, error.detail.clone()),
+                    );
+                    return Ok(vec![control_error_frame(&frame, code, error.detail)?]);
+                }
+            }
+        }
 
         // Swap gate, ahead of the reserved gate on purpose. While a blue/green
         // swap is open for this id, the only HELLO admitted as a second process

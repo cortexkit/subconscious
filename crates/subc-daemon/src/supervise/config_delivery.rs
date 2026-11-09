@@ -149,15 +149,10 @@ impl RegistrationGuard {
         let Some(spawn) = &self.spawn else {
             return Ok(true);
         };
-        match self.runtime.0.delivery_launch_current(spawn, self.active) {
-            Ok(Some(current)) => Ok(current),
-            Ok(None) => Err(SuperviseError::ConfigDeliveryDeferred {
-                module_id: spawn.module().to_owned(),
-            }),
-            Err(error) => Err(SuperviseError::InvalidSpec {
-                reason: error.to_string(),
-            }),
-        }
+        launch_current_result(
+            spawn.module(),
+            self.runtime.0.delivery_launch_current(spawn, self.active),
+        )
     }
     pub(super) fn commit(mut self) {
         self.committed = true;
@@ -320,5 +315,39 @@ impl ConfigDelivery {
         };
         self.0.notify_delivery_changed();
         failed || owned_failure
+    }
+}
+
+fn launch_current_result(
+    module: &str,
+    result: std::result::Result<Option<bool>, crate::config_gate::GateError>,
+) -> Result<bool, SuperviseError> {
+    match result {
+        Ok(Some(current)) => Ok(current),
+        Ok(None) => Err(SuperviseError::ConfigDeliveryDeferred {
+            module_id: module.to_owned(),
+        }),
+        Err(_) => Err(SuperviseError::ConfigDeliveryDeferred {
+            module_id: module.to_owned(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod launch_current_tests {
+    use super::*;
+    #[test]
+    fn config_admission_post_exec_poisoned_launch_recheck_defers_instead_of_failing_spec() {
+        let result = launch_current_result(
+            "a",
+            Err(crate::config_gate::GateError::new(
+                "config_unavailable",
+                "configuration owner lock is poisoned",
+            )),
+        );
+        assert!(
+            matches!(result, Err(SuperviseError::ConfigDeliveryDeferred { .. })),
+            "{result:?}"
+        );
     }
 }

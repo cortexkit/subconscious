@@ -76,8 +76,8 @@ use crate::{
     server::MAX_PENDING_ROUTE_BINDS_PER_TARGET,
     stderr_tail::{CaptureState, TailEntry},
     supervise::{
-        validate_spec, ModuleProcessLiveness, ReservedHelloRejection, SpawnSubscribeRefusal,
-        SupervisorHandle, SwapHelloAdmission,
+        validate_spec, ModuleProcessLiveness, ReservedHelloRejection, ReservedHelloVerification,
+        SpawnSubscribeRefusal, SupervisorHandle, SwapHelloAdmission,
     },
     ConnectedClients, DaemonCounters, Frame, ProjectRootId, Supervisor,
 };
@@ -2728,8 +2728,11 @@ impl ControlHandler {
         // Other registrations receive this catalog fact only when reserved-module
         // policy required and accepted a nonce; unreserved registrations require
         // no nonce check.
-        let nonce_verified = if swap_candidate {
-            true
+        let verification = if swap_candidate {
+            ReservedHelloVerification {
+                nonce_verified: true,
+                prefix_owner: None,
+            }
         } else {
             match self.supervisor.reserved_hello_verification(
                 &hello.manifest.module_id,
@@ -2826,7 +2829,7 @@ impl ControlHandler {
                 negotiated_ver,
                 connection_id,
                 control_ops,
-                nonce_verified,
+                verification.nonce_verified,
             ) {
             Ok(registration) => registration,
             Err(RegistryError::DuplicateModuleId { module_id }) => {
@@ -2879,7 +2882,10 @@ impl ControlHandler {
                 negotiated_ver,
                 concurrency,
                 sink,
-                hello_ack,
+                crate::forwarding::ModuleHelloAck {
+                    frame: hello_ack,
+                    verified_prefix_owner: verification.prefix_owner,
+                },
             ) {
                 // Forwarding registration failed, so there is no forwarding
                 // state to tear down. Remove the registry entry, which was never

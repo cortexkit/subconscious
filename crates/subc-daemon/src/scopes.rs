@@ -314,12 +314,16 @@ impl ScopeBindLease {
 impl BoundScope {
     /// Called only after the target acknowledges `route.bind` and the
     /// acknowledgement is accepted.
-    pub(crate) fn record_served(&self, module_id: &str) {
-        self._lease
+    pub(crate) fn record_served(&self, module_id: &str, verified_prefix_owner: Option<&str>) {
+        let mut served = self
+            ._lease
             .served_modules
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(module_id.to_owned());
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        served.insert(module_id.to_owned());
+        if let Some(owner) = verified_prefix_owner {
+            served.insert(owner.to_owned());
+        }
     }
 
     pub(crate) fn commit_presence(&self) {
@@ -2270,13 +2274,13 @@ mod tests {
             .unwrap();
         let bound = table.reserve_bind(&admission, &reserved(PREFRONTAL), conn(1), false);
         assert_eq!(table.served_by(PREFRONTAL, "s", 1, "tool"), NotServed);
-        bound.record_served("tool");
+        bound.record_served("tool", None);
         assert_eq!(table.served_by(PREFRONTAL, "s", 1, "tool"), Served);
         assert_eq!(table.served_by("other", "s", 1, "tool"), Unknown);
         sync(&mut table, PREFRONTAL, conn(1), 2, vec![head("s", 1)]);
         assert_eq!(table.served_by(PREFRONTAL, "s", 1, "tool"), Served);
         sync(&mut table, PREFRONTAL, conn(1), 3, vec![head("s", 2)]);
-        bound.record_served("late-tool");
+        bound.record_served("late-tool", None);
         assert_eq!(table.served_by(PREFRONTAL, "s", 1, "tool"), Unknown);
         assert_eq!(table.served_by(PREFRONTAL, "s", 2, "late-tool"), NotServed);
         sync(&mut table, PREFRONTAL, conn(1), 4, vec![]);

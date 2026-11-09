@@ -923,8 +923,9 @@ The reply carries `op: "scope.served_by"`, `answer`, and `daemon_incarnation`
 (the same incarnation as `scope.describe`). `answer` is an open string:
 
 - `served`: the target acknowledged `route.bind` under exactly this owner, ref
-  and epoch. A refused or unacknowledged bind never counts.
-- `not_served`: the epoch is tracked and that module has never acknowledged a bind.
+  and epoch, or is the verified reserved-prefix owner of that target registration.
+  A refused or unacknowledged bind never counts.
+- `not_served`: the epoch is tracked and that module has no service credit.
 - `unknown`: the epoch was never registered, ended, expired, was replaced, or
   has not been re-registered since this daemon started.
 
@@ -932,6 +933,13 @@ Only `served` is affirmative; future answer strings must not grant access.
 History survives route closure and same-epoch updates, but ends with the epoch
 and is never persisted. Re-registering an epoch after daemon restart starts
 with an empty history, not a carried-over `served`.
+
+When a target's HELLO was admitted under a reserved prefix by verifying the
+prefix owner's spawn nonce, an accepted bind credits both the target module id
+and that verified owner. The owner is captured on the connection registration;
+an id that merely starts with a prefix, a later prefix-policy change, or a nonce
+verified for an exact-id reservation does not confer prefix-owner credit. This
+rule applies to every reserved prefix, not just federation's `fed:` namespace.
 
 The owner is implied by the sending module's registration (`reserved:<module>`),
 never supplied in the request. Another module querying the same ref and epoch

@@ -2186,6 +2186,13 @@ pub(crate) enum ReservedHelloRejection {
     },
 }
 
+/// Identity facts established by the reserved-module policy for one HELLO.
+#[derive(Debug, Default)]
+pub(crate) struct ReservedHelloVerification {
+    pub(crate) nonce_verified: bool,
+    pub(crate) prefix_owner: Option<String>,
+}
+
 #[derive(Debug)]
 struct DaemonRestartIntent {
     expires: Option<Duration>,
@@ -2357,7 +2364,7 @@ impl SupervisorHandle {
         &self,
         module_id: &str,
         presented: Option<&str>,
-    ) -> Result<bool, ReservedHelloRejection> {
+    ) -> Result<ReservedHelloVerification, ReservedHelloRejection> {
         let nonces = self
             .reserved_nonces
             .lock()
@@ -2373,7 +2380,10 @@ impl SupervisorHandle {
                 None => false,
             };
             if authorized {
-                return Ok(true);
+                return Ok(ReservedHelloVerification {
+                    nonce_verified: true,
+                    prefix_owner: None,
+                });
             }
             return Err(ReservedHelloRejection::Exact {
                 module_id: module_id.to_string(),
@@ -2390,7 +2400,7 @@ impl SupervisorHandle {
             .max_by_key(|(prefix, _)| prefix.len())
             .map(|(prefix, owner)| (prefix.clone(), owner.clone()));
         let Some((prefix, owner_module_id)) = matched_prefix else {
-            return Ok(false);
+            return Ok(ReservedHelloVerification::default());
         };
 
         let authorized = presented.is_some_and(|presented| {
@@ -2404,7 +2414,10 @@ impl SupervisorHandle {
                 || self.swap_nonce_matches(&owner_module_id, presented)
         });
         if authorized {
-            Ok(true)
+            Ok(ReservedHelloVerification {
+                nonce_verified: true,
+                prefix_owner: Some(owner_module_id),
+            })
         } else {
             Err(ReservedHelloRejection::Prefix {
                 prefix,

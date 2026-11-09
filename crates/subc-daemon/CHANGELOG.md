@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.44.1
+
+- Credit acknowledged scoped binds to both the target registration and its reserved-prefix owner when HELLO verified that owner's spawn nonce. Keep this identity fact on the connection, so later prefix-policy changes cannot grant service credit retroactively. Refused and unacknowledged binds still credit nobody; `scope.served_by` keeps its existing reply shape.
+
 ## 0.44.0
 
 - Construct all supervisor resource and pending-reload wire structs through their extensible control API, rather than public struct literals. Tree resource and reload-verdict JSON stays unchanged.

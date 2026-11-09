@@ -1530,62 +1530,19 @@ if [ -n "$MIGRATES" ]; then
   # Named for the module as well as the store file: several modules keep a
   # store.db, and snapshots sharing a name could not be pruned per module.
   store_rb="$STAGING/$MODULE.$(basename "$MIGRATES").rollback-$(date -u +%Y%m%dT%H%M%SZ)"
-  # sqlite3 .backup, NOT cp: the module holds the store open with a live -wal,
+  # A consistent copy, NOT cp: the module holds the store open with a live -wal,
   # and cp captures a torn .db beside a WAL it does not include -- a snapshot
-  # that restores to a state which never existed. .backup is the online backup
-  # API and is WAL-correct against a running writer.
-  # `mode=ro` is right HERE because --migrates runs while the module still holds
-  # the store open, so a -wal exists. It is not a universal choice: on a WAL-less
-  # whole-db artifact (this snapshot itself, once written) mode=ro REFUSES with
-  # error 14 on some SQLite builds and `immutable=1` is the honest reader
-  # instead. Flag by artifact, not by preference (CKCRED, 2026-09-19).
-  #
-  # THE READER IS CHOSEN BY THE ARTIFACT, and the discriminator is whether a
-  # RECOVERY SIDECAR EXISTS -- not whether the module happens to be running.
-  # immutable=1 promises the file cannot change, so it skips BOTH recovery
-  # mechanisms (the WAL and a rollback/hot journal) and the skipped read
-  # SUCCEEDS without error.
-  #
-  #   sidecar present  -> mode=ro, and REFUSE on failure with NO FALLBACK.
-  #                       immutable=1 would succeed and silently omit every
-  #                       transaction in the -wal, which is the worst possible
-  #                       outcome for a rollback artifact.
-  #   NO sidecar       -> the store was closed cleanly (or is a whole-db
-  #                       artifact), there is nothing to replay, and
-  #                       immutable=1 is the HONEST reader. mode=ro REFUSES
-  #                       here with error 14 on some SQLite builds, so keying
-  #                       the choice on "did mode=ro fail" blocks a legitimate
-  #                       placement on a cleanly-stopped module.
-  #
-  # An earlier revision keyed on the failure rather than the sidecar and would
-  # have refused engram's RB-2 door: module parked, store cleanly checkpointed,
-  # no -wal, mode=ro error 14. The concern the no-fallback guard was written for
-  # (dropping a WAL) cannot arise when there is no WAL to drop.
-  # (CKCRED + CEREB, 2026-09-19.)
-  # A store snapshot holds the module's whole database (vendor payloads,
-  # transcripts, audit rows), so it is created owner-only. sqlite3 creates the
-  # file under the process umask, which is usually 022 and would leave a copy of
-  # a 0600 store readable by every account that can enter the staging dir.
-  : > "$store_rb" && chmod 600 "$store_rb" \
-    || refuse "could not create $store_rb owner-only; nothing has been placed"
-  if [ -f "$MIGRATES-wal" ] || [ -f "$MIGRATES-journal" ]; then
-    say "store has a recovery sidecar; reading mode=ro (no immutable fallback)"
-    sqlite3 "file:$MIGRATES?mode=ro" ".backup $store_rb" 2>/dev/null \
-      || refuse "store snapshot failed for $MIGRATES; nothing has been placed.
-        A -wal or -journal is present, so a read-only open must replay it and
-        could not. Start the module and re-run, or copy the .db AND its sidecar
-        to a scratch dir and snapshot the copy. Do NOT reach for immutable=1:
-        it would succeed and silently omit the sidecar."
-  else
-    say "store has NO recovery sidecar (cleanly closed); reading immutable=1"
-    sqlite3 "file:$MIGRATES?immutable=1" ".backup $store_rb" 2>/dev/null \
-      || refuse "store snapshot failed for $MIGRATES; nothing has been placed.
-        No -wal or -journal is present and immutable=1 still could not read it,
-        so the file is damaged or is not a SQLite database."
-  fi
-  [ -s "$store_rb" ] || refuse "store snapshot $store_rb is empty; nothing has been placed"
-  [ "$(stat -f %Lp "$store_rb" 2>/dev/null || stat -c %a "$store_rb")" = 600 ] \
-    || refuse "store snapshot $store_rb is not owner-only (0600); nothing has been placed"
+  # that restores to a state which never existed. snapshot-store.sh takes the
+  # copy in one read transaction (VACUUM INTO), so the module's own writes
+  # can't restart it the way they restart sqlite3's .backup, picks the reader
+  # by whether a recovery sidecar exists, creates the file owner-only (0600),
+  # and checks it before anything is placed. Its header explains both choices.
+  snapshot_out=$("$(dirname "$0")/snapshot-store.sh" "$MIGRATES" "$store_rb" 2>&1) \
+    || refuse "store snapshot failed for $MIGRATES; nothing has been placed.
+        $snapshot_out
+        Do NOT reach for immutable=1 while a -wal or -journal exists: it would
+        succeed and silently omit the sidecar."
+  say "$snapshot_out"
   (cd "$STAGING" && shasum -a 256 "$(basename "$store_rb")" > "$(basename "$store_rb").sha256")
   say "store rollback $(basename "$store_rb") ($(stat -f %z "$store_rb" 2>/dev/null || stat -c %s "$store_rb") bytes)"
   # --migrates says a migration MAY run, not that one did, so this line states

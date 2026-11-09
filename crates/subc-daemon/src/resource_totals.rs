@@ -112,6 +112,8 @@ struct Module {
     finished_native_samples: Option<(NativeCpuSamples, NativeCpuSamples)>,
     #[cfg(all(test, windows))]
     finished_native_names: BTreeMap<(u32, u64), String>,
+    #[cfg(all(test, windows))]
+    native_job_samples: Option<(u64, u64)>,
     declaration_loss: Arc<declaration_loss::Losses>,
     #[cfg(windows)]
     retired_handles: Vec<Arc<subc_os::Process>>,

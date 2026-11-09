@@ -718,18 +718,13 @@ async fn windows_declared_tree(contained: bool) {
     assert!(native_baselines
         .keys()
         .all(|identity| native_finals.contains_key(identity)));
-    let expected_cpu: u64 = native_finals
-        .iter()
-        .map(|(identity, final_cpu)| {
-            final_cpu
-                .checked_sub(native_baselines.get(identity).copied().unwrap_or(0))
-                .unwrap()
-        })
-        .sum();
-    // Sum every raw identity, including Windows' real conhost descendant.
-    // No ledger, pending-credit total or published agents value funds this reference.
+    let job_samples = tracker.state.lock().unwrap().modules["test-module"].native_job_samples;
+    assert_eq!(job_samples.is_some(), contained);
+    let expected_cpu = windows_finish_cpu_reference(&native_baselines, &native_finals, job_samples);
+    // Include every native identity, including conhost, but respect the job's
+    // independently rounded growth. No attributed or pending credit funds this reference.
     assert!(observed_root >= confirmed_root);
-    println!("WINDOWS_FINISH contained={contained} baseline_root={baseline_root} sampled_root={sampled_root} early_final_root={confirmed_root} observed_final_root={observed_root} before_agents={} after_agents={} after_rows={after_rows:?} native_command_after={measured_after} credited_after={credited_after} pending_after={pending_after} final_rows={:?} final_agents={}",
+    println!("WINDOWS_FINISH contained={contained} job_samples={job_samples:?} baseline_root={baseline_root} sampled_root={sampled_root} early_final_root={confirmed_root} observed_final_root={observed_root} before_agents={} after_agents={} after_rows={after_rows:?} native_command_after={measured_after} credited_after={credited_after} pending_after={pending_after} final_rows={:?} final_agents={}",
         before.cpu_ms, after.cpu_ms, tracker.state.lock().unwrap().modules["test-module"].cpu_model.rows(), finished.cpu_ms);
     assert!(finished.cpu_ms >= after.cpu_ms);
     assert!(finished.cpu_ms >= 100);
@@ -752,6 +747,82 @@ async fn windows_declared_tree(contained: bool) {
     }
     assert_eq!(finished.process_count, 0);
     assert_eq!(finished.memory_bytes, 0);
+}
+
+fn windows_finish_cpu_reference(
+    baselines: &BTreeMap<(u32, u64), u64>,
+    finals: &BTreeMap<(u32, u64), u64>,
+    job_samples: Option<(u64, u64)>,
+) -> u64 {
+    let process_cpu: u64 = finals
+        .iter()
+        .map(|(identity, final_cpu)| {
+            final_cpu
+                .checked_sub(baselines.get(identity).copied().unwrap_or(0))
+                .unwrap()
+        })
+        .sum();
+    // Subtracting individually floored endpoints can exceed the growth of
+    // the once-rounded job total. Inside attribution must fit both readings.
+    job_samples.map_or(process_cpu, |(before, after)| {
+        process_cpu.min(after.checked_sub(before).unwrap())
+    })
+}
+
+#[test]
+fn windows_finish_reference_respects_rounded_job_counter_growth() {
+    // Fixed user/kernel counters in Windows' 100 ns units reproduce the
+    // different rounding boundaries of per-process and combined job totals.
+    let before_ticks = [(0_u64, 0_u64), (156_250, 0), (1_562_500, 1_875_000)];
+    let after_ticks = [
+        (1_562_500_u64, 1_718_750_u64),
+        (156_250, 0),
+        (2_187_500, 2_812_500),
+    ];
+    let process_ms = |samples: &[(u64, u64)]| {
+        samples
+            .iter()
+            .enumerate()
+            .map(|(index, (user, kernel))| ((index as u32 + 1, 1), (user + kernel) / 10_000))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let job_ms = |samples: &[(u64, u64)]| {
+        samples
+            .iter()
+            .map(|(user, kernel)| user + kernel)
+            .sum::<u64>()
+            / 10_000
+    };
+    let baselines = process_ms(&before_ticks);
+    let finals = process_ms(&after_ticks);
+    let job_samples = (job_ms(&before_ticks), job_ms(&after_ticks));
+    assert_eq!(job_samples, (359, 843));
+    assert_eq!(windows_finish_cpu_reference(&baselines, &finals, None), 485);
+    assert_eq!(
+        windows_finish_cpu_reference(&baselines, &finals, Some(job_samples)),
+        484,
+        "individually rounded endpoints cannot authorize more CPU than job growth"
+    );
+
+    let mut model = counter_model::Model::default();
+    model.observe(counter_model::Kind::WindowsJob, 1, job_samples.0, &[], 0);
+    model.observe(
+        counter_model::Kind::WindowsJob,
+        1,
+        job_samples.1,
+        &[counter_model::Demand {
+            owner: Some(AgentCommandRoot {
+                pid: 1,
+                start_time_ms: 1,
+            }),
+            identity: Some((1, 1)),
+            cpu: 485,
+            before: job_samples.0,
+            inside_at_both_ends: true,
+        }],
+        job_samples.0,
+    );
+    assert_eq!(model.rows(), (359, 484, 843));
 }
 
 #[tokio::test]

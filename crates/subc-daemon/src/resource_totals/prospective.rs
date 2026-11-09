@@ -418,6 +418,11 @@ impl Module {
         } else {
             Kind::WindowsJob
         };
+        #[cfg(all(test, windows))]
+        if source == Some(TreeSource::Job) {
+            // Keep the actual kernel inputs independent of attributed rows.
+            self.native_job_samples.get_or_insert((raw, raw)).1 = raw;
+        }
         let baseline = self
             .roots
             .values()

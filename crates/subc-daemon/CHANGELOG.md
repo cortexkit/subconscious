@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.43.1
+
+- Correct the native Windows finished-command test's reference to respect the independently rounded job CPU increase. Fixed 100 ns counters now cover the one-millisecond difference between a combined job total and individually rounded process endpoints. Production accounting is unchanged and continues to conserve measured job CPU without a tolerance.
+
 ## 0.43.0
 
 - Add restart-required `federated_scope_owner` (default `callosum`), exclusive scope-kind ownership and epoch-fixed paired-peer facts. Parent and child-owner links cannot cross that owner boundary.

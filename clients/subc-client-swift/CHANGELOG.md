@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Read optional `BoardLaneItem.etaSource` (`eta_source` on the wire): `wait` when the
+  board module derived the ETA from what the item waits on. Kept as an open string;
+  absent stays nil.
 - Federated scope management replies preserve optional `agent_name` and `flow_name` for display only. They arrive already validated by the daemon; generic dictionary decoding remains unchanged, with no new typed scope API.
 - Mirror optional operation_deferral catalog metadata as CatalogEntry.operationDeferral.
 

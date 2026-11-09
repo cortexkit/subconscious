@@ -296,6 +296,7 @@ pub mod error_codes {
         if matches!(
             code,
             TARGET_FLOW_UNSUPPORTED
+                | FEDERATED_STAMP_REQUIRED
                 | TARGET_FEDERATED_UNSUPPORTED
                 | TARGET_AGENT_RUN_UNSUPPORTED
                 | SCOPE_BIND_PROOF_REQUIRED
@@ -316,6 +317,11 @@ pub mod error_codes {
                 | BIND_BUSY
         )
     }
+
+    /// The scope requires a federated stamp, but the target cannot read one.
+    pub const FEDERATED_STAMP_REQUIRED: &str = "federated_stamp_required";
+    /// Only the configured federated owner with route-authorize/v1 may ask.
+    pub const ROUTE_AUTHORIZE_NOT_PERMITTED: &str = "route_authorize_not_permitted";
 
     /// Whether the caller should evict this established route, reopen it, and
     /// resend the request once. Consumers mapping route death to their own

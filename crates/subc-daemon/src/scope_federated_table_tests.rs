@@ -14,6 +14,22 @@ fn federated(epoch: u64) -> ScopeRecord {
     )
 }
 
+#[test]
+fn federated_stamp_required_is_fixed_for_the_epoch() {
+    let mut table = table();
+    sync(&mut table, FED, conn(1), 1, vec![federated(1)]);
+    let mut required = federated(1);
+    required.attributes.federated.as_mut().unwrap().stamp_required = true;
+    let refused = change(&mut table, FED, false, required.clone());
+    assert_eq!(refused.results[0].code.as_deref(), Some(error_codes::SCOPE_FEDERATED_CHANGED));
+    required.scope_epoch = 2;
+    let applied = sync(&mut table, FED, conn(1), 3, vec![required]);
+    assert!(applied.results[0].code.is_none());
+    let admitted = table.admit(&reserved(FED), "target", &ScopeSelector::new(reserved(FED), "f", Some(2)), true).unwrap();
+    assert!(admitted.stamp_required);
+    assert!(!serde_json::to_string(&admitted.stamp).unwrap().contains("stamp_required"));
+}
+
 fn change(table: &mut ScopeTable, owner: &str, delta: bool, record: ScopeRecord) -> SyncApplied {
     if delta {
         table

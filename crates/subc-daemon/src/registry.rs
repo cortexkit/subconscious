@@ -70,6 +70,20 @@ pub struct ModuleRegistration {
     pub control_ops: Vec<String>,
 }
 
+/// Active routing registrations and their publication state from one lock.
+pub(crate) struct RouteAdmissionSnapshot {
+    pub(crate) modules: Vec<ModuleRegistration>,
+    pub(crate) unpublished: HashSet<ConnectionId>,
+}
+
+impl std::ops::Deref for RouteAdmissionSnapshot {
+    type Target = [ModuleRegistration];
+
+    fn deref(&self) -> &Self::Target {
+        &self.modules
+    }
+}
+
 /// Which registration a lookup or a lifecycle wait is about.
 ///
 /// A module id alone stops naming one process once a blue/green swap runs two
@@ -466,6 +480,20 @@ impl Registry {
     /// incumbents are never returned: this is the lookup routing decisions use.
     pub fn get_module(&self, module_id: &str) -> Result<Option<ModuleRegistration>, RegistryError> {
         Ok(self.lock_inner()?.modules.get(module_id).cloned())
+    }
+
+    /// Unlike the published-only catalog view, admission sees staged active
+    /// registrations too, exactly as `get_module` does. A target whose
+    /// registration is accepted but not yet published in the catalog must
+    /// answer `target_unavailable`, not `unknown_module`, on an ordinary open.
+    pub(crate) fn route_admission_snapshot(&self) -> Result<RouteAdmissionSnapshot, RegistryError> {
+        let inner = self.lock_inner()?;
+        let mut modules = inner.modules.values().cloned().collect::<Vec<_>>();
+        modules.sort_by(|a, b| a.manifest.module_id.cmp(&b.manifest.module_id));
+        Ok(RouteAdmissionSnapshot {
+            modules,
+            unpublished: inner.unpublished.clone(),
+        })
     }
 
     /// The swap candidate registered for `module_id`, if any.

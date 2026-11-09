@@ -228,6 +228,10 @@ fn deserialize_name<'de, D: serde::Deserializer<'de>>(
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct FederatedAttributes {
+    /// Require a federated stamp instead of falling back to a legacy bind.
+    /// This daemon instruction is removed from provider-facing stamps.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stamp_required: bool,
     pub peer_class: FederatedPeerClass,
     pub peer_fingerprint: String,
     pub pairing_id: String,
@@ -257,6 +261,7 @@ impl FederatedAttributes {
     ) -> Self {
         Self {
             peer_class,
+            stamp_required: false,
             peer_fingerprint,
             pairing_id,
             peer_name,
@@ -389,6 +394,26 @@ mod tests {
             }
         }
         assert!(!RemoteClaim::agent("agent").same_identity(&RemoteClaim::run("agent")));
+    }
+
+    #[test]
+    fn federated_stamp_required_defaults_false_and_is_omitted_unless_required() {
+        let mut facts = attributes();
+        let value = serde_json::to_value(&facts).unwrap();
+        assert!(value.get("stamp_required").is_none());
+        assert!(
+            !serde_json::from_value::<FederatedAttributes>(value)
+                .unwrap()
+                .stamp_required
+        );
+        facts.stamp_required = true;
+        let value = serde_json::to_value(&facts).unwrap();
+        assert_eq!(value["stamp_required"], true);
+        assert!(
+            serde_json::from_value::<FederatedAttributes>(value)
+                .unwrap()
+                .stamp_required
+        );
     }
 
     #[test]

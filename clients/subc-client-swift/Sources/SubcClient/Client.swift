@@ -25,6 +25,8 @@ public struct CatalogEntry {
     public let displayName: String?
     public let roles: [String]
     public let controlOps: [String]
+    /// Deferred-operation declarations mirrored from the provider manifest.
+    public let operationDeferral: [String: Bool]?
     public let events: [CatalogEventDeclaration]?
     public let richUi: CatalogRichUiDescriptor?
     /// Raw per-role JSON declarations; each role owns its entry's schema.
@@ -164,6 +166,7 @@ public final class SubcClient {
                 displayName: module["display_name"] as? String,
                 roles: rolesOf(module["roles"]),
                 controlOps: module["control_ops"] as? [String] ?? [],
+                operationDeferral: module["operation_deferral"] as? [String: Bool],
                 events: eventsOf(module["events"]),
                 richUi: richUiOf(module["rich_ui"]),
                 roleDeclarations: module["role_declarations"],

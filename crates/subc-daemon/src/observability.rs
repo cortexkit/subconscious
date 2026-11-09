@@ -30,6 +30,7 @@ const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
     "target_unavailable",
     subc_protocol::error_codes::TARGET_FLOW_UNSUPPORTED,
     subc_protocol::error_codes::TARGET_FEDERATED_UNSUPPORTED,
+    subc_protocol::error_codes::FEDERATED_STAMP_REQUIRED,
     subc_protocol::error_codes::TARGET_AGENT_RUN_UNSUPPORTED,
     "module_removed",
     "module_no_protocol",

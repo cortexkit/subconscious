@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.44.5
+
+- Add owner-restricted route.authorize over shared pure route admission, with exact claim matching and restart-stable content versions. Ordinary opens keep their existing refusal precedence; authorization does not promise transient availability.
+- Refuse federated_stamp_required at admission and captured-connection relay instead of stripping required stamps. Never expose the daemon instruction to providers or non-owner describe readers.
+- Validate operation_deferral at HELLO, warn and drop the whole invalid map, and relay valid metadata through catalog.list. Require protocol 0.36.2 and control 0.38.2.
+
 ## 0.44.4
 
 - Use clock-independent Windows process snapshots so a backward wall-clock adjustment cannot hide live agent-command roots or silently reduce their resource trees. Add native Windows coverage for declaring a live contained command after clock rollback.

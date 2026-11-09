@@ -147,6 +147,11 @@ pub struct ModuleManifest {
     /// and older daemons silently drop the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_operations: Option<Vec<String>>,
+    /// Operations safe to defer, keyed by `tool:<name>` or `management:<name>`.
+    /// Invalid maps are dropped whole; HELLO remains accepted. Only meaningful
+    /// with scope-federated/v1. The daemon relays, but never enforces, this map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_deferral: Option<BTreeMap<String, bool>>,
     /// Management operations this module guards by asking the person through
     /// `operator.confirm` before it acts.
     ///
@@ -202,6 +207,7 @@ pub struct ModuleManifestBuilder {
     operation_delivery: BTreeMap<String, OperationDelivery>,
     operation_payload: BTreeMap<String, OperationPayload>,
     flow_operations: Option<Vec<String>>,
+    operation_deferral: Option<BTreeMap<String, bool>>,
     confirm_operations: Option<Vec<String>>,
     rich_ui: Option<RichUiDescriptor>,
     role_declarations: BTreeMap<String, serde_json::Map<String, Value>>,
@@ -236,6 +242,7 @@ impl ModuleManifest {
             operation_delivery: BTreeMap::new(),
             operation_payload: BTreeMap::new(),
             flow_operations: None,
+            operation_deferral: None,
             confirm_operations: None,
             rich_ui: None,
             role_declarations: BTreeMap::new(),
@@ -362,6 +369,12 @@ impl ModuleManifestBuilder {
         self
     }
 
+    /// Declares operations that may run after a paired computer reconnects.
+    pub fn operation_deferral(mut self, operations: Option<BTreeMap<String, bool>>) -> Self {
+        self.operation_deferral = operations;
+        self
+    }
+
     /// Declares the management operations guarded with `operator.confirm`.
     ///
     /// `None` (the default) leaves the answer unknown and preserves legacy wire
@@ -407,6 +420,7 @@ impl ModuleManifestBuilder {
             operation_delivery: self.operation_delivery,
             operation_payload: self.operation_payload,
             flow_operations: self.flow_operations,
+            operation_deferral: self.operation_deferral,
             confirm_operations: self.confirm_operations,
             rich_ui: self.rich_ui,
             role_declarations: self.role_declarations,
@@ -464,6 +478,8 @@ struct ModuleManifestWire {
     // Kept raw so an invalid list can be dropped rather than refusing HELLO.
     #[serde(default)]
     flow_operations: Option<Value>,
+    #[serde(default)]
+    operation_deferral: Option<Value>,
     // Kept raw for the same reason as `flow_operations`.
     #[serde(default)]
     confirm_operations: Option<Value>,
@@ -530,6 +546,9 @@ impl<'de> Deserialize<'de> for ModuleManifest {
         manifest.flow_operations = wire
             .flow_operations
             .and_then(|value| decode_flow_operations(&manifest, &value).ok());
+        manifest.operation_deferral = wire
+            .operation_deferral
+            .and_then(|value| decode_operation_deferral(&manifest, &value).ok());
         manifest.confirm_operations = wire
             .confirm_operations
             .and_then(|value| decode_confirm_operations(&manifest, &value).ok());
@@ -2615,6 +2634,85 @@ pub fn validate_hello_flow_operations(hello: &Value) -> Result<(), FlowOperation
         return Ok(());
     };
     decode_flow_operations(&manifest, value).map(|_| ())
+}
+
+/// Maximum number of deferred-operation declarations in one manifest.
+pub const MAX_OPERATION_DEFERRAL: usize = 256;
+
+fn decode_operation_deferral(
+    manifest: &ModuleManifest,
+    value: &Value,
+) -> Result<BTreeMap<String, bool>, String> {
+    if !manifest.capabilities.as_ref().is_some_and(|caps| {
+        caps.provides
+            .iter()
+            .any(|cap| cap == crate::scope::SCOPE_FEDERATED_CAPABILITY)
+    }) {
+        return Err("operation_deferral requires scope-federated/v1".into());
+    }
+    let operations = value
+        .as_object()
+        .ok_or("operation_deferral must be an object")?;
+    if operations.len() > MAX_OPERATION_DEFERRAL {
+        return Err(format!(
+            "operation_deferral exceeds {MAX_OPERATION_DEFERRAL} entries"
+        ));
+    }
+    for (key, value) in operations {
+        let (surface, name) = key
+            .split_once(':')
+            .ok_or("operation_deferral keys require a surface prefix")?;
+        // Operation names share the federated catalog's printable-ASCII grammar;
+        // colon is reserved for the surface separator and dots are allowed.
+        if !matches!(surface, "tool" | "management")
+            || name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|b| (0x21..=0x7e).contains(&b) && b != b':')
+        {
+            return Err(format!("invalid operation_deferral key '{key}'"));
+        }
+        if value != &Value::Bool(true) {
+            return Err(format!("operation_deferral value for '{key}' must be true"));
+        }
+        if surface == "management" && !manifest.provides.iter().any(|role| matches!(role,
+            ProviderRole::ManagementSurface { operations, .. } if operations.iter().any(|op| op.name == name))) {
+            return Err(format!("operation_deferral names undeclared management operation '{name}'"));
+        }
+    }
+    Ok(operations.keys().map(|key| (key.clone(), true)).collect())
+}
+
+impl ModuleManifest {
+    /// Check producer-constructed deferred-operation declarations against this manifest.
+    pub fn validate_operation_deferral(&self) -> Result<(), String> {
+        match &self.operation_deferral {
+            Some(operations) => decode_operation_deferral(
+                self,
+                &serde_json::to_value(operations).expect("serializable map"),
+            )
+            .map(|_| ()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Warn about advisory metadata that the lenient manifest decoder drops whole.
+pub fn validate_hello_operation_deferral(hello: &Value) -> Result<(), String> {
+    let Some(manifest_value) = hello.get("manifest") else {
+        return Ok(());
+    };
+    let Some(value) = manifest_value
+        .get("operation_deferral")
+        .filter(|v| !v.is_null())
+    else {
+        return Ok(());
+    };
+    let Ok(manifest) = ModuleManifest::deserialize(manifest_value) else {
+        return Ok(());
+    };
+    decode_operation_deferral(&manifest, value).map(|_| ())
 }
 
 /// Why a [`ModuleManifest::confirm_operations`] list is dropped.

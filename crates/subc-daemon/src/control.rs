@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant as StdInstant},
 };
 
+use crate::scopes::admission::denied_capability;
 use serde::{Deserialize, Serialize};
 use subc_control::{
     ops, CapabilityRequirementStatus, CatalogEntry, ClientControlPush, ClientControlRequest,
@@ -26,10 +27,10 @@ use subc_protocol::{
     manifest::{
         validate_hello_capability_grammar, validate_hello_confirm_operations,
         validate_hello_display_name, validate_hello_event_declarations,
-        validate_hello_flow_operations, validate_hello_rich_ui_descriptor,
-        validate_hello_role_declarations, validate_hello_self_signal_declarations,
-        CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
-        ProviderRole,
+        validate_hello_flow_operations, validate_hello_operation_deferral,
+        validate_hello_rich_ui_descriptor, validate_hello_role_declarations,
+        validate_hello_self_signal_declarations, CapabilityDeclarations, CapabilityNeed,
+        Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
     },
     peer::{ObservedPeer, RouteBindPeer, OBSERVED_PEER_CAPABILITY, OPERATOR_APP_CAPABILITY},
     scope::{
@@ -142,6 +143,7 @@ const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
     SCOPE_SYNC_OP,
     SCOPE_APPLY_OP,
     SCOPE_DESCRIBE_OP,
+    subc_protocol::scope::ROUTE_AUTHORIZE_OP,
     "operator.confirm",
 ];
 
@@ -2182,9 +2184,19 @@ impl ControlHandler {
                 if is_known_module_request_op(&frame.body) {
                     let is_agents = serde_json::from_slice::<ControlOpProbe>(&frame.body)
                         .is_ok_and(|probe| probe.op == "supervisor.agent_commands");
+                    let code = if is_agents {
+                        "not_supervised"
+                    } else if op
+                        .as_ref()
+                        .is_some_and(|probe| probe.op == subc_protocol::scope::ROUTE_AUTHORIZE_OP)
+                    {
+                        error_codes::ROUTE_AUTHORIZE_NOT_PERMITTED
+                    } else {
+                        "not_registered"
+                    };
                     return Ok(vec![control_error_frame(
                         &frame,
-                        if is_agents { "not_supervised" } else { "not_registered" },
+                        code,
                         "module-originated control requests require the module's own registered connection",
                     )?]);
                 }
@@ -2643,6 +2655,14 @@ impl ControlHandler {
                 .as_str()
                 .unwrap_or("<unknown>");
             warn!(module_id, %reason, "dropping whole role_declarations map from HELLO");
+        }
+        if let Err(reason) = validate_hello_operation_deferral(&hello_value) {
+            let module_id = hello_value
+                .get("manifest")
+                .and_then(|m| m.get("module_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            warn!(module_id, %reason, "dropping operation_deferral from HELLO");
         }
         if let Err(reason) = validate_hello_flow_operations(&hello_value) {
             let module_id = hello_value["manifest"]["module_id"]
@@ -3439,6 +3459,19 @@ impl ControlHandler {
         request: ModuleControlRequestFromModule,
     ) -> Result<Vec<Frame>, RouterError> {
         match request {
+            ModuleControlRequestFromModule::RouteAuthorize {
+                principal,
+                scope,
+                target,
+                expected,
+            } => self.handle_route_authorize(
+                connection_id,
+                frame,
+                principal,
+                scope,
+                target,
+                expected,
+            ),
             ModuleControlRequestFromModule::CatalogUpdate {
                 provides,
                 capabilities,
@@ -3889,6 +3922,75 @@ impl ControlHandler {
         self.emit_route_goodbyes(goodbyes);
     }
 
+    fn handle_route_authorize(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+        principal: Principal,
+        scope: subc_protocol::scope::RouteAuthorizeScope,
+        target: String,
+        expected: subc_protocol::scope::RouteAuthorizeExpected,
+    ) -> Result<Vec<Frame>, RouterError> {
+        use crate::scopes::admission::{admit_route, AdmissionMode};
+        use subc_protocol::scope::{
+            RouteAuthorizeOutcome, RouteAuthorizeResponse, ROUTE_AUTHORIZE_CAPABILITY,
+        };
+        let registry = self
+            .registry
+            .route_admission_snapshot()
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let owner_configured = match &scope.owner {
+            Principal::Reserved { module_id } => self.supervisor.is_configured(module_id),
+            _ => false,
+        };
+        let selector = ScopeSelector::new(scope.owner, scope.scope_ref, Some(scope.epoch));
+        let answer = {
+            let scopes = self.scopes.read().unwrap_or_else(|p| p.into_inner());
+            let permitted = registry
+                .iter()
+                .find(|r| r.connection_id == connection_id)
+                .is_some_and(|r| {
+                    scopes.is_federated_owner(&Principal::Reserved {
+                        module_id: r.manifest.module_id.clone(),
+                    }) && r.manifest.capabilities.as_ref().is_some_and(|caps| {
+                        caps.provides
+                            .iter()
+                            .any(|cap| cap == ROUTE_AUTHORIZE_CAPABILITY)
+                    })
+                });
+            if !permitted {
+                drop(scopes);
+                return Ok(vec![control_error_frame(&frame, error_codes::ROUTE_AUTHORIZE_NOT_PERMITTED,
+                    "route.authorize requires the configured federated owner's route-authorize/v1 registration")?]);
+            }
+            admit_route(
+                &scopes,
+                &registry,
+                &principal,
+                &target,
+                Some(&selector),
+                owner_configured,
+                AdmissionMode::Authorize(&expected),
+            )
+        };
+        let response = match answer {
+            Ok(admission) => {
+                let mut response = RouteAuthorizeResponse::new(
+                    RouteAuthorizeOutcome::Authorized,
+                    "route admission authorized",
+                );
+                response.content_version = admission.content_version;
+                response
+            }
+            Err(refusal) => refusal.response(),
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "RouteAuthorizeResponse",
+        )?])
+    }
+
     /// `scope.describe`: any registered module may read any scope, because a
     /// provider must read the scope a route it serves is stamped with.
     fn handle_scope_describe(
@@ -3924,6 +4026,19 @@ impl ControlHandler {
         }
         let mut description = scopes.describe(&owner, &scope_ref);
         drop(scopes);
+        if owner
+            != (Principal::Reserved {
+                module_id: registered.manifest.module_id.clone(),
+            })
+        {
+            if let Some(facts) = description
+                .stamp
+                .as_mut()
+                .and_then(|stamp| stamp.attributes.federated.as_mut())
+            {
+                facts.stamp_required = false;
+            }
+        }
         // Describe readers also decode strict ScopeAttributes. Attribution is
         // safe to omit unless the requesting module declares it understands it.
         if !registered
@@ -4539,6 +4654,7 @@ impl ControlHandler {
                 .with_operation_delivery(registration.manifest.operation_delivery)
                 .with_operation_payload(registration.manifest.operation_payload)
                 .with_flow_operations(registration.manifest.flow_operations)
+                .with_operation_deferral(registration.manifest.operation_deferral)
                 .with_confirm_operations(registration.manifest.confirm_operations)
                 .with_rich_ui(registration.manifest.rich_ui)
                 .with_role_declarations(registration.manifest.role_declarations)
@@ -5018,10 +5134,12 @@ impl ControlHandler {
         // IF THE HANDSHAKE EVER ADMITS A PRINCIPAL THAT IS NOT THIS USER -- a
         // remote transport, a sandboxed caller, a shared-host mode -- THAT
         // PREMISE DIES AND THESE THREE REPLIES MUST COLLAPSE INTO ONE.
-        let Some(registration) = self
+        let admission_registry = self
             .registry
-            .get_module(&target_module_id)
-            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+            .route_admission_snapshot()
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let Some(registration) =
+            crate::scopes::admission::registered_target(&admission_registry, &target_module_id)
         else {
             if let Some((status, warming)) =
                 self.supervisor_status(&target_module_id, frame.header.corr)?
@@ -5087,7 +5205,9 @@ impl ControlHandler {
         // Best-effort only: registry readiness and forwarding reservation use
         // different locks, so a module can flip readiness between this read and
         // the relay. Modules must still tolerate an `on_bind` while not ready.
-        if !registration.ready {
+        if crate::scopes::admission::target_registration(&admission_registry, &target_module_id)
+            .is_err()
+        {
             self.counters
                 .increment_route_open_refused(ROUTE_OPEN_REFUSED_DECLARED_NOT_READY);
             info!(
@@ -5137,7 +5257,7 @@ impl ControlHandler {
         // goes away stay bound: nothing here tears them down, and the module
         // answers them as it can. Like the readiness read above this is
         // best-effort against a provider registering or leaving concurrently.
-        if let Some(capability) = self.first_unprovided_required_capability(&registration) {
+        if let Some(capability) = self.first_unprovided_required_capability(registration) {
             self.counters
                 .increment_route_open_refused(ROUTE_OPEN_REFUSED_REQUIRED_CAPABILITY_UNPROVIDED);
             info!(
@@ -5310,10 +5430,9 @@ impl ControlHandler {
             module_id: opening_module_id,
         } = &principal
         {
-            if let Some(opening_registration) = self
-                .registry
-                .get_module(opening_module_id)
-                .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+            if let Some(opening_registration) = admission_registry
+                .iter()
+                .find(|r| r.manifest.module_id == *opening_module_id)
             {
                 if let Some(capability) =
                     denied_capability(&opening_registration.manifest, &registration.manifest)
@@ -5381,8 +5500,8 @@ impl ControlHandler {
         // compared with the published one at commit, so a sync between here
         // and the module's ack refuses the open instead of binding a stamp
         // that is no longer true.
-        let (bound_scope, mut scope_stamp) = match &scope {
-            None => (None, None),
+        let (bound_scope, mut scope_stamp, stamp_required) = match &scope {
+            None => (None, None, false),
             Some(selector) => {
                 let owner_configured = match &selector.owner {
                     // A reserved owner counts as configured from before its
@@ -5397,37 +5516,37 @@ impl ControlHandler {
                     .scopes
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let admitted = scopes
-                    .admit(&principal, &target_module_id, selector, owner_configured)
-                    .and_then(|admission| {
-                        crate::scopes::check_target_flow_support(
-                            &admission.stamp,
-                            &target_module_id,
-                            registration.manifest.capabilities.as_ref(),
-                        )?;
-                        crate::scopes::check_target_agent_run_support(
-                            &admission.stamp,
-                            &target_module_id,
-                            registration.manifest.capabilities.as_ref(),
-                        )?;
-                        let bound = scopes.reserve_bind(
-                            &admission,
-                            &principal,
-                            ctx.connection_id,
-                            selector.hold_presence,
-                        );
-                        Ok((admission, bound))
-                    });
+                let admitted = crate::scopes::admission::admit_route(
+                    &scopes,
+                    &admission_registry,
+                    &principal,
+                    &target_module_id,
+                    Some(selector),
+                    owner_configured,
+                    crate::scopes::admission::AdmissionMode::Open,
+                )
+                .map(|route| {
+                    let admission = route.scope.expect("scoped admission");
+                    let bound = scopes.reserve_bind(
+                        &admission,
+                        &principal,
+                        ctx.connection_id,
+                        selector.hold_presence,
+                    );
+                    (admission, bound)
+                });
                 match admitted {
-                    Ok((admission, bound)) => (Some(bound), Some(admission.stamp)),
+                    Ok((admission, bound)) => {
+                        (Some(bound), Some(admission.stamp), admission.stamp_required)
+                    }
                     Err(refusal) => {
                         return Ok(vec![self.route_open_refusal_frame(
                             ctx,
                             &caller,
                             &frame,
                             &target_module_id,
-                            refusal.code,
-                            refusal.code,
+                            refusal.code.unwrap_or(error_codes::TARGET_UNAVAILABLE),
+                            refusal.code.unwrap_or(error_codes::TARGET_UNAVAILABLE),
                             refusal.message,
                         )?]);
                     }
@@ -5619,11 +5738,18 @@ impl ControlHandler {
             }
         }
         if let Some(stamp) = scope_stamp.as_ref() {
-            if let Err(refusal) = crate::scopes::check_target_flow_support(
-                stamp,
+            if let Err(refusal) = crate::scopes::check_target_required_stamp(
+                stamp_required,
                 &target_module_id,
                 relay_capabilities,
             )
+            .and_then(|()| {
+                crate::scopes::check_target_flow_support(
+                    stamp,
+                    &target_module_id,
+                    relay_capabilities,
+                )
+            })
             .and_then(|()| {
                 crate::scopes::check_target_agent_run_support(
                     stamp,
@@ -8318,6 +8444,9 @@ fn module_control_request_op(request: &ModuleControlRequestFromModule) -> &'stat
         ModuleControlRequestFromModule::ScopeSync { .. } => SCOPE_SYNC_OP,
         ModuleControlRequestFromModule::ScopeApply { .. } => SCOPE_APPLY_OP,
         ModuleControlRequestFromModule::ScopeDescribe { .. } => SCOPE_DESCRIBE_OP,
+        ModuleControlRequestFromModule::RouteAuthorize { .. } => {
+            subc_protocol::scope::ROUTE_AUTHORIZE_OP
+        }
         ModuleControlRequestFromModule::AgentCommands { .. } => "supervisor.agent_commands",
         _ => "unsupported",
     }
@@ -8475,26 +8604,6 @@ fn capability_census_trigger(
             .must_never_reach
             .iter()
             .any(|capability| !old_denies.contains(capability))
-}
-
-/// Find the first capability an attested opener denies that an attested target
-/// claims. Both manifests are live registry records, never cached or client data.
-fn denied_capability<'a>(
-    opening_manifest: &'a ModuleManifest,
-    target_manifest: &ModuleManifest,
-) -> Option<&'a str> {
-    let opening_capabilities = opening_manifest.capabilities.as_ref()?;
-    let target_capabilities = target_manifest.capabilities.as_ref()?;
-    opening_capabilities
-        .must_never_reach
-        .iter()
-        .find(|denied| {
-            target_capabilities
-                .provides
-                .iter()
-                .any(|provided| provided == *denied)
-        })
-        .map(String::as_str)
 }
 
 fn catalog_update_frozen_field_message(
@@ -10616,6 +10725,80 @@ mod tests {
         let (raw, entry) = role_declarations_catalog(&handler);
         assert!(raw.get("flow_operations").is_none());
         assert_eq!(entry.flow_operations, None);
+    }
+
+    #[test]
+    fn operation_deferral_hello_accepts_valid_and_invalid_maps_and_catalog_relays_only_valid() {
+        let oversized: serde_json::Map<String, Value> = (0..257)
+            .map(|n| (format!("tool:t{n}"), json!(true)))
+            .collect();
+        for (capabilities, map, valid) in [
+            (
+                json!(["scope-federated/v1"]),
+                json!({"tool:read":true,"management:reset":true}),
+                true,
+            ),
+            (json!(["scope-federated/v1"]), json!({}), true),
+            (json!([]), json!({"tool:read":true}), false),
+            (
+                json!(["scope-federated/v1"]),
+                json!({"tool:valid":true,"tool:bad":false}),
+                false,
+            ),
+            (
+                json!(["scope-federated/v1"]),
+                json!({"tool:valid":true,"management:missing":true}),
+                false,
+            ),
+            (
+                json!(["scope-federated/v1"]),
+                Value::Object(oversized),
+                false,
+            ),
+        ] {
+            let capture = EventCapture::default();
+            let _subscriber = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(capture.clone()),
+            );
+            let registry = Arc::new(Registry::default());
+            let handler = ControlHandler::new(Arc::clone(&registry));
+            let hello = hello_with_flow_operations(capabilities, None);
+            let mut body: Value = serde_json::from_slice(&hello.body).unwrap();
+            body["manifest"]["operation_deferral"] = map.clone();
+            let hello = Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                401,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            let response = handler
+                .handle_control(ConnectionId::new(401), hello)
+                .unwrap();
+            assert_eq!(response[0].header.ty, FrameType::HelloAck);
+            let (raw, entry) = role_declarations_catalog(&handler);
+            if valid {
+                assert_eq!(raw["operation_deferral"], map);
+                assert_eq!(
+                    serde_json::to_value(entry.operation_deferral.unwrap()).unwrap(),
+                    map
+                );
+            } else {
+                assert!(entry.operation_deferral.is_none());
+                assert!(raw.get("operation_deferral").is_none());
+                assert_eq!(
+                    capture
+                        .events()
+                        .iter()
+                        .filter(|event| event.fields.get("message").map(String::as_str)
+                            == Some("dropping operation_deferral from HELLO"))
+                        .count(),
+                    1
+                );
+            }
+        }
     }
 
     fn assert_hello_drops_flow_operations_with_warning(
@@ -17838,6 +18021,9 @@ mod tests {
         }
         mod federated {
             include!("scope_federated_tests.rs");
+        }
+        mod authorize {
+            include!("route_authorize_tests.rs");
         }
         #[tokio::test]
         async fn served_by_dispatch_bypasses_exhaustive_decoder_and_requires_registration() {

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.36.2
+
+- Add typed route.authorize scope/expected/reply bodies and route-authorize/v1, plus terminal federated_stamp_required and route_authorize_not_permitted codes.
+- Add epoch-fixed FederatedAttributes.stamp_required (omitted when false) and bounded operation_deferral manifest metadata, dropped whole when invalid.
+
 ## 0.36.1
 
 - Add optional display-only `agent_name` on agent, run and worker remote claims, and `flow_name` on flow claims, with builders preserving existing constructors. Names follow `peer_name`'s 1–80 Unicode scalar plain-text rule; decoding drops invalid names without rejecting the claim. Absent names are omitted, never serialized as null.

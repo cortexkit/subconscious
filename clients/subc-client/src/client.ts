@@ -212,6 +212,8 @@ export interface CatalogEntry {
   events?: CatalogEventDeclaration[] | null;
   /** Open delivery strings mirrored from the manifest; absent entries are unary. */
   operation_delivery?: Record<string, string>;
+  /** Operations declared safe to defer, keyed by tool:<name> or management:<name>. */
+  operation_deferral?: Record<string, true>;
   /** Opaque rich-UI descriptor for the provider's manifest, mirrored from HELLO. */
   rich_ui?: CatalogRichUiDescriptor;
   /** Opaque per-role objects mirrored unchanged from the registered manifest. */

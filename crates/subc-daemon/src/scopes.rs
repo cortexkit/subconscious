@@ -46,6 +46,8 @@ use subc_protocol::{
 
 use crate::registry::ConnectionId;
 
+pub(crate) mod admission;
+
 /// The code a malformed sync body is refused with, the same one the control
 /// plane uses for any body that does not parse.
 const INVALID_CONTROL_BODY: &str = "invalid_control_body";
@@ -376,6 +378,8 @@ pub(crate) struct ScopeAdmission {
     pub(crate) owner: String,
     pub(crate) stamp: ScopeStamp,
     pub(crate) tag: ScopeTag,
+    /// Daemon-only routing instruction, kept outside the provider stamp.
+    pub(crate) stamp_required: bool,
 }
 
 /// Refuse before relaying a flow bind unless the target promises flow
@@ -438,6 +442,22 @@ pub(crate) fn check_target_federated_support(
         return Err(ScopeAdmissionRefusal {
             code: error_codes::TARGET_FEDERATED_UNSUPPORTED,
             message: format!("target module '{target_module}' does not provide scope-federated/v1"),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn check_target_required_stamp(
+    required: bool,
+    target_module: &str,
+    capabilities: Option<&CapabilityDeclarations>,
+) -> Result<(), ScopeAdmissionRefusal> {
+    if required && !target_supports_federated(capabilities) {
+        return Err(ScopeAdmissionRefusal {
+            code: error_codes::FEDERATED_STAMP_REQUIRED,
+            message: format!(
+                "target module '{target_module}' cannot receive the required federated stamp"
+            ),
         });
     }
     Ok(())
@@ -2096,6 +2116,16 @@ impl ScopeTable {
         selector: &ScopeSelector,
         owner_configured: bool,
     ) -> Result<ScopeAdmission, ScopeAdmissionRefusal> {
+        let (owner, scope) = self.resolve(selector, owner_configured)?;
+        self.check_carrier(scope, owner, opener, target_module)?;
+        Ok(Self::admission_stamp(owner, scope, selector))
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        selector: &'a ScopeSelector,
+        owner_configured: bool,
+    ) -> Result<(&'a str, &'a LiveScope), ScopeAdmissionRefusal> {
         let refuse = |code: &'static str, message: String| ScopeAdmissionRefusal { code, message };
         let Some(scope_epoch) = selector.scope_epoch else {
             return Err(refuse(
@@ -2149,6 +2179,17 @@ impl ScopeTable {
                 format!("scope '{scope_ref}' of {owner} deadline {deadline} has passed"),
             ));
         }
+        Ok((owner, scope))
+    }
+
+    fn check_carrier(
+        &self,
+        scope: &LiveScope,
+        owner: &str,
+        opener: &Principal,
+        target_module: &str,
+    ) -> Result<(), ScopeAdmissionRefusal> {
+        let scope_ref = &scope.record.scope_ref;
         if reserved_module_id(opener) != Some(owner) {
             let permitted = match carrier_allowance(&scope.record, opener) {
                 None => false,
@@ -2156,32 +2197,43 @@ impl ScopeTable {
                 Some(Some(targets)) => targets.contains(target_module),
             };
             if !permitted {
-                return Err(refuse(
-                    error_codes::SCOPE_NOT_CARRIER,
-                    format!(
+                return Err(ScopeAdmissionRefusal {
+                    code: error_codes::SCOPE_NOT_CARRIER,
+                    message: format!(
                         "the opener is not the owner or a carrier of scope '{scope_ref}' of \
                          {owner} permitted to open to '{target_module}'"
                     ),
-                ));
+                });
             }
         }
-        Ok(ScopeAdmission {
+        Ok(())
+    }
+
+    fn admission_stamp(owner: &str, scope: &LiveScope, selector: &ScopeSelector) -> ScopeAdmission {
+        let mut attributes = scope.record.attributes.clone();
+        let stamp_required = attributes.federated.as_mut().is_some_and(|facts| {
+            let required = facts.stamp_required;
+            facts.stamp_required = false;
+            required
+        });
+        ScopeAdmission {
             owner: owner.to_string(),
+            stamp_required,
             stamp: ScopeStamp::new(
                 selector.owner.clone(),
-                scope_ref.clone(),
-                scope_epoch,
+                selector.scope_ref.clone(),
+                scope.record.scope_epoch,
                 scope.record.kind,
             )
             .with_workdir(scope.record.workdir.clone())
             .with_project_id(scope.record.project_id.clone())
             .with_parent(scope.record.parent.clone())
             .with_parent_state(scope.parent_state)
-            .with_attributes(scope.record.attributes.clone())
+            .with_attributes(attributes)
             .with_owner_authorized(scope.owner_authorized)
             .with_expires_at_ms(scope.record.expires_at_ms),
             tag: scope.tag(),
-        })
+        }
     }
 
     /// The caller supplies its registered module id, never another owner's id.

@@ -175,6 +175,14 @@ pub enum ModuleControlResponse {
 #[serde(tag = "op")]
 #[non_exhaustive]
 pub enum ModuleControlRequestFromModule {
+    /// Ask the daemon whether a stored source may still open its route.
+    #[serde(rename = "route.authorize")]
+    RouteAuthorize {
+        principal: Principal,
+        scope: crate::scope::RouteAuthorizeScope,
+        target: String,
+        expected: crate::scope::RouteAuthorizeExpected,
+    },
     #[serde(rename = "catalog.update")]
     CatalogUpdate {
         provides: Vec<ProviderRole>,

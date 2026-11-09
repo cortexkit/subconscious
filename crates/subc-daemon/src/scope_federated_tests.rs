@@ -20,6 +20,65 @@ fn federated(scope_ref: &str, epoch: u64, claim: Option<RemoteClaim>) -> ScopeRe
         .with_attributes(ScopeAttributes::new().with_federated(Some(facts(claim))))
 }
 
+fn required_stamp() -> ScopeRecord {
+    let mut record = federated("base", 1, Some(RemoteClaim::agent("agent")));
+    record.attributes.federated.as_mut().unwrap().stamp_required = true;
+    record
+}
+
+#[tokio::test]
+async fn federated_stamp_required_rechecks_captured_replacement_before_relay() {
+    use std::future::Future;
+    let mut rig = federated_rig(&[SCOPE_FEDERATED_CAPABILITY]).await;
+    rig.sync(vec![required_stamp()]).await;
+    let (client, mut client_rx, frame) = rig.open_frame(Some(AFT), PLEXUS, Some(rig_selector("base", Some(1))));
+    // Exhaust response permits to pause after admission but before the relay
+    // captures its endpoint. A new connection may make a different promise.
+    for _ in 0..64 { client.egress.try_send(route_bind_ack(1)).unwrap(); }
+    let handler = rig.handler.clone();
+    let mut open = Box::pin(handler.handle_control_frame(&client, frame));
+    std::future::poll_fn(|cx| {
+        assert!(open.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    }).await;
+    rig.handler.cleanup_connection(rig.modules[PLEXUS].0.connection_id).unwrap();
+    let (replacement, mut replacement_rx) = wide_ctx(200);
+    hello_via_sink(&rig.handler, &replacement, &mut replacement_rx, hello_with_capabilities(PLEXUS, 200, &[])).await;
+    while client_rx.try_recv().is_ok() {}
+    let replies = tokio::time::timeout(Duration::from_secs(2), open).await.expect("refused before a bind ack").unwrap();
+    assert_eq!(parse_error(&replies[0])["code"], error_codes::FEDERATED_STAMP_REQUIRED);
+    assert!(replacement_rx.try_recv().is_err(), "no bind reaches the legacy replacement");
+    assert!(rig.modules.get_mut(PLEXUS).unwrap().1.try_recv().is_err());
+    assert_eq!(rig.forwarding.reserved_route_count().unwrap(), (0, 0));
+}
+
+#[tokio::test]
+async fn federated_stamp_required_refuses_admission_and_never_reaches_provider_or_nonowner_describe() {
+    let mut legacy = federated_rig(&[]).await;
+    legacy.sync(vec![required_stamp()]).await;
+    assert_eq!(legacy.refused(Some(AFT), PLEXUS, Some(rig_selector("base", Some(1)))).await,
+        error_codes::FEDERATED_STAMP_REQUIRED);
+    assert!(!error_codes::is_retryable_route_open(error_codes::FEDERATED_STAMP_REQUIRED));
+    let mut rig = federated_rig(&[SCOPE_FEDERATED_CAPABILITY]).await;
+    rig.sync(vec![required_stamp()]).await;
+    let bound = rig.bound(Some(AFT), PLEXUS, Some(rig_selector("base", Some(1)))).await;
+    assert!(!String::from_utf8_lossy(&bound.bind.body).contains("stamp_required"));
+    let reply = call(&rig.handler, &rig.modules[PLEXUS].0, &describe_request()).await;
+    assert!(!String::from_utf8_lossy(&reply.body).contains("stamp_required"));
+    // Owners may inspect the daemon instruction, but must declare the same
+    // strict federated decoder capability required of every describe reader.
+    rig.handler.cleanup_connection(rig.owner.connection_id).unwrap();
+    let (owner, mut owner_rx) = wide_ctx(44);
+    let hello = hello_frame_with_nonce(OWNER, PROTOCOL_VERSION, 44, Some(&nonce(OWNER)));
+    let mut body: Value = serde_json::from_slice(&hello.body).unwrap();
+    body["manifest"]["capabilities"] = serde_json::json!({"provides":[SCOPE_FEDERATED_CAPABILITY]});
+    let hello = Frame::build(FrameType::Hello, control_flags(), 0, 0, 44, serde_json::to_vec(&body).unwrap()).unwrap();
+    hello_via_sink(&rig.handler, &owner, &mut owner_rx, hello).await;
+    let reply = call(&rig.handler, &owner, &describe_request()).await;
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert_eq!(body["scope"]["attributes"]["federated"]["stamp_required"], true);
+}
+
 async fn federated_rig(provides: &[&str]) -> Rig {
     let mut rig = rig_with_target_capabilities(provides).await;
     rig.handler = rig.handler.clone().with_federated_scope_owner(OWNER.into());

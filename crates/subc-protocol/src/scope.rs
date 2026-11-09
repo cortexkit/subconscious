@@ -17,6 +17,11 @@ use crate::Principal;
 
 mod federated;
 pub use federated::{FederatedAttributes, FederatedPeerClass, RemoteClaim};
+mod authorize;
+pub use authorize::{
+    RouteAuthorizeExpected, RouteAuthorizeOutcome, RouteAuthorizeResponse, RouteAuthorizeScope,
+    ROUTE_AUTHORIZE_CAPABILITY, ROUTE_AUTHORIZE_OP,
+};
 
 /// A reader declares this only after implementing the federated provider rules.
 pub const SCOPE_FEDERATED_CAPABILITY: &str = "scope-federated/v1";

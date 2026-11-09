@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.38.2
+
+- Mirror optional operation_deferral metadata in non-exhaustive CatalogEntry, omitted when absent. Require protocol 0.36.2.
+
 ## 0.38.1
 
 - Add optional `measured_at_ms` timestamps to tree, daemon and agents resource readings. Omitted timestamps remain compatible with older frames; readers ignore unknown additions. A retained tree can accompany an open-set `tree_unavailable` reason describing a failed newer observation.

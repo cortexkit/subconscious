@@ -384,6 +384,22 @@ describe("SubcClient capability resolution", () => {
     }
   });
 
+  test("catalogList preserves operation_deferral and tolerates its absence", async () => {
+    const { connFile } = tempConnectionFile();
+    const operation_deferral = { "tool:read": true, "management:reset": true } as const;
+    const entry = { ...catalogEntry("deferrable-provider", undefined), operation_deferral };
+    const daemon = await startFakeDaemon({ stats: newStats(), catalogModules: [entry, catalogEntry("legacy-provider", undefined)] });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({ connectionFile: connFile });
+    try {
+      const modules = await client.catalogList();
+      expect(modules[0]?.operation_deferral).toEqual(operation_deferral);
+      expect(modules[1]?.operation_deferral).toBeUndefined();
+    } finally {
+      client.close();
+    }
+  });
+
   test("catalogList preserves open operation delivery and tolerates unknown entry fields", async () => {
     const { connFile } = tempConnectionFile();
     const operation_delivery = { status: "watch", future: "stream-v2" };

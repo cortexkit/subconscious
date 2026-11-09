@@ -423,6 +423,21 @@ final class ClientWireRevisionTests: XCTestCase {
         XCTAssertNil(modules[1].displayName)
     }
 
+    func testCatalogListMirrorsOperationDeferral() throws {
+        let transport = ScriptedTransport()
+        try transport.append(makeFrame(
+            ty: .response, channel: 0, epoch: 0, corr: 1,
+            json: ["modules": [
+                ["module_id": "provider", "roles": [], "control_ops": [],
+                 "operation_deferral": ["tool:read": true, "management:reset": true]],
+                ["module_id": "legacy", "roles": [], "control_ops": []],
+            ]]
+        ))
+        let modules = try SubcClient(transport: transport).catalogList()
+        XCTAssertEqual(modules[0].operationDeferral, ["tool:read": true, "management:reset": true])
+        XCTAssertNil(modules[1].operationDeferral)
+    }
+
     func testCatalogListReturnsDeclaredBusEvents() throws {
         let transport = ScriptedTransport()
         try transport.append(makeFrame(

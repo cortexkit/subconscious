@@ -2121,6 +2121,9 @@ pub struct CatalogEntry {
     /// from before the field. The daemon relays it and never enforces it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_operations: Option<Vec<String>>,
+    /// Deferred-operation declarations mirrored from the registered manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_deferral: Option<BTreeMap<String, bool>>,
     /// Management operations the module guards with `operator.confirm`,
     /// mirrored unchanged from its manifest. Absent means the module did not
     /// say (or declared an invalid list, which the daemon dropped), so a reader
@@ -2172,6 +2175,7 @@ impl CatalogEntry {
             operation_delivery: BTreeMap::new(),
             operation_payload: BTreeMap::new(),
             flow_operations: None,
+            operation_deferral: None,
             confirm_operations: None,
             rich_ui: None,
             role_declarations: BTreeMap::new(),
@@ -2194,6 +2198,13 @@ impl CatalogEntry {
     #[must_use]
     pub fn with_flow_operations(mut self, flow_operations: Option<Vec<String>>) -> Self {
         self.flow_operations = flow_operations;
+        self
+    }
+
+    /// Set deferred-operation declarations mirrored from the manifest.
+    #[must_use]
+    pub fn with_operation_deferral(mut self, operations: Option<BTreeMap<String, bool>>) -> Self {
+        self.operation_deferral = operations;
         self
     }
 

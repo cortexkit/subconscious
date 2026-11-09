@@ -138,14 +138,14 @@ impl History {
             };
             cpu_ms = cpu_ms.saturating_add(delta);
         }
-        Some(subc_control::CpuLastHour {
-            cpu_ms,
-            covered_ms,
-            bound: samples
-                .iter()
-                .any(|sample| sample.uncertain)
-                .then_some(subc_control::ResourceBound::Lower),
-        })
+        Some(
+            subc_control::CpuLastHour::new(cpu_ms, covered_ms).with_bound(
+                samples
+                    .iter()
+                    .any(|sample| sample.uncertain)
+                    .then_some(subc_control::ResourceBound::Lower),
+            ),
+        )
     }
 
     #[cfg(test)]

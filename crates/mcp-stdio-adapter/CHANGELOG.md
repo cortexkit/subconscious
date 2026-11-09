@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.0
+
+- Adopt Rust client 0.37 and its control 0.38 type family. Public credential-resolver construction accepts the new `ConsumerIdentity`, and handler methods/trait implementations expose the new SDK types, so this is a breaking Rust dependency release. Adapter wire behavior is unchanged.
+
 ## 0.4.0
 
 - Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.

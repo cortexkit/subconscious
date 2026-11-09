@@ -21,7 +21,9 @@ open_string_enum! {
 /// A live program group, ordered by descending memory in a tree reading.
 /// CPU is funded attributed credit of its currently live identities; the row
 /// additionally retains retired work. Groups never exceed their row's CPU.
+/// Construct with [`ProcessGroup::new`] and its builders, not a struct literal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ProcessGroup {
     pub name: String,
     pub count: u64,
@@ -32,8 +34,30 @@ pub struct ProcessGroup {
     pub bound: Option<ResourceBound>,
 }
 
-/// Cumulative CPU and current memory of a module and its descendants.
+/// The module root's attributed share, funded from the module row like groups.
+/// Root plus emitted child-group CPU and memory shares never exceed their
+/// respective module-row totals.
+///
+/// Construct this extensible wire type with [`TreeOwn::new`], not a literal.
+///
+/// ```compile_fail,E0639
+/// use subc_control::TreeOwn;
+/// let own = TreeOwn { cpu_ms: 1, memory_bytes: 2, bound: None };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TreeOwn {
+    pub cpu_ms: u64,
+    pub memory_bytes: u64,
+    /// Absent means exact. This bounds CPU only, not current memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<ResourceBound>,
+}
+
+/// Cumulative CPU and current memory of a module and its descendants.
+/// Construct with [`TreeReading::new`] and its builders, not a struct literal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TreeReading {
     pub cpu_ms: u64,
     pub memory_bytes: u64,
@@ -43,14 +67,22 @@ pub struct TreeReading {
     /// Absent means exact. Memory and process count are not CPU bounds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound: Option<ResourceBound>,
-    /// Absent means no program groups. Unreadable members invalidate the whole
-    /// reading instead of being represented by an empty collection.
+    /// The root process's attributed share, omitted when unknown. Its CPU is
+    /// funded from initial measured CPU and later progress, not its raw counter.
+    /// Its bound follows the row's CPU bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own: Option<TreeOwn>,
+    /// Up to eight child-only program groups by memory, excluding the root
+    /// identity but retaining children with the same name. Absent means none.
+    /// Unreadable members invalidate the whole reading, not an empty collection.
     #[serde(default)]
     pub groups: Vec<ProcessGroup>,
 }
 
 /// CPU used between the retained wall-clock samples, not a percentage.
+/// Construct with [`CpuLastHour::new`] and its builders, not a struct literal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CpuLastHour {
     pub cpu_ms: u64,
     pub covered_ms: u64,
@@ -60,7 +92,9 @@ pub struct CpuLastHour {
 }
 
 /// The daemon's own process, excluding CPU of its reaped module children.
+/// Construct with [`DaemonResources::new`] and its builders, not a struct literal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct DaemonResources {
     pub pid: u32,
     pub start_time_ms: u64,
@@ -72,7 +106,9 @@ pub struct DaemonResources {
 }
 
 /// Commands attributed to agents rather than to the module that launches them.
+/// Construct with [`AgentCommandResources::new`] and its builders, not a struct literal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AgentCommandResources {
     pub module_id: String,
     pub cpu_ms: u64,
@@ -89,6 +125,187 @@ pub struct AgentCommandResources {
     pub groups: Vec<ProcessGroup>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_last_hour: Option<CpuLastHour>,
+}
+
+impl ProcessGroup {
+    /// Create a measured program group with no CPU lower-bound marker.
+    #[must_use]
+    pub fn new(name: impl Into<String>, count: u64, cpu_ms: u64, memory_bytes: u64) -> Self {
+        Self {
+            name: name.into(),
+            count,
+            cpu_ms,
+            memory_bytes,
+            bound: None,
+        }
+    }
+
+    /// Set or clear the CPU lower-bound marker.
+    #[must_use]
+    pub fn with_bound(mut self, bound: Option<ResourceBound>) -> Self {
+        self.bound = bound;
+        self
+    }
+}
+
+impl TreeOwn {
+    /// Create the root's attributed share with no CPU lower-bound marker.
+    #[must_use]
+    pub fn new(cpu_ms: u64, memory_bytes: u64) -> Self {
+        Self {
+            cpu_ms,
+            memory_bytes,
+            bound: None,
+        }
+    }
+
+    /// Set or clear the CPU lower-bound marker.
+    #[must_use]
+    pub fn with_bound(mut self, bound: Option<ResourceBound>) -> Self {
+        self.bound = bound;
+        self
+    }
+}
+
+impl TreeReading {
+    /// Create a measured tree without optional root, group or bound metadata.
+    #[must_use]
+    pub fn new(
+        cpu_ms: u64,
+        memory_bytes: u64,
+        memory_kind: crate::ChildMemoryKind,
+        process_count: u64,
+        source: TreeSource,
+    ) -> Self {
+        Self {
+            cpu_ms,
+            memory_bytes,
+            memory_kind,
+            process_count,
+            source,
+            bound: None,
+            own: None,
+            groups: Vec::new(),
+        }
+    }
+
+    /// Set or clear the cumulative CPU lower-bound marker.
+    #[must_use]
+    pub fn with_bound(mut self, bound: Option<ResourceBound>) -> Self {
+        self.bound = bound;
+        self
+    }
+
+    /// Set or clear the root's attributed resource share.
+    #[must_use]
+    pub fn with_own(mut self, own: Option<TreeOwn>) -> Self {
+        self.own = own;
+        self
+    }
+
+    /// Replace the live child-only program groups; an empty list clears them.
+    #[must_use]
+    pub fn with_groups(mut self, groups: Vec<ProcessGroup>) -> Self {
+        self.groups = groups;
+        self
+    }
+}
+
+impl CpuLastHour {
+    /// Create an hourly sample total without a CPU lower-bound marker.
+    #[must_use]
+    pub fn new(cpu_ms: u64, covered_ms: u64) -> Self {
+        Self {
+            cpu_ms,
+            covered_ms,
+            bound: None,
+        }
+    }
+
+    /// Set or clear the covered hour's CPU lower-bound marker.
+    #[must_use]
+    pub fn with_bound(mut self, bound: Option<ResourceBound>) -> Self {
+        self.bound = bound;
+        self
+    }
+}
+
+impl DaemonResources {
+    /// Identify the daemon without manufacturing resource or hourly readings.
+    #[must_use]
+    pub fn new(pid: u32, start_time_ms: u64, version: impl Into<String>) -> Self {
+        Self {
+            pid,
+            start_time_ms,
+            version: version.into(),
+            resources: None,
+            cpu_last_hour: None,
+        }
+    }
+
+    /// Set or clear the daemon process's measured usage.
+    #[must_use]
+    pub fn with_resources(mut self, resources: Option<crate::ChildResourceUsage>) -> Self {
+        self.resources = resources;
+        self
+    }
+
+    /// Set or clear its retained hourly CPU reading.
+    #[must_use]
+    pub fn with_cpu_last_hour(mut self, cpu_last_hour: Option<CpuLastHour>) -> Self {
+        self.cpu_last_hour = cpu_last_hour;
+        self
+    }
+}
+
+impl AgentCommandResources {
+    /// Create measured command totals without optional attribution metadata.
+    #[must_use]
+    pub fn new(
+        module_id: impl Into<String>,
+        cpu_ms: u64,
+        memory_bytes: u64,
+        process_count: u64,
+    ) -> Self {
+        Self {
+            module_id: module_id.into(),
+            cpu_ms,
+            memory_bytes,
+            process_count,
+            bound: None,
+            unmeasured_finished: None,
+            groups: Vec::new(),
+            cpu_last_hour: None,
+        }
+    }
+
+    /// Set or clear the cumulative CPU lower-bound marker.
+    #[must_use]
+    pub fn with_bound(mut self, bound: Option<ResourceBound>) -> Self {
+        self.bound = bound;
+        self
+    }
+
+    /// Set or clear the count of finished commands whose CPU was unmeasured.
+    #[must_use]
+    pub fn with_unmeasured_finished(mut self, unmeasured_finished: Option<u64>) -> Self {
+        self.unmeasured_finished = unmeasured_finished;
+        self
+    }
+
+    /// Replace live command program groups; an empty list clears them.
+    #[must_use]
+    pub fn with_groups(mut self, groups: Vec<ProcessGroup>) -> Self {
+        self.groups = groups;
+        self
+    }
+
+    /// Set or clear retained hourly CPU attributed to commands.
+    #[must_use]
+    pub fn with_cpu_last_hour(mut self, cpu_last_hour: Option<CpuLastHour>) -> Self {
+        self.cpu_last_hour = cpu_last_hour;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -112,8 +329,27 @@ mod tests {
 
     #[test]
     fn resource_totals_round_trip_and_ignore_unknown_members() {
+        // The previous tree reader has no root-share field and accepts unknown
+        // fields. A new daemon must remain decodable by that older shape.
+        #[derive(Deserialize, Serialize)]
+        struct OlderTreeReading {
+            cpu_ms: u64,
+            memory_bytes: u64,
+            memory_kind: crate::ChildMemoryKind,
+            process_count: u64,
+            source: TreeSource,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            bound: Option<ResourceBound>,
+            #[serde(default)]
+            groups: Vec<ProcessGroup>,
+        }
         let reading = TreeReading {
             bound: None,
+            own: Some(TreeOwn {
+                cpu_ms: 23,
+                memory_bytes: 56,
+                bound: None,
+            }),
             cpu_ms: 123,
             memory_bytes: 456,
             memory_kind: crate::ChildMemoryKind::ResidentSet,
@@ -165,9 +401,16 @@ mod tests {
         value["future"] = serde_json::json!({"anything":true});
         value["modules"][0]["future"] = serde_json::json!(1);
         value["modules"][0]["tree"]["future"] = serde_json::json!(2);
+        value["modules"][0]["tree"]["own"]["future"] = serde_json::json!(true);
         value["modules"][0]["tree"]["groups"][0]["future"] = serde_json::json!(3);
         value["daemon"]["future"] = serde_json::json!(4);
         value["agent_commands"][0]["future"] = serde_json::json!(5);
+        let older: OlderTreeReading =
+            serde_json::from_value(value["modules"][0]["tree"].clone()).unwrap();
+        let older = serde_json::to_value(older).unwrap();
+        assert!(older.get("own").is_none());
+        assert_eq!(older["cpu_ms"], 123);
+        assert_eq!(older["groups"][0]["cpu_ms"], 100);
         let decoded: ClientControlResponse = serde_json::from_value(value).unwrap();
         assert_eq!(decoded, response);
         let ClientControlResponse::SupervisorList { modules, .. } = decoded else {
@@ -253,6 +496,8 @@ mod optional_member_tests {
         let reading: TreeReading = serde_json::from_value(tree.clone()).unwrap();
         assert!(reading.groups.is_empty());
         assert!(reading.bound.is_none());
+        assert!(reading.own.is_none());
+        assert!(serde_json::to_value(&reading).unwrap().get("own").is_none());
         refuses_missing::<TreeReading>(
             &tree,
             &[
@@ -288,14 +533,31 @@ mod optional_member_tests {
             .bound
             .is_none());
         refuses_missing::<ProcessGroup>(&group, &["name", "count", "cpu_ms", "memory_bytes"]);
+        let own = json!({"cpu_ms":2,"memory_bytes":3,"future":true});
+        let reading: TreeOwn = serde_json::from_value(own.clone()).unwrap();
+        assert!(reading.bound.is_none());
+        assert_eq!(
+            serde_json::to_value(reading).unwrap(),
+            json!({"cpu_ms":2,"memory_bytes":3})
+        );
+        refuses_missing::<TreeOwn>(&own, &["cpu_ms", "memory_bytes"]);
     }
 
     #[test]
     fn lower_bounds_and_unmeasured_finishes_round_trip_additively() {
-        let tree = json!({"cpu_ms":1,"memory_bytes":2,"memory_kind":"resident_set","process_count":3,"source":"process_tree","bound":"lower","future":true});
+        let tree = json!({"cpu_ms":1,"memory_bytes":2,"memory_kind":"resident_set","process_count":3,"source":"process_tree","bound":"lower","own":{"cpu_ms":1,"memory_bytes":2,"bound":"lower","future":true},"future":true});
         let reading: TreeReading = serde_json::from_value(tree.clone()).unwrap();
         assert_eq!(reading.bound, Some(ResourceBound::Lower));
-        assert_eq!(serde_json::to_value(reading).unwrap()["bound"], "lower");
+        assert_eq!(
+            reading.own.as_ref().unwrap().bound,
+            Some(ResourceBound::Lower)
+        );
+        let encoded = serde_json::to_value(reading).unwrap();
+        assert_eq!(encoded["bound"], "lower");
+        assert_eq!(
+            encoded["own"],
+            json!({"cpu_ms":1,"memory_bytes":2,"bound":"lower"})
+        );
         let group = json!({"name":"compiler","count":1,"cpu_ms":2,"memory_bytes":3,"bound":"lower","future":true});
         let reading: ProcessGroup = serde_json::from_value(group).unwrap();
         assert_eq!(reading.bound, Some(ResourceBound::Lower));

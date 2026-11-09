@@ -303,9 +303,14 @@ fn sources(shared: &Arc<Shared>, conn: &Conn) -> Vec<JoinHandle<()>> {
                     Ok(list) => {
                         sh.raw("supervisor.list", json_text(&list.modules));
                         if seeded {
-                            sh.update(|s| s.record_roster(list.modules, now()));
+                            sh.update(|s| s.record_supervisor_list(list, now()));
                         } else {
-                            sh.update(|s| s.record_cpu(&list.modules, now()));
+                            sh.update(|s| {
+                                let at = now();
+                                s.record_cpu(&list.modules, at);
+                                s.resources
+                                    .record_extra(list.daemon, list.agent_commands, at);
+                            });
                             seeded = true;
                             tokio::time::sleep(secs(1.0)).await;
                             continue;

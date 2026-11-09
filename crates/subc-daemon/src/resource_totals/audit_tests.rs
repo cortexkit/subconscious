@@ -774,16 +774,7 @@ fn cached_rows_keep_their_committed_observation_sequence_for_history_transfers()
         Vec::new(),
     ));
     let tree = wire(table.tree(1, 1, false).unwrap(), TreeSource::ProcessTree);
-    let agents = AgentCommandResources {
-        module_id: "cached-module".into(),
-        cpu_ms: 0,
-        memory_bytes: 0,
-        process_count: 0,
-        bound: None,
-        unmeasured_finished: None,
-        groups: Vec::new(),
-        cpu_last_hour: None,
-    };
+    let agents = AgentCommandResources::new("cached-module", 0, 0, 0);
     let launch = crate::supervise::ResourceLaunch {
         pid: Some(1),
         start: Some(1),

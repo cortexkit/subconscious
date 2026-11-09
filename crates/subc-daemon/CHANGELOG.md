@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.44.0
+
+- Construct all supervisor resource and pending-reload wire structs through their extensible control API, rather than public struct literals. Tree resource and reload-verdict JSON stays unchanged.
+- Report the module root's funded share separately as optional `tree.own`, and keep only child processes in `tree.groups`, even when root and children share a program name. Preserve initial CPU funding and row bounds; cap root plus emitted child groups by the attributed row's CPU and memory. Adopt control 0.38's breaking Rust construction API.
+
 ## 0.43.1
 
 - Correct the native Windows finished-command test's reference to respect the independently rounded job CPU increase. Fixed 100 ns counters now cover the one-millisecond difference between a combined job total and individually rounded process endpoints. Production accounting is unchanged and continues to conserve measured job CPU without a tolerance.

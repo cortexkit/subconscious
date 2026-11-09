@@ -500,17 +500,17 @@ impl Module {
         } else {
             Some(ProcessTable::sum(live_agents)?)
         };
-        let agents = AgentCommandResources {
-            module_id: String::new(),
-            cpu_ms: agent_cpu,
-            memory_bytes: agent_usage.as_ref().map_or(0, |usage| usage.memory_bytes),
-            process_count: agent_usage.as_ref().map_or(0, |usage| usage.process_count),
-            groups: agent_groups,
-            bound: agent_bound,
-            unmeasured_finished: (self.unmeasured_finished != 0)
-                .then_some(self.unmeasured_finished),
-            cpu_last_hour: None,
-        };
+        let agents = AgentCommandResources::new(
+            String::new(),
+            agent_cpu,
+            agent_usage.as_ref().map_or(0, |usage| usage.memory_bytes),
+            agent_usage.as_ref().map_or(0, |usage| usage.process_count),
+        )
+        .with_groups(agent_groups)
+        .with_bound(agent_bound)
+        .with_unmeasured_finished(
+            (self.unmeasured_finished != 0).then_some(self.unmeasured_finished),
+        );
         if let Some((reading, _)) = &mut tree {
             reading.cpu_ms = module_cpu;
             reading.bound = bound.clone();
@@ -527,7 +527,10 @@ impl Module {
                     .process_count
                     .saturating_sub(excluded_usage.process_count);
             }
-            reading.groups = self.group_credit.groups(&own, false, bound)?;
+            // ResourceLaunch generations retain the native root start time in
+            // their low 64 bits. Match both parts so a reused PID is not "own".
+            let root = self.pid.map(|pid| (pid, generation as u64));
+            self.group_credit.module_parts(&own, root, reading)?;
         }
         self.table_revision = table.revision();
         if generation != 0 {

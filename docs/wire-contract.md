@@ -358,19 +358,36 @@ time, independently of that ordering.
 plus response-level `daemon` and `agent_commands`. A tree reports cumulative
 `cpu_ms`, current `memory_bytes`, `memory_kind`, `process_count`, `source`
 (`cgroup`, `job`, `process_tree`) and up to eight `groups` ordered by memory.
-Each group's `cpu_ms` is funded attributed credit earned by its currently live
-identities, not their raw native counter. Agent groups start at zero at the
-accepted baseline. Initial module groups may subdivide the module's initial
-counter using live own CPU, largest first (ties by PID then native start), capped
-by that row's measured CPU. A newly observed module-owned identity reserves its
-already consumed own CPU from available module credit, rather than making that
-CPU available to a finish claim. New agent identities start at zero attributed
+`tree.groups` contains child processes only: the module's root identity is
+excluded, but children with the same program name remain in their group.
+An optional `tree.own: {cpu_ms, memory_bytes, bound?}` reports the root process's
+attributed share separately. It is omitted when that share is unknown or the
+tree is unavailable. Its memory is current root memory, capped by the row.
+Each group's and the root's `cpu_ms` is funded attributed credit earned by its
+currently live identities, not their raw native counter. Agent groups start at
+zero at the accepted baseline. The module's root and child groups may subdivide
+the module's initial counter using live own CPU, largest first (ties by PID then
+native start), capped by that row's measured CPU. A newly observed module-owned
+process reserves the CPU it had already used from the module's available credit,
+so a later agent command reported as finished can't claim that same CPU for the
+agents row. New agent identities start at zero attributed
 CPU at their first accepted measurement; their historical CPU stays module-side.
-The sum of
-live groups never exceeds the row, which also retains retired or unattributed
-history. A group's optional `bound: "lower"` follows its row and marks only CPU,
-not memory. Finishing never pays the same observed or pending CPU twice; only
-the bounded, previously unclassified tail may move between rows.
+The module's `own` plus all emitted child groups never exceeds the module row's
+attributed CPU or memory. The eight-group cap and retired or unattributed
+history can leave part of the row unrepresented. Agent groups likewise never
+exceed their agents row. A group's and `own`'s optional `bound: "lower"` follow
+their row and mark only CPU, not memory. Finished-command CPU is counted once.
+Only the unclassified portion confirmed by the daemon's counters and available
+module funding may transfer between rows.
+
+In the Rust control API, `TreeReading`, `ProcessGroup`, `TreeOwn`, `CpuLastHour`,
+`DaemonResources`, `AgentCommandResources`, `ChildResourceReading`, and
+`PendingReloadVerdict` are non-exhaustive, like `SupervisorEntry`. Construct them
+with required-field `new` functions and `with_*` builders instead of external
+struct literals. Optional values default to absent and groups to empty. This
+Rust source migration requires the breaking control 0.38 / daemon 0.44 release;
+it does not change JSON decoding.
+
 The old memory-only `subtree` member is replaced by `tree`. Unknown readings
 are omitted. `cpu_last_hour` is `{cpu_ms, covered_ms, bound?}` across retained wall-clock
 samples: 61 points cover 60 one-minute intervals. A changed process identity

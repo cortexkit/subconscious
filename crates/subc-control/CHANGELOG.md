@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.38.0
+
+- **Rust migration:** `TreeReading`, `ProcessGroup`, `TreeOwn`, `CpuLastHour`, `DaemonResources`, `AgentCommandResources`, `ChildResourceReading`, and `PendingReloadVerdict` are now non-exhaustive. Replace external struct literals with their required-field `new` constructors and `with_*` builders; optional metadata defaults to absent or empty. This keeps future optional resource fields source-compatible. `SupervisorEntry` already uses this construction API. JSON field names and decoding remain unchanged.
+- Add optional `TreeReading.own: TreeOwn` for the module root's attributed CPU and memory, with the row's optional CPU lower bound. `tree.groups` now contains only child processes, retaining children whose program name matches the root. Root and emitted child-group shares cannot exceed their module row; older JSON readers ignore `own`.
+
 ## 0.37.0
 
 - Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.

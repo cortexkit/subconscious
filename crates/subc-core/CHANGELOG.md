@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.1
+
+- Refresh the daemon, control, Rust-client and UI requirements for extensible supervisor resources. CLI and executable behavior is unchanged.
+
 ## 0.21.0
 
 - Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.

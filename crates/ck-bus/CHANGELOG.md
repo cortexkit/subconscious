@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.1
+
+- Refresh daemon/control and Rust-client requirements for the extensible supervisor resource API. This dependency-only release keeps bus wire behavior unchanged.
+
 ## 0.6.0
 
 - Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.

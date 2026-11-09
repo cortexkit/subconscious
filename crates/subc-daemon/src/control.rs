@@ -225,11 +225,7 @@ fn reload_verdict(
             },
         },
     };
-    PendingReloadVerdict {
-        path,
-        image,
-        spec: None,
-    }
+    PendingReloadVerdict::new(path, image)
 }
 
 fn launch_spec_agreement(

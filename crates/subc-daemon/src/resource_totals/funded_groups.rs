@@ -79,6 +79,54 @@ impl Credits {
         Some(newly_reserved)
     }
 
+    pub(super) fn module_parts(
+        &self,
+        live: &[subc_os::ProcessMember],
+        root: Option<Identity>,
+        reading: &mut subc_control::TreeReading,
+    ) -> Option<()> {
+        let root_member = live
+            .iter()
+            .find(|member| Some((member.pid, member.start_time)) == root);
+        reading.own = if let Some(member) = root_member {
+            Some(
+                subc_control::TreeOwn::new(
+                    self.module
+                        .get(&(member.pid, member.start_time))
+                        .copied()
+                        .unwrap_or(0)
+                        .min(reading.cpu_ms),
+                    member.resources?.memory_bytes.min(reading.memory_bytes),
+                )
+                .with_bound(reading.bound.clone()),
+            )
+        } else {
+            None
+        };
+        let children: Vec<_> = live
+            .iter()
+            .filter(|member| Some((member.pid, member.start_time)) != root)
+            .cloned()
+            .collect();
+        reading.groups = self.groups(&children, false, reading.bound.clone())?;
+        let mut cpu = reading
+            .cpu_ms
+            .saturating_sub(reading.own.as_ref().map_or(0, |own| own.cpu_ms));
+        let mut memory = reading
+            .memory_bytes
+            .saturating_sub(reading.own.as_ref().map_or(0, |own| own.memory_bytes));
+        // Native container totals can be smaller than summed per-process RSS.
+        // Reserve the root first, then fit child groups in memory rank order.
+        // Apply the same row cap to CPU without changing funded identity credit.
+        for group in &mut reading.groups {
+            group.cpu_ms = group.cpu_ms.min(cpu);
+            cpu -= group.cpu_ms;
+            group.memory_bytes = group.memory_bytes.min(memory);
+            memory -= group.memory_bytes;
+        }
+        Some(())
+    }
+
     pub(super) fn groups(
         &self,
         live: &[subc_os::ProcessMember],
@@ -94,16 +142,10 @@ impl Credits {
                 continue;
             }
             let resource = member.resources?;
-            let group =
-                groups
-                    .entry(member.name.clone())
-                    .or_insert_with(|| subc_control::ProcessGroup {
-                        name: member.name.clone(),
-                        count: 0,
-                        cpu_ms: 0,
-                        memory_bytes: 0,
-                        bound: bound.clone(),
-                    });
+            let group = groups.entry(member.name.clone()).or_insert_with(|| {
+                subc_control::ProcessGroup::new(member.name.clone(), 0, 0, 0)
+                    .with_bound(bound.clone())
+            });
             group.count += 1;
             group.cpu_ms = group
                 .cpu_ms

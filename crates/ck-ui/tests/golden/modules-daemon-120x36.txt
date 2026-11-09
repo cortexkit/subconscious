@@ -1,0 +1,36 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings      This computer  20:48 
+─────────────────────────━━━━━━━━━──────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                        
+  Modules 25                                                 / to filter  │  subc daemon                                
+                                                                          │  build 0.40.0                               
+    Module              Health      CPU  Cores 1h   Memory       Up       │                                             
+  ──────────────────────────────────────────────────────────────────────  │  Last hour           0.02 cores on average  
+  ↑ 4 more                                                                │                                             
+  ● callosum            ok         0.4%      0.00    64 MB   9h 12m       │  Processes                       1 running  
+  ● cerebellum          ok         0.8%      0.01   140 MB   4h 30m       │  ─────────────────────────────────────────  
+  ● cingulate           ok         0.2%      0.00    38 MB   9h 12m       │  own process                 1.9%   117 MB  
+  ● ckbus               ok         0.3%      0.00    44 MB   9h 12m       │  No child processes                         
+  ● claustrum           ok         0.1%      0.00    31 MB   9h 12m       │                                             
+  ● condition-runner    ok         0.0%      0.00    18 MB   9h 12m       │                                             
+  ▲ engram              degraded   3.2%      0.04   302 MB      24m       │                                             
+  ● entorhinal          ok         0.7%      0.01    96 MB    3h 0m       │                                             
+  ● fusiform            ok         0.2%      0.00   120 MB    8h 0m       │                                             
+  ● insula              ok         0.5%      0.00    58 MB   9h 12m       │                                             
+  ● magic-context       ok         2.1%      0.03   690 MB   9h 12m       │                                             
+  ● motor               ok         0.9%      0.02    72 MB      30m       │                                             
+  ● nats-server         ok         0.4%      0.00    49 MB   9h 12m       │                                             
+  ● plexus              ok         1.6%      0.01   137 MB    6h 6m       │                                             
+  ● prefrontal-core     ok         4.8%      0.12   410 MB      42m       │                                             
+  ● prefrontal-routing  ok         0.9%      0.01    96 MB      42m       │                                             
+  ● subc-mcp            ok         0.1%      0.00    22 MB   9h 12m       │                                             
+  ● synapse             ok         1.3%      0.07   895 MB   9h 12m       │                                             
+  ● thalamus            ok         0.7%      0.01    88 MB   9h 12m       │                                             
+  ▲ thalamus-harness    degraded   1.4%      0.05   651 MB   9h 12m       │                                             
+  ● wernicke            ok         0.2%      0.00    35 MB   9h 12m       │                                             
+  ● agents' commands    via aft    181%      1.41   2.2 GB                │                                             
+  ● subc daemon         ok         1.9%      0.02   117 MB   9h 12m       │                                             
+  ──────────────────────────────────────────────────────────────────────  │                                             
+    All of CortexKit               235%      2.26  11.5 GB                │                                             
+                                                                                                                        
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓  select                                                                                           updated just now 

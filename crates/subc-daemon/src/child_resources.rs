@@ -95,17 +95,17 @@ fn read_with(
 fn reading(usage: subc_os::ResourceUsage) -> ChildResourceReading {
     let millis =
         |duration: std::time::Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-    ChildResourceReading {
-        memory_bytes: usage.memory_bytes,
-        memory_kind: match usage.memory_kind {
+    ChildResourceReading::new(
+        usage.memory_bytes,
+        match usage.memory_kind {
             subc_os::MemoryKind::PhysFootprint => ChildMemoryKind::PhysFootprint,
             subc_os::MemoryKind::ResidentSet => ChildMemoryKind::ResidentSet,
             subc_os::MemoryKind::WindowsWorkingSet => ChildMemoryKind::WindowsWorkingSet,
         },
-        swap_bytes: usage.swap_bytes,
-        cpu_user_ms: millis(usage.cpu_user),
-        cpu_system_ms: millis(usage.cpu_system),
-    }
+        millis(usage.cpu_user),
+        millis(usage.cpu_system),
+    )
+    .with_swap_bytes(usage.swap_bytes)
 }
 
 #[cfg(test)]
@@ -227,13 +227,15 @@ mod tests {
         );
         assert_eq!(
             actual,
-            ChildResourceUsage::Measured(ChildResourceReading {
-                memory_bytes: 7 * 1024 * 1024,
-                memory_kind: ChildMemoryKind::ResidentSet,
-                swap_bytes: Some(4096),
-                cpu_user_ms: 1_250,
-                cpu_system_ms: 310,
-            })
+            ChildResourceUsage::Measured(
+                ChildResourceReading::new(
+                    7 * 1024 * 1024,
+                    ChildMemoryKind::ResidentSet,
+                    1_250,
+                    310
+                )
+                .with_swap_bytes(Some(4096))
+            )
         );
     }
 

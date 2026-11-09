@@ -1063,13 +1063,11 @@ impl Tracker {
                     );
                 }
             }
-            readings.daemon = Some(DaemonResources {
-                pid,
-                start_time_ms,
-                version: self.daemon_version.clone(),
-                resources: Some(resources),
-                cpu_last_hour: state.daemon.last_hour_at(now),
-            });
+            readings.daemon = Some(
+                DaemonResources::new(pid, start_time_ms, self.daemon_version.clone())
+                    .with_resources(Some(resources))
+                    .with_cpu_last_hour(state.daemon.last_hour_at(now)),
+            );
         }
         #[cfg(windows)]
         for module in state.modules.values_mut() {
@@ -1650,32 +1648,32 @@ impl Module {
 }
 
 pub(crate) fn wire(usage: TreeUsage, source: TreeSource) -> TreeReading {
-    TreeReading {
-        bound: None,
-        cpu_ms: usage.cpu_ms,
-        memory_bytes: usage.memory_bytes,
-        memory_kind: match usage.memory_kind {
+    TreeReading::new(
+        usage.cpu_ms,
+        usage.memory_bytes,
+        match usage.memory_kind {
             subc_os::MemoryKind::PhysFootprint => subc_control::ChildMemoryKind::PhysFootprint,
             subc_os::MemoryKind::ResidentSet => subc_control::ChildMemoryKind::ResidentSet,
             subc_os::MemoryKind::WindowsWorkingSet => {
                 subc_control::ChildMemoryKind::WindowsWorkingSet
             }
         },
-        process_count: usage.process_count,
+        usage.process_count,
         source,
-        groups: groups(usage.groups),
-    }
+    )
+    .with_groups(groups(usage.groups))
 }
 
 fn groups(groups: Vec<subc_os::ProcessGroup>) -> Vec<subc_control::ProcessGroup> {
     groups
         .into_iter()
-        .map(|group| subc_control::ProcessGroup {
-            bound: None,
-            name: group.name,
-            count: group.count,
-            cpu_ms: group.cpu_ms,
-            memory_bytes: group.memory_bytes,
+        .map(|group| {
+            subc_control::ProcessGroup::new(
+                group.name,
+                group.count,
+                group.cpu_ms,
+                group.memory_bytes,
+            )
         })
         .collect()
 }

@@ -292,6 +292,8 @@ pub struct Module {
     /// process is running.
     pub cpu_percent: Option<f64>,
     pub memory_mb: Option<f64>,
+    /// Tree accounting is absent on older daemons, not a zero reading.
+    pub resources: Option<ResourceUsage>,
     /// The module's own one-sentence health summary; empty when it gave none.
     pub summary: String,
     pub routes: Option<u32>,
@@ -320,6 +322,45 @@ pub struct Module {
     /// Where the module is in its lifecycle, in a word ("Restarting",
     /// "Starting", "Stopped"), when that says more than its status does.
     pub lifecycle: Option<String>,
+}
+
+/// Current tree measurements and the independently bounded hourly reading.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResourceUsage {
+    pub cpu_percent: Option<f64>,
+    pub memory_mb: Option<f64>,
+    pub lower: bool,
+    pub last_hour: Option<subc_control::CpuLastHour>,
+    pub process_count: Option<u64>,
+    pub own: Option<ProgramUsage>,
+    pub groups: Vec<ProgramUsage>,
+    pub unavailable: Option<String>,
+    pub cpu_history: Vec<f64>,
+    pub memory_history: Vec<f64>,
+}
+
+/// Live program measurements, not an exhaustive split of lifetime tree CPU.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProgramUsage {
+    pub name: String,
+    pub count: u64,
+    pub cpu_percent: Option<f64>,
+    pub memory_mb: f64,
+    pub lower: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ResourceRowKind {
+    Daemon,
+    Agents { via: String },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResourceRow {
+    pub kind: ResourceRowKind,
+    pub usage: ResourceUsage,
+    pub started_at: Option<Timestamp>,
+    pub build: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -765,6 +806,8 @@ pub struct Snapshot {
     pub host: Panel<Host>,
     pub daemon: Panel<Daemon>,
     pub modules: Panel<Vec<Module>>,
+    /// Extra accounting rows from the same roster poll as `modules`.
+    pub resource_rows: Vec<ResourceRow>,
     pub build_server: Panel<BuildServer>,
     pub backups: Panel<Backups>,
     pub usage: Panel<Usage>,
@@ -1325,6 +1368,7 @@ mod fixture {
                     commit: s(&m["commit"]),
                     cpu_percent: Some(f(&m["cpu"])),
                     memory_mb: Some(f(&m["mem"])),
+                    resources: None,
                     summary: s(&m["summary"]),
                     routes: Some(u(&m["routes"])),
                     serving: None,
@@ -1541,6 +1585,7 @@ mod fixture {
             .collect();
 
         Ok(Snapshot {
+            resource_rows: Vec::new(),
             settings: crate::live::settings::SettingsReading::default(),
             host: Panel::new(now, host),
             daemon: Panel::new(

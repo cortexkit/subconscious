@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0
+
+- Show module process trees, hourly CPU in cores, daemon and agents' command rows, and a pinned whole-stack total in Modules; preserve the older daemon view when tree accounting is absent.
+- Show the module's own process, from the optional `tree.own` reading, before its child-only program groups, and show no own-process line when the reading is absent.
+- Adopt control 0.38 and Rust client 0.37. Public live-state fields and mapping/settings methods now expose that control type family, requiring a breaking Rust dependency release. Rendering behavior is unchanged.
+
 ## 0.5.0
 
 - Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.

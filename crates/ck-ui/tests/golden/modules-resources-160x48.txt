@@ -1,0 +1,48 @@
+ ◆ CortexKit    1 Home   2 Modules   3 Activity   4 Usage   5 Agents   6 Devices   7 Settings                                              This computer  20:48 
+─────────────────────────━━━━━━━━━──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                                                                                
+  Modules 25                                                                                    / to filter  │  aft                                       ● ok  
+                                                                                                             │  pid 15535 · up 8h 18m · build 0.60.0            
+    Module              Health      CPU  Cores 1h   Memory       Up    Build       Summary                   │                                                  
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │  Health                          checked 1s ago  
+  ● aft                 ok          15%      0.21   4.3 GB   8h 18m    0.60.0      Warming 57 project inde…  │  ──────────────────────────────────────────────  
+  ● astrocyte           ok         0.6%      0.01   212 MB   1h 42m    0.1.0       Spend ledger current      │  Warming 57 project indexes; serving normally    
+  ● basal               ok         1.1%      0.02   188 MB   9h 12m    f416dc16    7 flows armed             │  Routes            41                            
+  ● broca ↻             ok          14%      0.21   576 MB    5h 6m    0.3.226     3 runs in flight          │  Restarts          0                             
+  ● callosum            ok         0.4%      0.00    64 MB   9h 12m    3fd7f72     2 devices connected       │                                                  
+  ● cerebellum          ok         0.8%      0.01   140 MB   4h 30m    b55082b4    No browser open           │  CPU and memory                     last 10 min  
+  ● cingulate           ok         0.2%      0.00    38 MB   9h 12m    0.10.0      No approvals waiting      │  ──────────────────────────────────────────────  
+  ● ckbus               ok         0.3%      0.00    44 MB   9h 12m    0.4.8       Message bus up            │  ▆▄▅▆▂▂▃▄▂▃▆▆▄▇▄▆▅▄▇▄▃▅▃▄▅▄▃▂▂▃▃▆▇▇▅▇▄▇     15%  
+  ● claustrum           ok         0.1%      0.00    31 MB   9h 12m    6a5603e6    88 credentials serving    │  ▃▅▅▄▄▄▅▅▆▇█▆▇▆▇▃▄▃▆▆▅▆▇▆██▇▅▅▅▆▅▆▅▄▃▄▂  4.3 GB  
+  ● condition-runner    ok         0.0%      0.00    18 MB   9h 12m    0.2.1       Idle                      │  Last hour                0.21 cores on average  
+  ▲ engram              degraded   3.2%      0.04   302 MB      24m    9d8a178c    Cloud backup 2 days beh…  │                                                  
+  ● entorhinal          ok         0.7%      0.01    96 MB    3h 0m    0.1.39      33 agents · 134 sessions  │  Processes                            2 running  
+  ● fusiform            ok         0.2%      0.00   120 MB    8h 0m    299a69c     Model catalog checked 4…  │  ──────────────────────────────────────────────  
+  ● insula              ok         0.5%      0.00    58 MB   9h 12m    0.4.2       11 accounts tracked; no…  │  own process                      3.4%   2.9 GB  
+  ● magic-context       ok         2.1%      0.03   690 MB   9h 12m    0.49.13     Idle; nothing in flight   │  rust-analyzer                     12%   1.4 GB  
+  ● motor               ok         0.9%      0.02    72 MB      30m    222d833f    Build server busy · que…  │  Agents' commands have their own row             
+  ● nats-server         ok         0.4%      0.00    49 MB   9h 12m    2.12.1      Running                   │                                                  
+  ● plexus              ok         1.6%      0.01   137 MB    6h 6m    b40bd6b1    GitHub relay connected    │  Log                                     live ●  
+  ● prefrontal-core     ok         4.8%      0.12   410 MB      42m    70d0d03f    12 workers running        │  ──────────────────────────────────────────────  
+  ● prefrontal-routing  ok         0.9%      0.01    96 MB      42m    70d0d03f    Routing ready             │  18:44   health check ok                         
+  ● subc-mcp            ok         0.1%      0.00    22 MB   9h 12m    0.1.40      Gateway ready             │  18:39   health check ok                         
+  ● synapse             ok         1.3%      0.07   895 MB   9h 12m    3937dbe2    Neural Engine lane idle   │                                                  
+  ● thalamus            ok         0.7%      0.01    88 MB   9h 12m    38f67de     Claude Code gateway rea…  │                                                  
+  ▲ thalamus-harness    degraded   1.4%      0.05   651 MB   9h 12m    38f67de     OpenCode configuration …  │                                                  
+  ● wernicke            ok         0.2%      0.00    35 MB   9h 12m    755fe6b     3 adapter instances con…  │                                                  
+  ● agents' commands    via aft    181%      1.41   2.2 GB                                                   │                                                  
+  ● subc daemon         ok         1.9%      0.02   117 MB   9h 12m    0.40.0                                │                                                  
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │                                                  
+    All of CortexKit               235%      2.26  11.5 GB                                                   │                                                  
+                                                                                                             │                                                  
+  Starts and exits                                                                                    today  │                                                  
+  ─────────────────────────────────────────────────────────────────────────────────────────────────────────  │                                                  
+  18:20:36  engram             started · pid 17621 · healthy after 2.1 s                                     │                                                  
+  18:20:34  engram             exited cleanly after a 412 ms drain                                           │                                                  
+  18:15:06  motor              started · pid 86948 · healthy after 1.4 s                                     │                                                  
+  18:15:05  motor              exited cleanly after a 30.0 s drain with 2 jobs running                       │                                                  
+  17:53:11  motor              started · pid 13076 · healthy after 1.2 s                                     │                                                  
+  17:02:12  astrocyte          started · pid 14154 · healthy after 0.8 s                                     │                                                  
+                                                                                                                                                                
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ↑↓  select    r  restart    s  stop    l  logs    e  settings                                                                                updated just now 

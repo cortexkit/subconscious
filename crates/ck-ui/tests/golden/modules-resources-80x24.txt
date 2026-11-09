@@ -1,0 +1,24 @@
+ ◆  1  2 Modules  3  4  5  6  7                                           20:48 
+───────━━━━━━━━━────────────────────────────────────────────────────────────────
+                                                                                
+  Modules 25                                                       / to filter  
+                                                                                
+    Module              Health      CPU  Cores 1h   Memory       Up             
+  ────────────────────────────────────────────────────────────────────────────  
+  ● aft                 ok          15%      0.21   4.3 GB   8h 18m             
+  ● astrocyte           ok         0.6%      0.01   212 MB   1h 42m             
+  ● basal               ok         1.1%      0.02   188 MB   9h 12m             
+  ● broca ↻             ok          14%      0.21   576 MB    5h 6m             
+  ● callosum            ok         0.4%      0.00    64 MB   9h 12m             
+  ● cerebellum          ok         0.8%      0.01   140 MB   4h 30m             
+  ● cingulate           ok         0.2%      0.00    38 MB   9h 12m             
+  ● ckbus               ok         0.3%      0.00    44 MB   9h 12m             
+  ● claustrum           ok         0.1%      0.00    31 MB   9h 12m             
+  ● condition-runner    ok         0.0%      0.00    18 MB   9h 12m             
+  ▲ engram              degraded   3.2%      0.04   302 MB      24m             
+  ● entorhinal          ok         0.7%      0.01    96 MB    3h 0m             
+  ───────────────────────────────────────────────────────────────── ↓ 15 more   
+    All of CortexKit               235%      2.26  11.5 GB                      
+                                                                                
+────────────────────────────────────────────────────────────────────────────────
+  ↑↓  select    r  restart    s  stop    l  logs    e  settings                 

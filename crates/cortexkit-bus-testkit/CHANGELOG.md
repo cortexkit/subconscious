@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.0
+
+- Adopt control 0.38 and Rust client 0.37. `PrivateDaemon::control` and `HarnessSigner::answer` expose those dependencies' nominal types, so their upgrade requires a breaking Rust release. Test rig behavior is unchanged.
+
 ## 0.5.0
 
 - Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.

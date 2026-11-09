@@ -179,13 +179,15 @@ fn supervisor_builders_set_and_clear_every_defaulted_field() {
         .clone()
         .with_protocol(ModuleProtocol::None)
         .with_launch_nonce_env(Some(false))
-        .with_pending_reload(Some(PendingReloadVerdict {
-            path: ReloadPathAgreement::Match,
-            image: RunningImageAgreement::Unavailable {
-                reason: RunningImageUnavailableReason::NotRunning,
-            },
-            spec: None,
-        }))
+        .with_pending_reload(Some(
+            PendingReloadVerdict::new(
+                ReloadPathAgreement::Match,
+                RunningImageAgreement::Unavailable {
+                    reason: RunningImageUnavailableReason::NotRunning,
+                },
+            )
+            .with_spec(None),
+        ))
         .with_last_probe_ms(Some(101))
         .with_last_exit_code(Some(2))
         .with_last_exit_signal(Some(3))

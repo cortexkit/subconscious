@@ -744,12 +744,46 @@ pub struct SupervisorObservedProcess {
 
 /// Independent comparisons of configured path, launch spec and running image at list time.
 /// An absent verdict means the daemon predates this field, not agreement.
+///
+/// Use [`PendingReloadVerdict::new`] rather than an external struct literal:
+///
+/// ```compile_fail,E0639
+/// use subc_control::{PendingReloadVerdict, ReloadPathAgreement, RunningImageAgreement,
+///     RunningImageUnavailableReason};
+/// let verdict = PendingReloadVerdict {
+///     path: ReloadPathAgreement::Match,
+///     image: RunningImageAgreement::Unavailable {
+///         reason: RunningImageUnavailableReason::NotRunning,
+///     },
+///     spec: None,
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct PendingReloadVerdict {
     pub path: ReloadPathAgreement,
     pub image: RunningImageAgreement,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<LaunchSpecAgreement>,
+}
+
+impl PendingReloadVerdict {
+    /// Create the path and image comparisons without a launch-spec verdict.
+    #[must_use]
+    pub fn new(path: ReloadPathAgreement, image: RunningImageAgreement) -> Self {
+        Self {
+            path,
+            image,
+            spec: None,
+        }
+    }
+
+    /// Set or clear the comparison of launch specifications.
+    #[must_use]
+    pub fn with_spec(mut self, spec: Option<LaunchSpecAgreement>) -> Self {
+        self.spec = spec;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -2786,7 +2820,9 @@ pub enum ChildResourceUsage {
 }
 
 /// One reading of a module process's memory and CPU time.
+/// Use [`ChildResourceReading::new`] and its builders so future fields stay additive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChildResourceReading {
     /// Memory in bytes, measured as `memory_kind` says. The figures differ
     /// by platform and are not comparable across kinds.
@@ -2803,6 +2839,32 @@ pub struct ChildResourceReading {
     /// CPU time spent in the kernel on the process's behalf since it started,
     /// in milliseconds.
     pub cpu_system_ms: u64,
+}
+
+impl ChildResourceReading {
+    /// Create a process reading without optional swap accounting.
+    #[must_use]
+    pub fn new(
+        memory_bytes: u64,
+        memory_kind: ChildMemoryKind,
+        cpu_user_ms: u64,
+        cpu_system_ms: u64,
+    ) -> Self {
+        Self {
+            memory_bytes,
+            memory_kind,
+            cpu_user_ms,
+            cpu_system_ms,
+            swap_bytes: None,
+        }
+    }
+
+    /// Set or clear swap bytes where the platform can measure them.
+    #[must_use]
+    pub fn with_swap_bytes(mut self, swap_bytes: Option<u64>) -> Self {
+        self.swap_bytes = swap_bytes;
+        self
+    }
 }
 
 open_string_enum! {

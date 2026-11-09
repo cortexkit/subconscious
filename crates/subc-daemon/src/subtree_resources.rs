@@ -84,18 +84,18 @@ fn container_reading(
 ) -> subc_control::TreeReading {
     usage
         .map(|usage| crate::resource_totals::wire(usage, source.clone()))
-        .unwrap_or_else(|| subc_control::TreeReading {
-            bound: None,
-            cpu_ms: 0,
-            memory_bytes: 0,
-            memory_kind: if source == subc_control::TreeSource::Job {
-                subc_control::ChildMemoryKind::WindowsWorkingSet
-            } else {
-                subc_control::ChildMemoryKind::Unknown("cgroup_memory".to_owned())
-            },
-            process_count: 0,
-            source,
-            groups: Vec::new(),
+        .unwrap_or_else(|| {
+            subc_control::TreeReading::new(
+                0,
+                0,
+                if source == subc_control::TreeSource::Job {
+                    subc_control::ChildMemoryKind::WindowsWorkingSet
+                } else {
+                    subc_control::ChildMemoryKind::Unknown("cgroup_memory".to_owned())
+                },
+                0,
+                source,
+            )
         })
 }
 
@@ -210,15 +210,13 @@ impl Target {
             self.clone()
                 .read(Instant::now() + READ_TIMEOUT, &AtomicU64::new(0));
             return Some((
-                subc_control::TreeReading {
-                    bound: None,
-                    cpu_ms: 0,
-                    memory_bytes: 1,
-                    memory_kind: subc_control::ChildMemoryKind::ResidentSet,
-                    process_count: 1,
-                    source: subc_control::TreeSource::ProcessTree,
-                    groups: Vec::new(),
-                },
+                subc_control::TreeReading::new(
+                    0,
+                    1,
+                    subc_control::ChildMemoryKind::ResidentSet,
+                    1,
+                    subc_control::TreeSource::ProcessTree,
+                ),
                 Default::default(),
             ));
         }

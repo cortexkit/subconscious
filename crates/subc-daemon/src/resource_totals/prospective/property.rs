@@ -485,7 +485,21 @@ fn randomized_actual_module_observations_prove_the_floor_and_prospective_row_inv
             let (all_module_groups, all_agent_groups) = module.group_credit.totals();
             assert!(all_module_groups <= tree.cpu_ms && all_agent_groups <= agents.cpu_ms,
                 "funded groups exceed a row: seed={seed} step={step} groups=({all_module_groups},{all_agent_groups}) rows=({},{})", tree.cpu_ms, agents.cpu_ms);
-            assert!(tree.groups.iter().map(|group| group.cpu_ms).sum::<u64>() <= tree.cpu_ms);
+            assert!(
+                tree.own.as_ref().map_or(0, |own| own.cpu_ms)
+                    + tree.groups.iter().map(|group| group.cpu_ms).sum::<u64>()
+                    <= tree.cpu_ms
+            );
+            assert!(
+                tree.own.as_ref().map_or(0, |own| own.memory_bytes)
+                    + tree
+                        .groups
+                        .iter()
+                        .map(|group| group.memory_bytes)
+                        .sum::<u64>()
+                    <= tree.memory_bytes
+            );
+            assert!(tree.own.as_ref().is_none_or(|own| own.bound == tree.bound));
             assert!(agents.groups.iter().map(|group| group.cpu_ms).sum::<u64>() <= agents.cpu_ms);
             assert!(tree.groups.iter().all(|group| group.bound == tree.bound));
             assert!(agents
@@ -531,6 +545,153 @@ fn randomized_actual_module_observations_prove_the_floor_and_prospective_row_inv
 
 #[cfg(unix)]
 #[test]
+fn root_parts_conserve_cpu_and_memory_with_capped_child_groups() {
+    let mut world = World::new();
+    let mut born = BTreeMap::from([(1, 0)]);
+    world.burn(1, 100);
+    for amount in 1..=10 {
+        let child = world.spawn(1);
+        born.insert(child, 1);
+        world.burn(child, amount * 10);
+    }
+    let current = table(&world, &born, 1, None);
+    let mut module = Module {
+        pid: Some(1),
+        ..Module::default()
+    };
+    let (mut reading, identities) = cgroup_scope(&world, &current, 123);
+    // A native container can report less memory than summed process RSS.
+    // The detail parts must still fit the measured row, not the raw sum.
+    reading.memory_bytes = 25;
+    let (tree, _) = module
+        .prospective(1, Some((reading, identities)), &current, 60_000, 0)
+        .unwrap();
+    let tree = tree.unwrap();
+    let own = tree
+        .own
+        .as_ref()
+        .expect("root has its own attributed share");
+    assert_eq!((own.cpu_ms, own.memory_bytes), (100, 10));
+    assert_eq!(tree.groups.len(), 8);
+    assert!(tree.groups.iter().all(|group| group.name != "program-1"));
+    assert!(own.cpu_ms + tree.groups.iter().map(|group| group.cpu_ms).sum::<u64>() <= tree.cpu_ms);
+    assert!(
+        own.memory_bytes
+            + tree
+                .groups
+                .iter()
+                .map(|group| group.memory_bytes)
+                .sum::<u64>()
+            <= tree.memory_bytes
+    );
+    assert!(tree
+        .groups
+        .windows(2)
+        .all(|pair| pair[0].memory_bytes >= pair[1].memory_bytes));
+}
+
+#[cfg(unix)]
+#[test]
+fn root_parts_keep_same_named_children_in_their_group() {
+    let mut world = World::new();
+    let child = world.spawn(1);
+    let born = BTreeMap::from([(1, 0), (child, 1)]);
+    world.burn(1, 30);
+    world.burn(child, 70);
+    let base = table(&world, &born, 1, None);
+    let current = ProcessTable::from_test_members(
+        1,
+        60_000,
+        base.members()
+            .cloned()
+            .map(|mut member| {
+                member.name = "module-program".into();
+                member
+            })
+            .collect(),
+        Vec::new(),
+    );
+    let mut module = Module {
+        pid: Some(1),
+        ..Module::default()
+    };
+    let (tree, _) = module
+        .prospective(1, scope(&current), &current, 60_000, 0)
+        .unwrap();
+    let tree = tree.unwrap();
+    assert_eq!(tree.groups.len(), 1);
+    let child_group = &tree.groups[0];
+    assert_eq!(
+        (
+            &*child_group.name,
+            child_group.count,
+            child_group.cpu_ms,
+            child_group.memory_bytes
+        ),
+        ("module-program", 1, 70, 10)
+    );
+    let own = tree.own.unwrap();
+    assert_eq!((own.cpu_ms, own.memory_bytes), (30, 10));
+}
+
+#[cfg(unix)]
+#[test]
+fn root_parts_without_children_report_only_funded_own_cpu() {
+    let mut world = World::new();
+    world.burn(1, 120);
+    world.unseen_child(1, 80);
+    let born = BTreeMap::from([(1, 0)]);
+    let current = table(&world, &born, 1, None);
+    for contained in [false, true] {
+        let mut module = Module {
+            pid: Some(1),
+            ..Module::default()
+        };
+        let reading = if contained {
+            Some(cgroup_scope(&world, &current, 30))
+        } else {
+            scope(&current)
+        };
+        let (tree, _) = module.prospective(1, reading, &current, 60_000, 0).unwrap();
+        let tree = tree.unwrap();
+        assert!(tree.groups.is_empty(), "a root alone is not a child group");
+        let own = tree.own.unwrap();
+        assert_eq!(own.cpu_ms, if contained { 30 } else { 120 });
+        assert_eq!(own.memory_bytes, 10);
+        assert_eq!(tree.cpu_ms, if contained { 30 } else { 200 });
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn root_parts_follow_the_module_rows_lower_bound() {
+    let mut world = World::new();
+    let child = world.spawn(1);
+    world.burn(1, 20);
+    world.burn(child, 80);
+    let born = BTreeMap::from([(1, 0), (child, 1)]);
+    let current = table(&world, &born, 1, None);
+    for contained in [false, true] {
+        let mut module = Module {
+            pid: Some(1),
+            ..Module::default()
+        };
+        let reading = if contained {
+            Some(cgroup_scope(&world, &current, 100))
+        } else {
+            scope(&current)
+        };
+        let (tree, _) = module.prospective(1, reading, &current, 60_000, 0).unwrap();
+        let tree = tree.unwrap();
+        let expected = (!contained).then_some(subc_control::ResourceBound::Lower);
+        assert_eq!(tree.bound, expected);
+        assert_eq!(tree.own.unwrap().bound, expected);
+        assert!(tree.groups.iter().all(|group| group.bound == expected));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn initial_module_groups_are_funded_largest_own_counter_first_and_new_module_identities_keep_their_cpu(
 ) {
     let mut world = World::new();
@@ -538,7 +699,10 @@ fn initial_module_groups_are_funded_largest_own_counter_first_and_new_module_ide
     let mut born = BTreeMap::from([(1, 0), (child, 1)]);
     world.burn(1, 70);
     world.burn(child, 90);
-    let mut module = Module::default();
+    let mut module = Module {
+        pid: Some(1),
+        ..Module::default()
+    };
     let first = table(&world, &born, 1, None);
     let (tree, agents) = module
         .prospective(
@@ -558,14 +722,7 @@ fn initial_module_groups_are_funded_largest_own_counter_first_and_new_module_ide
             .cpu_ms,
         90
     );
-    assert_eq!(
-        tree.groups
-            .iter()
-            .find(|group| group.name == "program-1")
-            .unwrap()
-            .cpu_ms,
-        10
-    );
+    assert_eq!(tree.own.as_ref().unwrap().cpu_ms, 10);
     assert_eq!(module.group_credit.totals(), (100, 0));
     assert_eq!(agents.cpu_ms, 0);
     let late = world.spawn(1);
@@ -1051,11 +1208,10 @@ fn outside_only_agents_keep_hourly_history_and_an_unreadable_peer_cannot_hide_th
     assert_eq!(outside.cpu_ms, 25);
     assert_eq!(
         outside.cpu_last_hour,
-        Some(subc_control::CpuLastHour {
-            cpu_ms: 25,
-            covered_ms: 60_000,
-            bound: Some(subc_control::ResourceBound::Lower),
-        })
+        Some(
+            subc_control::CpuLastHour::new(25, 60_000)
+                .with_bound(Some(subc_control::ResourceBound::Lower))
+        )
     );
     assert!(!agents.iter().any(|row| row.module_id == "unreadable"));
 }

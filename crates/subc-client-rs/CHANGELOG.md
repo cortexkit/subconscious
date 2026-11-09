@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.0
+
+- Adopt control 0.38's extensible supervisor resource and reload-verdict types. This is a breaking Rust dependency upgrade because the SDK re-exports control types and returns them in public supervisor responses. Use their `new` constructors and `with_*` builders instead of external resource struct literals; the new root-only `tree.own` remains optional on the wire.
+
 ## 0.36.0
 
 - Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.

@@ -667,6 +667,7 @@ impl ConfigStore {
         module: &str,
         approved_base: subc_config::Digest,
         refused_identity: subc_config::Digest,
+        held_modules: &std::collections::BTreeSet<String>,
     ) -> Result<(), StoreError> {
         self.delivery_ready()?;
         if self.state != StoreState::Stamped {
@@ -682,8 +683,21 @@ impl ConfigStore {
         }
         let mut body = self.envelope.body.clone();
         body.program_refusals.push(refusal);
-        if body.program_refusals.len() > PROGRAM_REFUSAL_LIMIT {
-            body.program_refusals.remove(0);
+        while body.program_refusals.len() > PROGRAM_REFUSAL_LIMIT {
+            if let Some(index) = body
+                .program_refusals
+                .iter()
+                .position(|record| !held_modules.contains(&record.module))
+            {
+                body.program_refusals.remove(index);
+            } else {
+                tracing::warn!(
+                    retained = body.program_refusals.len(),
+                    limit = PROGRAM_REFUSAL_LIMIT,
+                    "program refusal limit exceeded: every remaining record protects a held module"
+                );
+                break;
+            }
         }
         let result = self.publish(body, false, wall_time_ms());
         if result.is_ok()

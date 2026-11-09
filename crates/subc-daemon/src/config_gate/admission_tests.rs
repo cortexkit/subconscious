@@ -185,6 +185,85 @@ fn config_admission_transient_capture_failure_defers_without_a_durable_refusal()
 }
 
 #[test]
+fn config_admission_capture_classification_approved_symlink_is_unchanged() {
+    let rig = rig();
+    let link = rig.path.join("program-link");
+    std::os::unix::fs::symlink(rig.path.join("program"), &link).unwrap();
+    let (_, input) = crate::config_gate::capture::capture_program(&link).unwrap();
+    let approved = std::collections::BTreeMap::from([(
+        crate::config_gate::InputKey::Program {
+            module: "a".into(),
+            path: link.to_string_lossy().into_owned(),
+        },
+        input,
+    )]);
+    assert!(
+        !crate::config_gate::program::definite_program_change(&approved),
+        "a previously approved symlink is not a new mismatch when capture temporarily fails"
+    );
+}
+
+#[test]
+fn config_admission_capture_classification_over_limit_is_held() {
+    let rig = rig();
+    let owner = rig.owner("over-limit-program");
+    rig.stamp(&owner);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(rig.path.join("program"))
+        .unwrap()
+        .set_len(512 * 1024 * 1024 + 1)
+        .unwrap();
+    assert_eq!(
+        owner.prepare_spawn(&spec(&rig)).err().unwrap().code,
+        "program_refused"
+    );
+    assert_eq!(
+        owner.check_module_hold("a").unwrap_err().code,
+        "config_gated"
+    );
+    assert_eq!(
+        owner
+            .lock()
+            .unwrap()
+            .store
+            .body()
+            .unwrap()
+            .program_refusals
+            .len(),
+        1
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn config_admission_capture_classification_malformed_macho_is_held() {
+    let rig = rig();
+    let owner = rig.owner("malformed-program");
+    rig.stamp(&owner);
+    std::fs::write(rig.path.join("program"), [0xcf, 0xfa, 0xed, 0xfe]).unwrap();
+    assert_eq!(
+        owner.prepare_spawn(&spec(&rig)).err().unwrap().code,
+        "program_refused"
+    );
+    assert_eq!(
+        owner.check_module_hold("a").unwrap_err().code,
+        "config_gated"
+    );
+    assert_eq!(
+        owner
+            .lock()
+            .unwrap()
+            .store
+            .body()
+            .unwrap()
+            .program_refusals
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn config_admission_refusal_from_an_old_base_cannot_hold_the_new_approval() {
     let rig = rig();
     let owner = rig.owner("stale-refusal");
@@ -872,36 +951,62 @@ fn config_admission_unstamp_clears_durable_refusals_and_restores_file_authority(
 }
 
 #[test]
-fn config_admission_program_refusal_records_are_capped_oldest_first() {
+fn config_admission_program_refusal_limit_never_releases_a_held_module() {
     let rig = rig();
+    let path = rig.path.join("subc.jsonc");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    document["modules"]["b"] = document["modules"]["a"].clone();
+    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
     let owner = rig.owner("refusal-cap");
     rig.stamp(&owner);
     let approved = owner.lock().unwrap().store.body().unwrap().approved.clone();
-    let base = crate::config_gate::program::approved_base(
-        &crate::config_gate::GateSnapshot::from_store(&approved).unwrap(),
-        "a",
-    );
+    let snapshot = crate::config_gate::GateSnapshot::from_store(&approved).unwrap();
+    let base_a = crate::config_gate::program::approved_base(&snapshot, "a");
+    let base_b = crate::config_gate::program::approved_base(&snapshot, "b");
     let limit = crate::config_store::PROGRAM_REFUSAL_LIMIT;
-    let mut state = owner.lock().unwrap();
-    for identity in 0..=limit {
-        state
-            .store
+    owner
+        .record_program_refusal(
+            "a",
+            &base_a,
+            subc_config::raw_digest(b"first refused program"),
+        )
+        .unwrap();
+    for identity in 0..limit {
+        owner
             .record_program_refusal(
-                "a",
-                base.clone(),
+                "b",
+                &base_b,
                 subc_config::raw_digest(identity.to_string().as_bytes()),
             )
             .unwrap();
     }
-    let records = &state.store.body().unwrap().program_refusals;
-    assert_eq!(records.len(), limit);
     assert_eq!(
-        records.first().unwrap().refused_identity,
-        subc_config::raw_digest(b"1")
+        owner
+            .check_module_hold("a")
+            .expect_err("capacity eviction released a held module")
+            .code,
+        "config_gated"
     );
     assert_eq!(
-        records.last().unwrap().refused_identity,
-        subc_config::raw_digest(limit.to_string().as_bytes())
+        owner
+            .lock()
+            .unwrap()
+            .store
+            .body()
+            .unwrap()
+            .program_refusals
+            .len(),
+        limit + 1
+    );
+    drop(owner);
+    let restarted = rig.owner("refusal-cap-restarted");
+    assert_eq!(
+        restarted
+            .check_module_hold("a")
+            .expect_err("restart lost the first durable hold")
+            .code,
+        "config_gated"
     );
 }
 

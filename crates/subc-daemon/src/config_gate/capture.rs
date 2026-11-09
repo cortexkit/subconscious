@@ -586,8 +586,7 @@ pub(crate) fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
     let signatures = subc_os::code_signature::file_signature(&file, |chunk| {
         length += chunk.len() as u64;
         hasher.update(chunk);
-    })
-    .map_err(|error| GateError::new("input_unavailable", error))?;
+    });
     #[cfg(not(target_os = "macos"))]
     {
         let mut reader = &file;
@@ -609,7 +608,11 @@ pub(crate) fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
     }
     let after = file.metadata().map_err(capture_error)?;
     let reopened = subc_os::open_regular_nofollow(&resolved).map_err(capture_error)?;
-    if length != before.len()
+    #[cfg(target_os = "macos")]
+    let completed = signatures.is_ok();
+    #[cfg(not(target_os = "macos"))]
+    let completed = true;
+    if (completed && length != before.len())
         || std::fs::canonicalize(path).map_err(capture_error)? != resolved
         || before.len() != after.len()
         || before.modified().ok() != after.modified().ok()
@@ -617,6 +620,14 @@ pub(crate) fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
     {
         return Err(GateError::stale());
     }
+    #[cfg(target_os = "macos")]
+    let signatures = signatures.map_err(|error| match error {
+        subc_os::code_signature::SignatureError::Parse => GateError::new(
+            "program_invalid",
+            "covered program has an invalid or unsupported Mach-O structure",
+        ),
+        other => capture_error(other),
+    })?;
     let identity = json!({ "path": resolved, "file": id, "length": length, "raw": format!("sha256:{:x}", hasher.finalize()) });
     #[cfg(target_os = "macos")]
     let identity = {

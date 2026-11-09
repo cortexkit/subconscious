@@ -2,6 +2,12 @@
 
 ## 0.41.10
 
+- Classify stable malformed or oversized program captures as definite refusals,
+  preserve transient capture deferral, and do not misclassify an unchanged
+  approved symlink. Refusal-list capacity cannot remove records that keep a
+  refused module stopped. Retain and report overflow when removing a record
+  would silently allow a refused module to respawn.
+
 - Recheck the current process's content at HELLO, not only its initial executable
   inode or readiness latch. Hash Linux's live executable descriptor; compare
   macOS kernel code-directory hashes with validated approved-file hashes; retain

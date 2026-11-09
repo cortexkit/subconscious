@@ -59,8 +59,14 @@ impl ProgramLaunch {
                 module: self.spec.module_id.clone(),
                 path: path.to_string_lossy().into_owned(),
             };
-            let (_, actual) = capture_program(path)
-                .map_err(|error| GateError::new("config_delivery_deferred", error.detail))?;
+            let (_, actual) = capture_program(path).map_err(|error| {
+                let code = if definite_capture_error(&error) {
+                    "program_refused"
+                } else {
+                    "config_delivery_deferred"
+                };
+                GateError::new(code, error.detail)
+            })?;
             if self
                 .inputs
                 .get(&key)
@@ -125,11 +131,21 @@ pub(crate) fn definite_program_change(approved: &BTreeMap<InputKey, CapturedInpu
         let InputKey::Program { path, .. } = key else {
             return false;
         };
-        if std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
+        if std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
             return true;
         }
-        capture_program(Path::new(path)).is_ok_and(|(_, actual)| actual.state != expected.state)
+        match capture_program(Path::new(path)) {
+            Ok((_, actual)) => actual.state != expected.state,
+            Err(error) => definite_capture_error(&error),
+        }
     })
+}
+
+fn definite_capture_error(error: &GateError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "program_invalid" | "input_too_large" | "path_invalid"
+    )
 }
 
 fn resolve(spec: &ModuleSpec) -> Result<SpawnProgramBinding> {

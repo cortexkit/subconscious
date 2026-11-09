@@ -156,7 +156,9 @@ pub(crate) fn extract(
         return Ok(FileSignature::NotMachO);
     }
     let mut hashes = Vec::new();
+    let mut unsigned_slice = false;
     for slice in capture.slices {
+        unsigned_slice |= slice.signature.is_none();
         let valid: Vec<_> = slice
             .directories
             .into_iter()
@@ -174,6 +176,8 @@ pub(crate) fn extract(
     }
     Ok(if hashes.is_empty() {
         FileSignature::Unsigned
+    } else if unsigned_slice {
+        FileSignature::Invalid
     } else {
         FileSignature::Signed(hashes)
     })

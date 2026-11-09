@@ -11,6 +11,7 @@ pub struct CodeDirectoryHash(pub [u8; 20]);
 pub enum SignatureError {
     NoSuchProcess,
     NotSigned,
+    NotValid,
     Other(io::Error),
     Parse,
 }
@@ -20,6 +21,7 @@ impl fmt::Display for SignatureError {
         match self {
             Self::NoSuchProcess => f.write_str("process no longer exists"),
             Self::NotSigned => f.write_str("image has no code signature"),
+            Self::NotValid => f.write_str("running code signature is not valid"),
             Self::Other(error) => error.fmt(f),
             Self::Parse => f.write_str("invalid or unsupported Mach-O code signature"),
         }
@@ -37,20 +39,36 @@ pub fn process_cdhash(pid: u32) -> Result<CodeDirectoryHash, SignatureError> {
                 "invalid process id",
             ))
         })?;
-    let mut hash = [0u8; 20];
-    // SAFETY: pid is positive and representable as pid_t. The initialized
-    // writable buffer has the twenty bytes required by CS_OPS_CDHASH.
-    #[allow(unsafe_code)]
-    let status = unsafe { ffi::csops(pid, 5, hash.as_mut_ptr().cast(), hash.len()) };
-    if status == 0 {
-        return Ok(CodeDirectoryHash(hash));
+    process_cdhash_with_query(|operation, buffer| {
+        // SAFETY: pid is positive and representable as pid_t. The initialized
+        // writable buffer has the operation's required size.
+        #[allow(unsafe_code)]
+        let status =
+            unsafe { ffi::csops(pid, operation, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if status == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    })
+}
+
+fn process_cdhash_with_query(
+    mut query: impl FnMut(u32, &mut [u8]) -> io::Result<()>,
+) -> Result<CodeDirectoryHash, SignatureError> {
+    let map_error = |error: io::Error| match error.raw_os_error() {
+        Some(libc::ESRCH) => SignatureError::NoSuchProcess,
+        Some(libc::EINVAL) => SignatureError::NotSigned,
+        _ => SignatureError::Other(error),
+    };
+    let mut hash = [0; 20];
+    query(5, &mut hash).map_err(map_error)?;
+    let mut flags = [0; 4];
+    query(0, &mut flags).map_err(map_error)?;
+    if u32::from_ne_bytes(flags) & 1 == 0 {
+        return Err(SignatureError::NotValid);
     }
-    let error = io::Error::last_os_error();
-    match error.raw_os_error() {
-        Some(libc::ESRCH) => Err(SignatureError::NoSuchProcess),
-        Some(libc::EINVAL) => Err(SignatureError::NotSigned),
-        _ => Err(SignatureError::Other(error)),
-    }
+    Ok(CodeDirectoryHash(hash))
 }
 
 /// Signature identities extracted from the exact bytes sent to the witness callback.
@@ -126,6 +144,32 @@ pub(super) fn hash_bytes(bytes: &[u8], kind: u8) -> Result<Vec<u8>, SignatureErr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn content_binding_refuses_a_kernel_hash_without_cs_valid() {
+        for flags in [0u32, 2, 0x200] {
+            let result = super::process_cdhash_with_query(|operation, output| {
+                match operation {
+                    0 => output.copy_from_slice(&flags.to_ne_bytes()),
+                    5 => output.fill(42),
+                    _ => panic!("unexpected csops operation"),
+                }
+                Ok(())
+            });
+            assert!(
+                matches!(result, Err(super::SignatureError::NotValid)),
+                "csops flags {flags:#x} do not attest valid running code"
+            );
+        }
+        assert!(super::process_cdhash_with_query(|operation, output| {
+            if operation == 0 {
+                output.copy_from_slice(&1u32.to_ne_bytes());
+            } else {
+                output.fill(42);
+            }
+            Ok(())
+        })
+        .is_ok());
+    }
     use super::*;
     use std::{
         path::Path,

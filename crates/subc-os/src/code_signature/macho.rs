@@ -339,7 +339,9 @@ impl Directory {
         {
             return Err(bad());
         }
-        let mut valid = !(version >= 0x20100 && word(bytes, 44, false)? != 0);
+        let mut valid = limit != 0
+            && limit == code_end
+            && !(version >= 0x20100 && word(bytes, 44, false)? != 0);
         for slot in 1..=special {
             let start = offset - slot * size;
             let expected = &bytes[start..start + size];
@@ -580,6 +582,45 @@ mod tests {
             assert!(reads.iter().all(|read| *read == 1));
         }
         result
+    }
+    #[test]
+    fn content_binding_refuses_zero_or_short_code_directory_coverage() {
+        for limit in [0u32, 48] {
+            let mut bytes = signed();
+            bytes[116..120].copy_from_slice(&limit.to_be_bytes());
+            if limit == 0 {
+                bytes[112..116].copy_from_slice(&0u32.to_be_bytes());
+            } else {
+                let page = super::super::hash_bytes(&bytes[..limit as usize], 2).unwrap();
+                bytes[136..168].copy_from_slice(&page);
+            }
+            assert!(
+                matches!(parse(&bytes, 7), Ok(FileSignature::Invalid)),
+                "codeLimit {limit} must cover the entire64-byte code region"
+            );
+        }
+    }
+    #[test]
+    fn content_binding_refuses_a_fat_file_with_any_unsigned_slice() {
+        let signed = signed();
+        let mut unsigned = vec![0; 32];
+        unsigned[..4].copy_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]);
+        let mut bytes = vec![0; 64];
+        bytes[..4].copy_from_slice(&0xcafebabeu32.to_be_bytes());
+        bytes[4..8].copy_from_slice(&2u32.to_be_bytes());
+        for (at, start, size) in [
+            (8, 64u32, signed.len() as u32),
+            (28, 64 + signed.len() as u32, unsigned.len() as u32),
+        ] {
+            bytes[at + 8..at + 12].copy_from_slice(&start.to_be_bytes());
+            bytes[at + 12..at + 16].copy_from_slice(&size.to_be_bytes());
+        }
+        bytes.extend(signed);
+        bytes.extend(unsigned);
+        assert!(
+            matches!(parse(&bytes, 7), Ok(FileSignature::Invalid)),
+            "a signed slice cannot authorize its unsigned sibling"
+        );
     }
     #[test]
     fn content_binding_streaming_parser_rejects_truncation_counts_and_overlaps_without_panicking() {

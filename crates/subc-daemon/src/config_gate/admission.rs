@@ -306,7 +306,13 @@ impl RuntimeOwner {
             state
                 .refused_generations
                 .insert(module.to_owned(), base.clone());
-            state.store.record_program_refusal(module, base, identity)?;
+            let held_modules = AdmissionCache::from_state(&state)
+                .held_modules()
+                .into_iter()
+                .collect();
+            state
+                .store
+                .record_program_refusal(module, base, identity, &held_modules)?;
             return Ok(true);
         }
         Ok(false)

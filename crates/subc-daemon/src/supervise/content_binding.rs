@@ -139,7 +139,10 @@ impl LiveProgramBinding {
                     .iter()
                     .map(|byte| format!("{byte:02x}"))
                     .collect::<String>(),
-                Err(subc_os::code_signature::SignatureError::NotSigned) => return Err(changed()),
+                Err(
+                    subc_os::code_signature::SignatureError::NotSigned
+                    | subc_os::code_signature::SignatureError::NotValid,
+                ) => return Err(changed()),
                 Err(_) => return Err(unavailable()),
             };
             if !launch

@@ -7,6 +7,9 @@
   descriptor witness, validating code pages and embedded special-slot blobs
   before returning an identity. Bound Mach-O metadata, slices, pages and slots;
   malformed signatures are distinct from unsigned files. No new dependencies.
+  Require full, nonzero code-region coverage and a valid directory in every
+  universal-file slice. Process hashes also require the kernel's `CS_VALID`
+  status rather than treating a retained hash as proof of valid running code.
 
 - Open bounded configuration inputs without following the leaf or blocking on
   substituted FIFOs. Verify regular-file type on the retained Unix or Windows

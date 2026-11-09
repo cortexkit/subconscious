@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
     error::Error,
     fmt,
     future::Future,
@@ -2827,8 +2827,11 @@ impl SubcConsumer {
     /// client's `closeRoute`. For a long-lived consumer that opens unbounded distinct
     /// routes (one per session), this releases a route on session-end without dropping
     /// the whole consumer: it drops the cached route, settles in-flight requests on it
-    /// at-most-once (OutcomeUnknown if already sent, NotSent otherwise), and sends a
-    /// best-effort route GOODBYE so the daemon releases it and notifies the module.
+    /// at-most-once (OutcomeUnknown if already sent, NotSent otherwise), and queues a
+    /// route GOODBYE so the daemon releases it and notifies the module. When closing
+    /// a cached route returns, its GOODBYE is queued ahead of any frame sent later on
+    /// this connection, so the caller may release its per-route budget. If the
+    /// connection died instead, the daemon releases all its routes on disconnect.
     /// `opts.scope` selects only that scope's cache entry; `None` selects only
     /// the unscoped entry. Calls and subscriptions use the same route cache.
     ///
@@ -3536,6 +3539,9 @@ struct Inner {
     route_epochs: HashMap<u16, RouteHandle>,
     retired_routes: HashSet<RouteHandle>,
     retirement_goodbyes: HashSet<RouteHandle>,
+    retirement_queue: VecDeque<RouteHandle>,
+    retirement_notify: Arc<Notify>,
+    retirement_task: Option<JoinHandle<()>>,
     route_modules: HashMap<u16, String>,
     route_end_reasons: HashMap<u16, (RouteEndReason, bool)>,
     legacy_channel_reasons: HashMap<u16, RouteCloseReason>,
@@ -3642,13 +3648,21 @@ impl Inner {
         {
             return;
         }
-        let handle = self
+        // Pending keys carry only the wire identity. Use the retained handle
+        // when releasing its reverse-request registry after retirement.
+        let handle = *self
             .retired_routes
-            .take(&handle)
+            .get(&handle)
             .expect("retired route exists");
-        if self.retirement_goodbyes.remove(&handle) {
-            self.queue_retirement_goodbye(handle);
+        if self.retirement_goodbyes.contains(&handle) {
+            if !self.queue_retirement_goodbye(handle) {
+                // Keep the ingress handle occupied until the flusher queues the
+                // GOODBYE, so a reopened route cannot take this channel first.
+                return;
+            }
+            self.retirement_goodbyes.remove(&handle);
         }
+        self.retired_routes.remove(&handle);
         if self.route_epochs.get(&handle.channel) == Some(&handle) {
             self.route_epochs.remove(&handle.channel);
             self.push_event_receivers.remove(&handle);
@@ -3656,28 +3670,43 @@ impl Inner {
         release_reverse_request_registry(handle);
     }
 
-    fn queue_retirement_goodbye(&self, handle: RouteHandle) {
+    fn queue_retirement_goodbye(&mut self, handle: RouteHandle) -> bool {
         if self.generation != handle.connection_token()
             || self.route_epochs.get(&handle.channel) != Some(&handle)
+            || self.writer.is_none()
         {
-            return;
+            return true;
         }
-        if let (Some(writer), Ok(frame)) = (
-            &self.writer,
-            Frame::build(
+        if self.retirement_queue.is_empty() {
+            let frame = Frame::build(
                 FrameType::Goodbye,
                 Flags::new(false, Priority::Interactive, false),
                 handle.channel,
                 handle.epoch,
                 0,
                 Vec::new(),
-            ),
-        ) {
-            let _ = writer.try_send(WriteCommand {
-                frame,
-                pending: None,
-            });
+            )
+            .expect("header-only route GOODBYE is valid");
+            if self
+                .writer
+                .as_ref()
+                .unwrap()
+                .try_send(WriteCommand {
+                    frame,
+                    pending: None,
+                })
+                .is_ok()
+            {
+                return true;
+            }
         }
+        // Once one retirement is waiting, later retirements join the same FIFO
+        // rather than overtaking it through the synchronous fast path.
+        if !self.retirement_queue.contains(&handle) {
+            self.retirement_queue.push_back(handle);
+        }
+        self.retirement_notify.notify_one();
+        false
     }
 
     fn remove_pending(&mut self, key: &PendingKey) -> Option<PendingEntry> {
@@ -3731,6 +3760,10 @@ impl Inner {
             slot.release();
         }
         self.retirement_goodbyes.clear();
+        self.retirement_queue.clear();
+        if let Some(task) = self.retirement_task.take() {
+            task.abort();
+        }
         for handle in self.retired_routes.drain() {
             release_reverse_request_registry(handle);
         }
@@ -3786,6 +3819,9 @@ impl Shared {
                 route_epochs: HashMap::new(),
                 retired_routes: HashSet::new(),
                 retirement_goodbyes: HashSet::new(),
+                retirement_queue: VecDeque::new(),
+                retirement_notify: Arc::new(Notify::new()),
+                retirement_task: None,
                 route_modules: HashMap::new(),
                 route_end_reasons: HashMap::new(),
                 legacy_channel_reasons: HashMap::new(),
@@ -3940,6 +3976,11 @@ impl Shared {
             }
             inner.reader_task = Some(reader_task);
             inner.writer_task = Some(writer_task);
+            let retirement_shared = Arc::clone(self);
+            let retirement_notify = Arc::clone(&inner.retirement_notify);
+            inner.retirement_task = Some(tokio::spawn(async move {
+                retirement_goodbye_loop(retirement_shared, generation, retirement_notify).await;
+            }));
         }
 
         Ok((generation, epoch))
@@ -5363,8 +5404,16 @@ impl Shared {
                 return;
             }
             inner.closed = true;
-            for handle in &inner.retirement_goodbyes {
-                inner.queue_retirement_goodbye(*handle);
+            // Disconnect releases every daemon route, including retirements
+            // whose GOODBYEs are still waiting for writer capacity. Preserve
+            // the best-effort shutdown send for retirements not yet reaped.
+            let retirements = inner
+                .retirement_goodbyes
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            for handle in retirements {
+                inner.queue_retirement_goodbye(handle);
             }
             inner.writer = None;
             inner.route_epochs.clear();
@@ -5401,7 +5450,7 @@ impl Shared {
             handle.abort();
         }
         if let Some(mut handle) = writer {
-            // Let queued retirement GOODBYEs reach the socket, but never leave
+            // Let already queued GOODBYEs reach the socket, but never leave
             // a writer blocked on an unresponsive peer alive after close.
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(async move {
@@ -5567,7 +5616,7 @@ impl Shared {
             "route closed by close_handle",
             RouteEndReason::ClosedByCaller,
         );
-        self.send_route_goodbye(handle, false);
+        self.queue_route_goodbye(handle).await;
         self.uninstall_route_handle(handle);
         Ok(())
     }
@@ -5613,9 +5662,10 @@ impl Shared {
             RouteEndReason::ClosedByCaller,
         );
 
-        // Best-effort route GOODBYE: the daemon releases the route + relays the module
-        // route-gone GOODBYE the module's reaper consumes. One-way, no ack.
-        self.send_route_goodbye(route.handle, false);
+        // Fail pending requests and release their slots before waiting for the
+        // writer. Keep the ingress handle installed until GOODBYE is queued,
+        // preventing channel reuse from overtaking the old route's teardown.
+        self.queue_route_goodbye(route.handle).await;
         self.uninstall_route_handle(route.handle);
     }
 
@@ -5685,6 +5735,64 @@ impl Shared {
                 return;
             }
             sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn queue_route_goodbye(self: &Arc<Self>, handle: RouteHandle) {
+        let frame = Frame::build(
+            FrameType::Goodbye,
+            Flags::new(false, Priority::Interactive, false),
+            handle.channel,
+            handle.epoch,
+            0,
+            Vec::new(),
+        )
+        .expect("header-only route GOODBYE is valid");
+        loop {
+            let changed = self.notify.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let writer = {
+                let inner = self.lock_inner();
+                // A missing writer or changed generation means the connection
+                // is dead: the daemon releases every route on that connection,
+                // so no GOODBYE is needed. A removed handle was already closed.
+                if inner.closed
+                    || inner.generation != handle.connection_token()
+                    || inner.route_epochs.get(&handle.channel) != Some(&handle)
+                {
+                    return;
+                }
+                let Some(writer) = inner.writer.clone() else {
+                    return;
+                };
+                writer
+            };
+            // Request deadlines bound other awaited writes, but there is no
+            // writer-stall timeout: a live connection must admit this teardown
+            // before its caller can release route budget.
+            tokio::select! {
+                result = writer.reserve() => {
+                    let Ok(permit) = result else {
+                        self.handle_generation_drop(
+                            handle.connection_token(),
+                            "writer closed before route GOODBYE".into(),
+                        );
+                        return;
+                    };
+                    let inner = self.lock_inner();
+                    if !inner.closed
+                        && inner.generation == handle.connection_token()
+                        && inner.writer.as_ref().is_some_and(|current| current.same_channel(&writer))
+                        && inner.route_epochs.get(&handle.channel) == Some(&handle)
+                    {
+                        permit.send(WriteCommand { frame, pending: None });
+                    }
+                    return;
+                }
+                _ = &mut changed => {}
+                _ = self.close_token.cancelled() => return,
+            }
         }
     }
 
@@ -6971,6 +7079,60 @@ impl Shared {
         for route in removed {
             route.close();
         }
+    }
+}
+
+async fn retirement_goodbye_loop(shared: Arc<Shared>, generation: u64, notify: Arc<Notify>) {
+    loop {
+        let notified = notify.notified();
+        let next = {
+            let inner = shared.lock_inner();
+            if inner.closed || inner.generation != generation || inner.writer.is_none() {
+                return;
+            }
+            inner
+                .retirement_queue
+                .front()
+                .map(|handle| (*handle, inner.writer.as_ref().unwrap().clone()))
+        };
+        let Some((handle, writer)) = next else {
+            notified.await;
+            continue;
+        };
+        let Ok(permit) = writer.reserve().await else {
+            shared.handle_generation_drop(
+                generation,
+                "writer closed before retirement GOODBYE".into(),
+            );
+            return;
+        };
+        let mut inner = shared.lock_inner();
+        if inner.closed || inner.generation != generation || inner.writer.is_none() {
+            return;
+        }
+        if inner.retirement_queue.front() != Some(&handle) {
+            continue;
+        }
+        inner.retirement_queue.pop_front();
+        inner.retirement_goodbyes.remove(&handle);
+        if inner.route_epochs.get(&handle.channel) == Some(&handle) {
+            let frame = Frame::build(
+                FrameType::Goodbye,
+                Flags::new(false, Priority::Interactive, false),
+                handle.channel,
+                handle.epoch,
+                0,
+                Vec::new(),
+            )
+            .expect("header-only route GOODBYE is valid");
+            // Queue admission and uninstallation share the lock. No new route
+            // can claim this channel between those operations.
+            permit.send(WriteCommand {
+                frame,
+                pending: None,
+            });
+        }
+        inner.reap_retired_route(handle);
     }
 }
 
@@ -9632,6 +9794,229 @@ mod tests {
         assert!(inner.routes.is_empty());
         assert!(inner.route_epochs.is_empty());
         assert!(inner.openings.is_empty());
+    }
+
+    fn route_teardown_stand_in() -> (
+        Arc<Shared>,
+        SubcConsumer,
+        mpsc::Receiver<WriteCommand>,
+        tokio::io::DuplexStream,
+        RouteKey,
+        RouteState,
+    ) {
+        let shared = writer_test_shared();
+        let (stream, peer) = tokio::io::duplex(1024);
+        shared
+            .install_initial(OpenedConnection {
+                stream: Box::new(stream),
+                daemon_origin_trusted: true,
+                daemon_ver: "0.39.0".into(),
+            })
+            .unwrap();
+        let (writer, rx) = mpsc::channel(1);
+        writer
+            .try_send(WriteCommand {
+                frame: response_frame(0, 0, 99, b"filler".to_vec()),
+                pending: None,
+            })
+            .unwrap();
+        let key = RouteKey::new(&restart_target("teardown"), &restart_identity(), None, None);
+        let route = RouteState {
+            handle: RouteHandle::new(17, 23, 1),
+            sem: Arc::new(Semaphore::new(1)),
+            watch_sem: None,
+            opted_in: false,
+        };
+        {
+            let mut inner = shared.lock_inner();
+            inner.writer = Some(writer);
+            inner.cache_route(key.clone(), route.clone());
+        }
+        let consumer = SubcConsumer {
+            shared: Arc::clone(&shared),
+        };
+        (shared, consumer, rx, peer, key, route)
+    }
+
+    async fn assert_reopened_request_after_goodbye(
+        shared: &Arc<Shared>,
+        consumer: &SubcConsumer,
+        rx: &mut mpsc::Receiver<WriteCommand>,
+        old: RouteHandle,
+    ) {
+        let reopened = RouteHandle::new(old.channel, old.epoch + 1, old.connection_token());
+        shared
+            .install_one_shot_route(RouteState {
+                handle: reopened,
+                sem: Arc::new(Semaphore::new(1)),
+                watch_sem: None,
+                opted_in: false,
+            })
+            .unwrap();
+        let request = consumer.request(&reopened, b"reopened".to_vec(), CallOptions::default());
+        tokio::pin!(request);
+        assert_pending(request.as_mut()).await;
+        let command = rx.recv().await.unwrap();
+        assert_eq!(command.frame.header.ty, FrameType::Goodbye);
+        assert_eq!(
+            (command.frame.header.channel, command.frame.header.epoch),
+            (old.channel, old.epoch)
+        );
+        assert_pending(request.as_mut()).await;
+        let command = rx.recv().await.unwrap();
+        assert_eq!(command.frame.header.ty, FrameType::Request);
+        assert_eq!(command.frame.header.channel, reopened.channel);
+        assert_eq!(command.frame.header.epoch, reopened.epoch);
+        dispatch_frame(
+            shared,
+            reopened.connection_token(),
+            response_frame(
+                reopened.channel,
+                reopened.epoch,
+                command.frame.header.corr,
+                Vec::new(),
+            ),
+        )
+        .await;
+        request.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_teardown_close_waits_for_goodbye_before_channel_reuse() {
+        for by_handle in [false, true] {
+            let (shared, consumer, mut rx, _peer, key, route) = route_teardown_stand_in();
+            let close = async {
+                if by_handle {
+                    consumer
+                        .close_handle(&route.handle, CloseRouteOptions::default())
+                        .await
+                        .unwrap();
+                } else {
+                    consumer
+                        .close_route(
+                            restart_target("teardown"),
+                            restart_identity(),
+                            CloseRouteOptions::default(),
+                        )
+                        .await;
+                }
+            };
+            tokio::pin!(close);
+            assert_pending(close.as_mut()).await;
+            assert!(route.sem.is_closed());
+            assert!(!shared.lock_inner().routes.contains_key(&key));
+            assert_eq!(
+                shared.lock_inner().route_epochs.get(&route.handle.channel),
+                Some(&route.handle)
+            );
+            let mut reopened = route.clone();
+            reopened.handle = RouteHandle::new(route.handle.channel, route.handle.epoch + 1, 1);
+            assert!(shared.install_one_shot_route(reopened).is_err());
+            assert_eq!(rx.recv().await.unwrap().frame.body, b"filler");
+            close.await;
+            assert_reopened_request_after_goodbye(&shared, &consumer, &mut rx, route.handle).await;
+            consumer.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn route_teardown_retirement_waits_for_goodbye_before_channel_reuse() {
+        let (shared, consumer, mut rx, _peer, key, route) = route_teardown_stand_in();
+        shared.invalidate_route_with_deadline(&key, Some(route.handle), true);
+        assert!(route.sem.is_closed());
+        assert_eq!(
+            shared.lock_inner().route_epochs.get(&route.handle.channel),
+            Some(&route.handle)
+        );
+        let mut reopened = route.clone();
+        reopened.handle = RouteHandle::new(route.handle.channel, route.handle.epoch + 1, 1);
+        assert!(shared.install_one_shot_route(reopened).is_err());
+        assert_eq!(rx.recv().await.unwrap().frame.body, b"filler");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while shared
+                .lock_inner()
+                .route_epochs
+                .contains_key(&route.handle.channel)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement must queue its GOODBYE after writer capacity frees");
+        assert_reopened_request_after_goodbye(&shared, &consumer, &mut rx, route.handle).await;
+        consumer.close().await;
+    }
+
+    #[tokio::test]
+    async fn route_teardown_retirements_flush_in_order() {
+        let (shared, consumer, mut rx, _peer, first_key, first) = route_teardown_stand_in();
+        let second_key = RouteKey::new(&restart_target("second"), &restart_identity(), None, None);
+        let mut second = first.clone();
+        second.handle = RouteHandle::new(first.handle.channel + 1, 31, 1);
+        shared
+            .lock_inner()
+            .cache_route(second_key.clone(), second.clone());
+        shared.invalidate_route_with_deadline(&first_key, Some(first.handle), true);
+        shared.invalidate_route_with_deadline(&second_key, Some(second.handle), true);
+        assert_eq!(rx.recv().await.unwrap().frame.body, b"filler");
+        for handle in [first.handle, second.handle] {
+            let command = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(command.frame.header.ty, FrameType::Goodbye);
+            assert_eq!(
+                (command.frame.header.channel, command.frame.header.epoch),
+                (handle.channel, handle.epoch)
+            );
+            assert!(!shared
+                .lock_inner()
+                .route_epochs
+                .contains_key(&handle.channel));
+        }
+        assert!(shared.lock_inner().retirement_queue.is_empty());
+        assert!(shared.lock_inner().retirement_goodbyes.is_empty());
+        assert!(rx.try_recv().is_err());
+        consumer.close().await;
+    }
+
+    #[tokio::test]
+    async fn route_teardown_dead_connection_ends_writer_wait_and_discards_retirements() {
+        for death in 0..3 {
+            let (shared, consumer, mut rx, _peer, key, route) = route_teardown_stand_in();
+            let opts = CloseRouteOptions::default();
+            let close = shared.close_route(&key, &opts);
+            tokio::pin!(close);
+            assert_pending(close.as_mut()).await;
+            match death {
+                0 => rx.close(),
+                1 => shared.handle_generation_drop(1, "test connection lost".into()),
+                _ => shared.close_sync("test connection closed"),
+            }
+            tokio::time::timeout(Duration::from_secs(1), close)
+                .await
+                .unwrap();
+            assert!(!shared
+                .lock_inner()
+                .route_epochs
+                .contains_key(&route.handle.channel));
+            assert_eq!(rx.recv().await.unwrap().frame.body, b"filler");
+            assert!(rx.try_recv().is_err());
+            consumer.close().await;
+
+            let (shared, consumer, mut rx, _peer, key, route) = route_teardown_stand_in();
+            shared.invalidate_route_with_deadline(&key, Some(route.handle), true);
+            if death == 1 {
+                shared.handle_generation_drop(1, "test connection lost".into());
+            } else {
+                consumer.close().await;
+            }
+            assert!(shared.lock_inner().retirement_queue.is_empty());
+            assert!(shared.lock_inner().retirement_goodbyes.is_empty());
+            assert_eq!(rx.recv().await.unwrap().frame.body, b"filler");
+            assert!(rx.try_recv().is_err());
+            consumer.close().await;
+        }
     }
 
     #[tokio::test]

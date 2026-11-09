@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.38.1
+
+- Route closes now wait for writer capacity before returning, so callers may release
+  per-route budget without leaking a daemon route when the writer queue is full.
+  Deadline-retired routes also retain their GOODBYEs in order until queued; both
+  paths keep the channel occupied until teardown is queued or the connection dies.
+
 ## 0.38.0
 
 - Add `CallOptions.scope` for every managed call, including cancellable calls,

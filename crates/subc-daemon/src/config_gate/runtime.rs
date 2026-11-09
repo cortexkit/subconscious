@@ -30,7 +30,7 @@ pub struct RuntimeOwner {
     canceled_approvals: Mutex<Vec<u64>>,
     // Reader and Drop callbacks must not wait behind a keychain or disk check.
     // These short queues/indexes never perform store I/O while locked.
-    approval_request_index: Mutex<HashMap<(ConnectionId, u64), u64>>,
+    approval_request_index: Mutex<HashMap<(ConnectionId, u64), std::sync::Arc<ApprovalRequest>>>,
     disconnected_pending: Mutex<Vec<ConnectionId>>,
     abandoned_spawns: Mutex<Vec<(DeliverySpawn, bool)>>,
     phone_withdrawals: Mutex<phone::PhoneWithdrawals>,
@@ -40,6 +40,14 @@ pub struct RuntimeOwner {
     spawn_preflight_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     exit_record_attempts: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    phone_bind_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    begin_approval_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    begin_approval_completions: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    desktop_receipt_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// The post-answer deadline can withdraw queued work, but never a publication
@@ -378,8 +386,11 @@ pub(crate) mod delivery;
 #[path = "route_policy.rs"]
 mod route_policy;
 
+#[path = "approval_request.rs"]
+mod approval_request;
 #[path = "phone.rs"]
 mod phone;
+pub(crate) use approval_request::{ApprovalRequest, CancelApprovalRequest};
 
 impl RuntimeOwner {
     /// Keep store I/O and waits for its synchronous owner lock off runtime threads.
@@ -416,12 +427,31 @@ impl RuntimeOwner {
     }
     /// Record the exact full response only after its writer flush succeeds and
     /// the adapter revalidates the same live desktop connection.
+    #[cfg(test)]
     pub(crate) fn desktop_view_delivered(
         &self,
         connection: ConnectionId,
         view: &subc_control::config::ConfigPlanView,
     ) -> Result<()> {
+        self.desktop_view_delivered_when(connection, view, || true)
+    }
+
+    pub(crate) fn desktop_view_delivered_when(
+        &self,
+        connection: ConnectionId,
+        view: &subc_control::config::ConfigPlanView,
+        is_live: impl FnOnce() -> bool,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = self.desktop_receipt_hook.lock().unwrap().take() {
+            hook();
+        }
         let mut state = self.lock()?;
+        // Check the live peer after acquiring the owner, without retaining the
+        // peer mutex during an owner wait or any configuration/store work.
+        if !is_live() {
+            return Ok(());
+        }
         let plan = state
             .gate
             .plans
@@ -478,6 +508,14 @@ impl RuntimeOwner {
             spawn_preflight_hook: Mutex::new(None),
             #[cfg(test)]
             exit_record_attempts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            phone_bind_hook: Mutex::new(None),
+            #[cfg(test)]
+            begin_approval_hook: Mutex::new(None),
+            #[cfg(test)]
+            begin_approval_completions: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            desktop_receipt_hook: Mutex::new(None),
         }
     }
 
@@ -569,14 +607,21 @@ impl RuntimeOwner {
     }
 
     pub fn disconnected(&self, connection: ConnectionId) {
+        if let Ok(mut index) = self.approval_request_index.lock() {
+            index.retain(|(caller, _), request| {
+                if *caller == connection {
+                    request.cancel();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         self.notify_delivery_changed();
         if let Ok(mut state) = self.inner.try_lock() {
             state.disconnected(connection);
         } else if let Ok(mut pending) = self.disconnected_pending.lock() {
             pending.push(connection);
-        }
-        if let Ok(mut index) = self.approval_request_index.lock() {
-            index.retain(|(caller, _), _| *caller != connection);
         }
     }
 
@@ -1023,7 +1068,33 @@ impl RuntimeOwner {
         digest: &Digest,
         facts: &ApprovalFacts,
     ) -> Result<ApprovalChallenge> {
+        self.begin_approval_for_request(digest, facts, None)
+    }
+
+    pub(crate) fn begin_approval_for_request(
+        &self,
+        digest: &Digest,
+        facts: &ApprovalFacts,
+        request: Option<&ApprovalRequest>,
+    ) -> Result<ApprovalChallenge> {
+        #[cfg(test)]
+        struct Completion<'a>(&'a std::sync::atomic::AtomicUsize);
+        #[cfg(test)]
+        impl Drop for Completion<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        #[cfg(test)]
+        let _completed = Completion(&self.begin_approval_completions);
+        #[cfg(test)]
+        if let Some(hook) = self.begin_approval_hook.lock().unwrap().take() {
+            hook();
+        }
         let mut state = self.lock()?;
+        if let Some(request) = request {
+            request.ensure_live()?;
+        }
         if state.expired_plans.contains(digest) {
             return Err(GateError::new(
                 "plan_expired",
@@ -1041,6 +1112,9 @@ impl RuntimeOwner {
             .map_err(|_| GateError::stale())?;
         let facts = state.with_desktop_view(digest, facts);
         let OwnerState { gate, store, .. } = &mut *state;
+        if let Some(request) = request {
+            request.ensure_live()?;
+        }
         let challenge = gate.begin_approval(digest, store, &current.diagnostic, &facts)?;
         state.reviewed(digest, Instant::now());
         Ok(challenge)
@@ -1105,6 +1179,12 @@ impl RuntimeOwner {
         let facts = state.with_desktop_view(&digest, facts);
         self.drain_canceled_approvals(&mut state);
         self.drain_disconnections(&mut state);
+        let cancellation = self.approval_request_index.lock().ok().and_then(|index| {
+            index
+                .values()
+                .find(|request| request.attempt() == attempt)
+                .cloned()
+        });
         let was_unstamped = state.store.status().state == StoreState::Unstamped;
         #[cfg(test)]
         let publication_hook = state.publication_hook.take();
@@ -1132,6 +1212,9 @@ impl RuntimeOwner {
                 }
                 if let Some(window) = window {
                     window.begin_publication()?;
+                }
+                if let Some(request) = cancellation {
+                    request.claim_publication()?;
                 }
                 route_policy::restore_superseded(
                     route_policy_receipts,

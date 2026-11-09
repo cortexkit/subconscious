@@ -2074,9 +2074,7 @@ impl ControlHandler {
                     .forwarding
                     .operator_confirms()
                     .cancel(ctx.connection_id, frame.header.corr)
-                    || self.config_runtime.as_ref().is_some_and(|owner| {
-                        owner.cancel_approval_request(ctx.connection_id, frame.header.corr)
-                    })
+                    || self.cancel_config_approval(ctx.connection_id, frame.header.corr)
                     || self
                         .supervisor
                         .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)

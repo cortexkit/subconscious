@@ -218,6 +218,68 @@ fn review_fixture() -> (
     (Scratch(path), owner, view)
 }
 
+#[cfg(feature = "dev-desktop-approval")]
+#[tokio::test]
+async fn config_desktop_cleanup_does_not_convoy_behind_an_owner_waiting_receipt() {
+    let (_scratch, owner, view) = review_fixture();
+    let connection = ConnectionId::new(700);
+    let handler = Arc::new(
+        ControlHandler::new(Arc::new(Registry::default())).with_config_runtime(owner.clone()),
+    );
+    owner_peer(&handler, connection);
+    let digest = view.digest.clone();
+    let mut facts = handler
+        .config_approval_facts(&RouteCtx {
+            connection_id: connection,
+            egress: crate::FrameSink::new(tokio::sync::mpsc::channel(1).0),
+        })
+        .await;
+    facts.attested_operator_app = true;
+    facts.os_prompt_available = true;
+    let (held, observed_hold) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let holder = owner.clone();
+    let holding = std::thread::spawn(move || {
+        holder.with_owner_lock_for_test(move || {
+            let _ = held.send(());
+            wait.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        })
+    });
+    observed_hold.await.unwrap();
+    let (reached, receipt_waiting) = tokio::sync::oneshot::channel();
+    owner.set_desktop_receipt_hook(move || {
+        let _ = reached.send(());
+    });
+    let receipt_handler = handler.clone();
+    let receipt = tokio::spawn(async move {
+        receipt_handler
+            .config_desktop_review_delivered(connection, view)
+            .await
+    });
+    receipt_waiting.await.unwrap();
+    let (done, mut cleanup_done) = tokio::sync::oneshot::channel();
+    let cleanup_handler = handler.clone();
+    let cleanup = std::thread::spawn(move || {
+        cleanup_handler.cleanup_connection(connection).unwrap();
+        let _ = done.send(());
+    });
+    let independent =
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut cleanup_done)
+            .await
+            .is_ok();
+    release.send(()).unwrap();
+    holding.join().unwrap();
+    cleanup.join().unwrap();
+    receipt.await.unwrap();
+    assert_eq!(
+        owner.begin_approval(&digest, &facts).unwrap_err().code,
+        "approval_surface_unavailable",
+        "a delayed writer acknowledgement must not resurrect a disconnected desktop receipt"
+    );
+    assert!(independent, "cleanup must finish before the held owner lock is released, not wait on captured_peers behind a receipt");
+}
+
 #[cfg(not(feature = "dev-desktop-approval"))]
 #[tokio::test]
 async fn config_desktop_without_development_switch_refuses_same_user_local_review() {

@@ -102,7 +102,7 @@ impl ControlHandler {
                 .subscribe_module_changes("callosum")
                 .map_err(|_| unavailable())?;
             let gate = runtime.module_gate("callosum")?;
-            let (pending, invalidated, spawn) = {
+            let (pending, invalidated, spawn, mut card) = {
                 let _gate = gate.lock().await;
                 if self
                     .config_phone_surface()
@@ -125,6 +125,17 @@ impl ControlHandler {
                         deadline,
                     )
                     .map_err(|_| unavailable())?;
+                // Allocation already owns forwarding state. Arm cleanup before
+                // the first bind await, even though no card has been sent yet.
+                let card = PhoneCardGuard {
+                    owner: Arc::downgrade(runtime),
+                    forwarding: self.forwarding.clone(),
+                    endpoint: pending.endpoint,
+                    sink: pending.module_sink.clone(),
+                    version: pending.negotiated_ver,
+                    correlation: pending.corr,
+                    answered: false,
+                };
                 let binding = if pending.endpoint.connection_id == connection {
                     let corr = pending.corr;
                     config_work(runtime.clone(), move |owner| {
@@ -134,16 +145,8 @@ impl ControlHandler {
                 } else {
                     Err(unavailable())
                 };
-                let invalidated = match binding {
-                    Ok(receiver) => receiver,
-                    Err(error) => {
-                        let _ = self
-                            .forwarding
-                            .cancel_module_control_rpc(pending.endpoint, pending.corr);
-                        return Err(error);
-                    }
-                };
-                (pending, invalidated, spawn)
+                let invalidated = binding?;
+                (pending, invalidated, spawn, card)
             };
             let PendingModuleControlRpc {
                 endpoint,
@@ -152,15 +155,6 @@ impl ControlHandler {
                 corr,
                 receiver,
             } = pending;
-            let mut card = PhoneCardGuard {
-                owner: Arc::downgrade(runtime),
-                forwarding: self.forwarding.clone(),
-                endpoint,
-                sink: module_sink.clone(),
-                version: negotiated_ver,
-                correlation: corr,
-                answered: false,
-            };
             let frame = Frame::build_with_version(
                 negotiated_ver,
                 FrameType::Request,

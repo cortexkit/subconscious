@@ -19,6 +19,8 @@ use tokio::sync::mpsc;
 const PHONE: ConnectionId = ConnectionId::new(90);
 const CALLER: ConnectionId = ConnectionId::new(7);
 
+#[path = "phone_cancel_r2_tests.rs"]
+mod cancel_r2_tests;
 #[path = "phone_lifecycle_tests.rs"]
 mod lifecycle_tests;
 
@@ -728,7 +730,7 @@ impl crate::operator_confirm::OperatorProvider for PendingPresence {
     }
 }
 
-async fn connection_approval_withdrawal(phone: bool, disconnect: bool) {
+async fn connection_approval_withdrawal(phone: bool, disconnect: bool, early_cancel: bool) {
     use crate::operator_confirm::OperatorWithdraw;
     let mut fixture = Fixture::new().await;
     let (events, mut presence_events) = mpsc::unbounded_channel();
@@ -806,6 +808,45 @@ async fn connection_approval_withdrawal(phone: bool, disconnect: bool) {
     crate::write_frame(socket.as_mut().unwrap(), &apply)
         .await
         .unwrap();
+    if early_cancel {
+        // Both frames enter the reader without waiting for any prompt or task
+        // tracking. The reader must reserve cancellation before it defers Apply.
+        let cancel = Frame::build(FrameType::Cancel, control_flags(), 0, 0, 881, vec![]).unwrap();
+        crate::write_frame(socket.as_mut().unwrap(), &cancel)
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::read_frame(socket.as_mut().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let error: subc_protocol::ErrorBody = serde_json::from_slice(&response.body).unwrap();
+        presence.withdraw("test cleanup");
+        drop(socket);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut shown = false;
+        while let Ok(event) = presence_events.try_recv() {
+            shown |= event == "shown" || event == "unexpected generic prompt";
+        }
+        assert_eq!(fixture.owner.history().unwrap().0.len(), 1);
+        fixture.stop().await;
+        assert_eq!(
+            error.code, "approval_surface_unavailable",
+            "an immediate Cancel must cancel Apply, not become unknown_subscription"
+        );
+        assert!(
+            !shown,
+            "an Apply cancelled in the reader must never open a prompt"
+        );
+        return;
+    }
     let card = if phone {
         Some(fixture.request().await)
     } else {
@@ -863,20 +904,25 @@ async fn connection_approval_withdrawal(phone: bool, disconnect: bool) {
 
 #[tokio::test]
 async fn config_connection_loop_os_cancel_withdraws_without_recording() {
-    connection_approval_withdrawal(false, false).await;
+    connection_approval_withdrawal(false, false, false).await;
 }
 
 #[tokio::test]
 async fn config_connection_loop_os_disconnect_withdraws_without_recording() {
-    connection_approval_withdrawal(false, true).await;
+    connection_approval_withdrawal(false, true, false).await;
 }
 
 #[tokio::test]
 async fn config_connection_loop_phone_cancel_withdraws_without_recording() {
-    connection_approval_withdrawal(true, false).await;
+    connection_approval_withdrawal(true, false, false).await;
 }
 
 #[tokio::test]
 async fn config_connection_loop_phone_disconnect_withdraws_without_recording() {
-    connection_approval_withdrawal(true, true).await;
+    connection_approval_withdrawal(true, true, false).await;
+}
+
+#[tokio::test]
+async fn config_connection_loop_cancel_before_tracking_never_prompts() {
+    connection_approval_withdrawal(false, false, true).await;
 }

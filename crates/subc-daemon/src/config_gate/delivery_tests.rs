@@ -1124,11 +1124,10 @@ async fn config_spawn_async_io_checks_keychain_and_store_hash_off_the_runtime_th
 fn config_callback_queues_are_independent_of_the_store_mutex() {
     let (_rig, owner) = rig();
     let owner = std::sync::Arc::new(owner);
-    owner
-        .approval_request_index
-        .lock()
-        .unwrap()
-        .insert((INCUMBENT, 91), 17);
+    owner.approval_request_index.lock().unwrap().insert(
+        (INCUMBENT, 91),
+        crate::config_gate::runtime::ApprovalRequest::for_attempt(17),
+    );
     let (sender, _) = tokio::sync::mpsc::channel(1);
     let cancel = subc_protocol::Frame::build(
         subc_protocol::FrameType::Cancel,

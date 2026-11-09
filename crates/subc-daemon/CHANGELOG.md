@@ -65,6 +65,12 @@
   substitutions. Use native volume/file identity on Windows and effective-user
   executable access for PATH search. Own new Linux cgroup cleanup before any
   fallible admission or command preparation.
+  Reserve Apply cancellation in the reader before deferred dispatch, retain
+  drop-safe ownership across blocking approval allocation and phone RPC binding,
+  and linearize withdrawal with the publication claim. Post-claim Cancel keeps
+  the real apply outcome and records `config.cancel_too_late` diagnostically,
+  without a new wire reply. Desktop receipt work never holds the peer mutex while
+  waiting on the owner and cannot revive a disconnected caller's receipt.
 - Fence respawn until a spontaneous warm-up exit's configuration failure is
   recorded. Waiting spends no extra crash budget; intentional restarts preserve
   pending configuration, and a failed first generation stays stopped.

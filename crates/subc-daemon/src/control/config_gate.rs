@@ -86,6 +86,31 @@ impl ControlHandler {
             )
     }
 
+    pub(crate) fn reserve_config_approval(&self, ctx: &RouteCtx, frame: &Frame) {
+        if self.defers_config_approval(frame) {
+            if let Some(owner) = &self.config_runtime {
+                owner.reserve_approval_request(ctx.connection_id, frame.header.corr);
+            }
+        }
+    }
+
+    pub(super) fn cancel_config_approval(&self, caller: ConnectionId, correlation: u64) -> bool {
+        use crate::config_gate::runtime::CancelApprovalRequest;
+        let Some(owner) = &self.config_runtime else {
+            return false;
+        };
+        match owner.cancel_approval_request_outcome(caller, correlation) {
+            CancelApprovalRequest::Unknown => false,
+            CancelApprovalRequest::Withdrawn => true,
+            CancelApprovalRequest::TooLate => {
+                if let Some(activity) = &self.activity {
+                    activity.config_cancel_too_late(caller, correlation);
+                }
+                true
+            }
+        }
+    }
+
     pub(super) async fn handle_module_config_request(
         &self,
         ctx: &RouteCtx,
@@ -400,14 +425,12 @@ impl ControlHandler {
         };
         let peers = self.captured_peers.clone();
         let _ = config_work(runtime, move |owner| {
-            // Lock order is captured peers, then owner. Cleanup removes the
-            // peer before dropping the owner's receipt, so a delayed writer
-            // acknowledgement cannot resurrect a disconnected connection.
-            let peers = peers.lock().unwrap_or_else(|p| p.into_inner());
-            if !peers.contains_key(&connection) {
-                return Ok(());
-            }
-            owner.desktop_view_delivered(connection, &view)
+            owner.desktop_view_delivered_when(connection, &view, || {
+                peers
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains_key(&connection)
+            })
         })
         .await;
     }
@@ -531,6 +554,9 @@ impl ControlHandler {
                 })
             }
             ConfigControlRequest::Apply { digest } => {
+                let connection = ctx.connection_id;
+                let corr = frame.header.corr;
+                let request_guard = runtime.claim_approval_request(connection, corr)?;
                 if self.rescan.is_none() {
                     return Err(GateError::new(
                         "supervisor_reconcile_unavailable",
@@ -538,8 +564,20 @@ impl ControlHandler {
                     ));
                 }
                 let facts = self.config_approval_facts(ctx).await;
-                let challenge = config_work(runtime.clone(), move |owner| {
-                    owner.begin_approval(&digest, &facts)
+                let cancellation = request_guard.request.clone();
+                let (challenge, mut attempt_guard) = config_work(runtime.clone(), move |owner| {
+                    let challenge =
+                        owner.begin_approval_for_request(&digest, &facts, Some(&cancellation))?;
+                    // The job owns slot cleanup even if its async caller drops
+                    // before this blocking result can be delivered.
+                    let guard = phone::ApprovalAttemptGuard::new(&owner, challenge.attempt());
+                    owner.track_reserved_approval_request(
+                        challenge.attempt(),
+                        connection,
+                        corr,
+                        &cancellation,
+                    )?;
+                    Ok((challenge, guard))
                 })
                 .await
                 .map_err(|error| {
@@ -551,15 +589,7 @@ impl ControlHandler {
                         error
                     }
                 })?;
-                let mut attempt_guard =
-                    phone::ApprovalAttemptGuard::new(&runtime, challenge.attempt());
-                let attempt = challenge.attempt();
-                let connection = ctx.connection_id;
-                let corr = frame.header.corr;
-                config_work(runtime.clone(), move |owner| {
-                    owner.track_approval_request(attempt, connection, corr)
-                })
-                .await?;
+                request_guard.request.ensure_live()?;
                 let reply = match &challenge {
                     ApprovalChallenge::Desktop { .. } | ApprovalChallenge::OsPrompt { .. } => {
                         ApprovalReply::Presence(

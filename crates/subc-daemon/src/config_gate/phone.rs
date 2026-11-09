@@ -32,7 +32,7 @@ impl OwnerState {
             .retain(|_, current| *current != connection);
     }
 
-    fn cancel_approval(&mut self, attempt: u64) {
+    pub(super) fn cancel_approval(&mut self, attempt: u64) {
         if let Ok(digest) = self.gate.approval_digest(attempt) {
             self.reviewed(&digest, Instant::now());
         }
@@ -63,6 +63,28 @@ impl OwnerState {
 }
 
 impl RuntimeOwner {
+    #[cfg(all(test, feature = "dev-desktop-approval"))]
+    pub(crate) fn set_desktop_receipt_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.desktop_receipt_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+    #[cfg(all(test, feature = "dev-desktop-approval"))]
+    pub(crate) fn with_owner_lock_for_test(&self, work: impl FnOnce()) {
+        let _state = self.lock().unwrap();
+        work();
+    }
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_begin_approval_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.begin_approval_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+    #[cfg(all(test, unix))]
+    pub(crate) fn begin_approval_completions_for_test(&self) -> usize {
+        self.begin_approval_completions
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_phone_bind_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.phone_bind_hook.lock().unwrap() = Some(Box::new(hook));
+    }
     pub(super) fn drain_canceled_approvals(&self, state: &mut OwnerState) {
         if let Ok(mut pending) = self.canceled_approvals.lock() {
             for attempt in pending.drain(..) {
@@ -70,7 +92,10 @@ impl RuntimeOwner {
             }
         }
         if let Ok(mut index) = self.approval_request_index.lock() {
-            index.retain(|key, attempt| state.approval_requests.get(key) == Some(attempt));
+            index.retain(|key, request| {
+                request.attempt() == 0
+                    || state.approval_requests.get(key) == Some(&request.attempt())
+            });
         }
     }
 
@@ -145,6 +170,10 @@ impl RuntimeOwner {
         connection: ConnectionId,
         correlation: u64,
     ) -> Result<tokio::sync::oneshot::Receiver<()>> {
+        #[cfg(test)]
+        if let Some(hook) = self.phone_bind_hook.lock().unwrap().take() {
+            hook();
+        }
         let mut state = self.lock()?;
         state
             .gate
@@ -163,47 +192,10 @@ impl RuntimeOwner {
         self.notify_delivery_changed();
     }
 
-    pub(crate) fn track_approval_request(
-        &self,
-        attempt: u64,
-        caller: ConnectionId,
-        correlation: u64,
-    ) -> Result<()> {
-        let mut state = self.lock()?;
-        state.gate.approval_digest(attempt)?;
-        if state.approval_requests.contains_key(&(caller, correlation)) {
-            return Err(GateError::new(
-                "config_busy",
-                "approval request correlation is already pending",
-            ));
-        }
-        state
-            .approval_requests
-            .insert((caller, correlation), attempt);
-        self.approval_request_index
-            .lock()
-            .map_err(|_| {
-                GateError::new(
-                    "config_unavailable",
-                    "approval cancellation index is poisoned",
-                )
-            })?
-            .insert((caller, correlation), attempt);
-        Ok(())
-    }
-
+    #[cfg(test)]
     pub(crate) fn cancel_approval_request(&self, caller: ConnectionId, correlation: u64) -> bool {
-        let attempt = self
-            .approval_request_index
-            .lock()
-            .ok()
-            .and_then(|index| index.get(&(caller, correlation)).copied());
-        if let Some(attempt) = attempt {
-            self.cancel_approval(attempt);
-            true
-        } else {
-            false
-        }
+        self.cancel_approval_request_outcome(caller, correlation)
+            != super::CancelApprovalRequest::Unknown
     }
 
     /// A full writer queue must delay withdrawal, not discard the Cancel. The

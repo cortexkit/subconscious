@@ -251,6 +251,21 @@ impl ActivityLedger {
         );
     }
 
+    pub(crate) fn config_cancel_too_late(&self, caller: crate::ConnectionId, correlation: u64) {
+        self.enqueue_lifecycle(
+            "config.cancel_too_late",
+            None,
+            Principal::Reserved {
+                module_id: "subc".into(),
+            },
+            serde_json::json!({"connection_id": caller.get(), "correlation": correlation})
+                .as_object()
+                .unwrap()
+                .clone(),
+            None,
+        );
+    }
+
     pub(crate) fn module_rescanned(
         &self,
         added: &[String],

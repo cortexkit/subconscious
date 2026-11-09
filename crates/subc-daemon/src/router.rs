@@ -928,6 +928,10 @@ impl Router {
         self.control.defers_config_approval(frame)
     }
 
+    pub(crate) fn reserve_config_approval(&self, ctx: &RouteCtx, frame: &Frame) {
+        self.control.reserve_config_approval(ctx, frame);
+    }
+
     pub(crate) fn route_open_capacity_refusal(
         &self,
         ctx: &RouteCtx,

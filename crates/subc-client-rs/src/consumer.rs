@@ -486,6 +486,11 @@ impl Error for ConsumerCapabilityError {}
 /// Options for [`SubcConsumer::close_route`].
 #[derive(Debug, Clone)]
 pub struct CloseRouteOptions {
+    /// Scope used to open the cached route. Defaults to `None`, which selects
+    /// only the unscoped entry; other scopes and epochs are never closed here.
+    /// [`SubcConsumer::close_handle`] rejects this option because the handle
+    /// already selects exactly one route.
+    pub scope: Option<ScopeSelector>,
     /// Await in-flight unary requests on the route to settle naturally before tearing
     /// it down. Defaults to false: close immediately, settling anything in flight as
     /// at-most-once failures (outcome_unknown if already sent, not_sent otherwise).
@@ -507,6 +512,7 @@ pub struct CloseRouteOptions {
 impl Default for CloseRouteOptions {
     fn default() -> Self {
         Self {
+            scope: None,
             drain: false,
             drain_timeout: DEFAULT_CALL_TIMEOUT,
             consumer_identity: None,
@@ -548,6 +554,15 @@ impl CloseRouteOptions {
 /// Per-call options for [`SubcConsumer::call`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallOptions {
+    /// Scope for a managed call's cached route, including reconnect reopens.
+    /// Each owner/ref/epoch has a separate cache entry, apart from unscoped routes.
+    /// Admission, retries and terminal refusals follow [`SubcConsumer::open_route_scoped`].
+    /// A later call after a scope-related close tries a fresh route; the daemon
+    /// refuses it as `scope_ended` for an old epoch or `scope_not_live` if the
+    /// scope ref is gone. No tombstone is cached.
+    /// Defaults to `None`. Methods using an already-open handle reject this option;
+    /// select the scope when opening the route instead.
+    pub scope: Option<ScopeSelector>,
     /// Deadline for the whole managed call, including route-open retry and the response wait.
     pub timeout: Duration,
     pub priority: Priority,
@@ -586,6 +601,7 @@ pub struct CallOptions {
 impl Default for CallOptions {
     fn default() -> Self {
         Self {
+            scope: None,
             timeout: DEFAULT_CALL_TIMEOUT,
             priority: Priority::Interactive,
             admission_class: AdmissionClass::Normal,
@@ -599,6 +615,15 @@ impl Default for CallOptions {
 }
 
 impl CallOptions {
+    fn reject_scope(&self) -> Result<(), CallError> {
+        if self.scope.is_some() {
+            return Err(CallError::not_sent(
+                "CallOptions.scope is not supported here; select the scope with open_route_scoped or a managed call",
+            ));
+        }
+        Ok(())
+    }
+
     /// Add a provider-contract capability declaration to the route.
     ///
     /// The list is merged with reverse-request handler families, sorted and
@@ -632,6 +657,12 @@ impl CallOptions {
 /// Options for [`SubcConsumer::subscribe`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscribeOptions {
+    /// Scope for the cached route and its reopen attempts. Defaults to `None`.
+    /// Cache separation and daemon refusals follow [`CallOptions::scope`].
+    /// [`SubcConsumer::subscribe_route`] rejects this option because its handle
+    /// already fixes the scope. A scope-related close ends the subscription;
+    /// it is not automatically reopened under this or any other selector.
+    pub scope: Option<ScopeSelector>,
     pub priority: Priority,
     /// Admission behavior stamped into the subscription request. Defaults to NORMAL.
     pub admission_class: AdmissionClass,
@@ -662,6 +693,7 @@ pub struct SubscribeOptions {
 impl Default for SubscribeOptions {
     fn default() -> Self {
         Self {
+            scope: None,
             priority: Priority::Interactive,
             admission_class: AdmissionClass::Normal,
             event_buffer: DEFAULT_SUBSCRIPTION_EVENT_BUFFER,
@@ -1368,13 +1400,16 @@ impl SubcConsumer {
         Ok(Self { shared })
     }
 
-    /// Open or reuse a managed route and return its connection-fenced handle.
+    /// Open or reuse an unscoped managed route and return a handle tied to its
+    /// current connection (stale after a reconnect).
+    /// A scope in `opts` is an argument error; use [`Self::open_route_scoped`].
     pub async fn open_route(
         &self,
         target: RouteTarget,
         identity: BindIdentity,
         opts: CallOptions,
     ) -> Result<RouteHandle, CallError> {
+        opts.reject_scope()?;
         let deadline = Instant::now() + opts.timeout;
         let consumer_identity = self.shared.route_open_consumer_identity(&opts);
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
@@ -1401,8 +1436,8 @@ impl SubcConsumer {
             .map(|route| route.handle)
     }
 
-    /// Open or reuse a managed route admitted under `scope`, and return its
-    /// connection-fenced handle.
+    /// Open or reuse a managed route admitted under `scope`, and return a handle
+    /// tied to its current connection (stale after a reconnect).
     ///
     /// This is how a carrier opens its onward route for a session. The daemon
     /// admits the open only when the opener (the consumer identity in `opts`,
@@ -1431,7 +1466,12 @@ impl SubcConsumer {
     /// delivers `route.closed` with a `scope_*` reason. Its
     /// [`RouteCloseReason::disposition`] is
     /// [`RouteCloseDisposition::MustNotReopen`]: the session the route served is
-    /// over, so do not open it again under the same selector.
+    /// over, so callers should stop work for that session. The SDK does not
+    /// cache a tombstone: a later explicit open or managed call with the same
+    /// selector attempts a fresh open. The daemon refuses it as `scope_ended`
+    /// if the ref is live at another epoch, or `scope_not_live` if the ref is gone.
+    /// A selector in `opts.scope` must equal `scope`, or the call fails locally
+    /// as an argument error before opening a route.
     pub async fn open_route_scoped(
         &self,
         target: RouteTarget,
@@ -1439,6 +1479,15 @@ impl SubcConsumer {
         scope: ScopeSelector,
         opts: CallOptions,
     ) -> Result<RouteHandle, CallError> {
+        if opts
+            .scope
+            .as_ref()
+            .is_some_and(|selected| selected != &scope)
+        {
+            return Err(CallError::not_sent(
+                "CallOptions.scope differs from open_route_scoped's explicit scope",
+            ));
+        }
         let deadline = Instant::now() + opts.timeout;
         let consumer_identity = self.shared.route_open_consumer_identity(&opts);
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
@@ -1508,6 +1557,7 @@ impl SubcConsumer {
     ///
     /// Like [`Self::open_route_with_admission_facts`], the route is never cached
     /// or reopened; after a failure or a close the caller performs admission again.
+    /// A non-`None` `opts.scope` is rejected as an argument error.
     pub async fn open_route_with_admission_facts_and_options(
         &self,
         target: RouteTarget,
@@ -1515,6 +1565,7 @@ impl SubcConsumer {
         facts: serde_json::Value,
         opts: CallOptions,
     ) -> Result<RouteHandle, CallError> {
+        opts.reject_scope()?;
         let deadline = Instant::now() + opts.timeout;
         let reverse_requests = opts.reverse_requests.clone();
         self.open_admitted_route(
@@ -2048,6 +2099,7 @@ impl SubcConsumer {
     }
 
     /// Send one request using an already-opened route handle.
+    /// `opts.scope` must be `None`: the handle's scope was selected at route open.
     pub async fn request(
         &self,
         handle: &RouteHandle,
@@ -2110,6 +2162,7 @@ impl SubcConsumer {
         opts: CallOptions,
         cancel: Option<Arc<UnaryCancel>>,
     ) -> Result<Vec<u8>, CallError> {
+        opts.reject_scope()?;
         let deadline = Instant::now() + opts.timeout;
         let route = self.shared.route_state(*handle)?;
         let permit = route.acquire(false, deadline, cancel.as_ref()).await?;
@@ -2156,12 +2209,18 @@ impl SubcConsumer {
     }
 
     /// Start a held-open request using an already-opened route handle.
+    /// `opts.scope` must be `None`: the handle's scope was selected at route open.
     pub async fn subscribe_route(
         &self,
         handle: &RouteHandle,
         body: Vec<u8>,
         opts: SubscribeOptions,
     ) -> Result<Subscription, CallError> {
+        if opts.scope.is_some() {
+            return Err(CallError::not_sent(
+                "SubscribeOptions.scope is not supported on subscribe_route; select the scope when opening the route",
+            ));
+        }
         let deadline = Instant::now() + opts.route_open_timeout;
         let route = self.shared.route_state(*handle)?;
         let permit = route.acquire(true, deadline, None).await?;
@@ -2491,7 +2550,8 @@ impl SubcConsumer {
             consumer_identity.as_ref(),
             consumer_capabilities.as_deref(),
         )
-        .with_role_versions(role_versions.as_ref());
+        .with_role_versions(role_versions.as_ref())
+        .with_scope(opts.scope.as_ref());
 
         let route_open = RouteOpenParams {
             target: &target,
@@ -2500,7 +2560,7 @@ impl SubcConsumer {
             consumer_capabilities: &consumer_capabilities,
             role_versions: &role_versions,
             reverse_requests: &opts.reverse_requests,
-            scope: None,
+            scope: opts.scope.as_ref(),
         };
 
         let mut busy_permit: Option<Arc<RoutePermit>> = None;
@@ -2662,7 +2722,7 @@ impl SubcConsumer {
 
     /// Open a held-open subscription on a managed route.
     ///
-    /// This opens or reuses the same `(target, identity, consumer_identity, consumer_capabilities, role_versions)` route as
+    /// This opens or reuses the same `(target, identity, consumer_identity, consumer_capabilities, role_versions, scope)` route as
     /// [`SubcConsumer::call`], sends one Request that the provider keeps open, and
     /// returns a [`Subscription`] whose event receiver yields each matching
     /// `StreamData` payload. The request holds one route flow-control permit until
@@ -2680,6 +2740,7 @@ impl SubcConsumer {
     ) -> Result<Subscription, CallError> {
         let open_deadline = Instant::now() + opts.route_open_timeout;
         let route_opts = CallOptions {
+            scope: opts.scope.clone(),
             timeout: opts.route_open_timeout,
             priority: opts.priority,
             admission_class: opts.admission_class,
@@ -2698,7 +2759,8 @@ impl SubcConsumer {
             consumer_identity.as_ref(),
             consumer_capabilities.as_deref(),
         )
-        .with_role_versions(role_versions.as_ref());
+        .with_role_versions(role_versions.as_ref())
+        .with_scope(opts.scope.as_ref());
 
         let route_open = RouteOpenParams {
             target: &target,
@@ -2707,7 +2769,7 @@ impl SubcConsumer {
             consumer_capabilities: &consumer_capabilities,
             role_versions: &role_versions,
             reverse_requests: &opts.reverse_requests,
-            scope: None,
+            scope: opts.scope.as_ref(),
         };
 
         loop {
@@ -2767,6 +2829,8 @@ impl SubcConsumer {
     /// the whole consumer: it drops the cached route, settles in-flight requests on it
     /// at-most-once (OutcomeUnknown if already sent, NotSent otherwise), and sends a
     /// best-effort route GOODBYE so the daemon releases it and notifies the module.
+    /// `opts.scope` selects only that scope's cache entry; `None` selects only
+    /// the unscoped entry. Calls and subscriptions use the same route cache.
     ///
     /// Idempotent: a no-op if the route was never opened or is already closed (callers
     /// over-call on session-end). NOT a permanent tombstone — a later `call()` for the
@@ -2786,16 +2850,23 @@ impl SubcConsumer {
             consumer_identity.as_ref(),
             consumer_capabilities.as_deref(),
         )
-        .with_role_versions(route_open_role_versions(opts.role_versions.as_ref()).as_ref());
+        .with_role_versions(route_open_role_versions(opts.role_versions.as_ref()).as_ref())
+        .with_scope(opts.scope.as_ref());
         self.shared.close_route(&key, &opts).await;
     }
 
     /// Close exactly this route handle. A stale connection token fails locally and emits no frame.
+    /// `opts.scope` must be `None`: the handle already selects exactly one route.
     pub async fn close_handle(
         &self,
         handle: &RouteHandle,
         opts: CloseRouteOptions,
     ) -> Result<(), CallError> {
+        if opts.scope.is_some() {
+            return Err(CallError::not_sent(
+                "CloseRouteOptions.scope is not supported on close_handle; the handle already selects the route",
+            ));
+        }
         self.shared.close_handle(*handle, &opts).await
     }
 
@@ -10089,8 +10160,14 @@ mod tests {
     /// Refuse every scoped route.open with `code` until the open settles, and
     /// return how many attempts were served and the error the caller got.
     async fn refuse_scoped_opens(code: &str) -> (usize, CallError) {
+        refuse_scoped_operation(code, "open").await
+    }
+
+    async fn refuse_scoped_operation(code: &str, operation: &str) -> (usize, CallError) {
         let (shared, consumer, mut receiver) = route_open_stand_in(seeded_random(9));
+        let selector = scope_selector("owner", "session-a", 1);
         let options = CallOptions {
+            scope: Some(selector.clone()),
             timeout: Duration::from_secs(2),
             route_retry: RetryBackoff {
                 base: Duration::ZERO,
@@ -10100,15 +10177,44 @@ mod tests {
             route_retry_deadline: Duration::from_millis(150),
             ..CallOptions::default()
         };
+        let operation = operation.to_string();
         let mut task = tokio::spawn(async move {
-            consumer
-                .open_route_scoped(
-                    restart_target("plexus"),
-                    restart_identity(),
-                    scope_selector("owner", "session-a", 1),
-                    options,
-                )
-                .await
+            match operation.as_str() {
+                "call" => consumer
+                    .call(
+                        restart_target("plexus"),
+                        restart_identity(),
+                        b"{}".to_vec(),
+                        options,
+                    )
+                    .await
+                    .map(|_| ()),
+                "subscribe" => consumer
+                    .subscribe(
+                        restart_target("plexus"),
+                        restart_identity(),
+                        b"{}".to_vec(),
+                        SubscribeOptions {
+                            scope: options.scope,
+                            route_open_timeout: options.timeout,
+                            route_retry: options.route_retry,
+                            route_retry_deadline: options.route_retry_deadline,
+                            ..SubscribeOptions::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ()),
+                "open" => consumer
+                    .open_route_scoped(
+                        restart_target("plexus"),
+                        restart_identity(),
+                        scope_selector("owner", "session-a", 1),
+                        options,
+                    )
+                    .await
+                    .map(|_| ()),
+                _ => unreachable!(),
+            }
         });
         let mut attempts = 0usize;
         let err = loop {
@@ -10117,6 +10223,8 @@ mod tests {
                     let Some(command) = command else {
                         break task.await.unwrap().expect_err("route.open must be refused");
                     };
+                    let open: serde_json::Value = serde_json::from_slice(&command.frame.body).unwrap();
+                    assert_eq!(open["scope"], serde_json::to_value(&selector).unwrap());
                     attempts += 1;
                     let frame = route_open_answer(
                         command.frame.header.corr,
@@ -10132,6 +10240,30 @@ mod tests {
         };
         shared.close_sync("test complete");
         (attempts, err)
+    }
+
+    #[tokio::test]
+    async fn scoped_managed_operations_retry_only_transient_scope_refusals() {
+        for operation in ["call", "subscribe"] {
+            for (code, retryable) in [
+                (error_codes::SCOPE_NOT_SYNCED, true),
+                (error_codes::SCOPE_CHANGED, true),
+                (error_codes::SCOPE_ENDED, false),
+                (error_codes::SCOPE_NOT_LIVE, false),
+                (error_codes::SCOPE_EPOCH_REQUIRED, false),
+                (error_codes::SCOPE_NOT_CARRIER, false),
+            ] {
+                let (attempts, err) = refuse_scoped_operation(code, operation).await;
+                if retryable {
+                    assert!(attempts > 1, "{operation}: {code} must be retried");
+                } else {
+                    assert_eq!(attempts, 1, "{operation}: {code} must be terminal");
+                }
+                assert!(matches!(err, CallError::NotSent(_)), "{operation}: {err}");
+                assert_eq!(err.never_forwarded(), Some(true));
+                assert_eq!(err.route_open_refusal().unwrap().code, code);
+            }
+        }
     }
 
     #[tokio::test]

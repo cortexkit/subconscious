@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.38.0
+
+- Add `CallOptions.scope` for every managed call, including cancellable calls,
+  framed uploads and binary replies, and `SubscribeOptions.scope` for managed
+  watches. `CloseRouteOptions.scope` closes only the matching cached route.
+  Scoped calls and watches share the existing cache,
+  keyed separately by owner, ref and epoch. Scope refusals and route closure use
+  the same retry and delivery guarantees as unscoped calls. A later call after
+  a scope-related close opens a fresh route; the daemon refuses it as
+  `scope_ended` for an old epoch or `scope_not_live` if the ref is gone, without
+  a client-side tombstone. Closing a watch's scope ends the watch rather than
+  automatically reopening it under another selector.
+- **Rust migration:** exhaustive `CallOptions`, `SubscribeOptions` and
+  `CloseRouteOptions` literals must add `scope: None`
+  (or the desired selector). Callers using `..Default::default()` change nothing.
+  `open_route` rejects a scope in its options: use `open_route_scoped`, whose
+  explicit selector must agree with any selector in the options. Already-open
+  handle requests, watches, handle closes, reserved sends and one-shot
+  admission-facts opens reject a scope in their options rather than silently
+  ignoring it. There is no wire change.
+
 ## 0.37.0
 
 - Adopt control 0.38's extensible supervisor resource and reload-verdict types. This is a breaking Rust dependency upgrade because the SDK re-exports control types and returns them in public supervisor responses. Use their `new` constructors and `with_*` builders instead of external resource struct literals; the new root-only `tree.own` remains optional on the wire.

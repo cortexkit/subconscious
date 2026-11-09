@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.0
+
+- Adopt subc-client-rs 0.38.0 for scoped managed calls and watches. This is a breaking Rust dependency upgrade because the public API exposes SDK types; downstream users must upgrade their SDK dependency too. No wire behavior changes.
+
 ## 0.6.0
 
 - Adopt control 0.38 and Rust client 0.37. `PrivateDaemon::control` and `HarnessSigner::answer` expose those dependencies' nominal types, so their upgrade requires a breaking Rust release. Test rig behavior is unchanged.

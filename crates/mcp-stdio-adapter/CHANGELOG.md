@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.0
+
+- Adopt subc-client-rs 0.38.0 for scoped managed calls and watches. This is a breaking Rust dependency upgrade because the public API exposes SDK types; downstream users must upgrade their SDK dependency too. No wire behavior changes.
+
 ## 0.5.0
 
 - Adopt Rust client 0.37 and its control 0.38 type family. Public credential-resolver construction accepts the new `ConsumerIdentity`, and handler methods/trait implementations expose the new SDK types, so this is a breaking Rust dependency release. Adapter wire behavior is unchanged.

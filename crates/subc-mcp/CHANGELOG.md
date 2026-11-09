@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2
+
+- Require subc-client-rs 0.38.0 for scoped managed calls and watches. This dependency-only patch keeps wire behavior unchanged.
+
 ## 0.2.1
 
 - Refresh daemon/control and Rust-client requirements for the extensible supervisor resource API. MCP behavior is unchanged.

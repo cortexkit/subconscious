@@ -133,8 +133,12 @@ async fn describe_connection_reports_tcp_and_local_listener_on_real_daemon() {
 }
 
 #[test]
-fn route_option_legacy_struct_literals_and_default_updates_still_compile() {
+fn route_option_struct_literals_with_scope_and_default_updates_compile() {
+    assert!(CallOptions::default().scope.is_none());
+    assert!(SubscribeOptions::default().scope.is_none());
+    assert!(CloseRouteOptions::default().scope.is_none());
     let _full_call = CallOptions {
+        scope: None,
         timeout: Duration::from_secs(30),
         priority: Priority::Interactive,
         admission_class: subc_protocol::AdmissionClass::Normal,
@@ -145,8 +149,21 @@ fn route_option_legacy_struct_literals_and_default_updates_still_compile() {
         role_versions: None,
     };
     let _full_close = CloseRouteOptions {
+        scope: None,
         drain: false,
         drain_timeout: Duration::from_secs(30),
+        consumer_identity: None,
+        reverse_requests: ReverseRequestRegistry::new(),
+        role_versions: None,
+    };
+    let _full_subscribe = SubscribeOptions {
+        scope: None,
+        priority: Priority::Interactive,
+        admission_class: subc_protocol::AdmissionClass::Normal,
+        event_buffer: 16,
+        route_retry: RetryBackoff::default(),
+        route_retry_deadline: Duration::from_secs(90),
+        route_open_timeout: Duration::from_secs(30),
         consumer_identity: None,
         reverse_requests: ReverseRequestRegistry::new(),
         role_versions: None,
@@ -6601,3 +6618,5 @@ mod capability_deny;
 
 #[path = "real_daemon/binary_replies.rs"]
 mod binary_replies;
+#[path = "real_daemon/managed_scopes.rs"]
+mod managed_scopes;

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.3
+
+- Require subc-client-rs 0.38.0 for scoped managed calls and watches. This dependency-only patch keeps wire behavior unchanged.
+
 ## 0.21.2
 
 - Test-only: accept a pre-fetched, SHA-256-verified published ck-auth archive so Linux CI can cache the pinned release without changing bootstrap coverage. Cache the pinned nats-server archive in CI as well, with checksum verification and download retries on cache misses.

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.0
+
+- Adopt subc-client-rs 0.38.0 for scoped managed calls and watches. This is a breaking Rust dependency upgrade because the public API exposes SDK types; downstream users must upgrade their SDK dependency too. No wire behavior changes.
+
 ## 0.6.0
 
 - Show module process trees, hourly CPU in cores, daemon and agents' command rows, and a pinned whole-stack total in Modules; preserve the older daemon view when tree accounting is absent.

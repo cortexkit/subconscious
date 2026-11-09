@@ -42,7 +42,10 @@
   revoking old routes and their scope-admission stamps with the existing reload
   close reason; require a fresh health probe before activation. Refuse
   daemon-owned route-policy fields.
-- Advertise `config.gate` only with an installed configuration runtime, and verify
+- Advertise `config.gate` only when bootstrap explicitly activates a config store;
+  embedded runtime installation alone does not advertise it. Carry the caller's
+  tracing dispatcher and span into blocking HELLO work, preserving the existing
+  admission log exactly once with its connection context. Verify
   the reviewer's active connection, launch nonce and live executable identity
   before sending configuration or consent reviews. Wire spawn and swap test
   pauses and defer tamper activity emission until module gates have been released.

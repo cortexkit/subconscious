@@ -1102,7 +1102,7 @@ async fn serve_bound_daemon(
             control.with_activity_ledger_config(&run_dir, daemon_incarnation, activity_config);
     }
     if let Some(runtime) = config_runtime {
-        control = control.with_config_runtime(runtime);
+        control = control.with_explicit_config_store(runtime);
     }
     if let Some(ms) = route_bind_relay_default_ms {
         // A daemon-wide config value overrides the built-in default; a

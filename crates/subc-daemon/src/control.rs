@@ -2048,8 +2048,12 @@ impl ControlHandler {
                 let connection = ctx.connection_id;
                 let egress = ctx.egress.clone();
                 let correlation = frame.header.corr;
+                let dispatcher = tracing::dispatcher::get_default(|dispatcher| dispatcher.clone());
+                let span = tracing::Span::current();
                 tokio::task::spawn_blocking(move || {
-                    handler.handle_hello(connection, Some(egress), frame)
+                    tracing::dispatcher::with_default(&dispatcher, || {
+                        span.in_scope(|| handler.handle_hello(connection, Some(egress), frame))
+                    })
                 })
                 .await
                 .map_err(|error| RouterError::backend(0, correlation, error.to_string()))?

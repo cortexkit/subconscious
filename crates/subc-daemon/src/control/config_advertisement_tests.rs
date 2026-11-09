@@ -5,7 +5,7 @@ use crate::FrameSink;
 use serde_json::json;
 
 #[test]
-fn config_admission_gate_capability_is_advertised_only_with_a_runtime() {
+fn config_admission_gate_capability_requires_explicit_store_activation() {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/scratch")
         .join(format!("config-advertisement-{}", std::process::id()));
@@ -26,10 +26,19 @@ fn config_admission_gate_capability_is_advertised_only_with_a_runtime() {
     let original = plain
         .build_hello_ack(&frame, subc_protocol::PROTOCOL_VERSION, "probe")
         .unwrap();
+    let embedded = plain.clone().with_config_runtime(owner.clone());
+    assert_eq!(
+        embedded
+            .build_hello_ack(&frame, subc_protocol::PROTOCOL_VERSION, "probe")
+            .unwrap()
+            .body,
+        original.body,
+        "installing an embedded runtime alone must not advertise daemon gate activation"
+    );
     let gated = plain
         .clone()
-        .with_config_runtime(owner.clone())
-        .with_config_runtime(owner);
+        .with_explicit_config_store(owner.clone())
+        .with_explicit_config_store(owner);
     let activated = gated
         .build_hello_ack(&frame, subc_protocol::PROTOCOL_VERSION, "probe")
         .unwrap();

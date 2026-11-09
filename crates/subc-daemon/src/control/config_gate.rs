@@ -369,18 +369,27 @@ impl ControlHandler {
             self.clone(),
             Arc::downgrade(&runtime),
         )));
+        self.config_runtime = Some(runtime);
+        self
+    }
+
+    /// Only bootstrap's explicit store-root path advertises configuration authority.
+    pub(crate) fn with_explicit_config_store(
+        self,
+        runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
+    ) -> Self {
+        let mut handler = self.with_config_runtime(runtime);
         let capability = subc_protocol::config::CONFIG_GATE_CAPABILITY;
-        if !self
+        if !handler
             .subc_capabilities
             .iter()
             .any(|present| present == capability)
         {
-            let mut capabilities = self.subc_capabilities.to_vec();
+            let mut capabilities = handler.subc_capabilities.to_vec();
             capabilities.push(capability.to_owned());
-            self.subc_capabilities = capabilities.into();
+            handler.subc_capabilities = capabilities.into();
         }
-        self.config_runtime = Some(runtime);
-        self
+        handler
     }
 
     fn config_desktop_identity(

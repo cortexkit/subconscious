@@ -7805,10 +7805,24 @@ async fn supervise_loop(
                         }
                     }
                     let active_child=child.as_mut().expect("exit observation retained its child");
-                    let deferred_spawn=active_child.spawn_failure.as_deref().is_some_and(|detail|detail.starts_with("config_delivery_deferred:"));
+                    // An unavailable image can race the program's own exit.
+                    // Only the admission kill is budget-free; another exit must
+                    // retain its ordinary crash/clean-exit accounting.
+                    #[cfg(unix)]
+                    let admission_kill = exit_report.signal == Some(9);
+                    // Tokio's Windows start_kill uses TerminateProcess with code 1.
+                    #[cfg(windows)]
+                    let admission_kill = exit_report.code == Some(1);
+                    #[cfg(not(any(unix, windows)))]
+                    let admission_kill = false;
+                    let deferred_spawn=admission_kill && active_child.spawn_failure.as_deref().is_some_and(|detail|detail.starts_with("config_delivery_deferred:"));
                     let next = if deferred_spawn {
                         record_terminal_with_detail(&spec.module_id,&runtime.terminal_ring,&runtime.spawn_events,&exit_report,TerminalDisposition::Restarting,active_child.spawn_failure.clone());
-                        let _=update_snapshot(&snapshot,Some(&spec.module_id),|state|state.state=ModuleState::Restarting);
+                        let _=update_snapshot(&snapshot,Some(&spec.module_id),|state| {
+                            state.state=ModuleState::Restarting;
+                            clear_current_process_facts(state);
+                            state.last_exit=Some(exit_report.clone());
+                        });
                         NextAction::Restart {schedule:None}
                     } else if active_child.live_program_binding.as_ref().is_some_and(|binding|binding.is_refused()) || runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.exit_is_held(&spec.module_id)) {
                         record_terminal_with_detail(&spec.module_id, &runtime.terminal_ring, &runtime.spawn_events, &exit_report, TerminalDisposition::Stopped, active_child.spawn_failure.clone().or_else(|| Some("config_gated".into())));
@@ -10956,23 +10970,19 @@ fn launch_child_in_slot(
         && recorded_image.and_then(|image| image.executable) != expected_image
         && child.try_wait().ok().flatten().is_some();
     #[cfg(target_os = "linux")]
+    let unavailable_initial_image = expected_image.is_some()
+        && recorded_image.and_then(|image| image.executable).is_none()
+        && !exited_before_binding;
+    #[cfg(not(target_os = "linux"))]
+    let unavailable_initial_image = false;
+    #[cfg(target_os = "linux")]
     if expected_image
         .is_some_and(|expected| recorded_image.and_then(|image| image.executable) != Some(expected))
         && !exited_before_binding
+        && !unavailable_initial_image
     {
-        #[cfg(all(test, target_os = "linux"))]
-        assert!(roster.admission_event_for_test(
-            &spec.module_id,
-            "before_initial_image_kill",
-            Some(pid),
-        ));
         kill_module_cgroup(cgroup_placement, &cgroup_name);
         kill_and_reap_rejected_child(&mut child, group_target.clone());
-        if recorded_image.and_then(|image| image.executable).is_none() {
-            return Err(SuperviseError::ConfigDeliveryDeferred {
-                module_id: spec.module_id.clone(),
-            });
-        }
         return Err(SuperviseError::ConfigHeld {
             module_id: spec.module_id.clone(),
             code: "program_refused".into(),
@@ -11287,17 +11297,29 @@ fn launch_child_in_slot(
         return Err(error);
     }
     if binding_ready {
-        let checked = match (
-            &supervised._program_binding,
-            &supervised.live_program_binding,
-        ) {
-            (Some(binding), _) => binding.verify(),
-            (None, Some(live)) => live.check(),
-            _ if supervised.admission_base.is_some() => Err(crate::config_gate::GateError::new(
+        // An unreadable initial image is not a definite mismatch. Keep the
+        // owned child and delivery registration until its reaped status decides
+        // whether it crashed on its own or was stopped by admission's kill.
+        let checked = if unavailable_initial_image {
+            Err(crate::config_gate::GateError::new(
                 "config_delivery_deferred",
-                "live program witness is unavailable",
-            )),
-            _ => Ok(()),
+                "initial process image is unavailable",
+            ))
+        } else {
+            match (
+                &supervised._program_binding,
+                &supervised.live_program_binding,
+            ) {
+                (Some(binding), _) => binding.verify(),
+                (None, Some(live)) => live.check(),
+                _ if supervised.admission_base.is_some() => {
+                    Err(crate::config_gate::GateError::new(
+                        "config_delivery_deferred",
+                        "live program witness is unavailable",
+                    ))
+                }
+                _ => Ok(()),
+            }
         };
         #[cfg(all(test, target_os = "linux"))]
         let checked = if roster.admission_event_for_test(
@@ -11325,7 +11347,11 @@ fn launch_child_in_slot(
                 #[cfg(all(test, target_os = "linux"))]
                 assert!(roster.admission_event_for_test(
                     &spec.module_id,
-                    "before_content_witness_kill",
+                    if unavailable_initial_image {
+                        "before_initial_image_kill"
+                    } else {
+                        "before_content_witness_kill"
+                    },
                     Some(pid),
                 ));
                 #[cfg(target_os = "linux")]

@@ -1934,18 +1934,30 @@ async fn config_delivery_supervisor_pre_hello_crash_defers_respawn_without_spend
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn config_delivery_supervisor_pre_hello_crash_after_unavailable_witness_spends_budget() {
-    crash_after_unavailable_image("after_content_witness_check").await;
+    exit_after_unavailable_image("after_content_witness_check", true).await;
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn config_delivery_supervisor_pre_hello_crash_after_unavailable_initial_image_spends_budget()
 {
-    crash_after_unavailable_image("after_spawn_image_sample").await;
+    exit_after_unavailable_image("after_spawn_image_sample", true).await;
 }
 
 #[cfg(target_os = "linux")]
-async fn crash_after_unavailable_image(unavailable_stage: &'static str) {
+#[tokio::test]
+async fn config_delivery_supervisor_unavailable_witness_admission_kill_spends_no_budget() {
+    exit_after_unavailable_image("after_content_witness_check", false).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn config_delivery_supervisor_unavailable_initial_image_admission_kill_spends_no_budget() {
+    exit_after_unavailable_image("after_spawn_image_sample", false).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn exit_after_unavailable_image(unavailable_stage: &'static str, child_exits: bool) {
     use std::io::Write;
     let (rig, owner, supervisor, _handler) = supervised_fixture_with_program(
         true,
@@ -1960,6 +1972,7 @@ async fn crash_after_unavailable_image(unavailable_stage: &'static str) {
         .success());
     let checked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let checked_hook = checked.clone();
+    let launched = rig.path.join("a.launches");
     supervisor.set_admission_hook_for_test(move |module, stage, pid| {
         if module != "a" {
             return true;
@@ -1976,6 +1989,20 @@ async fn crash_after_unavailable_image(unavailable_stage: &'static str) {
             }
             "before_content_witness_kill" | "before_initial_image_kill" => {
                 assert!(checked_hook.load(std::sync::atomic::Ordering::SeqCst));
+                if !child_exits {
+                    // Let the program reach its FIFO before allowing the kill,
+                    // so this control also proves that one real launch occurred.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while !std::fs::read_to_string(&launched).is_ok_and(|text| text == "started\n")
+                    {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "program did not start"
+                        );
+                        std::thread::yield_now();
+                    }
+                    return true;
+                }
                 writeln!(std::fs::File::create(&release).unwrap(), "crash").unwrap();
                 // Finish the program's own exit before the supervisor can signal
                 // it. WNOWAIT observes the status without stealing its reap.
@@ -2000,13 +2027,19 @@ async fn crash_after_unavailable_image(unavailable_stage: &'static str) {
     .await;
     assert!(checked.load(std::sync::atomic::Ordering::SeqCst));
     let status = module.status().unwrap();
-    assert_eq!(
-        status.restart_count, 1,
-        "a real exit 23 after exec spends one entry even when its witness was unavailable"
-    );
-    assert_eq!(status.lifetime_restarts, 1);
+    if child_exits {
+        assert_eq!(
+            status.restart_count, 1,
+            "a real exit 23 after exec spends one entry even when its witness was unavailable"
+        );
+        assert_eq!(status.lifetime_restarts, 1);
+        assert_eq!(status.last_exit.unwrap().code, Some(23));
+    } else {
+        assert_eq!(status.restart_count, 0, "an admission kill is not a crash");
+        assert_eq!(status.lifetime_restarts, 0);
+        assert_eq!(status.last_exit.unwrap().signal, Some(9));
+    }
     assert!(!status.process_alive);
-    assert_eq!(status.last_exit.unwrap().code, Some(23));
     assert!(owner.delivery_exit_fence("a").unwrap().is_some());
     assert_eq!(
         std::fs::read_to_string(rig.path.join("a.launches"))

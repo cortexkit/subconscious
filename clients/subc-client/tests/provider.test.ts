@@ -30,6 +30,8 @@ import {
   type ProviderConnectionState,
   type RouteBindRequest,
   type SubcProviderConnectOptions,
+  type ConfigView,
+  type ModuleConfigOptions,
 } from "../src/index.js";
 import { LaunchNonceError, resetLaunchNonceForTests } from "../src/launch-nonce.js";
 import { createRouteHandle, newConnectionToken, type RouteHandle } from "../src/route-handle.js";
@@ -1209,6 +1211,154 @@ describe("SubcProvider managed reconnect", () => {
   });
 });
 
+describe("SubcProvider config negotiation", () => {
+  const golden = (name: string) => JSON.parse(readFileSync(join(import.meta.dir,
+    "../../../crates/subc-protocol/tests/golden/config_gate", `${name}.json`), "utf8"));
+  const options = (extra: Partial<ModuleConfigOptions> = {}): ModuleConfigOptions => ({
+    declaration: golden("config_declare_request"),
+    review: () => golden("config_review_reply"),
+    readFiles: () => { throw new Error("must never read live files on config.gate"); },
+    apply: () => ({ result: "ack" }),
+    onError: (error) => { throw error; },
+    ...extra,
+  });
+  async function connectConfig(daemon: ScriptedProviderDaemon, config: ModuleConfigOptions) {
+    daemon.capabilities = ["config.gate"];
+    return SubcProvider.connect({
+      connectionFile: writeConnectionFile(trackedTempDir("subc-config-wire-"), daemon.port),
+      manifest: managementSurfaceManifest({ moduleId: "sample", operations: ["echo"] }),
+      handler: async (_handle, body) => body, reconnectOnDrop: false, config,
+    });
+  }
+
+  test("golden wire: review, config.changed and N+1 ACK while N is active", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    let get = golden("config_get_reply_active");
+    const applied: ConfigView[] = [];
+    daemon.control = (body) => body.op === "config.get" ? get : { op: body.op };
+    const provider = await connectConfig(daemon, options({ apply: (view) => { applied.push(view); return { result: "ack" }; } }));
+    try {
+      expect(provider.config?.state?.state).toBe("active");
+      expect(daemon.requests[0]).toEqual(golden("config_declare_request"));
+      expect(daemon.requests[1]).toEqual(golden("config_get_request"));
+      await daemon.sendLatest(FrameType.Request, golden("config_review_request"), 901n);
+      await waitForCondition(() => daemon.responses.length === 1, "review response");
+      expect(daemon.responses[0]).toEqual(golden("config_review_reply"));
+      get = golden("config_get_reply_pending");
+      await daemon.sendLatest(FrameType.Push, golden("config_changed"));
+      await waitForCondition(() => daemon.requests.some((r) => r.op === "config.applied"), "ACK after changed");
+      expect(daemon.requests.at(-1)).toEqual(golden("config_applied_request_ack"));
+      expect(applied.map((v) => v.generation)).toEqual([3, 4]);
+      expect(applied[1]?.effective).toEqual({ limit: 20 });
+    } finally { await provider.close(); }
+  });
+
+  test("golden wire: first delivery NACK keeps the connection serving", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    const get = golden("config_get_reply_first_delivery");
+    get.pending.project_id = "project-a";
+    daemon.control = (body) => body.op === "config.get" ? get : { op: body.op };
+    const provider = await connectConfig(daemon, options({ apply: () => ({ result: "nack", reasons: ["Cannot activate this generation"] }) }));
+    try {
+      expect(daemon.requests.at(-1)).toEqual(golden("config_applied_request_nack"));
+      expect(provider.config?.state?.state).toBe("failed");
+      expect(await settlesWithin(provider.closed, 10)).toBe(false);
+    } finally { await provider.close(); }
+  });
+
+  for (const op of ["config.declare", "config.get", "config.applied"]) {
+    test(`golden wire: ${op} config_gated never falls back or ends serving`, async () => {
+      const daemon = await ScriptedProviderDaemon.start();
+      daemon.control = (body) => body.op === op ? { error: golden("config_get_error_gated") }
+        : body.op === "config.get" ? golden("config_get_reply_first_delivery") : { op: body.op };
+      const provider = await connectConfig(daemon, options());
+      try {
+        const state = provider.config?.state;
+        expect(state?.state).toBe("config_gated");
+        if (state?.state === "config_gated") {
+          expect(state.availability).toBe(op === "config.applied" ? "last_view" : "no_approved_config");
+          expect(state.refusal.code).toBe("config_gated");
+          if (op !== "config.applied") expect("view" in state).toBe(false);
+        }
+        expect(await settlesWithin(provider.closed, 10)).toBe(false);
+      } finally { await provider.close(); }
+    });
+  }
+
+  for (const code of ["not_delivery_target", "anchor_pending"] as const) {
+    test(`golden wire: ${code} keeps bytes and retries on config.changed`, async () => {
+      const daemon = await ScriptedProviderDaemon.start();
+      let blocked = true;
+      daemon.control = (body) => body.op === "config.applied" && blocked ? { error: { ...golden("config_get_error_gated"), code } }
+        : body.op === "config.get" ? golden("config_get_reply_first_delivery") : { op: body.op };
+      const applied: number[] = [];
+      const provider = await connectConfig(daemon, options({ apply: (view) => { applied.push(view.generation); return { result: "ack" }; } }));
+      try {
+        expect(provider.config?.state?.state).toBe(code);
+        expect(await settlesWithin(provider.closed, 10)).toBe(false);
+        blocked = false;
+        await daemon.sendLatest(FrameType.Push, golden("config_changed"));
+        await waitForCondition(() => provider.config?.state?.state === "active", "outcome retry after hint");
+        const reports = daemon.requests.filter((r) => r.op === "config.applied");
+        expect(reports).toHaveLength(2);
+        expect(reports[0]).toEqual(golden("config_applied_request_ack"));
+        expect(reports[1]).toEqual(reports[0]);
+        expect(applied).toEqual([4]);
+      } finally { await provider.close(); }
+    });
+  }
+
+  test("golden wire: unknown status remains raw and cannot apply", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    daemon.control = (body) => body.op === "config.get" ? golden("config_get_reply_unknown_status") : { op: body.op };
+    let applies = 0;
+    const provider = await connectConfig(daemon, options({ apply: () => { applies++; return { result: "ack" }; } }));
+    try {
+      expect(provider.config?.state).toEqual({ state: "unknown", rawState: "future_status", view: undefined });
+      expect(applies).toBe(0);
+    } finally { await provider.close(); }
+  });
+
+  test("retains HELLO_ACK capabilities across reconnect", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    daemon.capabilities = ["config.gate", "future.capability"];
+    const provider = await SubcProvider.connect({
+      connectionFile: writeConnectionFile(trackedTempDir("subc-config-ack-"), daemon.port),
+      manifest: managementSurfaceManifest({ moduleId: "config-ack", operations: ["echo"] }),
+      handler: async (_handle, body) => body,
+      reconnectOnDrop: true, reconnectBackoff: RECONNECT_BACKOFF,
+    });
+    try {
+      expect(provider.subcCapabilities).toEqual(["config.gate", "future.capability"]);
+      daemon.capabilities = ["manifest_registration_v1"];
+      daemon.dropLatest();
+      await waitForCondition(() => provider.currentEpoch() === 2, "reconnected capabilities");
+      expect(provider.subcCapabilities).toEqual(["manifest_registration_v1"]);
+    } finally { await provider.close(); }
+  });
+
+  test("opts in with control_ops and reads files only when the daemon lacks config.gate", async () => {
+    const daemon = await ScriptedProviderDaemon.start();
+    let reads = 0;
+    const provider = await SubcProvider.connect({
+      connectionFile: writeConnectionFile(trackedTempDir("subc-config-legacy-"), daemon.port),
+      manifest: managementSurfaceManifest({ moduleId: "config-legacy", operations: ["echo"] }),
+      handler: async (_handle, body) => body,
+      config: {
+        declaration: { schema: {}, user_file: "/isolated/file", project_dirs: [] },
+        review: () => ({ op: "config.review", fields: [], refusals: [] }),
+        readFiles: () => { reads++; return { generation: 0, status: "unstamped", layers: [], sources: {}, effective: {} }; },
+        apply: () => ({ result: "ack" }),
+      },
+    });
+    try {
+      expect(reads).toBe(1);
+      expect(daemon.hellos[0]?.control_ops).toContain("config.review");
+      expect(provider.config?.state?.state).toBe("unstamped");
+    } finally { await provider.close(); }
+  });
+});
+
 describe("SubcProvider closed", () => {
   const SUPERVISED_ENV = { SUBC_MODULE_ID: "closed-provider", SUBC_LAUNCH_NONCE: "nonce-for-closed-test" };
   const UNSUPERVISED_ENV = { SUBC_MODULE_ID: undefined, SUBC_LAUNCH_NONCE: undefined };
@@ -1729,6 +1879,15 @@ type HelloResult = "ack" | "drop" | { code: string; message: string };
 class ScriptedProviderDaemon {
   readonly sockets = new Set<Socket>();
   helloCount = 0;
+  capabilities = ["manifest_registration_v1"];
+  control?: (body: Record<string, unknown>) => Record<string, unknown>;
+  readonly requests: Array<Record<string, unknown>> = [];
+  readonly responses: unknown[] = [];
+
+  async sendLatest(type: FrameType, body: object, corr = 0n): Promise<void> {
+    const socket = Array.from(this.sockets).at(-1)!;
+    await writeFrame(socket, buildFrame(type, CONTROL_FLAGS, 0, 0, corr, encodeJson(body)), Date.now() + 1000);
+  }
   /** Every HELLO body received, parsed, in arrival order. */
   readonly hellos: Array<Record<string, unknown>> = [];
   private readonly waiters: Array<{ count: number; resolve: () => void }> = [];
@@ -1804,12 +1963,12 @@ class ScriptedProviderDaemon {
         buildFrameWithVersion(PROTOCOL_VERSION, FrameType.HelloAck, CONTROL_FLAGS, 0, 0, hello.header.corr, encodeJson({
           negotiated_ver: PROTOCOL_VERSION,
           subc_ops: ["server.describe", "catalog.list", "route.open", "route.poll"],
-          subc_capabilities: ["manifest_registration_v1"],
+          subc_capabilities: this.capabilities,
         })),
         deadline,
       );
       this.recordHello();
-      await this.drainUntilClose(reader);
+      await this.drainUntilClose(reader, socket);
       return;
     }
 
@@ -1827,9 +1986,16 @@ class ScriptedProviderDaemon {
     this.recordHello();
   }
 
-  private async drainUntilClose(reader: SocketReader): Promise<void> {
+  private async drainUntilClose(reader: SocketReader, socket: Socket): Promise<void> {
     for (;;) {
-      await readFrame(reader, Date.now() + 60_000);
+      const frame = await readFrame(reader, Date.now() + 60_000);
+      if (frame.header.ty === FrameType.Response) this.responses.push(parseJson(frame.body));
+      if (frame.header.ty !== FrameType.Request || !this.control) continue;
+      const body = parseJson(frame.body) as Record<string, unknown>;
+      this.requests.push(body);
+      const reply = this.control(body);
+      await writeFrame(socket, buildFrame(reply.error ? FrameType.Error : FrameType.Response, CONTROL_FLAGS,
+        0, 0, frame.header.corr, encodeJson(reply.error ?? reply)), Date.now() + 1000);
     }
   }
 

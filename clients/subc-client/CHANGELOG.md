@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.25.0
+
+- Providers retain HELLO_ACK `subc_capabilities` across registration and reconnect.
+- Add opt-in module configuration delivery through the provider's `config` option:
+  declare per connection, pure review, immutable views, pending-generation ACK/NACK,
+  changed-hint refresh and bounded anchor retries. Gate refusals retain the last
+  view; a first refusal carries typed `no_approved_config` availability without
+  file bytes. Only a daemon lacking `config.gate` permits the legacy file reader.
+- Add a small adopting sample and isolated unstamped daemon coverage, plus
+  golden-driven wire tests for stamped delivery, refusals and unknown statuses.
+
 ## 0.24.0
 
 - Bound local admission by the request deadline, refusing to write with less

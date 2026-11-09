@@ -95,6 +95,13 @@ export {
   CLIENT_AUTH_DOMAIN,
 } from "./auth.js";
 export { SubcSocket, SocketClosedError, SocketTimeoutError } from "./socket.js";
+export {
+  ModuleConfig, configLayerBytes,
+  type ConfigLayerSnapshot, type ConfigView, type ConfigDeclaration,
+  type ConfigReviewRequest, type ConfigReviewReply, type ConfigFieldChange, type ConfigRecordedValue,
+  type ConfigGetReply, type ConfigAppliedRequest, type ConfigRefusal,
+  type ConfigAvailability, type ModuleConfigState, type ModuleConfigOptions,
+} from "./config.js";
 export type {
   ScopeAttributes, ScopeParent, ScopeCarrier, ScopeRecord, ScopeEnd,
   ScopeRecordResult, ScopeEndResult, ScopeEnded, ScopeSyncReply, ScopeApplyReply,

@@ -206,6 +206,70 @@ canonicalized by the daemon. A target providing `scope-workdir/v1` receives the
 directory as `workdir` in the bind's `scope`. A carrier uses the selector shown above
 with its own supervised consumer identity; the selector alone grants nothing.
 
+### Opt-in configuration delivery
+
+Pass `config: ModuleConfigOptions` to `SubcProvider.connect()` to list
+`config.review` in HELLO `control_ops`. It does not change the manifest.
+`provider.subcCapabilities` retains the current HELLO_ACK capabilities, including
+`config.gate`; reconnect replaces them and sends one new declaration. A provider
+without `config` keeps its existing behavior.
+
+The callbacks separate these responsibilities:
+
+- `declaration` supplies the schema, `user_file` and `project_dirs`.
+- `review(request)` is pure: use only the supplied immutable layer snapshots and
+  active `base`. Do not read files, environment, network or secrets. Return the
+  normalized field changes (including sources/apply kinds) and any refusals.
+- `apply(view)` installs the whole supplied view before returning `{result:"ack"}`.
+  Return `{result:"nack", reasons:[...]}` only after keeping/restoring the last
+  view. Apply `pending` rather than reapplying `active` when both are supplied.
+  The SDK reports the exact generation, project and delivery attempt.
+- `readFiles()` returns a generation-zero `unstamped` view using the old file
+  reader. It runs **only** when HELLO_ACK lacks `config.gate`. A gate refusal
+  never calls it. Unstamped views have no delivery attempt to ACK on the wire.
+
+`configLayerBytes(snapshot)` verifies canonical base64 and the raw SHA-256 before
+decoding bytes. Missing files return `undefined`, not empty bytes. Paths in a
+snapshot are identities, never instructions to open a file. The SDK does not
+compute canonical configuration or approval digests; echo daemon-provided ones.
+
+`provider.config.state` and `onState` expose these discriminants:
+
+| Wire status/code | `state` | Meaning |
+| --- | --- | --- |
+| `unstamped` | `unstamped` | Current file view, applied locally |
+| `pending` | `pending` | View applied locally, outcome not yet accepted |
+| `active` | `active` | Active view or accepted ACK |
+| `failed` | `failed` | NACK/failure; previous view retained if present |
+| `config_gated` | `config_gated` | Refusal plus `availability: "last_view"` and `view`, or `availability: "no_approved_config"` with no bytes |
+| `not_delivery_target` | `not_delivery_target` | Keep the view, never mark gated; wait for a hint after cutover |
+| `anchor_pending` | `anchor_pending` | Keep the view/outcome and retry on a hint or bounded backoff |
+| Unknown string | `unknown` with `rawState` | Preserve the spelling; never activate it |
+
+Refusal states include the original error in `refusal.cause`. None ends serving
+or exits the process. `onError` reports unexpected transport/protocol/callback
+failures without falling back to files. `config.changed` resynchronizes without
+blocking the frame reader; `provider.config.refresh()` allows an explicit refresh.
+Anchor retry intervals default to 1000 ms and must be 1..30000 ms. Closing the
+provider cancels retries. Plain unstamped file edits currently require explicit
+refresh; changed-hint handling is covered separately by wire tests.
+
+See the paired [legacy sample](tests/fixtures/config-sample-legacy.ts) and
+[adopting sample](tests/fixtures/config-sample.ts), whose line diff is checked to
+stay within 60 changed lines. Run its real-daemon test on Linux after prebuilding
+`cargo build --locked -p subc-core --bin ck-subc`:
+
+```sh
+RUN_SUBC_CONFIG_LIVE=1 bun test tests/live-config.test.ts
+```
+
+That test isolates HOME, the three XDG homes and the connection file. It covers
+unstamped declare/get/local apply and explicit refresh, plus the unchanged
+non-opted sample. Stamped N+1 delivery, review, NACK, hint handling, gate refusals,
+no-approved-config availability, non-target replies and anchor retries are
+deterministic wire tests using the committed Rust protocol goldens; they are not
+claimed as stamped real-daemon coverage.
+
 ### Launch nonce
 
 A module the daemon spawns proves who it is with a launch nonce. On macOS and

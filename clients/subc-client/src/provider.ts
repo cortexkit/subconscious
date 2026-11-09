@@ -53,6 +53,8 @@ import {
   writeBorrowed,
 } from "./socket.js";
 
+import { ModuleConfig, type ModuleConfigOptions } from "./config.js";
+
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 const CONTROL_REQUEST_TIMEOUT_MS = 10_000;
 const BODY_READ_TIMEOUT_MS = 30_000;
@@ -311,6 +313,8 @@ export interface SubcProviderConnectOptions {
   health?: ProviderHealthHandler;
   handshakeTimeoutMs?: number;
   controlOps?: string[] | null;
+  /** Opt into configuration delivery without changing the module manifest. */
+  config?: ModuleConfigOptions;
   onBind?: (request: RouteBindRequest) => Promise<BindDecision> | BindDecision;
   /** Runs only after an accepted bind ack is queued and the handle is installed. */
   onBound?: (handle: RouteHandle) => void | Promise<void>;
@@ -374,6 +378,7 @@ interface NormalizedSubcProviderConnectOptions {
   health: ProviderHealthHandler;
   handshakeTimeoutMs?: number;
   controlOps?: string[] | null;
+  config?: ModuleConfigOptions;
   onBind?: (request: RouteBindRequest) => Promise<BindDecision> | BindDecision;
   /** Runs only after an accepted bind ack is queued and the handle is installed. */
   onBound?: (handle: RouteHandle) => void | Promise<void>;
@@ -564,6 +569,10 @@ export class SubcProvider {
   private connectionToken = newConnectionToken();
   private nextCorr = HELLO_CORR + 1n;
   private subcOps: string[];
+  /** Capabilities from the current connection's HELLO_ACK, including config.gate. */
+  private currentSubcCapabilities: readonly string[];
+  get subcCapabilities(): readonly string[] { return this.currentSubcCapabilities; }
+  readonly config: ModuleConfig | undefined;
   private ingressEpochDropCount = 0;
   private readonly requestGate = new AsyncPermitPool(DEFAULT_PROVIDER_HANDLER_CAPACITY);
   private reconnecting: ReconnectCycle | null = null;
@@ -596,6 +605,12 @@ export class SubcProvider {
     ack: ModuleHelloAckBody,
   ) {
     this.subcOps = ack.subc_ops;
+    this.currentSubcCapabilities = Object.freeze([...(ack.subc_capabilities ?? [])]);
+    this.config = opts.config ? new ModuleConfig({
+      capabilities: () => this.subcCapabilities,
+      epoch: () => this.currentEpoch(),
+      request: (body) => this.configControl(body),
+    }, opts.config) : undefined;
     this.storage = ack.storage;
     this.machineId = machineIdFromHelloAck(ack);
     this.closed = new Promise<void>((resolve) => {
@@ -669,6 +684,29 @@ export class SubcProvider {
     } catch {
       throw new SubcProviderError(`invalid ${op} reply`, "protocol_error");
     }
+  }
+
+  private async configControl(body: object): Promise<unknown> {
+    if (this.closedErr) throw this.closedErr;
+    if (this.reconnecting) throw new SubcProviderError("provider is reconnecting", "connection_lost", "not_sent");
+    const op = (body as { op: string }).op;
+    const corr = this.allocateCorr();
+    const key = `0:0:${corr}`;
+    const frame = buildFrame(FrameType.Request, controlFlags(), 0, 0, corr, encodeJson(body));
+    const response = await new Promise<Frame>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(key)) reject(new SubcProviderError(`${op} timed out`, "request_timeout"));
+      }, CONTROL_REQUEST_TIMEOUT_MS);
+      this.pending.set(key, { resolve, reject, timer });
+      this.sendOn(this.sock, this.generation, frame).catch((error) => {
+        if (!this.pending.delete(key)) return;
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
+    const reply = parseJson(response.body) as { op?: string };
+    if (!reply || reply.op !== op) throw new SubcProviderError(`invalid ${op} reply`, "protocol_error");
+    return reply;
   }
 
   /** Send a reverse request on exactly one installed route generation. */
@@ -762,7 +800,9 @@ export class SubcProvider {
 
     const normalized = await normalizeProviderConnectOptions(opts);
     const opened = await SubcProvider.openConnection(normalized);
-    return new SubcProvider(opened.sock, opened.conn, normalized, opened.ack);
+    const provider = new SubcProvider(opened.sock, opened.conn, normalized, opened.ack);
+    await provider.config?.refresh();
+    return provider;
   }
 
   async close(): Promise<void> {
@@ -911,6 +951,10 @@ export class SubcProvider {
     let body: { op?: unknown; reason?: unknown; deadline_ms?: unknown };
     try {
       body = JSON.parse(Buffer.from(frame.body).toString("utf8"));
+      if (body?.op === "config.changed" && this.config) {
+        void this.config.refresh();
+        return;
+      }
       if (body === null || body.op !== "module.draining" || typeof body.reason !== "string" ||
           typeof body.deadline_ms !== "number" || !Number.isInteger(body.deadline_ms) || body.deadline_ms < 0) {
         throw new Error("invalid module control command");
@@ -1025,6 +1069,15 @@ export class SubcProvider {
           console.warn("SubcProvider health handler failed after its request was dispatched", error);
         }
       });
+      return;
+    }
+    if (request.op === "config.review" && this.config) {
+      // Review callbacks must not block the reader that resolves module RPCs.
+      void this.config.review(request).then(
+        (reply) => this.sendOn(sock, generation, buildFrameWithVersion(frame.header.ver,
+          FrameType.Response, controlFlags(), 0, 0, frame.header.corr, encodeJson(reply))),
+        () => this.sendError(frame, "config_review_failed", "configuration review failed", controlFlags(), sock, generation),
+      ).catch(() => undefined);
       return;
     }
     if (request.op !== "route.bind") {
@@ -1377,6 +1430,7 @@ export class SubcProvider {
 
         const epoch = this.replaceConnection(opened, cycle.generation);
         this.reconnecting = null;
+        void this.config?.refresh();
         if (this.reconnecting !== null) {
           throw new SubcProviderError("reconnect state must clear before restored", "reconnect_state");
         }
@@ -1417,6 +1471,7 @@ export class SubcProvider {
     this.storage = opened.ack.storage;
     this.machineId = machineIdFromHelloAck(opened.ack);
     this.subcOps = opened.ack.subc_ops;
+    this.currentSubcCapabilities = Object.freeze([...(opened.ack.subc_capabilities ?? [])]);
     this.closedErr = null;
     this.connectionEpoch += 1;
     this.connectionToken = newConnectionToken();
@@ -1522,6 +1577,7 @@ export class SubcProvider {
 
   /** End work before closing the socket, which cannot settle requests on its own. */
   private endServing(err: Error): void {
+    this.config?.close();
     if (!this.closedErr) this.closedErr = err;
     this.closeStarted = true;
     this.cancelRestoredDebounce();
@@ -1558,6 +1614,8 @@ function nonEmpty(value: string | undefined): string | undefined {
 }
 
 async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Promise<NormalizedSubcProviderConnectOptions> {
+  if (opts.config?.anchorRetryMs !== undefined && (!Number.isInteger(opts.config.anchorRetryMs)
+    || opts.config.anchorRetryMs < 1 || opts.config.anchorRetryMs > 30000)) throw new Error("anchorRetryMs must be 1..30000");
   // The environment is read once here. The daemon injects both variables when it
   // spawns a module; together they mark the process as supervised, and the nonce
   // is also what HELLO echoes for a reserved module_id.
@@ -1585,7 +1643,8 @@ async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions)
     handler: opts.handler,
     health: opts.health ?? (() => ({ status: "ok" })),
     handshakeTimeoutMs: opts.handshakeTimeoutMs,
-    controlOps: opts.controlOps,
+    controlOps: opts.config ? [...new Set([...(opts.controlOps ?? []), "config.review"])] : opts.controlOps,
+    config: opts.config,
     onBind: opts.onBind,
     onBound: opts.onBound,
     onRouteGone: opts.onRouteGone,

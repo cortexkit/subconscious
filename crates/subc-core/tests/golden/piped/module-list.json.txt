@@ -62,17 +62,14 @@ exit: Some(0)
       "tree": {
         "bound": "lower",
         "cpu_ms": "<resource_counters>",
-        "groups": [
-          {
-            "bound": "lower",
-            "count": 1,
-            "cpu_ms": "<resource_counters>",
-            "memory_bytes": "<resource_counters>",
-            "name": "fake-aft-stub"
-          }
-        ],
+        "groups": [],
         "memory_bytes": "<resource_counters>",
         "memory_kind": "resident_set",
+        "own": {
+          "bound": "lower",
+          "cpu_ms": "<resource_counters>",
+          "memory_bytes": "<resource_counters>"
+        },
         "process_count": 1,
         "source": "process_tree"
       }

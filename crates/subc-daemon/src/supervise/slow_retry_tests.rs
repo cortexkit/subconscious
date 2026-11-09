@@ -530,7 +530,12 @@ async fn daemon_stranded_operation_schedules_recovery() {
 #[tokio::test(start_paused = true)]
 async fn operator_deferred_spawn_failure_does_not_schedule_recovery() {
     let module = parked_actor(ModuleState::Restarting, Some(false), false, false, false);
-    advance_to_failure(&module).await;
+    // The attempt is due now, but preparation finishes on a real blocking
+    // worker. Observe completion without spending virtual retry time.
+    wait_for("operator deferred failure", || {
+        module.state().unwrap() == ModuleState::Failed
+    })
+    .await;
     assert_no_timer(&module);
 }
 

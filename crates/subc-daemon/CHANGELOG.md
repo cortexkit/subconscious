@@ -71,6 +71,9 @@
   the real apply outcome and records `config.cancel_too_late` diagnostically,
   without a new wire reply. Desktop receipt work never holds the peer mutex while
   waiting on the owner and cannot revive a disconnected caller's receipt.
+  Keep the background scope-expiry timer running after its startup caller
+  releases the control handler, retaining only scope/routing state and no
+  configuration-store owner.
 - Fence respawn until a spontaneous warm-up exit's configuration failure is
   recorded. Waiting spends no extra crash budget; intentional restarts preserve
   pending configuration, and a failed first generation stays stopped.

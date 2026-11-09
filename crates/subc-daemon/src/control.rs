@@ -137,6 +137,7 @@ const SUBC_UNADVERTISED_CONTROL_OPS: &[&str] = &[
 ];
 
 mod config_gate;
+mod scope_expiry;
 
 mod rescan_checked;
 use rescan_checked::{RescanMode, RescanPlan};
@@ -1382,45 +1383,25 @@ impl ControlHandler {
     /// scope change instead of ticking, so a daemon without deadlines never
     /// wakes for expiry.
     pub(crate) fn spawn_scope_expiry_loop(self: Arc<Self>) {
-        let handler = Arc::downgrade(&self);
+        let context = scope_expiry::ScopeExpiryContext::new(&self);
         let deadline_added = self.scope_deadline_added.clone();
         tokio::spawn(async move {
             loop {
-                let has_deadlines = {
-                    let Some(handler) = handler.upgrade() else {
-                        break;
-                    };
-                    let scopes = handler
-                        .scopes
-                        .read()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    scopes.has_deadlines()
-                };
-                if !has_deadlines {
+                if !context.has_deadlines() {
                     deadline_added.notified().await;
                     continue;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
-                let Some(handler) = handler.upgrade() else {
-                    break;
-                };
-                if let Err(error) = handler.sweep_expired_scopes() {
+                if let Err(error) = context.sweep() {
                     warn!(%error, "scope expiry sweep failed");
                 }
             }
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn sweep_expired_scopes(&self) -> Result<(), RouterError> {
-        let mut table = self
-            .scopes
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let swept = table.sweep_expired();
-        let drained = self.publish_scope_changes(&swept.tag_changes, &swept.expired)?;
-        drop(table);
-        self.close_scope_drained_routes(drained);
-        Ok(())
+        scope_expiry::ScopeExpiryContext::new(self).sweep()
     }
 
     fn publish_scope_changes(
@@ -1428,37 +1409,7 @@ impl ControlHandler {
         changes: &[crate::scopes::ScopeTagChange],
         expired: &[crate::scopes::ScopeExpired],
     ) -> Result<Vec<crate::forwarding::ScopeDrainedRoute>, RouterError> {
-        if changes.is_empty() {
-            return Ok(Vec::new());
-        }
-        let drained = self
-            .forwarding
-            .publish_scope_changes(changes)
-            .map_err(RouterError::Forwarding)?;
-        let mut counts = HashMap::new();
-        for route in &drained {
-            *counts
-                .entry((
-                    route.scope.owner.as_str(),
-                    route.scope.scope_ref.as_str(),
-                    route.scope.tag.scope_epoch,
-                ))
-                .or_insert(0usize) += 1;
-        }
-        for scope in expired {
-            let routes_closed = counts
-                .get(&(
-                    scope.owner.as_str(),
-                    scope.scope_ref.as_str(),
-                    scope.scope_epoch,
-                ))
-                .copied()
-                .unwrap_or(0);
-            warn!(owner = %scope.owner, scope_ref = %scope.scope_ref,
-                scope_epoch = scope.scope_epoch, expires_at_ms = scope.expires_at_ms,
-                routes_closed, "scope expired");
-        }
-        Ok(drained)
+        scope_expiry::ScopeExpiryContext::new(self).publish_scope_changes(changes, expired)
     }
 
     fn runtime_capability_snapshot(
@@ -2466,67 +2417,7 @@ impl ControlHandler {
     }
 
     fn emit_route_goodbyes(&self, released_routes: Vec<GoodbyeTarget>) {
-        for released in released_routes {
-            let frame = match Frame::build_with_version(
-                released.negotiated_ver,
-                FrameType::Goodbye,
-                control_flags(),
-                released.channel,
-                released.epoch,
-                0,
-                Vec::new(),
-            ) {
-                Ok(frame) => frame,
-                Err(err) => {
-                    warn!(
-                        route_channel = released.channel,
-                        error = %err,
-                        "failed to build route GOODBYE frame"
-                    );
-                    continue;
-                }
-            };
-            if !released.close_on_delivery_failure() {
-                crate::forwarding::send_module_route_goodbye(
-                    &self.counters,
-                    &released.sink,
-                    frame,
-                    released.module_id.as_deref(),
-                    "client route released",
-                );
-                continue;
-            }
-            if let Err(err) = released.sink.try_send(frame) {
-                warn!(
-                    target_connection_id = released.connection_id.get(),
-                    route_channel = released.channel,
-                    error = %err,
-                    "route GOODBYE was not delivered to client; closing target connection"
-                );
-                if self
-                    .forwarding
-                    .escalate_client_delivery_failure(
-                        released.connection_id,
-                        released.channel,
-                        released.epoch,
-                        CloseReason::new(
-                            "route_goodbye_delivery_failed",
-                            format!(
-                                "failed to enqueue route GOODBYE for channel {}: {err}",
-                                released.channel
-                            ),
-                        ),
-                        crate::forwarding::UndeliveredFrame {
-                            module_id: released.module_id.as_deref(),
-                            sink: &released.sink,
-                        },
-                    )
-                    .unwrap_or(false)
-                {
-                    self.counters.increment_goodbye_relay_client_failed();
-                }
-            }
-        }
+        scope_expiry::ScopeExpiryContext::new(self).emit_route_goodbyes(released_routes);
     }
 
     /// Best-effort GOODBYE to a module for a route channel subc reserved but then
@@ -3817,56 +3708,9 @@ impl ControlHandler {
         }
     }
 
-    /// Tell both ends of each route a scope change closed. The module gets a
-    /// channel-scoped GOODBYE and so does the client: the GOODBYE is what ends
-    /// the client's route handle. The client also gets `route.closed` with the
-    /// scope reason, one push per module and reason, so it can tell a revoked
-    /// route from an ordinary close and not reopen it.
+    /// Notify both endpoints of routes drained by a scope change.
     fn close_scope_drained_routes(&self, drained: Vec<crate::forwarding::ScopeDrainedRoute>) {
-        if drained.is_empty() {
-            return;
-        }
-        let mut pushes: BTreeMap<(String, String), (RouteCloseReason, Vec<EndpointRoute>)> =
-            BTreeMap::new();
-        let mut goodbyes = Vec::with_capacity(drained.len() * 2);
-        for route in drained {
-            warn!(
-                module_id = %route.module_id,
-                reason = ?route.reason,
-                client_connection_id = route.client.connection_id.get(),
-                route_channel = route.client.channel,
-                "closing route because its scope changed"
-            );
-            pushes
-                .entry((route.module_id.clone(), format!("{:?}", route.reason)))
-                .or_insert_with(|| (route.reason, Vec::new()))
-                .1
-                .push(EndpointRoute {
-                    goodbye_target: route.client.clone(),
-                    principal: Principal::Unverified,
-                    bound_at: Instant::now(),
-                    draining: false,
-                    drain_reason: None,
-                });
-            goodbyes.push(route.module);
-            goodbyes.push(route.client);
-        }
-        for ((module_id, _), (reason, routes)) in pushes {
-            send_route_control_pushes(
-                &self.forwarding,
-                routes,
-                ClientControlPush::RouteClosed {
-                    module_id,
-                    channels: Vec::new(),
-                    reason,
-                    drained: false,
-                    abandoned: 0,
-                    excluded_subscriptions: 0,
-                    terminal: Some(false),
-                },
-            );
-        }
-        self.emit_route_goodbyes(goodbyes);
+        scope_expiry::ScopeExpiryContext::new(self).close_scope_drained_routes(drained);
     }
 
     /// `scope.describe`: any registered module may read any scope, because a

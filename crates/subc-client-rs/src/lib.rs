@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
 pub mod activity;
+mod agent_commands;
+pub use agent_commands::AgentCommandsError;
+pub use subc_protocol::session::{AgentCommandFinished, AgentCommandRoot};
 pub mod consumer;
 mod operator_app;
 pub mod policy_cache;
@@ -466,6 +469,7 @@ struct ModuleHandleShared {
     daemon_capabilities: Vec<String>,
     supports_catalog_update: bool,
     supports_live_roots: bool,
+    supports_agent_commands: bool,
     supports_scope_sync: bool,
     supports_scope_apply: bool,
     supports_scope_describe: bool,
@@ -491,6 +495,7 @@ struct ModuleHandleState {
     pending_operator_confirms: HashMap<u64, oneshot::Sender<Frame>>,
     pending_activity_records: HashMap<u64, oneshot::Sender<Frame>>,
     pending_scope_served_by: HashMap<u64, oneshot::Sender<Frame>>,
+    pending_agent_commands: HashMap<u64, oneshot::Sender<Frame>>,
     current_provides: Option<Vec<ProviderRole>>,
     catalog_changes: VecDeque<CatalogChange>,
     closed: bool,
@@ -536,6 +541,10 @@ impl ModuleHandle {
                     .iter()
                     .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE),
                 supports_live_roots: ack.subc_ops.iter().any(|op| op == "supervisor.live_roots"),
+                supports_agent_commands: ack
+                    .subc_ops
+                    .iter()
+                    .any(|op| op == "supervisor.agent_commands"),
                 supports_scope_sync: ack.subc_ops.iter().any(|op| op == SCOPE_SYNC_OP),
                 supports_scope_apply: ack.subc_ops.iter().any(|op| op == SCOPE_APPLY_OP),
                 supports_scope_describe: ack.subc_ops.iter().any(|op| op == SCOPE_DESCRIBE_OP),
@@ -564,6 +573,7 @@ impl ModuleHandle {
                     pending_operator_confirms: HashMap::new(),
                     pending_activity_records: HashMap::new(),
                     pending_scope_served_by: HashMap::new(),
+                    pending_agent_commands: HashMap::new(),
                     current_provides: None,
                     catalog_changes: VecDeque::new(),
                     closed: false,
@@ -1286,6 +1296,15 @@ impl ModuleHandle {
     }
 
     fn handle_control_reply(&self, frame: Frame) -> bool {
+        if let Some(reply) = self
+            .shared
+            .lock_inner()
+            .pending_agent_commands
+            .remove(&frame.header.corr)
+        {
+            let _ = reply.send(frame);
+            return true;
+        }
         let served_by_reply = self
             .shared
             .lock_inner()
@@ -1451,6 +1470,7 @@ impl ModuleHandleShared {
             inner.pending_operator_confirms.clear();
             inner.pending_activity_records.clear();
             inner.pending_scope_served_by.clear();
+            inner.pending_agent_commands.clear();
             inner
                 .pending_catalog_updates
                 .drain()

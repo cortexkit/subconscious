@@ -528,7 +528,19 @@ fn ckni_json_wins_over_each_plain_table_and_versions_the_piped_ck_payload() {
             versioned.as_object_mut().unwrap().remove("schema"),
             Some(json!(schema))
         );
-        let legacy: Value = serde_json::from_slice(&ck.stdout).unwrap();
+        let mut legacy: Value = serde_json::from_slice(&ck.stdout).unwrap();
+        if args == ["module", "list"] {
+            // The two requests observe the daemon at different instants. Keep
+            // field names and kinds in the comparison, but not live counters.
+            for value in [&mut versioned, &mut legacy] {
+                for field in ["memory_bytes", "cpu_user_ms", "cpu_system_ms", "swap_bytes"] {
+                    if let Some(counter) = value["daemon"]["resources"].get_mut(field) {
+                        assert!(counter.is_u64(), "{field} must remain an unsigned counter");
+                        *counter = json!("<resource_counters>");
+                    }
+                }
+            }
+        }
         if args == ["activity"] {
             assert_eq!(versioned, json!({"entries": legacy}));
         } else {
@@ -593,6 +605,13 @@ async fn ckni_json_exemptions_keep_probes_and_action_acks_byte_identical() {
                             false,
                             SupervisorHealthStatus::Unknown,
                         )],
+                        daemon: Some(serde_json::from_value(json!({"pid": 123, "start_time_ms": 456,
+                            "version": "test-version", "resources": {"status": "measured", "cpu_user_ms": 10,
+                            "cpu_system_ms": 20, "memory_bytes": 30, "memory_kind": "resident_set"},
+                            "cpu_last_hour": {"cpu_ms": 40, "covered_ms": 60_000}})).unwrap()),
+                        agent_commands: Some(serde_json::from_value(json!([{"module_id": "alpha",
+                            "cpu_ms": 50, "memory_bytes": 60, "process_count": 1, "groups": [],
+                            "cpu_last_hour": {"cpu_ms": 70, "covered_ms": 60_000}}])).unwrap()),
                     },
                 )
             };
@@ -672,6 +691,8 @@ async fn ck_json_terminal_health_list_and_restart_are_exactly_piped_without_prog
                     false,
                     SupervisorHealthStatus::Unknown,
                 )],
+                daemon: None,
+                agent_commands: None,
             };
             match args.as_slice() {
                 ["health"] => vec![reply(
@@ -745,6 +766,8 @@ async fn ckni_json_log_follow_versions_each_initial_and_appended_line() {
             action: ScriptedControlAction::Reply(Box::new(ClientControlResponse::SupervisorList {
                 generation: 1,
                 modules: vec![scripted_supervisor_entry("alpha", None)],
+                daemon: None,
+                agent_commands: None,
             })),
         }],
     )
@@ -809,6 +832,8 @@ async fn ckni_json_empty_logs_are_arrays_and_unknown_modules_are_refused() {
                         } else {
                             vec![]
                         },
+                        daemon: None,
+                        agent_commands: None,
                     },
                 )),
             }],
@@ -4590,6 +4615,8 @@ async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts(
             action: ScriptedControlAction::Reply(Box::new(ClientControlResponse::SupervisorList {
                 generation: 1,
                 modules: vec![scripted_supervisor_entry(module_id, None)],
+                daemon: None,
+                agent_commands: None,
             })),
         }],
     )
@@ -4664,6 +4691,8 @@ async fn module_logs_orders_legacy_capture_head_before_stamped_tail() {
             action: ScriptedControlAction::Reply(Box::new(ClientControlResponse::SupervisorList {
                 generation: 1,
                 modules: vec![scripted_supervisor_entry(module_id, None)],
+                daemon: None,
+                agent_commands: None,
             })),
         }],
     )
@@ -4702,6 +4731,8 @@ async fn module_logs_empty_states_are_verbatim() {
             action: ScriptedControlAction::Reply(Box::new(ClientControlResponse::SupervisorList {
                 generation: 1,
                 modules: vec![scripted_supervisor_entry(known, None)],
+                daemon: None,
+                agent_commands: None,
             })),
         }],
     )
@@ -4723,6 +4754,8 @@ async fn module_logs_empty_states_are_verbatim() {
             action: ScriptedControlAction::Reply(Box::new(ClientControlResponse::SupervisorList {
                 generation: 1,
                 modules: Vec::new(),
+                daemon: None,
+                agent_commands: None,
             })),
         }],
     )
@@ -4781,7 +4814,7 @@ async fn module_list_json_uses_subc_override_and_shows_stub() {
         assert!(entry.get("launch_nonce_source").is_none());
     }
 
-    let text_output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
+    let text_output = module_list_with_image_verdict(&server, module_id).await;
     assert_exit(&text_output, 0);
     let text_stdout = text(&text_output.stdout);
     let expected_list = if cfg!(windows) {
@@ -4800,8 +4833,132 @@ async fn module_list_json_uses_subc_override_and_shows_stub() {
     module.stop().await.unwrap();
 }
 
+async fn module_list_with_image_verdict(server: &TestServer, module_id: &str) -> Output {
+    module_list_with_image_verdict_using(module_id, || {
+        ck_with_subc(&server.connection_file_path, ["module", "list"])
+    })
+    .await
+}
+
+async fn module_status_with_tree_using(mut read: impl FnMut() -> Output, json: bool) -> Output {
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    loop {
+        let output = read();
+        let stdout = text(&output.stdout);
+        // Each status reply has its own bounded read. A prior ready reply
+        // cannot make a later omitted measurement into a numeric zero.
+        let ready = if json {
+            serde_json::from_slice::<Value>(&output.stdout)
+                .ok()
+                .is_some_and(|value| {
+                    value
+                        .pointer("/module/tree/cpu_ms")
+                        .and_then(Value::as_u64)
+                        .is_some()
+                })
+        } else {
+            stdout
+                .lines()
+                .filter_map(|line| line.strip_prefix("  cpu including child processes: "))
+                .any(|reading| {
+                    reading
+                        .trim_start_matches('≥')
+                        .chars()
+                        .next()
+                        .is_some_and(|first| first.is_ascii_digit())
+                })
+                && stdout.lines().any(|line| {
+                    line.starts_with("  memory including child processes: ")
+                        && line.contains("[source: ")
+                })
+        };
+        if !output.status.success() || ready {
+            return output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "status tree stayed unavailable: {stdout}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn module_status_byte_fixture_waits_for_the_tree_in_its_own_reply() {
+    let status = ck_command().arg("--help").output().unwrap().status;
+    for (json,pending,ready) in [
+        (true,"{\"module\":{\"tree_unavailable\":\"tree_unavailable\"}}","{\"module\":{\"tree\":{\"cpu_ms\":0}}}"),
+        (false,"  cpu including child processes: not measured\n  memory including child processes: not measured\n","  cpu including child processes: ≥0 ms\n  memory including child processes: 1 MiB [source: process_tree]\n"),
+    ] {
+        let mut calls=0;
+        let output=module_status_with_tree_using(|| {calls+=1;Output {status,stdout:if calls==1 {pending.as_bytes().to_vec()} else {ready.as_bytes().to_vec()},stderr:Vec::new()}},json).await;
+        assert_eq!(calls,2,"the bytes being pinned need a measured tree, not an earlier RPC's promise");
+        assert_eq!(output.stdout,ready.as_bytes());
+    }
+}
+
+async fn module_list_with_image_verdict_using(
+    module_id: &str,
+    mut read: impl FnMut() -> Output,
+) -> Output {
+    let deadline = Instant::now() + SETUP_TIMEOUT;
+    loop {
+        let output = read();
+        let stdout = text(&output.stdout);
+        // A separate readiness RPC cannot guarantee that this fresh list gets
+        // its image work admitted before the optional diagnostics deadline.
+        // Wait only for a settled marker in the reply whose bytes are asserted.
+        let pending = stdout
+            .lines()
+            .find_map(|line| {
+                let mut columns = line.split_whitespace();
+                (columns.next() == Some(module_id)).then(|| columns.nth(2) == Some("unknown"))
+            })
+            .unwrap_or(false);
+        if !output.status.success() || !pending {
+            return output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "module list image verdict stayed pending: {stdout}"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn module_list_byte_fixture_waits_for_the_verdict_in_the_rendered_reply() {
+    let status = ck_command().arg("--help").output().unwrap().status;
+    assert!(status.success());
+    let ready = b"module  status   health    reload\ninsula  running  degraded  nothing\n";
+    let mut calls = 0;
+    let output = module_list_with_image_verdict_using("insula", || {
+        calls += 1;
+        Output {
+            status,
+            stdout: if calls == 1 {
+                b"module  status   health    reload\ninsula  running  degraded  unknown\n".to_vec()
+            } else {
+                ready.to_vec()
+            },
+            stderr: Vec::new(),
+        }
+    })
+    .await;
+    assert_eq!(
+        calls, 2,
+        "an earlier ready RPC cannot settle a later pending reply"
+    );
+    assert_eq!(output.stdout, ready);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_list_renders_status_words_not_wire_booleans() {
+    // A smoke check far above the 100 ms optional-work deadline, far below a
+    // multi-second stall. image_probe_stalled_reader_has_a_bounded_reply proves
+    // the bound; list_diagnostics_share_one_budget_and_skip_unready_readings
+    // pins its exact duration with an injected clock.
+    const STARTUP_LIST_ROUND_TRIP_LIMIT: Duration = Duration::from_secs(1);
     let server = TestServer::start().await;
     let supervisor = supervisor_with_fast_health(&server);
     let module = spawn_stub_with_env(
@@ -4814,6 +4971,39 @@ async fn module_list_renders_status_words_not_wire_booleans() {
         ],
     )
     .await;
+    let mut client = wait_for_client(&server.connection_file_path).await;
+    let mut response = tokio::time::timeout(
+        STARTUP_LIST_ROUND_TRIP_LIMIT,
+        control_rpc_on_stream(&mut client, 29_000, ClientControlRequest::SupervisorList {}),
+    )
+    .await
+    .expect("the first startup list must answer without waiting for a cold image hash");
+    let image_deadline = Instant::now() + SETUP_TIMEOUT;
+    let mut corr = 29_001;
+    loop {
+        let ClientControlResponse::SupervisorList { modules, .. } = response else {
+            panic!("unexpected startup list response: {response:?}");
+        };
+        let entry = modules
+            .iter()
+            .find(|entry| entry.module_id == "insula")
+            .expect("the startup list includes the module");
+        let image = serde_json::to_value(&entry.pending_reload).unwrap();
+        let ready = image.pointer("/image/status").and_then(Value::as_str) == Some("match")
+            || image.pointer("/image/reason").and_then(Value::as_str)
+                == Some("unsupported_platform");
+        if ready {
+            break;
+        }
+        assert!(
+            Instant::now() < image_deadline,
+            "startup image stayed unknown: {image}"
+        );
+        sleep(Duration::from_millis(20)).await;
+        response =
+            control_rpc_on_stream(&mut client, corr, ClientControlRequest::SupervisorList {}).await;
+        corr += 1;
+    }
     wait_for_health_status(
         &server.connection_file_path,
         "insula",
@@ -4821,7 +5011,7 @@ async fn module_list_renders_status_words_not_wire_booleans() {
     )
     .await;
 
-    let output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
+    let output = module_list_with_image_verdict(&server, "insula").await;
     assert_exit(&output, 0);
     let expected_list = if cfg!(windows) {
         "module  status   health    reload   nonce source\ninsula  running  degraded  nothing  pipe        \n"
@@ -5091,6 +5281,29 @@ async fn module_status_reports_launch_nonce_env_false() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_status_reports_stopped_tree_as_not_running_byte_for_byte() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor_with_fast_health(&server);
+    // A disabled module has no process to measure, which is distinct from a
+    // live module waiting for its first resource observation.
+    let _module = supervisor
+        .supervise_configured(stub_spec("first-tree"), false)
+        .unwrap();
+
+    let output = ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", "first-tree"],
+    );
+    assert_exit(&output, 0);
+    let rendered = text(&output.stdout);
+    let line = rendered
+        .split_inclusive('\n')
+        .find(|line| line.starts_with("  memory including child processes: "))
+        .expect("the first status includes the tree measurement line");
+    assert_eq!(line, "  memory including child processes: not running\n");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn module_status_renders_key_value_block_byte_for_byte() {
     let server = TestServer::start().await;
     let supervisor = supervisor_with_fast_health(&server);
@@ -5111,10 +5324,47 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     )
     .await;
 
-    let status_json = assert_json_success(ck_with_subc(
-        &server.connection_file_path,
-        ["module", "status", "aft", "--json"],
-    ));
+    let mut client = wait_for_client(&server.connection_file_path).await;
+    let ready_deadline = Instant::now() + SETUP_TIMEOUT;
+    let mut corr = 29_100;
+    loop {
+        let response =
+            control_rpc_on_stream(&mut client, corr, ClientControlRequest::SupervisorList {}).await;
+        let ClientControlResponse::SupervisorList { modules, .. } = response else {
+            panic!("unexpected status setup response: {response:?}");
+        };
+        let entry = modules
+            .iter()
+            .find(|entry| entry.module_id == "aft")
+            .unwrap();
+        let image = serde_json::to_value(&entry.pending_reload).unwrap();
+        let image_ready = image.pointer("/image/status").and_then(Value::as_str) == Some("match")
+            || image.pointer("/image/reason").and_then(Value::as_str)
+                == Some("unsupported_platform");
+        let resources = serde_json::to_value(&entry.resources).unwrap();
+        if entry.tree.is_some() && resources["status"] == "measured" && image_ready {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "the status fixture never obtained complete diagnostics: {entry:?}"
+        );
+        sleep(Duration::from_millis(20)).await;
+        corr += 1;
+    }
+
+    let status_json = assert_json_success(
+        module_status_with_tree_using(
+            || {
+                ck_with_subc(
+                    &server.connection_file_path,
+                    ["module", "status", "aft", "--json"],
+                )
+            },
+            true,
+        )
+        .await,
+    );
     assert_eq!(status_json["module"]["module_id"], "aft");
     assert_eq!(
         status_json["module"]["pending_reload"]["spec"]["status"],
@@ -5153,7 +5403,11 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
         status => format!("running image status {}", status.unwrap_or("unknown")),
     };
 
-    let output = ck_with_subc(&server.connection_file_path, ["module", "status", "aft"]);
+    let output = module_status_with_tree_using(
+        || ck_with_subc(&server.connection_file_path, ["module", "status", "aft"]),
+        false,
+    )
+    .await;
     assert_exit(&output, 0);
     // The age is computed twice from two clocks a few hundred milliseconds
     // apart, so on a slow runner `5s ago` becomes `6s ago` across the second
@@ -5202,31 +5456,32 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     } else {
         assert_eq!(resources, "unavailable (unsupported platform)");
     }
+    let (tree_cpu, rest) = rest
+        .strip_prefix("  cpu including child processes: ")
+        .expect("status labels cumulative tree CPU separately from own-process CPU")
+        .split_once('\n')
+        .expect("tree CPU is followed by the memory reading");
+    assert_eq!(
+        tree_cpu.starts_with('≥'),
+        status_json["module"]["tree"]["bound"] == "lower"
+    );
+    assert!(!tree_cpu.trim_start_matches('≥').is_empty());
     let (subtree, rest) = rest
         .strip_prefix("  memory including child processes: ")
         .expect("status labels memory including child processes separately")
         .split_once('\n')
         .expect("subtree reading is followed by more status");
-    if cfg!(windows) {
-        assert!(subtree.ends_with("[source: process_sum]"), "{subtree:?}");
-        assert!(subtree.contains(" processes"), "{subtree:?}");
-        assert!(
-            !subtree.contains("swap"),
-            "Windows does not report swap: {subtree:?}"
-        );
-        assert_eq!(status_json["module"]["subtree"]["source"], "process_sum");
-    } else {
-        let reason = if cfg!(target_os = "linux") {
-            "no_cgroup"
-        } else {
-            "unsupported_platform"
-        };
-        assert_eq!(
-            subtree,
-            format!("unavailable ({reason}) [source: unavailable]")
-        );
-        assert_eq!(status_json["module"]["subtree"]["reason"], reason);
-    }
+    let source = if cfg!(windows) { "job" } else { "process_tree" };
+    assert!(
+        subtree.ends_with(&format!("[source: {source}]")),
+        "{subtree:?}"
+    );
+    assert!(subtree.contains(" processes"), "{subtree:?}");
+    assert!(
+        !subtree.contains("swap"),
+        "tree readings report memory without process-only swap: {subtree:?}"
+    );
+    assert_eq!(status_json["module"]["tree"]["source"], source);
     let rest = format!("{policy}\n{rest}");
     // The budget renders with the window it is counted over (`in 10m`), because
     // the count alone reads as a lifetime total and stopped being one.
@@ -5437,6 +5692,8 @@ async fn module_start_stop_print_exact_drift_lines_and_preserve_matching_bytes()
                         modules: vec![entry
                             .clone()
                             .with_configured_enabled(configured_enabled.map(|value| !value))],
+                        daemon: None,
+                        agent_commands: None,
                     };
                     let unrelated = SupervisorEntry::new(
                         "another-module",
@@ -5453,6 +5710,8 @@ async fn module_start_stop_print_exact_drift_lines_and_preserve_matching_bytes()
                     let after = ClientControlResponse::SupervisorList {
                         generation: 1,
                         modules,
+                        daemon: None,
+                        agent_commands: None,
                     };
                     let daemon = ScriptedDaemon::start(
                         "ck-enabled-drift",
@@ -5539,6 +5798,8 @@ async fn mutating_timeout_exits_outcome_unknown_and_names_status_verification() 
                     ClientControlResponse::SupervisorList {
                         generation: 1,
                         modules: vec![scripted_supervisor_entry(module_id, Some(0))],
+                        daemon: None,
+                        agent_commands: None,
                     },
                 )),
             },

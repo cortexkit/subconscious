@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.30
+
+- Reject partial Toolhelp enumerations on Windows and failed Mach timebase reads on macOS instead of reporting successful but incorrect resources. Native macOS coverage verifies that an unreaped zombie is excluded without poisoning an unrelated tree.
+- Read a protected macOS process's current parent through its validated sysctl record when BSD process info is denied, so unrelated protected processes do not make every module tree unavailable.
+- Fence complete process walks against exits during resource reads, expose ordered walk revisions and separate identity uncertainty from confirmed exit. Structural tree ownership remains queryable when only a resource counter is unavailable.
+- Keep own and reaped-child CPU from the same native snapshot separate for membership-aware accounting. Unreadable members and unresolved related identities invalidate a tree instead of silently producing a partial sum.
+
+- Convert Linux process start times against the current boot-time value so clock steps do not split SDK and daemon identities. Windows snapshots now retain pinned process handles, and a pinned process can report its final CPU after exit.
+- Add read-only process-tree CPU/memory snapshots with Unix reaped-child and session accounting, program groups, PID-reuse checks, and a shared Unix-epoch millisecond process start-time helper.
+
 ## 0.1.29
 
 - Add a CLOEXEC pre-exec admission gate with bounded parent-side PID readiness,

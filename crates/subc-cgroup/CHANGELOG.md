@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.10
+
+- Read cumulative cpu.stat usage and recursive live cgroup membership without changing or freezing the cgroup.
+
 ## 0.1.9
 
 - Add non-creating recorded-path lookup, removal, cgroup-tree kill and async/blocking

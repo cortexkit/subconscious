@@ -6684,6 +6684,10 @@ fn print_status_table(
     }
     println!("  resources: {}", format_child_resources(module));
     println!(
+        "  cpu including child processes: {}",
+        format_tree_cpu(module)
+    );
+    println!(
         "  memory including child processes: {}",
         format_subtree_memory(module)
     );
@@ -7142,9 +7146,33 @@ fn format_child_resources(module: &Value) -> String {
     }
 }
 
+fn tree_resource_unavailable(module: &Value) -> &'static str {
+    match module.get("tree_unavailable").and_then(Value::as_str) {
+        Some("not_running") => "not running",
+        Some("not_yet_measured") => "not measured yet",
+        Some(_) => "not measured",
+        None => "not reported by this daemon",
+    }
+}
+
+fn format_tree_cpu(module: &Value) -> String {
+    let Some(reading) = module.get("tree") else {
+        return tree_resource_unavailable(module).into();
+    };
+    let Some(cpu) = reading.get("cpu_ms").and_then(Value::as_u64) else {
+        return "unknown".into();
+    };
+    let cpu = format_cpu_time(cpu);
+    match reading.get("bound").and_then(Value::as_str) {
+        None => cpu,
+        Some("lower") => format!("≥{cpu}"),
+        Some(other) => format!("{cpu} (unknown bound: {})", terminal_safe_string(other)),
+    }
+}
+
 fn format_subtree_memory(module: &Value) -> String {
-    let Some(reading) = module.get("subtree") else {
-        return "not reported by this daemon".into();
+    let Some(reading) = module.get("tree") else {
+        return tree_resource_unavailable(module).into();
     };
     let source = reading
         .get("source")
@@ -10268,26 +10296,79 @@ mod tests {
     }
 
     #[test]
+    fn tree_cpu_labels_only_cpu_lower_bounds_and_never_invents_missing_measurements() {
+        let mut module = serde_json::json!({
+            "tree": {"source":"process_tree", "cpu_ms":12_400, "bound":"lower", "memory_bytes":2_097_152,"process_count":1},
+            "resources":{"status":"measured","memory_bytes":2_097_152,"memory_kind":"resident_set","cpu_user_ms":1_000,"cpu_system_ms":0}
+        });
+        assert_eq!(format_tree_cpu(&module), "≥12.4s");
+        assert_eq!(
+            format_subtree_memory(&module),
+            "2.0 MiB · 1 processes [source: process_tree]"
+        );
+        assert!(!format_child_resources(&module).contains('≥'));
+        module["tree"].as_object_mut().unwrap().remove("bound");
+        assert_eq!(format_tree_cpu(&module), "12.4s");
+        module["tree"]["bound"] = serde_json::json!("future_bound");
+        assert_eq!(
+            format_tree_cpu(&module),
+            "12.4s (unknown bound: future_bound)"
+        );
+        assert_eq!(
+            format_tree_cpu(&serde_json::json!({"tree":{"bound":"lower"}})),
+            "unknown"
+        );
+        assert_eq!(
+            format_tree_cpu(&serde_json::json!({"tree_unavailable":"not_yet_measured"})),
+            "not measured yet"
+        );
+        assert_eq!(
+            format_tree_cpu(&serde_json::json!({"tree_unavailable":"not_running"})),
+            "not running"
+        );
+        assert_eq!(
+            format_tree_cpu(&serde_json::json!({})),
+            "not reported by this daemon"
+        );
+    }
+
+    #[test]
     fn subtree_memory_status_labels_source_and_counts_children() {
-        let module = serde_json::json!({"subtree": {
-            "source": "process_sum", "memory_bytes": 2_097_152,
+        let module = serde_json::json!({"tree": {
+            "source": "process_tree", "memory_bytes": 2_097_152,
             "swap_bytes": 1024, "process_count": 35
         }});
         assert_eq!(
             format_subtree_memory(&module),
-            "2.0 MiB, swap 1.0 KiB · 35 processes [source: process_sum]"
+            "2.0 MiB, swap 1.0 KiB · 35 processes [source: process_tree]"
         );
         assert_eq!(
             format_subtree_memory(
-                &serde_json::json!({"subtree": {"source":"unavailable","reason":"timeout"}})
+                &serde_json::json!({"tree": {"source":"unavailable","reason":"timeout"}})
             ),
             "unavailable (timeout) [source: unavailable]"
         );
         assert_eq!(
-            format_subtree_memory(&serde_json::json!({"subtree": {
+            format_subtree_memory(&serde_json::json!({"tree": {
                 "source":"unavailable", "reason":"timeout", "process_count":35
             }})),
             "unavailable (timeout) · 35 processes [source: unavailable]"
+        );
+        assert_eq!(
+            format_subtree_memory(&serde_json::json!({})),
+            "not reported by this daemon"
+        );
+    }
+
+    #[test]
+    fn subtree_memory_distinguishes_first_measurement_from_absent_support() {
+        assert_eq!(
+            format_subtree_memory(&serde_json::json!({"tree_unavailable":"not_yet_measured"})),
+            "not measured yet"
+        );
+        assert_eq!(
+            format_subtree_memory(&serde_json::json!({"tree_unavailable":"future_reason"})),
+            "not measured"
         );
         assert_eq!(
             format_subtree_memory(&serde_json::json!({})),

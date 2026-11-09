@@ -737,6 +737,8 @@ pub struct CatalogList {
 pub struct SupervisorListResponse {
     pub generation: u64,
     pub modules: Vec<SupervisorEntry>,
+    pub daemon: Option<subc_control::DaemonResources>,
+    pub agent_commands: Option<Vec<subc_control::AgentCommandResources>>,
 }
 
 /// A provider-originated push delivered on one live route.
@@ -1765,6 +1767,8 @@ impl SubcConsumer {
                     let ClientControlResponse::SupervisorList {
                         generation,
                         modules,
+                        daemon,
+                        agent_commands,
                     } = response
                     else {
                         return Err(CallError::invalid_response(
@@ -1774,6 +1778,8 @@ impl SubcConsumer {
                     return Ok(SupervisorListResponse {
                         generation,
                         modules,
+                        daemon,
+                        agent_commands,
                     });
                 }
                 Ok(TerminalFrame::Error { body, .. }) => return Err(CallError::Module(body)),

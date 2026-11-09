@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0
+
+- Raise dependency floors for the resource-accounting wire release; the public dependency types require a breaking minor version.
+
 ## 0.2.1
 
 - Adopt compatible dependency requirements for the updated route-open control types; no behavior change.

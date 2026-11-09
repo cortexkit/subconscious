@@ -103,8 +103,33 @@ pub(crate) fn start_time_from_stat(stat: &str) -> Option<u64> {
 /// when the kernel reports it. Both files cover the process itself: threads
 /// are included, children are not.
 pub(crate) fn resource_usage(pid: u32) -> Option<ResourceUsage> {
+    resource_usage_with_children(pid, false)
+}
+
+pub(crate) fn resource_usage_with_children(pid: u32, children: bool) -> Option<ResourceUsage> {
+    let (mut usage, child_user, child_system) = resource_usage_parts(pid)?;
+    if children {
+        usage.cpu_user += child_user;
+        usage.cpu_system += child_system;
+    }
+    Some(usage)
+}
+
+pub(crate) fn resource_usage_parts(
+    pid: u32,
+) -> Option<(ResourceUsage, std::time::Duration, std::time::Duration)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (user_ticks, system_ticks) = cpu_ticks_from_stat(&stat)?;
+    let fields: Vec<_> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    let child = |index: usize| {
+        fields
+            .get(index)?
+            .parse::<i64>()
+            .ok()
+            .map(|n| n.max(0) as u64)
+    };
+    let child_user = child(13)?;
+    let child_system = child(14)?;
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let (memory_bytes, swap_bytes) = memory_from_status(&status)?;
     let ticks_per_second = rustix::param::clock_ticks_per_second().max(1);
@@ -112,13 +137,17 @@ pub(crate) fn resource_usage(pid: u32) -> Option<ResourceUsage> {
         let nanos = u128::from(count) * 1_000_000_000 / u128::from(ticks_per_second);
         std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
     };
-    Some(ResourceUsage {
-        memory_bytes,
-        memory_kind: MemoryKind::ResidentSet,
-        swap_bytes,
-        cpu_user: ticks(user_ticks),
-        cpu_system: ticks(system_ticks),
-    })
+    Some((
+        ResourceUsage {
+            memory_bytes,
+            memory_kind: MemoryKind::ResidentSet,
+            swap_bytes,
+            cpu_user: ticks(user_ticks),
+            cpu_system: ticks(system_ticks),
+        },
+        ticks(child_user),
+        ticks(child_system),
+    ))
 }
 
 /// `utime` and `stime` of `/proc/<pid>/stat`, or `None` for a zombie or a

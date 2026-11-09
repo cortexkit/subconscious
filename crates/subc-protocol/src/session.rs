@@ -173,6 +173,7 @@ pub enum ModuleControlResponse {
 /// are sent by an already-registered module to subc on a `REQUEST` frame.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op")]
+#[non_exhaustive]
 pub enum ModuleControlRequestFromModule {
     #[serde(rename = "catalog.update")]
     CatalogUpdate {
@@ -191,6 +192,17 @@ pub enum ModuleControlRequestFromModule {
     },
     #[serde(rename = "supervisor.live_roots")]
     LiveRoots {},
+    /// Attribute agent-requested command roots to the declaring module.
+    /// Only the module's supervised connection may send this operation.
+    /// `known`, when present, replaces its complete live root set. The reply
+    /// is an empty object; invalid roots are ignored independently.
+    #[serde(rename = "supervisor.agent_commands")]
+    AgentCommands {
+        started: Vec<AgentCommandRoot>,
+        finished: Vec<AgentCommandFinished>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        known: Option<Vec<AgentCommandRoot>>,
+    },
     /// Register this module's full scope set. The owner is the module whose
     /// registered connection sends it; nothing in the body names the owner.
     /// Per-record refusals come back in the reply; a refusal of the whole sync
@@ -218,6 +230,23 @@ pub enum ModuleControlRequestFromModule {
         #[serde(rename = "ref")]
         scope_ref: String,
     },
+}
+
+/// A command's PID and kernel start time in milliseconds since the Unix epoch.
+/// Obtain the time through `subc_os::process_start_time_ms`, not a wall clock.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AgentCommandRoot {
+    pub pid: u32,
+    pub start_time_ms: u64,
+}
+
+/// A completed declared root. CPU includes reaped descendants where available.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentCommandFinished {
+    pub pid: u32,
+    pub start_time_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ms: Option<u64>,
 }
 
 /// Counts of routes for one canonical project root.
@@ -650,5 +679,53 @@ mod tests {
         );
         let decoded: ModuleControlRequest = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, present);
+    }
+}
+
+#[cfg(test)]
+mod agent_command_tests {
+    use super::*;
+
+    #[test]
+    fn agent_commands_round_trip_start_finish_and_known_snapshot() {
+        let root = AgentCommandRoot {
+            pid: 42,
+            start_time_ms: 1_700_000_000_123,
+        };
+        let request = ModuleControlRequestFromModule::AgentCommands {
+            started: vec![root],
+            finished: vec![AgentCommandFinished {
+                pid: 43,
+                start_time_ms: root.start_time_ms,
+                cpu_ms: Some(100),
+            }],
+            known: Some(vec![root]),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"op":"supervisor.agent_commands",
+            "started":[{"pid":42,"start_time_ms":1_700_000_000_123_u64}],
+            "finished":[{"pid":43,"start_time_ms":1_700_000_000_123_u64,"cpu_ms":100}],
+            "known":[{"pid":42,"start_time_ms":1_700_000_000_123_u64}]})
+        );
+        assert_eq!(
+            serde_json::from_value::<ModuleControlRequestFromModule>(value).unwrap(),
+            request
+        );
+        let absent = ModuleControlRequestFromModule::AgentCommands {
+            started: Vec::new(),
+            finished: vec![AgentCommandFinished {
+                pid: 1,
+                start_time_ms: 2,
+                cpu_ms: None,
+            }],
+            known: None,
+        };
+        assert_eq!(
+            serde_json::to_value(absent).unwrap(),
+            serde_json::json!({"op":"supervisor.agent_commands",
+            "started":[],"finished":[{"pid":1,"start_time_ms":2}]})
+        );
     }
 }

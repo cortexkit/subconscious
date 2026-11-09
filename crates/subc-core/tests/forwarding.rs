@@ -2004,6 +2004,7 @@ async fn supervisor_list_enumerates_supervised_modules() {
         ClientControlResponse::SupervisorList {
             generation,
             modules,
+            ..
         } => {
             assert_eq!(generation, server.registry.generation().unwrap());
             let entry = modules

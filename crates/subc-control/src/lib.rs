@@ -90,6 +90,8 @@ pub use connection_describe::*;
 
 mod subtree;
 pub use subtree::*;
+mod tree;
+pub use tree::*;
 
 /// Daemon-spawned consumer identity presented on route.open.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -508,6 +510,10 @@ pub enum ClientControlResponse {
     SupervisorList {
         generation: u64,
         modules: Vec<SupervisorEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon: Option<DaemonResources>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_commands: Option<Vec<AgentCommandResources>>,
     },
     #[serde(rename = "supervisor.spawn_snapshot")]
     SupervisorSpawnSnapshot {
@@ -902,6 +908,7 @@ open_string_enum! {
     /// Reasons why an executable identity could not be observed.
     RunningImageUnavailableReason {
         NotRunning => "not_running",
+        NotYetMeasured => "not_yet_measured",
         UnsupportedPlatform => "unsupported_platform",
         RunningExecutableUnreadable => "running_executable_unreadable",
         RunningExecutablePermissionDenied => "running_executable_permission_denied",
@@ -2547,10 +2554,17 @@ pub struct SupervisorEntry {
     /// mistaken for a process using nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ChildResourceUsage>,
-    /// Memory including child processes, with its measurement source. Report
-    /// only; absence means the daemon does not report one.
+    /// Cumulative CPU and current memory including child processes, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtree: Option<SubtreeReading>,
+    pub tree: Option<TreeReading>,
+    /// Why this reporting daemon has no tree reading for this response.
+    /// `not_yet_measured` means no measurement is available; other snake_case
+    /// reasons may be added. Absence alone does not establish tree support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_unavailable: Option<String>,
+    /// CPU used across the wall-clock interval covered by retained samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_last_hour: Option<CpuLastHour>,
 }
 
 impl SupervisorEntry {
@@ -2597,7 +2611,9 @@ impl SupervisorEntry {
             restart_backoff_ms: None,
             restart_max_backoff_ms: None,
             resources: None,
-            subtree: None,
+            tree: None,
+            tree_unavailable: None,
+            cpu_last_hour: None,
         }
     }
 
@@ -2740,8 +2756,15 @@ impl SupervisorEntry {
 
     /// Attach a report-only reading covering the module's process container.
     #[must_use]
-    pub fn with_subtree(mut self, subtree: Option<SubtreeReading>) -> Self {
-        self.subtree = subtree;
+    pub fn with_tree(mut self, tree: Option<TreeReading>) -> Self {
+        self.tree = tree;
+        self
+    }
+
+    /// Explain an absent tree reading without manufacturing numeric counters.
+    #[must_use]
+    pub fn with_tree_unavailable(mut self, reason: Option<String>) -> Self {
+        self.tree_unavailable = reason;
         self
     }
 }

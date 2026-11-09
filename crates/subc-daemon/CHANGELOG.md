@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.42.0
+
+- Preserve hourly uncertainty when the last inherited command finishes or is swept after a restart. On Windows, keep the first validation pass's per-process finish counters across declaration retries; later attempts cannot attribute additional CPU, while independent live sampler credit stays monotone. Stopped commands report no live program groups.
+- Derive hourly CPU bounds from uncertainty retained on the same samples as the hour figure, including across clock corrections and source changes. Omit agents rows for modules with no declarations or command history, while keeping inherited active commands and current-hour CPU visible.
+- On Windows, freeze live command attribution at the finish/replacement snapshot and leave later work module-side. Limit saved identities for roots omitted by a replacement, and do not remove them using process walks begun before declaration acceptance. Match resumed roots to their validated native identity, and reject oversized batches before loss tracking. Share declaration refusal retry classes with the SDK.
+
+- When missing command identities exceed the bounded tracking set, keep agents' hourly CPU marked as a lower bound for a full hour after that overflow and until a complete validated resync. A partial resync keeps missing live commands marked as gaps in CPU attribution. Return retryable `agent_roots_full` at the live-root cap, show rows with a zero CPU lower bound, and deliver duplicate/closed-queue refusals without blocking the shared connection reader.
+- Age attribution metadata with the suspend-inclusive monotonic clock and report separate, expiring hourly CPU bounds while retaining cumulative loss markers. Validate native Windows totals against raw per-identity reader inputs rather than derived accounting counters.
+
+- Order finished-CPU transfers by monotonic observation sequence and check both rows before reclassification, so clock corrections and tied timestamps cannot panic accounting or lose CPU. Protect first-seen module-owned work and cap finish eligibility at its first validation or confirmed-exit observation; consume eligible reaped work oldest first.
+- Preserve missing-command coverage after refused or timed-out declarations, with bounded per-identity diagnostics and replay recovery. Keep list refusals off the connection reader when its reply queue is full, cap registered-module refusal labels, and retain lower bounds after lost Windows final counters. Verify list and status decoding against the published control crate.
+- Bound Unix finished-command claims by daemon-observed reaped CPU and the module CPU measured since the command was accepted; reclassify the original sampled minutes without changing the total measured CPU. Missing final command CPU keeps the reported totals lower bounds. Declaration and list admission now refuse excess work immediately instead of parking readers, and stalled reply sends expire.
+- Keep refusal delivery off the shared module reader even when its writer is full; bound the fallback queue and expose dropped refusals per module in `server.describe` counters. Replayed command identities remain idempotent.
+- Account for declared command CPU prospectively from its first successful measurement, retaining monotone lifetime rows and Unix CPU lower bounds that retain observed exited work without counting it again when a parent reaps it. Serialize declarations with four in-flight replies per connection; timeout cancellation and accounting commit share one atomic decision.
+- Restrict command resynchronization to previously accepted identities in the current launch or its carried container. Distinguish pending observations from stopped processes and real image-hash failures; keep required resource numbers strict while allowing optional diagnostics to be omitted.
+
+- Identify unavailable tree measurements with the additive `tree_unavailable: "not_yet_measured"` reason instead of making a startup read look like an older daemon without tree support. Measured tree counters remain absent until a safe reading is available.
+- Bound optional `supervisor.list` diagnostics to one 100 ms budget and prioritize per-process resource readings and completed image observations over process-table walks. `ck module list` can briefly show an unknown image status immediately after a start while the bounded background hash finishes. Explicit provenance requests still wait for their complete image observation.
+- Bound agent-command validation away from connection readers, reject oversized batches and overlapping command roots, and recheck the declaring launch before committing. Unknown or contended resource reads no longer erase attribution facts or claim an empty agents row.
+- Expire launch-scoped command state and ten-minute tombstones without requiring a successful process-table read. Keep bounded hourly histories and settled totals through restarts, and key carried-container accounting to the actual cgroup or job rather than its path or process launch.
+- Preserve CPU high-water marks through partial reads and expire stopped histories by wall time. Limit CPU transferred from a module to its agents to work already measured inside that module, preserving cumulative and hourly totals; finish reports cannot inflate daemon-confirmed CPU. Windows in-job commands retain exited-descendant CPU and settle the pinned root's final counter without double counting it.
+- Report the configured daemon version consistently with the handshake and server description.
+- Preserve readable cgroup/job totals even when no live process remains, and use container membership for process counts.
+- Account for complete module trees and separately declared agent commands, cache process-table reads, report daemon resources, and retain 60 minutes of sampled CPU. Finished commands are debited once from their originating module. Windows command trees keep the CPU of members that have already exited, as last sampled. Adopt the breaking `ModuleControlRequestFromModule::AgentCommands` request variant and the optional supervisor resource fields.
+
 ## 0.41.2
 
 - Refuse HELLO manifests with invalid `display_name` as malformed manifests and mirror accepted names in `catalog.list`. Require protocol 0.34.5 and control 0.35.1.
@@ -714,3 +739,7 @@
 - `route.open` checks `role_versions` with `subc_protocol::session::validate_role_versions` before anything else. A malformed map is refused as terminal `invalid_request` with `detail.field = "role_versions"`, and the module never sees a bind. An empty map becomes no field. A well-formed map is forwarded unchanged on the module's `route.bind`.
 - `route-role-versions/v1` is advertised in HELLO_ACK and `server.describe`.
 - The route.open refusal counter gains the `invalid_request` key.
+
+## Unreleased
+
+- Bound running-image probes and share a short deadline across list diagnostics, returning unknown resource readings instead of delaying control replies.

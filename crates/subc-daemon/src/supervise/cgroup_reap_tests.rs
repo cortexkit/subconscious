@@ -381,3 +381,67 @@ async fn scratch_reaped_cgroup_empty_skips_freeze_and_kill() {
     );
     assert_eq!(fs::read(module.join("cgroup.kill")).unwrap(), b"unchanged");
 }
+
+#[tokio::test]
+async fn linux_cgroup_cpu_survives_child_reap() {
+    let Some(kernel) = KernelCgroup::new("cpu-reap") else {
+        return;
+    };
+    let dir = ScratchDir::new("cgroup-cpu-reap");
+    let script = r#"
+        (while [ ! -f "$1/reap" ]; do sleep 0.01; done; echo exit) |
+          SUBC_RESOURCE_COMMAND_FIXTURE=1 "$2" --exact resource_totals::tests::resource_command_fixture --nocapture > "$1/child.out" &
+        command=$!
+        echo "$command" > "$1/child.pid"
+        wait "$command"
+        touch "$1/reaped"
+        while [ ! -f "$1/finish" ]; do sleep 0.01; done
+    "#;
+    let mut child = spawn_module(
+        kernel.placement.clone(),
+        &dir,
+        vec![
+            "-c".into(),
+            script.into(),
+            "fixture".into(),
+            dir.display().to_string(),
+            std::env::current_exe().unwrap().display().to_string(),
+        ],
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !fs::read_to_string(dir.join("child.out")).is_ok_and(|s| s.contains("RESOURCE_READY")) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "CPU child never became ready"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pid: u32 = fs::read_to_string(dir.join("child.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let usage = subc_os::resource_usage(pid).unwrap();
+    let child_cpu = (usage.cpu_user + usage.cpu_system).as_millis() as u64;
+    assert!(child_cpu >= 100);
+    let group = kernel.module_cgroups().pop().unwrap();
+    let before = subc_cgroup::read_cpu_ms(&group).unwrap();
+    assert!(before >= child_cpu);
+    fs::write(dir.join("reap"), "").unwrap();
+    while !dir.join("reaped").exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "CPU child was not reaped"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let after = subc_cgroup::read_cpu_ms(&group).unwrap();
+    fs::write(dir.join("finish"), "").unwrap();
+    child.wait().await.unwrap();
+    assert!(
+        after >= before,
+        "cgroup CPU dropped across reap: {before} -> {after}"
+    );
+    assert!(after >= child_cpu);
+    eprintln!("EXECUTED linux_cgroup_cpu_survives_child_reap: {before} -> {after}");
+}

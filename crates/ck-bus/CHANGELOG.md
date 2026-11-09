@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.6
+
+- Raise dependency floors for the resource-accounting wire release.
+
 ## 0.5.5
 
 - Adopt cortexkit-bus-naming 0.3.2, replacing the routing change in 0.5.4,

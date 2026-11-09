@@ -89,14 +89,22 @@ mod tests {
     }
 
     #[test]
-    fn older_entry_decoder_ignores_subtree() {
+    fn older_entry_decoder_ignores_tree() {
         #[derive(serde::Deserialize)]
         struct LegacyEntry {
             module_id: String,
         }
         let entry =
             SupervisorEntry::new("m", "running", true, true, SupervisorHealthStatus::Unknown)
-                .with_subtree(Some(SubtreeReading::process_sum(4096, None, 3)));
+                .with_tree(Some(crate::TreeReading {
+                    bound: None,
+                    cpu_ms: 1,
+                    memory_bytes: 4096,
+                    memory_kind: crate::ChildMemoryKind::ResidentSet,
+                    process_count: 3,
+                    source: crate::TreeSource::ProcessTree,
+                    groups: Vec::new(),
+                }));
         let bytes = serde_json::to_vec(&entry).unwrap();
         let old: LegacyEntry = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(old.module_id, "m");

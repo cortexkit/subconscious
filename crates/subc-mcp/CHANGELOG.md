@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.59
+
+- Raise dependency floors for the resource-accounting wire release.
+
 ## 0.1.58
 
 - Move the subc-daemon dev-dependency requirement to 0.40.0; no behavior change for the binary.

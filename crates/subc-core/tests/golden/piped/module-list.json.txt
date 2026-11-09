@@ -2,6 +2,20 @@ $ ck --subc <connection file> --json module list
 exit: Some(0)
 --- stdout ---
 {
+  "agent_commands": [],
+  "daemon": {
+    "pid": "<pids>",
+    "resources": {
+      "cpu_system_ms": "<resource_counters>",
+      "cpu_user_ms": "<resource_counters>",
+      "memory_bytes": "<resource_counters>",
+      "memory_kind": "resident_set",
+      "status": "measured",
+      "swap_bytes": "<resource_counters>"
+    },
+    "start_time_ms": "<timestamps>",
+    "version": "<daemon_resource_versions>"
+  },
   "generation": 1,
   "modules": [
     {
@@ -45,9 +59,22 @@ exit: Some(0)
       "restart_window_secs": 600,
       "spawn_generation": 1,
       "state": "running",
-      "subtree": {
-        "reason": "no_cgroup",
-        "source": "unavailable"
+      "tree": {
+        "bound": "lower",
+        "cpu_ms": "<resource_counters>",
+        "groups": [
+          {
+            "bound": "lower",
+            "count": 1,
+            "cpu_ms": "<resource_counters>",
+            "memory_bytes": "<resource_counters>",
+            "name": "fake-aft-stub"
+          }
+        ],
+        "memory_bytes": "<resource_counters>",
+        "memory_kind": "resident_set",
+        "process_count": 1,
+        "source": "process_tree"
       }
     }
   ],

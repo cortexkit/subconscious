@@ -1,6 +1,7 @@
 //! macOS process identity through `sysctl(KERN_PROC_PID)` and `proc_pidpath`,
 //! and resource usage through `proc_pid_rusage` and `mach_timebase_info`.
-//! Parent pids come from `proc_pidinfo(PROC_PIDTBSDINFO)`.
+//! Parent pids come from `proc_pidinfo(PROC_PIDTBSDINFO)`, falling back to
+//! the current parent in `sysctl(KERN_PROC_PID)` for protected processes.
 
 use std::{
     ffi::{c_int, c_void, OsStr},
@@ -29,6 +30,9 @@ const P_STAT_OFFSET: usize = 36;
 /// `kp_proc.p_pid` (a `pid_t`), checked against the requested pid so a layout
 /// change is caught instead of read as some other process's start time.
 const P_PID_OFFSET: usize = 40;
+/// `kp_eproc.e_ppid` (a `pid_t`): the current parent, not `p_oppid`'s saved
+/// original parent. The 64-bit Apple SDK places it at 560 in the 648-byte record.
+const PARENT_PID_OFFSET: usize = 560;
 /// `SZOMB`: exited, waiting for its parent to reap it.
 const SZOMB: u8 = 5;
 
@@ -69,6 +73,28 @@ pub(crate) fn exists(pid: u32) -> bool {
 }
 
 pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
+    parent_pid_using(pid, bsd_parent_pid)
+}
+
+fn parent_pid_using(pid: u32, bsd_parent: impl FnOnce(u32) -> Option<u32>) -> Option<u32> {
+    bsd_parent(pid).or_else(|| {
+        // Protected system processes can refuse proc_pidinfo while exposing
+        // their ordinary sysctl identity. Resolve their parent rather than
+        // making every unrelated process tree structurally unknown.
+        let info = kinfo_proc(pid)?;
+        if info.0[P_STAT_OFFSET] == SZOMB {
+            return None;
+        }
+        let parent = i32::from_ne_bytes(
+            info.0[PARENT_PID_OFFSET..PARENT_PID_OFFSET + 4]
+                .try_into()
+                .ok()?,
+        );
+        u32::try_from(parent).ok()
+    })
+}
+
+fn bsd_parent_pid(pid: u32) -> Option<u32> {
     let pid = c_int::try_from(pid).ok()?;
     // SAFETY: proc_bsdinfo is a C output structure; all-zero bytes are valid.
     #[allow(unsafe_code)]
@@ -166,6 +192,21 @@ pub(crate) fn executable_identity(pid: u32) -> Option<FileIdentity> {
 /// allocator has released with `MADV_FREE` until the kernel reclaims them, so
 /// it overstates a long-lived process that allocates and frees heavily.
 pub(crate) fn resource_usage(pid: u32) -> Option<ResourceUsage> {
+    resource_usage_with_children(pid, false)
+}
+
+pub(crate) fn resource_usage_with_children(pid: u32, children: bool) -> Option<ResourceUsage> {
+    let (mut usage, child_user, child_system) = resource_usage_parts(pid)?;
+    if children {
+        usage.cpu_user += child_user;
+        usage.cpu_system += child_system;
+    }
+    Some(usage)
+}
+
+pub(crate) fn resource_usage_parts(
+    pid: u32,
+) -> Option<(ResourceUsage, std::time::Duration, std::time::Duration)> {
     let raw_pid = c_int::try_from(pid).ok()?;
     let mut info = libc::rusage_info_v2 {
         ri_uuid: [0; 16],
@@ -209,33 +250,41 @@ pub(crate) fn resource_usage(pid: u32) -> Option<ResourceUsage> {
     // after the read so a process that exits in between is not reported as
     // running.
     start_time(pid)?;
-    Some(ResourceUsage {
-        memory_bytes: info.ri_phys_footprint,
-        memory_kind: MemoryKind::PhysFootprint,
-        swap_bytes: None,
-        cpu_user: mach_ticks_to_duration(info.ri_user_time),
-        cpu_system: mach_ticks_to_duration(info.ri_system_time),
-    })
+    Some((
+        ResourceUsage {
+            memory_bytes: info.ri_phys_footprint,
+            memory_kind: MemoryKind::PhysFootprint,
+            swap_bytes: None,
+            cpu_user: mach_ticks_to_duration(info.ri_user_time)?,
+            cpu_system: mach_ticks_to_duration(info.ri_system_time)?,
+        },
+        mach_ticks_to_duration(info.ri_child_user_time)?,
+        mach_ticks_to_duration(info.ri_child_system_time)?,
+    ))
 }
 
 /// `ri_user_time` and `ri_system_time` count Mach absolute-time ticks, not
 /// nanoseconds. The two are the same on Intel Macs, but on Apple silicon a
 /// tick is 125/3 ns, so an unconverted value would read about 24 times low.
-fn mach_ticks_to_duration(ticks: u64) -> Duration {
-    let (numer, denom) = mach_timebase();
-    let nanos = u128::from(ticks) * u128::from(numer) / u128::from(denom.max(1));
-    Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+fn mach_ticks_to_duration(ticks: u64) -> Option<Duration> {
+    let (numer, denom) = mach_timebase()?;
+    let nanos = u128::from(ticks) * u128::from(numer) / u128::from(denom);
+    Some(Duration::from_nanos(
+        u64::try_from(nanos).unwrap_or(u64::MAX),
+    ))
 }
 
 /// The tick-to-nanosecond ratio, fixed for the life of the system, so it is
-/// read once. If the call fails the ratio falls back to 1/1, the Intel value.
+/// cached only after a successful nonzero ratio. A failed read stays unknown
+/// and can be retried; it must not silently use a 1:1 tick-to-nanosecond
+/// ratio on machines whose clocks use different units.
 ///
 /// libc marks its Mach bindings deprecated in favour of the `mach2` crate;
 /// this one struct and function do not justify a new dependency.
 #[allow(deprecated)]
-fn mach_timebase() -> (u32, u32) {
+fn mach_timebase() -> Option<(u32, u32)> {
     static TIMEBASE: OnceLock<(u32, u32)> = OnceLock::new();
-    *TIMEBASE.get_or_init(|| {
+    timebase_using(&TIMEBASE, || {
         let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
         // SAFETY: `info` is a live, writable `mach_timebase_info` struct, the
         // only thing the call writes to. It returns KERN_SUCCESS (0) on
@@ -243,11 +292,42 @@ fn mach_timebase() -> (u32, u32) {
         #[allow(unsafe_code)]
         let result = unsafe { libc::mach_timebase_info(&mut info) };
         if result == 0 && info.numer != 0 && info.denom != 0 {
-            (info.numer, info.denom)
+            Some((info.numer, info.denom))
         } else {
-            (1, 1)
+            None
         }
     })
+}
+
+fn timebase_using(
+    cache: &OnceLock<(u32, u32)>,
+    read: impl FnOnce() -> Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    if let Some(ratio) = cache.get() {
+        return Some(*ratio);
+    }
+    let ratio = read().filter(|(numer, denom)| *numer != 0 && *denom != 0)?;
+    let _ = cache.set(ratio);
+    cache.get().copied()
+}
+
+#[cfg(test)]
+mod timebase_tests {
+    #[test]
+    fn a_failed_timebase_is_unknown_and_not_cached_as_intel_units() {
+        let cache = std::sync::OnceLock::new();
+        assert_eq!(super::timebase_using(&cache, || None), None);
+        assert!(cache.get().is_none());
+        assert_eq!(super::timebase_using(&cache, || Some((125, 0))), None);
+        assert_eq!(
+            super::timebase_using(&cache, || Some((125, 3))),
+            Some((125, 3))
+        );
+        assert_eq!(
+            super::timebase_using(&cache, || panic!("a successful ratio is reused")),
+            Some((125, 3))
+        );
+    }
 }
 
 pub(crate) fn signal(pid: u32, signal: Signal) -> Result<(), Errno> {
@@ -304,6 +384,26 @@ mod owned_child_birth_tests {
         assert!(
             owned_child_start_time(pid).is_err(),
             "a reaped child is not owned"
+        );
+    }
+}
+
+#[cfg(test)]
+mod parent_tests {
+    #[test]
+    fn current_parent_is_readable_when_bsd_process_info_is_refused() {
+        // SAFETY: getppid reads the caller's parent and takes no pointers.
+        #[allow(unsafe_code)]
+        let expected = unsafe { libc::getppid() } as u32;
+        assert_eq!(
+            super::parent_pid_using(std::process::id(), |_| None),
+            Some(expected),
+            "a denied BSD query must not hide the sysctl record's current parent"
+        );
+        assert_eq!(
+            super::parent_pid_using(u32::MAX, |_| None),
+            None,
+            "the fallback must still refuse an invalid process identity"
         );
     }
 }

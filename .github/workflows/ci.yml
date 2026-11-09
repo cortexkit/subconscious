@@ -309,6 +309,7 @@ jobs:
               '
           )"
           tests=(
+            supervise::cgroup_reap_tests::linux_cgroup_cpu_survives_child_reap
             supervise::cgroup_reap_tests::linux_reaped_cgroup_sigterm_then_exit
             supervise::cgroup_reap_tests::linux_reaped_cgroup_ignored_sigterm_escalates_after_two_seconds
             supervise::cgroup_reap_tests::linux_reaped_cgroup_empty_has_no_grace_wait

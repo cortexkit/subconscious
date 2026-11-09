@@ -274,8 +274,8 @@ const RULES: &[Rule] = &[
     Rule {
         name: "pids",
         text: |text, _| mask_between(text, " · pid ", " · ", "pids"),
-        json_keys: &[],
-        json_kind: any,
+        json_keys: &["pid"],
+        json_kind: number,
         pins: &[],
     },
     // How long the daemon has run, in plain `ck daemon`.
@@ -307,7 +307,7 @@ const RULES: &[Rule] = &[
     Rule {
         name: "timestamps",
         text: |text, _| mask_utc_times(text),
-        json_keys: &["at_ms", "last_probe_ms", "last_exit_ms"],
+        json_keys: &["at_ms", "last_probe_ms", "last_exit_ms", "start_time_ms"],
         json_kind: number,
         pins: &[],
     },
@@ -319,11 +319,27 @@ const RULES: &[Rule] = &[
         json_kind: string,
         pins: &[],
     },
-    // The module process's memory and CPU readings.
+    // A module list also identifies the daemon build beside its own resources.
+    Rule {
+        name: "daemon_resource_versions",
+        text: no_text,
+        json_keys: &["version"],
+        json_kind: string,
+        pins: &["module-list.json"],
+    },
+    // Memory and cumulative CPU counters change between requests for both
+    // module trees and the daemon's own process.
     Rule {
         name: "resource_counters",
         text: no_text,
-        json_keys: &["memory_bytes", "cpu_user_ms", "cpu_system_ms", "swap_bytes"],
+        json_keys: &[
+            "memory_bytes",
+            "cpu_user_ms",
+            "cpu_system_ms",
+            "swap_bytes",
+            "cpu_ms",
+            "covered_ms",
+        ],
         json_kind: number,
         pins: &[],
     },
@@ -497,6 +513,23 @@ fn masked(run: &Run, kit_root: &str) -> (String, Vec<&'static str>) {
             "{}: stdout is not the value pretty-printed with a trailing newline",
             run.pin
         );
+        // Restart replies can race the departing process. Check either the
+        // measured tree or a specific unavailable reason before removing that
+        // timing-dependent pair; the running-module pin keeps its full tree.
+        if run.pin == "module-restart.json" {
+            let module = value["module"].as_object_mut().unwrap();
+            match (module.remove("tree"), module.remove("tree_unavailable")) {
+                (Some(tree), None) => {
+                    serde_json::from_value::<subc_control::TreeReading>(tree)
+                        .expect("a restarting module's available tree must retain its wire shape");
+                }
+                (None, Some(reason)) => assert!(matches!(reason.as_str(),Some("not_yet_measured"|"tree_unavailable"|"not_running")),
+                    "a restart can be pending, unreadable, or already stopped; it cannot invent a reason: {reason}"),
+                _ => {
+                    panic!("a restarting module must report a tree or its unavailable reason, not both")
+                }
+            }
+        }
         for rule in RULES.iter().filter(|rule| applies(rule, run.pin)) {
             if mask_json(&mut value, rule) {
                 fired.push(rule.name);

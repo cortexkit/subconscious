@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.20.162
+
+- Show cumulative tree CPU separately from own-process resources; prefix only CPU lower bounds with `≥`. Stopped modules report `not running`, distinct from a pending first measurement.
+- `ck module list` can briefly show an unknown reload verdict immediately after a module starts while the daemon finishes its bounded image observation. Per-process resource readings take priority over optional tree diagnostics.
+- Show `not measured yet` for a new daemon's pending tree measurement, retaining `not reported by this daemon` for older daemons. Unknown unavailability reasons render as `not measured` without guessing a cause.
+- Read the new cumulative tree resource field when displaying module memory, retaining the process-only resource display. Update fixture expectations because tree replaces unavailable memory-only subtree readings on non-container platforms.
+
 ## 0.20.161
 
 - Ship daemon 0.41.2 with validated optional module display names in `catalog.list`, and cover registration and catalog projection with an isolated child-daemon integration test. Refresh co-bumped wire-crate requirements.

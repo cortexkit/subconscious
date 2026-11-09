@@ -39,6 +39,8 @@ pub mod privileged_prompt;
 #[allow(dead_code)]
 mod provenance;
 pub mod registry;
+mod resource_history;
+mod resource_totals;
 mod route_outage;
 pub mod router;
 mod run_dir_lock;

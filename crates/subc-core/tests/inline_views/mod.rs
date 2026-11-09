@@ -68,6 +68,8 @@ async fn terminal_module_list_at_100_columns_keeps_columns_and_colors_status_gly
     let value = serde_json::to_value(ClientControlResponse::SupervisorList {
         generation: 1,
         modules,
+        daemon: None,
+        agent_commands: None,
     })
     .unwrap();
     let mut daemon = ScriptedDaemon::start(

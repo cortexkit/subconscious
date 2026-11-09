@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.0
+
+- Raise dependency floors for the resource-accounting wire release; the public dependency types require a breaking minor version.
+
 ## 0.3.2
 
 - Add the named-computer picker and an explicit forget action, including recovery when forgetting only partly succeeds.

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.0
+
+- Raise dependency floors for the resource-accounting wire release; the public dependency types require a breaking minor version.
+
 ## 0.15.0
 
 - Breaking: upgrade public frame and decoding types to protocol 0.34. Upgrade transport and protocol together so consumers do not mix incompatible Rust types. Handshake, connection-file and frame-envelope encodings are unchanged.

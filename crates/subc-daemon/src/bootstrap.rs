@@ -999,6 +999,7 @@ async fn serve_bound_daemon(
         .collect::<std::collections::BTreeMap<_, _>>();
     let control_start_clock = crate::clock::StartClock::capture();
     let mut control = ControlHandler::with_forwarding(Arc::clone(&registry), forwarding)
+        .with_daemon_version(bound.connection_info.daemon_ver.clone())
         .with_process_liveness(process_liveness)
         .with_supervisor(supervisor_handle)
         // The same flag `begin_daemon_shutdown` sets below, so requirement
@@ -1150,6 +1151,7 @@ async fn serve_bound_daemon(
     control.refresh_capability_requirements();
     Arc::clone(&control).spawn_capability_deadline_loop();
     Arc::clone(&control).spawn_scope_expiry_loop();
+    control.spawn_resource_sampler();
 
     #[cfg(unix)]
     {

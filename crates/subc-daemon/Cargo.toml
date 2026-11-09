@@ -1,6 +1,6 @@
 [package]
 name = "subc-daemon"
-version = "0.41.2"
+version = "0.42.0"
 edition = "2021"
 publish = true
 description = "Embeddable subc daemon: bootstrap, module supervision, and opaque-byte splice routing."
@@ -30,22 +30,22 @@ serde_json = "1"
 semver = "1.0.28"
 sha2 = "0.10"
 subtle = "2"
-subc-control = { path = "../subc-control", version = "0.35.1" }
+subc-control = { path = "../subc-control", version = "0.36.0" }
 subc-jsonc = { path = "../subc-jsonc", version = "0.1.0" }
-subc-os = { path = "../subc-os", version = "0.1.29", features = ["tokio"] }
-subc-protocol = { path = "../subc-protocol", version = "0.34.5" }
-subc-transport = { path = "../subc-transport", version = "0.15.0" }
+subc-os = { path = "../subc-os", version = "0.1.30", features = ["tokio"] }
+subc-protocol = { path = "../subc-protocol", version = "0.35.0" }
+subc-transport = { path = "../subc-transport", version = "0.16.0" }
 subc-uptime = { path = "../subc-uptime", version = "0.1.0" }
 tokio = { version = "1", features = ["fs", "net", "rt-multi-thread", "macros", "io-util", "sync", "time", "process", "signal"] }
 tracing = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-subc-cgroup = { path = "../subc-cgroup", version = "0.1.9" }
+subc-cgroup = { path = "../subc-cgroup", version = "0.1.10" }
 
 [target.'cfg(windows)'.dependencies]
 # Job-object containment for module grandchildren (issue #109). A leaf crate
 # because this crate forbids unsafe code and the Win32 calls need it.
-subc-jobobject = { path = "../subc-jobobject", version = "0.2.3" }
+subc-jobobject = { path = "../subc-jobobject", version = "0.2.4" }
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 # Platform bindings stay out of the module SDKs. The CLI shares the Linux
@@ -59,7 +59,8 @@ subc-presence = { path = "../subc-presence", version = "0.2" }
 rustix = { version = "1", default-features = false, features = ["process"] }
 
 [dev-dependencies]
-subc-os = { path = "../subc-os", version = "0.1.29", features = ["test-support"] }
+subc-control-published = { package = "subc-control", version = "=0.35.0" }
+subc-os = { path = "../subc-os", version = "0.1.30", features = ["test-support"] }
 cortexkit-test-support = "0.1.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 loom = "0.7"

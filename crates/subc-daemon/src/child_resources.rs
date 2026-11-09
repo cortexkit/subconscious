@@ -7,6 +7,16 @@ use subc_control::{
     ChildMemoryKind, ChildResourceReading, ChildResourceUnavailableReason, ChildResourceUsage,
 };
 
+/// The daemon must never include its reaped module children's CPU.
+pub(crate) fn read_own(pid: u32) -> ChildResourceUsage {
+    match subc_os::resource_usage(pid) {
+        Some(usage) => ChildResourceUsage::Measured(reading(usage)),
+        None => ChildResourceUsage::Unavailable {
+            reason: ChildResourceUnavailableReason::Unreadable,
+        },
+    }
+}
+
 /// The resources of the process the supervisor spawned as `pid`.
 ///
 /// `expected_start_time` is the kernel start time recorded at spawn, where the
@@ -101,6 +111,66 @@ fn reading(usage: subc_os::ResourceUsage) -> ChildResourceReading {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn own_reader_does_not_charge_a_reaped_cpu_burning_child() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "child_resources::tests::own_reader_fixture",
+                "--nocapture",
+            ])
+            .env("RESOURCE_OWN_FIXTURE", "parent")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "isolated own-resource fixture: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn own_reader_fixture() {
+        let Ok(mode) = std::env::var("RESOURCE_OWN_FIXTURE") else {
+            return;
+        };
+        let pid = std::process::id();
+        if mode == "burn" {
+            let start = subc_os::resource_usage(pid).unwrap();
+            let before = (start.cpu_user + start.cpu_system).as_millis();
+            loop {
+                for n in 0..100_000_u64 {
+                    std::hint::black_box(n.wrapping_mul(97));
+                }
+                let now = subc_os::resource_usage(pid).unwrap();
+                if (now.cpu_user + now.cpu_system).as_millis() >= before + 400 {
+                    break;
+                }
+            }
+            return;
+        }
+        let own = |reading| match reading {
+            ChildResourceUsage::Measured(reading) => reading.cpu_user_ms + reading.cpu_system_ms,
+            other => panic!("own reading unavailable: {other:?}"),
+        };
+        let before = own(read_own(pid));
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "child_resources::tests::own_reader_fixture"])
+            .env("RESOURCE_OWN_FIXTURE", "burn")
+            .output()
+            .unwrap();
+        assert!(child.status.success());
+        let after = own(read_own(pid));
+        let table = subc_os::ProcessTable::read().unwrap();
+        assert!(table.process(pid).unwrap().reaped_cpu_ms.unwrap() >= 400);
+        assert!(
+            after.saturating_sub(before) < 400,
+            "reaped child CPU was charged to the daemon"
+        );
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn usage() -> subc_os::ResourceUsage {

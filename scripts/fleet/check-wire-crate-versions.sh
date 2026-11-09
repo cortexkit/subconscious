@@ -302,6 +302,13 @@ for package in packages:
         if name == package["name"] or name not in bumped:
             continue
         requirement = dependency["req"]
+        # An older published decoder in tests is a deliberate exact pin, not a stale sibling floor.
+        if (dependency["kind"] == "dev"
+                and dependency.get("rename") not in (None, name)
+                and dependency.get("path") is None
+                and (dependency.get("source") or "").startswith("registry+")
+                and re.fullmatch(r"=\d+\.\d+\.\d+", requirement)):
+            continue
         if not requirement_at_least(requirement, bumped[name]):
             print(f"  {package['name']}: dependency {name} requires {requirement}, below new version {bumped[name]}")
             print("      raise the sibling requirement when changing dependent source alongside a sibling bump.")

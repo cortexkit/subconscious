@@ -1,3 +1,6 @@
+#[path = "control/list_diagnostics.rs"]
+pub(crate) mod list_diagnostics;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
@@ -128,12 +131,14 @@ const SUBC_CONTROL_OPS: &[&str] = &[
 /// rather than as an unknown op.
 const SUBC_UNADVERTISED_CONTROL_OPS: &[&str] = &[ops::SUPERVISOR_RESCAN_CHECKED];
 
+mod agent_commands;
 mod rescan_checked;
 use rescan_checked::{RescanMode, RescanPlan};
 
 const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
     MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     "supervisor.live_roots",
+    "supervisor.agent_commands",
     SCOPE_SYNC_OP,
     SCOPE_APPLY_OP,
     SCOPE_DESCRIBE_OP,
@@ -359,6 +364,9 @@ pub struct ControlHandler {
     forwarding: Arc<ForwardingTable>,
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
     supervisor: SupervisorHandle,
+    pub(crate) resource_tracker: Arc<crate::resource_totals::Tracker>,
+    agent_declarations: agent_commands::Queues,
+    list_admission: Arc<tokio::sync::Semaphore>,
     subc_capabilities: Arc<[String]>,
     /// Daemon-wide route.bind relay budget. Used as the fallback when the
     /// target module has no per-module override in
@@ -996,6 +1004,11 @@ impl ControlHandler {
             forwarding,
             process_liveness: None,
             supervisor: SupervisorHandle::new(),
+            resource_tracker: Arc::new(crate::resource_totals::Tracker::new(
+                env!("CARGO_PKG_VERSION").to_owned(),
+            )),
+            agent_declarations: agent_commands::Queues::default(),
+            list_admission: Arc::new(tokio::sync::Semaphore::new(4)),
             subc_capabilities: Arc::from([
                 CAP_MANIFEST_REGISTRATION.to_string(),
                 CAP_CHANNEL_LIFECYCLE.to_string(),
@@ -2021,12 +2034,15 @@ impl ControlHandler {
             }
             FrameType::Goodbye => self.handle_goodbye(ctx.connection_id),
             FrameType::Cancel => {
-                // A Cancel on channel 0 names a waiting operator.confirm or a
-                // subscription. Successful cancellation has no ordinary reply.
+                // Channel-0 cancellation also fences pending declarations;
+                // successful cancellation has no ordinary reply.
                 if self
-                    .forwarding
-                    .operator_confirms()
+                    .agent_declarations
                     .cancel(ctx.connection_id, frame.header.corr)
+                    || self
+                        .forwarding
+                        .operator_confirms()
+                        .cancel(ctx.connection_id, frame.header.corr)
                     || self
                         .supervisor
                         .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)
@@ -2117,6 +2133,26 @@ impl ControlHandler {
                     let op = module_control_request_op(&request);
                     let corr = frame.header.corr;
                     log_control_dispatch_arrival(op, ctx.connection_id, corr);
+                    if let ModuleControlRequestFromModule::AgentCommands {
+                        started,
+                        finished,
+                        known,
+                    } = request
+                    {
+                        return self
+                            .agent_declarations
+                            .enqueue(
+                                self,
+                                ctx,
+                                frame,
+                                crate::resource_totals::Declaration {
+                                    started,
+                                    finished,
+                                    known,
+                                },
+                            )
+                            .await;
+                    }
                     let result =
                         self.handle_module_control_request(ctx.connection_id, frame, request);
                     log_slow_control_dispatch(
@@ -2130,10 +2166,12 @@ impl ControlHandler {
                 }
 
                 if is_known_module_request_op(&frame.body) {
+                    let is_agents = serde_json::from_slice::<ControlOpProbe>(&frame.body)
+                        .is_ok_and(|probe| probe.op == "supervisor.agent_commands");
                     return Ok(vec![control_error_frame(
                         &frame,
-                        "not_registered",
-                        "catalog.update requires an active module registration owned by this connection",
+                        if is_agents { "not_supervised" } else { "not_registered" },
+                        "module-originated control requests require the module's own registered connection",
                     )?]);
                 }
 
@@ -2246,6 +2284,7 @@ impl ControlHandler {
         connection_id: ConnectionId,
         requested_reason: RegistrationEndReason,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        self.agent_declarations.close(connection_id);
         let end_reason = if requested_reason == RegistrationEndReason::ConnectionClosed {
             self.registry
                 .get_module_by_connection(connection_id)?
@@ -3166,11 +3205,24 @@ impl ControlHandler {
                 kind,
             } => self.handle_route_poll(ctx, frame, route_channel, route_epoch, kind),
             ClientControlRequest::SupervisorList {} => {
+                let Ok(permit) = Arc::clone(&self.list_admission).try_acquire_owned() else {
+                    self.agent_declarations.refuse(
+                        self,
+                        ctx,
+                        control_error_frame(
+                            &frame,
+                            "busy",
+                            "supervisor list work is at capacity; retry",
+                        )?,
+                    );
+                    return Ok(Vec::new());
+                };
                 // Filesystem-backed diagnostics must not hold up this connection's reader.
                 let handler = self.clone();
                 let sink = ctx.egress.clone();
                 tokio::spawn(
                     async move {
+                        let _permit = permit;
                         let result = handler.handle_supervisor_list(frame.clone()).await;
                         let replies = match result {
                             Ok(replies) => replies,
@@ -3181,7 +3233,11 @@ impl ControlHandler {
                             }
                         };
                         for reply in replies {
-                            if sink.send(reply).await.is_err() {
+                            if !matches!(
+                                tokio::time::timeout(Duration::from_millis(200), sink.send(reply))
+                                    .await,
+                                Ok(Ok(()))
+                            ) {
                                 break;
                             }
                         }
@@ -3386,6 +3442,11 @@ impl ControlHandler {
                     "ModuleControlResponseToModule::LiveRoots",
                 )?])
             }
+            ModuleControlRequestFromModule::AgentCommands {
+                started,
+                finished,
+                known,
+            } => self.handle_agent_commands(connection_id, frame, started, finished, known),
             ModuleControlRequestFromModule::ScopeSync { generation, scopes } => {
                 self.handle_scope_sync(connection_id, frame, generation, scopes)
             }
@@ -3397,6 +3458,11 @@ impl ControlHandler {
             ModuleControlRequestFromModule::ScopeDescribe { owner, scope_ref } => {
                 self.handle_scope_describe(connection_id, frame, owner, scope_ref)
             }
+            _ => Ok(vec![control_error_frame(
+                &frame,
+                "unsupported_control_frame",
+                "unsupported module control operation",
+            )?]),
         }
     }
 
@@ -4329,6 +4395,12 @@ impl ControlHandler {
         // diagnostic endpoint must still answer if the forwarding lock is
         // contended.
         let mut counters = self.counters.snapshot();
+        let losses = self.resource_tracker.loss_diagnostics();
+        if losses.as_object().is_some_and(|losses| !losses.is_empty()) {
+            if let Some(obj) = counters.as_object_mut() {
+                obj.insert("agent_command_declaration_loss_by_module".into(), losses);
+            }
+        }
         if let (Some(ledger), Some(obj)) = (&self.activity, counters.as_object_mut()) {
             obj.insert(
                 "activity_unparseable_lines".into(),
@@ -5888,18 +5960,33 @@ impl ControlHandler {
     }
 
     async fn handle_supervisor_list(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        // Status/configuration snapshots may wait on synchronous supervisor
+        // locks. Keep that work off the connection's async runtime thread.
+        let handler = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        // The blocking pool does not inherit the control request's tracing
+        // subscriber. Preserve it so slow snapshot-lock warnings stay visible.
+        let subscriber = tracing::dispatcher::get_default(Clone::clone);
+        let corr = frame.header.corr;
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(
+                list_diagnostics::scope(handler.handle_supervisor_list_inner(frame))
+                    .with_subscriber(subscriber),
+            )
+        })
+        .await
+        .map_err(|error| RouterError::backend(0, corr, error.to_string()))?
+    }
+
+    async fn handle_supervisor_list_inner(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
         let generation = self
             .registry
             .generation()
             .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
         let supervised = self.supervisor.list();
-        let targets = supervised
-            .iter()
-            .map(|module| module.subtree_target())
-            .collect();
-        let subtree = tokio::spawn(crate::subtree_resources::read(targets));
-        let mut modules = Vec::new();
-        for module in supervised {
+        let mut statuses = BTreeMap::new();
+        let mut not_running = BTreeSet::new();
+        for module in &supervised {
             let status = module.status_for_control("list").map_err(|err| {
                 RouterError::backend(
                     0,
@@ -5907,6 +5994,38 @@ impl ControlHandler {
                     format!("failed to read supervisor status: {err}"),
                 )
             })?;
+            if !status.enabled || !status.process_alive {
+                not_running.insert(module.module_id().to_owned());
+            }
+            statuses.insert(module.module_id().to_owned(), status);
+        }
+        // Preserve cheap per-process readings before optional tree walks or
+        // image hashing can spend the shared diagnostics deadline.
+        let mut process_resources = BTreeMap::new();
+        for module in &supervised {
+            process_resources.insert(
+                module.module_id().to_owned(),
+                crate::subtree_resources::read_process(module.clone()).await,
+            );
+        }
+        // Check image evidence before a process-table cache miss can spend the
+        // remaining budget; a completed background hash must stay observable.
+        let mut image_readings = BTreeMap::new();
+        for module in &supervised {
+            image_readings.insert(
+                module.module_id().to_owned(),
+                module.running_image_agreement().await,
+            );
+        }
+        let readings = self
+            .resource_tracker
+            .read(supervised.clone(), false, "list")
+            .await;
+        let mut modules = Vec::new();
+        for module in supervised {
+            let status = statuses
+                .remove(module.module_id())
+                .expect("each supervised module has a status snapshot");
             let (configured, _) = module.configuration().map_err(|err| {
                 RouterError::backend(
                     0,
@@ -5921,11 +6040,10 @@ impl ControlHandler {
                     format!("failed to read retry time: {err}"),
                 )
             })?;
-            // Status and configuration snapshots release their locks before the image probe awaits.
-            let image = module.running_image_agreement().await;
-            // Read per request so the figure is current when the operator asks;
-            // the daemon samples nothing in between.
-            let resources = Some(crate::subtree_resources::read_process(module.clone()).await);
+            let image = image_readings
+                .remove(module.module_id())
+                .expect("each supervised module has an image snapshot");
+            let resources = process_resources.remove(module.module_id());
             let mut verdict =
                 reload_verdict(&configured.program, status.spawned_from.as_deref(), image);
             verdict.spec = Some(launch_spec_agreement(
@@ -5970,18 +6088,29 @@ impl ControlHandler {
                 .with_resources(resources),
             );
         }
-        let readings = subtree
-            .await
-            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
-        for (module, reading) in modules.iter_mut().zip(readings) {
-            if reading.reason.as_deref() == Some("timeout") {
-                crate::subtree_resources::log_timeout(&module.module_id, "subtree");
+        for module in &mut modules {
+            if let Some((tree, hour)) = readings.modules.get(&module.module_id) {
+                module.tree = tree.clone();
+                module.cpu_last_hour = hour.clone();
             }
-            module.subtree = Some(reading);
+            if module.tree.is_none() {
+                module.tree_unavailable = Some(
+                    if not_running.contains(&module.module_id) {
+                        "not_running"
+                    } else if readings.modules.contains_key(&module.module_id) {
+                        "tree_unavailable"
+                    } else {
+                        "not_yet_measured"
+                    }
+                    .to_owned(),
+                );
+            }
         }
         let response = ClientControlResponse::SupervisorList {
             generation,
             modules,
+            daemon: readings.daemon,
+            agent_commands: readings.agent_commands,
         };
         Ok(vec![control_response_body_frame(
             &frame,
@@ -8143,6 +8272,8 @@ fn module_control_request_op(request: &ModuleControlRequestFromModule) -> &'stat
         ModuleControlRequestFromModule::ScopeSync { .. } => SCOPE_SYNC_OP,
         ModuleControlRequestFromModule::ScopeApply { .. } => SCOPE_APPLY_OP,
         ModuleControlRequestFromModule::ScopeDescribe { .. } => SCOPE_DESCRIBE_OP,
+        ModuleControlRequestFromModule::AgentCommands { .. } => "supervisor.agent_commands",
+        _ => "unsupported",
     }
 }
 
@@ -8701,6 +8832,8 @@ pub(crate) fn send_route_control_pushes(
 
 #[cfg(test)]
 mod tests {
+    include!("control/agent_commands_tests.rs");
+    include!("control/resource_revision_tests.rs");
     #[tokio::test]
     async fn route_busy_wait_attribution_resolves_targets_instead_of_trusting_selectors() {
         let registry = Arc::new(Registry::default());
@@ -13996,6 +14129,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_module_tree_is_not_running_instead_of_permanently_pending() {
+        let registry = Arc::new(Registry::default());
+        let handle = SupervisorHandle::new();
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone());
+        supervisor
+            .supervise_configured(
+                crate::ModuleSpec {
+                    module_id: "disabled-resource-reading".into(),
+                    program: std::env::current_exe().unwrap(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    reserved: false,
+                    reserved_prefixes: Vec::new(),
+                    protocol: ModuleProtocol::None,
+                    overlap: Default::default(),
+                    carry_containment: false,
+                },
+                false,
+            )
+            .unwrap();
+        let handler = ControlHandler::new(registry).with_supervisor(handle);
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+        let replies = handler.handle_supervisor_list(frame).await.unwrap();
+        let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
+        assert!(body["modules"][0].get("tree").is_none());
+        assert_eq!(body["modules"][0]["tree_unavailable"], "not_running");
+    }
+
+    #[tokio::test]
+    async fn supervisor_list_reads_process_resources_before_a_stalled_tree() {
+        let _guard = crate::subtree_resources::fault_read_guard().await;
+        let dir = cortexkit_test_support::ScratchDir::new("list-process-priority");
+        let registry = Arc::new(Registry::default());
+        let handle = SupervisorHandle::new();
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone());
+        let module = supervisor
+            .spawn(crate::ModuleSpec {
+                carry_containment: false,
+                module_id: "list-process-priority".into(),
+                program: std::env::current_exe().unwrap(),
+                args: vec![
+                    "--exact".into(),
+                    "control::tests::pid_resource_read_fixture".into(),
+                ],
+                env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                    .into_iter()
+                    .map(|key| (key.into(), dir.display().to_string()))
+                    .chain(std::iter::once((
+                        "SUBC_SUBTREE_PID_FIXTURE".into(),
+                        "1".into(),
+                    )))
+                    .collect(),
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::None,
+                overlap: Default::default(),
+            })
+            .unwrap();
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let image = module.running_image_agreement().await;
+            if matches!(image, subc_control::RunningImageAgreement::Match { .. }) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "the fixture process never became observable: {image:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (target, release, _) = crate::subtree_resources::held();
+        module.set_subtree_target_for_test(target);
+        let handler = ControlHandler::new(registry).with_supervisor(handle);
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+        let replies = handler.handle_supervisor_list(frame).await.unwrap();
+        drop(release);
+        module.stop().await.unwrap();
+        let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
+        assert_eq!(
+            body["modules"][0]["resources"]["status"], "measured",
+            "the optional tree timeout must not discard the process reading: {body}"
+        );
+        assert!(body["modules"][0].get("tree").is_none());
+        assert_eq!(body["modules"][0]["tree_unavailable"], "not_yet_measured");
+        assert_eq!(
+            body["modules"][0]["pending_reload"]["image"]["status"], "match",
+            "the tree timeout must not hide a completed image observation"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn cold_explicit_provenance_completes_while_list_stays_bounded() {
+        let mut handler = ControlHandler::new(Arc::new(Registry::default()))
+            .with_daemon_provenance(
+                std::process::id(),
+                0,
+                Some(std::env::current_exe().unwrap()),
+                None,
+                None,
+            );
+        let (probe, release, began) = ExecutableIdentityProbe::held();
+        handler.daemon_provenance.probe = probe;
+        let observe = |handler: ControlHandler, corr| {
+            tokio::spawn(async move {
+                let (ctx, _) = route_ctx(ConnectionId::new(corr));
+                let frame =
+                    Frame::build(FrameType::Request, control_flags(), 0, 0, corr, Vec::new())
+                        .unwrap();
+                handler
+                    .handle_supervisor_provenance(&ctx, frame, None)
+                    .await
+                    .unwrap()
+            })
+        };
+        let explicit = observe(handler.clone(), 114);
+        began.await.unwrap();
+        let concurrent = observe(handler.clone(), 115);
+        // Keep explicit provenance waiting on its first image observation beyond
+        // the list deadline; release it only after the concurrent list replies.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 2, Vec::new()).unwrap();
+        let list = tokio::time::timeout(
+            Duration::from_secs(1),
+            handler.handle_supervisor_list(frame),
+        )
+        .await;
+        let explicit_was_pending = !explicit.is_finished() && !concurrent.is_finished();
+        drop(release);
+        let replies = explicit.await.unwrap();
+        let concurrent_replies = concurrent.await.unwrap();
+        assert!(
+            explicit_was_pending,
+            "explicit provenance must await the full observation"
+        );
+        let list = list
+            .expect("a concurrent explicit probe must not stall list")
+            .unwrap();
+        let list_body: Value = serde_json::from_slice(&list[0].body).unwrap();
+        assert_eq!(list_body["op"], "supervisor.list");
+        for replies in [replies, concurrent_replies] {
+            let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
+            assert_eq!(
+                body["daemon"]["daemon_observed"]["running_image"]["status"],
+                "match"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn supervisor_list_slow_subtree_does_not_hold_connection_reader() {
         let _guard = crate::subtree_resources::fault_read_guard().await;
         let registry = Arc::new(Registry::default());
@@ -14015,10 +14300,17 @@ mod tests {
                     protocol: ModuleProtocol::Subc,
                     overlap: Default::default(),
                 },
-                false,
+                true,
             )
             .unwrap();
         let (target, release, began) = crate::subtree_resources::held();
+        // Optional list work may be skipped when its deadline is already spent.
+        // Establish the stalled fixture before asking the list to observe it.
+        let stalled_target = target.clone();
+        let stalled = tokio::task::spawn_blocking(move || {
+            stalled_target.tree(&subc_os::ProcessTable::default())
+        });
+        began.await.unwrap();
         module.set_subtree_target_for_test(target);
         let handler = ControlHandler::new(registry).with_supervisor(handle);
         let (ctx, mut rx) = route_ctx(ConnectionId::new(112));
@@ -14036,7 +14328,6 @@ mod tests {
             replies.is_empty(),
             "list reply must be detached from the connection reader"
         );
-        began.await.unwrap();
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 2, Vec::new()).unwrap();
         let replies = handler
             .handle_client_control_request(
@@ -14058,20 +14349,20 @@ mod tests {
             .unwrap();
         release.send(()).unwrap();
         drop(release);
+        stalled.await.unwrap();
         let body: Value = serde_json::from_slice(&reply.frame.body).unwrap();
-        assert_eq!(body["modules"][0]["subtree"]["source"], "unavailable");
-        assert_eq!(body["modules"][0]["subtree"]["reason"], "timeout");
-        assert_eq!(
-            body["modules"][0]["subtree"]["process_count"], 1,
-            "a count obtained before the stalled read must survive timeout"
+        assert!(
+            body["modules"][0].get("tree").is_none(),
+            "an unknown tree reading must be omitted after the bounded read expires"
         );
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 3, Vec::new()).unwrap();
         let replies = handler.handle_supervisor_list(frame).await.unwrap();
         let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
         assert_eq!(
-            body["modules"][0]["subtree"]["source"], "process_sum",
+            body["modules"][0]["tree"]["source"], "process_tree",
             "the next request must read afresh"
         );
+        assert_eq!(body["modules"][0]["tree"]["process_count"], 1);
     }
 
     #[tokio::test]
@@ -14119,8 +14410,8 @@ mod tests {
                 body["modules"][0].get("configured_enabled"),
                 configured.map(Value::Bool).as_ref()
             );
-            assert_eq!(body["modules"][0]["subtree"]["source"], "unavailable");
-            assert_eq!(body["modules"][0]["subtree"]["reason"], "not_running");
+            assert!(body["modules"][0].get("tree").is_none());
+            assert!(body["modules"][0].get("subtree").is_none());
         }
     }
 

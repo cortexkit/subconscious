@@ -48,10 +48,26 @@ pub mod tool_call;
 
 /// Canonical error codes emitted by subc.
 ///
-/// Error frames remain extensible strings, but these daemon-owned route-open
-/// outcomes need identical spelling across the daemon and SDK retry policies.
+/// Error frames remain extensible strings; daemon-owned refusals need identical
+/// spelling and operation-specific retry policies across the daemon and SDKs.
 pub mod error_codes {
     use crate::Flags;
+
+    /// Whether an agent declaration may be retried with a fresh correlation
+    /// and, for a closed declaration queue, a current supervised connection.
+    pub fn is_retryable_agent_commands(code: &str) -> bool {
+        matches!(
+            code,
+            AGENT_ROOTS_FULL | DECLARATION_CLOSED | DUPLICATE_CORRELATION | "busy"
+        )
+    }
+
+    /// RETRYABLE after live command capacity is available; accepted batch peers remain committed.
+    pub const AGENT_ROOTS_FULL: &str = "agent_roots_full";
+    /// RETRYABLE on a current supervised connection, not on the closed declaration queue.
+    pub const DECLARATION_CLOSED: &str = "declaration_closed";
+    /// RETRYABLE with a fresh correlation; the original declaration remains in flight.
+    pub const DUPLICATE_CORRELATION: &str = "duplicate_correlation";
 
     pub const UNKNOWN_CHANNEL: &str = "unknown_channel";
     pub const STALE_ROUTE_EPOCH: &str = "stale_route_epoch";
@@ -317,6 +333,24 @@ pub mod error_codes {
     /// errors, and errors on routes without the opt-in, prove no non-delivery.
     pub fn is_route_busy_retryable(flags: Flags, code: &str, route_opted_in: bool) -> bool {
         route_opted_in && flags.is_daemon_origin() && code == ROUTE_BUSY
+    }
+
+    #[cfg(test)]
+    mod agent_command_tests {
+        #[test]
+        fn agent_declaration_refusals_have_explicit_retry_classes() {
+            for (code, retry) in [
+                ("agent_roots_full", true),
+                ("busy", true),
+                ("duplicate_correlation", true),
+                ("declaration_closed", true),
+                ("not_supervised", false),
+                ("invalid_request", false),
+                ("future_code", false),
+            ] {
+                assert_eq!(super::is_retryable_agent_commands(code), retry, "{code}");
+            }
+        }
     }
 }
 

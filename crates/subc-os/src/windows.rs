@@ -287,6 +287,17 @@ fn times(handle: HANDLE) -> Option<(u64, u64, u64)> {
     Some((ticks(creation), ticks(kernel), ticks(user)))
 }
 
+pub(crate) fn cumulative_cpu_ms(process: &Process) -> Option<u64> {
+    let (_, kernel, user) = times(process.handle.as_raw_handle())?;
+    Some(kernel.saturating_add(user) / 10_000)
+}
+
+impl std::os::windows::io::AsRawHandle for Process {
+    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+        self.handle.as_raw_handle()
+    }
+}
+
 pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
     // Query-only handles also work for ancestors we may not terminate. Holding
     // the child handle prevents its pid from being reused during the snapshot.
@@ -430,4 +441,63 @@ pub(crate) fn resource_usage(process: &Process) -> Option<ResourceUsage> {
         cpu_user: duration(user),
         cpu_system: duration(kernel),
     })
+}
+
+/// One Toolhelp snapshot for all roots in a resource read.
+pub(crate) fn process_entries() -> io::Result<Vec<(u32, Option<u32>, String)>> {
+    // SAFETY: no pointers are passed; success transfers a snapshot handle.
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful snapshot handle is owned exactly once.
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
+    // SAFETY: PROCESSENTRY32W permits zero initialization before setting size.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+    // SAFETY: the snapshot and the correctly sized output buffer are live.
+    let mut found = unsafe { Process32FirstW(snapshot.as_raw_handle(), &mut entry) };
+    let mut result = Vec::new();
+    while found != 0 {
+        let length = entry
+            .szExeFile
+            .iter()
+            .position(|c| *c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        result.push((
+            entry.th32ProcessID,
+            Some(entry.th32ParentProcessID),
+            String::from_utf16_lossy(&entry.szExeFile[..length]),
+        ));
+        // SAFETY: the snapshot and initialized buffer remain valid.
+        found = unsafe { Process32NextW(snapshot.as_raw_handle(), &mut entry) };
+    }
+    finish_process_entries(result, io::Error::last_os_error())
+}
+
+fn finish_process_entries<T>(entries: Vec<T>, error: io::Error) -> io::Result<Vec<T>> {
+    if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_NO_MORE_FILES as i32) {
+        Ok(entries)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(test)]
+mod process_entry_tests {
+    #[test]
+    fn toolhelp_error_cannot_publish_a_partial_or_empty_success() {
+        use super::finish_process_entries;
+        for entries in [vec![], vec![1, 2]] {
+            assert!(
+                finish_process_entries(entries.clone(), std::io::Error::from_raw_os_error(5))
+                    .is_err()
+            );
+            assert_eq!(
+                finish_process_entries(entries.clone(), std::io::Error::from_raw_os_error(18))
+                    .unwrap(),
+                entries
+            );
+        }
+    }
 }

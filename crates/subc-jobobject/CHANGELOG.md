@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.4
+
+- Add read-only job membership queries against a pinned process handle, avoiding a PID lookup between identity validation and membership checks.
+- Expose cumulative job CPU including exited members and query-only live process IDs for resource grouping.
+
 ## 0.2.3
 
 - Add query-only job handles, each open until it's dropped, for reporting the working sets and count of live member processes. Enumeration retries a growing buffer and checks membership through each opened process handle. Dropping the job owner still ends its processes even while a reader holds a query handle.

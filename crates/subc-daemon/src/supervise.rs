@@ -1,3 +1,6 @@
+mod resource_launch;
+pub(crate) use resource_launch::{ResourceCommitError, ResourceLaunch};
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     error::Error,
@@ -4050,6 +4053,7 @@ impl SupervisedModule {
         }
     }
 
+    #[cfg(all(test, any(target_os = "linux", windows)))]
     pub(crate) fn subtree_target(&self) -> crate::subtree_resources::Target {
         self.inner
             .snapshot

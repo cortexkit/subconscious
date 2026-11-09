@@ -782,6 +782,8 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
             ClientControlResponse::SupervisorList {
                 generation: 7,
                 modules: vec![supervisor_entry()],
+                daemon: None,
+                agent_commands: None,
             },
         ),
         (

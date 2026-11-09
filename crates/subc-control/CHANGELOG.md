@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.36.0
+
+- Add an optional `cpu_last_hour.bound` independently of the cumulative CPU bound, so a recent-hour uncertainty can expire without claiming lost lifetime CPU was recovered.
+
+- Program groups report only live processes' CPU already credited to their module or agents total, with optional lower-bound metadata. The groups' CPU sum cannot exceed that enclosing total, which also retains exited processes' work.
+- Add optional CPU lower-bound and unmeasured-finish metadata. Omitted program groups decode as none, while required resource numbers still reject omission rather than becoming zero.
+
+- Add optional `SupervisorEntry.tree_unavailable`, an open snake_case reason string for a missing tree measurement. `not_yet_measured` distinguishes a reporting daemon from an older daemon without resource-tree support; measured tree fields remain unchanged.
+- Report cumulative module-tree CPU/memory, program groups, daemon resources, agent-command totals and sampled last-hour CPU. Unknown readings remain optional. Replace the memory-only SupervisorEntry.subtree member with tree. Adopt the breaking protocol release.
+
 ## 0.35.1
 
 - Add optional `CatalogEntry::display_name` and `with_display_name`. Absence preserves existing catalog JSON; non-exhaustive construction keeps the Rust API additive. Require protocol 0.34.5.

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.35.0
+
+- Name capacity, closed-queue and duplicate-correlation agent declaration refusals and expose their operation-specific retry classification without changing route-open retry policy.
+
+- Add the supervised supervisor.agent_commands module request with epoch-millisecond process identities and optional reap totals. The new request variant and non-exhaustive request enum require a breaking minor release; unknown module requests can be handled without exhaustive downstream matches in future releases.
+
 ## 0.34.5
 
 - Add optional `ModuleManifest::display_name`, a fallible builder setter, and shared display-name validation for trimmed, bounded plain text. The manifest remains non-exhaustive and unknown top-level fields remain lenient.

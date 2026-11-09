@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.35.0
+
+- Expose `AgentCommandsError::is_retryable`, sharing declaration refusal classes with the protocol. Retries use fresh correlations and, for a closed queue, a current supervised connection; the SDK does not retry automatically.
+
+- Add ModuleHandle::agent_commands with typed unsupported/refused outcomes that leave the module connection open. Return daemon and agent-command resources with supervisor lists. Adopt the breaking protocol/control/transport types exposed by the SDK.
+
 ## 0.34.3
 
 - Require protocol 0.34.5 and control 0.35.1, exposing the additive optional display name through the re-exported `CatalogEntry`.

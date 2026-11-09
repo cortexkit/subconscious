@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.4
+
+- Tests only: write test scripts through a `sh` child instead of `std::fs::write`, so a
+  thread forking for another test can't hold a writable descriptor on a script being
+  launched (Linux `ETXTBSY`, seen as "cannot start sampler" in CI), and publish the
+  symbolizer fixture's pid with a rename so the test never reads an empty file.
+
 ## 0.4.3
 
 - Require subc-client-rs 0.38.0 for scoped managed calls and watches. This dependency-only patch keeps wire behavior unchanged.

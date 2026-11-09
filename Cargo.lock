@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "ck-inspect"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "async-trait",
  "ck-inspect",

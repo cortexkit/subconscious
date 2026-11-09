@@ -1,7 +1,6 @@
 use super::atos_with;
 use crate::profile::Profile;
 use serde_json::{json, Value};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,8 +19,7 @@ fn dwarf(root: &Path, bundle: &str, file: &str) -> PathBuf {
 
 fn script(root: &Path, contents: &str) -> PathBuf {
     let path = root.join("atos");
-    std::fs::write(&path, format!("#!/bin/sh\n{contents}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    super::write_executable(&path, &format!("#!/bin/sh\n{contents}\n"));
     path
 }
 

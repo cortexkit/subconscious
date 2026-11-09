@@ -219,10 +219,45 @@ pub(crate) async fn capture(
 #[path = "symbolization_tests.rs"]
 mod symbolization_tests;
 
+/// Write `contents` to `path` as an owner-only executable script that a test
+/// will then launch.
+///
+/// Do not replace this with `std::fs::write`. Tests run on many threads, and
+/// any of them may fork for a `Command::spawn`. A child forked while this
+/// process holds a writable descriptor on the script keeps that descriptor
+/// until it reaches `execve`, and on Linux a launch of the script in that
+/// window fails with `ETXTBSY` ("Text file busy"). Here `sh` opens the file and
+/// `cat` fills it from a pipe, so this process only ever holds the pipe, which
+/// cannot block an exec.
+#[cfg(all(test, unix))]
+fn write_executable(path: &Path, contents: &str) {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", r#"cat > "$1""#, "write_executable"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("start sh for an executable fixture");
+    {
+        let mut stdin = child.stdin.take().expect("pipe to the fixture writer");
+        stdin
+            .write_all(contents.as_bytes())
+            .expect("send executable fixture contents");
+        // Dropping the pipe here sends end-of-file so `cat` finishes.
+    }
+    let status = child.wait().expect("wait for the fixture writer");
+    assert!(
+        status.success(),
+        "writing executable fixture {} failed: {status}",
+        path.display()
+    );
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     async fn sample_with(path: &Path, profile: Profile) -> Result<Profile, &'static str> {
@@ -250,18 +285,18 @@ mod tests {
             .join("helper.dSYM/Contents/Resources/DWARF/debug");
         std::fs::create_dir_all(dwarf.parent().unwrap()).unwrap();
         std::fs::write(dwarf, b"debug info").unwrap();
-        std::fs::write(&sampler, format!("#!/bin/sh\ncat > \"$5\" <<'END'\nCall graph:\n  1 Thread_1\n    1 ???  (in helper)  load address 0x1000 + 0x10  [0x1010]\nBinary Images:\n0x1000 - 0x2000 +helper (1) <{uuid}> /helper\nEND\n")).unwrap();
-        std::fs::write(
+        super::write_executable(&sampler, &format!("#!/bin/sh\ncat > \"$5\" <<'END'\nCall graph:\n  1 Thread_1\n    1 ???  (in helper)  load address 0x1000 + 0x10  [0x1010]\nBinary Images:\n0x1000 - 0x2000 +helper (1) <{uuid}> /helper\nEND\n"));
+        // Publish the pid with a rename: the test polls for the file, and a
+        // plain `echo > file` creates it empty before writing.
+        super::write_executable(
             &atos,
-            format!(
-                "#!/bin/sh\necho $$ > '{}'\nexec sleep 600\n",
+            &format!(
+                "#!/bin/sh\necho $$ > '{}.ready'\nmv '{}.ready' '{}'\nexec sleep 600\n",
+                pid_file.display(),
+                pid_file.display(),
                 pid_file.display()
             ),
-        )
-        .unwrap();
-        for path in [&sampler, &atos] {
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        );
         let root = dir.path().to_path_buf();
         let task = tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
@@ -313,27 +348,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sampler");
         let pids = dir.path().join("pids");
-        std::fs::write(
+        super::write_executable(
             &path,
-            format!(
+            &format!(
                 "#!/bin/sh\nsleep 600 &\necho $$ $! > '{}.ready'\nmv '{}.ready' '{}'\nwait\n",
                 pids.display(),
                 pids.display(),
                 pids.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let task = tokio::spawn(async move {
+        );
+        let mut task = tokio::spawn(async move {
             sample_with(&path, Profile::new("fixture".into(), 1, 1, "sample".into())).await
         });
         // The paused Tokio clock drives the deadline, but the OS child needs to
         // publish its pid before advancing it. Yield without a wall-clock delay.
         while !pids.exists() {
-            assert!(
-                !task.is_finished(),
-                "sampler exited before publishing its process ids"
-            );
+            if task.is_finished() {
+                let result = (&mut task).await.unwrap();
+                panic!("sampler exited before publishing its process ids: {result:?}");
+            }
             tokio::task::yield_now().await;
         }
         let ids: Vec<i32> = std::fs::read_to_string(&pids)
@@ -385,8 +418,7 @@ mod tests {
         } else {
             "-c %a"
         };
-        std::fs::write(&path,format!("#!/bin/sh\necho \"${{5%/*}}\" > '{}'\nstat {stat_args} \"${{5%/*}}\" > '{}'\nprintf 'Call graph:\\n  1 Thread_1\\n    1 working\\n' > \"$5\"\n",record.display(),mode.display())).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        super::write_executable(&path, &format!("#!/bin/sh\necho \"${{5%/*}}\" > '{}'\nstat {stat_args} \"${{5%/*}}\" > '{}'\nprintf 'Call graph:\\n  1 Thread_1\\n    1 working\\n' > \"$5\"\n",record.display(),mode.display()));
         let profile = sample_with(&path, Profile::new("fixture".into(), 1, 1, "sample".into()))
             .await
             .unwrap();

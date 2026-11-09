@@ -3367,6 +3367,17 @@ fn hold_test_clock() -> WorkerGuard {
 #[cfg(unix)]
 #[tokio::test]
 async fn config_delivery_swap_candidate_exit_requeues_busy_approved_restart_exactly_once() {
+    restart_after_busy_swap_warmup(true).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn config_delivery_swap_owner_release_supersedes_retained_restart_exactly_once() {
+    restart_after_busy_swap_warmup(false).await;
+}
+
+#[cfg(unix)]
+async fn restart_after_busy_swap_warmup(candidate_exits_first: bool) {
     use crate::supervise::{ModuleOverlap, RestartPolicy, Supervisor, SupervisorHandle};
     use std::{os::unix::fs::PermissionsExt, sync::Arc};
     let rig = Rig::new();
@@ -3463,6 +3474,8 @@ async fn config_delivery_swap_candidate_exit_requeues_busy_approved_restart_exac
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::ModuleRestart]);
     let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
     let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    let (busy_tx, busy_rx) = tokio::sync::oneshot::channel();
+    *owner.warm_restart_busy.lock().unwrap() = Some(busy_tx);
     *owner.warm_restart_pause.lock().unwrap() =
         Some(crate::config_gate::runtime::WarmRestartPause {
             reached: reached_tx,
@@ -3475,31 +3488,52 @@ async fn config_delivery_swap_candidate_exit_requeues_busy_approved_restart_exac
         .unwrap();
     let guard = owner.lock().unwrap();
     resume_tx.send(()).unwrap();
-    let candidate_pid = std::fs::read_to_string(rig.path.join("a.launches"))
-        .unwrap()
-        .lines()
-        .nth(1)
-        .unwrap()
-        .parse::<i32>()
-        .unwrap();
-    let pid = rustix::process::Pid::from_raw(candidate_pid).unwrap();
-    rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while subc_os::child_exit::observe(candidate_pid as u32)
-            .unwrap()
-            .is_none()
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    drop(guard);
-    assert!(tokio::time::timeout(Duration::from_secs(5), swap)
+    // Observe the actual busy freshness check before choosing which event wins.
+    tokio::time::timeout(Duration::from_secs(5), busy_rx)
         .await
         .unwrap()
-        .unwrap()
-        .is_err());
+        .unwrap();
+    if candidate_exits_first {
+        let candidate_pid = std::fs::read_to_string(rig.path.join("a.launches"))
+            .unwrap()
+            .lines()
+            .nth(1)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let pid = rustix::process::Pid::from_raw(candidate_pid).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
+        // Keep the configuration owner locked until warm-up observes the
+        // candidate's exit, not just until the OS reports it.
+        let outcome = tokio::time::timeout(Duration::from_secs(5), swap)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(guard);
+        assert!(
+            matches!(
+                outcome,
+                Err(crate::supervise::SuperviseError::SwapFailed {
+                    arm: crate::supervise::SwapFailureArm::CandidateExited,
+                    ..
+                })
+            ),
+            "expected candidate exit while the configuration owner was busy: {outcome:?}"
+        );
+    } else {
+        // The live candidate cannot exit first. Let the next freshness check
+        // replace the retained command with one superseding restart instead.
+        drop(guard);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), swap)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome,
+            crate::supervise::SwapOutcome::SupersededByConfigRestart
+        );
+    }
     registry.deregister_connection(INCUMBENT).unwrap();
     let restarted = tokio::time::timeout(Duration::from_secs(5), async {
         while !rig.path.join("a.current.launches").exists() {
@@ -3508,8 +3542,8 @@ async fn config_delivery_swap_candidate_exit_requeues_busy_approved_restart_exac
     })
     .await
     .is_ok();
-    // The worker still sees pending (module a, generation 2), but sends that
-    // pair only once. Warm-up must hand back its consumed ConfigApplyRestart.
+    // The worker sends (module a, generation 2) only once. Candidate exit must
+    // retain that command; supersession must replace it, never duplicate it.
     if restarted {
         tokio::time::sleep(Duration::from_millis(150)).await;
     }

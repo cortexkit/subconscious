@@ -25,6 +25,8 @@ pub struct RuntimeOwner {
     #[cfg(test)]
     pub(crate) warm_restart_pause: Mutex<Option<WarmRestartPause>>,
     #[cfg(test)]
+    pub(crate) warm_restart_busy: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    #[cfg(test)]
     pub(crate) swap_preflight_attempts: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "test-support")]
     test_hooks: Option<crate::config_store::testing::TestSupport>,
@@ -604,6 +606,8 @@ impl RuntimeOwner {
         Self {
             #[cfg(test)]
             warm_restart_pause: Mutex::new(None),
+            #[cfg(test)]
+            warm_restart_busy: Mutex::new(None),
             #[cfg(test)]
             swap_preflight_attempts: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-support")]

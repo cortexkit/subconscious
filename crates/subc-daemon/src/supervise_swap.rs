@@ -822,6 +822,8 @@ async fn warm_candidate(
     .await;
     if matches!(outcome, Warm::Superseded { .. }) {
         // The superseded branch queues its freshly checked generation instead.
+        // Downstream revalidation would discard a stale duplicate anyway, so
+        // filtering prevents a redundant command rather than a second launch.
         let deferred = end.requeue.split_off(requeue_start);
         end.requeue.extend(
             deferred
@@ -860,7 +862,13 @@ async fn warm_candidate_until_outcome(
                 {
                     Ok(Some(generation)) => return Warm::Superseded { generation },
                     Ok(None) => config_restart_pending = false,
-                    Err(_) => next_config_check = Instant::now() + CONFIG_ADMISSION_RETRY_DELAY,
+                    Err(_) => {
+                        #[cfg(test)]
+                        if let Some(reached) = delivery.0.warm_restart_busy.lock().unwrap().take() {
+                            let _ = reached.send(());
+                        }
+                        next_config_check = Instant::now() + CONFIG_ADMISSION_RETRY_DELAY;
+                    }
                 }
             } else {
                 config_restart_pending = false;
@@ -1444,6 +1452,80 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn approve_timing_restart(fixture: &ConfigTimingFixture) {
+        use crate::config_gate::{ApprovalFacts, ApprovalReply, PlanKind, PresenceDecision};
+        use serde_json::json;
+        let owner = &fixture.runtime.config_delivery.as_ref().unwrap().0;
+        std::fs::create_dir_all(fixture.dir.join("cortexkit")).unwrap();
+        std::fs::write(
+            fixture.dir.join("subc.jsonc"),
+            serde_json::to_vec(
+                &json!({"version":1,"modules":{"timed":{"program":"/bin/sleep","args":["600"]}}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let path = fixture.dir.join("cortexkit/timed.jsonc");
+        std::fs::write(&path, br#"{"limit":1}"#).unwrap();
+        owner.declare(
+            ConnectionId::new(1),
+            "timed",
+            subc_protocol::config::ConfigDeclareRequest::new(
+                json!({"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","unevaluatedProperties":false,"x-ck-layers":["user"],"x-ck-apply":"live","properties":{"limit":{"type":"integer","description":"Limit","default":1}}}),
+                path.to_string_lossy(), vec![],
+            ),
+            true,
+        ).unwrap();
+        let facts = ApprovalFacts {
+            connection: 7,
+            owner_uid: true,
+            desktop_app: true,
+            attested_operator_app: true,
+            os_prompt_available: true,
+            phone: None,
+            caller: crate::caller_identity::CallerIdentity::default(),
+        };
+        for (kind, generation) in [(PlanKind::Stamp, 1), (PlanKind::Change, 2)] {
+            std::fs::write(
+                &path,
+                serde_json::to_vec(&json!({"limit":generation})).unwrap(),
+            )
+            .unwrap();
+            let plan = owner
+                .finish_plan(owner.prepare(kind).unwrap(), |old, new| {
+                    let mut changeset = crate::config_gate::runtime::daemon_review(old, new)?;
+                    changeset.fields.push(subc_config::FieldChange::new(
+                        "timed",
+                        "/limit",
+                        subc_config::RecordedValue::new(json!(generation - 1)),
+                        subc_config::RecordedValue::new(json!(generation)),
+                        subc_config::ApplyKind::ModuleRestart,
+                    ));
+                    Ok(changeset)
+                })
+                .unwrap();
+            owner
+                .desktop_view_delivered(ConnectionId::new(7), &plan)
+                .unwrap();
+            let challenge = owner.begin_approval(&plan.digest, &facts).unwrap();
+            owner
+                .finish_approval(
+                    challenge.attempt(),
+                    &facts,
+                    ApprovalReply::Presence(PresenceDecision::InteractiveApproval),
+                    generation,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            owner
+                .try_requires_fresher_spawn("timed", fixture.child.config_delivery.as_ref())
+                .unwrap(),
+            Some(2)
+        );
+    }
+
+    #[cfg(unix)]
     async fn retained_restart_after_warm_exit(exit: &str) {
         let mut fixture = config_timing_fixture();
         fixture
@@ -1472,6 +1554,15 @@ mod tests {
             )
             .unwrap();
         let (sender, mut commands) = mpsc::channel(8);
+        let owner = fixture.runtime.config_delivery.as_ref().unwrap().0.clone();
+        let (busy_tx, mut busy_rx) = oneshot::channel();
+        let owner_guard = if exit == "superseded" {
+            approve_timing_restart(&fixture);
+            *owner.warm_restart_busy.lock().unwrap() = Some(busy_tx);
+            Some(owner.try_swap_configuration().unwrap())
+        } else {
+            None
+        };
         sender
             .send(SupervisorCommand::ConfigApplyRestart {
                 generation: 23,
@@ -1487,7 +1578,7 @@ mod tests {
             ConnectionId::new(1),
             Duration::from_secs(5),
             None,
-            None,
+            (exit == "superseded").then_some(fixture.runtime.config_delivery.as_ref().unwrap()),
             &mut commands,
             &mut end,
         ));
@@ -1497,6 +1588,14 @@ mod tests {
         })
         .await;
         match exit {
+            "superseded" => {
+                assert!(
+                    busy_rx.try_recv().is_ok(),
+                    "warm-up must observe the busy owner"
+                );
+                drop(owner_guard);
+                tokio::time::advance(CONFIG_ADMISSION_RETRY_DELAY).await;
+            }
             "ready" => {
                 fixture
                     .registry
@@ -1519,26 +1618,25 @@ mod tests {
         let outcome = warm.await;
         let correct_outcome = match exit {
             "ready" => matches!(outcome, Warm::Ready(_)),
+            "superseded" => matches!(outcome, Warm::Superseded { generation: 2 }),
             _ => matches!(outcome, Warm::Failed(_)),
         };
         let retained = end
             .requeue
             .iter()
             .filter(|command| {
-                matches!(
-                    command,
-                    SupervisorCommand::ConfigApplyRestart {
-                        generation: 23,
-                        supersedes_swap: false
-                    }
-                )
+                matches!(command, SupervisorCommand::ConfigApplyRestart {
+                    generation,
+                    supersedes_swap
+                } if exit == "superseded" || (*generation == 23 && !*supersedes_swap))
             })
             .count();
         finish_timing_child(fixture.child).await;
         assert!(correct_outcome);
         assert_eq!(
-            retained, 1,
-            "warm {exit} lost the consumed restart generation"
+            retained,
+            usize::from(exit != "superseded"),
+            "warm {exit} retained the wrong number of consumed restarts"
         );
     }
 
@@ -1552,6 +1650,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn config_admission_warm_timeout_requeues_consumed_restart() {
         retained_restart_after_warm_exit("timeout").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn config_admission_warm_superseded_drops_consumed_restart() {
+        retained_restart_after_warm_exit("superseded").await;
     }
 
     #[cfg(unix)]

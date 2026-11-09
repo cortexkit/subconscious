@@ -1264,3 +1264,130 @@ async fn config_admission_windows_protocol_none_keeps_binding_until_child_exit()
         "a reaped child cannot keep a write-exclusion handle alive"
     );
 }
+
+#[cfg(windows)]
+async fn windows_removed_registration_preserves_binding(candidate: bool) {
+    use crate::supervise::{RestartPolicy, Supervisor, SupervisorHandle, SwapHelloAdmission};
+    use std::sync::Arc;
+    let rig = Rig::new();
+    let program = rig.path.join("program.exe");
+    std::fs::copy(
+        std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/ping.exe"),
+        &program,
+    )
+    .unwrap();
+    let covered = rig.path.join("covered.txt");
+    std::fs::write(&covered, b"approved").unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":program,"args":["-t","127.0.0.1"],"protocol":"subc","overlap":"safe","program_files":[covered]}}})).unwrap()).unwrap();
+    let owner = Arc::new(rig.owner("removed-registration"));
+    rig.stamp(&owner);
+    let registry = Arc::new(crate::Registry::default());
+    let forwarding = Arc::new(crate::ForwardingTable::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone())
+        .with_forwarding(forwarding.clone())
+        .with_drain_timeout(std::time::Duration::from_millis(20));
+    let spec = crate::daemon_config::load(rig.path.join("subc.jsonc"))
+        .unwrap()
+        .unwrap()
+        .modules[0]
+        .module_spec();
+    let module = supervisor.spawn_async(spec).await.unwrap();
+    let nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    assert!(handle.wait_program_binding("a", &nonce).await);
+    if candidate {
+        registry
+            .register_with_control_ops(
+                subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+                subc_protocol::PROTOCOL_VERSION,
+                ConnectionId::new(770),
+                vec![],
+            )
+            .unwrap();
+        // Exercise candidate registration with the real child's open handles
+        // that prevent writes to its approved program and covered files;
+        // this test does not run the asynchronous swap coordinator.
+        handle.open_swap("a", nonce.clone());
+    }
+    let hold = Arc::new(std::sync::Barrier::new(2));
+    let handler = crate::ControlHandler::with_forwarding(registry.clone(), forwarding)
+        .with_supervisor(handle.clone())
+        .with_config_runtime(owner)
+        .with_hello_registry_to_forwarding_hold(hold.clone());
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: Some(nonce.clone()),
+    };
+    let frame = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&hello).unwrap(),
+    )
+    .unwrap();
+    let connection = ConnectionId::new(771);
+    let (sender, mut frames) = tokio::sync::mpsc::channel(8);
+    let ctx = crate::RouteCtx {
+        connection_id: connection,
+        egress: crate::FrameSink::new(sender),
+    };
+    let runtime = tokio::runtime::Handle::current();
+    let pending = {
+        let handler = handler.clone();
+        std::thread::spawn(move || {
+            runtime
+                .block_on(handler.handle_control_frame(&ctx, frame))
+                .unwrap()
+        })
+    };
+    hold.wait();
+    assert_eq!(registry.deregister_connection(connection).unwrap().len(), 1);
+    hold.wait();
+    let reply = pending.join().unwrap();
+    let ack = frames.try_recv().unwrap().frame.header.ty;
+    let retained = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&covered)
+        .err()
+        .and_then(|error| error.raw_os_error());
+    let candidate_still_available = !candidate
+        || matches!(
+            handle.swap_hello_admission("a", Some(&nonce)),
+            SwapHelloAdmission::Candidate
+        );
+    handler.cleanup_connection(connection).unwrap();
+    registry
+        .deregister_connection(ConnectionId::new(770))
+        .unwrap();
+    handle.close_swap("a");
+    module.stop().await.unwrap();
+    assert!(reply.is_empty());
+    assert_eq!(ack, subc_protocol::FrameType::HelloAck);
+    assert_eq!(
+        retained,
+        Some(32),
+        "removed registration must not release retained content handles"
+    );
+    assert!(
+        candidate_still_available,
+        "unpublished candidate must not consume its admission nonce"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn config_admission_windows_removed_ordinary_publication_keeps_handles() {
+    windows_removed_registration_preserves_binding(false).await;
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn config_admission_windows_removed_candidate_publication_keeps_handles_and_nonce() {
+    windows_removed_registration_preserves_binding(true).await;
+}

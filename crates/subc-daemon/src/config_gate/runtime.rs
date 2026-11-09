@@ -23,6 +23,8 @@ use crate::{
 
 pub struct RuntimeOwner {
     #[cfg(test)]
+    pub(crate) warm_restart_pause: Mutex<Option<WarmRestartPause>>,
+    #[cfg(test)]
     pub(crate) swap_preflight_attempts: std::sync::atomic::AtomicUsize,
     #[cfg(feature = "test-support")]
     test_hooks: Option<crate::config_store::testing::TestSupport>,
@@ -65,6 +67,12 @@ pub struct RuntimeOwner {
 pub(crate) struct SwapConfiguration<'a> {
     owner: &'a RuntimeOwner,
     state: OwnerGuard<'a>,
+}
+
+#[cfg(test)]
+pub(crate) struct WarmRestartPause {
+    pub(crate) reached: tokio::sync::oneshot::Sender<()>,
+    pub(crate) resume: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl SwapConfiguration<'_> {
@@ -594,6 +602,8 @@ impl RuntimeOwner {
         let initial_generation = store.body().map(|body| body.last_generation).unwrap_or(0);
         let admission = std::sync::RwLock::new(admission::AdmissionCache::from_store(&store));
         Self {
+            #[cfg(test)]
+            warm_restart_pause: Mutex::new(None),
             #[cfg(test)]
             swap_preflight_attempts: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "test-support")]

@@ -2730,15 +2730,11 @@ impl ControlHandler {
             }
         };
 
-        #[cfg(test)]
-        if let Some(hold) = &self.hello_before_publication_hold {
-            hold.wait();
-            hold.wait();
-        }
-
         // Registration and forwarding publication use the same module gate as
-        // stamp, hold entry and spawning. Recheck after taking it; a HELLO may
-        // have been parsed before any of those transitions completed.
+        // stamp, unstamp and spawning. Recheck after taking it; parsing may
+        // precede those transitions. A program-refusal hold blocks future
+        // spawns, but does not take this gate or revoke a HELLO whose supervised
+        // child's image has already passed the check.
         let _publication_gate = if let Some(owner) = &self.config_runtime {
             let gate = owner
                 .module_gate(&hello.manifest.module_id)
@@ -2760,6 +2756,11 @@ impl ControlHandler {
         } else {
             None
         };
+        #[cfg(test)]
+        if let Some(hold) = &self.hello_before_publication_hold {
+            hold.wait();
+            hold.wait();
+        }
         let module = &hello.manifest.module_id;
         let required = self
             .config_runtime
@@ -2778,7 +2779,7 @@ impl ControlHandler {
             return Ok(vec![control_error_frame(
                 &frame,
                 "reserved_module",
-                "a gated identity belongs only to its supervised child",
+                "gated admission requires an unheld module and the current supervised child's nonce and verified image binding",
             )?]);
         }
         if let Some(nonce) = hello.launch_nonce.as_deref() {
@@ -3031,6 +3032,7 @@ impl ControlHandler {
                 connection_id = connection_id.get(),
                 "registration was removed before it could be published"
             );
+            return Ok(reply);
         }
 
         // Exposure over assumption: Concurrency's serde default is pinned to the
@@ -3175,6 +3177,7 @@ impl ControlHandler {
                 connection_id = connection_id.get(),
                 "swap candidate registration was removed before it could be published"
             );
+            return Ok(reply);
         }
         self.supervisor.mark_swap_candidate_admitted(&module_id);
         info!(

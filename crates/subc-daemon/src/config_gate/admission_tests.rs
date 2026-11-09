@@ -1853,12 +1853,20 @@ async fn config_admission_hello_publication_rechecks_across_stamp_hold_and_new_s
             .with_supervisor(handle.clone())
             .with_config_runtime(owner.clone())
             .with_hello_before_publication_hold(hold.clone());
+        let (sender, _frames) = tokio::sync::mpsc::channel(8);
+        let ctx = crate::RouteCtx {
+            connection_id: ConnectionId::new(760),
+            egress: crate::FrameSink::new(sender),
+        };
+        let runtime = tokio::runtime::Handle::current();
         let pending = std::thread::spawn(move || {
-            handler
-                .handle_control(ConnectionId::new(760), module_hello(nonce))
+            runtime
+                .block_on(handler.handle_control_frame(&ctx, module_hello(nonce)))
                 .unwrap()
         });
         hold.wait();
+        let gate = owner.module_gate("a").unwrap();
+        let gate_is_held = gate.try_lock().is_err();
         let mut replacement = None;
         match transition {
             "stamp" => {
@@ -1882,11 +1890,19 @@ async fn config_admission_hello_publication_rechecks_across_stamp_hold_and_new_s
             }
             _ => {
                 module.as_ref().unwrap().stop().await.unwrap();
-                replacement = Some(supervisor.spawn_async(spec(&rig)).await.unwrap());
+                // The paused HELLO owns the publication gate; a replacement
+                // can be spawned only once that stale admission is resolved.
             }
         }
         hold.wait();
         let reply = pending.join().unwrap();
+        if transition == "new_spawn" {
+            replacement = Some(supervisor.spawn_async(spec(&rig)).await.unwrap());
+        }
+        assert!(
+            gate_is_held,
+            "production HELLO pause must own its module gate"
+        );
         if let Some(module) = replacement {
             module.stop().await.unwrap();
         }
@@ -2110,4 +2126,91 @@ async fn config_admission_promoted_unreserved_child_can_reconnect_with_its_curre
         subc_protocol::FrameType::HelloAck,
         "the configured unreserved policy must not retain the incumbent's synthetic legacy nonce"
     );
+}
+
+#[tokio::test]
+async fn config_admission_hold_after_final_hello_check_preserves_admission_but_refuses_next_spawn()
+{
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = Arc::new(rig.owner("post-check-hold"));
+    rig.stamp(&owner);
+    let registry = Arc::new(crate::Registry::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    reported_pid(&module).await;
+    let nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    assert!(tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.wait_program_binding("a", &nonce)
+    )
+    .await
+    .unwrap());
+    let hold = Arc::new(std::sync::Barrier::new(2));
+    let handler = crate::ControlHandler::new(registry.clone())
+        .with_supervisor(handle)
+        .with_config_runtime(owner.clone())
+        .with_hello_registry_to_forwarding_hold(hold.clone());
+    let (sender, mut frames) = tokio::sync::mpsc::channel(8);
+    let ctx = crate::RouteCtx {
+        connection_id: ConnectionId::new(761),
+        egress: crate::FrameSink::new(sender),
+    };
+    let runtime = tokio::runtime::Handle::current();
+    let pending = std::thread::spawn(move || {
+        runtime
+            .block_on(handler.handle_control_frame(&ctx, module_hello(Some(nonce))))
+            .unwrap()
+    });
+    hold.wait();
+    let gate = owner.module_gate("a").unwrap();
+    let gate_is_held = gate.try_lock().is_err();
+    let base = crate::config_gate::program::approved_base(
+        &crate::config_gate::GateSnapshot::from_store(
+            &owner.lock().unwrap().store.body().unwrap().approved,
+        )
+        .unwrap(),
+        "a",
+    );
+    owner
+        .record_program_refusal(
+            "a",
+            &base,
+            subc_config::raw_digest(b"refused after verified hello"),
+        )
+        .unwrap();
+    let held_before_ack = owner.check_module_hold("a").is_err();
+    hold.wait();
+    let reply = pending.join().unwrap();
+    let published = registry
+        .published_registration(crate::registry::RegistrationSlot::Connection(
+            ConnectionId::new(761),
+        ))
+        .unwrap()
+        .is_some();
+    let ack = frames.try_recv().unwrap().frame.header.ty;
+    let held_after_ack = owner.check_module_hold("a").is_err();
+    registry
+        .deregister_connection(ConnectionId::new(761))
+        .unwrap();
+    let generation = module.status().unwrap().spawn_generation;
+    let pid = module.status().unwrap().pid;
+    let next = module.restart(None).await;
+    let status = module.status().unwrap();
+    module.stop().await.unwrap();
+    assert!(gate_is_held && held_before_ack);
+    assert!(reply.is_empty() && published);
+    assert_eq!(ack, subc_protocol::FrameType::HelloAck);
+    assert!(held_after_ack);
+    assert!(
+        matches!(next, Err(crate::SuperviseError::ConfigHeld { .. })),
+        "next spawn must retain the hold: {next:?}"
+    );
+    assert!(status.process_alive);
+    assert_eq!(status.pid, pid);
+    assert_eq!(status.spawn_generation, generation);
+    assert_eq!(status.restart_count, 0);
 }

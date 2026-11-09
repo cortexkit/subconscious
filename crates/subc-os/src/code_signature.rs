@@ -68,6 +68,16 @@ fn process_cdhash_with_query(
     if u32::from_ne_bytes(flags) & 1 == 0 {
         return Err(SignatureError::NotValid);
     }
+    let mut after = [0; 20];
+    query(5, &mut after).map_err(map_error)?;
+    if after != hash {
+        // Exec preserves the process birth time. Do not combine the old image's
+        // hash with a status sampled from its replacement; let callers retry.
+        return Err(SignatureError::Other(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "process code hash changed while sampling signature status",
+        )));
+    }
     Ok(CodeDirectoryHash(hash))
 }
 
@@ -144,6 +154,27 @@ pub(super) fn hash_bytes(bytes: &[u8], kind: u8) -> Result<Vec<u8>, SignatureErr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn content_binding_defers_a_code_hash_change_during_status_query() {
+        let mut hashes = 0;
+        let result = super::process_cdhash_with_query(|operation, output| {
+            match operation {
+                0 => output.copy_from_slice(&1u32.to_ne_bytes()),
+                5 => {
+                    hashes += 1;
+                    output.fill(hashes);
+                }
+                _ => panic!("unexpected csops operation"),
+            }
+            Ok(())
+        });
+        assert!(
+            matches!(result,Err(super::SignatureError::Other(ref error)) if error.kind()==std::io::ErrorKind::WouldBlock),
+            "a changed hash cannot pair another image's valid status: {result:?}"
+        );
+        assert_eq!(hashes, 2);
+    }
+
     #[test]
     fn content_binding_refuses_a_kernel_hash_without_cs_valid() {
         for flags in [0u32, 2, 0x200] {

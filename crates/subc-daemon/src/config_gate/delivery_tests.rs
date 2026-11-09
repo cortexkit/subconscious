@@ -3210,3 +3210,167 @@ fn hold_test_clock() -> WorkerGuard {
         }
     }))
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn config_delivery_swap_candidate_exit_requeues_busy_approved_restart_exactly_once() {
+    use crate::supervise::{ModuleOverlap, RestartPolicy, Supervisor, SupervisorHandle};
+    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+    let rig = Rig::new();
+    write(&rig, 1);
+    std::fs::write(
+        rig.path.join("program"),
+        b"#!/bin/sh\nprintf '%s\\n' \"$$\" >> \"$2\"\nwhile :; do /bin/sleep 600; done\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        rig.path.join("program"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let mut spec = supervised_spec(&rig, "a");
+    spec.protocol = subc_control::ModuleProtocol::Subc;
+    spec.overlap = ModuleOverlap::Safe;
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":spec.program,"args":spec.args,"protocol":"subc","overlap":"safe"}}})).unwrap()).unwrap();
+    let owner = Arc::new(rig.owner("restart-after-candidate-exit"));
+    rig.declare(&owner, INCUMBENT.get());
+    rig.stamp(&owner);
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    let registry = Arc::new(crate::Registry::default());
+    let forwarding = Arc::new(crate::ForwardingTable::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
+        .with_handle(handle.clone())
+        .with_forwarding(forwarding.clone())
+        .with_config_runtime(owner.clone())
+        .with_drain_timeout(Duration::from_millis(20));
+    let handler = Arc::new(
+        crate::ControlHandler::with_forwarding(registry.clone(), forwarding.clone())
+            .with_supervisor(handle)
+            .with_config_runtime(owner.clone()),
+    );
+    let module = supervisor.spawn(spec.clone()).unwrap();
+    let mut manifest = subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build();
+    manifest.ready = Some(true);
+    registry
+        .register_with_control_ops(
+            manifest.clone(),
+            subc_protocol::PROTOCOL_VERSION,
+            INCUMBENT,
+            vec!["config.review".into()],
+        )
+        .unwrap();
+    let (sender, _incumbent_frames) = tokio::sync::mpsc::channel(8);
+    forwarding
+        .register_module_connection(
+            INCUMBENT,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(sender),
+        )
+        .unwrap();
+    let swap = {
+        let module = module.clone();
+        tokio::spawn(async move { module.swap(Some(Duration::from_secs(30))).await })
+    };
+    wait_for_delivery_condition(|| {
+        std::fs::read_to_string(rig.path.join("a.launches"))
+            .is_ok_and(|text| text.lines().count() == 2)
+    })
+    .await;
+    manifest.ready = Some(false);
+    registry
+        .register_candidate_with_control_ops(
+            manifest,
+            subc_protocol::PROTOCOL_VERSION,
+            CANDIDATE,
+            vec!["config.review".into()],
+        )
+        .unwrap();
+    let (sender, _candidate_frames) = tokio::sync::mpsc::channel(8);
+    forwarding
+        .register_candidate_module_connection(
+            CANDIDATE,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(sender),
+        )
+        .unwrap();
+    let mut next = spec;
+    next.program = rig.path.join("next-program");
+    std::fs::copy(rig.path.join("program"), &next.program).unwrap();
+    next.args[1] = rig
+        .path
+        .join("a.current.launches")
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":next.program,"args":next.args,"protocol":"subc","overlap":"safe"}}})).unwrap()).unwrap();
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::ModuleRestart]);
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    *owner.warm_restart_pause.lock().unwrap() =
+        Some(crate::config_gate::runtime::WarmRestartPause {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+    let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
+    tokio::time::timeout(Duration::from_secs(5), reached_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let guard = owner.lock().unwrap();
+    resume_tx.send(()).unwrap();
+    let candidate_pid = std::fs::read_to_string(rig.path.join("a.launches"))
+        .unwrap()
+        .lines()
+        .nth(1)
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    let pid = rustix::process::Pid::from_raw(candidate_pid).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while subc_os::child_exit::observe(candidate_pid as u32)
+            .unwrap()
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(guard);
+    assert!(tokio::time::timeout(Duration::from_secs(5), swap)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    registry.deregister_connection(INCUMBENT).unwrap();
+    let restarted = tokio::time::timeout(Duration::from_secs(5), async {
+        while !rig.path.join("a.current.launches").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    // The worker still sees pending (module a, generation 2), but sends that
+    // pair only once. Warm-up must hand back its consumed ConfigApplyRestart.
+    if restarted {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let launches = std::fs::read_to_string(rig.path.join("a.current.launches"))
+        .unwrap_or_default()
+        .lines()
+        .count();
+    let status = module.status().unwrap();
+    module.stop().await.unwrap();
+    assert!(
+        restarted,
+        "candidate exit lost the worker's one approved restart"
+    );
+    assert_eq!(launches, 1);
+    assert_eq!(status.spawn_generation, 2);
+    assert_eq!(status.restart_count, 0);
+}

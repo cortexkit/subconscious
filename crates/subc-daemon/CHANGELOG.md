@@ -10,6 +10,11 @@
   under the forwarding write lock. Swap cutover uses synchronous loaded-state
   checks without awaiting the configuration owner; deferred attempts back off
   while stop and child exit remain selectable.
+  The checks verify the supervised child's image and possession of its launch
+  nonce, not the HELLO sender's process identity. A same-user process that learns
+  the nonce (including a Windows descendant inheriting it) can impersonate the
+  child while that child's image remains approved. Peer authentication remains
+  required before releasing or enabling the configuration gate.
 
 - Release Windows program write-exclusion handles once HELLO acknowledges a
   normal launch or the warmed replacement in a blue/green swap, including

@@ -10,6 +10,7 @@
   Require full, nonzero code-region coverage and a valid directory in every
   universal-file slice. Process hashes also require the kernel's `CS_VALID`
   status rather than treating a retained hash as proof of valid running code.
+  Sample the hash again after status and defer if exec changed it between calls.
 
 - Open bounded configuration inputs without following the leaf or blocking on
   substituted FIFOs. Verify regular-file type on the retained Unix or Windows

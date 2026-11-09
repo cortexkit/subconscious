@@ -81,10 +81,9 @@ enum Warm {
 /// What a swap hands back to the supervise loop when it ends.
 #[derive(Default)]
 pub(super) struct SwapEnd {
-    /// Commands for the loop to run next, in arrival order: configuration
-    /// ungated updates that arrived during warm-up (already answered, applied now
-    /// that the swap no longer holds the spec), followed by an interrupting stop,
-    /// disable or retire, or the approved restart that superseded the candidate.
+    /// Commands for the loop to run next. An interrupting stop, disable or hold
+    /// takes priority over retained configuration commands so a queued restart
+    /// cannot run before the stop is applied. Otherwise arrival order is kept.
     pub(super) requeue: Vec<SupervisorCommand>,
 }
 
@@ -270,7 +269,11 @@ async fn run_swap_inner(
             )
             .await;
             let _ = reply.send(Err(failure.into_error(module_id)));
-            end.requeue.extend(command);
+            // Stop/disable/hold must take effect before retained restart
+            // commands; the actor then discards restarts for the stopped child.
+            if let Some(command) = command {
+                end.requeue.insert(0, command);
+            }
             return;
         }
         Warm::Failed(failure) => {
@@ -804,6 +807,8 @@ async fn warm_candidate(
     commands: &mut mpsc::Receiver<SupervisorCommand>,
     end: &mut SwapEnd,
 ) -> Warm {
+    let requeue_start = end.requeue.len();
+    let outcome=async {
     let mut deadline = Instant::now() + ready_timeout;
     let mut registered: Option<ConnectionId> = None;
     let mut config_restart_pending = false;
@@ -938,6 +943,16 @@ async fn warm_candidate(
                     return Warm::Interrupted { command: None, connection: registered };
                 };
                 if matches!(command, SupervisorCommand::ConfigApplyRestart { .. }) {
+                    // The coordinator sends each generation only once. Keep
+                    // the command even if readiness, exit or timeout wins the
+                    // race with the nonblocking freshness recheck. The actor
+                    // revalidates it against the current spawn before acting.
+                    end.requeue.push(command);
+                    #[cfg(test)]
+                    if let Some(delivery)=config_delivery {
+                        let pause=delivery.0.warm_restart_pause.lock().unwrap().take();
+                        if let Some(pause)=pause {let _=pause.reached.send(());let _=pause.resume.await;}
+                    }
                     config_restart_pending=true;
                     next_config_check=Instant::now();
                     continue;
@@ -949,6 +964,17 @@ async fn warm_candidate(
             _ = sleep(poll) => {}
         }
     }
+    }.await;
+    if matches!(outcome, Warm::Superseded { .. }) {
+        // The superseded branch queues its freshly checked generation instead.
+        let deferred = end.requeue.split_off(requeue_start);
+        end.requeue.extend(
+            deferred
+                .into_iter()
+                .filter(|command| !matches!(command, SupervisorCommand::ConfigApplyRestart { .. })),
+        );
+    }
+    outcome
 }
 
 fn config_candidate_deadline(
@@ -1385,6 +1411,117 @@ mod tests {
         candidate.start_kill().unwrap();
         candidate.wait().await.unwrap();
         candidate.finish_exit(false).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn retained_restart_after_warm_exit(exit: &str) {
+        let mut fixture = config_timing_fixture();
+        fixture
+            .registry
+            .deregister_connection(ConnectionId::new(2))
+            .unwrap();
+        let mut manifest =
+            subc_protocol::manifest::ModuleManifest::builder("timed", "1.0.0").build();
+        fixture
+            .registry
+            .register_with_control_ops(
+                manifest.clone(),
+                subc_protocol::PROTOCOL_VERSION,
+                ConnectionId::new(1),
+                vec![],
+            )
+            .unwrap();
+        manifest.ready = Some(false);
+        fixture
+            .registry
+            .register_candidate_with_control_ops(
+                manifest.clone(),
+                subc_protocol::PROTOCOL_VERSION,
+                ConnectionId::new(2),
+                vec![],
+            )
+            .unwrap();
+        let (sender, mut commands) = mpsc::channel(8);
+        sender
+            .send(SupervisorCommand::ConfigApplyRestart {
+                generation: 23,
+                supersedes_swap: false,
+            })
+            .await
+            .unwrap();
+        let mut end = SwapEnd::default();
+        let mut warm = Box::pin(warm_candidate(
+            "timed",
+            &fixture.registry,
+            &mut fixture.child,
+            ConnectionId::new(1),
+            Duration::from_secs(5),
+            None,
+            None,
+            &mut commands,
+            &mut end,
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(warm.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        match exit {
+            "ready" => {
+                fixture
+                    .registry
+                    .deregister_connection(ConnectionId::new(2))
+                    .unwrap();
+                manifest.ready = Some(true);
+                fixture
+                    .registry
+                    .register_candidate_with_control_ops(
+                        manifest,
+                        subc_protocol::PROTOCOL_VERSION,
+                        ConnectionId::new(2),
+                        vec![],
+                    )
+                    .unwrap();
+            }
+            "timeout" => tokio::time::advance(Duration::from_secs(5)).await,
+            _ => unreachable!(),
+        }
+        let outcome = warm.await;
+        let correct_outcome = match exit {
+            "ready" => matches!(outcome, Warm::Ready(_)),
+            _ => matches!(outcome, Warm::Failed(_)),
+        };
+        let retained = end
+            .requeue
+            .iter()
+            .filter(|command| {
+                matches!(
+                    command,
+                    SupervisorCommand::ConfigApplyRestart {
+                        generation: 23,
+                        supersedes_swap: false
+                    }
+                )
+            })
+            .count();
+        finish_timing_child(fixture.child).await;
+        assert!(correct_outcome);
+        assert_eq!(
+            retained, 1,
+            "warm {exit} lost the consumed restart generation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn config_admission_warm_ready_requeues_consumed_restart() {
+        retained_restart_after_warm_exit("ready").await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn config_admission_warm_timeout_requeues_consumed_restart() {
+        retained_restart_after_warm_exit("timeout").await;
     }
 
     #[cfg(unix)]

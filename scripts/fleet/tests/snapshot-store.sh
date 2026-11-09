@@ -24,7 +24,8 @@ finish() {
 trap finish EXIT
 
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
-mode_of() { stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"; }
+# GNU stat first: on Linux `stat -f` succeeds but describes the filesystem.
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
 
 # run_bounded <seconds> <output file> <command...>: run the command, killing it
 # after <seconds>. Returns its status, or 124 if it was killed. Written out
@@ -72,7 +73,8 @@ OUT="$TEST_ROOT/busy.snapshot"
 start=$(date +%s)
 rc=0
 run_bounded 60 "$TEST_ROOT/busy.log" bash "$SNAP" "$DB" "$OUT" || rc=$?
-[ "$rc" -eq 0 ] || fail "busy store: snapshot did not finish within 60 s (rc=$rc): $(cat "$TEST_ROOT/busy.log")"
+[ "$rc" -ne 124 ] || fail "busy store: snapshot did not finish within 60 s"
+[ "$rc" -eq 0 ] || fail "busy store: snapshot failed (rc=$rc): $(cat "$TEST_ROOT/busy.log")"
 out=$(cat "$TEST_ROOT/busy.log")
 elapsed=$(( $(date +%s) - start ))
 [ "$elapsed" -le 30 ] || fail "busy store: snapshot took ${elapsed}s"

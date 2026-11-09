@@ -61,7 +61,9 @@ if ! err=$( (umask 077; sqlite3 "$uri" "VACUUM INTO '$quoted'") 2>&1 ); then
 fi
 
 [ -s "$OUT" ] || refuse "snapshot $OUT is empty"
-mode=$(stat -f %Lp "$OUT" 2>/dev/null || stat -c %a "$OUT")
+# GNU stat first: on Linux `stat -f` succeeds but prints filesystem
+# information, so a BSD-first fallback would never run there.
+mode=$(stat -c %a "$OUT" 2>/dev/null || stat -f %Lp "$OUT")
 [ "$mode" = 600 ] || refuse "snapshot $OUT has mode $mode, not 600"
 check=$(sqlite3 "file:$OUT?immutable=1" 'PRAGMA quick_check;' 2>&1)
 [ "$check" = ok ] || refuse "snapshot $OUT fails quick_check: $check"

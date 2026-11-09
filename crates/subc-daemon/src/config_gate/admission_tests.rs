@@ -1556,6 +1556,64 @@ async fn config_admission_hello_accepts_only_the_approved_current_native_image()
     assert_eq!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
 }
 
+#[tokio::test]
+async fn config_recovery_hello_accepts_only_a_preexisting_bound_launch() {
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = Arc::new(rig.owner("recovery-bound-hello"));
+    rig.stamp(&owner);
+    let handle = SupervisorHandle::new();
+    let registry = Arc::new(crate::Registry::default());
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    let nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    assert!(handle.wait_program_binding("a", &nonce).await);
+    std::fs::write(
+        rig.path.join("store").join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(owner.check_recovery().unwrap());
+    let handler = crate::ControlHandler::new(registry.clone())
+        .with_supervisor(handle)
+        .with_config_runtime(owner);
+    for presented in [None, Some("wrong".into()), Some(nonce)] {
+        let hello = subc_protocol::ModuleHelloBody {
+            manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+            protocol_ver: subc_protocol::PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: presented.clone(),
+        };
+        let frame = subc_protocol::Frame::build(
+            subc_protocol::FrameType::Hello,
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&hello).unwrap(),
+        )
+        .unwrap();
+        let reply = handler
+            .handle_control(ConnectionId::new(445), frame)
+            .unwrap();
+        if presented.as_deref().is_some_and(|nonce| nonce != "wrong") {
+            assert_eq!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
+        } else {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&reply[0].body).unwrap()["code"],
+                "config_gated"
+            );
+            assert!(registry.get_module("a").unwrap().is_none());
+        }
+    }
+    registry
+        .deregister_connection(ConnectionId::new(445))
+        .unwrap();
+    module.stop().await.unwrap();
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn config_admission_unsigned_macos_program_is_held_before_any_spawn() {

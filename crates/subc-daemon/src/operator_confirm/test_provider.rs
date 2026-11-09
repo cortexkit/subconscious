@@ -90,6 +90,9 @@ impl OperatorWithdraw for Withdraw {
     }
 }
 impl OperatorProvider for ScriptProvider {
+    fn config_gate_ready(&self) -> bool {
+        true
+    }
     fn prompt(
         &self,
         text: &str,

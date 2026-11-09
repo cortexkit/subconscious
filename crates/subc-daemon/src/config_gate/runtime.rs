@@ -318,6 +318,9 @@ struct OwnerState {
     refused_generations: BTreeMap<String, Digest>,
     admission_holds: Vec<String>,
     admission_releases: Vec<String>,
+    authority_exit: Option<u64>,
+    recovery_exit_hold: bool,
+    unstamp_hints: std::collections::HashSet<ConnectionId>,
     installed_route_policies: BTreeMap<String, u64>,
     route_policy_receipts: BTreeMap<(String, u64), route_policy::PendingRoutePolicy>,
     #[cfg(test)]
@@ -439,7 +442,9 @@ impl Drop for OwnerGuard<'_> {
         let next = admission::AdmissionCache::from_state(&self.0);
         if let Ok(mut cache) = self.1.write() {
             let (holds, releases) = next.transitions_from(&cache);
-            let changed = !holds.is_empty() || !releases.is_empty();
+            let changed = next.is_recovering() != cache.is_recovering()
+                || !holds.is_empty()
+                || !releases.is_empty();
             self.0.admission_holds.extend(holds);
             self.0.admission_releases.extend(releases);
             *cache = next;
@@ -516,6 +521,8 @@ pub(crate) mod delivery;
 
 #[path = "admission.rs"]
 mod admission;
+#[path = "recovery.rs"]
+mod recovery;
 #[path = "route_policy.rs"]
 mod route_policy;
 pub(crate) use admission::SpawnAdmission;
@@ -633,6 +640,9 @@ impl RuntimeOwner {
                 refused_generations: BTreeMap::new(),
                 admission_holds: Vec::new(),
                 admission_releases: Vec::new(),
+                authority_exit: None,
+                recovery_exit_hold: false,
+                unstamp_hints: std::collections::HashSet::new(),
                 installed_route_policies: BTreeMap::new(),
                 route_policy_receipts: BTreeMap::new(),
                 #[cfg(test)]
@@ -796,6 +806,14 @@ impl RuntimeOwner {
         subc_config::Schema::new(declaration.schema.clone())
             .map_err(|r| GateError::new("schema_invalid", format!("{module}: {}", r.path)))?;
         let mut state = self.lock()?;
+        if state.store.status().state == StoreState::StoreMissing
+            || state.store.status().state == StoreState::StoreUnverified
+        {
+            return Err(GateError::new(
+                "config_gated",
+                "configuration store is in recovery",
+            ));
+        }
         if state.declarations.contains_key(&connection) {
             return Err(GateError::new(
                 "declaration_order",
@@ -867,7 +885,14 @@ impl RuntimeOwner {
             ));
         }
         if check_store {
-            state.store.check()?;
+            let checked = state.store.check();
+            if matches!(
+                state.store.loaded_admission_state().0,
+                StoreState::StoreMissing | StoreState::StoreUnverified
+            ) {
+                return recovery::active_view(state, module, &declaration, &request);
+            }
+            checked?;
         }
         if state.store.loaded_admission_state().0 == StoreState::Unstamped {
             if request.generation.is_some() || request.attempt.is_some() {
@@ -1046,9 +1071,27 @@ impl RuntimeOwner {
             &mut state,
             matches!(kind, PlanKind::Stamp | PlanKind::Unstamp),
         )?;
+        if matches!(kind, PlanKind::Stamp | PlanKind::Unstamp) {
+            crate::daemon_config::load_with_activity(&self.capturer.daemon_path)
+                .map_err(|error| {
+                    GateError::new(
+                        "invalid_daemon_config",
+                        format!("supervisor rescan rejected daemon config: {error}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    GateError::new(
+                        "invalid_daemon_config",
+                        "subc.jsonc is absent; refusing to rescan",
+                    )
+                })?;
+        }
         let observed = self.capture(&mut state)?;
         if observed.daemon.bytes.is_none() {
-            return Err(GateError::new("config_missing", "subc.jsonc is absent"));
+            return Err(GateError::new(
+                "invalid_daemon_config",
+                "subc.jsonc is absent; refusing to rescan",
+            ));
         }
         if state.store.status().state == StoreState::Stamped {
             state.store.observe(observed.diagnostic.to_store()?)?;
@@ -1422,6 +1465,12 @@ impl RuntimeOwner {
             hook();
         }
         let was_unstamped = state.store.status().state == StoreState::Unstamped;
+        let was_recovery = state.recovery_exit_hold
+            || matches!(
+                state.store.status().state,
+                StoreState::StoreMissing | StoreState::StoreUnverified
+            );
+        let unstamp_hints = recovery::changed_file_views(self, &mut state, &current);
         #[cfg(test)]
         let publication_hook = state.publication_hook.take();
         #[cfg(test)]
@@ -1473,7 +1522,7 @@ impl RuntimeOwner {
                 Ok(())
             },
         );
-        let stamped_files = was_unstamped
+        let stamped_files = (was_unstamped || was_recovery)
             && state.store.body().is_ok_and(|body| {
                 body.generations
                     .get(&body.last_generation)
@@ -1482,29 +1531,48 @@ impl RuntimeOwner {
                             && entry.kind == crate::config_store::CommitKind::Stamp
                     })
             });
-        if stamped_files {
-            let connections: Vec<_> = state.active_declarations.values().copied().collect();
-            state.delivery.remember_stamp_connections(connections);
-        }
         if result.is_ok() {
             state.plan_deadlines.remove(&digest);
             state.retained_plan_files.remove(&digest);
             state.desktop_views.retain(|_, (shown, _)| shown != &digest);
         }
         let unstamped = result.is_ok() && state.store.status().state == StoreState::Unstamped;
+        let committed_exit = state
+            .store
+            .loaded_admission_state()
+            .1
+            .generations
+            .iter()
+            .next_back()
+            .filter(|(_, entry)| {
+                entry.generation.plan_digest == digest
+                    && (was_recovery || entry.kind == crate::config_store::CommitKind::Unstamp)
+            })
+            .map(|(generation, entry)| {
+                (
+                    *generation,
+                    entry.kind == crate::config_store::CommitKind::Unstamp,
+                )
+            });
+        if let Some((generation, unstamp)) = committed_exit {
+            state.authority_exit = Some(generation);
+            state.recovery_exit_hold = was_recovery;
+            state
+                .delivery
+                .reset_for_authority_exit(if unstamp { generation } else { 0 });
+            if unstamp {
+                state.unstamp_hints.extend(unstamp_hints);
+            }
+        } else if result.is_ok() {
+            state.authority_exit = None;
+        }
+        if stamped_files {
+            let connections: Vec<_> = state.active_declarations.values().copied().collect();
+            state.delivery.remember_stamp_connections(connections);
+        }
         drop(state);
         if unstamped {
-            // Retire only after releasing the store mutex: a running-image
-            // check holds the ProgramLaunch mutex while recording a refusal,
-            // and retiring Windows handles takes that same mutex.
-            for retire in self
-                .binding_retirements
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .values()
-            {
-                retire();
-            }
+            self.retire_unstamped_bindings();
         }
         result
     }

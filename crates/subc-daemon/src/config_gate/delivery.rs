@@ -90,6 +90,13 @@ pub(super) struct DeliveryState {
 }
 
 impl DeliveryState {
+    pub(super) fn reset_for_authority_exit(&mut self, generation: u64) {
+        *self = Self {
+            next_spawn: self.next_spawn,
+            next_attempt: self.next_attempt,
+            ..Self::new(generation)
+        };
+    }
     pub(super) fn started_at_generation(&self) -> u64 {
         self.initial_generation
     }

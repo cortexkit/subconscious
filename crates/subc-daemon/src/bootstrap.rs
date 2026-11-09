@@ -125,6 +125,12 @@ pub struct BootstrapConfig {
     /// Only a service-definition argument may name this authority store. An
     /// embedded daemon with no explicit root never opens an installation store.
     config_store_root: Option<PathBuf>,
+    defer_file_load: bool,
+    #[cfg(all(test, feature = "test-support"))]
+    test_store_factory:
+        Option<fn(crate::config_store::StoreRoot) -> crate::config_store::ConfigStore>,
+    #[cfg(all(test, feature = "test-support"))]
+    test_control: Option<fn(ControlHandler) -> ControlHandler>,
     configured_port: Option<u16>,
     /// Daemon-wide route.bind relay budget in milliseconds (the fallback for
     /// any module without a per-module override). `None` = built-in default
@@ -217,6 +223,11 @@ impl BootstrapConfig {
             activity_config: daemon_config::ActivityConfig::default(),
             daemon_config_path: None,
             config_store_root: None,
+            defer_file_load: false,
+            #[cfg(all(test, feature = "test-support"))]
+            test_store_factory: None,
+            #[cfg(all(test, feature = "test-support"))]
+            test_control: None,
             configured_port: None,
             route_bind_relay_default_ms: None,
             reserved_capabilities: BTreeMap::new(),
@@ -307,12 +318,19 @@ impl BootstrapConfig {
         let run_dir = daemon_config::daemon_run_dir().map_err(BootstrapError::RunDir)?;
         let machine_id_path =
             crate::machine_id::default_machine_id_path().map_err(BootstrapError::MachineId)?;
-        let config = Self::from_env()?
+        // The service supplies its store root after constructing this value.
+        // Do not parse live files until that store has selected recovery mode.
+        let (connection_file, source) =
+            connection_file_path_with_source(non_empty_os_var("XDG_RUNTIME_DIR"));
+        let mut config = Self::new(connection_file, DEFAULT_SUBC_PORT)
+            .with_connection_file_source(source)
+            .with_daemon_config_source(daemon_config::default_config_path(), None)
             .with_local_listener(LocalListenerConfig::in_socket_dir(&run_dir))
             .with_capture_logs_dir(run_dir.join("logs"))
             .with_terminal_journal_path(run_dir.join("terminals.jsonl"))
             .with_live_children_record(crate::live_children::record_path(&run_dir))
             .with_machine_id_path(machine_id_path);
+        config.defer_file_load = true;
         #[cfg(feature = "test-support")]
         let config = {
             let mut config = config;
@@ -666,6 +684,36 @@ pub async fn run() -> Result<(), BootstrapError> {
 /// (they measured 236 daemon lines with the subscriber installed, 0 with the
 /// call commented out) -- otherwise the fix is itself unverified.
 pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapError> {
+    let Some(start_lock) = singleton_start_lock(&config.connection_file_path).await? else {
+        info!("subc daemon already running");
+        return Ok(());
+    };
+    let (config, opened_store, start_lock) = tokio::task::spawn_blocking(move || {
+        let mut opened_store = config
+            .config_store_root
+            .as_ref()
+            .map(|root| {
+                let (root, lock) = crate::config_store::StoreWriterLock::acquire(root)
+                    .map_err(|e| BootstrapError::ConfigStore(e.to_string()))?;
+                #[cfg(all(test, feature = "test-support"))]
+                let store = if let Some(factory) = config.test_store_factory {
+                    crate::config_store::testing::TestSupport::new(root.path().to_path_buf(), None)
+                        .map_err(|e| BootstrapError::ConfigStore(e.to_string()))?;
+                    factory(root)
+                } else {
+                    crate::config_store::ConfigStore::open(root)
+                };
+                #[cfg(not(all(test, feature = "test-support")))]
+                let store = crate::config_store::ConfigStore::open(root);
+                Ok::<_, BootstrapError>((store, lock))
+            })
+            .transpose()?;
+        let config =
+            load_bootstrap_authority(config, opened_store.as_mut().map(|(store, _)| store))?;
+        Ok::<_, BootstrapError>((config, opened_store, start_lock))
+    })
+    .await
+    .map_err(|e| BootstrapError::ConfigStore(e.to_string()))??;
     #[cfg(feature = "test-support")]
     let shutdown_intent_window = config.shutdown_intent_window;
     let forwarding = Arc::new(ForwardingTable::default());
@@ -677,7 +725,6 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let privileged_operator_prompt = config.privileged_operator_prompt;
     let activity_config = config.activity_config;
     let daemon_config_path = config.daemon_config_path.clone();
-    let config_store_root = config.config_store_root.clone();
     let configured_port = config.configured_port;
     let route_bind_relay_default_ms = config.route_bind_relay_default_ms;
     let reserved_capabilities = config.reserved_capabilities.clone();
@@ -687,7 +734,9 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let terminal_journal_path = config.terminal_journal_path.clone();
     let live_children_path = config.live_children_path.clone();
     let privacy_trampoline = config.privacy_trampoline.clone();
-    match ensure_singleton_inner(config, false).await? {
+    #[cfg(all(test, feature = "test-support"))]
+    let test_control = config.test_control;
+    match ensure_singleton_with_start_lock(config, false, start_lock).await? {
         Outcome::AlreadyRunning => {
             info!("subc daemon already running");
             Ok(())
@@ -707,7 +756,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 privileged_operator_prompt,
                 activity_config,
                 daemon_config_path,
-                config_store_root,
+                opened_store,
                 configured_port,
                 route_bind_relay_default_ms,
                 reserved_capabilities,
@@ -716,6 +765,8 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 terminal_journal_path,
                 live_children_path,
                 privacy_trampoline,
+                #[cfg(all(test, feature = "test-support"))]
+                test_control,
                 #[cfg(feature = "test-support")]
                 shutdown_intent_window,
                 #[cfg(target_os = "linux")]
@@ -724,6 +775,52 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
             .await
         }
     }
+}
+
+// Keep authority selection before binding listeners or constructing control
+// authorization. Recovery must remain reachable even with invalid live files.
+fn load_bootstrap_authority(
+    mut config: BootstrapConfig,
+    store: Option<&mut crate::config_store::ConfigStore>,
+) -> Result<BootstrapConfig, BootstrapError> {
+    let recovery = store.is_some_and(|store| {
+        matches!(
+            store.status().state,
+            crate::config_store::StoreState::StoreUnverified
+                | crate::config_store::StoreState::StoreMissing
+        )
+    });
+    if recovery {
+        config.port = DEFAULT_SUBC_PORT;
+        config.configured_port = None;
+        config.configured_modules.clear();
+        config.storage_config = None;
+        config.admission_facts = AdmissionFactsConfig::default();
+        config.scope_authority_owners = daemon_config::default_scope_authority_owners();
+        config.privileged_operator_prompt = daemon_config::PrivilegedOperatorPrompt::default();
+        config.activity_config = daemon_config::ActivityConfig::default();
+        config.route_bind_relay_default_ms = None;
+        config.reserved_capabilities.clear();
+        config.watchdog_config = DaemonSelfWatchdogConfig::default();
+    } else if config.defer_file_load {
+        let loaded = BootstrapConfig::from_env_with_daemon_config_path(
+            config
+                .daemon_config_path
+                .as_ref()
+                .expect("binary config path"),
+        )?;
+        config.port = loaded.port;
+        config.configured_port = loaded.configured_port;
+        config.configured_modules = loaded.configured_modules;
+        config.storage_config = loaded.storage_config;
+        config.admission_facts = loaded.admission_facts;
+        config.scope_authority_owners = loaded.scope_authority_owners;
+        config.privileged_operator_prompt = loaded.privileged_operator_prompt;
+        config.activity_config = loaded.activity_config;
+        config.route_bind_relay_default_ms = loaded.route_bind_relay_default_ms;
+        config.reserved_capabilities = loaded.reserved_capabilities;
+    }
+    Ok(config)
 }
 
 #[cfg(target_os = "linux")]
@@ -861,7 +958,10 @@ async fn serve_bound_daemon(
     privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt,
     activity_config: daemon_config::ActivityConfig,
     daemon_config_path: Option<PathBuf>,
-    config_store_root: Option<PathBuf>,
+    opened_store: Option<(
+        crate::config_store::ConfigStore,
+        crate::config_store::StoreWriterLock,
+    )>,
     configured_port: Option<u16>,
     route_bind_relay_default_ms: Option<u64>,
     reserved_capabilities: BTreeMap<String, String>,
@@ -870,6 +970,9 @@ async fn serve_bound_daemon(
     terminal_journal_path: Option<PathBuf>,
     live_children_path: Option<PathBuf>,
     privacy_trampoline: Option<PathBuf>,
+    #[cfg(all(test, feature = "test-support"))] test_control: Option<
+        fn(ControlHandler) -> ControlHandler,
+    >,
     #[cfg(feature = "test-support")] shutdown_intent_window: Duration,
     #[cfg(target_os = "linux")] cgroup_placement: Option<subc_cgroup::Placement>,
 ) -> Result<(), BootstrapError> {
@@ -936,7 +1039,7 @@ async fn serve_bound_daemon(
         "{:032x}",
         u128::from_be_bytes(bound.connection_info.daemon_id)
     );
-    let config_runtime = if let Some(root) = config_store_root {
+    let config_runtime = if let Some((store, writer_lock)) = opened_store {
         let path = daemon_config_path.clone().ok_or_else(|| {
             BootstrapError::ConfigStore(
                 "an explicit daemon config path is required with a config store".into(),
@@ -946,11 +1049,9 @@ async fn serve_bound_daemon(
         let incarnation = daemon_incarnation.clone();
         Some(Arc::new(
             tokio::task::spawn_blocking(move || {
-                let (root, writer_lock) = crate::config_store::StoreWriterLock::acquire(&root)
-                    .map_err(io::Error::other)?;
                 crate::config_gate::runtime::RuntimeOwner::new(
                     incarnation,
-                    crate::config_store::ConfigStore::open(root),
+                    store,
                     crate::config_gate::capture::ConfigCapturer {
                         daemon_path: path,
                         config_home,
@@ -1112,6 +1213,23 @@ async fn serve_bound_daemon(
     if let Some(config_path) = daemon_config_path {
         control = control.with_supervisor_rescan(supervisor.clone(), config_path, configured_port);
     }
+    #[cfg(all(test, feature = "test-support"))]
+    let control = if let Some(adapt) = test_control {
+        // A test hook is not a substitute for the executable-name guard.
+        let executable =
+            std::env::current_exe().map_err(|e| BootstrapError::ConfigStore(e.to_string()))?;
+        if !executable
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("ckdev-"))
+        {
+            return Err(BootstrapError::ConfigStore(
+                "test control requires a ckdev executable".into(),
+            ));
+        }
+        adapt(control)
+    } else {
+        control
+    };
     let control = Arc::new(control);
     let router = Arc::new(Router::with_control_handler(Arc::clone(&control)));
     let auth = ServerAuth::new(
@@ -1333,24 +1451,37 @@ async fn ensure_singleton_inner(
     config: BootstrapConfig,
     publish: bool,
 ) -> Result<Outcome, BootstrapError> {
-    #[cfg(windows)]
-    let copy_path = windows_connection_copy::resolve(&config);
-    let path = config.connection_file_path;
-
-    if stable_peer(&path).await? {
+    let Some(lock) = singleton_start_lock(&config.connection_file_path).await? else {
         return Ok(Outcome::AlreadyRunning);
+    };
+    ensure_singleton_with_start_lock(config, publish, lock).await
+}
+
+async fn singleton_start_lock(path: &Path) -> Result<Option<StartLock>, BootstrapError> {
+    if stable_peer(path).await? {
+        return Ok(None);
     }
 
-    let lock = StartLock::acquire(&path).await?;
+    let lock = StartLock::acquire(path).await?;
 
     // Re-probe after acquiring the start lock so a peer that won the race between
     // our first failed probe and the lock acquisition is observed instead of
     // overwritten.
-    if stable_peer(&path).await? {
-        return Ok(Outcome::AlreadyRunning);
+    if stable_peer(path).await? {
+        return Ok(None);
     }
+    Ok(Some(lock))
+}
 
-    // The start lock and the probe above only rule out a daemon using this
+async fn ensure_singleton_with_start_lock(
+    config: BootstrapConfig,
+    publish: bool,
+    lock: StartLock,
+) -> Result<Outcome, BootstrapError> {
+    #[cfg(windows)]
+    let copy_path = windows_connection_copy::resolve(&config);
+    let path = config.connection_file_path;
+    // The held start lock and its peer check only rule out a daemon using this
     // connection file. A daemon started with another runtime directory but
     // the same data home shares the run directory while passing both, so the
     // run directory needs its own owner: refuse at once if a live daemon holds
@@ -2142,6 +2273,10 @@ impl Error for BootstrapError {
     }
 }
 
+#[cfg(all(test, feature = "test-support", unix))]
+#[path = "bootstrap_recovery_tests.rs"]
+mod recovery_tests;
+
 #[cfg(test)]
 mod tests {
     mod activity {
@@ -2170,6 +2305,44 @@ mod tests {
     #[test]
     fn normalized_build_provenance_preserves_real_values() {
         assert_eq!(normalized_build_provenance("abc"), Some("abc".to_string()));
+    }
+
+    #[test]
+    fn config_recovery_bootstrap_ignores_invalid_live_file_and_poisoned_settings() {
+        let scratch = unique_temp_dir("recovery-bootstrap");
+        let root = scratch.join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(crate::config_store::STORE_FILE),
+            br#"{"format_version":999}"#,
+        )
+        .unwrap();
+        let mut store = crate::config_store::ConfigStore::open_digest_only_for_tests(
+            crate::config_store::StoreRoot::from_service_definition(root).unwrap(),
+        );
+        assert_eq!(
+            store.status().state,
+            crate::config_store::StoreState::StoreUnverified
+        );
+        let file = scratch.join("subc.jsonc");
+        std::fs::write(&file, b"invalid live config").unwrap();
+        let mut config = BootstrapConfig::new(scratch.join("connection.json"), 1)
+            .with_daemon_config_source(file, Some(1))
+            .with_scope_authority_owners(vec!["untrusted".into()])
+            .with_reserved_capabilities(BTreeMap::from([("untrusted".into(), "untrusted".into())]));
+        config.defer_file_load = true;
+        let config = load_bootstrap_authority(config, Some(&mut store)).unwrap();
+        assert_eq!(config.port, DEFAULT_SUBC_PORT);
+        assert!(config.configured_modules.is_empty());
+        assert_eq!(
+            config.scope_authority_owners,
+            daemon_config::default_scope_authority_owners()
+        );
+        assert!(config.reserved_capabilities.is_empty());
+        assert_eq!(
+            config.privileged_operator_prompt,
+            daemon_config::PrivilegedOperatorPrompt::default()
+        );
     }
 
     #[test]

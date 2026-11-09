@@ -2,6 +2,16 @@
 
 ## 0.41.10
 
+- Keep missing or unverified configuration stores in recovery: bind the control
+  plane from built-in defaults, hold all future supervised launches and retries,
+  admit only already-bound supervised launch nonces, and refuse other control
+  operations before the generic privileged-operation prompt. Preserve running modules' in-memory active
+  views. Recovery unstamp uses the OS prompt's fixed explanation; desktop re-stamp
+  and unstamp replace rejected configuration-store history only after fresh input validation.
+- Notify opted-in modules whose file views change when unstamping, without
+  requiring a new edit, delivery attempt or process restart. Install recovered
+  reservation policy before releasing the recovery hold.
+
 - Recheck live content after every gated exec, including children without HELLO,
   and refuse a ready binding when the running process's approved content cannot
   be verified.

@@ -9,6 +9,125 @@ struct Rig {
     declaration: ConfigDeclareRequest,
 }
 
+#[test]
+fn config_recovery_get_keeps_only_active_memory_and_refuses_declare() {
+    let rig = Rig::new();
+    let raw = br#"{"credential":{"vault_ref":"approved"},"limit":2}"#;
+    std::fs::write(rig.path.join("cortexkit/a.jsonc"), raw).unwrap();
+    let owner = rig.owner("recovery-active");
+    rig.declare(&owner, 10);
+    rig.stamp(&owner);
+    owner
+        .lock()
+        .unwrap()
+        .store
+        .record_delivery(
+            &crate::config_store::Tuple {
+                module: "a".into(),
+                project: None,
+            },
+            1,
+            true,
+        )
+        .unwrap();
+    let store = rig.path.join("store").join(crate::config_store::STORE_FILE);
+    std::fs::write(&store, b"tampered").unwrap();
+    std::fs::write(rig.path.join("cortexkit/a.jsonc"), br#"{"limit":99}"#).unwrap();
+    assert!(owner.check_recovery().unwrap());
+    let reply = owner
+        .module_get(ConnectionId::new(10), "a", ConfigGetRequest::new())
+        .unwrap();
+    assert!(reply.pending.is_none());
+    assert_eq!(
+        reply.active.unwrap().layers[0].bytes.as_deref(),
+        Some(raw.as_slice())
+    );
+    assert_eq!(
+        owner
+            .declare(ConnectionId::new(11), "a", rig.declaration.clone(), true)
+            .unwrap_err()
+            .code,
+        "config_gated"
+    );
+    assert_eq!(std::fs::read(store).unwrap(), b"tampered");
+}
+
+#[test]
+fn config_recovery_exit_rejects_invalid_or_missing_daemon_config_without_writes() {
+    let rig = Rig::new();
+    let owner = rig.owner("recovery-invalid");
+    rig.stamp(&owner);
+    let store = rig.path.join("store").join(crate::config_store::STORE_FILE);
+    std::fs::write(&store, b"tampered").unwrap();
+    assert!(owner.check_recovery().unwrap());
+    for invalid in [Some(b"{ invalid".as_slice()), None] {
+        if let Some(bytes) = invalid {
+            std::fs::write(rig.path.join("subc.jsonc"), bytes).unwrap();
+        } else {
+            std::fs::remove_file(rig.path.join("subc.jsonc")).unwrap();
+        }
+        for kind in [PlanKind::Stamp, PlanKind::Unstamp] {
+            assert_eq!(
+                owner.prepare(kind).err().unwrap().code,
+                "invalid_daemon_config"
+            );
+            assert_eq!(std::fs::read(&store).unwrap(), b"tampered");
+            assert!(owner.is_recovering());
+        }
+    }
+}
+
+#[tokio::test]
+async fn config_recovery_allowlist_precedes_probed_and_legacy_ops() {
+    let rig = Rig::new();
+    let owner = std::sync::Arc::new(rig.owner("recovery-ops"));
+    rig.stamp(&owner);
+    let store = rig.path.join("store").join(crate::config_store::STORE_FILE);
+    std::fs::write(&store, b"tampered").unwrap();
+    let handler = crate::ControlHandler::new(std::sync::Arc::new(crate::Registry::default()))
+        .with_config_runtime(owner.clone())
+        .with_privileged_operator_prompt(crate::daemon_config::PrivilegedOperatorPrompt::Enforce);
+    let (sender, _receiver) = tokio::sync::mpsc::channel(16);
+    let sink = crate::FrameSink::new(sender);
+    let ctx = crate::RouteCtx {
+        connection_id: ConnectionId::new(50),
+        egress: sink,
+    };
+    for op in [
+        "config.plan",
+        "supervisor.set_enabled",
+        "supervisor.rescan",
+        "supervisor.rescan_checked",
+        "supervisor.restart",
+        "supervisor.reload",
+        "supervisor.swap",
+        "route.open",
+        "catalog.list",
+        "operator.confirm",
+        "scope.served_by",
+        "activity.record",
+        "config.declare",
+        "config.applied",
+        "unknown.op",
+    ] {
+        let frame = subc_protocol::Frame::build(
+            subc_protocol::FrameType::Request,
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&json!({"op":op})).unwrap(),
+        )
+        .unwrap();
+        let reply = handler.handle_control_frame(&ctx, frame).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reply[0].body).unwrap();
+        assert_eq!(body["code"], "config_gated", "{op}: {body}");
+        assert_eq!(std::fs::read(&store).unwrap(), b"tampered", "{op}");
+    }
+    assert_eq!(owner.status().unwrap().state, "store_unverified");
+    assert_eq!(std::fs::read(store).unwrap(), b"tampered");
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello() {
@@ -995,7 +1114,13 @@ fn config_owner_recovery_refuses_changes_but_can_plan_and_commit_restamp() {
     )
     .unwrap();
     let owner = rig.owner("recovery");
-    rig.declare(&owner, 20);
+    assert_eq!(
+        owner
+            .declare(ConnectionId::new(20), "a", rig.declaration.clone(), true)
+            .unwrap_err()
+            .code,
+        "config_gated"
+    );
     assert_eq!(owner.status().unwrap().state, "store_unverified");
     assert_eq!(
         owner.prepare(PlanKind::Change).err().unwrap().code,

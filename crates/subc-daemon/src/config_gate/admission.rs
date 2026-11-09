@@ -22,6 +22,12 @@ struct ModuleAdmission {
 }
 
 impl AdmissionCache {
+    pub(super) fn is_recovering(&self) -> bool {
+        matches!(
+            self.state,
+            StoreState::StoreMissing | StoreState::StoreUnverified
+        )
+    }
     pub(super) fn held_modules(&self) -> Vec<String> {
         self.modules
             .iter()
@@ -159,6 +165,9 @@ impl AdmissionCache {
 
     pub(super) fn from_state(state: &OwnerState) -> Self {
         let mut cache = Self::from_store_at(&state.store, state.delivery.started_at_generation());
+        if state.recovery_exit_hold {
+            cache.state = StoreState::StoreUnverified;
+        }
         for (module, program_base) in &state.refused_generations {
             if let Some(authority) = cache
                 .modules

@@ -929,3 +929,40 @@ fn approval_recovery_unstamp_uses_fixed_os_sentence_without_a_phone() {
     assert_eq!(rig.approve(&view, &caller).unwrap(), 1);
     assert_eq!(rig.store.status().state, StoreState::Unstamped);
 }
+
+#[test]
+fn config_recovery_desktop_unstamp_still_uses_the_fixed_os_sentence() {
+    let mut rig = Rig::new();
+    rig.stamp();
+    let file = std::fs::read_dir(&rig.path)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(file, b"tampered store").unwrap();
+    assert!(rig.store.check().is_err());
+    let view = rig
+        .gate
+        .plan(
+            &mut rig.store,
+            PlanKind::Unstamp,
+            rig.current.clone(),
+            &rig.current,
+            complex,
+        )
+        .unwrap();
+    let caller = facts(true);
+    let challenge = rig
+        .gate
+        .begin_approval(&view.digest, &mut rig.store, &rig.current, &caller)
+        .unwrap();
+    assert!(
+        matches!(challenge, ApprovalChallenge::OsPrompt { .. }),
+        "{challenge:?}"
+    );
+    assert!(challenge
+        .prompt()
+        .unwrap()
+        .starts_with("Config files become authoritative again"));
+}

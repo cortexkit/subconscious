@@ -35,6 +35,111 @@ async fn failed_module() -> SupervisedModule {
     module
 }
 
+#[tokio::test(start_paused = true)]
+async fn config_recovery_cancels_a_preexisting_slow_retry_without_spending_budget() {
+    let dir = cortexkit_test_support::ScratchDir::new("recovery-slow-retry");
+    let path = dir.join("subc.jsonc");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "version":1,"modules":{"slow-retry-child":{
+                "program":"/bin/sh", "args":["-c","exit 17"], "protocol":"none"
+            }}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let owner = Arc::new(crate::config_gate::runtime::RuntimeOwner::new(
+        "slow-recovery".into(),
+        crate::config_store::ConfigStore::open_digest_only_for_tests(
+            crate::config_store::StoreRoot::from_service_definition(dir.join("store")).unwrap(),
+        ),
+        crate::config_gate::capture::ConfigCapturer {
+            daemon_path: path,
+            config_home: dir.path().to_path_buf(),
+            projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+        },
+    ));
+    let policy = RestartPolicy::new(1, Duration::ZERO).with_window(Duration::from_secs(3600));
+    let registry = Arc::new(Registry::default());
+    let forwarding = Arc::new(ForwardingTable::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new_for_test(registry.clone(), policy)
+        .with_handle(handle.clone())
+        .with_forwarding(forwarding.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor
+        .supervise_configured_requested_async(
+            crashing_spec(),
+            true,
+            HealthConfig::default(),
+            None,
+            policy,
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .unwrap();
+    wait_failed(&module, 2).await;
+    assert!(
+        module.next_retry_at_ms().unwrap().is_some(),
+        "the retry must be armed before tamper"
+    );
+    let plan = owner.prepare(crate::config_gate::PlanKind::Stamp).unwrap();
+    let plan = owner
+        .finish_plan(plan, crate::config_gate::runtime::daemon_review)
+        .unwrap();
+    let facts = crate::config_gate::ApprovalFacts {
+        connection: 7,
+        owner_uid: true,
+        desktop_app: true,
+        attested_operator_app: true,
+        os_prompt_available: true,
+        phone: None,
+        caller: crate::caller_identity::CallerIdentity::default(),
+    };
+    owner
+        .desktop_view_delivered(crate::ConnectionId::new(7), &plan)
+        .unwrap();
+    let challenge = owner.begin_approval(&plan.digest, &facts).unwrap();
+    owner
+        .finish_approval(
+            challenge.attempt(),
+            &facts,
+            crate::config_gate::ApprovalReply::Presence(
+                crate::config_gate::PresenceDecision::InteractiveApproval,
+            ),
+            1,
+        )
+        .unwrap();
+    std::fs::write(
+        dir.join("store").join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(owner.check_recovery().unwrap());
+    let before = module.status().unwrap();
+    let handler = Arc::new(
+        crate::ControlHandler::with_forwarding(registry, forwarding)
+            .with_supervisor(handle)
+            .with_config_runtime(owner),
+    );
+    let worker = handler.spawn_config_delivery_worker().unwrap();
+    wait_for("recovery cancels the already-armed retry", || {
+        module.next_retry_at_ms().unwrap().is_none()
+    })
+    .await;
+    assert_eq!(module.status().unwrap().restart_count, before.restart_count);
+    assert!(module.next_retry_at_ms().unwrap().is_none());
+    tokio::time::advance(Duration::from_secs(7200)).await;
+    tokio::task::yield_now().await;
+    let after = module.status().unwrap();
+    assert_eq!(after.spawn_generation, before.spawn_generation);
+    assert_eq!(after.lifetime_restarts, before.lifetime_restarts);
+    assert!(module.next_retry_at_ms().unwrap().is_none());
+    worker.abort();
+}
+
 async fn wait_failed(module: &SupervisedModule, generation: u64) {
     wait_for(
         &format!("budget failure at generation {generation}"),

@@ -2492,7 +2492,7 @@ impl SupervisorHandle {
             .cloned()
     }
 
-    fn apply_identity_configuration(&self, spec: &ModuleSpec) {
+    pub(crate) fn apply_identity_configuration(&self, spec: &ModuleSpec) {
         self.set_reserved_prefixes(&spec.module_id, &spec.reserved_prefixes);
         let spawn_nonce = self
             .spawn_nonces
@@ -8401,7 +8401,11 @@ async fn handle_supervisor_command(
             true
         }
         SupervisorCommand::ConfigExitHold { reply } => {
-            let result = if child.is_none() {
+            let held = runtime
+                .config_delivery
+                .as_ref()
+                .is_some_and(|delivery| delivery.0.check_module_hold(&spec.module_id).is_err());
+            let result = if held {
                 cancel_deferred_reload(
                     runtime,
                     &spec.module_id,
@@ -8412,10 +8416,14 @@ async fn handle_supervisor_command(
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) = None;
                 update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                    state.state = ModuleState::Stopped;
+                    if child.is_none() {
+                        state.state = ModuleState::Stopped;
+                    }
                     state.respawn_pending = false;
                     state.failed_retry.pending = None;
-                    clear_current_process_facts(state);
+                    if child.is_none() {
+                        clear_current_process_facts(state);
+                    }
                 })
             } else {
                 Ok(())

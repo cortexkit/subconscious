@@ -4,6 +4,7 @@ use super::*;
 mod admission;
 mod delivery_worker;
 mod phone;
+mod recovery;
 mod route_policy;
 
 /// Bound each immutable module review so an unanswered request cannot approve a plan.
@@ -52,6 +53,14 @@ impl PrivilegedRequest for ConfigControlRequest {
 }
 
 impl ControlHandler {
+    #[cfg(all(test, feature = "test-support", unix))]
+    pub(crate) fn with_config_os_prompt_policy_for_tests(self) -> Self {
+        self.config_runtime
+            .as_ref()
+            .unwrap()
+            .set_os_prompt_policy_for_tests();
+        self
+    }
     fn config_delivery_target_current(
         &self,
         module: &str,
@@ -681,6 +690,7 @@ impl ControlHandler {
                 let now = now_ms();
                 let publish_window = window.clone();
                 let publication_request = request_guard.request.clone();
+                let exit_runtime = runtime.clone();
                 let work = config_work(runtime, move |owner| {
                     let _owned_gates = (operation, module_gates);
                     owner.finish_approval_with_commit_window(
@@ -704,6 +714,8 @@ impl ControlHandler {
                 } else {
                     work.await?
                 };
+                self.reconcile_authority_exit(exit_runtime, generation)
+                    .await?;
                 Ok(ConfigControlResponse::Applied { generation })
             }
             request => {
@@ -838,6 +850,13 @@ impl ControlHandler {
     // The caller holds Callosum's module gate while allocating its RPC or
     // committing approval. This snapshot grants nothing until revalidated there.
     async fn config_phone_surface(&self) -> Option<crate::config_gate::PhoneSurface> {
+        if self
+            .config_runtime
+            .as_ref()
+            .is_some_and(|owner| owner.is_recovering())
+        {
+            return None;
+        }
         if !self.operator_app_policy.phone_enabled {
             return None;
         }

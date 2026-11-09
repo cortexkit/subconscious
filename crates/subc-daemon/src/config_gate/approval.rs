@@ -305,7 +305,10 @@ impl ConfigGate {
         }
         self.next_attempt = self.next_attempt.checked_add(1).ok_or_else(unavailable)?;
         let id = self.next_attempt;
-        let (surface, challenge) = if let Some(channel) = facts.desktop_channel() {
+        let (surface, challenge) = if let Some(channel) = facts
+            .desktop_channel()
+            .filter(|_| !(plan.recovery && plan.kind == PlanKind::Unstamp))
+        {
             if !facts.os_prompt_available {
                 return Err(unavailable());
             }

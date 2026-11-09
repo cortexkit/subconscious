@@ -2051,7 +2051,15 @@ impl ControlHandler {
                             );
                             return Ok(vec![control_error_frame(
                                 &frame,
-                                "program_refused",
+                                if self
+                                    .config_runtime
+                                    .as_ref()
+                                    .is_some_and(|owner| owner.is_recovering())
+                                {
+                                    "config_gated"
+                                } else {
+                                    "program_refused"
+                                },
                                 "the spawned program binding failed",
                             )?]);
                         }
@@ -2100,6 +2108,16 @@ impl ControlHandler {
                 // This additive operation is not part of the existing exhaustive
                 // module-control enum. Probe the op before decoding that enum.
                 let op = serde_json::from_slice::<ControlOpProbe>(&frame.body).ok();
+                if let Some(refusal) = self
+                    .recovery_request_refusal(
+                        ctx,
+                        &frame,
+                        op.as_ref().map(|probe| probe.op.as_str()),
+                    )
+                    .await?
+                {
+                    return Ok(vec![refusal]);
+                }
                 if let Some(probe) = op
                     .as_ref()
                     .filter(|probe| config_gate::is_module_config_op(&probe.op))
@@ -2574,10 +2592,29 @@ impl ControlHandler {
             .and_then(|value| value.get("module_id"))
             .and_then(|value| value.as_str())
         {
+            let recovering = self
+                .config_runtime
+                .as_ref()
+                .is_some_and(|owner| owner.check_recovery().unwrap_or(true));
+            if recovering
+                && !hello_value
+                    .get("launch_nonce")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|nonce| {
+                        self.supervisor.spawned_consumer_authorized(module, nonce)
+                            && self.supervisor.has_program_binding(module, nonce)
+                    })
+            {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "config_gated",
+                    "recovery admits only previously bound supervised launches",
+                )?]);
+            }
             if self
                 .config_runtime
                 .as_ref()
-                .is_some_and(|owner| owner.module_is_gated(module))
+                .is_some_and(|owner| !recovering && owner.module_is_gated(module))
                 && (self
                     .config_runtime
                     .as_ref()
@@ -2766,7 +2803,24 @@ impl ControlHandler {
             .config_runtime
             .as_ref()
             .is_some_and(|owner| owner.module_is_gated(module));
+        let recovering = self
+            .config_runtime
+            .as_ref()
+            .is_some_and(|owner| owner.is_recovering());
+        if recovering
+            && !hello.launch_nonce.as_deref().is_some_and(|nonce| {
+                self.supervisor.spawned_consumer_authorized(module, nonce)
+                    && self.supervisor.has_program_binding(module, nonce)
+            })
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "config_gated",
+                "recovery admits only previously bound supervised launches",
+            )?]);
+        }
         if required
+            && !recovering
             && (self
                 .config_runtime
                 .as_ref()

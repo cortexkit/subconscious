@@ -31,6 +31,7 @@ impl ControlHandler {
             let mut wakes = HashMap::<ConnectionId, Arc<Notify>>::new();
             let recording = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
             let mut restarting = HashSet::<(String, u64)>::new();
+            let mut recovery_holds = HashSet::<String>::new();
             loop {
                 let next_anchor = {
                     let Some(control) = handler.upgrade() else {
@@ -39,9 +40,10 @@ impl ControlHandler {
                     let Some(owner) = &control.config_runtime else {
                         break;
                     };
-                    let Ok((next, withdrawals, exits, pending, recoveries, holds, releases)) =
+                    let Ok((next, withdrawals, exits, pending, recoveries, holds, mut releases)) =
                         owner
                             .on_blocking(|owner| {
+                                let _ = owner.check_recovery();
                                 let next = owner.retry_anchor().ok().flatten();
                                 let withdrawals = owner.take_phone_withdrawals();
                                 let exits = owner.delivery_exits().unwrap_or_default();
@@ -70,6 +72,28 @@ impl ControlHandler {
                     else {
                         break;
                     };
+                    if let Ok(Some(generation)) = owner
+                        .on_blocking(|owner| owner.pending_authority_exit())
+                        .await
+                    {
+                        if let Err(error) = control
+                            .reconcile_authority_exit(owner.clone(), generation)
+                            .await
+                        {
+                            warn!(%error, "approved configuration exit could not be reconciled");
+                        }
+                    }
+                    if owner.is_recovering() {
+                        for module in control.supervisor.list() {
+                            if recovery_holds.insert(module.module_id().to_owned()) {
+                                tasks.spawn(async move {
+                                    let _ = module.config_exit_hold().await;
+                                });
+                            }
+                        }
+                    } else {
+                        releases.extend(recovery_holds.drain());
+                    }
                     for module in holds {
                         if let Some(supervised) = control
                             .supervisor
@@ -81,7 +105,10 @@ impl ControlHandler {
                             });
                         }
                     }
-                    for module in releases {
+                    for module in releases.into_iter().collect::<HashSet<_>>() {
+                        if owner.check_module_hold(&module).is_err() {
+                            continue;
+                        }
                         if let Some(supervised) =
                             control.supervisor.get(&module).filter(|supervised| {
                                 supervised
@@ -252,6 +279,37 @@ async fn module_worker(
                 break;
             };
             let connection = registration.connection_id;
+            if owner
+                .on_blocking(move |owner| owner.take_unstamp_hint(connection))
+                .await
+                .unwrap_or(false)
+            {
+                let hint = subc_protocol::config::ConfigChanged::new(0, vec![]);
+                if let Ok(frame) = serde_json::to_vec(&hint)
+                    .ok()
+                    .and_then(|body| {
+                        Frame::build_with_version(
+                            registration.negotiated_ver,
+                            FrameType::Push,
+                            control_flags(),
+                            0,
+                            0,
+                            0,
+                            body,
+                        )
+                        .ok()
+                    })
+                    .ok_or(())
+                {
+                    drop(_guard);
+                    let _ = timeout_at(
+                        Instant::now() + CONFIG_LIVE_ACK_TIMEOUT,
+                        sink.send_flushed(frame),
+                    )
+                    .await;
+                    _guard = gate.lock().await;
+                }
+            }
             let view = module_work(owner, module, move |owner, module| {
                 owner.module_get(
                     connection,

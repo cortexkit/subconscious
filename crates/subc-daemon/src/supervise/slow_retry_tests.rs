@@ -497,7 +497,12 @@ fn assert_first_retry(module: &SupervisedModule) {
 #[tokio::test(start_paused = true)]
 async fn daemon_respawn_creation_failure_schedules_recovery() {
     let module = parked_actor(ModuleState::Restarting, Some(true), false, false, true);
-    advance_to_failure(&module).await;
+    // The respawn is due now, but executable preparation runs on a blocking
+    // worker. Wait for its real missing-program error without advancing time.
+    wait_for("daemon respawn creation failure", || {
+        module.state().unwrap() == ModuleState::Failed
+    })
+    .await;
     assert_first_retry(&module);
     module.stop().await.unwrap();
 }
@@ -514,7 +519,15 @@ async fn daemon_respawn_registration_failure_schedules_once() {
 #[tokio::test(start_paused = true)]
 async fn daemon_previous_instance_start_failure_schedules_recovery() {
     let module = parked_actor(ModuleState::Starting, None, true, false, false);
-    advance_to_failure(&module).await;
+    // Let the monitor arm its previous-instance poll, then make that poll due.
+    // Only the poll uses virtual time; missing-program preparation runs on a
+    // blocking worker and must finish before checking the recovery schedule.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    wait_for("daemon previous-instance start failure", || {
+        module.state().unwrap() == ModuleState::Failed
+    })
+    .await;
     assert_first_retry(&module);
     module.stop().await.unwrap();
 }

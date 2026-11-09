@@ -367,6 +367,7 @@ impl ControlHandler {
         let _ = runtime.set_activity(self.activity.clone());
         runtime.install_module_route_authority(Arc::new(route_policy::ModuleRouteAuthority(
             self.clone(),
+            Arc::downgrade(&runtime),
         )));
         let capability = subc_protocol::config::CONFIG_GATE_CAPABILITY;
         if !self

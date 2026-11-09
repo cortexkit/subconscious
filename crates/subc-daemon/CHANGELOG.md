@@ -2,6 +2,30 @@
 
 ## 0.41.10
 
+- Recheck the current process's content at HELLO, not only its initial executable
+  inode or readiness latch. Hash Linux's live executable descriptor; compare
+  macOS kernel code-directory hashes with validated approved-file hashes; retain
+  Windows write-exclusion handles until HELLO or exit. Rehash script and declared
+  files at spawn and HELLO. Refuse unsigned macOS gated images and unsupported
+  gated platforms, and kill the whole container on a definite content mismatch.
+- Bind refusal publication to the approved program identities used by the failed
+  check, retire volatile holds
+  with durable records, and defer transient capture failures with bounded delay.
+  Keep registered actors and exit observations responsive to commands while
+  configuration authority is busy. Approving only executable or launch-field
+  changes does not require the running module's configuration-review RPC;
+  module-layer and declaration changes still require that review.
+- Bind route-policy installation to its active connection, delivery attempt and
+  unexpired ACK. While approved configuration is authoritative, refuse executing
+  rescans before the generic privileged-operation prompt, record their proposals,
+  and prevent live file reconfiguration from replacing approved supervision
+  policy, including while a swap candidate warms.
+- Preserve configured reservation policy instead of adding sticky legacy nonce
+  reservations for gated launches. Explicit nonce and current-content checks
+  protect gated identities even while stopped or held. Module reconnects after
+  promotion and disabling configuration approval with unstamp preserve the
+  configured reservation policy.
+
 - Admit every supervised launch against approved configuration and covered program
   files. Resolve executable and supported shebang interpreters once, bind the
   executed image to the retained hash witness, and withhold HELLO service until

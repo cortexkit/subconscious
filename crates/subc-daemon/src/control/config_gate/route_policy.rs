@@ -4,7 +4,10 @@ use crate::config_gate::runtime::{
     RoutePolicyReceipt,
 };
 
-pub(super) struct ModuleRouteAuthority(pub(super) ControlHandler);
+pub(super) struct ModuleRouteAuthority(
+    pub(super) ControlHandler,
+    pub(super) std::sync::Weak<crate::config_gate::runtime::RuntimeOwner>,
+);
 
 struct AckedPolicyReceipt;
 impl RoutePolicyReceipt for AckedPolicyReceipt {
@@ -19,6 +22,17 @@ impl RoutePolicyAuthority for ModuleRouteAuthority {
 
     fn install_and_revoke<'a>(&'a self, policy: ApprovedRoutePolicy) -> RoutePolicyInstall<'a> {
         Box::pin(async move {
+            if !self
+                .1
+                .upgrade()
+                .ok_or_else(|| GateError::new("config_gated", "configuration authority is absent"))?
+                .route_policy_authorized(&policy)?
+            {
+                return Err(GateError::new(
+                    "delivery_superseded",
+                    "route policy ACK is no longer current or has expired",
+                ));
+            }
             // RuntimeOwner calls this only after the target's configuration ACK.
             // The module owns bind policy; the daemon invalidates old decisions.
             let (routes, goodbyes) = self

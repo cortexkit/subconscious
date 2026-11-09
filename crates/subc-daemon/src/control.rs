@@ -2044,7 +2044,15 @@ impl ControlHandler {
                         }
                     }
                 }
-                self.handle_hello(ctx.connection_id, Some(ctx.egress.clone()), frame)
+                let handler = self.clone();
+                let connection = ctx.connection_id;
+                let egress = ctx.egress.clone();
+                let correlation = frame.header.corr;
+                tokio::task::spawn_blocking(move || {
+                    handler.handle_hello(connection, Some(egress), frame)
+                })
+                .await
+                .map_err(|error| RouterError::backend(0, correlation, error.to_string()))?
             }
             FrameType::Goodbye => self.handle_goodbye(ctx.connection_id),
             FrameType::Cancel => {
@@ -2498,6 +2506,39 @@ impl ControlHandler {
     fn handle_hello(
         &self,
         connection_id: ConnectionId,
+        egress: Option<crate::router::FrameSink>,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        #[cfg(windows)]
+        let binding = serde_json::from_slice::<serde_json::Value>(&frame.body)
+            .ok()
+            .and_then(|value| {
+                Some((
+                    value
+                        .get("manifest")?
+                        .get("module_id")?
+                        .as_str()?
+                        .to_owned(),
+                    value.get("launch_nonce")?.as_str()?.to_owned(),
+                ))
+            });
+        let result = self.handle_hello_checked(connection_id, egress, frame);
+        #[cfg(windows)]
+        if result.as_ref().is_ok_and(|frames| {
+            frames
+                .iter()
+                .any(|frame| frame.header.ty == FrameType::HelloAck)
+        }) {
+            if let Some((module, nonce)) = binding {
+                self.supervisor.program_hello_accepted(&module, &nonce);
+            }
+        }
+        result
+    }
+
+    fn handle_hello_checked(
+        &self,
+        connection_id: ConnectionId,
         sink: Option<crate::FrameSink>,
         frame: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
@@ -2540,10 +2581,17 @@ impl ControlHandler {
                 .config_runtime
                 .as_ref()
                 .is_some_and(|owner| owner.module_is_gated(module))
-                && !hello_value
-                    .get("launch_nonce")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|nonce| self.supervisor.spawned_consumer_authorized(module, nonce))
+                && (self
+                    .config_runtime
+                    .as_ref()
+                    .is_some_and(|owner| owner.check_module_hold(module).is_err())
+                    || !hello_value
+                        .get("launch_nonce")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|nonce| {
+                            self.supervisor.spawned_consumer_authorized(module, nonce)
+                                && self.supervisor.has_program_binding(module, nonce)
+                        }))
             {
                 return Ok(vec![control_error_frame(
                     &frame,
@@ -2561,19 +2609,29 @@ impl ControlHandler {
                 .get("launch_nonce")
                 .and_then(|value| value.as_str()),
         ) {
-            if !self.supervisor.program_binding_verified(module, nonce) {
+            let binding = self.supervisor.has_program_binding(module, nonce);
+            let required = self
+                .config_runtime
+                .as_ref()
+                .is_some_and(|owner| owner.module_is_gated(module));
+            if let Some(error) = (binding || required)
+                .then(|| {
+                    self.supervisor
+                        .check_current_program_binding(module, nonce)
+                        .err()
+                })
+                .flatten()
+            {
+                let code = if error.code == "program_refused" {
+                    "program_refused"
+                } else {
+                    "config_delivery_deferred"
+                };
                 self.forwarding.request_connection_close(
                     connection_id,
-                    CloseReason::new(
-                        "program_refused",
-                        "the spawned program binding is not verified",
-                    ),
+                    CloseReason::new(code, error.detail.clone()),
                 );
-                return Ok(vec![control_error_frame(
-                    &frame,
-                    "program_refused",
-                    "the spawned program binding is not verified",
-                )?]);
+                return Ok(vec![control_error_frame(&frame, code, error.detail)?]);
             }
         }
         if let Err(err) = validate_hello_capability_grammar(&hello_value) {

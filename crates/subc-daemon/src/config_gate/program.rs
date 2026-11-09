@@ -28,21 +28,72 @@ pub(crate) struct ProgramLaunch {
 }
 
 impl ProgramLaunch {
-    pub(crate) fn current(&self) -> bool {
-        self.bindings.iter().all(|(path, identity)| {
-            #[cfg(unix)]
-            {
-                subc_os::file_identity(path) == Some(*identity)
+    pub(crate) fn validate_for_spawn(&self) -> Result<()> {
+        self.check_files(false)?;
+        #[cfg(target_os = "macos")]
+        if self
+            .executable_value()?
+            .get("cdhashes")
+            .and_then(|value| value.as_array())
+            .is_none_or(|hashes| hashes.is_empty())
+        {
+            return Err(GateError::new(
+                "program_refused",
+                "approved executable has no validated code directory",
+            ));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        return Err(GateError::new(
+            "program_refused",
+            "content binding is unsupported on this platform",
+        ));
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        Ok(())
+    }
+    pub(crate) fn check_files(&self, auxiliary_only: bool) -> Result<()> {
+        for (path, _) in &self.bindings {
+            if auxiliary_only && *path == self.spec.program {
+                continue;
             }
-            #[cfg(windows)]
+            let key = InputKey::Program {
+                module: self.spec.module_id.clone(),
+                path: path.to_string_lossy().into_owned(),
+            };
+            let (_, actual) = capture_program(path)
+                .map_err(|error| GateError::new("config_delivery_deferred", error.detail))?;
+            if self
+                .inputs
+                .get(&key)
+                .is_none_or(|expected| expected.state != actual.state)
             {
-                std::fs::canonicalize(path)
-                    .ok()
-                    .and_then(|path| subc_os::open_regular_nofollow(&path).ok())
-                    .and_then(|file| subc_os::retained_file_identity(&file).ok())
-                    == Some(*identity)
+                return Err(GateError::new(
+                    "program_refused",
+                    "covered file content differs from its approved witness",
+                ));
             }
-        })
+        }
+        Ok(())
+    }
+    pub(crate) fn executable_value(&self) -> Result<&serde_json::Value> {
+        self.inputs
+            .get(&InputKey::Program {
+                module: self.spec.module_id.clone(),
+                path: self.spec.program.to_string_lossy().into_owned(),
+            })
+            .and_then(|input| match &input.value {
+                subc_config::RecordedValue::Value { value } => Some(value),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                GateError::new(
+                    "program_refused",
+                    "approved executable witness is unavailable",
+                )
+            })
+    }
+    #[cfg(windows)]
+    pub(crate) fn release_hello_handles(&mut self) {
+        self._windows_files.clear();
     }
 }
 
@@ -67,6 +118,18 @@ pub(crate) fn program_files(entry: &serde_json::Value) -> Result<Vec<String>> {
             Ok(path.to_owned())
         })
         .collect()
+}
+
+pub(crate) fn definite_program_change(approved: &BTreeMap<InputKey, CapturedInput>) -> bool {
+    approved.iter().any(|(key, expected)| {
+        let InputKey::Program { path, .. } = key else {
+            return false;
+        };
+        if std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
+            return true;
+        }
+        capture_program(Path::new(path)).is_ok_and(|(_, actual)| actual.state != expected.state)
+    })
 }
 
 fn resolve(spec: &ModuleSpec) -> Result<SpawnProgramBinding> {
@@ -133,6 +196,8 @@ fn known_interpreter(path: &Path) -> bool {
         })
 }
 
+const GATED_SCRIPTS_ALLOWED: bool = true;
+
 pub(crate) fn capture(spec: &ModuleSpec, covered: &[String]) -> Result<ProgramLaunch> {
     let binding = resolve(spec)?;
     let mut launch = spec.clone();
@@ -146,6 +211,12 @@ pub(crate) fn capture(spec: &ModuleSpec, covered: &[String]) -> Result<ProgramLa
     .map_err(|error| GateError::new("program_refused", error))?;
     let mut image = binding.identity;
     if let Some(words) = shebang(&script)? {
+        if !GATED_SCRIPTS_ALLOWED {
+            return Err(GateError::new(
+                "program_refused",
+                "gated scripts are disabled",
+            ));
+        }
         let env_form = words[0] == "/usr/bin/env";
         if env_form
             && (words.len() != 2
@@ -285,7 +356,7 @@ mod windows_tests {
             carry_containment: false,
         };
         let launch = capture(&spec, &[covered.to_string_lossy().into_owned()]).unwrap();
-        assert!(launch.current());
+        assert!(launch.check_files(false).is_ok());
         assert_eq!(
             std::fs::rename(&covered, path.join("replaced.cjs"))
                 .unwrap_err()

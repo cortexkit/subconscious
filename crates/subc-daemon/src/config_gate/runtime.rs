@@ -365,6 +365,18 @@ impl std::ops::DerefMut for OwnerGuard<'_> {
 }
 impl Drop for OwnerGuard<'_> {
     fn drop(&mut self) {
+        // Volatile holds follow the same lifetime as their durable records.
+        // Approving another program identity retires the previous identity's
+        // volatile hold, even if that previous identity is later approved again.
+        let (_, body) = self.0.store.loaded_admission_state();
+        let valid: std::collections::BTreeSet<_> = body
+            .program_refusals
+            .iter()
+            .map(|refusal| (refusal.module.clone(), refusal.approved_base.clone()))
+            .collect();
+        self.0
+            .refused_generations
+            .retain(|module, base| valid.contains(&(module.clone(), base.clone())));
         let next = admission::AdmissionCache::from_state(&self.0);
         if let Ok(mut cache) = self.1.write() {
             let (holds, releases) = next.transitions_from(&cache);
@@ -964,6 +976,7 @@ impl RuntimeOwner {
         let review_modules: BTreeSet<String> = touched_modules
             .iter()
             .filter(|module| candidate.modules.contains_key(*module))
+            .filter(|module|matches!(kind,PlanKind::Stamp|PlanKind::Unstamp) || candidate.diagnostic.changed_keys(&old).iter().any(|key|matches!(key,super::InputKey::Layer {module:owner,..}|super::InputKey::Declaration(owner) if owner==*module)))
             .cloned()
             .collect();
         let program_keys: Vec<_> = candidate

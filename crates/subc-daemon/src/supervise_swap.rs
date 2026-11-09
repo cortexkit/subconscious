@@ -82,7 +82,7 @@ enum Warm {
 #[derive(Default)]
 pub(super) struct SwapEnd {
     /// Commands for the loop to run next, in arrival order: configuration
-    /// updates that arrived during the warm-up (already answered, applied now
+    /// ungated updates that arrived during warm-up (already answered, applied now
     /// that the swap no longer holds the spec), followed by an interrupting stop,
     /// disable or retire, or the approved restart that superseded the candidate.
     pub(super) requeue: Vec<SupervisorCommand>,
@@ -650,9 +650,10 @@ async fn dispatch_retirement(
 /// readiness budget. It is returned so the swap can kill its candidate and the
 /// loop can then carry it out on the incumbent. Restart, reload and a second
 /// swap are refused with a typed error rather than queued; enabling an already
-/// enabled module is answered as the no-op it is. A configuration update is
-/// answered at once and applied when the swap ends, since the swap is using the
-/// spec it replaces.
+/// enabled module is answered as the no-op it is. An ungated configuration update
+/// is answered at once and applied when the swap ends, since the swap is using
+/// the spec it replaces. File updates are refused without queueing while the
+/// daemon uses approved configuration instead of live file authority.
 async fn wait_for_config_gate(
     runtime: &SupervisorRuntimeConfig,
     module: &str,
@@ -670,7 +671,7 @@ async fn wait_for_config_gate(
             guard = gate.lock() => { drop(guard); return true; }
             command = commands.recv() => {
                 let Some(command) = command else { return false; };
-                if let Some(interrupt) = serve_command_while_warming(module, command, end) {
+                if let Some(interrupt) = serve_command_while_warming(module, command, end,runtime.config_delivery.as_ref().is_some_and(|delivery|delivery.0.module_is_gated(module))) {
                     end.requeue.push(interrupt);
                     return false;
                 }
@@ -683,6 +684,7 @@ fn serve_command_while_warming(
     module_id: &str,
     command: SupervisorCommand,
     end: &mut SwapEnd,
+    gated: bool,
 ) -> Option<SupervisorCommand> {
     let in_progress = || SuperviseError::SwapInProgress {
         module_id: module_id.to_string(),
@@ -717,13 +719,21 @@ fn serve_command_while_warming(
             }));
             None
         }
+        SupervisorCommand::UpdateConfiguration { reply, .. } if gated => {
+            let _ = reply.send(Err(SuperviseError::ConfigHeld {
+                module_id: module_id.into(),
+                code: "config_gated".into(),
+                detail: "live file reconfiguration cannot replace stamped authority".into(),
+            }));
+            None
+        }
         SupervisorCommand::UpdateConfiguration {
             spec,
             health,
             drain_timeout_ms,
             reply,
         } => {
-            let _ = reply.send(());
+            let _ = reply.send(Ok(()));
             // The caller has its answer; the replayed command's reply channel
             // has no receiver and is only there to fit the command's shape.
             let (unanswered, _) = oneshot::channel();
@@ -931,7 +941,7 @@ async fn warm_candidate(
                     }
                     continue;
                 }
-                if let Some(command) = serve_command_while_warming(module_id, command, end) {
+                if let Some(command) = serve_command_while_warming(module_id, command, end,config_delivery.is_some_and(|delivery|delivery.0.module_is_gated(module_id))) {
                     return Warm::Interrupted { command: Some(command), connection: registered };
                 }
             }
@@ -1225,6 +1235,32 @@ async fn retire_incumbent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn config_admission_swap_cannot_ack_or_queue_an_unapproved_configuration_update() {
+        let (_rig, _owner, _supervisor, _handler, spec) =
+            crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+        let (reply, answer) = oneshot::channel();
+        let mut end = SwapEnd::default();
+        assert!(serve_command_while_warming(
+            &spec.module_id.clone(),
+            SupervisorCommand::UpdateConfiguration {
+                spec,
+                health: HealthConfig::default(),
+                drain_timeout_ms: None,
+                reply
+            },
+            &mut end,
+            true
+        )
+        .is_none());
+        assert!(matches!(
+            answer.await.unwrap(),
+            Err(SuperviseError::ConfigHeld { .. })
+        ));
+        assert!(end.requeue.is_empty());
+    }
 
     #[cfg(unix)]
     struct ConfigTimingFixture {

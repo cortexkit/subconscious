@@ -331,6 +331,12 @@ pub struct ConfigStore {
     hooks: Option<testing::TestSupport>,
 }
 impl ConfigStore {
+    #[cfg(all(test, unix))]
+    pub(crate) fn clear_delivery_snapshot_for_test(&mut self, generation: u64) {
+        let mut body = self.envelope.body.clone();
+        body.generations.get_mut(&generation).unwrap().delivery = None;
+        self.publish(body, false, wall_time_ms()).unwrap();
+    }
     /// A verified loaded view for gate-locked admission. The owner performs
     /// `check` outside the module gate before preparing the launch witness.
     pub(crate) fn loaded_admission_state(&self) -> (StoreState, &StoreBody) {

@@ -1,6 +1,35 @@
 use super::*;
 use std::path::Path;
 
+#[tokio::test(start_paused = true)]
+async fn config_spawn_contended_or_poisoned_admission_backs_off_without_spinning() {
+    let (_rig, _owner, supervisor, _handler, spec) =
+        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+    let runtime = supervisor.runtime_config();
+    let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+    defer_config_spawn(&spec, &runtime, &snapshot, RespawnKind::Spawn).unwrap();
+    let scheduled = runtime.scheduled_respawn.lock().unwrap().unwrap();
+    assert!(
+        scheduled.deadline > Instant::now(),
+        "contention and poison must not re-arm an already-ready timer"
+    );
+    assert!(
+        scheduled.deadline - Instant::now() <= Duration::from_secs(1),
+        "admission retry must remain bounded"
+    );
+    assert_eq!(lock_snapshot(&snapshot).unwrap().crash_restarts.len(), 0);
+}
+
+#[test]
+fn config_spawn_stale_reservation_is_deferred_not_failed() {
+    let (_rig, _owner, _supervisor, _handler, spec) =
+        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+    assert!(matches!(
+        spawn_plan_stale(&spec),
+        SuperviseError::ConfigDeliveryDeferred { .. }
+    ));
+}
+
 fn fifo_at(path: &Path) {
     std::fs::remove_file(path).unwrap();
     assert!(std::process::Command::new("mkfifo")

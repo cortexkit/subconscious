@@ -210,11 +210,23 @@ pub(crate) struct SpawnAdmission {
     pub(crate) launch: Option<program::ProgramLaunch>,
 }
 
+impl SpawnAdmission {
+    pub(crate) fn approved_base(&self) -> Option<&Digest> {
+        self.authority
+            .as_ref()
+            .map(|authority| &authority.program_base)
+    }
+}
+
 impl RuntimeOwner {
     pub(crate) fn module_is_gated(&self, module: &str) -> bool {
         self.admission
             .read()
-            .map(|cache| cache.state == StoreState::Stamped && cache.modules.contains_key(module))
+            .map(|cache| match cache.state {
+                StoreState::Unstamped => false,
+                StoreState::Stamped => cache.modules.contains_key(module),
+                _ => true,
+            })
             .unwrap_or(true)
     }
     pub(crate) fn checked_admission_hold(&self, module: Option<&str>) -> Result<()> {
@@ -224,7 +236,16 @@ impl RuntimeOwner {
         }
         match module {
             Some(module) => self.check_module_hold(module),
-            None => self.check_rescan_hold(),
+            None => {
+                if self
+                    .admission
+                    .read()
+                    .is_ok_and(|cache| cache.state == StoreState::Stamped)
+                {
+                    let _ = self.status();
+                }
+                self.check_rescan_hold()
+            }
         }
     }
     pub(crate) fn take_admission_transitions(&self) -> Result<(Vec<String>, Vec<String>)> {
@@ -261,27 +282,34 @@ impl RuntimeOwner {
     fn refuse_program(
         &self,
         module: &str,
+        base: &Digest,
         inputs: &BTreeMap<InputKey, CapturedInput>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let identity = subc_config::raw_digest(
             &serde_json::to_vec(&inputs.iter().collect::<Vec<_>>()).map_err(GateError::invalid)?,
         );
-        self.record_program_refusal(module, identity)
+        self.record_program_refusal(module, base, identity)
     }
 
-    pub(crate) fn record_program_refusal(&self, module: &str, identity: Digest) -> Result<()> {
+    pub(crate) fn record_program_refusal(
+        &self,
+        module: &str,
+        checked_base: &Digest,
+        identity: Digest,
+    ) -> Result<bool> {
         let mut state = self.lock()?;
         let base = AdmissionCache::from_state(&state)
             .modules
             .get(module)
             .map(|authority| authority.program_base.clone());
-        if let Some(base) = base {
+        if let Some(base) = base.filter(|current| current == checked_base) {
             state
                 .refused_generations
                 .insert(module.to_owned(), base.clone());
             state.store.record_program_refusal(module, base, identity)?;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
     /// Run before taking a module gate; hashing and integrity checks may block.
     pub(crate) fn prepare_spawn(&self, spec: &ModuleSpec) -> Result<SpawnAdmission> {
@@ -315,22 +343,38 @@ impl RuntimeOwner {
                     GateError::new("config_gated", "approved module entry is missing")
                 })?;
             let covered = program::program_files(entry)?;
-            let launch =
-                match program::capture(authority.command.as_ref().unwrap_or(spec), &covered) {
-                    Ok(launch) => launch,
-                    Err(error) => {
-                        self.record_program_refusal(
-                            &spec.module_id,
-                            subc_config::raw_digest(error.to_string().as_bytes()),
-                        )?;
-                        return Err(GateError::new("program_refused", error.detail));
-                    }
-                };
+            let command = authority.command.as_ref().ok_or_else(|| {
+                GateError::new("config_gated", "approved launch command is unavailable")
+            })?;
             let approved: BTreeMap<_, _> = authority.snapshot.inputs.iter()
                 .filter(|(key, _)| matches!(key, InputKey::Program { module, .. } if module == &spec.module_id))
                 .map(|(key, input)| (key.clone(), input.clone())).collect();
+            let launch = match program::capture(command, &covered) {
+                Ok(launch) => launch,
+                Err(error) => {
+                    if program::definite_program_change(&approved) {
+                        if !self.record_program_refusal(
+                            &spec.module_id,
+                            &authority.program_base,
+                            subc_config::raw_digest(error.detail.as_bytes()),
+                        )? {
+                            return Err(GateError::new(
+                                "config_delivery_deferred",
+                                "program approval changed during capture",
+                            ));
+                        }
+                        return Err(GateError::new("program_refused", error.detail));
+                    }
+                    return Err(GateError::new("config_delivery_deferred", error.detail));
+                }
+            };
             if launch.inputs != approved {
-                self.refuse_program(&spec.module_id, &launch.inputs)?;
+                if !self.refuse_program(&spec.module_id, &authority.program_base, &launch.inputs)? {
+                    return Err(GateError::new(
+                        "config_delivery_deferred",
+                        "program approval changed during capture",
+                    ));
+                }
                 return Err(GateError::new(
                     "program_refused",
                     format!(
@@ -389,8 +433,11 @@ impl RuntimeOwner {
                 "configuration store is in recovery",
             ));
         }
-        for module in cache.modules.keys() {
-            cache.decision(module)?;
+        if cache.state == StoreState::Stamped {
+            return Err(GateError::new(
+                "config_gated",
+                "stamped configuration changes require plan and apply, not rescan",
+            ));
         }
         Ok(())
     }

@@ -9,6 +9,94 @@ struct Rig {
     declaration: ConfigDeclareRequest,
 }
 
+#[cfg(windows)]
+#[tokio::test]
+async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello() {
+    use crate::supervise::{RestartPolicy, Supervisor, SupervisorHandle};
+    use std::sync::Arc;
+    let rig = Rig::new();
+    let program = rig.path.join("program.exe");
+    std::fs::copy(
+        std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/ping.exe"),
+        &program,
+    )
+    .unwrap();
+    let covered = rig.path.join("covered.txt");
+    std::fs::write(&covered, b"approved").unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":program,"args":["-t","127.0.0.1"],"protocol":"subc","program_files":[covered]}}})).unwrap()).unwrap();
+    let owner = Arc::new(rig.owner("windows-handle-lifetime"));
+    rig.stamp(&owner);
+    let registry = Arc::new(crate::Registry::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let spec = crate::daemon_config::load(rig.path.join("subc.jsonc"))
+        .unwrap()
+        .unwrap()
+        .modules[0]
+        .module_spec();
+    let module = supervisor.spawn_async(spec).await.unwrap();
+    let before = std::fs::OpenOptions::new().write(true).open(&covered);
+    let excluded = before.as_ref().err().and_then(|error| error.raw_os_error());
+    drop(before);
+    let nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    let handler = crate::ControlHandler::new(registry.clone())
+        .with_supervisor(handle)
+        .with_config_runtime(owner);
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: Some(nonce),
+    };
+    let frame = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&hello).unwrap(),
+    )
+    .unwrap();
+    let mut malformed = frame.clone();
+    let mut invalid: serde_json::Value = serde_json::from_slice(&malformed.body).unwrap();
+    invalid["protocol_ver"] = json!(0);
+    malformed.body = serde_json::to_vec(&invalid).unwrap();
+    let rejected = handler
+        .handle_control(ConnectionId::new(778), malformed)
+        .unwrap();
+    let after_rejection = std::fs::OpenOptions::new().write(true).open(&covered);
+    let still_excluded = after_rejection
+        .as_ref()
+        .err()
+        .and_then(|error| error.raw_os_error());
+    drop(after_rejection);
+    let connection = ConnectionId::new(777);
+    let reply = handler.handle_control(connection, frame).unwrap();
+    let after = std::fs::OpenOptions::new().write(true).open(&covered);
+    let released = after.is_ok();
+    drop(after);
+    let _ = registry.deregister_connection(connection);
+    module.stop().await.unwrap();
+    assert_eq!(
+        excluded,
+        Some(32),
+        "covered file must keep its no-write-share witness after resume and before HELLO"
+    );
+    assert_ne!(rejected[0].header.ty, subc_protocol::FrameType::HelloAck);
+    assert_eq!(
+        still_excluded,
+        Some(32),
+        "a refused HELLO must not release the child's write-exclusion witness"
+    );
+    assert_eq!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
+    assert!(
+        released,
+        "successful HELLO releases the Windows write-exclusion handles"
+    );
+}
+
 #[cfg(unix)]
 #[path = "admission_tests.rs"]
 mod admission_tests;

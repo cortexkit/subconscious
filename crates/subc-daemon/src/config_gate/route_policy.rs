@@ -1,5 +1,6 @@
 //! Trusted installation boundary between reviewed config and live route authority.
 
+use crate::ConnectionId;
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use super::*;
@@ -8,6 +9,7 @@ use super::*;
 /// deserialized from a control request or assembled by an untrusted module.
 #[derive(Clone)]
 pub struct ApprovedRoutePolicy {
+    authorization: Option<(ConnectionId, u64, tokio::time::Instant)>,
     module: String,
     generation: u64,
     digest: Digest,
@@ -188,6 +190,28 @@ pub(super) fn ready(state: &mut OwnerState, module: &str, generation: u64) -> Re
 }
 
 impl RuntimeOwner {
+    pub(crate) fn route_policy_authorized(&self, policy: &ApprovedRoutePolicy) -> Result<bool> {
+        let Some((connection, attempt, deadline)) = policy.authorization else {
+            return Ok(true);
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        let state = self.inner.try_lock().map_err(|_| {
+            GateError::new(
+                "config_delivery_deferred",
+                "configuration publication is busy",
+            )
+        })?;
+        Ok(
+            state.active_declarations.get(&policy.module) == Some(&connection)
+                && state.delivery.policy_authorization(
+                    &policy.module,
+                    policy.generation,
+                    connection,
+                ) == Some((attempt, deadline)),
+        )
+    }
     pub fn with_route_policy_authority(self, authority: Arc<dyn RoutePolicyAuthority>) -> Self {
         let _ = self.route_policy_authority.set(authority);
         self
@@ -234,27 +258,45 @@ impl RuntimeOwner {
                 "config_gated: RoutePolicyAuthority is absent",
             )
         })?;
-        if authority.requires_module_ack() {
+        let authorization = if authority.requires_module_ack() {
             let module_id = module.to_owned();
-            if !self
+            let authorization = self
                 .on_blocking(move |owner| {
-                    Ok(owner
-                        .lock()?
-                        .delivery
-                        .policy_acknowledged(&module_id, generation))
+                    let mut state = owner.lock()?;
+                    let authorization =
+                        state
+                            .active_declarations
+                            .get(&module_id)
+                            .and_then(|connection| {
+                                state
+                                    .delivery
+                                    .policy_authorization(&module_id, generation, *connection)
+                                    .map(|(attempt, deadline)| (*connection, attempt, deadline))
+                            });
+                    if authorization.is_none() {
+                        state.restore_route_policy(&module_id, generation);
+                    }
+                    Ok(authorization)
                 })
-                .await?
-            {
+                .await?;
+            let Some(authorization) = authorization else {
                 return Ok(());
-            }
-        }
+            };
+            Some(authorization)
+        } else {
+            None
+        };
         let module_id = module.to_owned();
         let prepared = self
             .on_blocking(move |owner| owner.prepare_route_policy(&module_id, generation))
             .await?;
-        let Some((policy, previous_generation)) = prepared else {
+        let Some((mut policy, previous_generation)) = prepared else {
             return Ok(());
         };
+        policy.authorization = authorization;
+        if !self.route_policy_authorized(&policy)? {
+            return Ok(());
+        }
         let installation = authority.install_and_revoke(policy).await?;
         let module = module.to_owned();
         self.on_blocking(move |owner| {
@@ -294,6 +336,7 @@ impl RuntimeOwner {
         })?;
         Ok(Some((
             ApprovedRoutePolicy {
+                authorization: None,
                 module: module.into(),
                 generation,
                 digest: entry.generation.plan_digest.clone(),

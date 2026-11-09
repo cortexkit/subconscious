@@ -1,18 +1,31 @@
 use super::*;
 
-pub(super) type ProgramBindings =
-    Arc<Mutex<HashMap<(String, String), tokio::sync::watch::Receiver<Option<bool>>>>>;
+pub(super) type ProgramBindings = Arc<Mutex<HashMap<(String, String), ProgramBindingEntry>>>;
 
 #[derive(Clone, Debug)]
-pub(super) struct ProgramBindingPublication(Arc<tokio::sync::watch::Sender<Option<bool>>>);
+pub(super) struct ProgramBindingEntry {
+    receiver: tokio::sync::watch::Receiver<Option<bool>>,
+    live: Arc<Mutex<std::sync::Weak<content_binding::LiveProgramBinding>>>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ProgramBindingPublication {
+    signal: Arc<tokio::sync::watch::Sender<Option<bool>>>,
+    live: Arc<Mutex<std::sync::Weak<content_binding::LiveProgramBinding>>>,
+}
 
 impl ProgramBindingPublication {
     pub(super) fn verify(&mut self) {
-        self.0.send_replace(Some(true));
+        self.signal.send_replace(Some(true));
     }
     #[cfg(target_os = "macos")]
     pub(super) fn reject(&mut self) {
-        self.0.send_replace(Some(false));
+        self.signal.send_replace(Some(false));
+    }
+    pub(super) fn attach(&self, live: &Arc<content_binding::LiveProgramBinding>) {
+        if let Ok(mut binding) = self.live.lock() {
+            *binding = Arc::downgrade(live);
+        }
     }
 }
 
@@ -21,13 +34,61 @@ impl ProgramBindingPublication {
 mod tests;
 impl Drop for ProgramBindingPublication {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.0) == 1 {
-            self.0.send_replace(Some(false));
+        if Arc::strong_count(&self.signal) == 1 {
+            self.signal.send_replace(Some(false));
         }
     }
 }
 
 impl SupervisorHandle {
+    #[cfg(windows)]
+    pub(crate) fn program_hello_accepted(&self, module: &str, nonce: &str) {
+        let live = self
+            .program_bindings
+            .lock()
+            .ok()
+            .and_then(|bindings| {
+                bindings
+                    .get(&(module.to_owned(), nonce.to_owned()))
+                    .cloned()
+            })
+            .and_then(|entry| entry.live.lock().ok()?.upgrade());
+        if let Some(live) = live {
+            live.hello_accepted();
+        }
+    }
+    pub(crate) fn has_program_binding(&self, module: &str, nonce: &str) -> bool {
+        self.program_binding(module, nonce).is_some()
+    }
+    pub(crate) fn check_current_program_binding(
+        &self,
+        module: &str,
+        nonce: &str,
+    ) -> Result<(), crate::config_gate::GateError> {
+        let refused = || {
+            crate::config_gate::GateError::new(
+                "program_refused",
+                "no current supervised image is bound to this HELLO",
+            )
+        };
+        let entry = self
+            .program_bindings
+            .lock()
+            .map_err(|_| refused())?
+            .get(&(module.to_owned(), nonce.to_owned()))
+            .cloned()
+            .ok_or_else(refused)?;
+        if *entry.receiver.borrow() != Some(true) {
+            return Err(refused());
+        }
+        let live = entry
+            .live
+            .lock()
+            .map_err(|_| refused())?
+            .upgrade()
+            .ok_or_else(refused)?;
+        live.check()
+    }
     pub(crate) fn check_program_review(
         &self,
         module: &str,
@@ -43,6 +104,9 @@ impl SupervisorHandle {
             || !self.program_binding_verified(module, nonce)
         {
             return Err(refused());
+        }
+        if self.has_program_binding(module, nonce) {
+            self.check_current_program_binding(module, nonce)?;
         }
         let child = self.get(module).ok_or_else(refused)?;
         let (status, _identity) = child
@@ -105,8 +169,18 @@ impl SupervisorHandle {
         if role == SpawnRole::Plain {
             bindings.retain(|(owner, _), _| owner != module);
         }
-        bindings.insert((module.to_owned(), nonce), receiver);
-        Some(ProgramBindingPublication(Arc::new(sender)))
+        let live = Arc::new(Mutex::new(std::sync::Weak::new()));
+        bindings.insert(
+            (module.to_owned(), nonce),
+            ProgramBindingEntry {
+                receiver,
+                live: live.clone(),
+            },
+        );
+        Some(ProgramBindingPublication {
+            signal: Arc::new(sender),
+            live,
+        })
     }
 
     fn program_binding(
@@ -118,7 +192,7 @@ impl SupervisorHandle {
             .lock()
             .ok()?
             .get(&(module.to_owned(), nonce.to_owned()))
-            .cloned()
+            .map(|entry| entry.receiver.clone())
     }
 
     pub(crate) async fn wait_program_binding(&self, module: &str, nonce: &str) -> bool {

@@ -43,10 +43,15 @@ async fn config_admission_hello_stays_unregistered_until_its_spawn_binding_passe
     );
     publication.verify();
     assert!(waiting.await);
-    let admitted = handler
+    let unbound = handler
         .handle_control(crate::ConnectionId::new(2), frame)
         .unwrap();
-    assert_eq!(admitted[0].header.ty, subc_protocol::FrameType::HelloAck);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&unbound[0].body).unwrap()["code"],
+        "program_refused",
+        "a ready latch without a current content witness must not authorize HELLO"
+    );
+    assert!(registry.get_module("binding-probe").unwrap().is_none());
     drop(publication);
     assert!(!handle.program_binding_verified("binding-probe", "nonce"));
 }

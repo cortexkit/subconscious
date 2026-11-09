@@ -35,13 +35,21 @@ impl SupervisorRuntimeConfig {
 }
 
 impl<'a> SpawnDelivery<'a> {
-    pub(super) fn record_refusal(&self, spec: &ModuleSpec, detail: &str) {
-        let _ = self
-            .runtime
+    pub(super) fn record_refusal(
+        &self,
+        spec: &ModuleSpec,
+        base: &subc_config::Digest,
+        detail: &str,
+    ) -> bool {
+        self.runtime
             .0
-            .record_program_refusal(&spec.module_id, subc_config::raw_digest(detail.as_bytes()));
+            .record_program_refusal(
+                &spec.module_id,
+                base,
+                subc_config::raw_digest(detail.as_bytes()),
+            )
+            .unwrap_or(true)
     }
-    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn runtime(&self) -> ConfigDelivery {
         self.runtime.clone()
     }
@@ -191,12 +199,12 @@ impl ConfigDelivery {
             }
         }
     }
-    pub(super) async fn registered(
+    pub(super) fn queue_registered(
         &self,
         module: &str,
-        forwarding: Option<&ForwardingTable>,
-        registry: &Registry,
-        child: &SupervisedChild,
+        forwarding: Option<&Arc<ForwardingTable>>,
+        registry: &Arc<Registry>,
+        child: &mut SupervisedChild,
     ) {
         let Some(spawn) = &child.config_delivery else {
             return;
@@ -204,7 +212,6 @@ impl ConfigDelivery {
         let Ok(gate) = self.0.module_gate(module) else {
             return;
         };
-        let _guard = gate.lock().await;
         let Some(registration) = registry.get_module(module).ok().flatten() else {
             return;
         };
@@ -215,15 +222,39 @@ impl ConfigDelivery {
             return;
         }
         let connection = registration.connection_id;
-        let spawn = spawn.clone();
-        if let Err(error) = self
-            .0
-            .on_blocking(move |owner| owner.registered(connection, &spawn))
-            .await
-        {
-            warn!(module_id=module, %error, "configuration registration observation failed");
+        if child.registered_config_connection == Some(connection) {
+            return;
         }
-        self.0.notify_delivery_changed();
+        child.registered_config_connection = Some(connection);
+        let spawn = spawn.clone();
+        let owner = self.0.clone();
+        let registry = registry.clone();
+        let forwarding = forwarding.cloned();
+        let module = module.to_owned();
+        tokio::spawn(async move {
+            let _guard = gate.lock().await;
+            if registry
+                .get_module(&module)
+                .ok()
+                .flatten()
+                .is_none_or(|current| current.connection_id != connection)
+                || forwarding
+                    .as_ref()
+                    .and_then(|forwarding| {
+                        forwarding.active_module_endpoint(&module).ok().flatten()
+                    })
+                    .is_none_or(|endpoint| endpoint.connection_id != connection)
+            {
+                return;
+            }
+            if let Err(error) = owner
+                .on_blocking(move |owner| owner.registered(connection, &spawn))
+                .await
+            {
+                warn!(module_id=%module,%error,"configuration registration observation failed");
+            }
+            owner.notify_delivery_changed();
+        });
     }
 
     pub(super) async fn health_probe(

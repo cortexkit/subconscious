@@ -2,6 +2,12 @@
 
 ## 0.1.33
 
+- Expose typed macOS process code-directory hashes through a safe `csops`
+  wrapper. Extract approved per-slice and alternate hashes from one retained
+  descriptor witness, validating code pages and embedded special-slot blobs
+  before returning an identity. Bound Mach-O metadata, slices, pages and slots;
+  malformed signatures are distinct from unsigned files. No new dependencies.
+
 - Open bounded configuration inputs without following the leaf or blocking on
   substituted FIFOs. Verify regular-file type on the retained Unix or Windows
   handle before returning it to a caller.

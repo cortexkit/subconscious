@@ -44,6 +44,19 @@ fn spec(rig: &Rig) -> ModuleSpec {
         .module_spec()
 }
 
+async fn reported_pid(module: &crate::supervise::SupervisedModule) -> u32 {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(pid) = module.status().unwrap().pid {
+                return pid;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the owned child must cross its exec acknowledgement before observation")
+}
+
 fn approve(_rig: &Rig, owner: &RuntimeOwner, kind: PlanKind) -> u64 {
     let plan = owner
         .finish_plan(owner.prepare(kind).unwrap(), daemon_review)
@@ -116,6 +129,277 @@ fn config_admission_changed_binary_is_held_and_refused_once_per_identity() {
         .is_empty());
     assert!(owner.prepare_spawn(&spec).is_ok());
     assert!(owner.status().unwrap().gated_modules.is_empty());
+}
+
+#[test]
+fn config_admission_refusal_does_not_return_after_a_to_b_to_a_approval() {
+    let rig = rig();
+    let owner = rig.owner("refusal-a-b-a");
+    rig.stamp(&owner);
+    let path = rig.path.join("program");
+    let original = std::fs::read(&path).unwrap();
+    let original_spec = spec(&rig);
+    std::fs::write(&path, b"unapproved content").unwrap();
+    assert_eq!(
+        owner.prepare_spawn(&original_spec).err().unwrap().code,
+        "program_refused"
+    );
+    let mut changed = original.clone();
+    changed.extend_from_slice(b"different program approval bytes");
+    std::fs::write(&path, &changed).unwrap();
+    approve(&rig, &owner, PlanKind::Change);
+    assert!(
+        owner.lock().unwrap().refused_generations.is_empty(),
+        "approving B must retire A's volatile refusal"
+    );
+    std::fs::write(&path, &original).unwrap();
+    approve(&rig, &owner, PlanKind::Change);
+    assert!(
+        owner.prepare_spawn(&original_spec).is_ok(),
+        "approving the original A must not resurrect its old refusal"
+    );
+    approve(&rig, &owner, PlanKind::Unstamp);
+    assert!(owner.lock().unwrap().refused_generations.is_empty());
+}
+
+#[test]
+fn config_admission_transient_capture_failure_defers_without_a_durable_refusal() {
+    let rig = rig();
+    let owner = rig.owner("capture-unavailable");
+    rig.stamp(&owner);
+    let program = rig.path.join("program");
+    let saved = rig.path.join("temporarily-unavailable");
+    std::fs::rename(&program, &saved).unwrap();
+    let result = owner.prepare_spawn(&spec(&rig));
+    std::fs::rename(&saved, &program).unwrap();
+    assert_eq!(result.err().unwrap().code, "config_delivery_deferred");
+    assert!(owner
+        .lock()
+        .unwrap()
+        .store
+        .body()
+        .unwrap()
+        .program_refusals
+        .is_empty());
+    assert!(owner.prepare_spawn(&spec(&rig)).is_ok());
+}
+
+#[test]
+fn config_admission_refusal_from_an_old_base_cannot_hold_the_new_approval() {
+    let rig = rig();
+    let owner = rig.owner("stale-refusal");
+    rig.stamp(&owner);
+    let old_base = crate::config_gate::program::approved_base(
+        &crate::config_gate::GateSnapshot::from_store(
+            &owner.lock().unwrap().store.body().unwrap().approved,
+        )
+        .unwrap(),
+        "a",
+    );
+    let path = rig.path.join("program");
+    let mut changed = std::fs::read(&path).unwrap();
+    changed.extend_from_slice(b"different program approval bytes");
+    std::fs::write(path, changed).unwrap();
+    approve(&rig, &owner, PlanKind::Change);
+    owner
+        .record_program_refusal(
+            "a",
+            &old_base,
+            subc_config::raw_digest(b"old failing image"),
+        )
+        .unwrap();
+    assert!(
+        owner.prepare_spawn(&spec(&rig)).is_ok(),
+        "a refusal checked under {old_base:?} must not hold a different approved base"
+    );
+    assert!(owner
+        .lock()
+        .unwrap()
+        .store
+        .body()
+        .unwrap()
+        .program_refusals
+        .is_empty());
+}
+
+#[test]
+fn config_admission_program_only_approval_of_a_held_module_needs_no_live_reviewer() {
+    use std::io::Write;
+    let rig = rig();
+    let owner = rig.owner("held-program-review");
+    rig.declare(&owner, 10);
+    rig.stamp(&owner);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(rig.path.join("program"))
+        .unwrap()
+        .write_all(b"new approved executable content")
+        .unwrap();
+    assert_eq!(
+        owner.prepare_spawn(&spec(&rig)).err().unwrap().code,
+        "program_refused"
+    );
+    let prepared = owner.prepare(PlanKind::Change).unwrap();
+    assert!(
+        !prepared.review_modules.contains("a"),
+        "a stopped program-only hold cannot answer its own review RPC"
+    );
+}
+
+#[test]
+fn config_admission_missing_approved_command_never_falls_back_to_the_live_spec() {
+    let rig = rig();
+    let owner = rig.owner("no-command");
+    let generation = rig.stamp(&owner);
+    owner
+        .lock()
+        .unwrap()
+        .store
+        .clear_delivery_snapshot_for_test(generation);
+    let mut live = spec(&rig);
+    live.args = vec!["unapproved live arguments".into()];
+    assert_eq!(
+        owner.prepare_spawn(&live).err().unwrap().code,
+        "config_gated"
+    );
+}
+
+#[tokio::test]
+async fn config_admission_spawn_rehashes_scripts_and_covered_files_after_preparation() {
+    use std::io::Write;
+    for script_changed in [false, true] {
+        let rig = rig();
+        std::fs::write(
+            rig.path.join("program"),
+            "#!/bin/sh\nwhile :; do /bin/sleep 600; done\n",
+        )
+        .unwrap();
+        let covered = rig.path.join("covered");
+        std::fs::write(&covered, b"approved").unwrap();
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(rig.path.join("subc.jsonc")).unwrap()).unwrap();
+        doc["modules"]["a"]["program_files"] = json!([covered]);
+        std::fs::write(
+            rig.path.join("subc.jsonc"),
+            serde_json::to_vec(&doc).unwrap(),
+        )
+        .unwrap();
+        let owner = Arc::new(rig.owner("spawn-double-check"));
+        rig.stamp(&owner);
+        let path = if script_changed {
+            rig.path.join("program")
+        } else {
+            covered
+        };
+        owner.set_spawn_preflight_hook_for_test(move || {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(path)
+                .unwrap()
+                .write_all(b"\n# changed after preparation\n")
+                .unwrap()
+        });
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(crate::Registry::default()),
+            RestartPolicy::default(),
+        )
+        .with_config_runtime(owner);
+        let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+        let status = module.status().unwrap();
+        module.stop().await.unwrap();
+        assert_eq!(status.state, ModuleState::Stopped);
+        assert_eq!(status.spawn_generation, 0);
+        assert_eq!(status.restart_count, 0);
+    }
+}
+
+#[test]
+fn config_admission_stamped_rescan_refuses_before_applying_a_live_file_spec() {
+    let rig = rig();
+    let owner = rig.owner("rescan-authority");
+    rig.stamp(&owner);
+    wire_fixture_document(&rig, json!(["unapproved arguments"]));
+    assert_eq!(
+        owner.checked_admission_hold(None).unwrap_err().code,
+        "config_gated"
+    );
+    assert_eq!(owner.status().unwrap().pending_proposals, 1);
+}
+
+#[tokio::test]
+async fn config_admission_update_configuration_cannot_install_an_unapproved_spec() {
+    let rig = rig();
+    let owner = Arc::new(rig.owner("update-authority"));
+    rig.stamp(&owner);
+    let original = spec(&rig);
+    let supervisor = Supervisor::new_for_test(
+        Arc::new(crate::Registry::default()),
+        RestartPolicy::default(),
+    )
+    .with_config_runtime(owner);
+    let module = supervisor.spawn_async(original.clone()).await.unwrap();
+    let mut changed = original.clone();
+    changed.args = vec!["unapproved arguments".into()];
+    changed.reserved_prefixes = vec!["unapproved".into()];
+    let result = module
+        .update_configuration(changed, crate::HealthConfig::default(), None)
+        .await;
+    let after = module.configuration().unwrap().0;
+    module.stop().await.unwrap();
+    assert!(
+        result.is_err(),
+        "the internal reconfiguration seam must not bypass stamped authority"
+    );
+    assert_eq!(after, original);
+}
+
+#[test]
+fn config_admission_recovery_and_a_missing_binding_cannot_complete_hello() {
+    for missing in [false, true] {
+        let rig = rig();
+        let owner = Arc::new(rig.owner("hello-recovery"));
+        rig.stamp(&owner);
+        let store = rig.path.join("store").join(crate::config_store::STORE_FILE);
+        if missing {
+            std::fs::remove_file(&store).unwrap();
+        } else {
+            let mut bytes = std::fs::read(&store).unwrap();
+            bytes.push(b' ');
+            std::fs::write(&store, bytes).unwrap();
+        }
+        assert!(owner.checked_admission_hold(Some("a")).is_err());
+        let registry = Arc::new(crate::Registry::default());
+        let handle = SupervisorHandle::new();
+        handle.set_spawn_nonce("a", "known-but-unbound".into());
+        handle.set_reserved_nonce("a", "known-but-unbound".into());
+        let handler = crate::ControlHandler::new(registry.clone())
+            .with_supervisor(handle)
+            .with_config_runtime(owner);
+        let hello = subc_protocol::ModuleHelloBody {
+            manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+            protocol_ver: subc_protocol::PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: Some("known-but-unbound".into()),
+        };
+        let frame = subc_protocol::Frame::build(
+            subc_protocol::FrameType::Hello,
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&hello).unwrap(),
+        )
+        .unwrap();
+        let reply = handler
+            .handle_control(ConnectionId::new(999), frame)
+            .unwrap();
+        assert_ne!(
+            reply[0].header.ty,
+            subc_protocol::FrameType::HelloAck,
+            "recovery must not use unbound nonce authority"
+        );
+        assert!(registry.get_module("a").unwrap().is_none());
+    }
 }
 
 #[test]
@@ -340,6 +624,98 @@ async fn config_admission_crash_during_approval_defers_without_parking_the_actor
 }
 
 #[tokio::test]
+async fn config_admission_registered_actor_serves_commands_while_its_gate_is_held() {
+    let rig = rig();
+    let owner = Arc::new(rig.owner("registered-responsive"));
+    rig.stamp(&owner);
+    let registry = Arc::new(crate::Registry::default());
+    let forwarding = Arc::new(crate::ForwardingTable::default());
+    let mut launch = spec(&rig);
+    launch.protocol = subc_control::ModuleProtocol::Subc;
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_forwarding(forwarding.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(launch).await.unwrap();
+    let gate = owner.module_gate("a").unwrap();
+    let guard = gate.lock().await;
+    let connection = ConnectionId::new(333);
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    forwarding
+        .register_module_connection(
+            connection,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(tx),
+        )
+        .unwrap();
+    registry
+        .register_with_control_ops(
+            subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+            subc_protocol::PROTOCOL_VERSION,
+            connection,
+            vec!["config.review".into()],
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let responsive = tokio::time::timeout(Duration::from_secs(1), module.set_enabled(true)).await;
+    drop(guard);
+    registry.deregister_connection(connection).unwrap();
+    module.stop().await.unwrap();
+    assert!(
+        matches!(responsive, Ok(Ok(false))),
+        "registered actor parked before its command select: {responsive:?}"
+    );
+}
+
+#[tokio::test]
+async fn config_admission_exit_observation_does_not_park_commands_behind_the_owner_mutex() {
+    let rig = rig();
+    let owner = Arc::new(rig.owner("exit-responsive"));
+    rig.stamp(&owner);
+    let supervisor = Supervisor::new_for_test(
+        Arc::new(crate::Registry::default()),
+        RestartPolicy::default(),
+    )
+    .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    let pid = reported_pid(&module).await;
+    let (entered, ready) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let publication = owner.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let _guard = publication.lock().unwrap();
+        entered.send(()).unwrap();
+        wait.recv().unwrap();
+    });
+    ready.await.unwrap();
+    subc_os::Process::open(pid)
+        .unwrap()
+        .unwrap()
+        .signal(subc_os::Signal::Kill)
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let deferred_restart = tokio::time::timeout(Duration::from_secs(1), module.restart(None)).await;
+    let responsive = tokio::time::timeout(Duration::from_secs(1), module.set_enabled(true)).await;
+    release.send(()).unwrap();
+    task.await.unwrap();
+    module.stop().await.unwrap();
+    assert!(
+        matches!(
+            deferred_restart,
+            Ok(Err(
+                crate::supervise::SuperviseError::ConfigDeliveryDeferred { .. }
+            ))
+        ),
+        "a new spawn decision cannot precede the old child's recorded exit: {deferred_restart:?}"
+    );
+    assert!(
+        matches!(responsive, Ok(Ok(false))),
+        "exited actor parked inside the owner-lock wait: {responsive:?}"
+    );
+}
+
+#[tokio::test]
 async fn config_admission_rollback_executes_the_current_restored_path_and_rechecks_it() {
     let rig = rig();
     let owner = Arc::new(rig.owner("rollback-spawn"));
@@ -422,7 +798,7 @@ async fn config_admission_tamper_recovery_preserves_running_children_but_refuses
     )
     .with_config_runtime(owner.clone());
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
-    let pid = module.status().unwrap().pid;
+    let pid = Some(reported_pid(&module).await);
     let store = rig.path.join("store").join(crate::config_store::STORE_FILE);
     let mut edited = std::fs::read(&store).unwrap();
     edited.push(b' ');
@@ -774,6 +1150,276 @@ async fn config_admission_wrapper_exec_to_a_different_program_is_program_refused
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn refused_content_hello(
+    rig: &Rig,
+    owner: Arc<RuntimeOwner>,
+    handle: SupervisorHandle,
+    registry: Arc<crate::Registry>,
+    module: crate::supervise::SupervisedModule,
+) {
+    let nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    let handler = crate::ControlHandler::new(registry.clone())
+        .with_supervisor(handle)
+        .with_config_runtime(owner.clone());
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: Some(nonce),
+    };
+    let frame = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&hello).unwrap(),
+    )
+    .unwrap();
+    let connection = ConnectionId::new(444);
+    let reply = handler.handle_control(connection, frame).unwrap();
+    let _ = registry.deregister_connection(connection);
+    module.stop().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&reply[0].body).unwrap();
+    assert_eq!(
+        body["code"], "program_refused",
+        "unapproved bytes completed HELLO at {:?}: {body}",
+        rig.path
+    );
+    assert_eq!(
+        owner
+            .take_activities()
+            .iter()
+            .filter(|activity| activity.event == "config.refused")
+            .count(),
+        1,
+        "content refusal, not merely an unready latch, must reject HELLO"
+    );
+}
+
+fn wire_fixture_document(rig: &Rig, args: serde_json::Value) {
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(rig.path.join("subc.jsonc")).unwrap()).unwrap();
+    doc["modules"]["a"]["protocol"] = json!("subc");
+    doc["modules"]["a"]["args"] = args;
+    std::fs::write(
+        rig.path.join("subc.jsonc"),
+        serde_json::to_vec(&doc).unwrap(),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn config_admission_hello_accepts_only_the_approved_current_native_image() {
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = Arc::new(rig.owner("native-content"));
+    rig.stamp(&owner);
+    let handle = SupervisorHandle::new();
+    let registry = Arc::new(crate::Registry::default());
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    let nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    assert!(handle.wait_program_binding("a", &nonce).await);
+    assert!(
+        !module.configuration().unwrap().0.reserved,
+        "the launch-local nonce gate must not rewrite approved role policy"
+    );
+    assert!(
+        handle.reserved_hello_authorized("a", None),
+        "the configured unreserved legacy policy must not be rewritten by content admission"
+    );
+    assert!(handle.reserved_hello_authorized("a", Some(&nonce)));
+    assert!(
+        handle.reserved_hello_authorized("a.child", None),
+        "no capability or child-id prefix was reserved by the launch-local flag"
+    );
+    let handler = crate::ControlHandler::new(registry.clone())
+        .with_supervisor(handle)
+        .with_config_runtime(owner);
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: Some(nonce),
+    };
+    let frame = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&hello).unwrap(),
+    )
+    .unwrap();
+    let impostor = handler
+        .handle_control(ConnectionId::new(446), module_hello(None))
+        .unwrap();
+    assert_ne!(
+        impostor[0].header.ty,
+        subc_protocol::FrameType::HelloAck,
+        "gated identity checks remain mandatory without a synthetic legacy reservation"
+    );
+    assert!(registry.get_module("a").unwrap().is_none());
+    let connection = ConnectionId::new(445);
+    let reply = handler.handle_control(connection, frame).unwrap();
+    registry.deregister_connection(connection).unwrap();
+    module.stop().await.unwrap();
+    assert_eq!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn config_admission_unsigned_macos_program_is_held_before_any_spawn() {
+    let rig = rig();
+    assert!(std::process::Command::new("/usr/bin/codesign")
+        .arg("--remove-signature")
+        .arg(rig.path.join("program"))
+        .status()
+        .unwrap()
+        .success());
+    let owner = Arc::new(rig.owner("unsigned-image"));
+    rig.stamp(&owner);
+    let supervisor = Supervisor::new_for_test(
+        Arc::new(crate::Registry::default()),
+        RestartPolicy::default(),
+    )
+    .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    let status = module.status().unwrap();
+    module.stop().await.unwrap();
+    assert_eq!(status.state, ModuleState::Stopped);
+    assert_eq!(status.spawn_generation, 0);
+    assert_eq!(
+        owner
+            .take_activities()
+            .iter()
+            .filter(|activity| activity.event == "config.refused")
+            .count(),
+        1
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn config_admission_hello_hashes_the_running_image_after_a_same_inode_rewrite() {
+    use std::io::Write;
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = Arc::new(rig.owner("image-content"));
+    rig.stamp(&owner);
+    let program = rig.path.join("program");
+    owner.set_spawn_exec_hook_for_test(move || {
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&program)
+            .unwrap()
+            .write_all(b"unapproved image bytes")
+            .unwrap()
+    });
+    let handle = SupervisorHandle::new();
+    let registry = Arc::new(crate::Registry::default());
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    assert!(module.status().unwrap().process_alive);
+    refused_content_hello(&rig, owner, handle, registry, module).await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn config_admission_hello_rechecks_script_and_declared_file_content() {
+    use std::io::Write;
+    for script_changed in [false, true] {
+        let rig = rig();
+        std::fs::write(
+            rig.path.join("program"),
+            "#!/bin/sh\nwhile :; do /bin/sleep 600; done\n",
+        )
+        .unwrap();
+        wire_fixture_document(&rig, json!([]));
+        let covered = rig.path.join("covered");
+        std::fs::write(&covered, b"approved").unwrap();
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(rig.path.join("subc.jsonc")).unwrap()).unwrap();
+        doc["modules"]["a"]["program_files"] = json!([covered]);
+        std::fs::write(
+            rig.path.join("subc.jsonc"),
+            serde_json::to_vec(&doc).unwrap(),
+        )
+        .unwrap();
+        let owner = Arc::new(rig.owner("auxiliary-content"));
+        rig.stamp(&owner);
+        let handle = SupervisorHandle::new();
+        let registry = Arc::new(crate::Registry::default());
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone())
+            .with_config_runtime(owner.clone());
+        let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+        assert!(
+            handle
+                .wait_program_binding("a", &handle.spawn_launch_nonce_for("a").unwrap())
+                .await
+        );
+        let changed = if script_changed {
+            rig.path.join("program")
+        } else {
+            covered
+        };
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(changed)
+            .unwrap()
+            .write_all(b"\n# unapproved bytes\n")
+            .unwrap();
+        refused_content_hello(&rig, owner, handle, registry, module).await;
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn config_admission_hello_rejects_a_wrapper_that_execs_after_the_spawn_sample() {
+    let rig = rig();
+    let marker = rig.path.join("release-wrapper");
+    std::fs::write(
+        rig.path.join("program"),
+        "#!/bin/sh\nwhile [ ! -f \"$1\" ]; do /bin/sleep 0.01; done\nexec /bin/sleep 600\n",
+    )
+    .unwrap();
+    wire_fixture_document(&rig, json!([marker]));
+    let owner = Arc::new(rig.owner("late-exec"));
+    rig.stamp(&owner);
+    let handle = SupervisorHandle::new();
+    let registry = Arc::new(crate::Registry::default());
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    assert!(
+        handle
+            .wait_program_binding("a", &handle.spawn_launch_nonce_for("a").unwrap())
+            .await
+    );
+    std::fs::write(marker, "").unwrap();
+    let process = subc_os::Process::open(module.status().unwrap().pid.unwrap())
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while process.observe().and_then(|image| image.executable)
+            != subc_os::file_identity(std::path::Path::new("/bin/sleep"))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    refused_content_hello(&rig, owner, handle, registry, module).await;
+}
+
 #[tokio::test]
 async fn config_admission_tamper_activity_is_emitted_only_after_the_module_gate_releases() {
     async fn logged(ledger: &crate::activity::ActivityLedger) -> usize {
@@ -814,4 +1460,222 @@ async fn config_admission_tamper_activity_is_emitted_only_after_the_module_gate_
         tokio::task::yield_now().await;
     }
     assert_eq!(logged(&ledger).await, 1);
+}
+
+fn module_hello(nonce: Option<String>) -> subc_protocol::Frame {
+    let body = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: nonce,
+    };
+    subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn config_admission_stopped_gated_identity_refuses_impostors_without_a_live_spawn() {
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = Arc::new(rig.owner("stopped-hello"));
+    rig.stamp(&owner);
+    let registry = Arc::new(crate::Registry::default());
+    let handle = SupervisorHandle::new();
+    let handler = crate::ControlHandler::new(registry.clone())
+        .with_supervisor(handle.clone())
+        .with_config_runtime(owner.clone());
+    for nonce in [None, Some("unminted".into())] {
+        let reply = handler
+            .handle_control(ConnectionId::new(701), module_hello(nonce))
+            .unwrap();
+        assert_ne!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
+    }
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    reported_pid(&module).await;
+    let old = handle.spawn_launch_nonce_for("a").unwrap();
+    module.stop().await.unwrap();
+    for nonce in [None, Some(old.clone())] {
+        let reply = handler
+            .handle_control(ConnectionId::new(702), module_hello(nonce))
+            .unwrap();
+        assert_ne!(
+            reply[0].header.ty,
+            subc_protocol::FrameType::HelloAck,
+            "a stopped child is not a live content witness"
+        );
+    }
+    let mut changed = std::fs::read(rig.path.join("program")).unwrap();
+    changed.extend_from_slice(b"changed while stopped");
+    std::fs::write(rig.path.join("program"), changed).unwrap();
+    assert_eq!(
+        owner.prepare_spawn(&spec(&rig)).err().unwrap().code,
+        "program_refused"
+    );
+    let held = handler
+        .handle_control(ConnectionId::new(704), module_hello(Some(old)))
+        .unwrap();
+    assert_ne!(
+        held[0].header.ty,
+        subc_protocol::FrameType::HelloAck,
+        "a held identity is protected without a spawn in flight"
+    );
+    assert!(registry.get_module("a").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn config_admission_unstamp_restores_unreserved_hello_without_a_synthetic_sticky_nonce() {
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = Arc::new(rig.owner("unstamp-reservation"));
+    rig.stamp(&owner);
+    let registry = Arc::new(crate::Registry::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    reported_pid(&module).await;
+    module.stop().await.unwrap();
+    approve(&rig, &owner, PlanKind::Unstamp);
+    let handler = crate::ControlHandler::new(registry.clone())
+        .with_supervisor(handle)
+        .with_config_runtime(owner);
+    let reply = handler
+        .handle_control(ConnectionId::new(703), module_hello(None))
+        .unwrap();
+    let _ = registry.deregister_connection(ConnectionId::new(703));
+    assert_eq!(
+        reply[0].header.ty,
+        subc_protocol::FrameType::HelloAck,
+        "unstamp must restore the configured unreserved policy"
+    );
+}
+
+#[tokio::test]
+async fn config_admission_promoted_unreserved_child_can_reconnect_with_its_current_content_witness()
+{
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(rig.path.join("subc.jsonc")).unwrap()).unwrap();
+    document["modules"]["a"]["overlap"] = json!("safe");
+    std::fs::write(
+        rig.path.join("subc.jsonc"),
+        serde_json::to_vec(&document).unwrap(),
+    )
+    .unwrap();
+    let owner = Arc::new(rig.owner("promoted-reservation"));
+    rig.stamp(&owner);
+    let registry = Arc::new(crate::Registry::default());
+    let forwarding = Arc::new(crate::ForwardingTable::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_forwarding(forwarding.clone())
+        .with_config_runtime(owner.clone())
+        .with_drain_timeout(Duration::from_millis(20));
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    reported_pid(&module).await;
+    let original = handle.spawn_launch_nonce_for("a").unwrap();
+    let mut manifest = subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build();
+    manifest.ready = Some(true);
+    let incumbent = ConnectionId::new(710);
+    let candidate = ConnectionId::new(711);
+    registry
+        .register_with_control_ops(
+            manifest.clone(),
+            subc_protocol::PROTOCOL_VERSION,
+            incumbent,
+            vec![],
+        )
+        .unwrap();
+    let (tx, _incumbent_frames) = tokio::sync::mpsc::channel(32);
+    forwarding
+        .register_module_connection(
+            incumbent,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(tx),
+        )
+        .unwrap();
+    let swapping = {
+        let module = module.clone();
+        tokio::spawn(async move { module.swap(Some(Duration::from_secs(5))).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !handle.swap_open("a") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    registry
+        .register_candidate_with_control_ops(
+            manifest,
+            subc_protocol::PROTOCOL_VERSION,
+            candidate,
+            vec![],
+        )
+        .unwrap();
+    let (tx, _candidate_frames) = tokio::sync::mpsc::channel(32);
+    forwarding
+        .register_candidate_module_connection(
+            candidate,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(tx),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while registry
+            .get_module("a")
+            .unwrap()
+            .is_none_or(|active| active.connection_id != candidate)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    registry.deregister_connection(incumbent).unwrap();
+    let outcome = swapping.await.unwrap();
+    assert!(outcome.is_ok(), "{outcome:?}");
+    reported_pid(&module).await;
+    let current = handle.spawn_launch_nonce_for("a").unwrap();
+    assert_ne!(original, current);
+    assert!(handle.wait_program_binding("a", &current).await);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while handle.swap_open("a") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let handler = crate::ControlHandler::with_forwarding(registry.clone(), forwarding)
+        .with_supervisor(handle)
+        .with_config_runtime(owner);
+    handler.cleanup_connection(candidate).unwrap();
+    let reconnect = ConnectionId::new(712);
+    let reply = handler
+        .handle_control(reconnect, module_hello(Some(current)))
+        .unwrap();
+    let _ = registry.deregister_connection(reconnect);
+    module.stop().await.unwrap();
+    assert_eq!(
+        reply[0].header.ty,
+        subc_protocol::FrameType::HelloAck,
+        "the configured unreserved policy must not retain the incumbent's synthetic legacy nonce"
+    );
 }

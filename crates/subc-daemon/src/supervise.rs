@@ -67,6 +67,7 @@ mod async_spawn_tests;
 #[cfg(all(test, windows))]
 mod carried_job_tests;
 mod config_delivery;
+mod content_binding;
 mod program_binding;
 use program_binding::ProgramBindingPublication;
 mod config_exit_failure;
@@ -319,6 +320,9 @@ fn privacy_command(
 }
 
 struct SupervisedChild {
+    live_program_binding: Option<Arc<content_binding::LiveProgramBinding>>,
+    registered_config_connection: Option<ConnectionId>,
+    admission_base: Option<subc_config::Digest>,
     _program_binding: Option<ProgramBindingPublication>,
     subtree_target: crate::subtree_resources::Target,
     child: containment::ProcessChild,
@@ -609,8 +613,10 @@ impl SupervisedChild {
         });
         if let Some(cause) = cause {
             warn!(module_id = %pending.module_id, pid = self.pid, %cause, "privacy identity trampoline refused module spawn");
-            self.spawn_failure = Some(if pending.gated {
+            self.spawn_failure = Some(if pending.gated && cause.contains("executable mismatch") {
                 format!("program_refused: {cause}")
+            } else if pending.gated {
+                format!("config_delivery_deferred: {cause}")
             } else {
                 cause
             });
@@ -4686,7 +4692,7 @@ impl SupervisedModule {
             })?;
         reply_rx.await.map_err(|_| SuperviseError::CommandClosed {
             module_id: self.inner.module_id.clone(),
-        })?;
+        })??;
         let mut configuration =
             self.inner
                 .configuration
@@ -4773,7 +4779,7 @@ enum SupervisorCommand {
         /// Per-module drain override from the new config; `None` re-resolves to
         /// the supervisor-wide default.
         drain_timeout_ms: Option<u64>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     Swap {
         requester: Option<Principal>,
@@ -6272,6 +6278,8 @@ fn schedule_respawn(
     Ok(())
 }
 
+const CONFIG_ADMISSION_RETRY_DELAY: Duration = Duration::from_millis(100);
+
 fn defer_config_spawn(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
@@ -6287,7 +6295,7 @@ fn defer_config_spawn(
         .scheduled_respawn
         .lock()
         .unwrap_or_else(|p| p.into_inner()) = Some(PendingRespawn {
-        deadline: Instant::now(),
+        deadline: Instant::now() + CONFIG_ADMISSION_RETRY_DELAY,
         kind,
         daemon_initiated: runtime.recovery_is_daemon,
     });
@@ -7494,7 +7502,7 @@ async fn supervise_loop(
         Duration::from_secs(5),
     );
     previous_instance_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
+    'supervision: loop {
         #[cfg(test)]
         {
             lock_snapshot(&snapshot).unwrap().actor_select = None;
@@ -7597,14 +7605,12 @@ async fn supervise_loop(
             let active = child.as_mut().expect("child checked above");
             if active.registered_since_spawn() {
                 if let Some(delivery) = &runtime.config_delivery {
-                    delivery
-                        .registered(
-                            &spec.module_id,
-                            runtime.forwarding.as_deref(),
-                            &registry,
-                            active,
-                        )
-                        .await;
+                    delivery.queue_registered(
+                        &spec.module_id,
+                        runtime.forwarding.as_ref(),
+                        &registry,
+                        active,
+                    );
                 }
             }
             if runtime.child_roster.is_closed() || active.registered_since_spawn() {
@@ -7692,17 +7698,53 @@ async fn supervise_loop(
                     };
                     active_child.drain_stderr(&spec.module_id).await;
 
-                    if let (Some(delivery), Some(spawn)) = (&runtime.config_delivery, &active_child.config_delivery) {
-                        let spawn = spawn.clone();
-                        if let Err(error) = delivery.0.on_blocking(move |owner| owner.delivery_child_exited(&spawn)).await {
-                            warn!(module_id=%spec.module_id, %error, "configuration exit observation failed");
+                    let delivery=runtime.config_delivery.clone();
+                    let exited_spawn=active_child.spawned_at;
+                    let spawn=active_child.config_delivery.clone();
+                    let refusal=active_child.spawn_failure.as_deref().filter(|detail|detail.starts_with("program_refused:")).zip(active_child.admission_base.clone()).map(|(detail,base)|(base,subc_config::raw_digest(detail.as_bytes())));
+                    let module_id=spec.module_id.clone();
+                    // Publication may own the store mutex for local durable I/O.
+                    // Keep commands selectable until the child's exit is recorded;
+                    // no respawn disposition is chosen before that observation.
+                    let observed=async move {
+                        if let Some(delivery)=delivery {
+                            delivery.0.on_blocking(move |owner| {
+                                if let Some(spawn)=spawn { owner.delivery_child_exited(&spawn)?; }
+                                if let Some((base,identity))=refusal {owner.record_program_refusal(&module_id,&base,identity)?;}
+                                Ok(())
+                            }).await
+                        } else {Ok(())}
+                    };
+                    tokio::pin!(observed);
+                    loop {
+                        tokio::select! {
+                            result=&mut observed=>{
+                                if let Err(error)=result {warn!(module_id=%spec.module_id,%error,"configuration exit observation failed");}
+                                break;
+                            }
+                            command=commands.recv()=>{
+                                let Some(command)=command else {containment::terminate(&runtime.child_roster.containment).await;return;};
+                                let deferred=||SuperviseError::ConfigDeliveryDeferred {module_id:spec.module_id.clone()};
+                                let command=match command {
+                                    SupervisorCommand::Restart {reply,..}|SupervisorCommand::Reload {reply,..}=>{let _=reply.send(Err(deferred()));continue;}
+                                    SupervisorCommand::Swap {reply,..}=>{let _=reply.send(Err(deferred()));continue;}
+                                    command @ (SupervisorCommand::ConfigApplyRestart {..}|SupervisorCommand::ConfigPolicyProbe {..}|SupervisorCommand::ConfigDeliveryFailed {..})=>{requeued.push_back(command);continue;}
+                                    command=>command,
+                                };
+                                if !handle_supervisor_command(command,&mut spec,&mut runtime,&registry,&process_liveness,&snapshot,&mut child,&mut commands,&mut requeued).await {
+                                    containment::terminate(&runtime.child_roster.containment).await;return;
+                                }
+                                if child.as_ref().is_none_or(|current|current.spawned_at!=exited_spawn) {continue 'supervision;}
+                            }
                         }
                     }
-
-                    if let Some(detail) = active_child.spawn_failure.as_deref().filter(|detail| detail.starts_with("program_refused:")) {
-                        if let Some(delivery) = runtime.spawn_delivery() { delivery.record_refusal(&spec, detail); }
-                    }
-                    let next = if runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.exit_is_held(&spec.module_id)) {
+                    let active_child=child.as_mut().expect("exit observation retained its child");
+                    let deferred_spawn=active_child.spawn_failure.as_deref().is_some_and(|detail|detail.starts_with("config_delivery_deferred:"));
+                    let next = if deferred_spawn {
+                        record_terminal_with_detail(&spec.module_id,&runtime.terminal_ring,&runtime.spawn_events,&exit_report,TerminalDisposition::Restarting,active_child.spawn_failure.clone());
+                        let _=update_snapshot(&snapshot,Some(&spec.module_id),|state|state.state=ModuleState::Restarting);
+                        NextAction::Restart {schedule:None}
+                    } else if active_child.live_program_binding.as_ref().is_some_and(|binding|binding.is_refused()) || runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.exit_is_held(&spec.module_id)) {
                         record_terminal_with_detail(&spec.module_id, &runtime.terminal_ring, &runtime.spawn_events, &exit_report, TerminalDisposition::Stopped, active_child.spawn_failure.clone().or_else(|| Some("config_gated".into())));
                         let _ = hold_config_spawn(&spec, &runtime, &snapshot);
                         NextAction::Stop { registration_released: registry.get_module(&spec.module_id).ok().flatten().is_none() }
@@ -7740,10 +7782,10 @@ async fn supervise_loop(
                             child = None;
                         }
                         NextAction::Restart { schedule } => {
-                            let delay = schedule.map_or(
+                            let delay = if deferred_spawn {CONFIG_ADMISSION_RETRY_DELAY} else {schedule.map_or(
                                 runtime.restart_policy.delay_for_restart(0),
                                 |schedule| schedule.delay,
-                            );
+                            )};
                             if let Some(schedule) = schedule {
                                 log_crash_respawn(&spec.module_id, schedule);
                             }
@@ -7908,7 +7950,7 @@ async fn supervise_loop(
                             debug!(module_id = %spec.module_id, "supervised module restarted after crash");
                         }
                         Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
-                            pending_respawn = Some(PendingRespawn { deadline:Instant::now(), ..pending });
+                            pending_respawn = Some(PendingRespawn { deadline:Instant::now()+CONFIG_ADMISSION_RETRY_DELAY, ..pending });
                             let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = true);
                         }
                         Err(SuperviseError::ConfigHeld { .. }) => {
@@ -8583,6 +8625,18 @@ async fn handle_supervisor_command(
             drain_timeout_ms,
             reply,
         } => {
+            if runtime
+                .config_delivery
+                .as_ref()
+                .is_some_and(|delivery| delivery.0.module_is_gated(&spec.module_id))
+            {
+                let _ = reply.send(Err(SuperviseError::ConfigHeld {
+                    module_id: spec.module_id.clone(),
+                    code: "config_gated".into(),
+                    detail: "live file reconfiguration cannot replace stamped authority".into(),
+                }));
+                return true;
+            }
             if let Some(handle) = &runtime.supervisor_handle {
                 handle.apply_identity_configuration(&next_spec);
             }
@@ -8606,7 +8660,7 @@ async fn handle_supervisor_command(
                 .effective_drain_timeout
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime.drain_timeout;
-            let _ = reply.send(());
+            let _ = reply.send(Ok(()));
             true
         }
         SupervisorCommand::Swap {
@@ -9884,13 +9938,20 @@ fn spawn_child_in_slot(
     if let (Some(delivery), Some(admission)) = (config_delivery, &prepared.spawn_admission) {
         delivery.check(spec, admission)?;
     }
-    let result = launch_child_in_slot(spec, ring, roster, prepared);
+    let checked_base = prepared
+        .spawn_admission
+        .as_ref()
+        .and_then(|admission| admission.approved_base())
+        .cloned();
+    let mut result = launch_child_in_slot(spec, ring, roster, prepared);
     drop(_gate);
     if let (Some(delivery), Err(SuperviseError::ConfigHeld { code, detail, .. })) =
         (config_delivery, &result)
     {
-        if code == "program_refused" {
-            delivery.record_refusal(spec, detail);
+        if let Some(base) = checked_base.as_ref().filter(|_| code == "program_refused") {
+            if !delivery.record_refusal(spec, base, detail) {
+                result = Err(spawn_plan_stale(spec));
+            }
         }
     }
     result
@@ -9913,7 +9974,6 @@ impl Drop for AsyncInitialIdentity<'_> {
 /// this value returns, the async caller validates its launch witness and creates
 /// and publishes the child without another await.
 struct PreparedChild {
-    #[cfg(any(test, feature = "test-support"))]
     config_context: Option<config_delivery::ConfigDelivery>,
     binding_publication: Option<ProgramBindingPublication>,
     launch_spec: ModuleSpec,
@@ -10077,8 +10137,8 @@ impl SpawnProgramBinding {
 }
 
 fn spawn_plan_stale(spec: &ModuleSpec) -> SuperviseError {
-    SuperviseError::InvalidSpec {
-        reason: format!("plan_stale: launch witness changed for {}", spec.module_id),
+    SuperviseError::ConfigDeliveryDeferred {
+        module_id: spec.module_id.clone(),
     }
 }
 
@@ -10203,18 +10263,27 @@ async fn spawn_child_in_slot_async(
         return Err(spawn_plan_stale(spec));
     }
     // No await may separate this last identity check from ownership publication.
-    let result = launch_child_in_slot(spec, &runtime.stderr_ring, &runtime.child_roster, prepared);
+    let checked_base = prepared
+        .spawn_admission
+        .as_ref()
+        .and_then(|admission| admission.approved_base())
+        .cloned();
+    let mut result =
+        launch_child_in_slot(spec, &runtime.stderr_ring, &runtime.child_roster, prepared);
     drop(_gate);
     if let (Some(delivery), Err(SuperviseError::ConfigHeld { code, detail, .. })) =
         (runtime.config_delivery.as_ref(), &result)
     {
-        if code == "program_refused" {
+        if let Some(base) = checked_base.filter(|_| code == "program_refused") {
             let module = spec.module_id.clone();
             let identity = subc_config::raw_digest(detail.as_bytes());
-            let _ = delivery
+            let recorded = delivery
                 .0
-                .on_blocking(move |owner| owner.record_program_refusal(&module, identity))
+                .on_blocking(move |owner| owner.record_program_refusal(&module, &base, identity))
                 .await;
+            if matches!(recorded, Ok(false)) {
+                result = Err(spawn_plan_stale(spec));
+            }
         }
     }
     result
@@ -10242,13 +10311,6 @@ fn prepare_child_in_slot(
         .and_then(|admission| admission.launch.as_ref())
         .map(|launch| launch.spec.clone())
         .unwrap_or_else(|| spec.clone());
-    let mut launch_spec = launch_spec;
-    if spawn_admission
-        .as_ref()
-        .is_some_and(|admission| admission.launch.is_some())
-    {
-        launch_spec.reserved = true;
-    }
     let spec = &launch_spec;
     if let Some(error) = recovery_block_error(spec, roster) {
         return Err(error);
@@ -10564,8 +10626,21 @@ fn prepare_child_in_slot(
             context.pause_preflight_for_test();
         }
     }
+    if let Some(admission) = &spawn_admission {
+        if let Some(program) = &admission.launch {
+            if let Err(error) = program.validate_for_spawn() {
+                if let (Some(context), Some(base)) = (delivery_context, admission.approved_base()) {
+                    if error.code == "program_refused"
+                        && !context.record_refusal(spec, base, &error.detail)
+                    {
+                        return Err(spawn_plan_stale(spec));
+                    }
+                }
+                return Err(config_delivery::gate_hold_error(spec, error));
+            }
+        }
+    }
     Ok(PreparedChild {
-        #[cfg(any(test, feature = "test-support"))]
         config_context: delivery_context.map(|delivery| delivery.runtime()),
         binding_publication,
         launch_spec,
@@ -10609,25 +10684,25 @@ fn launch_child_in_slot(
     prepared: PreparedChild,
 ) -> Result<SupervisedChild, SuperviseError> {
     let launch_spec = prepared.launch_spec.clone();
-    let spec = &launch_spec;
-    if prepared
+    let admission_base = prepared
         .spawn_admission
         .as_ref()
-        .and_then(|admission| admission.launch.as_ref())
-        .is_some_and(|program| !program.current())
-    {
-        return Err(SuperviseError::ConfigHeld {
-            module_id: spec.module_id.clone(),
-            code: "program_refused".into(),
-            detail: "a covered file changed after program hashing".into(),
-        });
-    }
+        .and_then(|admission| admission.approved_base())
+        .cloned();
+    let spec = &launch_spec;
     let expected_image = prepared
         .spawn_admission
         .as_ref()
         .and_then(|admission| admission.launch.as_ref())
         .map(|launch| launch.image);
-    let mut binding_publication = prepared.binding_publication;
+    let program_launch = prepared
+        .spawn_admission
+        .and_then(|admission| admission.launch);
+    let config_owner = prepared
+        .config_context
+        .as_ref()
+        .map(|context| context.0.clone());
+    let binding_publication = prepared.binding_publication;
     #[cfg(test)]
     if let Some(context) = &prepared.config_context {
         context.0.before_spawn_exec_for_test();
@@ -10809,7 +10884,13 @@ fn launch_child_in_slot(
         .is_some_and(|expected| recorded_image.and_then(|image| image.executable) != Some(expected))
         && !exited_before_binding
     {
+        kill_module_cgroup(cgroup_placement, &cgroup_name);
         kill_and_reap_rejected_child(&mut child, group_target.clone());
+        if recorded_image.and_then(|image| image.executable).is_none() {
+            return Err(SuperviseError::ConfigDeliveryDeferred {
+                module_id: spec.module_id.clone(),
+            });
+        }
         return Err(SuperviseError::ConfigHeld {
             module_id: spec.module_id.clone(),
             code: "program_refused".into(),
@@ -10827,12 +10908,7 @@ fn launch_child_in_slot(
     #[cfg(target_os = "linux")]
     let binding_ready = !exited_before_binding;
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let binding_ready = true;
-    if binding_ready {
-        if let Some(binding) = &mut binding_publication {
-            binding.verify();
-        }
-    }
+    let binding_ready = cfg!(windows);
     // spawn() confirms only the first exec, into the trampoline. Never persist
     // the trampoline image; the asynchronous acknowledgement publishes the
     // module image once the trampoline has replaced itself with the module.
@@ -11058,6 +11134,9 @@ fn launch_child_in_slot(
     #[cfg(not(any(target_os = "linux", windows)))]
     let subtree_target = crate::subtree_resources::Target::Unavailable("unsupported_platform");
     let mut supervised = SupervisedChild {
+        live_program_binding: None,
+        registered_config_connection: None,
+        admission_base,
         _program_binding: binding_publication,
         subtree_target,
         child: containment::ProcessChild::plain(child, pid),
@@ -11100,6 +11179,25 @@ fn launch_child_in_slot(
         #[cfg(all(test, unix))]
         let _ = roster.admission_event_for_test(&spec.module_id, "after_rejected_child", Some(pid));
         return Err(error);
+    }
+    if let (Some(launch), Some(owner), Some(base)) = (
+        program_launch,
+        config_owner,
+        supervised.admission_base.clone(),
+    ) {
+        supervised.live_program_binding =
+            content_binding::LiveProgramBinding::new(launch, &supervised, owner, base);
+        if let (Some(publication), Some(live)) = (
+            &supervised._program_binding,
+            &supervised.live_program_binding,
+        ) {
+            publication.attach(live);
+        }
+    }
+    if binding_ready {
+        if let Some(binding) = &mut supervised._program_binding {
+            binding.verify();
+        }
     }
     #[cfg(unix)]
     if let Some(admitted) = admitted.take() {
@@ -18580,6 +18678,9 @@ mod cgroup_placement_tests {
             .expect("spawn short-lived child");
         let pid = child.id().expect("spawned child has pid");
         let mut child = SupervisedChild {
+            live_program_binding: None,
+            registered_config_connection: None,
+            admission_base: None,
             _program_binding: None,
             subtree_target: crate::subtree_resources::Target::Unavailable("not_running"),
             child: crate::supervise::containment::ProcessChild::plain(child, pid),

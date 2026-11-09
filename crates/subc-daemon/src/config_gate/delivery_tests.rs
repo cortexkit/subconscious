@@ -679,6 +679,84 @@ async fn config_admission_route_rebind_ack_revokes_old_routes_and_allows_reopen(
     );
 }
 
+fn acknowledged_route_fixture() -> (
+    Rig,
+    std::sync::Arc<RuntimeOwner>,
+    std::sync::Arc<crate::ForwardingTable>,
+    ConfigView,
+) {
+    let (rig, owner) = rig();
+    let first = pending(&owner, INCUMBENT);
+    applied(&owner, INCUMBENT, &first, true).unwrap();
+    let owner = std::sync::Arc::new(owner);
+    let forwarding = std::sync::Arc::new(crate::ForwardingTable::default());
+    let (module_tx, _module_rx) = tokio::sync::mpsc::channel(32);
+    forwarding
+        .register_module_connection(
+            INCUMBENT,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(module_tx),
+        )
+        .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(32);
+    let route = forwarding
+        .begin_route_bind_relay_for_test(ConnectionId::new(30), crate::FrameSink::new(tx), 1, "a")
+        .unwrap();
+    forwarding
+        .complete_pending_relay(
+            INCUMBENT,
+            route.corr,
+            crate::forwarding::RouteBindRelayOutcome::Accepted,
+        )
+        .unwrap();
+    let _handler = crate::ControlHandler::with_forwarding(
+        std::sync::Arc::new(crate::Registry::default()),
+        forwarding.clone(),
+    )
+    .with_config_runtime(owner.clone());
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+    let view = pending(&owner, INCUMBENT);
+    assert_eq!(
+        applied(&owner, INCUMBENT, &view, true).unwrap(),
+        AppliedDisposition::WaitingForReadiness
+    );
+    (rig, owner, forwarding, view)
+}
+
+#[tokio::test]
+async fn config_admission_old_connection_ack_cannot_revoke_for_a_new_attempt() {
+    let (rig, owner, forwarding, view) = acknowledged_route_fixture();
+    rig.declare(&owner, 20);
+    let current = pending(&owner, ConnectionId::new(20));
+    assert_ne!(current.attempt, view.attempt);
+    owner
+        .install_approved_route_policy("a", view.generation)
+        .await
+        .unwrap();
+    assert_eq!(
+        forwarding.active_binding_count().unwrap(),
+        1,
+        "the incumbent's ACK cannot install policy for the new child"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn config_admission_ack_expired_before_revocation_closes_no_routes() {
+    let (_rig, owner, forwarding, view) = acknowledged_route_fixture();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    owner
+        .install_approved_route_policy("a", view.generation)
+        .await
+        .unwrap();
+    assert_eq!(
+        forwarding.active_binding_count().unwrap(),
+        1,
+        "an ACK cannot authorize revocation after its delivery deadline"
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn config_admission_route_rebind_nack_and_timeout_close_nothing() {
     for timed_out in [false, true] {
@@ -1620,7 +1698,7 @@ fn supervised_fixture_with_carry(
     let mut doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     for module in ["a", "b"] {
-        doc["modules"][module] = json!({"program":rig.path.join("program"),"args":[rig.path.join(format!("{module}.seen")),rig.path.join(format!("{module}.launches"))],"protocol":"subc","overlap":"safe","carry_containment":carry_containment});
+        doc["modules"][module] = json!({"program":rig.path.join("program"),"args":[rig.path.join(format!("{module}.seen")),rig.path.join(format!("{module}.launches"))],"protocol":"subc","overlap":if carry_containment {"exclusive"}else{"safe"},"carry_containment":carry_containment});
     }
     doc["modules"]["a"]["carry_containment"] = json!(carry_containment);
     std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
@@ -2710,7 +2788,7 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
         .join("a.next-command.launches")
         .to_string_lossy()
         .into_owned();
-    module.update_spec_for_test(next.clone()).await.unwrap();
+    // The approved generation, not live file staging, selects the next command.
     std::fs::write(rig.path.join("subc.jsonc"), serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":next.program,"args":next.args,"overlap":"safe"}}})).unwrap()).unwrap();
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::ModuleRestart]);
     let gate = owner.module_gate("a").unwrap();

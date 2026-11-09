@@ -93,10 +93,20 @@ impl DeliveryState {
     pub(super) fn started_at_generation(&self) -> u64 {
         self.initial_generation
     }
-    pub(super) fn policy_acknowledged(&self, module: &str, generation: u64) -> bool {
-        self.attempts.values().any(|attempt| {
-            attempt.module == module && attempt.generation == generation && attempt.acknowledged
-        })
+    pub(super) fn policy_authorization(
+        &self,
+        module: &str,
+        generation: u64,
+        connection: ConnectionId,
+    ) -> Option<(u64, tokio::time::Instant)> {
+        let attempt = self.attempts.get(&connection)?;
+        let deadline = attempt.deadline?;
+        (attempt.module == module
+            && attempt.generation == generation
+            && attempt.delivered
+            && attempt.acknowledged
+            && tokio::time::Instant::now() < deadline)
+            .then_some((attempt.id, deadline))
     }
     pub(super) fn fenced_modules(&self) -> impl Iterator<Item = String> + '_ {
         self.exited.keys().cloned()
@@ -810,7 +820,7 @@ impl RuntimeOwner {
             hook();
         }
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_spawn_preflight_hook_for_test(&self, hook: impl FnOnce() + Send + 'static) {
         *self.spawn_preflight_hook.lock().unwrap() = Some(Box::new(hook));
     }

@@ -580,23 +580,32 @@ pub(crate) fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
         ));
     }
     let id = file_object_id(&file)?;
-    let mut reader = &file;
     let mut hasher = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
     let mut length = 0;
-    loop {
-        let count = reader.read(&mut buffer).map_err(capture_error)?;
-        if count == 0 {
-            break;
+    #[cfg(target_os = "macos")]
+    let signatures = subc_os::code_signature::file_signature(&file, |chunk| {
+        length += chunk.len() as u64;
+        hasher.update(chunk);
+    })
+    .map_err(|error| GateError::new("input_unavailable", error))?;
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut reader = &file;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let count = reader.read(&mut buffer).map_err(capture_error)?;
+            if count == 0 {
+                break;
+            }
+            length += count as u64;
+            if length > PROGRAM_FILE_LIMIT {
+                return Err(GateError::new(
+                    "input_too_large",
+                    "covered program exceeds the 512 MiB streamed-hash limit",
+                ));
+            }
+            hasher.update(&buffer[..count]);
         }
-        length += count as u64;
-        if length > PROGRAM_FILE_LIMIT {
-            return Err(GateError::new(
-                "input_too_large",
-                "covered program exceeds the 512 MiB streamed-hash limit",
-            ));
-        }
-        hasher.update(&buffer[..count]);
     }
     let after = file.metadata().map_err(capture_error)?;
     let reopened = subc_os::open_regular_nofollow(&resolved).map_err(capture_error)?;
@@ -609,6 +618,29 @@ pub(crate) fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
         return Err(GateError::stale());
     }
     let identity = json!({ "path": resolved, "file": id, "length": length, "raw": format!("sha256:{:x}", hasher.finalize()) });
+    #[cfg(target_os = "macos")]
+    let identity = {
+        let mut identity = identity;
+        match signatures {
+            subc_os::code_signature::FileSignature::Signed(hashes) => {
+                identity["cdhashes"] = json!(hashes
+                    .into_iter()
+                    .map(|hash| hash
+                        .0
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>())
+                    .collect::<Vec<_>>())
+            }
+            subc_os::code_signature::FileSignature::Unsigned => identity["cdhashes"] = json!([]),
+            subc_os::code_signature::FileSignature::Invalid => {
+                identity["cdhashes"] = json!([]);
+                identity["signature_invalid"] = json!(true);
+            }
+            subc_os::code_signature::FileSignature::NotMachO => {}
+        }
+        identity
+    };
     let state = InputState::Present {
         digest: subc_config::raw_digest(
             &serde_json::to_vec(&identity).map_err(GateError::invalid)?,

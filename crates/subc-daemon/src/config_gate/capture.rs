@@ -360,12 +360,19 @@ impl ConfigCapturer {
         mut layer_file: impl FnMut(&Path) -> Result<CapturedFile>,
     ) -> Result<CapturedConfiguration> {
         let doc = daemon.parse()?;
+        let mut launch_specs = BTreeMap::new();
         if let Some(bytes) = &daemon.bytes {
-            crate::daemon_config::parse_with_activity(
+            let (config, _) = crate::daemon_config::parse_with_activity(
                 std::str::from_utf8(bytes).map_err(capture_error)?,
                 &self.daemon_path,
             )
             .map_err(capture_error)?;
+            launch_specs.extend(
+                config
+                    .modules
+                    .into_iter()
+                    .map(|module| (module.module_id.clone(), module.module_spec())),
+            );
             refuse_expansions(&doc, "subc", "")?;
         }
         let mut program_handles = Vec::new();
@@ -400,16 +407,13 @@ impl ConfigCapturer {
                 if selected.is_some_and(|modules| !modules.contains(module)) {
                     continue;
                 }
-                if let Some(program) = entry.get("program").and_then(Value::as_str) {
-                    let (file, captured) = capture_program(Path::new(program))?;
-                    diagnostic.inputs.insert(
-                        InputKey::Program {
-                            module: module.clone(),
-                            path: program.into(),
-                        },
-                        captured,
-                    );
-                    program_handles.push(file);
+                if let Some(spec) = launch_specs.get(module) {
+                    let covered = super::program::program_files(entry)?;
+                    let launch = super::program::capture(spec, &covered).map_err(|error| {
+                        GateError::new(&error.code, format!("{module}: {}", error.detail))
+                    })?;
+                    diagnostic.inputs.extend(launch.inputs);
+                    program_handles.extend(launch.files);
                 }
             }
         }
@@ -546,7 +550,7 @@ fn redact_launch_values(value: &Value) -> Result<Value> {
     }
 }
 
-fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
+pub(crate) fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
     use sha2::{Digest as _, Sha256};
     if !path.is_absolute() {
         return Err(GateError::new(
@@ -576,27 +580,39 @@ fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
         ));
     }
     let id = file_object_id(&file)?;
-    let mut reader = &file;
     let mut hasher = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
     let mut length = 0;
-    loop {
-        let count = reader.read(&mut buffer).map_err(capture_error)?;
-        if count == 0 {
-            break;
+    #[cfg(target_os = "macos")]
+    let signatures = subc_os::code_signature::file_signature(&file, |chunk| {
+        length += chunk.len() as u64;
+        hasher.update(chunk);
+    });
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut reader = &file;
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let count = reader.read(&mut buffer).map_err(capture_error)?;
+            if count == 0 {
+                break;
+            }
+            length += count as u64;
+            if length > PROGRAM_FILE_LIMIT {
+                return Err(GateError::new(
+                    "input_too_large",
+                    "covered program exceeds the 512 MiB streamed-hash limit",
+                ));
+            }
+            hasher.update(&buffer[..count]);
         }
-        length += count as u64;
-        if length > PROGRAM_FILE_LIMIT {
-            return Err(GateError::new(
-                "input_too_large",
-                "covered program exceeds the 512 MiB streamed-hash limit",
-            ));
-        }
-        hasher.update(&buffer[..count]);
     }
     let after = file.metadata().map_err(capture_error)?;
     let reopened = subc_os::open_regular_nofollow(&resolved).map_err(capture_error)?;
-    if length != before.len()
+    #[cfg(target_os = "macos")]
+    let completed = signatures.is_ok();
+    #[cfg(not(target_os = "macos"))]
+    let completed = true;
+    if (completed && length != before.len())
         || std::fs::canonicalize(path).map_err(capture_error)? != resolved
         || before.len() != after.len()
         || before.modified().ok() != after.modified().ok()
@@ -604,7 +620,38 @@ fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
     {
         return Err(GateError::stale());
     }
+    #[cfg(target_os = "macos")]
+    let signatures = signatures.map_err(|error| match error {
+        subc_os::code_signature::SignatureError::Parse => GateError::new(
+            "program_invalid",
+            "covered program has an invalid or unsupported Mach-O structure",
+        ),
+        other => capture_error(other),
+    })?;
     let identity = json!({ "path": resolved, "file": id, "length": length, "raw": format!("sha256:{:x}", hasher.finalize()) });
+    #[cfg(target_os = "macos")]
+    let identity = {
+        let mut identity = identity;
+        match signatures {
+            subc_os::code_signature::FileSignature::Signed(hashes) => {
+                identity["cdhashes"] = json!(hashes
+                    .into_iter()
+                    .map(|hash| hash
+                        .0
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>())
+                    .collect::<Vec<_>>())
+            }
+            subc_os::code_signature::FileSignature::Unsigned => identity["cdhashes"] = json!([]),
+            subc_os::code_signature::FileSignature::Invalid => {
+                identity["cdhashes"] = json!([]);
+                identity["signature_invalid"] = json!(true);
+            }
+            subc_os::code_signature::FileSignature::NotMachO => {}
+        }
+        identity
+    };
     let state = InputState::Present {
         digest: subc_config::raw_digest(
             &serde_json::to_vec(&identity).map_err(GateError::invalid)?,

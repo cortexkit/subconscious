@@ -591,6 +591,291 @@ fn plan_kinds(
     plan_kinds_from_disk(owner, kinds)
 }
 
+#[tokio::test]
+async fn config_admission_route_rebind_ack_revokes_old_routes_and_allows_reopen() {
+    let (rig, owner) = rig();
+    let first = pending(&owner, INCUMBENT);
+    applied(&owner, INCUMBENT, &first, true).unwrap();
+    let owner = std::sync::Arc::new(owner);
+    let forwarding = std::sync::Arc::new(crate::ForwardingTable::default());
+    let (module_tx, _module_rx) = tokio::sync::mpsc::channel(32);
+    forwarding
+        .register_module_connection(
+            INCUMBENT,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(module_tx),
+        )
+        .unwrap();
+    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel(32);
+    let sink = crate::FrameSink::new(client_tx);
+    let client = ConnectionId::new(30);
+    let old = forwarding
+        .begin_route_bind_relay_for_test(client, sink.clone(), 1, "a")
+        .unwrap();
+    forwarding
+        .complete_pending_relay(
+            INCUMBENT,
+            old.corr,
+            crate::forwarding::RouteBindRelayOutcome::Accepted,
+        )
+        .unwrap();
+    let _handler = crate::ControlHandler::with_forwarding(
+        std::sync::Arc::new(crate::Registry::default()),
+        forwarding.clone(),
+    )
+    .with_config_runtime(owner.clone());
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+    let view = pending(&owner, INCUMBENT);
+    owner
+        .install_approved_route_policy("a", view.generation)
+        .await
+        .unwrap();
+    assert_eq!(
+        forwarding.active_binding_count().unwrap(),
+        1,
+        "no old route closes before the module ACK"
+    );
+    assert_eq!(
+        applied(&owner, INCUMBENT, &view, true).unwrap(),
+        AppliedDisposition::WaitingForReadiness
+    );
+    owner
+        .install_approved_route_policy("a", view.generation)
+        .await
+        .unwrap();
+    assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+    let mut saw_reload = false;
+    while let Ok(frame) = client_rx.try_recv() {
+        if frame.frame.header.ty == subc_protocol::FrameType::Push {
+            let push: serde_json::Value = serde_json::from_slice(&frame.frame.body).unwrap();
+            saw_reload |= push["reason"] == "reload";
+        }
+    }
+    assert!(
+        saw_reload,
+        "clients need the existing reopen-eligible reload reason"
+    );
+    let new = forwarding
+        .begin_route_bind_relay_for_test(client, sink, 2, "a")
+        .unwrap();
+    forwarding
+        .complete_pending_relay(
+            INCUMBENT,
+            new.corr,
+            crate::forwarding::RouteBindRelayOutcome::Accepted,
+        )
+        .unwrap();
+    assert_eq!(forwarding.active_binding_count().unwrap(), 1);
+    assert_eq!(
+        owner
+            .module_get(INCUMBENT, "a", ConfigGetRequest::new())
+            .unwrap()
+            .pending
+            .unwrap()
+            .effective["limit"],
+        2
+    );
+}
+
+fn acknowledged_route_fixture() -> (
+    Rig,
+    std::sync::Arc<RuntimeOwner>,
+    std::sync::Arc<crate::ForwardingTable>,
+    ConfigView,
+) {
+    let (rig, owner) = rig();
+    let first = pending(&owner, INCUMBENT);
+    applied(&owner, INCUMBENT, &first, true).unwrap();
+    let owner = std::sync::Arc::new(owner);
+    let forwarding = std::sync::Arc::new(crate::ForwardingTable::default());
+    let (module_tx, _module_rx) = tokio::sync::mpsc::channel(32);
+    forwarding
+        .register_module_connection(
+            INCUMBENT,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(module_tx),
+        )
+        .unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(32);
+    let route = forwarding
+        .begin_route_bind_relay_for_test(ConnectionId::new(30), crate::FrameSink::new(tx), 1, "a")
+        .unwrap();
+    forwarding
+        .complete_pending_relay(
+            INCUMBENT,
+            route.corr,
+            crate::forwarding::RouteBindRelayOutcome::Accepted,
+        )
+        .unwrap();
+    let _handler = crate::ControlHandler::with_forwarding(
+        std::sync::Arc::new(crate::Registry::default()),
+        forwarding.clone(),
+    )
+    .with_config_runtime(owner.clone());
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+    let view = pending(&owner, INCUMBENT);
+    assert_eq!(
+        applied(&owner, INCUMBENT, &view, true).unwrap(),
+        AppliedDisposition::WaitingForReadiness
+    );
+    (rig, owner, forwarding, view)
+}
+
+#[tokio::test]
+async fn config_admission_old_connection_ack_cannot_revoke_for_a_new_attempt() {
+    let (rig, owner, forwarding, view) = acknowledged_route_fixture();
+    rig.declare(&owner, 20);
+    let current = pending(&owner, ConnectionId::new(20));
+    assert_ne!(current.attempt, view.attempt);
+    owner
+        .install_approved_route_policy("a", view.generation)
+        .await
+        .unwrap();
+    assert_eq!(
+        forwarding.active_binding_count().unwrap(),
+        1,
+        "the incumbent's ACK cannot install policy for the new child"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn config_admission_ack_expired_before_revocation_closes_no_routes() {
+    let (_rig, owner, forwarding, view) = acknowledged_route_fixture();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    owner
+        .install_approved_route_policy("a", view.generation)
+        .await
+        .unwrap();
+    assert_eq!(
+        forwarding.active_binding_count().unwrap(),
+        1,
+        "an ACK cannot authorize revocation after its delivery deadline"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn config_admission_route_rebind_rechecks_deadline_after_forwarding_write_wait() {
+    let (_rig, owner, forwarding, view) = acknowledged_route_fixture();
+    let locked = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let unlock = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let locker = {
+        let (forwarding, locked, unlock) = (forwarding.clone(), locked.clone(), unlock.clone());
+        std::thread::spawn(move || {
+            forwarding.with_forwarding_write_lock_for_test(|| {
+                locked.wait();
+                unlock.wait();
+            })
+        })
+    };
+    locked.wait();
+    let hold = std::sync::Arc::new(std::sync::Barrier::new(2));
+    forwarding.pause_policy_rebind_before_write(hold.clone());
+    let runtime = tokio::runtime::Handle::current();
+    let installation = std::thread::spawn(move || {
+        runtime.block_on(owner.install_approved_route_policy("a", view.generation))
+    });
+    hold.wait();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    hold.wait();
+    unlock.wait();
+    locker.join().unwrap();
+    let _ = installation.join().unwrap();
+    assert_eq!(
+        forwarding.active_binding_count().unwrap(),
+        1,
+        "a deadline crossed while awaiting forwarding publication must revoke no routes"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn config_admission_route_rebind_nack_and_timeout_close_nothing() {
+    for timed_out in [false, true] {
+        let (rig, owner) = rig();
+        let first = pending(&owner, INCUMBENT);
+        applied(&owner, INCUMBENT, &first, true).unwrap();
+        let owner = std::sync::Arc::new(owner);
+        let forwarding = std::sync::Arc::new(crate::ForwardingTable::default());
+        let (module_tx, _module_rx) = tokio::sync::mpsc::channel(32);
+        forwarding
+            .register_module_connection(
+                INCUMBENT,
+                "a".into(),
+                subc_protocol::PROTOCOL_VERSION,
+                subc_protocol::manifest::Concurrency::ModuleManaged,
+                crate::FrameSink::new(module_tx),
+            )
+            .unwrap();
+        let (client_tx, _client_rx) = tokio::sync::mpsc::channel(32);
+        let relay = forwarding
+            .begin_route_bind_relay_for_test(
+                ConnectionId::new(30),
+                crate::FrameSink::new(client_tx),
+                1,
+                "a",
+            )
+            .unwrap();
+        forwarding
+            .complete_pending_relay(
+                INCUMBENT,
+                relay.corr,
+                crate::forwarding::RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        let _handler = crate::ControlHandler::with_forwarding(
+            std::sync::Arc::new(crate::Registry::default()),
+            forwarding.clone(),
+        )
+        .with_config_runtime(owner.clone());
+        approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+        let view = pending(&owner, INCUMBENT);
+        owner
+            .install_approved_route_policy("a", view.generation)
+            .await
+            .unwrap();
+        if timed_out {
+            tokio::time::advance(Duration::from_secs(30)).await;
+            owner
+                .delivery_timeout(INCUMBENT, "a", view.generation, view.attempt.unwrap())
+                .unwrap();
+        } else {
+            applied(&owner, INCUMBENT, &view, false).unwrap();
+        }
+        owner
+            .install_approved_route_policy("a", view.generation)
+            .await
+            .unwrap();
+        assert_eq!(forwarding.active_binding_count().unwrap(), 1);
+        assert_active(&owner, INCUMBENT, 1);
+    }
+}
+
+#[test]
+fn config_admission_daemon_owned_route_rebind_is_refused_by_name() {
+    let (rig, owner) = rig();
+    let owner = std::sync::Arc::new(owner);
+    let _handler = crate::ControlHandler::new(std::sync::Arc::new(crate::Registry::default()))
+        .with_config_runtime(owner.clone());
+    write(&rig, 2);
+    let error = owner
+        .finish_plan(owner.prepare(PlanKind::Change).unwrap(), |old, new| {
+            let mut changeset = daemon_review(old, new)?;
+            changeset.fields.push(subc_config::FieldChange::new(
+                "subc",
+                "/scope_authority_owners",
+                subc_config::RecordedValue::new(json!([])),
+                subc_config::RecordedValue::new(json!(["a"])),
+                subc_config::ApplyKind::RouteRebind,
+            ));
+            Ok(changeset)
+        })
+        .unwrap_err();
+    assert_eq!(error.code, "daemon_route_policy_authority_unavailable");
+}
+
 fn plan_kinds_from_disk(
     owner: &RuntimeOwner,
     kinds: &[subc_config::ApplyKind],
@@ -1078,7 +1363,7 @@ async fn config_spawn_async_io_checks_keychain_and_store_hash_off_the_runtime_th
     let rig = Rig::new();
     std::fs::write(
         rig.path.join("program"),
-        b"#!/bin/sh\nexec /bin/sleep 600\n",
+        b"#!/bin/sh\nwhile :; do /bin/sleep 600; done\n",
     )
     .unwrap();
     std::fs::set_permissions(
@@ -1421,15 +1706,36 @@ fn supervised_fixture(
     crate::supervise::Supervisor,
     std::sync::Arc<crate::ControlHandler>,
 ) {
+    supervised_fixture_with_carry(has_active, false)
+}
+
+#[cfg(unix)]
+fn supervised_fixture_with_carry(
+    has_active: bool,
+    carry_containment: bool,
+) -> (
+    Rig,
+    std::sync::Arc<RuntimeOwner>,
+    crate::supervise::Supervisor,
+    std::sync::Arc<crate::ControlHandler>,
+) {
     use std::{os::unix::fs::PermissionsExt, sync::Arc};
     let rig = Rig::new();
-    std::fs::write(rig.path.join("program"), b"#!/bin/sh\nprintf 'started\\n' >> \"$2\"\nif [ ! -e \"$1\" ]; then : > \"$1\"; exit 23; fi\nexec /bin/sleep 600\n").unwrap();
+    std::fs::write(rig.path.join("program"), b"#!/bin/sh\nprintf 'started\\n' >> \"$2\"\nif [ ! -e \"$1\" ]; then : > \"$1\"; exit 23; fi\nwhile :; do /bin/sleep 600; done\n").unwrap();
     std::fs::set_permissions(
         rig.path.join("program"),
         std::fs::Permissions::from_mode(0o700),
     )
     .unwrap();
     write(&rig, 1);
+    let path = rig.path.join("subc.jsonc");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for module in ["a", "b"] {
+        doc["modules"][module] = json!({"program":rig.path.join("program"),"args":[rig.path.join(format!("{module}.seen")),rig.path.join(format!("{module}.launches"))],"protocol":"subc","overlap":if carry_containment {"exclusive"}else{"safe"},"carry_containment":carry_containment});
+    }
+    doc["modules"]["a"]["carry_containment"] = json!(carry_containment);
+    std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
     let owner = Arc::new(rig.owner("supervised-delivery"));
     rig.declare(&owner, INCUMBENT.get());
     rig.stamp(&owner);
@@ -1468,7 +1774,19 @@ impl RuntimeOwner {
         std::sync::Arc<crate::ControlHandler>,
         crate::supervise::ModuleSpec,
     ) {
-        let (rig, owner, supervisor, handler) = supervised_fixture(false);
+        Self::unactivated_supervisor_fixture_with_carry_for_test(false)
+    }
+
+    pub(crate) fn unactivated_supervisor_fixture_with_carry_for_test(
+        carry: bool,
+    ) -> (
+        impl Drop,
+        std::sync::Arc<Self>,
+        crate::supervise::Supervisor,
+        std::sync::Arc<crate::ControlHandler>,
+        crate::supervise::ModuleSpec,
+    ) {
+        let (rig, owner, supervisor, handler) = supervised_fixture_with_carry(false, carry);
         let path = rig.path.join("subc.jsonc");
         let (config, _) = crate::daemon_config::parse_with_activity(
             &std::fs::read_to_string(&path).unwrap(),
@@ -1497,13 +1815,37 @@ async fn wait_for_delivery_condition(mut condition: impl FnMut() -> bool) {
 }
 
 #[cfg(unix)]
+async fn wait_for_supervised_stage(
+    module: &crate::supervise::SupervisedModule,
+    stage: &str,
+    mut condition: impl FnMut() -> bool,
+) {
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "{stage}: status {:?}; terminal history {:?}; stderr {:?}",
+        module.status(),
+        module.terminal_history(),
+        module.stderr_tail(None, None)
+    );
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn config_delivery_supervisor_pre_hello_crash_defers_respawn_without_spending_budget_and_restores_active(
 ) {
     let (rig, owner, supervisor, handler) = supervised_fixture(true);
     let module = supervisor.spawn(supervised_spec(&rig, "a")).unwrap();
-    wait_for_delivery_condition(|| owner.delivery_exit_fence("a").unwrap().is_some()).await;
-    wait_for_delivery_condition(|| {
+    wait_for_supervised_stage(&module, "pre-HELLO crash raises exit fence", || {
+        owner.delivery_exit_fence("a").unwrap().is_some()
+    })
+    .await;
+    wait_for_supervised_stage(&module, "pre-HELLO crash defers the actor", || {
         module.state().unwrap() == crate::supervise::ModuleState::Restarting
     })
     .await;
@@ -1551,10 +1893,14 @@ async fn config_delivery_supervisor_pre_hello_crash_defers_respawn_without_spend
     );
     assert!(owner.delivery_exit_fence("a").unwrap().is_some());
     let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
-    wait_for_delivery_condition(|| {
-        std::fs::read_to_string(rig.path.join("a.launches"))
-            .is_ok_and(|text| text.lines().count() == 2)
-    })
+    wait_for_supervised_stage(
+        &module,
+        "pre-HELLO fence clears and one replacement starts",
+        || {
+            std::fs::read_to_string(rig.path.join("a.launches"))
+                .is_ok_and(|text| text.lines().count() == 2)
+        },
+    )
     .await;
     assert!(owner.delivery_exit_fence("a").unwrap().is_none());
     assert_eq!(module.status().unwrap().restart_count, 1);
@@ -2315,9 +2661,12 @@ async fn config_delivery_approved_restart_preserves_the_crash_ring_and_its_warmu
 ) {
     let (rig, owner, supervisor, handler) = supervised_fixture(true);
     let module = supervisor.spawn(supervised_spec(&rig, "a")).unwrap();
-    wait_for_delivery_condition(|| owner.delivery_exit_fence("a").unwrap().is_some()).await;
+    wait_for_supervised_stage(&module, "first crash raises exit fence", || {
+        owner.delivery_exit_fence("a").unwrap().is_some()
+    })
+    .await;
     let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
-    wait_for_delivery_condition(|| {
+    wait_for_supervised_stage(&module, "first crash respawns generation two", || {
         module
             .status()
             .is_ok_and(|status| status.spawn_generation == 2 && status.process_alive)
@@ -2326,7 +2675,7 @@ async fn config_delivery_approved_restart_preserves_the_crash_ring_and_its_warmu
     assert_eq!(module.status().unwrap().restart_count, 1);
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::ModuleRestart]);
     owner.notify_delivery_changed();
-    wait_for_delivery_condition(|| {
+    wait_for_supervised_stage(&module, "approved restart spawns generation three", || {
         module
             .status()
             .is_ok_and(|status| status.spawn_generation == 3 && status.process_alive)
@@ -2337,6 +2686,11 @@ async fn config_delivery_approved_restart_preserves_the_crash_ring_and_its_warmu
         1,
         "approval neither spends nor clears the preceding real crash"
     );
+    wait_for_supervised_stage(&module, "approved script records its third start", || {
+        std::fs::read_to_string(rig.path.join("a.launches"))
+            .is_ok_and(|text| text.lines().count() == 3)
+    })
+    .await;
     assert_eq!(
         std::fs::read_to_string(rig.path.join("a.launches"))
             .unwrap()
@@ -2351,11 +2705,15 @@ async fn config_delivery_approved_restart_preserves_the_crash_ring_and_its_warmu
         .status()
         .unwrap()
         .success());
-    wait_for_delivery_condition(|| {
-        module
-            .status()
-            .is_ok_and(|status| status.spawn_generation == 4 && status.process_alive)
-    })
+    wait_for_supervised_stage(
+        &module,
+        "replacement crash respawns generation four",
+        || {
+            module
+                .status()
+                .is_ok_and(|status| status.spawn_generation == 4 && status.process_alive)
+        },
+    )
     .await;
     assert_eq!(
         module.status().unwrap().restart_count,
@@ -2464,7 +2822,7 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
         .join("a.next-command.launches")
         .to_string_lossy()
         .into_owned();
-    module.update_spec_for_test(next.clone()).await.unwrap();
+    // The approved generation, not live file staging, selects the next command.
     std::fs::write(rig.path.join("subc.jsonc"), serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":next.program,"args":next.args,"overlap":"safe"}}})).unwrap()).unwrap();
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::ModuleRestart]);
     let gate = owner.module_gate("a").unwrap();
@@ -2676,7 +3034,7 @@ async fn config_delivery_route_worker_requests_immediate_health_and_uses_deliver
         let rig = Rig::new();
         std::fs::write(
             rig.path.join("program"),
-            b"#!/bin/sh\nexec /bin/sleep 600\n",
+            b"#!/bin/sh\nwhile :; do /bin/sleep 600; done\n",
         )
         .unwrap();
         std::fs::set_permissions(
@@ -2851,4 +3209,168 @@ fn hold_test_clock() -> WorkerGuard {
             tokio::task::yield_now().await;
         }
     }))
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn config_delivery_swap_candidate_exit_requeues_busy_approved_restart_exactly_once() {
+    use crate::supervise::{ModuleOverlap, RestartPolicy, Supervisor, SupervisorHandle};
+    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+    let rig = Rig::new();
+    write(&rig, 1);
+    std::fs::write(
+        rig.path.join("program"),
+        b"#!/bin/sh\nprintf '%s\\n' \"$$\" >> \"$2\"\nwhile :; do /bin/sleep 600; done\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        rig.path.join("program"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let mut spec = supervised_spec(&rig, "a");
+    spec.protocol = subc_control::ModuleProtocol::Subc;
+    spec.overlap = ModuleOverlap::Safe;
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":spec.program,"args":spec.args,"protocol":"subc","overlap":"safe"}}})).unwrap()).unwrap();
+    let owner = Arc::new(rig.owner("restart-after-candidate-exit"));
+    rig.declare(&owner, INCUMBENT.get());
+    rig.stamp(&owner);
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    let registry = Arc::new(crate::Registry::default());
+    let forwarding = Arc::new(crate::ForwardingTable::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
+        .with_handle(handle.clone())
+        .with_forwarding(forwarding.clone())
+        .with_config_runtime(owner.clone())
+        .with_drain_timeout(Duration::from_millis(20));
+    let handler = Arc::new(
+        crate::ControlHandler::with_forwarding(registry.clone(), forwarding.clone())
+            .with_supervisor(handle)
+            .with_config_runtime(owner.clone()),
+    );
+    let module = supervisor.spawn(spec.clone()).unwrap();
+    let mut manifest = subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build();
+    manifest.ready = Some(true);
+    registry
+        .register_with_control_ops(
+            manifest.clone(),
+            subc_protocol::PROTOCOL_VERSION,
+            INCUMBENT,
+            vec!["config.review".into()],
+        )
+        .unwrap();
+    let (sender, _incumbent_frames) = tokio::sync::mpsc::channel(8);
+    forwarding
+        .register_module_connection(
+            INCUMBENT,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(sender),
+        )
+        .unwrap();
+    let swap = {
+        let module = module.clone();
+        tokio::spawn(async move { module.swap(Some(Duration::from_secs(30))).await })
+    };
+    wait_for_delivery_condition(|| {
+        std::fs::read_to_string(rig.path.join("a.launches"))
+            .is_ok_and(|text| text.lines().count() == 2)
+    })
+    .await;
+    manifest.ready = Some(false);
+    registry
+        .register_candidate_with_control_ops(
+            manifest,
+            subc_protocol::PROTOCOL_VERSION,
+            CANDIDATE,
+            vec!["config.review".into()],
+        )
+        .unwrap();
+    let (sender, _candidate_frames) = tokio::sync::mpsc::channel(8);
+    forwarding
+        .register_candidate_module_connection(
+            CANDIDATE,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(sender),
+        )
+        .unwrap();
+    let mut next = spec;
+    next.program = rig.path.join("next-program");
+    std::fs::copy(rig.path.join("program"), &next.program).unwrap();
+    next.args[1] = rig
+        .path
+        .join("a.current.launches")
+        .to_string_lossy()
+        .into_owned();
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":next.program,"args":next.args,"protocol":"subc","overlap":"safe"}}})).unwrap()).unwrap();
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::ModuleRestart]);
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+    *owner.warm_restart_pause.lock().unwrap() =
+        Some(crate::config_gate::runtime::WarmRestartPause {
+            reached: reached_tx,
+            resume: resume_rx,
+        });
+    let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
+    tokio::time::timeout(Duration::from_secs(5), reached_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let guard = owner.lock().unwrap();
+    resume_tx.send(()).unwrap();
+    let candidate_pid = std::fs::read_to_string(rig.path.join("a.launches"))
+        .unwrap()
+        .lines()
+        .nth(1)
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    let pid = rustix::process::Pid::from_raw(candidate_pid).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while subc_os::child_exit::observe(candidate_pid as u32)
+            .unwrap()
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(guard);
+    assert!(tokio::time::timeout(Duration::from_secs(5), swap)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    registry.deregister_connection(INCUMBENT).unwrap();
+    let restarted = tokio::time::timeout(Duration::from_secs(5), async {
+        while !rig.path.join("a.current.launches").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    // The worker still sees pending (module a, generation 2), but sends that
+    // pair only once. Warm-up must hand back its consumed ConfigApplyRestart.
+    if restarted {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    let launches = std::fs::read_to_string(rig.path.join("a.current.launches"))
+        .unwrap_or_default()
+        .lines()
+        .count();
+    let status = module.status().unwrap();
+    module.stop().await.unwrap();
+    assert!(
+        restarted,
+        "candidate exit lost the worker's one approved restart"
+    );
+    assert_eq!(launches, 1);
+    assert_eq!(status.spawn_generation, 2);
+    assert_eq!(status.restart_count, 0);
 }

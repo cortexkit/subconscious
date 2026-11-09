@@ -1,8 +1,10 @@
 use subc_control::config::{ConfigControlRequest, ConfigControlResponse};
 
 use super::*;
+mod admission;
 mod delivery_worker;
 mod phone;
+mod route_policy;
 
 /// Bound each immutable module review so an unanswered request cannot approve a plan.
 const CONFIG_REVIEW_TIMEOUT: Duration = Duration::from_secs(30);
@@ -362,9 +364,33 @@ impl ControlHandler {
         mut self,
         runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
     ) -> Self {
+        self.supervisor.install_binding_retirement(&runtime);
         let _ = runtime.set_activity(self.activity.clone());
+        runtime.install_module_route_authority(Arc::new(route_policy::ModuleRouteAuthority(
+            self.clone(),
+            Arc::downgrade(&runtime),
+        )));
         self.config_runtime = Some(runtime);
         self
+    }
+
+    /// Only bootstrap's explicit store-root path advertises configuration authority.
+    pub(crate) fn with_explicit_config_store(
+        self,
+        runtime: Arc<crate::config_gate::runtime::RuntimeOwner>,
+    ) -> Self {
+        let mut handler = self.with_config_runtime(runtime);
+        let capability = subc_protocol::config::CONFIG_GATE_CAPABILITY;
+        if !handler
+            .subc_capabilities
+            .iter()
+            .any(|present| present == capability)
+        {
+            let mut capabilities = handler.subc_capabilities.to_vec();
+            capabilities.push(capability.to_owned());
+            handler.subc_capabilities = capabilities.into();
+        }
+        handler
     }
 
     fn config_desktop_identity(
@@ -460,7 +486,16 @@ impl ControlHandler {
         admission: Arc<dyn crate::config_gate::ReviewAdmission>,
     ) -> Self {
         self.config_review_admission = admission;
+        self.config_review_admission_is_default = false;
         self
+    }
+
+    pub(super) fn review_admission(&self) -> Arc<dyn crate::config_gate::ReviewAdmission> {
+        if self.config_runtime.is_some() && self.config_review_admission_is_default {
+            Arc::new(admission::SupervisedReviewAdmission(self.clone()))
+        } else {
+            self.config_review_admission.clone()
+        }
     }
 
     pub(super) async fn handle_config_gate_request(
@@ -703,7 +738,9 @@ impl ControlHandler {
                                 format!("{module}: no active reviewer"),
                             )
                         })?;
-                    self.config_review_admission.check(&registration)?;
+                    let admission = self.review_admission();
+                    let reviewer = registration.clone();
+                    config_work(runtime.clone(), move |_| admission.check(&reviewer)).await?;
                     if !registration
                         .control_ops
                         .iter()
@@ -818,7 +855,11 @@ impl ControlHandler {
         {
             return None;
         }
-        self.config_review_admission.check(&registration).ok()?;
+        let admission = self.review_admission();
+        let reviewer = registration.clone();
+        config_work(runtime.clone(), move |_| admission.check(&reviewer))
+            .await
+            .ok()?;
         let module = self.supervisor.get("callosum")?;
         let status = module.status().ok()?;
         let (spec, _) = module.configuration().ok()?;

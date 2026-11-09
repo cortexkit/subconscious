@@ -2132,6 +2132,114 @@ mod tests {
         ScopeTable::new([PREFRONTAL.to_string()])
     }
 
+    #[tokio::test]
+    async fn config_admission_policy_rebind_removes_live_and_pending_scope_stamps() {
+        let mut scopes = table();
+        let mut record = head("policy", 1).with_bind_proof_sha256(Some(
+            "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0".into(),
+        ));
+        record.carriers.push(ScopeCarrier::new(Principal::Direct));
+        let applied = sync(&mut scopes, PREFRONTAL, conn(1), 1, vec![record]);
+        let selector = ScopeSelector::new(reserved(PREFRONTAL), "policy", Some(1))
+            .with_bind_proof(Some("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".into()));
+        let forwarding = crate::ForwardingTable::default();
+        forwarding
+            .publish_scope_changes(&applied.tag_changes)
+            .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        forwarding
+            .register_module_connection(
+                conn(100),
+                AFT.into(),
+                subc_protocol::PROTOCOL_VERSION,
+                subc_protocol::manifest::Concurrency::ModuleManaged,
+                crate::FrameSink::new(tx),
+            )
+            .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let sink = crate::FrameSink::new(tx);
+        let mut routes = Vec::new();
+        for corr in [1, 2] {
+            let admission = scopes
+                .admit(&Principal::Direct, AFT, &selector, true)
+                .unwrap();
+            let scope = scopes.reserve_bind(&admission, &Principal::Direct, conn(200), false);
+            routes.push(
+                forwarding
+                    .begin_route_bind_relay_for(
+                        conn(200),
+                        sink.clone(),
+                        subc_protocol::PROTOCOL_VERSION,
+                        corr,
+                        AFT,
+                        Principal::Direct,
+                        Some(scope),
+                        None,
+                        String::new(),
+                        None,
+                        None,
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                        false,
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let live = routes.remove(0);
+        let mut pending = routes.remove(0);
+        forwarding
+            .complete_pending_relay(
+                conn(100),
+                live.corr,
+                crate::forwarding::RouteBindRelayOutcome::Accepted,
+            )
+            .unwrap();
+        rx.try_recv().unwrap();
+        let snapshot = match forwarding
+            .lookup_data_route(conn(200), live.client_channel, live.client_epoch)
+            .unwrap()
+        {
+            crate::forwarding::DataRoute::Client(crate::forwarding::DataRouteState::Bound(
+                binding,
+            )) => binding,
+            other => panic!("{other:?}"),
+        };
+        assert!(snapshot.scope.is_some());
+        assert_eq!(
+            scopes.owners[PREFRONTAL].live["policy"]
+                .binds
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        forwarding
+            .rebind_module_policy(AFT, Some(conn(100)), || true)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            pending.receiver.try_recv().unwrap(),
+            crate::forwarding::RouteBindRelayOutcome::DaemonRejected(_)
+        ));
+        assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+        assert!(matches!(
+            forwarding
+                .lookup_data_route(conn(200), live.client_channel, live.client_epoch)
+                .unwrap(),
+            crate::forwarding::DataRoute::Client(crate::forwarding::DataRouteState::Absent)
+        ));
+        assert!(snapshot.flow.acquire().await.is_err());
+        assert_eq!(scopes.owners[PREFRONTAL].live["policy"].binds.load(std::sync::atomic::Ordering::SeqCst),0,"both in-flight and committed scope leases must be revoked even while a data-path snapshot survives");
+        assert!(
+            !forwarding
+                .complete_pending_relay(
+                    conn(100),
+                    pending.corr,
+                    crate::forwarding::RouteBindRelayOutcome::Accepted
+                )
+                .unwrap()
+                .settled
+        );
+    }
+
     #[test]
     fn served_history_is_epoch_local_and_late_ack_does_not_resurrect_it() {
         use subc_control::ScopeServedByAnswer::{NotServed, Served, Unknown};

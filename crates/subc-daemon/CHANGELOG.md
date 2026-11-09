@@ -2,6 +2,82 @@
 
 ## 0.41.10
 
+- Recheck live content after every gated exec, including children without HELLO,
+  and refuse a ready binding when the running process's approved content cannot
+  be verified.
+  Serialize HELLO's final checks with registration publication and retire content
+  bindings after unstamp. Route revocation rechecks the exact ACK and deadline
+  under the forwarding write lock. Swap cutover uses synchronous loaded-state
+  checks without awaiting the configuration owner; deferred attempts back off
+  while stop and child exit remain selectable.
+  The checks verify the supervised child's image and possession of its launch
+  nonce, not the HELLO sender's process identity. A same-user process that learns
+  the nonce (including a Windows descendant inheriting it) can impersonate the
+  child while that child's image remains approved. Peer authentication remains
+  required before releasing or enabling the configuration gate.
+
+- Release Windows program write-exclusion handles once HELLO acknowledges a
+  normal launch or the warmed replacement in a blue/green swap, including
+  sink-backed connections whose acknowledgement is queued instead of returned
+  as a frame.
+
+- Classify stable malformed or oversized program captures as definite refusals,
+  preserve transient capture deferral, and do not misclassify an unchanged
+  approved symlink. Refusal-list capacity cannot remove records that keep a
+  refused module stopped. Retain and report overflow when removing a record
+  would silently allow a refused module to respawn.
+
+- Recheck the current process's content at HELLO, not only its initial executable
+  inode or readiness latch. Hash Linux's live executable descriptor; compare
+  macOS kernel code-directory hashes with validated approved-file hashes; retain
+  Windows write-exclusion handles until HELLO or exit. Rehash script and declared
+  files at spawn and HELLO. Refuse unsigned macOS gated images and unsupported
+  gated platforms, and kill the whole container on a definite content mismatch.
+- Bind refusal publication to the approved program identities used by the failed
+  check, retire volatile holds
+  with durable records, and defer transient capture failures with bounded delay.
+  Keep registered actors and exit observations responsive to commands while
+  configuration authority is busy. Approving only executable or launch-field
+  changes does not require the running module's configuration-review RPC;
+  module-layer and declaration changes still require that review.
+- Bind route-policy installation to its active connection, delivery attempt and
+  unexpired ACK. While approved configuration is authoritative, refuse executing
+  rescans before the generic privileged-operation prompt, record their proposals,
+  and prevent live file reconfiguration from replacing approved supervision
+  policy, including while a swap candidate warms.
+- Preserve configured reservation policy instead of adding sticky legacy nonce
+  reservations for gated launches. Explicit nonce and current-content checks
+  protect gated identities even while stopped or held. Module reconnects after
+  promotion and disabling configuration approval with unstamp preserve the
+  configured reservation policy.
+
+- Admit every supervised launch against approved configuration and covered program
+  files. Resolve executable and supported shebang interpreters once, bind the
+  executed image to the retained hash witness, and withhold HELLO service until
+  that binding passes. Show interpreter-only coverage without inferring code from
+  arguments. Linux and Windows refuse bare program names when PATH is absent.
+- Hold refused modules without respawns, slow retries, critical-spawn alerts or
+  additional crash-budget entries. Keep existing processes serving, preserve the
+  pending-exit fence, defer contended admission without blocking supervisor
+  commands, and resume enabled held modules after approval. Persist at most 256
+  refused program identities in the integrity-covered store, pruning oldest first
+  and clearing a module's entries when its approved program base changes.
+- Launch rollback commands at their restored paths and recheck their current
+  identities. For module-owned route policy, wait for the configuration ACK before
+  revoking old routes and their scope-admission stamps with the existing reload
+  close reason; require a fresh health probe before activation. Refuse
+  daemon-owned route-policy fields.
+- Advertise `config.gate` only when bootstrap explicitly activates a config store;
+  embedded runtime installation alone does not advertise it. Carry the caller's
+  tracing dispatcher and span into blocking HELLO work, preserving the existing
+  admission log exactly once with its connection context. Verify
+  the reviewer's active connection, launch nonce and live executable identity
+  before sending configuration or consent reviews. Wire spawn and swap test
+  pauses and defer tamper activity emission until module gates have been released.
+- Refuse a stamped wrapper whose observed spawn image replaces its covered
+  interpreter with another executable. Configure the final executable directly,
+  or keep the covered wrapper alive while running the other program as a child.
+
 - Build macOS privacy-trampoline commands from the same retained regular file
   used for launch validation, including shebang inspection. Resolve PATH once,
   honor its last override and executable permissions, and refuse absent names
@@ -36,9 +112,8 @@
   locks even when the caller disconnects.
 - Build rollback plans from retained byte-exact configuration and freshly
   captured programs at the restored paths. Show when a program changed since
-  the selected generation, preserve edited files as proposals, and refuse
-  path-changing rollback until the supervisor selects and launches programs
-  from the approved rollback inputs at the restored paths.
+  the selected generation, preserve edited files as proposals, and
+  select programs from the approved rollback inputs at their restored paths.
 - Under `dev-desktop-approval` only, accept same-user local complete desktop
   reviews without app verification, while retaining OS presence and writer
   receipts. Persist `unverified_development_desktop` explicitly in status and

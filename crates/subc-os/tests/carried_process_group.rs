@@ -21,6 +21,11 @@ impl Drop for OwnedChild {
 }
 
 fn spawn(group: i32, mode: &str) -> (OwnedChild, u32) {
+    let fixture = std::path::Path::new(FIXTURE).canonicalize().unwrap();
+    assert!(
+        !fixture.starts_with("/Volumes"),
+        "native macOS privacy fixtures must run from an internal-drive target directory; a removable-volume launch can wait for a privacy prompt"
+    );
     let mut builder = DisclaimedCommand::new(FIXTURE, FIXTURE);
     builder
         .arg(mode)

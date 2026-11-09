@@ -9,6 +9,7 @@ mod anchor_retry;
 mod apply;
 mod approval;
 pub mod capture;
+pub(crate) mod program;
 pub(crate) mod review;
 pub mod runtime;
 mod snapshot;

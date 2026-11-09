@@ -1081,3 +1081,58 @@ fn config_store_unanchored_mac_covers_unknown_fields_and_exact_body_bytes() {
     rig.replace(original.as_bytes());
     assert_eq!(rig.open(true).status().state, StoreState::Stamped);
 }
+
+#[test]
+fn config_admission_durable_program_refusal_is_inside_the_authenticated_store() {
+    let rig = Rig::new();
+    let mut store = rig.open(true);
+    commit(&mut store, CommitKind::Stamp);
+    let identity = raw_digest(b"refused-image");
+    store
+        .record_program_refusal(
+            "sample",
+            raw_digest(b"approved-image"),
+            identity.clone(),
+            &std::collections::BTreeSet::from(["sample".to_owned()]),
+        )
+        .unwrap();
+    let original = String::from_utf8(rig.bytes()).unwrap();
+    let old = serde_json::to_string(&identity).unwrap();
+    let forged = serde_json::to_string(&raw_digest(b"forged-refusal")).unwrap();
+    assert_eq!(original.matches(&old).count(), 1);
+    rig.replace(original.replacen(&old, &forged, 1).as_bytes());
+    assert_eq!(
+        store.check().unwrap_err().code,
+        StoreErrorCode::StoreTampered
+    );
+    drop(store);
+    assert_eq!(rig.open(true).status().state, StoreState::StoreUnverified);
+    rig.replace(original.as_bytes());
+    assert_eq!(rig.open(true).status().state, StoreState::Stamped);
+}
+
+#[test]
+fn config_admission_refusal_limit_evicts_only_unheld_module_records() {
+    let rig = Rig::new();
+    let mut store = rig.open(true);
+    commit(&mut store, CommitKind::Stamp);
+    let held = std::collections::BTreeSet::from(["held".to_owned()]);
+    let base = raw_digest(b"approved-image");
+    store
+        .record_program_refusal("retired", base.clone(), raw_digest(b"old"), &held)
+        .unwrap();
+    for index in 0..PROGRAM_REFUSAL_LIMIT {
+        store
+            .record_program_refusal(
+                "held",
+                base.clone(),
+                raw_digest(index.to_string().as_bytes()),
+                &held,
+            )
+            .unwrap();
+    }
+    let records = &store.body().unwrap().program_refusals;
+    assert_eq!(records.len(), PROGRAM_REFUSAL_LIMIT);
+    assert!(records.iter().all(|record| record.module == "held"));
+    assert_eq!(records[0].refused_identity, raw_digest(b"0"));
+}

@@ -76,10 +76,22 @@ pub struct Proposal {
     pub diff: BTreeMap<String, Option<RecordedValue>>,
 }
 
+/// One durable refused identity relative to a module's approved program set.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProgramRefusal {
+    pub module: String,
+    pub approved_base: Digest,
+    pub refused_identity: Digest,
+}
+
+pub const PROGRAM_REFUSAL_LIMIT: usize = 256;
+
 /// All authority state shares one atomic publication boundary. Tuple pointers
 /// use a list because JSON object keys cannot represent structured tuples.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StoreBody {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub program_refusals: Vec<ProgramRefusal>,
     pub stamped: bool,
     pub base_revision: u64,
     pub last_generation: u64,

@@ -1,5 +1,6 @@
 //! Trusted installation boundary between reviewed config and live route authority.
 
+use crate::ConnectionId;
 use std::{future::Future, pin::Pin, sync::Arc};
 
 use super::*;
@@ -8,6 +9,7 @@ use super::*;
 /// deserialized from a control request or assembled by an untrusted module.
 #[derive(Clone)]
 pub struct ApprovedRoutePolicy {
+    authorization: Option<(ConnectionId, u64, tokio::time::Instant)>,
     module: String,
     generation: u64,
     digest: Digest,
@@ -16,6 +18,9 @@ pub struct ApprovedRoutePolicy {
 }
 
 impl ApprovedRoutePolicy {
+    pub(crate) fn connection(&self) -> Option<ConnectionId> {
+        self.authorization.map(|(connection, _, _)| connection)
+    }
     pub fn module(&self) -> &str {
         &self.module
     }
@@ -86,6 +91,10 @@ impl Drop for RoutePolicyInstallation {
 /// authority from the durable active generation, or from the configuration files
 /// used before approval was enabled when no active generation has been recorded.
 pub trait RoutePolicyAuthority: Send + Sync {
+    /// Module-owned bind policy is installed by the module's delivery ACK.
+    fn requires_module_ack(&self) -> bool {
+        false
+    }
     fn install_and_revoke<'a>(&'a self, policy: ApprovedRoutePolicy) -> RoutePolicyInstall<'a>;
 }
 
@@ -174,23 +183,55 @@ pub(super) fn required(changeset: &Changeset, module: &str) -> bool {
 }
 
 pub(super) fn ready(state: &mut OwnerState, module: &str, generation: u64) -> Result<bool> {
+    state.store.body()?;
+    Ok(ready_loaded(state, module, generation))
+}
+
+pub(super) fn ready_loaded(state: &OwnerState, module: &str, generation: u64) -> bool {
     let required = state
         .store
-        .body()?
+        .loaded_admission_state()
+        .1
         .generations
         .get(&generation)
         .is_some_and(|entry| required(&entry.generation.changeset, module));
-    Ok(!required || state.installed_route_policies.get(module) == Some(&generation))
+    !required || state.installed_route_policies.get(module) == Some(&generation)
 }
 
 impl RuntimeOwner {
-    pub fn with_route_policy_authority(mut self, authority: Arc<dyn RoutePolicyAuthority>) -> Self {
-        self.route_policy_authority = Some(authority);
+    pub(crate) fn route_policy_authorized(&self, policy: &ApprovedRoutePolicy) -> Result<bool> {
+        let Some((connection, attempt, deadline)) = policy.authorization else {
+            return Ok(true);
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        let state = self.inner.try_lock().map_err(|_| {
+            GateError::new(
+                "config_delivery_deferred",
+                "configuration publication is busy",
+            )
+        })?;
+        Ok(
+            state.active_declarations.get(&policy.module) == Some(&connection)
+                && state.delivery.policy_authorization(
+                    &policy.module,
+                    policy.generation,
+                    connection,
+                ) == Some((attempt, deadline)),
+        )
+    }
+    pub fn with_route_policy_authority(self, authority: Arc<dyn RoutePolicyAuthority>) -> Self {
+        let _ = self.route_policy_authority.set(authority);
         self
     }
 
+    pub(crate) fn install_module_route_authority(&self, authority: Arc<dyn RoutePolicyAuthority>) {
+        let _ = self.route_policy_authority.set(authority);
+    }
+
     pub(super) fn check_route_policy_authority(&self, changeset: &Changeset) -> Result<()> {
-        if self.route_policy_authority.is_none()
+        if self.route_policy_authority.get().is_none()
             && changeset
                 .fields
                 .iter()
@@ -198,6 +239,16 @@ impl RuntimeOwner {
         {
             return Err(GateError::new("route_policy_authority_unavailable",
                 "config_gated: RoutePolicyAuthority is absent; approved route policy cannot be installed and affected routes and stamps cannot be revoked"));
+        }
+        if self
+            .route_policy_authority
+            .get()
+            .is_some_and(|authority| authority.requires_module_ack())
+            && changeset.fields.iter().any(|field| {
+                field.apply == subc_config::ApplyKind::RouteRebind && field.module_id == "subc"
+            })
+        {
+            return Err(GateError::new("daemon_route_policy_authority_unavailable", "daemon-owned route_rebind policy is not supported; scope authority changes require daemon restart"));
         }
         Ok(())
     }
@@ -210,20 +261,63 @@ impl RuntimeOwner {
         module: &str,
         generation: u64,
     ) -> Result<()> {
-        let authority = self.route_policy_authority.as_ref().ok_or_else(|| {
+        let authority = self.route_policy_authority.get().ok_or_else(|| {
             GateError::new(
                 "route_policy_authority_unavailable",
                 "config_gated: RoutePolicyAuthority is absent",
             )
         })?;
+        let authorization = if authority.requires_module_ack() {
+            let module_id = module.to_owned();
+            let authorization = self
+                .on_blocking(move |owner| {
+                    let mut state = owner.lock()?;
+                    let authorization =
+                        state
+                            .active_declarations
+                            .get(&module_id)
+                            .and_then(|connection| {
+                                state
+                                    .delivery
+                                    .policy_authorization(&module_id, generation, *connection)
+                                    .map(|(attempt, deadline)| (*connection, attempt, deadline))
+                            });
+                    if authorization.is_none() {
+                        state.restore_route_policy(&module_id, generation);
+                    }
+                    Ok(authorization)
+                })
+                .await?;
+            let Some(authorization) = authorization else {
+                return Ok(());
+            };
+            Some(authorization)
+        } else {
+            None
+        };
         let module_id = module.to_owned();
         let prepared = self
             .on_blocking(move |owner| owner.prepare_route_policy(&module_id, generation))
             .await?;
-        let Some((policy, previous_generation)) = prepared else {
+        let Some((mut policy, previous_generation)) = prepared else {
             return Ok(());
         };
-        let installation = authority.install_and_revoke(policy).await?;
+        policy.authorization = authorization;
+        if !self.route_policy_authorized(&policy)? {
+            return Ok(());
+        }
+        let installation = match authority.install_and_revoke(policy).await {
+            Ok(installation) => installation,
+            Err(error) => {
+                let module_id = module.to_owned();
+                self.on_blocking(move |owner| {
+                    owner.lock()?.restore_route_policy(&module_id, generation);
+                    Ok(())
+                })
+                .await?;
+                return Err(error);
+            }
+        };
         let module = module.to_owned();
         self.on_blocking(move |owner| {
             owner.finish_route_policy(&module, generation, previous_generation, installation)
@@ -262,6 +356,7 @@ impl RuntimeOwner {
         })?;
         Ok(Some((
             ApprovedRoutePolicy {
+                authorization: None,
                 module: module.into(),
                 generation,
                 digest: entry.generation.plan_digest.clone(),

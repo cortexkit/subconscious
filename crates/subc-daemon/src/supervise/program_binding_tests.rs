@@ -72,7 +72,7 @@ async fn config_spawn_macos_fifo_refuses_without_stranding_the_module_gate() {
         .success());
     let mut launch = tokio::spawn(async move { supervisor.spawn_async(spec).await });
     let prompt = tokio::time::timeout(Duration::from_millis(250), &mut launch).await;
-    let refused = matches!(&prompt, Ok(Ok(Err(error))) if error.to_string().contains("regular"));
+    let refused = matches!(&prompt, Ok(Ok(Ok(module))) if module.status().is_ok_and(|status| !status.process_alive && status.state == ModuleState::Stopped));
     if prompt.is_err() {
         launch.abort();
         let _ = launch.await;
@@ -92,7 +92,7 @@ async fn config_spawn_macos_fifo_refuses_without_stranding_the_module_gate() {
     assert_eq!(owner.unregistered_spawn_count_for_test(), 0);
     assert!(gate.try_lock().is_ok());
     assert!(
-        refused,
+        refused && owner.module_is_gated("a"),
         "macOS must reject a FIFO before shebang inspection"
     );
 }

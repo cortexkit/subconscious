@@ -136,6 +136,9 @@ const SUBC_UNADVERTISED_CONTROL_OPS: &[&str] = &[
     "config.rollback",
 ];
 
+#[cfg(test)]
+#[path = "control/config_advertisement_tests.rs"]
+mod config_advertisement_tests;
 mod config_gate;
 mod scope_expiry;
 
@@ -367,6 +370,7 @@ pub struct ControlHandler {
     registry: Arc<Registry>,
     config_runtime: Option<Arc<crate::config_gate::runtime::RuntimeOwner>>,
     config_review_admission: Arc<dyn crate::config_gate::ReviewAdmission>,
+    config_review_admission_is_default: bool,
     activity: Option<crate::activity::ActivityLedger>,
     activity_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
     forwarding: Arc<ForwardingTable>,
@@ -500,6 +504,8 @@ pub struct ControlHandler {
     /// runs the HELLO on its own thread.
     #[cfg(test)]
     hello_registry_to_forwarding_hold: Option<Arc<std::sync::Barrier>>,
+    #[cfg(test)]
+    hello_before_publication_hold: Option<Arc<std::sync::Barrier>>,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -1009,6 +1015,7 @@ impl ControlHandler {
             registry,
             config_runtime: None,
             config_review_admission: Arc::new(crate::config_gate::MissingReviewAdmission),
+            config_review_admission_is_default: true,
             activity: None,
             activity_streams: Arc::new(Mutex::new(HashMap::new())),
             forwarding,
@@ -1091,6 +1098,8 @@ impl ControlHandler {
             route_bind_relay_sent_hold: None,
             #[cfg(test)]
             hello_registry_to_forwarding_hold: None,
+            #[cfg(test)]
+            hello_before_publication_hold: None,
         }
     }
 
@@ -1238,6 +1247,15 @@ impl ControlHandler {
             hold.wait();
             hold.wait();
         }
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_hello_before_publication_hold(
+        mut self,
+        hold: Arc<std::sync::Barrier>,
+    ) -> Self {
+        self.hello_before_publication_hold = Some(hold);
+        self
     }
 
     pub fn with_process_liveness(
@@ -2015,7 +2033,45 @@ impl ControlHandler {
         match frame.header.ty {
             FrameType::Ping => Ok(vec![pong(&frame)?]),
             FrameType::Hello => {
-                self.handle_hello(ctx.connection_id, Some(ctx.egress.clone()), frame)
+                if let Ok(hello) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
+                    if let (Some(module), Some(nonce)) = (
+                        hello
+                            .get("manifest")
+                            .and_then(|value| value.get("module_id"))
+                            .and_then(|value| value.as_str()),
+                        hello.get("launch_nonce").and_then(|value| value.as_str()),
+                    ) {
+                        if !self.supervisor.wait_program_binding(module, nonce).await {
+                            self.forwarding.request_connection_close(
+                                ctx.connection_id,
+                                CloseReason::new(
+                                    "program_refused",
+                                    "the spawned program binding failed",
+                                ),
+                            );
+                            return Ok(vec![control_error_frame(
+                                &frame,
+                                "program_refused",
+                                "the spawned program binding failed",
+                            )?]);
+                        }
+                    }
+                }
+                let handler = self.clone();
+                let connection = ctx.connection_id;
+                let egress = ctx.egress.clone();
+                let correlation = frame.header.corr;
+                let dispatcher = tracing::dispatcher::get_default(|dispatcher| dispatcher.clone());
+                let span = tracing::Span::current();
+                tokio::task::spawn_blocking(move || {
+                    tracing::dispatcher::with_default(&dispatcher, || {
+                        span.in_scope(|| {
+                            handler.handle_hello_checked(connection, Some(egress), frame, true)
+                        })
+                    })
+                })
+                .await
+                .map_err(|error| RouterError::backend(0, correlation, error.to_string()))?
             }
             FrameType::Goodbye => self.handle_goodbye(ctx.connection_id),
             FrameType::Cancel => {
@@ -2466,11 +2522,22 @@ impl ControlHandler {
         );
     }
 
+    #[cfg(test)]
     fn handle_hello(
+        &self,
+        connection_id: ConnectionId,
+        egress: Option<crate::router::FrameSink>,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        self.handle_hello_checked(connection_id, egress, frame, false)
+    }
+
+    fn handle_hello_checked(
         &self,
         connection_id: ConnectionId,
         sink: Option<crate::FrameSink>,
         frame: Frame,
+        wait_for_gate: bool,
     ) -> Result<Vec<Frame>, RouterError> {
         debug!(
             connection_id = connection_id.get(),
@@ -2502,6 +2569,68 @@ impl ControlHandler {
                 )?])
             }
         };
+        if let Some(module) = hello_value
+            .get("manifest")
+            .and_then(|value| value.get("module_id"))
+            .and_then(|value| value.as_str())
+        {
+            if self
+                .config_runtime
+                .as_ref()
+                .is_some_and(|owner| owner.module_is_gated(module))
+                && (self
+                    .config_runtime
+                    .as_ref()
+                    .is_some_and(|owner| owner.check_module_hold(module).is_err())
+                    || !hello_value
+                        .get("launch_nonce")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|nonce| {
+                            self.supervisor.spawned_consumer_authorized(module, nonce)
+                                && self.supervisor.has_program_binding(module, nonce)
+                        }))
+            {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "reserved_module",
+                    "a gated identity belongs only to its supervised child",
+                )?]);
+            }
+        }
+        if let (Some(module), Some(nonce)) = (
+            hello_value
+                .get("manifest")
+                .and_then(|value| value.get("module_id"))
+                .and_then(|value| value.as_str()),
+            hello_value
+                .get("launch_nonce")
+                .and_then(|value| value.as_str()),
+        ) {
+            let binding = self.supervisor.has_program_binding(module, nonce);
+            let required = self
+                .config_runtime
+                .as_ref()
+                .is_some_and(|owner| owner.module_is_gated(module));
+            if let Some(error) = (binding || required)
+                .then(|| {
+                    self.supervisor
+                        .check_current_program_binding(module, nonce)
+                        .err()
+                })
+                .flatten()
+            {
+                let code = if error.code == "program_refused" {
+                    "program_refused"
+                } else {
+                    "config_delivery_deferred"
+                };
+                self.forwarding.request_connection_close(
+                    connection_id,
+                    CloseReason::new(code, error.detail.clone()),
+                );
+                return Ok(vec![control_error_frame(&frame, code, error.detail)?]);
+            }
+        }
         if let Err(err) = validate_hello_capability_grammar(&hello_value) {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -2600,6 +2729,78 @@ impl ControlHandler {
                 )?])
             }
         };
+
+        // Registration and forwarding publication use the same module gate as
+        // stamp, unstamp and spawning. Recheck after taking it; parsing may
+        // precede those transitions. A program-refusal hold blocks future
+        // spawns, but does not take this gate or revoke a HELLO whose supervised
+        // child's image has already passed the check.
+        let _publication_gate = if let Some(owner) = &self.config_runtime {
+            let gate = owner
+                .module_gate(&hello.manifest.module_id)
+                .map_err(|error| RouterError::backend(0, frame.header.corr, error.to_string()))?;
+            Some(if wait_for_gate {
+                gate.blocking_lock_owned()
+            } else {
+                match gate.try_lock_owned() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            "config_delivery_deferred",
+                            "module admission is busy",
+                        )?])
+                    }
+                }
+            })
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if let Some(hold) = &self.hello_before_publication_hold {
+            hold.wait();
+            hold.wait();
+        }
+        let module = &hello.manifest.module_id;
+        let required = self
+            .config_runtime
+            .as_ref()
+            .is_some_and(|owner| owner.module_is_gated(module));
+        if required
+            && (self
+                .config_runtime
+                .as_ref()
+                .is_some_and(|owner| owner.check_module_hold(module).is_err())
+                || !hello.launch_nonce.as_deref().is_some_and(|nonce| {
+                    self.supervisor.spawned_consumer_authorized(module, nonce)
+                        && self.supervisor.has_program_binding(module, nonce)
+                }))
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "reserved_module",
+                "gated admission requires an unheld module and the current supervised child's nonce and verified image binding",
+            )?]);
+        }
+        if let Some(nonce) = hello.launch_nonce.as_deref() {
+            if required
+                || (self.config_runtime.is_none()
+                    && self.supervisor.has_program_binding(module, nonce))
+            {
+                if let Err(error) = self.supervisor.check_current_program_binding(module, nonce) {
+                    let code = if error.code == "program_refused" {
+                        "program_refused"
+                    } else {
+                        "config_delivery_deferred"
+                    };
+                    self.forwarding.request_connection_close(
+                        connection_id,
+                        CloseReason::new(code, error.detail.clone()),
+                    );
+                    return Ok(vec![control_error_frame(&frame, code, error.detail)?]);
+                }
+            }
+        }
 
         // Swap gate, ahead of the reserved gate on purpose. While a blue/green
         // swap is open for this id, the only HELLO admitted as a second process
@@ -2715,6 +2916,8 @@ impl ControlHandler {
                 negotiated_ver,
                 control_ops,
                 hello_ack,
+                #[cfg(windows)]
+                hello.launch_nonce.as_deref(),
             );
         }
         // Registered unpublished: the module id is claimed, so a duplicate HELLO
@@ -2829,6 +3032,7 @@ impl ControlHandler {
                 connection_id = connection_id.get(),
                 "registration was removed before it could be published"
             );
+            return Ok(reply);
         }
 
         // Exposure over assumption: Concurrency's serde default is pinned to the
@@ -2860,6 +3064,12 @@ impl ControlHandler {
             "module registered"
         );
 
+        #[cfg(windows)]
+        if let Some(nonce) = hello.launch_nonce.as_deref() {
+            self.supervisor
+                .program_hello_accepted(&registration.manifest.module_id, nonce);
+        }
+
         Ok(reply)
     }
 
@@ -2889,6 +3099,7 @@ impl ControlHandler {
         negotiated_ver: u8,
         control_ops: Vec<String>,
         hello_ack: Frame,
+        #[cfg(windows)] launch_nonce: Option<&str>,
     ) -> Result<Vec<Frame>, RouterError> {
         let module_id = manifest.module_id.clone();
         let registration = match self.registry.register_unpublished_verified_candidate_with_control_ops(
@@ -2966,6 +3177,7 @@ impl ControlHandler {
                 connection_id = connection_id.get(),
                 "swap candidate registration was removed before it could be published"
             );
+            return Ok(reply);
         }
         self.supervisor.mark_swap_candidate_admitted(&module_id);
         info!(
@@ -2976,6 +3188,10 @@ impl ControlHandler {
             connection_id = connection_id.get(),
             "swap candidate registered; not routable until cutover"
         );
+        #[cfg(windows)]
+        if let Some(nonce) = launch_nonce {
+            self.supervisor.program_hello_accepted(&module_id, nonce);
+        }
         Ok(reply)
     }
 
@@ -3022,6 +3238,41 @@ impl ControlHandler {
         request: ClientControlRequest,
         route_open_timings: &mut Option<RouteOpenTimings>,
     ) -> Result<Vec<Frame>, RouterError> {
+        if let Some(owner) = &self.config_runtime {
+            let module = match &request {
+                ClientControlRequest::SupervisorRestart { module_id, .. }
+                | ClientControlRequest::SupervisorReload { module_id }
+                | ClientControlRequest::SupervisorSwap { module_id, .. }
+                | ClientControlRequest::SupervisorSetEnabled {
+                    module_id,
+                    enabled: true,
+                } => Some(module_id.as_str()),
+                _ => None,
+            };
+            let rescan = matches!(
+                &request,
+                ClientControlRequest::SupervisorRescan { preview: false }
+                    | ClientControlRequest::SupervisorRescanChecked { preview: false, .. }
+            );
+            let held = if module.is_some() || rescan {
+                let module = module.map(str::to_owned);
+                owner
+                    .on_blocking(move |owner| owner.checked_admission_hold(module.as_deref()))
+                    .await
+            } else {
+                Ok(())
+            };
+            if let Err(error) = held {
+                if error.code != "config_delivery_deferred" {
+                    let code = if error.code == "store_tampered" {
+                        "store_tampered"
+                    } else {
+                        "config_gated"
+                    };
+                    return Ok(vec![control_error_frame(&frame, code, error.detail)?]);
+                }
+            }
+        }
         if let Some(operation) = privileged_operation(&request) {
             let caller = self.resolve_caller(ctx.connection_id).await;
             let op = client_control_request_op(&request);
@@ -6261,6 +6512,9 @@ impl ControlHandler {
             self.route_outages
                 .operator_action_ended_unrefused(&module_id);
             let (code, message) = match err {
+                crate::supervise::SuperviseError::ConfigHeld { .. } => {
+                    ("config_gated", err.to_string())
+                }
                 crate::supervise::SuperviseError::Disabled { .. } => {
                     ("module_disabled", err.to_string())
                 }
@@ -6325,6 +6579,7 @@ impl ControlHandler {
             use crate::supervise::SuperviseError;
             let message = err.to_string();
             let error = match err {
+                SuperviseError::ConfigHeld { .. } => ErrorBody::new("config_gated", message),
                 SuperviseError::Disabled { .. } => ErrorBody::new("module_disabled", message),
                 SuperviseError::SwapRefused { reason, .. } => ErrorBody {
                     code: "swap_refused".to_string(),
@@ -6389,6 +6644,9 @@ impl ControlHandler {
             self.route_outages
                 .operator_action_ended_unrefused(&module_id);
             let (code, message) = match err {
+                crate::supervise::SuperviseError::ConfigHeld { .. } => {
+                    ("config_gated", err.to_string())
+                }
                 crate::supervise::SuperviseError::Disabled { .. } => {
                     ("module_disabled", err.to_string())
                 }
@@ -6978,7 +7236,11 @@ impl ControlHandler {
                     .operator_action_ended_unrefused(&module_id);
                 return Ok(vec![control_error_frame(
                     &frame,
-                    "target_unavailable",
+                    if matches!(err, crate::supervise::SuperviseError::ConfigHeld { .. }) {
+                        "config_gated"
+                    } else {
+                        "target_unavailable"
+                    },
                     format!("failed to set module_id '{module_id}' enabled={enabled}: {err}"),
                 )?]);
             }

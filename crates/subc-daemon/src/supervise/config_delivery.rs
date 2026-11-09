@@ -35,20 +35,55 @@ impl SupervisorRuntimeConfig {
 }
 
 impl<'a> SpawnDelivery<'a> {
+    pub(super) fn record_refusal(
+        &self,
+        spec: &ModuleSpec,
+        base: &subc_config::Digest,
+        detail: &str,
+    ) -> bool {
+        self.runtime
+            .0
+            .record_program_refusal(
+                &spec.module_id,
+                base,
+                subc_config::raw_digest(detail.as_bytes()),
+            )
+            .unwrap_or(true)
+    }
+    pub(super) fn runtime(&self) -> ConfigDelivery {
+        self.runtime.clone()
+    }
+    pub(super) fn prepare(
+        &self,
+        spec: &ModuleSpec,
+    ) -> Result<crate::config_gate::runtime::SpawnAdmission, SuperviseError> {
+        self.runtime
+            .0
+            .prepare_spawn(spec)
+            .map_err(|error| gate_hold_error(spec, error))
+    }
+    pub(super) fn check(
+        &self,
+        spec: &ModuleSpec,
+        admission: &crate::config_gate::runtime::SpawnAdmission,
+    ) -> Result<(), SuperviseError> {
+        self.runtime
+            .0
+            .check_spawn(&spec.module_id, admission)
+            .map_err(|error| gate_hold_error(spec, error))
+    }
+    pub(super) fn module_gate(
+        &self,
+        spec: &ModuleSpec,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, SuperviseError> {
+        self.runtime
+            .0
+            .module_gate(&spec.module_id)
+            .map_err(|error| gate_hold_error(spec, error))
+    }
     #[cfg(test)]
     pub(super) fn pause_preflight_for_test(&self) {
         self.runtime.0.pause_spawn_preflight_for_test();
-    }
-    pub(super) fn admit(&self, spec: &ModuleSpec) -> Result<(), SuperviseError> {
-        match self.runtime.0.delivery_exit_fence(&spec.module_id) {
-            Ok(None) => Ok(()),
-            Ok(Some(_)) => Err(SuperviseError::ConfigDeliveryDeferred {
-                module_id: spec.module_id.clone(),
-            }),
-            Err(error) => Err(SuperviseError::InvalidSpec {
-                reason: error.to_string(),
-            }),
-        }
     }
     pub(super) fn registration_guard(
         self,
@@ -78,21 +113,24 @@ impl<'a> SpawnDelivery<'a> {
                 self.health_budget,
                 !matches!(role, SpawnRole::SwapCandidate),
             )
-            .map_err(|error| SuperviseError::InvalidSpec {
-                reason: error.to_string(),
-            })
+            .map_err(|error| gate_hold_error(spec, error))
     }
+}
 
-    #[cfg(feature = "test-support")]
-    pub(super) fn pause_before_exec(&self, spec: &ModuleSpec) -> Result<(), SuperviseError> {
-        self.runtime
-            .0
-            .pause_spawn_before_exec()
-            .map_err(|error| SuperviseError::Spawn {
-                program: spec.program.clone(),
-                source: io::Error::other(error.to_string()),
-                cgroup_path: None,
-            })
+pub(super) fn gate_hold_error(
+    spec: &ModuleSpec,
+    error: crate::config_gate::GateError,
+) -> SuperviseError {
+    if error.code == "config_delivery_deferred" {
+        SuperviseError::ConfigDeliveryDeferred {
+            module_id: spec.module_id.clone(),
+        }
+    } else {
+        SuperviseError::ConfigHeld {
+            module_id: spec.module_id.clone(),
+            code: error.code,
+            detail: error.detail,
+        }
     }
 }
 
@@ -107,25 +145,14 @@ impl RegistrationGuard {
     pub(super) fn defer_cleanup(&mut self) {
         self.deferred_cleanup = true;
     }
-    pub(super) async fn launch_current(&self) -> Result<bool, SuperviseError> {
+    pub(super) fn launch_current(&self) -> Result<bool, SuperviseError> {
         let Some(spawn) = &self.spawn else {
             return Ok(true);
         };
-        loop {
-            match self.runtime.0.delivery_launch_current(spawn, self.active) {
-                Ok(Some(current)) => return Ok(current),
-                Ok(None) => {
-                    self.runtime
-                        .0
-                        .on_blocking(|owner| owner.delivery_wait_for_owner())
-                        .await
-                }
-                Err(error) => Err(error),
-            }
-            .map_err(|error| SuperviseError::InvalidSpec {
-                reason: error.to_string(),
-            })?;
-        }
+        launch_current_result(
+            spawn.module(),
+            self.runtime.0.delivery_launch_current(spawn, self.active),
+        )
     }
     pub(super) fn commit(mut self) {
         self.committed = true;
@@ -149,6 +176,11 @@ impl Drop for RegistrationGuard {
 
 impl ConfigDelivery {
     pub(super) async fn unfenced(&self, module: &str) {
+        if let Ok(gate) = self.0.module_gate(module) {
+            // This future is selected alongside actor commands. Waiting for
+            // publication here never parks the actor's command handler.
+            drop(gate.lock().await);
+        }
         let module = module.to_owned();
         if let Ok(Some(mut changed)) = self
             .0
@@ -162,12 +194,12 @@ impl ConfigDelivery {
             }
         }
     }
-    pub(super) async fn registered(
+    pub(super) fn queue_registered(
         &self,
         module: &str,
-        forwarding: Option<&ForwardingTable>,
-        registry: &Registry,
-        child: &SupervisedChild,
+        forwarding: Option<&Arc<ForwardingTable>>,
+        registry: &Arc<Registry>,
+        child: &mut SupervisedChild,
     ) {
         let Some(spawn) = &child.config_delivery else {
             return;
@@ -175,7 +207,6 @@ impl ConfigDelivery {
         let Ok(gate) = self.0.module_gate(module) else {
             return;
         };
-        let _guard = gate.lock().await;
         let Some(registration) = registry.get_module(module).ok().flatten() else {
             return;
         };
@@ -186,15 +217,39 @@ impl ConfigDelivery {
             return;
         }
         let connection = registration.connection_id;
-        let spawn = spawn.clone();
-        if let Err(error) = self
-            .0
-            .on_blocking(move |owner| owner.registered(connection, &spawn))
-            .await
-        {
-            warn!(module_id=module, %error, "configuration registration observation failed");
+        if child.registered_config_connection == Some(connection) {
+            return;
         }
-        self.0.notify_delivery_changed();
+        child.registered_config_connection = Some(connection);
+        let spawn = spawn.clone();
+        let owner = self.0.clone();
+        let registry = registry.clone();
+        let forwarding = forwarding.cloned();
+        let module = module.to_owned();
+        tokio::spawn(async move {
+            let _guard = gate.lock().await;
+            if registry
+                .get_module(&module)
+                .ok()
+                .flatten()
+                .is_none_or(|current| current.connection_id != connection)
+                || forwarding
+                    .as_ref()
+                    .and_then(|forwarding| {
+                        forwarding.active_module_endpoint(&module).ok().flatten()
+                    })
+                    .is_none_or(|endpoint| endpoint.connection_id != connection)
+            {
+                return;
+            }
+            if let Err(error) = owner
+                .on_blocking(move |owner| owner.registered(connection, &spawn))
+                .await
+            {
+                warn!(module_id=%module,%error,"configuration registration observation failed");
+            }
+            owner.notify_delivery_changed();
+        });
     }
 
     pub(super) async fn health_probe(
@@ -260,5 +315,39 @@ impl ConfigDelivery {
         };
         self.0.notify_delivery_changed();
         failed || owned_failure
+    }
+}
+
+fn launch_current_result(
+    module: &str,
+    result: std::result::Result<Option<bool>, crate::config_gate::GateError>,
+) -> Result<bool, SuperviseError> {
+    match result {
+        Ok(Some(current)) => Ok(current),
+        Ok(None) => Err(SuperviseError::ConfigDeliveryDeferred {
+            module_id: module.to_owned(),
+        }),
+        Err(_) => Err(SuperviseError::ConfigDeliveryDeferred {
+            module_id: module.to_owned(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod launch_current_tests {
+    use super::*;
+    #[test]
+    fn config_admission_post_exec_poisoned_launch_recheck_defers_instead_of_failing_spec() {
+        let result = launch_current_result(
+            "a",
+            Err(crate::config_gate::GateError::new(
+                "config_unavailable",
+                "configuration owner lock is poisoned",
+            )),
+        );
+        assert!(
+            matches!(result, Err(SuperviseError::ConfigDeliveryDeferred { .. })),
+            "{result:?}"
+        );
     }
 }

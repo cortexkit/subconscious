@@ -82,6 +82,8 @@ pub mod admission_gate;
 pub mod boot_id;
 #[cfg(unix)]
 pub mod child_exit;
+#[cfg(target_os = "macos")]
+pub mod code_signature;
 pub mod config_keychain;
 mod durable_replace;
 #[cfg(any(unix, windows))]

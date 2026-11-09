@@ -59,6 +59,9 @@ pub struct TreeOwn {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TreeReading {
+    /// Unix-epoch milliseconds of this measurement, retained when a newer walk fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_at_ms: Option<u64>,
     pub cpu_ms: u64,
     pub memory_bytes: u64,
     pub memory_kind: crate::ChildMemoryKind,
@@ -96,6 +99,9 @@ pub struct CpuLastHour {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct DaemonResources {
+    /// Unix-epoch milliseconds of this resource measurement, not the reply time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_at_ms: Option<u64>,
     pub pid: u32,
     pub start_time_ms: u64,
     pub version: String,
@@ -110,6 +116,9 @@ pub struct DaemonResources {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AgentCommandResources {
+    /// Unix-epoch milliseconds of these command measurements, not the reply time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_at_ms: Option<u64>,
     pub module_id: String,
     pub cpu_ms: u64,
     pub memory_bytes: u64,
@@ -168,6 +177,13 @@ impl TreeOwn {
 }
 
 impl TreeReading {
+    /// Set or clear the measurement's Unix-epoch millisecond timestamp.
+    #[must_use]
+    pub fn with_measured_at_ms(mut self, measured_at_ms: Option<u64>) -> Self {
+        self.measured_at_ms = measured_at_ms;
+        self
+    }
+
     /// Create a measured tree without optional root, group or bound metadata.
     #[must_use]
     pub fn new(
@@ -183,6 +199,7 @@ impl TreeReading {
             memory_kind,
             process_count,
             source,
+            measured_at_ms: None,
             bound: None,
             own: None,
             groups: Vec::new(),
@@ -231,6 +248,13 @@ impl CpuLastHour {
 }
 
 impl DaemonResources {
+    /// Set or clear the measurement's Unix-epoch millisecond timestamp.
+    #[must_use]
+    pub fn with_measured_at_ms(mut self, measured_at_ms: Option<u64>) -> Self {
+        self.measured_at_ms = measured_at_ms;
+        self
+    }
+
     /// Identify the daemon without manufacturing resource or hourly readings.
     #[must_use]
     pub fn new(pid: u32, start_time_ms: u64, version: impl Into<String>) -> Self {
@@ -238,6 +262,7 @@ impl DaemonResources {
             pid,
             start_time_ms,
             version: version.into(),
+            measured_at_ms: None,
             resources: None,
             cpu_last_hour: None,
         }
@@ -259,6 +284,13 @@ impl DaemonResources {
 }
 
 impl AgentCommandResources {
+    /// Set or clear the measurement's Unix-epoch millisecond timestamp.
+    #[must_use]
+    pub fn with_measured_at_ms(mut self, measured_at_ms: Option<u64>) -> Self {
+        self.measured_at_ms = measured_at_ms;
+        self
+    }
+
     /// Create measured command totals without optional attribution metadata.
     #[must_use]
     pub fn new(
@@ -269,6 +301,7 @@ impl AgentCommandResources {
     ) -> Self {
         Self {
             module_id: module_id.into(),
+            measured_at_ms: None,
             cpu_ms,
             memory_bytes,
             process_count,
@@ -313,6 +346,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resource_measurement_times_round_trip_without_becoming_required() {
+        fn round_trip<T: serde::Serialize + serde::de::DeserializeOwned>(reading: T) {
+            let mut value = serde_json::to_value(reading).unwrap();
+            assert!(value.get("measured_at_ms").is_none());
+            value["measured_at_ms"] = serde_json::json!(1_800_000_000_123_u64);
+            let decoded: T = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                serde_json::to_value(decoded).unwrap()["measured_at_ms"],
+                1_800_000_000_123_u64
+            );
+        }
+        round_trip(TreeReading::new(
+            10,
+            20,
+            crate::ChildMemoryKind::ResidentSet,
+            1,
+            TreeSource::ProcessTree,
+        ));
+        round_trip(DaemonResources::new(1, 2, "test"));
+        round_trip(AgentCommandResources::new("worker", 10, 20, 1));
+    }
+
+    #[test]
     fn hour_bound_is_optional_and_independent_of_cumulative_bounds() {
         let old: CpuLastHour =
             serde_json::from_value(serde_json::json!({"cpu_ms":0,"covered_ms":60_000})).unwrap();
@@ -344,6 +400,7 @@ mod tests {
             groups: Vec<ProcessGroup>,
         }
         let reading = TreeReading {
+            measured_at_ms: Some(1_800_000_000_123),
             bound: None,
             own: Some(TreeOwn {
                 cpu_ms: 23,
@@ -375,6 +432,7 @@ mod tests {
             generation: 1,
             modules: vec![module],
             daemon: Some(DaemonResources {
+                measured_at_ms: Some(1_800_000_000_123),
                 pid: 1,
                 start_time_ms: 1_700_000_000_000,
                 version: "1.0.0".into(),
@@ -386,6 +444,7 @@ mod tests {
                 }),
             }),
             agent_commands: Some(vec![AgentCommandResources {
+                measured_at_ms: Some(1_800_000_000_123),
                 module_id: "module".into(),
                 bound: None,
                 unmeasured_finished: None,
@@ -409,6 +468,7 @@ mod tests {
             serde_json::from_value(value["modules"][0]["tree"].clone()).unwrap();
         let older = serde_json::to_value(older).unwrap();
         assert!(older.get("own").is_none());
+        assert!(older.get("measured_at_ms").is_none());
         assert_eq!(older["cpu_ms"], 123);
         assert_eq!(older["groups"][0]["cpu_ms"], 100);
         let decoded: ClientControlResponse = serde_json::from_value(value).unwrap();
@@ -446,7 +506,13 @@ mod tests {
             tree: Option<TreeReading>,
         }
 
-        for reason in ["not_yet_measured", "future_reason"] {
+        for reason in [
+            "not_yet_measured",
+            "not_running",
+            "unreadable",
+            "launch_changed",
+            "future_reason",
+        ] {
             let entry = SupervisorEntry::new(
                 "module",
                 "running",

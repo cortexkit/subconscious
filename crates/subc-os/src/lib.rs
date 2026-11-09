@@ -215,6 +215,61 @@ pub fn start_time(pid: u32) -> Option<u64> {
     }
 }
 
+/// Snapshot probes distinguish an exited process from a failed identity read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdentityRead {
+    Alive(u64),
+    #[cfg_attr(windows, allow(dead_code))]
+    // Windows retains its existing unknown-on-observe-failure policy.
+    Gone,
+    Unknown,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod identity_read_tests {
+    use super::*;
+
+    #[test]
+    fn identity_probe_distinguishes_alive_gone_and_invalid() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while read_identity(pid) != IdentityRead::Gone {
+            assert!(
+                std::time::Instant::now() < until,
+                "an exited owned child must become gone before reaping"
+            );
+            std::thread::yield_now();
+        }
+        child.wait().unwrap();
+        assert_eq!(
+            read_identity(pid),
+            IdentityRead::Gone,
+            "a missing owned PID is gone"
+        );
+        assert_eq!(read_identity(0), IdentityRead::Unknown);
+        assert!(matches!(
+            read_identity(std::process::id()),
+            IdentityRead::Alive(_)
+        ));
+    }
+}
+
+#[cfg(not(windows))]
+fn read_identity(pid: u32) -> IdentityRead {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::read_identity(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        start_time(pid).map_or(IdentityRead::Unknown, IdentityRead::Alive)
+    }
+}
+
 mod process_tree;
 pub use process_tree::{ProcessGroup, ProcessMember, ProcessTable, TreeUsage};
 

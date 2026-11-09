@@ -112,6 +112,31 @@ fn init_reap_and_unseen_child_histories_share_a_provable_floor() {
 }
 
 #[test]
+fn child_exit_after_parent_read_recovers_reaped_cpu_exactly_once() {
+    for child_previously_measured in [false, true] {
+        let mut ledger = Ledger::new(false);
+        let mut first = vec![member(1, None, 10, 0)];
+        if child_previously_measured {
+            first.push(member(2, Some(1), 100, 0));
+        }
+        observe(&mut ledger, 1, &first, &[1, 2]);
+        observe(&mut ledger, 2, &[member(1, None, 10, 0)], &[1]);
+        assert_eq!(
+            ledger.total(),
+            if child_previously_measured { 110 } else { 10 }
+        );
+        observe(&mut ledger, 3, &[member(1, None, 10, 100)], &[1]);
+        assert_eq!(ledger.total(), 110);
+        observe(&mut ledger, 4, &[member(1, None, 15, 100)], &[1]);
+        assert_eq!(
+            ledger.total(),
+            115,
+            "the parent's later reaped counter cannot credit the child's sample twice"
+        );
+    }
+}
+
+#[test]
 fn confirmed_live_orphans_cannot_be_absorbed_as_reaped_cpu() {
     let mut ledger = Ledger::new(false);
     observe(

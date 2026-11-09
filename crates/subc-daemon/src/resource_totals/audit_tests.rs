@@ -804,14 +804,17 @@ fn cached_rows_keep_their_committed_observation_sequence_for_history_transfers()
         .unwrap()
         .modules
         .insert("cached-module".into(), module);
-    let readings = tracker.read_observed_before(
-        BTreeMap::from([("cached-module".into(), Some(launch))]),
-        table,
-        true,
-        60_000,
-        Instant::now() + Duration::from_secs(5),
-        BTreeMap::new(),
-    );
+    let observation = tracker
+        .read_observed_before(
+            BTreeMap::from([("cached-module".into(), Some(launch))]),
+            table,
+            true,
+            60_000,
+            Instant::now() + Duration::from_secs(5),
+            BTreeMap::new(),
+        )
+        .unwrap();
+    let readings = tracker.commit_observation(observation);
     assert_eq!(
         readings.modules["cached-module"].0.as_ref().unwrap().cpu_ms,
         100

@@ -476,7 +476,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.38.0",
+ "subc-control 0.38.1",
  "subc-daemon",
  "subc-jsonc",
  "subc-protocol 0.36.0",
@@ -500,7 +500,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subc-client-rs",
- "subc-control 0.38.0",
+ "subc-control 0.38.1",
  "subc-protocol 0.36.0",
  "tempfile",
  "tokio",
@@ -522,7 +522,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.38.0",
+ "subc-control 0.38.1",
  "subc-jsonc",
  "subc-os",
  "subc-protocol 0.36.0",
@@ -677,7 +677,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.38.0",
+ "subc-control 0.38.1",
  "subc-os",
  "subc-protocol 0.36.0",
  "subc-transport",
@@ -1055,7 +1055,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2436,7 +2436,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2850,7 +2850,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "socket2",
- "subc-control 0.38.0",
+ "subc-control 0.38.1",
  "subc-os",
  "subc-protocol 0.36.0",
  "subc-transport",
@@ -2873,7 +2873,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.38.0"
+version = "0.38.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2902,7 +2902,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.38.0",
+ "subc-control 0.38.1",
  "subc-core",
  "subc-daemon",
  "subc-jsonc",
@@ -2920,7 +2920,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.44.1"
+version = "0.44.2"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -2938,7 +2938,7 @@ dependencies = [
  "sha2",
  "subc-cgroup",
  "subc-control 0.35.0",
- "subc-control 0.38.0",
+ "subc-control 0.38.1",
  "subc-jobobject",
  "subc-jsonc",
  "subc-os",
@@ -2994,7 +2994,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.38.0",
+ "subc-control 0.38.1",
  "subc-daemon",
  "subc-jsonc",
  "subc-os",
@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "cortexkit-test-support",
  "libc",
@@ -3123,7 +3123,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

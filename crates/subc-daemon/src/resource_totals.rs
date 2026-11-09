@@ -2,6 +2,7 @@
 
 mod accounting;
 mod commit_fence;
+mod committed;
 mod counter_model;
 pub(crate) mod declaration_loss;
 mod finish_cpu;
@@ -10,6 +11,8 @@ mod overlap;
 pub(crate) use commit_fence::CommitFence;
 #[cfg(test)]
 mod audit_tests;
+#[cfg(test)]
+mod committed_tests;
 mod cpu_ledger;
 mod prospective;
 mod time;
@@ -45,6 +48,11 @@ pub(crate) struct Tracker {
     cache: TableCache,
     refreshing: Arc<AtomicBool>,
     state: Mutex<State>,
+    committed: Mutex<committed::View>,
+    walk: tokio::sync::Mutex<()>,
+    view_refreshing: Arc<AtomicBool>,
+    #[cfg(test)]
+    view_refreshes: std::sync::atomic::AtomicUsize,
     declaration_losses: Mutex<BTreeMap<String, Arc<declaration_loss::Losses>>>,
     wake: tokio::sync::Notify,
     #[cfg(test)]
@@ -68,11 +76,20 @@ pub(crate) struct Receipt {
     windows_stop_cpu: windows::StopBoundary,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct State {
     revision: u64,
     modules: BTreeMap<String, Module>,
     daemon: History,
+}
+
+/// Blocking work prepares a candidate. Only an accepted, revision-fenced
+/// result may publish measurements or append minute history.
+struct Observation {
+    expected_revision: u64,
+    state: State,
+    readings: Readings,
+    generations: BTreeMap<String, u128>,
 }
 
 #[cfg(all(test, windows))]
@@ -180,11 +197,12 @@ struct Command {
     root_exited: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Readings {
     pub modules: BTreeMap<String, (Option<TreeReading>, Option<CpuLastHour>)>,
     pub daemon: Option<DaemonResources>,
     pub agent_commands: Option<Vec<AgentCommandResources>>,
+    pub reasons: BTreeMap<String, &'static str>,
 }
 
 /// A complete candidate computed without supervisor locks. Commit only swaps
@@ -724,12 +742,27 @@ impl Tracker {
     }
 
     async fn table(&self) -> Option<Arc<ProcessTable>> {
-        if let Some((at, table)) = self.cache.try_lock().ok()?.as_ref() {
-            if at.elapsed() < Duration::from_secs(1) {
-                return Some(Arc::clone(table));
+        {
+            let Ok(cache) = self.cache.try_lock() else {
+                tracing::debug!(
+                    cause = "state_contention",
+                    phase = "table_cache",
+                    "resource pass incomplete"
+                );
+                return None;
+            };
+            if let Some((at, table)) = cache.as_ref() {
+                if at.elapsed() < Duration::from_secs(1) {
+                    return Some(Arc::clone(table));
+                }
             }
         }
         if self.refreshing.swap(true, Ordering::AcqRel) {
+            tracing::debug!(
+                cause = "admission",
+                phase = "table_refresh",
+                "resource pass incomplete"
+            );
             return None;
         }
         struct Refresh(Arc<AtomicBool>);
@@ -746,8 +779,14 @@ impl Tracker {
                 let _refresh = refresh;
                 // Publish even a late result. No cache or attribution lock is
                 // held while walking the host's process table.
-                let table = Arc::new(ProcessTable::read().ok()?);
-                *cache.try_lock().ok()? = Some((Instant::now(), Arc::clone(&table)));
+                let table = Arc::new(ProcessTable::read().map_err(|error| {
+                    tracing::debug!(cause = "unreadable", phase = "process_table", %error, "resource pass incomplete");
+                }).ok()?);
+                let Ok(mut cache) = cache.try_lock() else {
+                    tracing::debug!(cause = "state_contention", phase = "table_publication", "resource pass incomplete");
+                    return None;
+                };
+                *cache = Some((Instant::now(), Arc::clone(&table)));
                 Some(table)
             },
             |_| None,
@@ -784,12 +823,26 @@ impl Tracker {
         sample: bool,
         _caller: &'static str,
     ) -> Readings {
+        let _walk = self.walk.lock().await;
         let now = now_ms();
         let launches: BTreeMap<_, _> = modules
             .into_iter()
             .map(|module| (module.module_id().to_owned(), module.resource_launch()))
             .collect();
+        if launches.values().any(Option::is_none) {
+            tracing::debug!(
+                cause = "state_contention",
+                phase = "launch_snapshot",
+                "resource pass incomplete"
+            );
+            return Readings::default();
+        }
         self.prune(&launches, now);
+        if sample {
+            // A minute endpoint must come from this sampler's walk, not from
+            // an interactive refresh that happened to finish a moment earlier.
+            *self.cache.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
         let targets: Vec<_> = launches
             .iter()
             .filter_map(|(id, launch)| {
@@ -813,14 +866,17 @@ impl Tracker {
             return Readings::default();
         };
         let tracker = Arc::clone(self);
-        crate::subtree_resources::bounded(
+        let observation = crate::subtree_resources::bounded(
             read_deadline(),
             move |deadline| {
                 tracker.read_observed_before(launches, table, sample, now, deadline, before)
             },
-            |_| Readings::default(),
+            |_| None,
         )
-        .await
+        .await;
+        observation.map_or_else(Readings::default, |observation| {
+            self.commit_observation(observation)
+        })
     }
 
     #[cfg(test)]
@@ -843,6 +899,9 @@ impl Tracker {
             })
             .collect();
         self.read_observed_before(launches, table, sample, now, deadline, before)
+            .map_or_else(Readings::default, |observation| {
+                self.commit_observation(observation)
+            })
     }
 
     fn read_observed_before(
@@ -853,24 +912,43 @@ impl Tracker {
         now: u64,
         deadline: Instant,
         before: BTreeMap<String, (u128, u64)>,
-    ) -> Readings {
+    ) -> Option<Observation> {
         let Ok(state) = self.state.try_lock() else {
-            return Readings::default();
+            tracing::debug!(
+                cause = "state_contention",
+                phase = "before_observation",
+                "resource pass incomplete"
+            );
+            return None;
         };
         let expected_revision = state.revision;
         drop(state);
         #[cfg(windows)]
         let Some(commands) = self.observe_windows_commands(&table) else {
-            return Readings::default();
+            tracing::debug!(
+                cause = "unreadable",
+                phase = "command_observation",
+                "resource pass incomplete"
+            );
+            return None;
         };
         let mut observed = BTreeMap::new();
         for (id, launch) in launches {
             if Instant::now() >= deadline {
-                return Readings::default();
+                tracing::debug!(
+                    cause = "deadline",
+                    phase = "module_observation",
+                    "resource pass incomplete"
+                );
+                return None;
             }
             let Some(launch) = launch else {
-                observed.insert(id, (0, None, None, None, None, false));
-                continue;
+                tracing::debug!(
+                    cause = "state_contention",
+                    phase = "launch_observation",
+                    "resource pass incomplete"
+                );
+                return None;
             };
             if !launch.enabled {
                 continue;
@@ -899,6 +977,9 @@ impl Tracker {
             } else {
                 tree
             };
+            if let Some((reading, _)) = &mut reading {
+                reading.measured_at_ms = Some(table.observed_at_ms());
+            }
             let counter = if launch.target.has_container() {
                 launch.target.counter_identity()
             } else {
@@ -940,16 +1021,34 @@ impl Tracker {
         let own = subc_os::process_start_time_ms(pid)
             .map(|start| (start, crate::child_resources::read_own(pid)));
         if Instant::now() >= deadline {
-            return Readings::default();
+            tracing::debug!(
+                cause = "deadline",
+                phase = "after_observation",
+                "resource pass incomplete"
+            );
+            return None;
         }
         #[cfg(windows)]
         let mut retired = Vec::new();
-        let Ok(mut state) = self.state.try_lock() else {
-            return Readings::default();
+        let Ok(state) = self.state.try_lock() else {
+            tracing::debug!(
+                cause = "state_contention",
+                phase = "observation_commit",
+                "resource pass incomplete"
+            );
+            return None;
         };
         if state.revision != expected_revision {
-            return Readings::default();
+            tracing::debug!(
+                cause = "state_contention",
+                phase = "observation_revision",
+                "resource pass incomplete"
+            );
+            return None;
         }
+        let mut candidate = state.clone();
+        drop(state);
+        let state = &mut candidate;
         state.revision = state.revision.wrapping_add(1);
         #[cfg(windows)]
         {
@@ -972,6 +1071,10 @@ impl Tracker {
             agent_commands: Some(Vec::new()),
             ..Readings::default()
         };
+        let generations = observed
+            .iter()
+            .map(|(id, (generation, ..))| (id.clone(), *generation))
+            .collect();
         let mut any_agents_known = false;
         let mut any_agents_unknown = false;
         for id in state.modules.keys() {
@@ -1018,6 +1121,11 @@ impl Tracker {
             };
             let (tree, mut agents) =
                 result.map_or((None, None), |(tree, agents)| (tree, Some(agents)));
+            if stale_transition {
+                readings.reasons.insert(id.clone(), "launch_changed");
+            } else if tree.is_none() && !module.outside_only {
+                readings.reasons.insert(id.clone(), "unreadable");
+            }
             if module.declaration_loss.lower() {
                 if let Some(agents) = &mut agents {
                     agents.bound = Some(subc_control::ResourceBound::Lower);
@@ -1065,6 +1173,7 @@ impl Tracker {
             }
             readings.daemon = Some(
                 DaemonResources::new(pid, start_time_ms, self.daemon_version.clone())
+                    .with_measured_at_ms(Some(now_ms()))
                     .with_resources(Some(resources))
                     .with_cpu_last_hour(state.daemon.last_hour_at(now)),
             );
@@ -1073,10 +1182,51 @@ impl Tracker {
         for module in state.modules.values_mut() {
             retired.append(&mut module.retired_handles);
         }
-        drop(state);
         #[cfg(windows)]
         drop(retired);
-        readings
+        if Instant::now() >= deadline {
+            tracing::debug!(
+                cause = "deadline",
+                phase = "attribution",
+                "resource pass incomplete"
+            );
+            return None;
+        }
+        Some(Observation {
+            expected_revision,
+            state: candidate,
+            readings,
+            generations,
+        })
+    }
+
+    fn commit_observation(&self, observation: Observation) -> Readings {
+        let Ok(mut state) = self.state.try_lock() else {
+            tracing::debug!(
+                cause = "state_contention",
+                phase = "accepted_commit",
+                "resource pass incomplete"
+            );
+            return Readings::default();
+        };
+        if state.revision != observation.expected_revision {
+            tracing::debug!(
+                cause = "state_contention",
+                phase = "accepted_revision",
+                "resource pass incomplete"
+            );
+            return Readings::default();
+        }
+        let previous = std::mem::replace(&mut *state, observation.state);
+        self.committed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .publish(&observation.readings, observation.generations);
+        drop(state);
+        // Native process handles retired by the candidate are released outside
+        // attribution state, including on Windows.
+        drop(previous);
+        observation.readings
     }
 }
 

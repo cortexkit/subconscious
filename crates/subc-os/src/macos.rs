@@ -41,7 +41,11 @@ const SZOMB: u8 = 5;
 struct KinfoProc([u8; KINFO_PROC_SIZE]);
 
 fn kinfo_proc(pid: u32) -> Option<KinfoProc> {
-    let pid = c_int::try_from(pid).ok()?;
+    read_kinfo_proc(pid).ok().flatten()
+}
+
+fn read_kinfo_proc(pid: u32) -> Result<Option<KinfoProc>, ()> {
+    let pid = c_int::try_from(pid).ok().filter(|pid| *pid > 0).ok_or(())?;
     let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
     let mut info = KinfoProc([0; KINFO_PROC_SIZE]);
     let mut len: libc::size_t = KINFO_PROC_SIZE;
@@ -61,11 +65,34 @@ fn kinfo_proc(pid: u32) -> Option<KinfoProc> {
         )
     };
     // A pid with no process succeeds with nothing written.
-    if result != 0 || len != KINFO_PROC_SIZE {
-        return None;
+    if result != 0 {
+        return Err(());
     }
-    let reported_pid = i32::from_ne_bytes(info.0[P_PID_OFFSET..P_PID_OFFSET + 4].try_into().ok()?);
-    (reported_pid == pid).then_some(info)
+    if len == 0 {
+        return Ok(None);
+    }
+    if len != KINFO_PROC_SIZE {
+        return Err(());
+    }
+    let reported_pid = i32::from_ne_bytes(
+        info.0[P_PID_OFFSET..P_PID_OFFSET + 4]
+            .try_into()
+            .map_err(|_| ())?,
+    );
+    if reported_pid != pid {
+        return Err(());
+    }
+    Ok(Some(info))
+}
+
+pub(crate) fn read_identity(pid: u32) -> crate::IdentityRead {
+    use crate::IdentityRead;
+    match read_kinfo_proc(pid) {
+        Ok(None) => IdentityRead::Gone,
+        Ok(Some(info)) if info.0[P_STAT_OFFSET] == SZOMB => IdentityRead::Gone,
+        Ok(Some(info)) => birth_time(&info).map_or(IdentityRead::Unknown, IdentityRead::Alive),
+        Err(()) => IdentityRead::Unknown,
+    }
 }
 
 pub(crate) fn exists(pid: u32) -> bool {

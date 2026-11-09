@@ -2592,8 +2592,10 @@ pub struct SupervisorEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree: Option<TreeReading>,
     /// Why this reporting daemon has no tree reading for this response.
-    /// `not_yet_measured` means no measurement is available; other snake_case
-    /// reasons may be added. Absence alone does not establish tree support.
+    /// `not_yet_measured` means this launch has no measurement; `unreadable`
+    /// and `launch_changed` can accompany a retained, older tree. `not_running`
+    /// marks a stopped module. Future reasons remain valid open-set strings.
+    /// Absence alone does not establish tree support.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree_unavailable: Option<String>,
     /// CPU used across the wall-clock interval covered by retained samples.

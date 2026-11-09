@@ -97,6 +97,7 @@ mod tests {
         let entry =
             SupervisorEntry::new("m", "running", true, true, SupervisorHealthStatus::Unknown)
                 .with_tree(Some(crate::TreeReading {
+                    measured_at_ms: Some(1_800_000_000_123),
                     own: None,
                     bound: None,
                     cpu_ms: 1,

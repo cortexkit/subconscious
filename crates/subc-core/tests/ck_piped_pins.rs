@@ -303,11 +303,18 @@ const RULES: &[Rule] = &[
         json_kind: string,
         pins: &[],
     },
-    // Wall-clock times: probes, exits and ledger entries.
+    // Wall-clock times: probes, exits, ledger entries and when each resource
+    // reading was measured.
     Rule {
         name: "timestamps",
         text: |text, _| mask_utc_times(text),
-        json_keys: &["at_ms", "last_probe_ms", "last_exit_ms", "start_time_ms"],
+        json_keys: &[
+            "at_ms",
+            "last_probe_ms",
+            "last_exit_ms",
+            "start_time_ms",
+            "measured_at_ms",
+        ],
         json_kind: number,
         pins: &[],
     },

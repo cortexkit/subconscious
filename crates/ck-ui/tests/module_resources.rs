@@ -265,6 +265,41 @@ fn resource_hour_zero_coverage_is_missing_and_under_hour_is_dimmed() {
 }
 
 #[test]
+fn short_lower_bound_hours_render_without_a_tree_and_below_rounding_precision() {
+    let mut value = wire(1000);
+    let mut idle = value["modules"][0].clone();
+    value["modules"][0]["module_id"] = json!("busy-worker");
+    value["modules"][0].as_object_mut().unwrap().remove("tree");
+    value["modules"][0]["tree_unavailable"] = json!("unreadable");
+    value["modules"][0]["cpu_last_hour"] =
+        json!({"bound":"lower","covered_ms":120001,"cpu_ms":159491});
+    idle["module_id"] = json!("idle-worker");
+    idle["cpu_last_hour"] = json!({"bound":"lower","covered_ms":60000,"cpu_ms":6});
+    value["modules"].as_array_mut().unwrap().push(idle);
+    let mut state = State::empty("test");
+    let at = Timestamp::from_unix_millis(1_800_000_000_000);
+    state.record_supervisor_list(reply(value), at);
+    let screen = render(&app(), &assemble(&state, at), 140, 40);
+    for (name, figure) in [
+        ("busy-worker", "≥1.33"),
+        ("idle-worker", "≥0.00"),
+        ("All of CortexKit", "≥2.35"),
+    ] {
+        let y = (7..40).find(|y| row(&screen, *y).contains(name)).unwrap();
+        assert!(row(&screen, y).contains(figure));
+        assert_eq!(
+            Theme::test_roles(
+                screen[(48, y)].fg,
+                screen[(48, y)].bg,
+                screen[(48, y)].modifier
+            )
+            .0,
+            "dim"
+        );
+    }
+}
+
+#[test]
 fn resource_processes_sort_by_cpu_and_keep_the_own_process_first() {
     let mut snap = fixture::snapshot();
     let usage = snap.modules.data[0].resources.as_mut().unwrap();

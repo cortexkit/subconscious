@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.44.2
+
+- Serve `supervisor.list` resources from committed measurements without walking processes inside the list's diagnostics budget. Lists older than two seconds request a single background refresh; minute samples serialize with refreshes and use their own completed walk. No refresh timer runs without list callers.
+- Retain successful trees and their measurement timestamps when a newer walk is unreadable or rejects a launch transition. Report `unreadable` and `launch_changed` reasons, keep hourly history independent of current-tree failures, and never reuse a tree across module launches.
+- Leave the committed view unchanged when a background pass cannot complete; log admission, deadline and state-contention causes at debug level instead of assigning an inaccurate wire reason.
+- Adopt the confirmed-exit process reader so exited children no longer void their parent's tree. Recover their CPU from the operating system's parent accounting without counting it twice.
+
 ## 0.44.1
 
 - Credit acknowledged scoped binds to both the target registration and its reserved-prefix owner when HELLO verified that owner's spawn nonce. Keep this identity fact on the connection, so later prefix-policy changes cannot grant service credit retroactively. Refused and unacknowledged binds still credit nobody; `scope.served_by` keeps its existing reply shape.

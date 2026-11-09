@@ -506,6 +506,7 @@ impl Module {
             agent_usage.as_ref().map_or(0, |usage| usage.memory_bytes),
             agent_usage.as_ref().map_or(0, |usage| usage.process_count),
         )
+        .with_measured_at_ms(Some(table.observed_at_ms()))
         .with_groups(agent_groups)
         .with_bound(agent_bound)
         .with_unmeasured_finished(

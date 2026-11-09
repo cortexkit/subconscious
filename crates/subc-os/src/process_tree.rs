@@ -119,7 +119,11 @@ impl ProcessTable {
             #[cfg(windows)]
             let start = process.observe().map(|observation| observation.start_time);
             #[cfg(not(windows))]
-            let start = crate::start_time(pid);
+            let start = match crate::read_identity(pid) {
+                crate::IdentityRead::Alive(start) => Some(start),
+                crate::IdentityRead::Gone => continue,
+                crate::IdentityRead::Unknown => None,
+            };
             let Some(start_time) =
                 start.filter(|start| expected_start.is_none_or(|expected| expected == *start))
             else {
@@ -172,11 +176,20 @@ impl ProcessTable {
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let reaped_cpu_ms = resources.map(|_| 0);
             #[cfg(windows)]
-            let current_start = process.observe().map(|observation| observation.start_time);
+            let current_start = process
+                .observe()
+                .map_or(crate::IdentityRead::Unknown, |observation| {
+                    crate::IdentityRead::Alive(observation.start_time)
+                });
             #[cfg(not(windows))]
-            let current_start = crate::start_time(pid);
-            if current_start != Some(start_time) {
-                unreadable.insert(pid, (Some(parent_pid), session_id));
+            let current_start = crate::read_identity(pid);
+            if !Self::same_identity(
+                pid,
+                start_time,
+                (Some(parent_pid), session_id),
+                current_start,
+                &mut unreadable,
+            ) {
                 continue;
             }
             members.insert(
@@ -196,19 +209,19 @@ impl ProcessTable {
                 },
             );
         }
-        // Resource reads are not an atomic snapshot. If a child was reaped
-        // during the walk, a later parent counter can already include the
-        // child's earlier sample. Reject that related reading rather than
-        // publishing both copies of the same CPU. All resource reads finish
-        // before this final identity fence starts.
+        // A reaped child's earlier sample can overlap a later parent's reaped
+        // counter. Drop confirmed exits, leaving recovery to that counter, but
+        // reject unknown identities rather than publishing a partial live sum.
         Self::fence(&mut members, &mut unreadable, |member| {
             #[cfg(windows)]
             let current = member
                 .process
                 .observe()
-                .map(|observation| observation.start_time);
+                .map_or(crate::IdentityRead::Unknown, |observation| {
+                    crate::IdentityRead::Alive(observation.start_time)
+                });
             #[cfg(not(windows))]
-            let current = crate::start_time(member.pid);
+            let current = crate::read_identity(member.pid);
             current
         });
         Ok(Self {
@@ -223,17 +236,34 @@ impl ProcessTable {
     fn fence(
         members: &mut BTreeMap<u32, ProcessMember>,
         unreadable: &mut BTreeMap<u32, (Option<u32>, Option<u32>)>,
-        mut identity: impl FnMut(&ProcessMember) -> Option<u64>,
+        mut identity: impl FnMut(&ProcessMember) -> crate::IdentityRead,
     ) {
         members.retain(|pid, member| {
-            let current = identity(member);
-            if current == Some(member.start_time) {
-                true
-            } else {
-                unreadable.insert(*pid, (Some(member.parent_pid), member.session_id));
+            Self::same_identity(
+                *pid,
+                member.start_time,
+                (Some(member.parent_pid), member.session_id),
+                identity(member),
+                unreadable,
+            )
+        });
+    }
+
+    fn same_identity(
+        pid: u32,
+        start: u64,
+        ownership: (Option<u32>, Option<u32>),
+        current: crate::IdentityRead,
+        unreadable: &mut BTreeMap<u32, (Option<u32>, Option<u32>)>,
+    ) -> bool {
+        match current {
+            crate::IdentityRead::Alive(now) if now == start => true,
+            crate::IdentityRead::Gone => false,
+            _ => {
+                unreadable.insert(pid, ownership);
                 false
             }
-        });
+        }
     }
 
     /// Start of the walk, so exit confirmations can distinguish a
@@ -594,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn a_child_reaped_during_the_walk_invalidates_the_related_snapshot() {
+    fn a_child_reaped_during_the_walk_keeps_parent_cpu_without_double_counting() {
         let mut table = ProcessTable::default();
         let mut parent = member(1, 0, 10, 1, 1);
         parent.resources.as_mut().unwrap().cpu_user = Duration::from_millis(110);
@@ -602,13 +632,73 @@ mod tests {
         table.members.insert(1, parent);
         table.members.insert(2, member(2, 1, 20, 1, 10));
         ProcessTable::fence(&mut table.members, &mut table.unreadable, |member| {
-            (member.pid != 2).then_some(member.start_time)
+            if member.pid == 2 {
+                crate::IdentityRead::Gone
+            } else {
+                crate::IdentityRead::Alive(member.start_time)
+            }
         });
-        assert!(table.tree(1,10,false).is_none(), "the child cannot be counted beside a later parent reading that already contains its CPU");
+        let tree = table
+            .tree(1, 10, false)
+            .expect("a confirmed exit must not void the parent");
+        assert_eq!(
+            tree.cpu_ms, 110,
+            "the child's 100 ms is already in the parent's reaped counter"
+        );
+        assert_eq!(tree.process_count, 1);
         assert_eq!(
             table.identity_alive(2, 20),
-            None,
-            "an overlap fence is uncertainty, not a confirmed old snapshot exit"
+            Some(false),
+            "a confirmed exit is not an unreadable live identity"
+        );
+    }
+
+    #[test]
+    fn identity_checks_drop_only_confirmed_exits_at_either_fence() {
+        use crate::IdentityRead::{Alive, Gone, Unknown};
+        for current in [Gone, Unknown, Alive(21)] {
+            let mut unreadable = BTreeMap::new();
+            assert!(!ProcessTable::same_identity(
+                2,
+                20,
+                (Some(1), Some(1)),
+                current,
+                &mut unreadable
+            ));
+            assert_eq!(unreadable.contains_key(&2), current != Gone);
+            let mut members = BTreeMap::from([(2, member(2, 1, 20, 1, 10))]);
+            unreadable.clear();
+            ProcessTable::fence(&mut members, &mut unreadable, |_| current);
+            assert!(members.is_empty());
+            assert_eq!(
+                unreadable.contains_key(&2),
+                current != Gone,
+                "unknown identity and PID reuse must still reject the related tree"
+            );
+        }
+    }
+
+    #[test]
+    fn a_child_exiting_after_parent_read_defers_cpu_until_reaped() {
+        let mut table = ProcessTable::default();
+        table.members.insert(1, member(1, 0, 10, 1, 1));
+        table.members.insert(2, member(2, 1, 20, 1, 10));
+        ProcessTable::fence(&mut table.members, &mut table.unreadable, |member| {
+            if member.pid == 2 {
+                crate::IdentityRead::Gone
+            } else {
+                crate::IdentityRead::Alive(member.start_time)
+            }
+        });
+        assert_eq!(table.tree(1, 10, false).unwrap().cpu_ms, 10);
+        let parent = table.members.get_mut(&1).unwrap();
+        parent.reaped_cpu_ms = Some(100);
+        parent.resources.as_mut().unwrap().cpu_user = Duration::from_millis(110);
+        assert_eq!(table.tree(1, 10, false).unwrap().cpu_ms, 110);
+        assert_eq!(
+            table.tree(1, 10, false).unwrap().cpu_ms,
+            110,
+            "re-reading the same cumulative counter cannot credit another child sample"
         );
     }
 

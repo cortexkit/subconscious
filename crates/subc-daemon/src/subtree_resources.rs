@@ -455,6 +455,11 @@ pub(crate) async fn bounded<T: Send + 'static>(
     static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let slots = SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_READERS)));
     if Instant::now() >= deadline {
+        tracing::debug!(
+            cause = "deadline",
+            phase = "before_admission",
+            "resource read incomplete"
+        );
         return unavailable("timeout");
     }
     let Ok(Ok(permit)) = tokio::time::timeout(
@@ -463,9 +468,19 @@ pub(crate) async fn bounded<T: Send + 'static>(
     )
     .await
     else {
+        tracing::debug!(
+            cause = "admission",
+            phase = "reader_pool",
+            "resource read incomplete"
+        );
         return unavailable("timeout");
     };
     if Instant::now() >= deadline {
+        tracing::debug!(
+            cause = "deadline",
+            phase = "after_admission",
+            "resource read incomplete"
+        );
         return unavailable("timeout");
     }
     let task = tokio::task::spawn_blocking(move || {
@@ -479,9 +494,26 @@ pub(crate) async fn bounded<T: Send + 'static>(
         // A delayed runtime poll must not let a completed but overdue read
         // win the race against the timer.
         Ok(Ok((reading, finished))) if finished < deadline => reading,
-        Ok(Ok(_)) => unavailable("timeout"),
-        Ok(Err(_)) => unavailable("read_failed"),
-        Err(_) => unavailable("timeout"),
+        Ok(Ok(_)) => {
+            tracing::debug!(
+                cause = "deadline",
+                phase = "late_completion",
+                "resource read incomplete"
+            );
+            unavailable("timeout")
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(cause = "read_failed", phase = "blocking_task", %error, "resource read incomplete");
+            unavailable("read_failed")
+        }
+        Err(_) => {
+            tracing::debug!(
+                cause = "deadline",
+                phase = "blocking_task",
+                "resource read incomplete"
+            );
+            unavailable("timeout")
+        }
     }
 }
 

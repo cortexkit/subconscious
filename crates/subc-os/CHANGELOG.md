@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.31
+
+- Distinguish confirmed process exits from unreadable identities during Linux and macOS tree walks. Drop exited children instead of invalidating their parent's reading, without counting an exited child's CPU beside its parent's reaped counter. Unknown identities and PID reuse still reject the related tree.
+- Cover live child churn with a bounded Linux/macOS integration test and preserve deterministic no-double-counting checks at both identity fences.
+- Recognize Linux's `PF_EXITING` flag before the zombie state: memory can already be gone while the process still reports state `R`. Keep malformed flags and genuine read failures unknown rather than treating missing memory as zero.
+- Treat an exiting procfs read's `ESRCH` (no such process) like a missing record only after an independent absence check; hidden live PIDs and permission failures remain unknown.
+
 ## 0.1.30
 
 - Reject partial Toolhelp enumerations on Windows and failed Mach timebase reads on macOS instead of reporting successful but incorrect resources. Native macOS coverage verifies that an unreaped zombie is excluded without poisoning an unrelated tree.

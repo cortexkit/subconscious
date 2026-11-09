@@ -4,6 +4,7 @@ exit: Some(0)
 {
   "agent_commands": [],
   "daemon": {
+    "measured_at_ms": "<timestamps>",
     "pid": "<pids>",
     "resources": {
       "cpu_system_ms": "<resource_counters>",
@@ -63,6 +64,7 @@ exit: Some(0)
         "bound": "lower",
         "cpu_ms": "<resource_counters>",
         "groups": [],
+        "measured_at_ms": "<timestamps>",
         "memory_bytes": "<resource_counters>",
         "memory_kind": "resident_set",
         "own": {

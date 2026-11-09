@@ -389,7 +389,16 @@ Rust source migration requires the breaking control 0.38 / daemon 0.44 release;
 it does not change JSON decoding.
 
 The old memory-only `subtree` member is replaced by `tree`. Unknown readings
-are omitted. `cpu_last_hour` is `{cpu_ms, covered_ms, bound?}` across retained wall-clock
+are omitted. Tree readings and the daemon and agents rows optionally carry
+`measured_at_ms`, Unix-epoch milliseconds of their resource measurement, not the
+reply time. A list returns the last committed measurements immediately. When
+the committed view is older than two seconds, the list requests one background
+refresh; concurrent lists do not start another walk or wait for it. The minute
+sampler continues independently and records only its own completed observations.
+An incomplete background pass (for example admission, deadline or attribution
+contention) changes neither the committed measurements nor their reasons or
+timestamps; a later list may retry. Debug logs describe the incomplete pass.
+`cpu_last_hour` is `{cpu_ms, covered_ms, bound?}` across retained wall-clock
 samples: 61 points cover 60 one-minute intervals. A changed process identity
 credits the replacement's total; a same-process process-tree floor retains already observed departed work, so
 later CPU from surviving members is not lost when the current tree sum falls.
@@ -404,9 +413,20 @@ a loss marker. Retention and diagnostic overflow ages still use the
 suspend-inclusive monotonic clock. A renderer draws "≥" on the hour figure
 from `cpu_last_hour.bound` only, and on cumulative CPU from its cumulative
 `bound`. Older published readers ignore the new optional hourly member.
-Unreadable resources/identity make the entire tree unavailable, never a numeric
-partial sum. `tree_unavailable` distinguishes `not_yet_measured` from
-`not_running`. Skipped image probes likewise say `not_yet_measured`, not
+Unreadable resources/identity reject a new tree measurement, never a numeric
+partial sum. A confirmed exited child is removed from live members. Its CPU is
+recovered from the operating system's totals for exited children whose parent
+has collected their exit status, without counting the child's old sample twice.
+Unknown identity failures and PID reuse still reject the related tree.
+`tree_unavailable` is an open set of reasons: `not_yet_measured` means no tree
+has been measured for this launch, `not_running` means the module is stopped,
+`unreadable` means a required process could not be read for a reason other than
+confirmed exit, and `launch_changed` means a stale launch transition was refused.
+A failed newer observation retains the last committed tree and its older
+`measured_at_ms` alongside the reason; it never fabricates an empty or zero tree.
+Trees from a previous launch are not reused. Hourly history remains attached
+even when the newest tree measurement fails. Readers must tolerate future
+reasons. Skipped image probes likewise say `not_yet_measured`, not
 `hash_failed`. Optional nested members tolerate omission; absent `groups`
 means no live program groups. Required numeric measurements remain required
 and cannot decode as zero. Readers must ignore unknown object members. The daemon's own resources

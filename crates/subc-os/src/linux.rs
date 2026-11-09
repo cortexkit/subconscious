@@ -66,6 +66,103 @@ pub(crate) fn start_time(pid: u32) -> Option<u64> {
     start_time_from_stat(&stat)
 }
 
+pub(crate) fn read_identity(pid: u32) -> crate::IdentityRead {
+    use crate::IdentityRead;
+    if raw_pid(pid).is_none() {
+        return IdentityRead::Unknown;
+    }
+    identity_from_read(std::fs::read_to_string(format!("/proc/{pid}/stat")), || {
+        !exists(pid)
+    })
+}
+
+fn identity_from_read(
+    stat: io::Result<String>,
+    absent: impl FnOnce() -> bool,
+) -> crate::IdentityRead {
+    use crate::IdentityRead;
+    match stat {
+        Ok(stat) => identity_from_stat(&stat),
+        // A hidden procfs entry is not proof of exit: hidepid can hide a live PID.
+        Err(error)
+            if (error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH))
+                && absent() =>
+        {
+            IdentityRead::Gone
+        }
+        Err(_) => IdentityRead::Unknown,
+    }
+}
+
+fn identity_from_stat(stat: &str) -> crate::IdentityRead {
+    use crate::IdentityRead;
+    let Some((_, fields)) = stat.rsplit_once(')') else {
+        return IdentityRead::Unknown;
+    };
+    let mut fields = fields.split_whitespace();
+    let state = fields.next();
+    let Some(flags) = fields.nth(5).and_then(|flags| flags.parse::<u64>().ok()) else {
+        return IdentityRead::Unknown;
+    };
+    // Linux sets PF_EXITING (field 9, bit 2) before removing the process's
+    // memory map. State can still be R while /proc/<pid>/status has no VmRSS.
+    // This is confirmed exit, not an unreadable live process or a zero RSS.
+    if matches!(state, Some("Z" | "X" | "x")) || flags & 0x4 != 0 {
+        IdentityRead::Gone
+    } else {
+        start_time_from_stat(stat).map_or(IdentityRead::Unknown, IdentityRead::Alive)
+    }
+}
+
+#[cfg(test)]
+mod exit_flag_tests {
+    #[test]
+    fn an_exiting_procfs_read_with_esrch_is_confirmed_gone_only_if_absent() {
+        use crate::IdentityRead;
+        assert_eq!(
+            super::identity_from_read(Err(std::io::Error::from_raw_os_error(libc::ESRCH)), || true),
+            IdentityRead::Gone
+        );
+        assert_eq!(
+            super::identity_from_read(Err(std::io::Error::from_raw_os_error(libc::ESRCH)), || {
+                false
+            }),
+            IdentityRead::Unknown
+        );
+        assert_eq!(
+            super::identity_from_read(Err(std::io::Error::from_raw_os_error(libc::EACCES)), || {
+                true
+            }),
+            IdentityRead::Unknown
+        );
+    }
+
+    #[test]
+    fn exiting_flag_confirms_exit_before_the_zombie_state() {
+        let mut fields = ["0"; 22];
+        fields[0] = "R";
+        fields[6] = "4194316";
+        fields[19] = "424242";
+        let stat = format!("123 (worker) {}", fields.join(" "));
+        assert_eq!(
+            super::identity_from_stat(&stat),
+            crate::IdentityRead::Gone,
+            "PF_EXITING is set before exit_mm removes memory and before the state becomes Z"
+        );
+        fields[6] = "4194304";
+        assert_eq!(
+            super::identity_from_stat(&format!("123 (worker) {}", fields.join(" "))),
+            crate::IdentityRead::Alive(424242)
+        );
+        fields[6] = "invalid";
+        assert_eq!(
+            super::identity_from_stat(&format!("123 (worker) {}", fields.join(" "))),
+            crate::IdentityRead::Unknown
+        );
+    }
+}
+
 pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parent_pid_from_stat(&stat)

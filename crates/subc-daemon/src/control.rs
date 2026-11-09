@@ -6037,8 +6037,8 @@ impl ControlHandler {
             }
             statuses.insert(module.module_id().to_owned(), status);
         }
-        // Preserve cheap per-process readings before optional tree walks or
-        // image hashing can spend the shared diagnostics deadline.
+        // Legacy per-process diagnostics keep their shared optional budget.
+        // The cached tree and accounting export below does not spend it.
         let mut process_resources = BTreeMap::new();
         for module in &supervised {
             process_resources.insert(
@@ -6046,8 +6046,8 @@ impl ControlHandler {
                 crate::subtree_resources::read_process(module.clone()).await,
             );
         }
-        // Check image evidence before a process-table cache miss can spend the
-        // remaining budget; a completed background hash must stay observable.
+        // Image evidence uses the same optional deadline, but an exhausted
+        // budget must not suppress the committed resource view.
         let mut image_readings = BTreeMap::new();
         for module in &supervised {
             image_readings.insert(
@@ -6055,10 +6055,7 @@ impl ControlHandler {
                 module.running_image_agreement().await,
             );
         }
-        let readings = self
-            .resource_tracker
-            .read(supervised.clone(), false, "list")
-            .await;
+        let readings = self.resource_tracker.list(supervised.clone());
         let mut modules = Vec::new();
         for module in supervised {
             let status = statuses
@@ -6131,12 +6128,16 @@ impl ControlHandler {
                 module.tree = tree.clone();
                 module.cpu_last_hour = hour.clone();
             }
+            module.tree_unavailable = readings
+                .reasons
+                .get(&module.module_id)
+                .map(|reason| (*reason).to_owned());
             if module.tree.is_none() {
                 module.tree_unavailable = Some(
                     if not_running.contains(&module.module_id) {
                         "not_running"
-                    } else if readings.modules.contains_key(&module.module_id) {
-                        "tree_unavailable"
+                    } else if let Some(reason) = readings.reasons.get(&module.module_id) {
+                        reason
                     } else {
                         "not_yet_measured"
                     }
@@ -14400,14 +14401,132 @@ mod tests {
             body["modules"][0].get("tree").is_none(),
             "an unknown tree reading must be omitted after the bounded read expires"
         );
+        // Lists export completed work rather than measuring synchronously.
+        // Complete a refresh after the fixture is released before asserting
+        // that a later list contains its measured tree.
+        handler
+            .resource_tracker
+            .read(handler.supervisor.list(), false, "released_tree_fixture")
+            .await;
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 3, Vec::new()).unwrap();
         let replies = handler.handle_supervisor_list(frame).await.unwrap();
         let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
         assert_eq!(
             body["modules"][0]["tree"]["source"], "process_tree",
-            "the next request must read afresh"
+            "the next request must export the completed refresh"
         );
         assert_eq!(body["modules"][0]["tree"]["process_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn supervisor_list_expired_budget_keeps_committed_accounting_rows() {
+        use subc_control::{
+            AgentCommandResources, ChildMemoryKind, ChildResourceReading,
+            ChildResourceUnavailableReason, ChildResourceUsage, CpuLastHour, DaemonResources,
+            TreeReading, TreeSource,
+        };
+        let registry = Arc::new(Registry::default());
+        let handle = SupervisorHandle::new();
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone());
+        supervisor
+            .supervise_configured(
+                crate::ModuleSpec {
+                    carry_containment: false,
+                    module_id: "budget-worker".into(),
+                    program: PathBuf::from("disabled-module"),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    reserved: false,
+                    reserved_prefixes: Vec::new(),
+                    protocol: ModuleProtocol::Subc,
+                    overlap: Default::default(),
+                },
+                true,
+            )
+            .unwrap();
+        let handler = ControlHandler::new(registry).with_supervisor(handle);
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let measured = now - 1_000;
+        let hour = CpuLastHour::new(100, 60_000);
+        let daemon = DaemonResources::new(7, 1, "test")
+            .with_measured_at_ms(Some(measured))
+            .with_resources(Some(ChildResourceUsage::Measured(
+                ChildResourceReading::new(20, ChildMemoryKind::ResidentSet, 10, 0),
+            )))
+            .with_cpu_last_hour(Some(hour.clone()));
+        let agents = AgentCommandResources::new("budget-worker", 50, 30, 1)
+            .with_measured_at_ms(Some(measured))
+            .with_cpu_last_hour(Some(hour.clone()));
+        let tree = TreeReading::new(
+            150,
+            50,
+            ChildMemoryKind::ResidentSet,
+            1,
+            TreeSource::ProcessTree,
+        )
+        .with_measured_at_ms(Some(measured));
+        handler.resource_tracker.seed_committed_for_test(
+            &handler.supervisor.list(),
+            crate::resource_totals::Readings {
+                modules: BTreeMap::from([("budget-worker".into(), (Some(tree), Some(hour)))]),
+                daemon: Some(daemon),
+                agent_commands: Some(vec![agents]),
+                ..Default::default()
+            },
+            now,
+        );
+        list_diagnostics::scope(async {
+            tokio::time::sleep(Duration::from_millis(110)).await;
+            assert!(list_diagnostics::deadline().unwrap() <= tokio::time::Instant::now());
+            let request =
+                Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+            let replies = handler.handle_supervisor_list_inner(request).await.unwrap();
+            let ClientControlResponse::SupervisorList {
+                modules,
+                daemon,
+                agent_commands,
+                ..
+            } = serde_json::from_slice(&replies[0].body).unwrap()
+            else {
+                panic!("expected a list response")
+            };
+            assert!(matches!(
+                modules[0].resources,
+                Some(ChildResourceUsage::Unavailable {
+                    reason: ChildResourceUnavailableReason::Unreadable
+                })
+            ));
+            assert_eq!(
+                (
+                    modules[0].tree.as_ref().unwrap().cpu_ms,
+                    modules[0].tree.as_ref().unwrap().measured_at_ms
+                ),
+                (150, Some(measured))
+            );
+            let daemon = daemon.unwrap();
+            let agents = agent_commands.unwrap();
+            assert_eq!(daemon.measured_at_ms, Some(measured));
+            assert_eq!(
+                (agents.len(), agents[0].cpu_ms, agents[0].measured_at_ms),
+                (1, 50, Some(measured))
+            );
+            for hour in [
+                modules[0].cpu_last_hour.as_ref(),
+                daemon.cpu_last_hour.as_ref(),
+                agents[0].cpu_last_hour.as_ref(),
+            ] {
+                let hour = hour.unwrap();
+                assert_eq!((hour.cpu_ms, hour.covered_ms), (100, 60_000));
+            }
+        })
+        .await;
     }
 
     #[tokio::test]

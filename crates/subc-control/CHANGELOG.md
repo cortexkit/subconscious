@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.38.1
+
+- Add optional `measured_at_ms` timestamps to tree, daemon and agents resource readings. Omitted timestamps remain compatible with older frames; readers ignore unknown additions. A retained tree can accompany an open-set `tree_unavailable` reason describing a failed newer observation.
+
 ## 0.38.0
 
 - **Rust migration:** `TreeReading`, `ProcessGroup`, `TreeOwn`, `CpuLastHour`, `DaemonResources`, `AgentCommandResources`, `ChildResourceReading`, and `PendingReloadVerdict` are now non-exhaustive. Replace external struct literals with their required-field `new` constructors and `with_*` builders; optional metadata defaults to absent or empty. This keeps future optional resource fields source-compatible. `SupervisorEntry` already uses this construction API. JSON field names and decoding remain unchanged.

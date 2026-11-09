@@ -436,6 +436,15 @@ impl SupervisedChild {
         // caller releases it after recording the exit (`release_roster`), and
         // dropping the handle releases it too.
         let result = self.child.wait().await;
+        // All plain and swap waits pass here. Revoke the reaped child's nonce
+        // before cgroup cleanup, stderr draining or exit observation can await.
+        if let Some(binding) = &self._program_binding {
+            binding.retire();
+        }
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(binding) = &self._program_binding {
+            binding.pause_after_wait_for_test().await;
+        }
         #[cfg(target_os = "linux")]
         if result.is_ok() && self.child.container().is_none() {
             if let Some(placement) = self.cgroup_placement.as_ref() {
@@ -450,8 +459,7 @@ impl SupervisedChild {
     }
 
     async fn finish_exit(&mut self, carry: bool) -> io::Result<()> {
-        // Revoke HELLO authority as soon as exit is observed, before any
-        // container cleanup awaits. A retained nonce cannot revive this child.
+        // Idempotent fallback for cleanup paths that did not call wait.
         if let Some(binding) = self._program_binding.take() {
             binding.retire();
         }
@@ -8307,9 +8315,28 @@ async fn handle_supervisor_command(
             SupervisorCommand::ConfigApplyRestart { .. } => return true,
             SupervisorCommand::SetEnabled {
                 enabled: true,
+                requester,
                 reply,
-                ..
             } => {
+                if matches!(error, SuperviseError::ConfigHeld { .. })
+                    && runtime.config_delivery.as_ref().is_some_and(|delivery| {
+                        !delivery.0.file_configuration_is_gated(&spec.module_id)
+                    })
+                {
+                    // The same committed-unstamp exception as UpdateConfiguration
+                    // stages desired state only. Admission release starts it later.
+                    let mut changed = false;
+                    let result = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                        changed = !state.enabled;
+                        state.enabled = true;
+                    })
+                    .map(|_| changed);
+                    if result.is_ok() && changed {
+                        runtime.start_requester = requester;
+                    }
+                    let _ = reply.send(result);
+                    return true;
+                }
                 let _ = reply.send(Err(error));
                 return true;
             }

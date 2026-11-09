@@ -226,17 +226,37 @@ impl crate::config_gate::ReviewAdmission for Admitted {
 
 fn adapt_control(mut handler: ControlHandler) -> ControlHandler {
     handler = handler.with_config_os_prompt_policy_for_tests();
-    handler = handler.with_recovery_exit_test_hook(|step| {
-        let root = PathBuf::from(std::env::var_os("RECOVERY_ROOT").unwrap());
-        if step == 1 && root.join("fail-exit-step").exists() {
-            std::fs::write(root.join("exit-step-completed"), b"1").unwrap();
-            return Err(crate::config_gate::GateError::new(
-                "rescan_failed",
-                "injected failure after first successful reconcile step",
-            ));
-        }
-        Ok(())
-    });
+    handler = handler.with_recovery_exit_test_hook(
+        |step| {
+            let root = PathBuf::from(std::env::var_os("RECOVERY_ROOT").unwrap());
+            if step == 1 && root.join("fail-exit-step").exists() {
+                let attempts = std::fs::read_to_string(root.join("exit-step-completed"))
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0)
+                    + 1;
+                std::fs::write(root.join("exit-step-completed"), attempts.to_string()).unwrap();
+                return Err(crate::config_gate::GateError::new(
+                    "rescan_failed",
+                    "injected failure after first successful reconcile step",
+                ));
+            }
+            if step == 2 {
+                std::fs::write(root.join("exit-definitions-reconciled"), b"1").unwrap();
+            }
+            if step == 0 && root.join("fail-before-exit-complete").exists() {
+                std::fs::write(root.join("exit-completion-held"), b"1").unwrap();
+                return Err(crate::config_gate::GateError::new(
+                    "rescan_failed",
+                    "injected failure before admission release",
+                ));
+            }
+            Ok(())
+        },
+        PathBuf::from(std::env::var_os("RECOVERY_ROOT").unwrap())
+            .join("quiet-exit-retry")
+            .exists(),
+    );
     let app = "test.desktop";
     handler = handler
         .with_test_operator_app_policy(crate::operator_apps::TestOperatorAppPolicy {
@@ -575,6 +595,7 @@ async fn config_recovery_spawned_partial_exit_failure_keeps_the_hold_and_retries
     rig.seed();
     rig.reject_store(false);
     std::fs::write(rig.dir.join("fail-exit-step"), b"fail").unwrap();
+    std::fs::write(rig.dir.join("quiet-exit-retry"), b"1").unwrap();
     let daemon = rig.start().await;
     let mut client = rig.local().await;
     let applied = apply(&mut client, "config.stamp").await;
@@ -595,7 +616,24 @@ async fn config_recovery_spawned_partial_exit_failure_keeps_the_hold_and_retries
     );
     let status = rpc(&mut client, json!({"op":"config.status"})).await;
     assert_eq!(status["status"]["state"], "store_unverified", "{status}");
+    // File polling below cannot trigger configuration retries. Suppress state
+    // notifications during the pending exit to exercise the daemon's timer alone.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let attempts = std::fs::read_to_string(rig.dir.join("exit-step-completed"))
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0);
+            if attempts >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the coordinator must observe the retained exit before notifications are suppressed");
     std::fs::remove_file(rig.dir.join("fail-exit-step")).unwrap();
+    wait_path(&rig.dir, "exit-definitions-reconciled").await;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let status = rpc(&mut client, json!({"op":"config.status"})).await;
@@ -610,6 +648,86 @@ async fn config_recovery_spawned_partial_exit_failure_keeps_the_hold_and_retries
     let modules = rpc(&mut client, json!({"op":"supervisor.list"})).await;
     assert_eq!(modules["modules"].as_array().unwrap().len(), 2, "{modules}");
     drop(daemon);
+}
+
+#[cfg(feature = "dev-desktop-approval")]
+#[tokio::test]
+async fn config_recovery_spawned_unstamp_stages_enable_until_exit_completion() {
+    let _serial = DAEMONS.lock().await;
+    for stamp in [false, true] {
+        let rig = Rig::new(true);
+        let path = rig.dir.join("subc.jsonc");
+        let mut doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        doc["modules"]["held-fixture"]["enabled"] = json!(false);
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        rig.seed();
+        let daemon = if stamp {
+            rig.reject_store(false);
+            rig.start().await
+        } else {
+            rig.start().await
+        };
+        let mut client = rig.local().await;
+        let path = rig.dir.join("subc.jsonc");
+        let mut doc: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        doc["modules"]["held-fixture"]["enabled"] = json!(true);
+        std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        if !stamp {
+            rig.reject_store(false);
+            assert_eq!(
+                rpc(&mut client, json!({"op":"config.status"})).await["status"]["state"],
+                "store_unverified"
+            );
+        }
+        std::fs::write(rig.dir.join("fail-before-exit-complete"), b"fail").unwrap();
+        let applied = apply(
+            &mut client,
+            if stamp {
+                "config.stamp"
+            } else {
+                "config.unstamp"
+            },
+        )
+        .await;
+        assert_eq!(applied["code"], "rescan_failed", "{applied}");
+        let staged = rpc(&mut client, json!({"op":"supervisor.list"})).await;
+        let module = staged["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["module_id"] == "held-fixture")
+            .unwrap();
+        assert_eq!(module["enabled"], true, "{staged}");
+        assert_eq!(
+            module["live"], false,
+            "staging must not spawn before completion: {staged}"
+        );
+        assert!(rig.dir.join("exit-completion-held").exists());
+        std::fs::remove_file(rig.dir.join("fail-before-exit-complete")).unwrap();
+        let mut last_observation = Value::Null;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = rpc(&mut client, json!({"op":"config.status"})).await;
+                let modules = rpc(&mut client, json!({"op":"supervisor.list"})).await;
+                let live =
+                    modules["modules"].as_array().unwrap().iter().any(|entry| {
+                        entry["module_id"] == "held-fixture" && entry["live"] == true
+                    });
+                last_observation = json!({"stamp":stamp, "status":status, "modules":modules});
+                if live {
+                    assert_eq!(
+                        status["status"]["state"],
+                        if stamp { "stamped" } else { "unstamped" }
+                    );
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("coordinator must start staged enabled module after completing exit: {last_observation}"));
+        drop(daemon);
+    }
 }
 
 #[cfg(feature = "dev-desktop-approval")]

@@ -453,6 +453,8 @@ pub struct ControlHandler {
     pub(crate) app_open_test_launch: Option<fn() -> Result<u32, crate::app_open::AppOpenRefusal>>,
     #[cfg(test)]
     recovery_exit_test_after_step: Option<fn(usize) -> Result<(), crate::config_gate::GateError>>,
+    #[cfg(test)]
+    recovery_exit_test_quiet_retry: bool,
     /// Test-only Windows signature and flash hooks. Production builds carry
     /// neither: with the publisher unset, the production table never reaches
     /// verification, and the default attention hook only logs.
@@ -1076,6 +1078,8 @@ impl ControlHandler {
             app_open_test_launch: None,
             #[cfg(test)]
             recovery_exit_test_after_step: None,
+            #[cfg(test)]
+            recovery_exit_test_quiet_retry: false,
             #[cfg(windows)]
             windows_verify: None,
             #[cfg(windows)]
@@ -2630,7 +2634,7 @@ impl ControlHandler {
                         .and_then(|value| value.as_str())
                         .is_some_and(|nonce| {
                             self.supervisor.spawned_consumer_authorized(module, nonce)
-                                && self.supervisor.has_program_binding_record(module)
+                                && self.supervisor.has_program_binding_record(module, nonce)
                         }))
             {
                 return Ok(vec![control_error_frame(
@@ -2649,7 +2653,7 @@ impl ControlHandler {
                 .get("launch_nonce")
                 .and_then(|value| value.as_str()),
         ) {
-            let binding = self.supervisor.has_program_binding_record(module);
+            let binding = self.supervisor.has_program_binding_record(module, nonce);
             let required = self
                 .config_runtime
                 .as_ref()
@@ -2840,7 +2844,7 @@ impl ControlHandler {
                 .is_some_and(|owner| owner.check_module_hold(module).is_err())
                 || !hello.launch_nonce.as_deref().is_some_and(|nonce| {
                     self.supervisor.spawned_consumer_authorized(module, nonce)
-                        && self.supervisor.has_program_binding_record(module)
+                        && self.supervisor.has_program_binding_record(module, nonce)
                 }))
         {
             return Ok(vec![control_error_frame(
@@ -2850,10 +2854,7 @@ impl ControlHandler {
             )?]);
         }
         if let Some(nonce) = hello.launch_nonce.as_deref() {
-            if required
-                || (self.config_runtime.is_none()
-                    && self.supervisor.has_program_binding_record(module))
-            {
+            if required || self.supervisor.has_program_binding_record(module, nonce) {
                 if let Err(error) = self.supervisor.check_current_program_binding(module, nonce) {
                     let code = if error.code == "program_refused" {
                         "program_refused"

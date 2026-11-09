@@ -3,6 +3,9 @@
 use super::*;
 
 impl RuntimeOwner {
+    pub(crate) fn authority_exit_retry_generation(&self) -> Result<Option<u64>> {
+        Ok(self.lock()?.authority_exit)
+    }
     pub(crate) fn pending_authority_exit(&self) -> Result<Option<u64>> {
         let mut state = self.lock()?;
         if state.authority_exit.is_some() && state.store.delivery_ready().is_ok() {

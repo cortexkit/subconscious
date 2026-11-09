@@ -3,21 +3,38 @@ use super::*;
 #[derive(Debug, Default)]
 pub(super) struct ProgramBindingRecords {
     active: HashMap<(String, String), ProgramBindingEntry>,
-    retired: HashMap<String, ProgramBindingEntry>,
+    retired: HashMap<String, RetiredProgramBinding>,
     configured: HashSet<String>,
+    #[cfg(all(test, target_os = "linux"))]
+    exit_pause: Option<ProgramBindingExitPause>,
 }
 type ProgramBindingTable = Mutex<ProgramBindingRecords>;
 pub(super) type ProgramBindings = Arc<ProgramBindingTable>;
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Debug)]
+struct ProgramBindingExitPause {
+    key: (String, String),
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
 
 // A negative record must survive child death: no record means an ungated legacy
 // launch, so erasing it would let the dead child's nonce bypass image checks.
 // Keep one retired record per module until its next spawn or removal. During
 // swap warm-up, the running child and its replacement keep separate active bindings.
 // Configured-owner metadata survives unstamp so a later exit still records refusal.
+// Retirement refuses only the dead nonce, not a later unstamped spawn's fresh nonce.
 #[derive(Clone, Debug)]
 pub(super) struct ProgramBindingEntry {
     receiver: tokio::sync::watch::Receiver<Option<bool>>,
     live: Arc<Mutex<std::sync::Weak<content_binding::LiveProgramBinding>>>,
+}
+
+#[derive(Debug)]
+struct RetiredProgramBinding {
+    nonce: String,
+    entry: ProgramBindingEntry,
 }
 
 #[derive(Clone, Debug)]
@@ -26,10 +43,33 @@ pub(super) struct ProgramBindingPublication {
     live: Arc<Mutex<std::sync::Weak<content_binding::LiveProgramBinding>>>,
     bindings: std::sync::Weak<ProgramBindingTable>,
     key: (String, String),
+    retired: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ProgramBindingPublication {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) async fn pause_after_wait_for_test(&self) {
+        let pause = self.bindings.upgrade().and_then(|bindings| {
+            let mut records = bindings.lock().unwrap();
+            if records
+                .exit_pause
+                .as_ref()
+                .is_some_and(|pause| pause.key == self.key)
+            {
+                records.exit_pause.take()
+            } else {
+                None
+            }
+        });
+        if let Some(pause) = pause {
+            let _ = pause.reached.send(());
+            let _ = pause.release.await;
+        }
+    }
     pub(super) fn retire(&self) {
+        if self.retired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         self.signal.send_replace(Some(false));
         if let Some(bindings) = self.bindings.upgrade() {
             let mut bindings = bindings
@@ -43,9 +83,12 @@ impl ProgramBindingPublication {
                 let (_, receiver) = tokio::sync::watch::channel(Some(false));
                 bindings.retired.insert(
                     self.key.0.clone(),
-                    ProgramBindingEntry {
-                        receiver,
-                        live: Arc::new(Mutex::new(std::sync::Weak::new())),
+                    RetiredProgramBinding {
+                        nonce: self.key.1.clone(),
+                        entry: ProgramBindingEntry {
+                            receiver,
+                            live: Arc::new(Mutex::new(std::sync::Weak::new())),
+                        },
                     },
                 );
             }
@@ -89,6 +132,24 @@ impl Drop for ProgramBindingPublication {
 }
 
 impl SupervisorHandle {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn pause_program_binding_exit_for_test(
+        &self,
+        module: &str,
+        nonce: &str,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached, observed) = tokio::sync::oneshot::channel();
+        let (release, waiting) = tokio::sync::oneshot::channel();
+        self.program_bindings.lock().unwrap().exit_pause = Some(ProgramBindingExitPause {
+            key: (module.into(), nonce.into()),
+            reached,
+            release: waiting,
+        });
+        (observed, release)
+    }
     pub(crate) fn install_binding_retirement(
         &self,
         owner: &crate::config_gate::runtime::RuntimeOwner,
@@ -138,11 +199,14 @@ impl SupervisorHandle {
             live.hello_accepted();
         }
     }
-    pub(crate) fn has_program_binding_record(&self, module: &str) -> bool {
+    pub(crate) fn has_program_binding_record(&self, module: &str, nonce: &str) -> bool {
         self.program_bindings
             .lock()
             .map(|records| {
-                records.retired.contains_key(module)
+                records
+                    .retired
+                    .get(module)
+                    .is_some_and(|record| record.nonce == nonce)
                     || records.active.keys().any(|(owner, _)| owner == module)
             })
             .unwrap_or(true)
@@ -212,7 +276,7 @@ impl SupervisorHandle {
         if !self.spawned_consumer_authorized(module, nonce) {
             return Err(refused());
         }
-        if self.has_program_binding_record(module) {
+        if self.has_program_binding_record(module, nonce) {
             self.check_current_program_binding(module, nonce)?;
         }
         let child = self.get(module).ok_or_else(refused)?;
@@ -292,6 +356,7 @@ impl SupervisorHandle {
             live,
             bindings: Arc::downgrade(&self.program_bindings),
             key,
+            retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -304,7 +369,13 @@ impl SupervisorHandle {
         records
             .active
             .get(&(module.to_owned(), nonce.to_owned()))
-            .or_else(|| records.retired.get(module))
+            .or_else(|| {
+                records
+                    .retired
+                    .get(module)
+                    .filter(|record| record.nonce == nonce)
+                    .map(|record| &record.entry)
+            })
             .map(|entry| entry.receiver.clone())
     }
 

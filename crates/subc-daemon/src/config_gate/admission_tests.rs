@@ -870,7 +870,7 @@ async fn config_admission_swap_cutover_does_not_park_stop_behind_owner_publicati
         stopped.is_ok(),
         "the module gate parked stop behind blocking owner publication"
     );
-    assert!(handle.has_program_binding_record("a"));
+    assert!(handle.has_program_binding_record("a", &handle.spawn_nonce("a").unwrap()));
     assert!(!handle.has_live_verified_program_binding("a", &candidate_nonce));
     let handler = crate::ControlHandler::new(registry.clone())
         .with_supervisor(handle)
@@ -1624,12 +1624,12 @@ async fn config_recovery_dead_child_retires_binding_while_its_nonce_remains_curr
         }
         if mode == 2 {
             approve(&rig, &owner, PlanKind::Unstamp);
-            assert!(!handle.has_program_binding_record("a"));
+            assert!(!handle.has_program_binding_record("a", &nonce));
         }
         module.stop().await.unwrap();
         assert_eq!(handle.spawn_nonce("a"), Some(nonce.clone()));
         assert!(
-            handle.has_program_binding_record("a"),
+            handle.has_program_binding_record("a", &nonce),
             "retirement must keep the legacy fallback closed"
         );
         assert!(!handle.has_live_verified_program_binding("a", &nonce));
@@ -2021,8 +2021,172 @@ fn module_hello(nonce: Option<String>) -> subc_protocol::Frame {
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
+async fn config_recovery_reaped_child_refuses_hello_before_exit_cleanup() {
+    for case in ["plain", "reserved_unstamped", "swap_candidate"] {
+        let rig = rig();
+        wire_fixture_document(&rig, json!(["600"]));
+        let path = rig.path.join("subc.jsonc");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        doc["modules"]["a"]["reserved"] = json!(case == "reserved_unstamped");
+        doc["modules"]["a"]["overlap"] = json!("safe");
+        std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        let owner = Arc::new(rig.owner(case));
+        rig.stamp(&owner);
+        let registry = Arc::new(crate::Registry::default());
+        let handle = SupervisorHandle::new();
+        let forwarding = Arc::new(crate::ForwardingTable::default());
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone())
+            .with_forwarding(forwarding)
+            .with_config_runtime(owner.clone());
+        let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+        let pid = reported_pid(&module).await;
+        let mut nonce = handle.spawn_launch_nonce_for("a").unwrap();
+        assert!(handle.wait_program_binding("a", &nonce).await);
+        let mut swapping = None;
+        if case == "swap_candidate" {
+            let mut manifest =
+                subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build();
+            manifest.ready = Some(true);
+            registry
+                .register_with_control_ops(
+                    manifest,
+                    subc_protocol::PROTOCOL_VERSION,
+                    ConnectionId::new(787),
+                    vec![],
+                )
+                .unwrap();
+            swapping = Some(tokio::spawn({
+                let module = module.clone();
+                async move { module.swap(Some(Duration::from_secs(5))).await }
+            }));
+            nonce = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(nonce) = handle.candidate_launch_nonce_for_test("a") {
+                        if handle.has_live_verified_program_binding("a", &nonce) {
+                            break nonce;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let (reaped, release) = handle.pause_program_binding_exit_for_test("a", &nonce);
+        if case != "plain" {
+            approve(&rig, &owner, PlanKind::Unstamp);
+        }
+        let stopping = if case == "swap_candidate" {
+            Some(tokio::spawn({
+                let module = module.clone();
+                async move { module.stop().await }
+            }))
+        } else {
+            subc_os::Process::open(pid)
+                .unwrap()
+                .unwrap()
+                .signal(subc_os::Signal::Kill)
+                .unwrap();
+            None
+        };
+        tokio::time::timeout(Duration::from_secs(5), reaped)
+            .await
+            .unwrap()
+            .unwrap();
+        let retired = handle.has_program_binding_record("a", &nonce)
+            && !handle.has_live_verified_program_binding("a", &nonce);
+        let handler = crate::ControlHandler::new(registry.clone())
+            .with_supervisor(handle)
+            .with_config_runtime(owner);
+        let reply = handler
+            .handle_control(ConnectionId::new(788), module_hello(Some(nonce)))
+            .unwrap();
+        let _ = registry.deregister_connection(ConnectionId::new(788));
+        let _ = registry.deregister_connection(ConnectionId::new(787));
+        let _ = release.send(());
+        if let Some(stopping) = stopping {
+            stopping.await.unwrap().unwrap();
+        }
+        if let Some(swapping) = swapping {
+            let _ = swapping.await.unwrap();
+        }
+        module.stop().await.unwrap();
+        assert!(
+            retired,
+            "{case}: reap must retire authority before the paused cleanup await"
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&reply[0].body).unwrap()["code"],
+            "program_refused",
+            "{case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn config_recovery_unstamped_respawn_admits_fresh_nonce_and_refuses_dead_nonce() {
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = Arc::new(rig.owner("unstamped-respawn"));
+    rig.stamp(&owner);
+    let registry = Arc::new(crate::Registry::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    let pid = reported_pid(&module).await;
+    let dead_nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    assert!(handle.wait_program_binding("a", &dead_nonce).await);
+    approve(&rig, &owner, PlanKind::Unstamp);
+    subc_os::Process::open(pid)
+        .unwrap()
+        .unwrap()
+        .signal(subc_os::Signal::Kill)
+        .unwrap();
+    let fresh_nonce = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(nonce) = handle.spawn_launch_nonce_for("a") {
+                if nonce != dead_nonce && module.status().unwrap().process_alive {
+                    break nonce;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unstamped crash must respawn with a fresh nonce");
+    let handler = crate::ControlHandler::new(registry.clone())
+        .with_supervisor(handle)
+        .with_config_runtime(owner);
+    let fresh = handler
+        .handle_control(ConnectionId::new(785), module_hello(Some(fresh_nonce)))
+        .unwrap();
+    registry
+        .deregister_connection(ConnectionId::new(785))
+        .unwrap();
+    let dead = handler
+        .handle_control(ConnectionId::new(786), module_hello(Some(dead_nonce)))
+        .unwrap();
+    let _ = registry.deregister_connection(ConnectionId::new(786));
+    module.stop().await.unwrap();
+    assert_eq!(
+        fresh[0].header.ty,
+        subc_protocol::FrameType::HelloAck,
+        "fresh unstamped respawn must register: {fresh:?}"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&dead[0].body).unwrap()["code"],
+        "program_refused"
+    );
+}
+
+#[tokio::test]
 async fn config_admission_hello_publication_rechecks_across_stamp_hold_and_new_spawn() {
-    for transition in ["stamp", "hold", "new_spawn"] {
+    for transition in ["stamp", "hold", "new_spawn", "unstamped_exit"] {
         let rig = rig();
         wire_fixture_document(&rig, json!(["600"]));
         let owner = Arc::new(rig.owner(transition));
@@ -2052,6 +2216,9 @@ async fn config_admission_hello_publication_rechecks_across_stamp_hold_and_new_s
             )
             .await
             .unwrap());
+        }
+        if transition == "unstamped_exit" {
+            approve(&rig, &owner, PlanKind::Unstamp);
         }
         let hold = Arc::new(std::sync::Barrier::new(2));
         let handler = crate::ControlHandler::new(registry.clone())
@@ -2118,12 +2285,12 @@ async fn config_admission_hello_publication_rechecks_across_stamp_hold_and_new_s
         registry
             .deregister_connection(ConnectionId::new(760))
             .unwrap();
+        assert!(!admitted, "{transition} published the stale HELLO");
         assert_ne!(
             reply[0].header.ty,
             subc_protocol::FrameType::HelloAck,
             "a HELLO crossed {transition} without rechecking publication authority"
         );
-        assert!(!admitted, "{transition} published the stale HELLO");
     }
 }
 
@@ -2193,10 +2360,10 @@ async fn config_admission_unstamp_restores_unreserved_hello_without_a_synthetic_
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
     reported_pid(&module).await;
     let old_nonce = handle.spawn_launch_nonce_for("a").unwrap();
-    assert!(handle.has_program_binding_record("a"));
+    assert!(handle.has_program_binding_record("a", &old_nonce));
     module.stop().await.unwrap();
     approve(&rig, &owner, PlanKind::Unstamp);
-    assert!(handle.has_program_binding_record("a"));
+    assert!(handle.has_program_binding_record("a", &old_nonce));
     assert!(
         !handle.has_live_verified_program_binding("a", &old_nonce),
         "unstamp retained a retired content witness"

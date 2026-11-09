@@ -2,6 +2,13 @@
 
 ## 0.41.10
 
+- Refuse retired launch nonces without blocking fresh unstamped respawns, and
+  retire binding authority immediately when plain or swap child waits return.
+  Recheck retired bindings before publishing unstamped HELLO registrations.
+  Retry pending recovery exits on a one-second exponential backoff capped at
+  sixty seconds, and stage enable edits from newly authoritative files without spawning
+  until reconciliation releases admission.
+
 - Keep committed recovery exits held and retryable until all supervision,
   capability-reservation and activity configuration succeeds. Validate the exact
   captured daemon document and inherit loaded/default bootstrap fields whole.

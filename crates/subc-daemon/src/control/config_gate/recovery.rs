@@ -5,8 +5,10 @@ impl ControlHandler {
     pub(crate) fn with_recovery_exit_test_hook(
         mut self,
         hook: fn(usize) -> std::result::Result<(), GateError>,
+        quiet_retry: bool,
     ) -> Self {
         self.recovery_exit_test_after_step = Some(hook);
+        self.recovery_exit_test_quiet_retry = quiet_retry;
         self
     }
     pub(in crate::control) async fn recovery_request_refusal(
@@ -124,6 +126,10 @@ impl ControlHandler {
             .map_err(|error| GateError::new("rescan_failed", error))?;
         }
         self.refresh_capability_requirements();
+        #[cfg(test)]
+        if let Some(hook) = self.recovery_exit_test_after_step {
+            hook(0)?;
+        }
         // complete_authority_exit releases admission and clears the pending
         // recovery-exit marker. Earlier failure leaves both the hold and marker
         // intact for the configuration-delivery coordinator to retry.

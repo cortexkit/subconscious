@@ -9,6 +9,30 @@ use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{sleep_until, timeout_at, Instant};
 
+#[derive(Default)]
+struct AuthorityExitRetry {
+    generation: Option<u64>,
+    next: Option<Instant>,
+    delay: Duration,
+}
+
+impl AuthorityExitRetry {
+    fn observe_pending(&mut self, generation: Option<u64>, now: Instant) {
+        if generation.is_none() {
+            *self = Self::default();
+        } else if self.generation != generation {
+            self.generation = generation;
+            self.delay = Duration::from_secs(1);
+            self.next = Some(now + self.delay);
+        } else if self.next.is_some_and(|deadline| deadline <= now) {
+            self.delay = (self.delay * 2).min(Duration::from_secs(60));
+            self.next = Some(now + self.delay);
+        }
+        // Configuration-state notifications can retry immediately, but do not
+        // move an outstanding deadline or postpone timed retries.
+    }
+}
+
 impl ControlHandler {
     #[cfg(all(test, unix))]
     pub(crate) async fn record_config_exit_for_test(
@@ -32,8 +56,9 @@ impl ControlHandler {
             let recording = Arc::new(std::sync::Mutex::new(HashSet::<String>::new()));
             let mut restarting = HashSet::<(String, u64)>::new();
             let mut recovery_holds = HashSet::<String>::new();
+            let mut exit_retry = AuthorityExitRetry::default();
             loop {
-                let next_anchor = {
+                let (next_anchor, listen_for_changes) = {
                     let Some(control) = handler.upgrade() else {
                         break;
                     };
@@ -72,17 +97,26 @@ impl ControlHandler {
                     else {
                         break;
                     };
-                    if let Ok(Some(generation)) = owner
-                        .on_blocking(|owner| owner.pending_authority_exit())
+                    let (ready_exit, mut retained_exit) = owner
+                        .on_blocking(|owner| {
+                            Ok((
+                                owner.pending_authority_exit()?,
+                                owner.authority_exit_retry_generation()?,
+                            ))
+                        })
                         .await
-                    {
+                        .unwrap_or((None, exit_retry.generation));
+                    if let Some(generation) = ready_exit {
                         if let Err(error) = control
                             .reconcile_authority_exit(owner.clone(), generation)
                             .await
                         {
                             warn!(%error, "approved configuration exit could not be reconciled");
+                        } else {
+                            retained_exit = None;
                         }
                     }
+                    exit_retry.observe_pending(retained_exit, Instant::now());
                     if owner.is_recovering() {
                         for module in control.supervisor.list() {
                             if recovery_holds.insert(module.module_id().to_owned()) {
@@ -221,15 +255,45 @@ impl ControlHandler {
                             warn!(%error, "configuration delivery task stopped");
                         }
                     }
-                    next
+                    #[cfg(test)]
+                    let listen_for_changes =
+                        !(retained_exit.is_some() && control.recovery_exit_test_quiet_retry);
+                    #[cfg(not(test))]
+                    let listen_for_changes = true;
+                    let next = next.into_iter().chain(exit_retry.next).min();
+                    (next, listen_for_changes)
                 };
                 tokio::select! {
-                    _ = changed.notified() => {},
+                    _ = changed.notified(), if listen_for_changes => {},
                     _ = async { match next_anchor { Some(at) => sleep_until(at).await, None => std::future::pending().await } } => {},
                 }
             }
         }))
     }
+}
+
+#[cfg(test)]
+#[tokio::test(start_paused = true)]
+async fn config_recovery_exit_retry_backoff_caps_and_does_not_postpone_on_owner_wakes() {
+    let start = Instant::now();
+    let mut retry = AuthorityExitRetry::default();
+    retry.observe_pending(Some(7), start);
+    for seconds in [1, 3, 7, 15, 31, 63, 123, 183] {
+        let deadline = start + Duration::from_secs(seconds);
+        assert_eq!(retry.next, Some(deadline));
+        retry.observe_pending(Some(7), deadline - Duration::from_nanos(1));
+        assert_eq!(
+            retry.next,
+            Some(deadline),
+            "owner wakes must not defer a retry"
+        );
+        retry.observe_pending(Some(7), deadline);
+    }
+    assert_eq!(retry.next, Some(start + Duration::from_secs(243)));
+    retry.observe_pending(None, start + Duration::from_secs(184));
+    assert!(retry.next.is_none());
+    retry.observe_pending(Some(8), start + Duration::from_secs(184));
+    assert_eq!(retry.next, Some(start + Duration::from_secs(185)));
 }
 
 async fn module_worker(

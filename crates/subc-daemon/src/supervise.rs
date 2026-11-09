@@ -62,6 +62,7 @@ mod activity;
 #[cfg(unix)]
 #[path = "supervise/admission.rs"]
 mod admission;
+mod admission_exit;
 #[cfg(all(test, target_os = "linux"))]
 mod async_spawn_tests;
 #[cfg(all(test, windows))]
@@ -344,6 +345,9 @@ struct SupervisedChild {
     /// Supervisor failure detail retained for the terminal record, including
     /// image refusals and first-HELLO timeouts after a successful spawn.
     spawn_failure: Option<String>,
+    /// Set only after a kill requested because launch admission failed was
+    /// accepted, never for an operator, health, or shutdown kill.
+    admission_kill_sent: bool,
     /// The protocol this process was launched with. A reload can store a new
     /// launch spec with a different protocol, but that takes effect only at the
     /// next spawn, so this process keeps being handled by the protocol it
@@ -682,12 +686,7 @@ impl SupervisedChild {
             );
             // No image is admitted on failure. Reach the entire fresh process
             // group, including a module which spawned a helper before refusal.
-            if let Some(container) = self.child.container() {
-                container.hard_kill();
-            } else if let Some(pid) = rustix::process::Pid::from_raw(self.pid as i32) {
-                let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-            }
-            let _ = self.child.start_kill();
+            let _ = self.start_admission_kill();
         }
     }
 
@@ -731,6 +730,41 @@ impl SupervisedChild {
 
     fn kill_leader(&mut self) -> io::Result<()> {
         self.child.start_kill()
+    }
+
+    fn start_admission_kill(&mut self) -> io::Result<()> {
+        #[cfg(windows)]
+        let result = {
+            let image = self
+                .spawned_file_identity
+                .as_ref()
+                .and_then(|identity| identity.windows_image.as_ref())
+                .ok_or_else(|| io::Error::other("admission child handle unavailable"))?;
+            // Kill the retained leader with a distinctive status before job
+            // cleanup can use its ordinary code 1. finish_exit ends the helpers.
+            image
+                .process()
+                .terminate_with_exit_code(admission_exit::WINDOWS_ADMISSION_KILL_EXIT_CODE as u32)
+        };
+        #[cfg(not(windows))]
+        let result = self.start_kill().map(|()| true);
+        #[cfg(unix)]
+        let result = {
+            // A leader can exit before its helpers. Still end the fresh group
+            // even when the direct-child kill reports that the leader is gone.
+            let group_sent = self.child.container().is_none()
+                && rustix::process::Pid::from_raw(self.pid as i32).is_some_and(|group| {
+                    rustix::process::kill_process_group(group, rustix::process::Signal::KILL)
+                        .is_ok()
+                });
+            if group_sent {
+                Ok(true)
+            } else {
+                result
+            }
+        };
+        self.admission_kill_sent |= result?;
+        Ok(())
     }
 
     async fn drain_stderr(&mut self, module_id: &str) {
@@ -7808,13 +7842,7 @@ async fn supervise_loop(
                     // An unavailable image can race the program's own exit.
                     // Only the admission kill is budget-free; another exit must
                     // retain its ordinary crash/clean-exit accounting.
-                    #[cfg(unix)]
-                    let admission_kill = exit_report.signal == Some(9);
-                    // Tokio's Windows start_kill uses TerminateProcess with code 1.
-                    #[cfg(windows)]
-                    let admission_kill = exit_report.code == Some(1);
-                    #[cfg(not(any(unix, windows)))]
-                    let admission_kill = false;
+                    let admission_kill = admission_exit::is_admission_kill(active_child.admission_kill_sent, &exit_report);
                     let deferred_spawn=admission_kill && active_child.spawn_failure.as_deref().is_some_and(|detail|detail.starts_with("config_delivery_deferred:"));
                     let next = if deferred_spawn {
                         record_terminal_with_detail(&spec.module_id,&runtime.terminal_ring,&runtime.spawn_events,&exit_report,TerminalDisposition::Restarting,active_child.spawn_failure.clone());
@@ -11262,6 +11290,7 @@ fn launch_child_in_slot(
         #[cfg(target_os = "macos")]
         report_ready: Arc::new(OnceLock::new()),
         spawn_failure: None,
+        admission_kill_sent: false,
     };
     if let Err(error) = containment::adopt(&mut supervised, spec, roster) {
         supervised.child.reject(
@@ -11354,17 +11383,14 @@ fn launch_child_in_slot(
                     },
                     Some(pid),
                 ));
-                #[cfg(target_os = "linux")]
-                kill_module_cgroup(supervised.cgroup_placement.as_ref(), &supervised.module_id);
-                let _ = supervised.start_kill();
-                #[cfg(unix)]
-                if supervised.child.container().is_none() {
-                    if let Some(group) = rustix::process::Pid::from_raw(pid as i32) {
-                        let _ = rustix::process::kill_process_group(
-                            group,
-                            rustix::process::Signal::KILL,
-                        );
-                    }
+                let _ = supervised.start_admission_kill();
+                #[cfg(all(test, target_os = "linux"))]
+                if supervised.admission_kill_sent {
+                    assert!(roster.admission_event_for_test(
+                        &spec.module_id,
+                        "after_admission_kill_sent",
+                        Some(pid),
+                    ));
                 }
             }
         }
@@ -18866,6 +18892,7 @@ mod cgroup_placement_tests {
             #[cfg(target_os = "macos")]
             privacy_exec: None,
             spawn_failure: None,
+            admission_kill_sent: false,
         };
 
         child.wait().await.expect("reap short-lived child");

@@ -1972,12 +1972,18 @@ async fn exit_after_unavailable_image(unavailable_stage: &'static str, child_exi
         .success());
     let checked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let checked_hook = checked.clone();
+    let kill_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let kill_sent_hook = kill_sent.clone();
     let launched = rig.path.join("a.launches");
     supervisor.set_admission_hook_for_test(move |module, stage, pid| {
         if module != "a" {
             return true;
         }
         match stage {
+            "after_admission_kill_sent" => {
+                kill_sent_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            }
             // Model a transient /proc image read failure while the real program
             // is blocked on its release pipe, not yet waitable as an exited child.
             stage if stage == unavailable_stage => {
@@ -2026,6 +2032,10 @@ async fn exit_after_unavailable_image(unavailable_stage: &'static str, child_exi
     })
     .await;
     assert!(checked.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        kill_sent.load(std::sync::atomic::Ordering::SeqCst),
+        "the admission kill must have been sent, even if the program's own exit won"
+    );
     let status = module.status().unwrap();
     if child_exits {
         assert_eq!(

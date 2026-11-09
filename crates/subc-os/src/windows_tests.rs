@@ -119,6 +119,17 @@ fn windows_forced_stop_waits_for_exit() {
 }
 
 #[test]
+fn windows_termination_preserves_chosen_exit_code() {
+    let mut fixture = Fixture::spawn();
+    let process = fixture.image.process();
+    let code = 0x434b_0001;
+    assert!(process.terminate_with_exit_code(code).unwrap());
+    assert!(process.wait_for_exit(Duration::from_secs(5)).unwrap());
+    assert_eq!(fixture.child.wait().unwrap().code(), Some(code as i32));
+    assert!(!process.terminate_with_exit_code(code).unwrap());
+}
+
+#[test]
 fn windows_capture_denies_rename_until_suspended_child_is_bound() {
     let directory =
         std::env::temp_dir().join(format!("subc-os-capture-lock-{}", std::process::id()));

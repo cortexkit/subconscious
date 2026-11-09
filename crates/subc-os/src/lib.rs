@@ -458,6 +458,15 @@ impl Process {
         windows::force_stop(self, expected_start_time, timeout)
     }
 
+    /// Request forced termination on the retained Windows handle with a chosen
+    /// exit code. `Ok(true)` means the termination request was accepted;
+    /// `Ok(false)` means the process had already exited. This does not wait for
+    /// exit: call [`Self::wait_for_exit`] before treating the process as dead.
+    #[cfg(windows)]
+    pub fn terminate_with_exit_code(&self, exit_code: u32) -> io::Result<bool> {
+        windows::terminate_with_exit_code(self, exit_code)
+    }
+
     /// Windows resources read through the retained handle, not by reopening its PID.
     #[cfg(windows)]
     pub fn resource_usage(&self) -> Option<ResourceUsage> {

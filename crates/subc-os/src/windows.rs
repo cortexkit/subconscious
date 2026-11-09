@@ -384,6 +384,21 @@ pub(crate) fn force_stop(process: &Process, expected: u64, timeout: Duration) ->
     wait(process, timeout)
 }
 
+pub(crate) fn terminate_with_exit_code(process: &Process, exit_code: u32) -> io::Result<bool> {
+    if wait(process, Duration::ZERO)? {
+        return Ok(false);
+    }
+    // SAFETY: the retained process handle remains owned throughout this call.
+    if unsafe { TerminateProcess(process.handle.as_raw_handle(), exit_code) } == 0 {
+        let error = io::Error::last_os_error();
+        if wait(process, Duration::ZERO)? {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    Ok(true)
+}
+
 pub(crate) fn resource_usage(process: &Process) -> Option<ResourceUsage> {
     observe(process)?;
     let mut counters: PROCESS_MEMORY_COUNTERS = Default::default();

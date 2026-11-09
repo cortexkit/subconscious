@@ -1150,14 +1150,18 @@ where
         }
 
         if router.defers_config_approval(&frame) || router.defers_privileged_control(&ctx, &frame) {
-            router.reserve_config_approval(&ctx, &frame);
+            let reservation = router.reserve_config_approval(&ctx, &frame);
             // Configuration prompts for the specific plan, not the generic
             // privileged operation. Only task lifetime/reader scheduling is shared.
             let task_router = Arc::clone(&router);
             let task_ctx = ctx.clone();
             let started = Instant::now();
-            privileged_tasks
-                .spawn(async move { route_open_tail(task_router, task_ctx, frame, started).await });
+            privileged_tasks.spawn(async move {
+                // The future owns cleanup even if it is dropped before its
+                // first poll or authorization refuses before approval begins.
+                let _reservation = reservation;
+                route_open_tail(task_router, task_ctx, frame, started).await
+            });
             continue;
         }
 

@@ -434,6 +434,16 @@ impl FrameSink {
     /// connection closes right after the refusal is sent, so the writer must
     /// flush it first.
     pub async fn send_flushed(&self, frame: Frame) -> Result<(), RouterError> {
+        self.send_flushed_notifying_enqueue(frame, || {}).await
+    }
+
+    /// Notify the caller after queue admission, before waiting for the writer's
+    /// flush, so cancellation withdraws only requests that could have arrived.
+    pub(crate) async fn send_flushed_notifying_enqueue(
+        &self,
+        frame: Frame,
+        queued: impl FnOnce(),
+    ) -> Result<(), RouterError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let charge = self
             .charge_waiting(queued_frame_bytes(&frame))
@@ -445,6 +455,7 @@ impl FrameSink {
             .send(outbound)
             .await
             .map_err(|_| RouterError::backend(0, 0, "connection writer closed"))?;
+        queued();
         rx.await
             .map_err(|_| RouterError::backend(0, 0, "connection flush failed"))
     }
@@ -928,8 +939,12 @@ impl Router {
         self.control.defers_config_approval(frame)
     }
 
-    pub(crate) fn reserve_config_approval(&self, ctx: &RouteCtx, frame: &Frame) {
-        self.control.reserve_config_approval(ctx, frame);
+    pub(crate) fn reserve_config_approval(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+    ) -> Option<crate::config_gate::runtime::ApprovalRequestGuard> {
+        self.control.reserve_config_approval(ctx, frame)
     }
 
     pub(crate) fn route_open_capacity_refusal(

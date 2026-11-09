@@ -86,12 +86,17 @@ impl ControlHandler {
             )
     }
 
-    pub(crate) fn reserve_config_approval(&self, ctx: &RouteCtx, frame: &Frame) {
+    pub(crate) fn reserve_config_approval(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+    ) -> Option<crate::config_gate::runtime::ApprovalRequestGuard> {
         if self.defers_config_approval(frame) {
             if let Some(owner) = &self.config_runtime {
-                owner.reserve_approval_request(ctx.connection_id, frame.header.corr);
+                return owner.reserve_approval_request(ctx.connection_id, frame.header.corr);
             }
         }
+        None
     }
 
     pub(super) fn cancel_config_approval(&self, caller: ConnectionId, correlation: u64) -> bool {
@@ -101,7 +106,7 @@ impl ControlHandler {
         };
         match owner.cancel_approval_request_outcome(caller, correlation) {
             CancelApprovalRequest::Unknown => false,
-            CancelApprovalRequest::Withdrawn => true,
+            CancelApprovalRequest::Withdrawn | CancelApprovalRequest::AlreadyReported => true,
             CancelApprovalRequest::TooLate => {
                 if let Some(activity) = &self.activity {
                     activity.config_cancel_too_late(caller, correlation);
@@ -635,6 +640,7 @@ impl ControlHandler {
                 };
                 let now = now_ms();
                 let publish_window = window.clone();
+                let publication_request = request_guard.request.clone();
                 let work = config_work(runtime, move |owner| {
                     let _owned_gates = (operation, module_gates);
                     owner.finish_approval_with_commit_window(
@@ -643,6 +649,7 @@ impl ControlHandler {
                         reply,
                         now,
                         publish_window,
+                        publication_request,
                     )
                 });
                 tokio::pin!(work);

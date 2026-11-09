@@ -6,6 +6,13 @@
   used for launch validation, including shebang inspection. Resolve PATH once,
   honor its last override and executable permissions, and refuse absent names
   instead of falling back to the working directory.
+- Retain each configuration caller's cancellation token until publication starts,
+  so task drops and disconnects still prevent a commit after queued cleanup has
+  been processed. Refuse publication if the caller-request index's mutex was
+  poisoned: cancellation tracking can no longer be trusted. Reader reservations
+  own cleanup before dispatch, including authorization refusals and unpolled tasks.
+  Send phone withdrawal only after the card was enqueued, and record at most
+  one late-cancellation diagnostic per attempt.
 - Relay immutable `consent/v1` approval cards only through the policy-enabled,
   admitted active phone module. Bind each card to its daemon-allocated request
   correlation, bound the wait for an answer to five minutes, and withdraw unanswered

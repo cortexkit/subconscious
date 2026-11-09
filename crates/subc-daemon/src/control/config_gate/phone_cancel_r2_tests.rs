@@ -111,15 +111,20 @@ async fn config_connection_loop_disconnect_during_begin_returns_slots_for_a_fift
 
 #[tokio::test]
 async fn config_phone_wire_cancel_after_drain_before_publication_records_nothing() {
-    cancel_at_publication_boundary(false).await;
+    cancel_at_publication_boundary(false, 1).await;
 }
 
 #[tokio::test]
 async fn config_phone_wire_cancel_after_publication_claim_records_too_late_and_reports_outcome() {
-    cancel_at_publication_boundary(true).await;
+    cancel_at_publication_boundary(true, 1).await;
 }
 
-async fn cancel_at_publication_boundary(after_claim: bool) {
+#[tokio::test]
+async fn config_phone_repeated_late_cancel_records_one_diagnostic_per_attempt() {
+    cancel_at_publication_boundary(true, 3).await;
+}
+
+async fn cancel_at_publication_boundary(after_claim: bool, cancels: usize) {
     let mut fixture = Fixture::new().await;
     fixture.handler = Arc::new(
         fixture
@@ -147,22 +152,24 @@ async fn cancel_at_publication_boundary(after_claim: bool) {
         .await
         .unwrap()
         .unwrap();
-    let cancel = Frame::build(FrameType::Cancel, control_flags(), 0, 0, 881, vec![]).unwrap();
-    assert!(
-        fixture
-            .handler
-            .handle_control_frame(
-                &RouteCtx {
-                    connection_id: CALLER,
-                    egress: crate::FrameSink::new(mpsc::channel(1).0),
-                },
-                cancel
-            )
-            .await
-            .unwrap()
-            .is_empty(),
-        "wire Cancel keeps its no-reply contract"
-    );
+    for _ in 0..cancels {
+        let cancel = Frame::build(FrameType::Cancel, control_flags(), 0, 0, 881, vec![]).unwrap();
+        assert!(
+            fixture
+                .handler
+                .handle_control_frame(
+                    &RouteCtx {
+                        connection_id: CALLER,
+                        egress: crate::FrameSink::new(mpsc::channel(1).0),
+                    },
+                    cancel
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "wire Cancel keeps its no-reply contract"
+        );
+    }
     release.send(()).unwrap();
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), apply)
         .await

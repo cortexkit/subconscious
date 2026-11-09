@@ -17,6 +17,7 @@ pub(crate) struct ApprovalRequest {
     phase: AtomicU8,
     claimed: AtomicBool,
     attempt: AtomicU64,
+    late_reported: AtomicBool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24,10 +25,10 @@ pub(crate) enum CancelApprovalRequest {
     Unknown,
     Withdrawn,
     TooLate,
+    AlreadyReported,
 }
 
 impl ApprovalRequest {
-    #[cfg(test)]
     pub(super) fn for_attempt(attempt: u64) -> Arc<Self> {
         Arc::new(Self {
             attempt: AtomicU64::new(attempt),
@@ -101,10 +102,23 @@ impl Drop for ApprovalRequestGuard {
 }
 
 impl RuntimeOwner {
-    pub(crate) fn reserve_approval_request(&self, caller: ConnectionId, correlation: u64) {
-        if let Ok(mut index) = self.approval_request_index.lock() {
-            index.entry((caller, correlation)).or_default();
-        }
+    pub(crate) fn reserve_approval_request(
+        self: &Arc<Self>,
+        caller: ConnectionId,
+        correlation: u64,
+    ) -> Option<ApprovalRequestGuard> {
+        let mut index = self.approval_request_index.lock().ok()?;
+        let std::collections::hash_map::Entry::Vacant(entry) = index.entry((caller, correlation))
+        else {
+            return None;
+        };
+        let request = entry.insert(Arc::default()).clone();
+        Some(ApprovalRequestGuard {
+            owner: Arc::downgrade(self),
+            caller,
+            correlation,
+            request,
+        })
     }
 
     pub(crate) fn claim_approval_request(
@@ -176,6 +190,11 @@ impl RuntimeOwner {
             return CancelApprovalRequest::Unknown;
         };
         let outcome = request.cancel();
+        if outcome == CancelApprovalRequest::TooLate
+            && request.late_reported.swap(true, Ordering::AcqRel)
+        {
+            return CancelApprovalRequest::AlreadyReported;
+        }
         if outcome == CancelApprovalRequest::Withdrawn && request.attempt() != 0 {
             self.cancel_approval(request.attempt());
         }

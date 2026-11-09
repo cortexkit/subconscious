@@ -44,6 +44,7 @@ struct PhoneCardGuard {
     version: u8,
     correlation: u64,
     answered: bool,
+    enqueued: bool,
 }
 
 impl Drop for PhoneCardGuard {
@@ -51,7 +52,7 @@ impl Drop for PhoneCardGuard {
         let _ = self
             .forwarding
             .cancel_module_control_rpc(self.endpoint, self.correlation);
-        if self.answered {
+        if self.answered || !self.enqueued {
             return;
         }
         let Ok(cancel) = Frame::build_with_version(
@@ -135,6 +136,7 @@ impl ControlHandler {
                     version: pending.negotiated_ver,
                     correlation: pending.corr,
                     answered: false,
+                    enqueued: false,
                 };
                 let binding = if pending.endpoint.connection_id == connection {
                     let corr = pending.corr;
@@ -167,7 +169,7 @@ impl ControlHandler {
             .map_err(|_| unavailable())?;
             let response = async {
                 module_sink
-                    .send_flushed(frame)
+                    .send_flushed_notifying_enqueue(frame, || card.enqueued = true)
                     .await
                     .map_err(|_| unavailable())?;
                 let outcome = receiver.await.map_err(|_| unavailable())?;

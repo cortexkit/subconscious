@@ -249,6 +249,8 @@ struct OwnerState {
     publication_hook: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(test)]
     prepublication_hook: Option<Box<dyn FnOnce() + Send>>,
+    #[cfg(test)]
+    after_approval_drain_hook: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl OwnerState {
@@ -390,7 +392,7 @@ mod route_policy;
 mod approval_request;
 #[path = "phone.rs"]
 mod phone;
-pub(crate) use approval_request::{ApprovalRequest, CancelApprovalRequest};
+pub(crate) use approval_request::{ApprovalRequest, ApprovalRequestGuard, CancelApprovalRequest};
 
 impl RuntimeOwner {
     /// Keep store I/O and waits for its synchronous owner lock off runtime threads.
@@ -492,6 +494,8 @@ impl RuntimeOwner {
                 publication_hook: None,
                 #[cfg(test)]
                 prepublication_hook: None,
+                #[cfg(test)]
+                after_approval_drain_hook: None,
             }),
             capturer,
             module_gates: Mutex::new(HashMap::new()),
@@ -1143,7 +1147,16 @@ impl RuntimeOwner {
         reply: ApprovalReply,
         now_ms: u64,
     ) -> Result<u64> {
-        self.finish_approval_with_commit_window(attempt, facts, reply, now_ms, None)
+        // In-process approvals have no reader reservation. Wire approvals pass
+        // their exact request token into the publication job instead.
+        self.finish_approval_with_commit_window(
+            attempt,
+            facts,
+            reply,
+            now_ms,
+            None,
+            ApprovalRequest::for_attempt(attempt),
+        )
     }
 
     pub(crate) fn finish_approval_with_commit_window(
@@ -1153,7 +1166,14 @@ impl RuntimeOwner {
         reply: ApprovalReply,
         now_ms: u64,
         window: Option<std::sync::Arc<ApprovalCommitWindow>>,
+        cancellation: std::sync::Arc<ApprovalRequest>,
     ) -> Result<u64> {
+        if cancellation.attempt() != attempt {
+            return Err(GateError::new(
+                "config_unavailable",
+                "approval request witness does not match its attempt",
+            ));
+        }
         let mut state = self.lock()?;
         let digest = state.gate.approval_digest(attempt)?;
         state.reviewed(&digest, Instant::now());
@@ -1179,12 +1199,16 @@ impl RuntimeOwner {
         let facts = state.with_desktop_view(&digest, facts);
         self.drain_canceled_approvals(&mut state);
         self.drain_disconnections(&mut state);
-        let cancellation = self.approval_request_index.lock().ok().and_then(|index| {
-            index
-                .values()
-                .find(|request| request.attempt() == attempt)
-                .cloned()
-        });
+        #[cfg(test)]
+        if let Some(hook) = state.after_approval_drain_hook.take() {
+            hook();
+        }
+        if self.approval_request_index.is_poisoned() {
+            return Err(GateError::new(
+                "config_unavailable",
+                "approval cancellation index is poisoned",
+            ));
+        }
         let was_unstamped = state.store.status().state == StoreState::Unstamped;
         #[cfg(test)]
         let publication_hook = state.publication_hook.take();
@@ -1213,9 +1237,7 @@ impl RuntimeOwner {
                 if let Some(window) = window {
                     window.begin_publication()?;
                 }
-                if let Some(request) = cancellation {
-                    request.claim_publication()?;
-                }
+                cancellation.claim_publication()?;
                 route_policy::restore_superseded(
                     route_policy_receipts,
                     installed_route_policies,
@@ -1258,6 +1280,25 @@ impl RuntimeOwner {
     #[cfg(all(test, unix))]
     pub(crate) fn set_prepublication_hook(&self, hook: impl FnOnce() + Send + 'static) {
         self.inner.lock().unwrap().prepublication_hook = Some(Box::new(hook));
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_after_approval_drain_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        self.inner.lock().unwrap().after_approval_drain_hook = Some(Box::new(hook));
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn approval_request_count_for_test(&self) -> usize {
+        self.approval_request_index.lock().unwrap().len()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn poison_approval_request_index_for_test(&self) {
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.approval_request_index.lock().unwrap();
+            panic!("injected approval index poison");
+        }));
+        assert!(poisoned.is_err());
     }
 
     #[cfg(all(test, unix))]

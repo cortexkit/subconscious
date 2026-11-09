@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.5.6"
+version = "0.6.0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -476,10 +476,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.36.0",
+ "subc-control 0.37.0",
  "subc-daemon",
  "subc-jsonc",
- "subc-protocol 0.35.0",
+ "subc-protocol 0.36.0",
  "subc-transport",
  "syn 2.0.118",
  "tempfile",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "ck-inspect"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "ck-inspect",
@@ -500,15 +500,15 @@ dependencies = [
  "serde",
  "serde_json",
  "subc-client-rs",
- "subc-control 0.36.0",
- "subc-protocol 0.35.0",
+ "subc-control 0.37.0",
+ "subc-protocol 0.36.0",
  "tempfile",
  "tokio",
 ]
 
 [[package]]
 name = "ck-ui"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "ck-ui",
@@ -522,10 +522,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.36.0",
+ "subc-control 0.37.0",
  "subc-jsonc",
  "subc-os",
- "subc-protocol 0.35.0",
+ "subc-protocol 0.36.0",
  "subc-transport",
  "tokio",
  "unicode-width 0.2.2",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-testkit"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -677,9 +677,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.36.0",
+ "subc-control 0.37.0",
  "subc-os",
- "subc-protocol 0.35.0",
+ "subc-protocol 0.36.0",
  "subc-transport",
  "tempfile",
  "tokio",
@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-stdio-adapter"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "cortexkit-log",
  "cortexkit-test-support",
@@ -1741,7 +1741,7 @@ dependencies = [
  "subc-client-rs",
  "subc-jobobject",
  "subc-jsonc",
- "subc-protocol 0.35.0",
+ "subc-protocol 0.36.0",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "async-trait",
  "cortexkit-paths",
@@ -2850,9 +2850,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "socket2",
- "subc-control 0.36.0",
+ "subc-control 0.37.0",
  "subc-os",
- "subc-protocol 0.35.0",
+ "subc-protocol 0.36.0",
  "subc-transport",
  "syn 2.0.118",
  "tokio",
@@ -2873,16 +2873,16 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.36.0"
+version = "0.37.0"
 dependencies = [
  "serde",
  "serde_json",
- "subc-protocol 0.35.0",
+ "subc-protocol 0.36.0",
 ]
 
 [[package]]
 name = "subc-core"
-version = "0.20.162"
+version = "0.21.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -2902,13 +2902,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.36.0",
+ "subc-control 0.37.0",
  "subc-core",
  "subc-daemon",
  "subc-jsonc",
  "subc-os",
  "subc-presence",
- "subc-protocol 0.35.0",
+ "subc-protocol 0.36.0",
  "subc-transport",
  "tempfile",
  "terminal_size",
@@ -2920,7 +2920,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.42.0"
+version = "0.43.0"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -2938,12 +2938,12 @@ dependencies = [
  "sha2",
  "subc-cgroup",
  "subc-control 0.35.0",
- "subc-control 0.36.0",
+ "subc-control 0.37.0",
  "subc-jobobject",
  "subc-jsonc",
  "subc-os",
  "subc-presence",
- "subc-protocol 0.35.0",
+ "subc-protocol 0.36.0",
  "subc-transport",
  "subc-uptime",
  "subtle",
@@ -2959,7 +2959,7 @@ dependencies = [
  "cortexkit-test-support",
  "serde_json",
  "subc-daemon",
- "subc-protocol 0.35.0",
+ "subc-protocol 0.36.0",
  "subc-transport",
  "tokio",
 ]
@@ -2983,7 +2983,7 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.59"
+version = "0.2.0"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -2994,11 +2994,11 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control 0.36.0",
+ "subc-control 0.37.0",
  "subc-daemon",
  "subc-jsonc",
  "subc-os",
- "subc-protocol 0.35.0",
+ "subc-protocol 0.36.0",
  "subc-transport",
  "tokio",
  "tracing",
@@ -3043,7 +3043,7 @@ dependencies = [
 
 [[package]]
 name = "subc-protocol"
-version = "0.35.0"
+version = "0.36.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3051,7 +3051,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "cortexkit-test-support",
  "getrandom 0.2.17",
@@ -3061,7 +3061,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-os",
- "subc-protocol 0.35.0",
+ "subc-protocol 0.36.0",
  "subtle",
  "tokio",
 ]

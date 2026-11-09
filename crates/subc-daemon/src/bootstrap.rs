@@ -119,6 +119,7 @@ pub struct BootstrapConfig {
     admission_facts: AdmissionFactsConfig,
     /// Module ids whose scopes may carry the attributes that grant authority.
     scope_authority_owners: Vec<String>,
+    federated_scope_owner: String,
     privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt,
     activity_config: daemon_config::ActivityConfig,
     daemon_config_path: Option<PathBuf>,
@@ -198,6 +199,7 @@ impl BootstrapConfig {
             storage_config: None,
             admission_facts: AdmissionFactsConfig::default(),
             scope_authority_owners: daemon_config::default_scope_authority_owners(),
+            federated_scope_owner: daemon_config::default_federated_scope_owner(),
             privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt::default(),
             activity_config: daemon_config::ActivityConfig::default(),
             daemon_config_path: None,
@@ -352,6 +354,10 @@ impl BootstrapConfig {
             .as_ref()
             .map(|config| config.scope_authority_owners.clone())
             .unwrap_or_else(daemon_config::default_scope_authority_owners);
+        let federated_scope_owner = daemon_config
+            .as_ref()
+            .map(|config| config.federated_scope_owner.clone())
+            .unwrap_or_else(daemon_config::default_federated_scope_owner);
         let privileged_operator_prompt = daemon_config
             .as_ref()
             .map(|config| config.privileged_operator_prompt)
@@ -392,6 +398,7 @@ impl BootstrapConfig {
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_scope_authority_owners(scope_authority_owners)
+            .with_federated_scope_owner(federated_scope_owner)
             .with_privileged_operator_prompt(privileged_operator_prompt)
             .with_activity_config(activity_config)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
@@ -424,6 +431,10 @@ impl BootstrapConfig {
             .as_ref()
             .map(|config| config.scope_authority_owners.clone())
             .unwrap_or_else(daemon_config::default_scope_authority_owners);
+        let federated_scope_owner = daemon_config
+            .as_ref()
+            .map(|config| config.federated_scope_owner.clone())
+            .unwrap_or_else(daemon_config::default_federated_scope_owner);
         let privileged_operator_prompt = daemon_config
             .as_ref()
             .map(|config| config.privileged_operator_prompt)
@@ -443,6 +454,7 @@ impl BootstrapConfig {
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_scope_authority_owners(scope_authority_owners)
+            .with_federated_scope_owner(federated_scope_owner)
             .with_privileged_operator_prompt(privileged_operator_prompt)
             .with_activity_config(activity_config)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
@@ -484,6 +496,11 @@ impl BootstrapConfig {
     /// Absent from a config, this is `daemon_config::default_scope_authority_owners`.
     pub fn with_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
         self.scope_authority_owners = owners;
+        self
+    }
+
+    pub fn with_federated_scope_owner(mut self, owner: String) -> Self {
+        self.federated_scope_owner = owner;
         self
     }
 
@@ -658,6 +675,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
     let storage_config = config.storage_config.clone();
     let admission_facts = config.admission_facts.clone();
     let scope_authority_owners = config.scope_authority_owners.clone();
+    let federated_scope_owner = config.federated_scope_owner.clone();
     let privileged_operator_prompt = config.privileged_operator_prompt;
     let activity_config = config.activity_config;
     let daemon_config_path = config.daemon_config_path.clone();
@@ -687,6 +705,7 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 storage_config,
                 admission_facts,
                 scope_authority_owners,
+                federated_scope_owner,
                 privileged_operator_prompt,
                 activity_config,
                 daemon_config_path,
@@ -840,6 +859,7 @@ async fn serve_bound_daemon(
     storage_config: Option<daemon_config::StorageConfig>,
     admission_facts: AdmissionFactsConfig,
     scope_authority_owners: Vec<String>,
+    federated_scope_owner: String,
     privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt,
     activity_config: daemon_config::ActivityConfig,
     daemon_config_path: Option<PathBuf>,
@@ -1011,6 +1031,7 @@ async fn serve_bound_daemon(
         .with_machine_id(bound.machine_id.clone())
         .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets)
         .with_scope_authority_owners(scope_authority_owners)
+        .with_federated_scope_owner(federated_scope_owner)
         .with_privileged_operator_prompt(privileged_operator_prompt)
         .with_route_bind_relay_timeouts(route_bind_relay_timeouts)
         .with_daemon_provenance(

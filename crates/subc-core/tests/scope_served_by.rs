@@ -57,6 +57,10 @@ fn spawn(root: &ScratchDir) -> Child {
 
 impl Fixture {
     async fn new(provider_env: Value) -> Self {
+        Self::new_with_federated_owner(provider_env, false).await
+    }
+
+    async fn new_with_federated_owner(provider_env: Value, federated: bool) -> Self {
         let root = ScratchDir::new("scope-served-by");
         for dir in ["config/cortexkit", "runtime", "data"] {
             fs::create_dir_all(root.join(dir)).unwrap();
@@ -75,12 +79,15 @@ impl Fixture {
             }
             json!({"program":stub, "args":[], "env":env, "enabled":true, "reserved":id == OWNER})
         };
+        let mut config = json!({
+            "version":1, "modules":{OWNER:module(OWNER), PROVIDER:module(PROVIDER)}
+        });
+        if federated {
+            config["federated_scope_owner"] = json!(OWNER);
+        }
         fs::write(
             root.join("config/cortexkit/subc.jsonc"),
-            serde_json::to_vec(&json!({
-                "version":1, "modules":{OWNER:module(OWNER), PROVIDER:module(PROVIDER)}
-            }))
-            .unwrap(),
+            serde_json::to_vec(&config).unwrap(),
         )
         .unwrap();
         let child = spawn(&root);
@@ -217,6 +224,58 @@ impl Fixture {
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .any(|event| event["kind"] == kind)
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn federated_describe_survives_real_daemon_restart_without_serving_history() {
+    let mut f = Fixture::new_with_federated_owner(
+        json!({
+            "FAKE_AFT_CAPABILITIES": json!({"provides":["scope-federated/v1"]}).to_string()
+        }),
+        true,
+    )
+    .await;
+    let describe = json!({"op":"scope.describe", "owner":{"kind":"reserved","module_id":OWNER}, "ref":"session"});
+    let initial = f.request(PROVIDER, describe.clone()).await;
+    assert_eq!(initial["status"], "not_live");
+    assert_eq!(initial["owner_synced"], false);
+    assert_eq!(initial["owner_configured"], true);
+    let record = json!({"ref":"session", "scope_epoch":1, "kind":"federated", "attributes":{"federated":{
+        "peer_class":"computer", "peer_fingerprint":"a".repeat(32), "pairing_id":"pair:1", "peer_name":"Peer"
+    }}});
+    let synced = f
+        .request(
+            OWNER,
+            json!({"op":"scope.sync", "generation":1, "scopes":[record.clone()]}),
+        )
+        .await;
+    assert_eq!(synced["results"][0]["outcome"], "created");
+    let before = f.request(PROVIDER, describe.clone()).await;
+    assert_eq!(before["status"], "live");
+    assert_eq!(before["scope"]["kind"], "federated");
+    assert_eq!(before["scope"]["owner_authorized"], false);
+    f.child.kill().unwrap();
+    f.child.wait().unwrap();
+    for id in [OWNER, PROVIDER] {
+        let _ = fs::remove_file(f.root.join(format!("{id}.request")));
+    }
+    f.child = spawn(&f.root);
+    f.consumer = Fixture::connect(&f.root).await;
+    let after = f.request(PROVIDER, describe.clone()).await;
+    assert_ne!(before["daemon_incarnation"], after["daemon_incarnation"]);
+    assert_eq!(after["status"], "not_live");
+    assert_eq!(after["owner_synced"], false);
+    assert_eq!(after["owner_configured"], true);
+    let synced = f
+        .request(
+            OWNER,
+            json!({"op":"scope.sync", "generation":2, "scopes":[record]}),
+        )
+        .await;
+    assert_eq!(synced["results"][0]["outcome"], "created");
+    let live = f.request(PROVIDER, describe).await;
+    assert_eq!(live["status"], "live");
+    assert_eq!(live["scope"], before["scope"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

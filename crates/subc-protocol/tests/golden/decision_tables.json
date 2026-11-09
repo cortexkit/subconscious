@@ -29,6 +29,7 @@
     "session_address_unavailable": "retryable",
     "target_agent_run_unsupported": "terminal",
     "target_flow_unsupported": "terminal",
+    "target_federated_unsupported": "terminal",
     "target_unavailable": "retryable",
     "unknown_module": "terminal"
   },

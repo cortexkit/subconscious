@@ -2574,6 +2574,7 @@ export function isRetryableRouteOpenCode(code: string | undefined): boolean {
   if (code === "capability_forbidden") return false;
   // Targets must explicitly opt into flow and agent-run scope behaviour.
   if (code === "target_flow_unsupported") return false;
+  if (code === "target_federated_unsupported") return false;
   if (code === "target_agent_run_unsupported") return false;
   if (code === "scope_bind_proof_required" || code === "scope_bind_proof_mismatch") return false;
   if (code === "scope_epoch_in_use") return false;

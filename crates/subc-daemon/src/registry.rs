@@ -619,6 +619,21 @@ impl Registry {
         let registration = inner
             .registration_mut(slot, connection_id)
             .expect("registration discovered under the same registry lock must still exist");
+        if let Some(capabilities) = capabilities.as_ref() {
+            let declares_federated = |caps: Option<&CapabilityDeclarations>| {
+                caps.is_some_and(|caps| {
+                    caps.provides
+                        .iter()
+                        .any(|cap| cap == subc_protocol::scope::SCOPE_FEDERATED_CAPABILITY)
+                })
+            };
+            // Pending binds rely on this declaration while the target module's outbound queue is full.
+            if declares_federated(registration.manifest.capabilities.as_ref())
+                != declares_federated(Some(capabilities))
+            {
+                return Err(RegistryError::FederatedCapabilityChanged);
+            }
+        }
         registration.manifest.provides = provides;
         if let Some(capabilities) = capabilities {
             registration.manifest.capabilities = Some(capabilities);
@@ -805,6 +820,7 @@ impl RegistryInner {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
+    FederatedCapabilityChanged,
     DuplicateModuleId {
         module_id: String,
     },
@@ -826,6 +842,7 @@ pub enum RegistryError {
 impl fmt::Display for RegistryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FederatedCapabilityChanged => write!(f, "scope-federated/v1 is fixed at HELLO; re-register on a new connection to change it"),
             Self::DuplicateModuleId { module_id } => {
                 write!(f, "module_id '{module_id}' is already registered")
             }
@@ -853,25 +870,7 @@ impl Error for RegistryError {}
 /// and a colon cannot traverse. Windows path legality is the store library's
 /// concern, not an identity rule.
 pub fn module_id_path_hazard(module_id: &str) -> Result<(), String> {
-    if module_id.is_empty() {
-        return Err("empty".to_string());
-    }
-    if module_id.contains('/') || module_id.contains('\\') {
-        return Err("contains a path separator".to_string());
-    }
-    if module_id == "." || module_id == ".." {
-        return Err("is a dot path component".to_string());
-    }
-    if module_id.chars().any(|c| c.is_control()) {
-        return Err("contains a control character".to_string());
-    }
-    // `module_id` is already one literal store-path component, so this reports
-    // the existing failure before derivation instead of adding a restriction.
-    // NAME_MAX is 255 UTF-8 bytes, which `str::len()` measures.
-    if module_id.len() > 255 {
-        return Err("is longer than 255 bytes".to_string());
-    }
-    Ok(())
+    subc_protocol::manifest::validate_module_id(module_id)
 }
 
 #[cfg(test)]

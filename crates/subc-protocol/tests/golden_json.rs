@@ -1751,3 +1751,96 @@ fn a_module_built_before_scopes_accepts_a_stamped_bind() {
     };
     assert_eq!(route_channel, 42);
 }
+#[test]
+fn federated_scope_requests_match_typescript_goldens() {
+    use subc_protocol::scope::{
+        FederatedAttributes, FederatedPeerClass, RemoteClaim, ScopeAttributes, ScopeEnd, ScopeKind,
+        ScopeRecord,
+    };
+    use subc_protocol::session::ModuleControlRequestFromModule;
+    for (claim, sync_fixture, apply_fixture) in [
+        (
+            Some(RemoteClaim::flow(
+                "flow",
+                9_007_199_254_740_991,
+                "install",
+                "b".repeat(64),
+            )),
+            include_str!("../../../clients/subc-client/tests/golden/scope-sync-federated.json"),
+            include_str!("../../../clients/subc-client/tests/golden/scope-apply-federated.json"),
+        ),
+        (
+            Some(RemoteClaim::agent("remote-agent")),
+            include_str!(
+                "../../../clients/subc-client/tests/golden/scope-sync-federated-agent.json"
+            ),
+            include_str!(
+                "../../../clients/subc-client/tests/golden/scope-apply-federated-agent.json"
+            ),
+        ),
+        (
+            Some(RemoteClaim::worker(
+                "worker-owner",
+                "c".repeat(64),
+                Some("remote-agent".into()),
+            )),
+            include_str!(
+                "../../../clients/subc-client/tests/golden/scope-sync-federated-worker.json"
+            ),
+            include_str!(
+                "../../../clients/subc-client/tests/golden/scope-apply-federated-worker.json"
+            ),
+        ),
+        (
+            Some(RemoteClaim::run("remote-agent")),
+            include_str!("../../../clients/subc-client/tests/golden/scope-sync-federated-run.json"),
+            include_str!(
+                "../../../clients/subc-client/tests/golden/scope-apply-federated-run.json"
+            ),
+        ),
+        (
+            None,
+            include_str!(
+                "../../../clients/subc-client/tests/golden/scope-sync-federated-claimless.json"
+            ),
+            include_str!(
+                "../../../clients/subc-client/tests/golden/scope-apply-federated-claimless.json"
+            ),
+        ),
+    ] {
+        let record = ScopeRecord::new("peer", 1, ScopeKind::Federated).with_attributes(
+            ScopeAttributes::new().with_federated(Some(
+                FederatedAttributes::new(
+                    FederatedPeerClass::Computer,
+                    "a".repeat(32),
+                    "pair:1".into(),
+                    "Peer".into(),
+                )
+                .with_remote_claim(claim),
+            )),
+        );
+        for (request, fixture) in [
+            (
+                ModuleControlRequestFromModule::ScopeSync {
+                    generation: 7,
+                    scopes: vec![record.clone()],
+                },
+                sync_fixture,
+            ),
+            (
+                ModuleControlRequestFromModule::ScopeApply {
+                    generation: 8,
+                    upsert: vec![record],
+                    end: vec![ScopeEnd::new("old", 1)],
+                },
+                apply_fixture,
+            ),
+        ] {
+            assert_eq!(serde_json::to_string(&request).unwrap(), fixture);
+            assert_eq!(
+                serde_json::from_str::<ModuleControlRequestFromModule>(fixture).unwrap(),
+                request
+            );
+        }
+    }
+}

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.24.2
+
+- Reject non-object non-null `remote_claim` inputs rather than silently dropping falsy values. Null and undefined both omit the claim, matching Rust. Shared Rust/TypeScript request fixtures cover all claim kinds and absence.
+
+- Add federated scope input types and strict nested request serialization, matched to Rust golden fixtures. Unknown scope-kind strings remain representable; the provider still ignores stamp fields it does not model. Treat `target_federated_unsupported` as a terminal route-open refusal.
+
 ## 0.24.1
 
 - Expose optional `CatalogEntry.display_name` from module manifests. Apps fall back to `module_id` when absent; older catalog replies remain compatible.

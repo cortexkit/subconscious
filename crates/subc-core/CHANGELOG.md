@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.0
+
+- Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.
+
 ## 0.20.162
 
 - Show cumulative tree CPU separately from own-process resources; prefix only CPU lower bounds with `≥`. Stopped modules report `not running`, distinct from a pending first measurement.

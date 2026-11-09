@@ -51,6 +51,7 @@ pub mod tool_call;
 /// Error frames remain extensible strings; daemon-owned refusals need identical
 /// spelling and operation-specific retry policies across the daemon and SDKs.
 pub mod error_codes {
+    pub const CATALOG_UPDATE_FROZEN_CAPABILITY: &str = "catalog_update_frozen_capability";
     use crate::Flags;
 
     /// Whether an agent declaration may be retried with a fresh correlation
@@ -102,6 +103,12 @@ pub mod error_codes {
     /// alone does not promise flow behaviour, and removing it would silently
     /// change the identity.
     pub const TARGET_FLOW_UNSUPPORTED: &str = "target_flow_unsupported";
+    /// The target cannot safely receive a federated flow or run claim.
+    pub const TARGET_FEDERATED_UNSUPPORTED: &str = "target_federated_unsupported";
+    /// A describe reader has not declared the federated provider contract.
+    pub const SCOPE_FEDERATED_UNSUPPORTED: &str = "scope_federated_unsupported";
+    /// Federated facts cannot change within a scope epoch.
+    pub const SCOPE_FEDERATED_CHANGED: &str = "scope_federated_changed";
     /// An agent-run-scoped route targets a module providing neither
     /// `agent-run-scopes/v1` nor `call-modes/v1`, or a delegating run targets a
     /// module without `call-modes/v1`. TERMINAL: removing `run_id` or delegation
@@ -289,6 +296,7 @@ pub mod error_codes {
         if matches!(
             code,
             TARGET_FLOW_UNSUPPORTED
+                | TARGET_FEDERATED_UNSUPPORTED
                 | TARGET_AGENT_RUN_UNSUPPORTED
                 | SCOPE_BIND_PROOF_REQUIRED
                 | SCOPE_BIND_PROOF_MISMATCH

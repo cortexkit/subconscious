@@ -15,6 +15,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::Principal;
 
+mod federated;
+pub use federated::{FederatedAttributes, FederatedPeerClass, RemoteClaim};
+
+/// A reader declares this only after implementing the federated provider rules.
+pub const SCOPE_FEDERATED_CAPABILITY: &str = "scope-federated/v1";
+
 // Scope principals are authority-bearing input: an unrecognized constraint must
 // not silently widen a grant. Principal elsewhere is a forward-compatible caller
 // fact, so keep its general decoder lenient and enforce this only on scope input.
@@ -111,14 +117,16 @@ pub const MAX_CARRIER_TARGETS: usize = 16;
 /// current Unix wall clock: 24 hours.
 pub const MAX_SCOPE_EXPIRY_AHEAD_MS: u64 = 86_400_000;
 
-/// What a scope stands for. Closed, and fixed for the life of one
+/// What a scope stands for. Fixed for the life of one
 /// `scope_epoch`: a different kind needs a new epoch, which ends the old scope.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ScopeKind {
     Head,
     Worker,
     Ephemeral,
+    Federated,
 }
 
 /// A link from a scope to another scope, pinned to that scope's session by its
@@ -220,10 +228,15 @@ pub const SCOPE_SERVED_BY_CAPABILITY: &str = "scope-served-by/v1";
 /// Only an owner module named in the daemon config's `scope_authority_owners`
 /// list (by default the module that owns agent sessions) may set them; a scope
 /// owned by any other module must leave them empty.
+/// The separate `federated` object is restricted to the configured federated
+/// owner instead, and never confers local-agent authority.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct ScopeAttributes {
+    /// Paired-peer facts, required only for a federated scope. Never local authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub federated: Option<FederatedAttributes>,
     /// The agent the scope's session belongs to. Identity, never permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
@@ -302,6 +315,12 @@ impl ScopeAttributes {
     }
 
     #[must_use]
+    pub fn with_federated(mut self, federated: Option<FederatedAttributes>) -> Self {
+        self.federated = federated;
+        self
+    }
+
+    #[must_use]
     pub fn with_agent_id(mut self, agent_id: Option<String>) -> Self {
         self.agent_id = agent_id;
         self
@@ -350,7 +369,8 @@ impl ScopeAttributes {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.agent_id.is_none()
+        self.federated.is_none()
+            && self.agent_id.is_none()
             && self.on_behalf_of_agent.is_none()
             && !self.delegates
             && self.flow_id.is_none()
@@ -775,6 +795,7 @@ pub struct ScopeStamp {
     pub attributes: ScopeAttributes,
     /// Whether the owner is listed in the daemon's `scope_authority_owners`.
     /// Providers decide on this flag and keep no copy of the list.
+    /// Always false for the configured federated owner, even if it is listed.
     pub owner_authorized: bool,
     /// Absolute Unix wall-clock deadline in milliseconds, fixed for this epoch.
     /// On route binds the daemon sends this deadline only to targets declaring

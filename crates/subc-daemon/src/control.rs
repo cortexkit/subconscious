@@ -318,6 +318,7 @@ struct SupervisorRescanContext {
     admission_facts_carrier_module_id: Option<String>,
     admission_facts_targets: Option<Vec<String>>,
     scope_authority_owners: Vec<String>,
+    federated_scope_owner: String,
     privileged_operator_prompt: PrivilegedOperatorPrompt,
     /// Counts executed rescans that set out to change the supervised modules'
     /// staged or applied configuration, counted before the first change so a
@@ -412,6 +413,7 @@ pub struct ControlHandler {
     /// The configured `scope_authority_owners`, kept so a rescan can report a
     /// changed value as needing a daemon restart; rescan never applies it.
     scope_authority_owners: Vec<String>,
+    federated_scope_owner: String,
     /// Fixed at startup so rescan cannot change the policy that guards rescan itself.
     privileged_operator_prompt: PrivilegedOperatorPrompt,
     /// The local and peer address of each accepted TCP client connection, read
@@ -1016,6 +1018,7 @@ impl ControlHandler {
                 CAP_SESSION_ATTACH.to_string(),
                 CAP_ADMISSION_FACTS_RELAY.to_string(),
                 CAP_SCOPES_V1.to_string(),
+                subc_protocol::scope::SCOPE_FEDERATED_CAPABILITY.to_string(),
                 CAP_ROUTE_ROLE_VERSIONS_V1.to_string(),
                 subc_protocol::manifest::CAP_CATALOG_EVENTS_V1.to_string(),
                 subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1.to_string(),
@@ -1045,6 +1048,7 @@ impl ControlHandler {
             ))),
             scope_deadline_added: Arc::new(tokio::sync::Notify::new()),
             scope_authority_owners: crate::daemon_config::default_scope_authority_owners(),
+            federated_scope_owner: crate::daemon_config::default_federated_scope_owner(),
             privileged_operator_prompt: PrivilegedOperatorPrompt::default(),
             caller_endpoints: Arc::new(Mutex::new(HashMap::new())),
             build_class_warned: Arc::new(Mutex::new(HashSet::new())),
@@ -1132,8 +1136,21 @@ impl ControlHandler {
     /// Replaces the scope table with an empty one under the new list, so call it
     /// while building the handler, before any module can sync.
     pub fn with_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
-        self.scopes = Arc::new(RwLock::new(ScopeTable::new(owners.iter().cloned())));
+        self.scopes = Arc::new(RwLock::new(
+            ScopeTable::new(owners.iter().cloned())
+                .with_federated_owner(self.federated_scope_owner.clone()),
+        ));
         self.scope_authority_owners = owners;
+        self
+    }
+
+    /// Set the exclusive federated owner while building the handler, before syncs.
+    pub fn with_federated_scope_owner(mut self, owner: String) -> Self {
+        self.scopes = Arc::new(RwLock::new(
+            ScopeTable::new(self.scope_authority_owners.iter().cloned())
+                .with_federated_owner(owner.clone()),
+        ));
+        self.federated_scope_owner = owner;
         self
     }
 
@@ -1328,6 +1345,7 @@ impl ControlHandler {
             admission_facts_carrier_module_id: self.admission_facts_carrier_module_id.clone(),
             admission_facts_targets: self.admission_facts_targets.clone(),
             scope_authority_owners: self.scope_authority_owners.clone(),
+            federated_scope_owner: self.federated_scope_owner.clone(),
             privileged_operator_prompt: self.privileged_operator_prompt,
             generation: Arc::default(),
         });
@@ -3889,11 +3907,21 @@ impl ControlHandler {
                 "scope.describe requires an active module registration owned by this connection",
             )?]);
         };
-        let mut description = self
+        let scopes = self
             .scopes
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .describe(&owner, &scope_ref);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if scopes.is_federated_owner(&owner)
+            && !crate::scopes::target_supports_federated(registered.manifest.capabilities.as_ref())
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                error_codes::SCOPE_FEDERATED_UNSUPPORTED,
+                "scope.describe of the federated owner requires scope-federated/v1",
+            )?]);
+        }
+        let mut description = scopes.describe(&owner, &scope_ref);
+        drop(scopes);
         // Describe readers also decode strict ScopeAttributes. Attribution is
         // safe to omit unless the requesting module declares it understands it.
         if !registered
@@ -4023,10 +4051,13 @@ impl ControlHandler {
             )?]);
         }
 
-        let updated = self
-            .registry
-            .replace_catalog_for_connection(connection_id, provides, capabilities, ready)
-            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let updated = match self.registry.replace_catalog_for_connection(connection_id, provides, capabilities, ready) {
+            Err(crate::registry::RegistryError::FederatedCapabilityChanged) => return Ok(vec![control_error_frame(
+                &frame, error_codes::CATALOG_UPDATE_FROZEN_CAPABILITY,
+                "scope-federated/v1 is fixed at HELLO; re-register on a new connection to change it",
+            )?]),
+            result => result.map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?,
+        };
         if updated.is_none() {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -5585,10 +5616,7 @@ impl ControlHandler {
                 )?]);
             }
         }
-        if let Some(stamp) = scope_stamp
-            .as_ref()
-            .filter(|stamp| stamp.attributes.flow_id.is_some() || stamp.attributes.run_id.is_some())
-        {
+        if let Some(stamp) = scope_stamp.as_ref() {
             if let Err(refusal) = crate::scopes::check_target_flow_support(
                 stamp,
                 &target_module_id,
@@ -5616,6 +5644,14 @@ impl ControlHandler {
 
         // Older readers may reject unknown fields. Select optional fields from
         // the captured endpoint's declaration, including on unscoped binds.
+        if scope_stamp
+            .as_ref()
+            .is_some_and(|stamp| stamp.kind == subc_protocol::scope::ScopeKind::Federated)
+            && !crate::scopes::target_supports_federated(relay_capabilities)
+        {
+            // Keep bound_scope: even an unstamped legacy route belongs to this epoch.
+            scope_stamp = None;
+        }
         if !relay_capabilities.is_some_and(|caps| {
             caps.provides
                 .iter()
@@ -6685,6 +6721,7 @@ impl ControlHandler {
             admission_facts_carrier_module_id,
             admission_facts_targets,
             scope_authority_owners,
+            federated_scope_owner,
             privileged_operator_prompt,
             modules,
             reserved_capabilities,
@@ -6694,6 +6731,7 @@ impl ControlHandler {
             config.admission_facts_carrier_module_id,
             config.admission_facts_targets,
             config.scope_authority_owners,
+            config.federated_scope_owner,
             config.privileged_operator_prompt,
             config.modules,
             config.reserved_capabilities,
@@ -6720,6 +6758,9 @@ impl ControlHandler {
                 }
                 RestartRequiredSection::ScopeAuthorityOwners => {
                     scope_authority_owners != context.scope_authority_owners
+                }
+                RestartRequiredSection::FederatedScopeOwner => {
+                    federated_scope_owner != context.federated_scope_owner
                 }
                 RestartRequiredSection::PrivilegedOperatorPrompt => {
                     privileged_operator_prompt != context.privileged_operator_prompt
@@ -8231,6 +8272,8 @@ fn route_open_scope_label(stamp: &subc_protocol::scope::ScopeStamp) -> String {
         ScopeKind::Head => "head",
         ScopeKind::Worker => "worker",
         ScopeKind::Ephemeral => "ephemeral",
+        ScopeKind::Federated => "federated",
+        _ => "unknown",
     };
     format!(
         "{kind}/{}/{}@{}",
@@ -17671,6 +17714,9 @@ mod tests {
         }
         mod call_modes {
             include!("scope_call_mode_tests.rs");
+        }
+        mod federated {
+            include!("scope_federated_tests.rs");
         }
         #[tokio::test]
         async fn served_by_dispatch_bypasses_exhaustive_decoder_and_requires_registration() {

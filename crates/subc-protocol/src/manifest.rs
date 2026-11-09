@@ -660,6 +660,35 @@ pub fn validate_display_name(value: &str) -> Result<(), DisplayNameError> {
             "must be trimmed text of 1 to 40 characters",
         ));
     }
+    validate_plain_text(value, 40)
+}
+
+/// Check the module-id rule used at daemon registration, without sanitizing it.
+pub fn validate_module_id(module_id: &str) -> Result<(), String> {
+    if module_id.is_empty() {
+        return Err("empty".to_string());
+    }
+    if module_id.contains('/') || module_id.contains('\\') {
+        return Err("contains a path separator".to_string());
+    }
+    if module_id == "." || module_id == ".." {
+        return Err("is a dot path component".to_string());
+    }
+    if module_id.chars().any(|c| c.is_control()) {
+        return Err("contains a control character".to_string());
+    }
+    if module_id.len() > 255 {
+        return Err("is longer than 255 bytes".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_plain_text(value: &str, max: usize) -> Result<(), DisplayNameError> {
+    if value.is_empty() || value.chars().count() > max {
+        return Err(DisplayNameError(
+            "text length is outside the permitted bounds",
+        ));
+    }
     if value.chars().any(|ch| {
         ch.is_control()
             || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')

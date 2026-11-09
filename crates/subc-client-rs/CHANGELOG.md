@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.0
+
+- Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.
+
 ## 0.35.0
 
 - Expose `AgentCommandsError::is_retryable`, sharing declaration refusal classes with the protocol. Retries use fresh correlations and, for a closed queue, a current supervised connection; the SDK does not retry automatically.

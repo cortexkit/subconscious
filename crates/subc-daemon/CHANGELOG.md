@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.43.0
+
+- Add restart-required `federated_scope_owner` (default `callosum`), exclusive scope-kind ownership and epoch-fixed paired-peer facts. Parent and child-owner links cannot cross that owner boundary.
+- Advertise `scope-federated/v1`; gate federated bind stamps and describe replies by the target/reader manifest, preserving legacy unstamped binds and epoch tracking. Federated flow/run claims refuse unsupported targets at admission and relay.
+- **Behavior changes:** enabling `delegates` within an epoch now drains that scope's existing routes, just as disabling it does. Describing a federated scope without `scope-federated/v1` is refused, even before owner re-sync.
+- Freeze `scope-federated/v1` membership at HELLO; `catalog.update` refuses additions and removals as `catalog_update_frozen_capability` under the registry lock. Re-register on a new connection to change it.
+- Refuse local `workdir`/`project_id` and untargeted carrier entries on federated records.
+- Adopt non-exhaustive protocol 0.36 scope kinds. **Rust migration:** add a wildcard arm to `ScopeKind` matches; existing non-declaring wire readers remain unchanged.
+
 ## 0.42.0
 
 - Preserve hourly uncertainty when the last inherited command finishes or is swept after a restart. On Windows, keep the first validation pass's per-process finish counters across declaration retries; later attempts cannot attribute additional CPU, while independent live sampler credit stays monotone. Stopped commands report no live program groups.

@@ -478,7 +478,7 @@ crate does not know. The terminal codes the daemon emits on `route.open` are
 `capability_forbidden`, `admission_facts_not_permitted`,
 `admission_facts_target_not_allowed`, `op_not_allowed` (the target did not
 grant `route.bind`), `route_limit` (no free route channel), `forwarding_error`,
-`target_flow_unsupported`, `target_agent_run_unsupported`, and the `scope_*`
+`target_flow_unsupported`, `target_federated_unsupported`, `target_agent_run_unsupported`, and the `scope_*`
 admission refusals in [`scopes.md`](scopes.md) section 5a, including
 `scope_bind_proof_required` and `scope_bind_proof_mismatch`. This is the list
 in `crates/subc-protocol/tests/golden/decision_tables.json`.

@@ -52,7 +52,7 @@ Fields:
   holder of the scope's bind proof can bind it, in addition to the existing owner,
   carrier and epoch rules. A new epoch replaces the hash and still closes the old
   epoch's routes. The daemon stores only the hash, never the proof.
-- `kind`: a closed enum, `head | worker | ephemeral`, fixed for the life of an epoch. A sync that
+- `kind`: `head | worker | ephemeral | federated`, fixed for the life of an epoch. A sync that
   changes it at the same epoch refuses that record `scope_kind_changed`; the owner uses a higher
   epoch, which ends the old scope.
 - `workdir`: optional absolute session folder (the checkout or worktree root for git).
@@ -90,6 +90,7 @@ Fields:
   on (Cerebellum) is not listed at all. Being a carrier grants nothing on the provider side:
   what a provider does for the session is still decided by the stamp on its own inbound route.
 - `attributes`, settable only by the owner, anything else refused by name:
+  - `federated` (optional object): paired-peer facts, required only for kind `federated` (below).
   - `agent_id` (string): the head's agent, on every head scope. It is identity, and the value
     today's `agentProjectId` admission fact already carries.
   - `on_behalf_of_agent` (optional string): attribution only, never authority. A provider may
@@ -111,13 +112,74 @@ Fields:
 **Authority gate.** `agent_id`, `on_behalf_of_agent`, `delegates`, `flow_id`,
 `flow_version`, `flow_code_hash`, `flow_install_id` and `run_id` may be set only by
 the scope-authority owner, listed in the daemon config key `scope_authority_owners`.
-A scope from any other owner may carry `kind`,
+A non-federated scope from any other owner may carry `kind`,
 `parent`, `child_owners`, `carriers`, `expires_at_ms`, `workdir` and `project_id`, with empty attributes; a sync or
 apply that sets a gated attribute from an unlisted owner is refused per record by name
 (`scope_attribute_not_permitted`). `expires_at_ms` is not gated by this list. `scope_authority_owners` is a
 restart-required key: a change takes effect only on a daemon restart, which closes every route, so
 no live route keeps an `owner_authorized` stamp its owner has lost. Providers rely on the stamp's
 `owner_authorized` alone and keep no copy of the list (section 7).
+
+### Federated identity
+
+A federated scope represents a program on a paired computer, phone or simulator, never a
+local agent. The daemon setting `federated_scope_owner` names its exclusive reserved module
+owner (default `callosum`). It is restart-required, like `scope_authority_owners`; rescans
+report a change but do not apply it. The owner is not added to `scope_authority_owners`.
+Even if an operator lists it there, its federated stamps always have `owner_authorized: false`.
+
+The configured owner may create only federated records; every other owner is forbidden from
+creating them or carrying `attributes.federated`. Federated records require that object and
+forbid every local identity attribute: `agent_id`, `delegates: true`, `on_behalf_of_agent`,
+`run_id`, and all flow fields, plus `workdir` and `project_id`. Violations are per-record `scope_attribute_not_permitted`
+in both sync and apply. Parent and `child_owners` links cannot cross the federated owner
+boundary in either direction, even while a parent is pending (`scope_parent_not_permitted`).
+Carriers are a separate right and may be other modules, but every federated carrier must
+list explicit `targets`; an untargeted entry is `scope_carrier_targets_invalid`.
+
+`attributes.federated` is a strict object:
+
+| Member | Type and bounds |
+|---|---|
+| `peer_class` | `computer`, `phone`, `sim` or `unknown` |
+| `peer_fingerprint` | exactly 32 lowercase hexadecimal characters |
+| `pairing_id` | non-secret opaque token, new for each pairing |
+| `peer_name` | 1–80 Unicode scalar values of plain text, no controls or bidi formatting characters; from the local roster, not the peer's hello |
+| `remote_claim` | optional strict object, tagged by `kind`, as below |
+
+| Claim kind | Required members | Optional members |
+|---|---|---|
+| `agent` | `agent_id`: opaque token | none |
+| `worker` | `owner_module_id`: registered module-id syntax; `worker_ref`: exactly 64 lowercase hex | `on_behalf_of`: opaque token, display only |
+| `run` | `agent_id`: opaque token | none |
+| `flow` | `flow_id`, `flow_install_id`: opaque tokens; `flow_version`: integer 1..9007199254740991; `flow_code_hash`: exactly 64 lowercase hex | none |
+
+Opaque tokens use subc's 1–256 printable non-space ASCII byte rule. Module ids use the same
+validation as registration: nonempty, at most 255 UTF-8 bytes, not `.` or `..`, no path
+separators or controls. Every object refuses unknown members. Invalid fields refuse the whole
+sync or apply as `invalid_control_body`. All federated facts, including display name and claim,
+are fixed for an epoch; changing them is `scope_federated_changed`. Use a higher epoch instead.
+
+The daemon advertises `scope-federated/v1` in HELLO_ACK and `server.describe`.
+Membership in a module's declaration is fixed at HELLO for that connection's lifetime.
+`catalog.update` cannot add or remove it (`catalog_update_frozen_capability`), even while a
+bind is waiting on target egress. A module changes the declaration by re-registering on a
+new connection. Unrelated capability updates are unaffected.
+It sends a federated `route.bind` stamp only to a target whose captured manifest declares
+that capability. Other targets receive precisely the legacy bind with no scope stamp;
+the daemon still tracks owner, ref and epoch, so ending or replacing the scope closes the
+route. A `flow` or `run` remote claim never takes that fallback: admission and the captured
+endpoint relay re-check refuse `target_federated_unsupported`. This applies on every bind,
+including a reconnect after a target loses the capability. Declaring only `call-modes/v1`
+does not satisfy the federated contract. Non-federated stamps omit the `federated` member,
+preserving the bytes and strict nested decoder compatibility of protocol 0.34.
+
+The federation carrier can create a base scope per pairing and child scopes per remote
+claim. A consent carrier entry names the provider's daemon-verified principal and targets
+only the consent module. Adding that carrier or target closes no existing route; removing it
+closes only its affected routes. The owner ends or re-epochs the base and ends its claim
+scopes in the same apply, which closes ordinary, pending and carried routes. The daemon does
+not cascade deletion of child scopes.
 
 `workdir` and `project_id` are attribution, never authority. Owners send them after
 the daemon advertises `scope-workdir/v1` in `server.describe`. The project-registry
@@ -402,7 +464,7 @@ restart, is never locked out, and a stale connection can never overwrite a newer
   stamp, each with its own reason so a carrier can tell them apart:
   - `scope_carrier_removed`: the opener is no longer a listed carrier, or the route's target is
     no longer in its entry's `targets` (widening a list changes nothing live);
-  - `scope_delegation_changed`: `delegates` went from true to false, or `agent_id`, `on_behalf_of_agent`, `flow_id` or `run_id` changed;
+  - `scope_delegation_changed`: `delegates` changed in either direction, or `agent_id`, `on_behalf_of_agent`, any flow identity field, `run_id`, the scope kind or `owner_authorized` changed;
   - `scope_ended`: the scope is gone, expired, or replaced by a higher epoch.
   - `scope_parent_ended`: the scope's parent ended (section 3).
   These are new `route.closed` reasons. Older SDKs map an unknown close reason to "do not
@@ -810,6 +872,13 @@ and `attributes.flow_install_id` only for a caller whose registered manifest
 provides `flow-identity-scopes/v1`. It strips all three for every other reader,
 including the scope owner if it has not declared reader support.
 
+For the configured federated owner, describe requires the caller's manifest to declare
+`scope-federated/v1`; otherwise it returns `scope_federated_unsupported`, never the kind or
+attributes. Every declaring registered module may describe any federated scope, regardless of
+whether it has ever served a route. This also applies after a daemon restart: before the
+owner re-syncs, it receives `not_live` with `owner_synced: false`, not a service-history refusal.
+The capability gate applies even to the owner and even before its first sync.
+
 How a reader holding something bound to `(owner, ref, scope_epoch)` decides, in this order:
 1. `live` with the same `scope_epoch`: use it.
 2. `live` with a different `scope_epoch`: a new session under a reused ref. Refuse by name; the
@@ -892,24 +961,28 @@ caller may re-open within its own deadline.
 | `scope_epoch_in_use` | `scope.sync` / `scope.apply`, per record | conditional epoch/proof replacement has routes, in-flight binds or connected presence holders | no |
 | `scope_not_carrier` | `route.open` | the opener is not the owner or a carrier, or not targeted at this module | no |
 | `target_flow_unsupported` | `route.open`, admission and relay re-check | a flow scope's target provides neither `call-modes/v1` nor `flow-scopes/v1` | no |
+| `target_federated_unsupported` | `route.open`, admission and relay re-check | a federated flow or run claim targets a module without `scope-federated/v1` | no |
+| `scope_federated_unsupported` | `scope.describe` | the reader lacks `scope-federated/v1` for the federated owner | no |
+| `scope_federated_changed` | per upsert in sync or apply | paired-peer facts or the remote claim changed within an epoch | no |
+| `catalog_update_frozen_capability` | `catalog.update` | adding or removing `scope-federated/v1` on the same connection; re-register to change it | no |
 | `target_agent_run_unsupported` | `route.open`, admission and relay re-check | an agent run's target provides neither `call-modes/v1` nor `agent-run-scopes/v1`, or the run delegates and the target lacks `call-modes/v1`, or a worker run's target lacks `worker-runs/v1` | no |
 | `scope_unsupported` | carrier, before opening | the daemon does not advertise `scopes/v1` | no |
 | `not_registered` | `scope.sync`, `scope.apply`, `scope.describe` | the connection has no module registration | no |
 | `scope_sync_not_authority` | `scope.sync`, `scope.apply` | the connection fails the owner's authority check | no |
 | `scope_sync_required` | `scope.apply` | this connection must first take authority through an accepted full sync | no |
 | `scope_sync_stale` | `scope.sync`, `scope.apply` | the generation is not larger than the last accepted | no |
-| `invalid_control_body` | whole sync or apply | an empty or duplicate ref, a ref in both apply lists, or a malformed flow/run identity field | no |
+| `invalid_control_body` | whole sync or apply | an empty or duplicate ref, a ref in both apply lists, or a malformed flow/run/federated identity field | no |
 | `scope_live_limit_exceeded` | whole sync or apply | an input list or resulting live set exceeds 10,000 scopes | no |
 | `scope_attributes_too_large` | whole sync or apply | a record's attributes exceed 4 KiB | no |
 | `scope_epoch_regressed` | per upsert in sync or apply | the epoch is lower than the one held | no |
-| `scope_attribute_not_permitted` | per upsert in sync or apply | a gated attribute from an owner not in `scope_authority_owners`, `on_behalf_of_agent` with `agent_id`, `delegates` or `flow_id` (including a run carrying both attributions), or installed flow identity incomplete or without `flow_id` | no |
+| `scope_attribute_not_permitted` | per upsert in sync or apply | a gated attribute from an unauthorized owner, a federated kind/owner/attributes mismatch, local identity on a federated scope, `on_behalf_of_agent` with `agent_id`, `delegates` or `flow_id` (including a run carrying both attributions), or installed flow identity incomplete or without `flow_id` | no |
 | `scope_flow_identity_changed` | per upsert in sync or apply | `flow_version`, `flow_code_hash` or `flow_install_id` added, changed or removed within an epoch | no |
 | `scope_carrier_targets_invalid` | per upsert in sync or apply | a carrier's target list is empty or has more than 16 entries | no |
 | `scope_delegates_without_agent` | per upsert in sync or apply | `delegates: true` without `agent_id` | no |
 | `scope_run_id_without_agent` | per upsert in sync or apply | `run_id` with neither `agent_id` nor `on_behalf_of_agent` | no |
 | `scope_run_id_with_flow_id` | per upsert in sync or apply | both `run_id` and `flow_id` | no |
 | `scope_run_id_delegates` | older peers' record validation only | legacy refusal for `run_id` with `delegates: true`; retained as a stable code, no longer emitted by this daemon's validation | no |
-| `scope_parent_not_permitted` | per upsert in sync or apply | the parent's owner has synced, and the syncing owner is not the parent's owner or in its `child_owners`, or the parent epoch is not live | no |
+| `scope_parent_not_permitted` | per upsert in sync or apply | the parent's owner has synced, and the syncing owner is not the parent's owner or in its `child_owners`, or the parent epoch is not live; also any `parent` or `child_owners` link crossing the federated owner boundary, even while pending | no |
 | `scope_kind_changed` | per upsert in sync or apply | `kind` differs from the held record at the same epoch | no |
 | `scope_epoch_ended` | per upsert in sync or apply | the ref@epoch has an owner-ended tombstone | no |
 | `scope_expired` | per upsert in sync or apply | the ref@epoch has an expiry tombstone, or a new epoch's deadline is at or before wall now | no |
@@ -930,16 +1003,22 @@ Which live routes a record change drains:
 | scope omitted, explicitly ended, expired, or replaced by a higher epoch | every route under it | `scope_ended` |
 | a carrier entry removed | that carrier's routes | `scope_carrier_removed` |
 | a module removed from a carrier's `targets` | that carrier's routes to that module | `scope_carrier_removed` |
-| `delegates` true to false | every route under it | `scope_delegation_changed` |
+| `delegates` changes in either direction | every route under it | `scope_delegation_changed` |
 | `agent_id` changed | every route under it | `scope_delegation_changed` |
 | `on_behalf_of_agent` added, changed or removed | every route under it | `scope_delegation_changed` |
 | `flow_id` changed | every route under it | `scope_delegation_changed` |
 | `run_id` changed (including added or removed) | every route under it | `scope_delegation_changed` |
+| any other flow field, kind or `owner_authorized` changes in-place | every route under it | `scope_delegation_changed` |
 | `parent_state` becomes `ended` | every route under it | `scope_parent_ended` |
 | anything else (`child_owners`, a carrier or target added, `parent_state` from `pending` to `linked`, an unchanged record) | none | |
 
 A route whose stamp names an older `version` but is not in a drained row stays up: its stamp
 still grants no more than the current record does.
+
+Immutable field changes (kind and installed flow identity) are refused at the same epoch;
+an accepted higher epoch closes the old routes as `scope_ended`. Owner-list changes currently
+require a restart, which closes all routes. The drain predicate also covers these identity
+inputs so a future in-place policy update cannot leave a route using outdated scope identity.
 
 ## 6. State, locking, restarts and upgrades
 
@@ -985,6 +1064,42 @@ uses the same wall-clock source as accepted calls and admission; a timer only pr
 
 ## 7. What providers must do
 
+### Providers declaring `scope-federated/v1`
+
+The capability promises the following behaviour, not just a decoder for the new kind:
+
+- A federated caller is never a local agent. Never apply local-agent grants to it.
+  Gate on stamped `peer_class`, not a harness string. The remote claim is trusted exactly
+  as far as the pairing: it means the paired stack asserts that identity, not that this
+  computer independently verified the remote agent.
+- Refuse a federated stamp whose `parent_state` is present and not `linked`, including
+  the pending state after restart.
+- Keep federated grants separate from module and local-agent authority, within the same
+  permission evaluation for the action and under the provider's normal ceilings and severity rules. An action
+  may remain local-only; declaring the capability need not expose all authority remotely.
+  A provider that otherwise refuses the federation carrier at bind admits it only when a
+  federated stamp is present, and continues refusing unstamped routes.
+- Key standing grants on fingerprint, pairing id, peer class and an explicit selector:
+  `claimless` matches only absent claims; `exact_claim` matches agent id, worker
+  (`owner_module_id`, `worker_ref`), or all four flow fields; `all_claims` must be explicitly
+  chosen by the person. Unknown selectors match nothing. Run claims are one-call attribution
+  and never match any standing grant, including `all_claims`. Peer name and worker
+  `on_behalf_of` are display only. Re-pairing and reclassification cannot inherit old grants.
+- Check the pairing's base scope (`fed-base:<fingerprint>:<pairing_id>`) before applying a
+  grant, listing it, or committing a consent answer. A definitive ended or synced-not-live
+  answer invalidates the grant; an unsynced/unconfigured owner or failed describe refuses
+  use and consent commit and fails the entire grant-list call, rather than returning a
+  misleading partial list. A provider with no federated grants need not make that check.
+- An unstamped route from the federation carrier is still interpreted by the existing
+  harness rules: `callosum-self` denotes its own local calls; `fed-<class>:<fp>` denotes
+  legacy forwarding. Apply those rules or refuse; never turn a forwarded peer into module
+  authority. Neither unstamped case matches a federated grant.
+
+Only declare the capability once all these rules are implemented. Deploy readers before the
+federation owner begins creating scopes; until then existing routes and stamps are unchanged.
+
+### All scope-aware providers
+
 - Read identity only from the bind stamp, never from a request payload.
 - Act as an agent only when `delegates` is true, `agent_id` matches, and `owner_authorized` is
   true. `agent_id` alone is identity, never
@@ -1021,6 +1136,18 @@ uses the same wall-clock source as accepted calls and admission; a timer only pr
     until `scope.subscribe` ships in stage 7.
 
 ## 8. Compatibility
+
+Protocol 0.36 makes Rust `ScopeKind` non-exhaustive and adds `Federated`; when upgrading a
+crate pin, add a wildcard arm to any exhaustive match. The new peer-class and remote-claim
+enums are non-exhaustive from their first release. Construct claims through `RemoteClaim`
+constructors and include `..` when matching their non-exhaustive struct-like variants.
+Wire rollout remains readers-first:
+non-declaring targets receive no federated stamps, and older strict attributes decoders
+continue reading the non-federated stamps they can receive.
+
+Two intentional behavior changes apply: turning `delegates` on within an epoch now drains
+existing routes, just as turning it off does; and describing a scope owned by the configured
+federated owner without `scope-federated/v1` is refused, including before the owner re-syncs.
 
 Installed flow identity uses a readers-first rollout: upgrade the daemon first,
 then upgrade readers and have them declare `flow-identity-scopes/v1`, then let

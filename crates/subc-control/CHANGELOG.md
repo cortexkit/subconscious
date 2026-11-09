@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.37.0
+
+- Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.
+
 ## 0.36.0
 
 - Add an optional `cpu_last_hour.bound` independently of the cumulative CPU bound, so a recent-hour uncertainty can expire without claiming lost lifetime CPU was recovered.

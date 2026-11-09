@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.36.0
+
+- Add federated scope kinds, typed paired-peer attributes and strict remote claims, shared validation, and the `scope-federated/v1` capability. Non-federated attributes omit the new member.
+- Add terminal `target_federated_unsupported` plus `scope_federated_unsupported` and `scope_federated_changed`.
+- Add `catalog_update_frozen_capability`; make every `RemoteClaim` struct-like variant non-exhaustive with public constructors. Use the constructors instead of variant literals and include `..` in field patterns.
+- **Breaking Rust API:** `ScopeKind` adds `Federated` and is now non-exhaustive. Add a wildcard arm to every `ScopeKind` match when adopting this version. New peer-class and remote-claim enums are non-exhaustive from their first release.
+
 ## 0.35.0
 
 - Name capacity, closed-queue and duplicate-correlation agent declaration refusals and expose their operation-specific retry classification without changing route-open retry policy.

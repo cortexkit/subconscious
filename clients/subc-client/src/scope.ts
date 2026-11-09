@@ -1,7 +1,21 @@
 import type { Principal } from "./provider.js";
 
-/** Attribution accepted only from owners listed in scope_authority_owners. */
+export type RemoteClaim =
+  | { kind: "agent" | "run"; agent_id: string }
+  | { kind: "worker"; owner_module_id: string; worker_ref: string; on_behalf_of?: string | null }
+  | { kind: "flow"; flow_id: string; flow_version: number; flow_install_id: string; flow_code_hash: string };
+
+export interface FederatedAttributes {
+  peer_class: "computer" | "phone" | "sim" | "unknown";
+  peer_fingerprint: string;
+  pairing_id: string;
+  peer_name: string;
+  remote_claim?: RemoteClaim | null;
+}
+
+/** Local attribution is authority-owner gated; federated facts use a separate owner. */
 export interface ScopeAttributes {
+  federated?: FederatedAttributes | null;
   agent_id?: string | null;
   on_behalf_of_agent?: string | null;
   delegates?: boolean;
@@ -34,7 +48,7 @@ export interface ScopeCarrier {
 export interface ScopeRecord {
   scope_ref: string;
   scope_epoch: number;
-  kind: "head" | "worker" | "ephemeral";
+  kind: "head" | "worker" | "ephemeral" | "federated" | (string & {});
   workdir?: string | null;
   project_id?: string | null;
   bind_proof_sha256?: string | null;
@@ -108,8 +122,9 @@ function principal(value: Principal): Principal {
 export function scopeRecordWire(record: ScopeRecord): object {
   fields(record, ["scope_ref", "scope_epoch", "kind", "workdir", "project_id", "bind_proof_sha256", "replace_only_if_idle", "expires_at_ms", "parent", "child_owners", "carriers", "attributes"]);
   const attributes = record.attributes ?? {};
-  fields(attributes, ["agent_id", "on_behalf_of_agent", "delegates", "flow_id", "flow_version", "flow_code_hash", "flow_install_id", "run_id"]);
+  fields(attributes, ["federated", "agent_id", "on_behalf_of_agent", "delegates", "flow_id", "flow_version", "flow_code_hash", "flow_install_id", "run_id"]);
   const wireAttributes = {
+    federated: attributes.federated == null ? undefined : federatedWire(attributes.federated),
     agent_id: attributes.agent_id ?? undefined,
     on_behalf_of_agent: attributes.on_behalf_of_agent ?? undefined,
     delegates: attributes.delegates || undefined,
@@ -138,6 +153,32 @@ export function scopeRecordWire(record: ScopeRecord): object {
     }) : undefined,
     attributes: Object.values(wireAttributes).some((value) => value !== undefined) ? wireAttributes : undefined,
   };
+}
+
+function federatedWire(facts: FederatedAttributes): object {
+  fields(facts, ["peer_class", "peer_fingerprint", "pairing_id", "peer_name", "remote_claim"]);
+  const claim = facts.remote_claim;
+  let remote_claim: object | undefined;
+  if (claim !== undefined && claim !== null) {
+    if (typeof claim !== "object" || Array.isArray(claim)) throw new TypeError("remote_claim must be an object");
+    switch (claim.kind) {
+      case "agent": case "run":
+        fields(claim, ["kind", "agent_id"]);
+        remote_claim = { kind: claim.kind, agent_id: claim.agent_id };
+        break;
+      case "worker":
+        fields(claim, ["kind", "owner_module_id", "worker_ref", "on_behalf_of"]);
+        remote_claim = { kind: claim.kind, owner_module_id: claim.owner_module_id, worker_ref: claim.worker_ref, on_behalf_of: claim.on_behalf_of ?? undefined };
+        break;
+      case "flow":
+        fields(claim, ["kind", "flow_id", "flow_version", "flow_install_id", "flow_code_hash"]);
+        if (claim.flow_version < 1) throw new TypeError("flow_version must be positive");
+        remote_claim = { kind: claim.kind, flow_id: claim.flow_id, flow_version: scopeInteger(claim.flow_version), flow_install_id: claim.flow_install_id, flow_code_hash: claim.flow_code_hash };
+        break;
+      default: throw new TypeError("unknown remote claim kind");
+    }
+  }
+  return { peer_class: facts.peer_class, peer_fingerprint: facts.peer_fingerprint, pairing_id: facts.pairing_id, peer_name: facts.peer_name, remote_claim };
 }
 
 export function scopeEndWire(end: ScopeEnd): object {

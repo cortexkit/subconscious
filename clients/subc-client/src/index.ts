@@ -96,7 +96,7 @@ export {
 } from "./auth.js";
 export { SubcSocket, SocketClosedError, SocketTimeoutError } from "./socket.js";
 export type {
-  ScopeAttributes, ScopeParent, ScopeCarrier, ScopeRecord, ScopeEnd,
+  ScopeAttributes, FederatedAttributes, RemoteClaim, ScopeParent, ScopeCarrier, ScopeRecord, ScopeEnd,
   ScopeRecordResult, ScopeEndResult, ScopeEnded, ScopeSyncReply, ScopeApplyReply,
 } from "./scope.js";
 export {

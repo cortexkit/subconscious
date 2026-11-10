@@ -337,29 +337,41 @@ async fn serve_connection(
         if frame.header.channel == 0 {
             let request: ClientControlRequest =
                 serde_json::from_slice(&frame.body).map_err(io::Error::other)?;
-            if matches!(request, ClientControlRequest::RouteOpen { .. }) {
-                let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
-                    request_window: None,
-                    watch_window: None,
-                    route_channel: 41,
-                    route_epoch: 1,
-                })
-                .map_err(io::Error::other)?;
-                send_frame(
-                    &mut stream,
-                    Frame::build_with_version(
-                        frame.header.ver,
-                        FrameType::Response,
-                        Flags::new(false, Priority::Interactive, false),
-                        0,
-                        0,
-                        frame.header.corr,
-                        body,
-                    )
-                    .map_err(io::Error::other)?,
-                )
-                .await?;
+            // An unanswered capability probe spends the caller's short deadline
+            // before route.open, so even this legacy daemon must answer it.
+            let body = match request {
+                ClientControlRequest::ServerDescribe {} => serde_json::to_vec(&serde_json::json!({
+                    "op": "server.describe",
+                    "protocol_ver": 1,
+                    "subc_ops": [],
+                    "capabilities": [],
+                    "connected_clients": 1
+                })),
+                ClientControlRequest::RouteOpen { .. } => {
+                    serde_json::to_vec(&ClientControlResponse::RouteOpen {
+                        request_window: None,
+                        watch_window: None,
+                        route_channel: 41,
+                        route_epoch: 1,
+                    })
+                }
+                _ => continue,
             }
+            .map_err(io::Error::other)?;
+            send_frame(
+                &mut stream,
+                Frame::build_with_version(
+                    frame.header.ver,
+                    FrameType::Response,
+                    Flags::new(false, Priority::Interactive, false),
+                    0,
+                    0,
+                    frame.header.corr,
+                    body,
+                )
+                .map_err(io::Error::other)?,
+            )
+            .await?;
             continue;
         }
 

@@ -543,11 +543,18 @@ async fn removed_accepted_pending_error(retain_late_route_open: bool, close: boo
     shared.lock_inner().writer = Some(writer);
     shared.lock_inner().daemon_ver = "0.39.0".into();
     let deadline = Instant::now() + Duration::from_secs(5);
+    // route.open negotiation adds accepts_close_reasons to JSON before the
+    // pending request is inserted, so retained opens need a valid request body.
+    let body = if retain_late_route_open {
+        br#"{"op":"route.open","target":{"module_id":"a"}}"#.to_vec()
+    } else {
+        b"ask".to_vec()
+    };
     let mut request = Box::pin(shared.send_request(RequestSend {
         expected_handle: None,
         channel: 0,
         epoch: 0,
-        body: b"ask".to_vec(),
+        body,
         binary: false,
         priority: Priority::Interactive,
         admission_class: AdmissionClass::Normal,

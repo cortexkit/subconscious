@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.44.10
+
+- Test-only: let resource fixtures exit cooperatively after supervisor draining begins on Windows. Hold the shared resource-reader isolation guard only during reader work, not fixture setup and shutdown. No daemon runtime changes.
+
 ## 0.44.9
 
 - Advertise and serve `catalog.update_role_declarations` on registered module connections. Replace or clear the whole map atomically; refuse invalid maps with `invalid_role_declarations` and preserve the previous catalog entry. Require protocol 0.36.3 and control 0.38.3.

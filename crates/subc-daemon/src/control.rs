@@ -14517,7 +14517,6 @@ mod tests {
 
     #[tokio::test]
     async fn slow_step_before_pid_read_does_not_spend_its_budget() {
-        let _guard = crate::subtree_resources::fault_read_guard().await;
         let dir = cortexkit_test_support::ScratchDir::new("pid-read-budget");
         let supervisor =
             Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
@@ -14556,8 +14555,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         tokio::time::sleep(crate::subtree_resources::READ_TIMEOUT * 2).await;
-        let reading = crate::subtree_resources::read_process(module.clone()).await;
-        module.stop().await.unwrap();
+        let reading = {
+            let _guard = crate::subtree_resources::fault_read_guard().await;
+            crate::subtree_resources::read_process(module.clone()).await
+        };
+        stop_resource_fixture(&module, &dir).await;
         assert!(
             matches!(reading, subc_control::ChildResourceUsage::Measured(_)),
             "{reading:?}"
@@ -14567,10 +14569,39 @@ mod tests {
     #[test]
     fn pid_resource_read_fixture() {
         if std::env::var_os("SUBC_SUBTREE_PID_FIXTURE").is_some() {
-            loop {
-                std::thread::park_timeout(Duration::from_secs(600));
+            let dir = std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap());
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while !dir.join("stop-module").exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
             }
+            std::fs::write(dir.join("module-stopped"), "").unwrap();
         }
+    }
+
+    async fn stop_resource_fixture(
+        module: &crate::supervise::SupervisedModule,
+        dir: &std::path::Path,
+    ) {
+        let stopping = module.stop();
+        tokio::pin!(stopping);
+        tokio::select! {
+            result = &mut stopping => result.unwrap(),
+            () = async {
+                while module.state().unwrap() != crate::supervise::ModuleState::Draining {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                std::fs::write(dir.join("stop-module"), "").unwrap();
+            } => stopping.await.unwrap(),
+        }
+        #[cfg(windows)]
+        assert!(
+            dir.join("module-stopped").exists(),
+            "the resource fixture must exit cooperatively, not wait for the drain kill"
+        );
+        assert_eq!(
+            module.state().unwrap(),
+            crate::supervise::ModuleState::Stopped
+        );
     }
 
     #[tokio::test]
@@ -14605,7 +14636,6 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_list_reads_process_resources_before_a_stalled_tree() {
-        let _guard = crate::subtree_resources::fault_read_guard().await;
         let dir = cortexkit_test_support::ScratchDir::new("list-process-priority");
         let registry = Arc::new(Registry::default());
         let handle = SupervisorHandle::new();
@@ -14646,13 +14676,15 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let guard = crate::subtree_resources::fault_read_guard().await;
         let (target, release, _) = crate::subtree_resources::held();
         module.set_subtree_target_for_test(target);
         let handler = ControlHandler::new(registry).with_supervisor(handle);
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
         let replies = handler.handle_supervisor_list(frame).await.unwrap();
         drop(release);
-        module.stop().await.unwrap();
+        drop(guard);
+        stop_resource_fixture(&module, &dir).await;
         let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
         assert_eq!(
             body["modules"][0]["resources"]["status"], "measured",
@@ -14727,7 +14759,6 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_list_slow_subtree_does_not_hold_connection_reader() {
-        let _guard = crate::subtree_resources::fault_read_guard().await;
         let registry = Arc::new(Registry::default());
         let handle = SupervisorHandle::new();
         let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
@@ -14748,6 +14779,7 @@ mod tests {
                 true,
             )
             .unwrap();
+        let _guard = crate::subtree_resources::fault_read_guard().await;
         let (target, release, began) = crate::subtree_resources::held();
         // Optional list work may be skipped when its deadline is already spent.
         // Establish the stalled fixture before asking the list to observe it.

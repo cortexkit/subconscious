@@ -63,7 +63,13 @@ fn main() {
         .unwrap();
     assert!(child.wait().unwrap().success());
     std::fs::write(dir.join("reaped"), "").unwrap();
-    loop {
-        std::thread::park_timeout(Duration::from_secs(60));
+    // This fixture has no daemon connection to observe EOF on, and Windows
+    // has no graceful stop signal. The test sends a marker after the real
+    // supervisor drain begins so the fixture can exit normally on every OS.
+    // Bound the wait so a failed test cannot leave the fixture parked forever.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !dir.join("stop-module").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
     }
+    std::fs::write(dir.join("module-stopped"), "").unwrap();
 }

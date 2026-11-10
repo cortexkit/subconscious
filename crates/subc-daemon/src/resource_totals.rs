@@ -403,6 +403,7 @@ impl Tracker {
         // These fixtures check attribution, not native acquisition latency.
         // Collect a fresh real table outside the bounded sampler reader pool.
         self.inject_sampler_tables_for_test([ProcessTable::read().unwrap()]);
+        let _readers = crate::subtree_resources::fault_read_guard().await;
         self.read(modules, sample, caller).await
     }
 

@@ -109,7 +109,6 @@ async fn exercise_agent_commands_with_validation(
     at_capacity: bool,
     delayed: DelayedDeclaration,
 ) {
-    let _readers = crate::subtree_resources::fault_read_guard().await;
     use std::fs;
     use subc_protocol::session::{AgentCommandFinished, AgentCommandRoot};
     async fn measured(
@@ -257,7 +256,7 @@ async fn exercise_agent_commands_with_validation(
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             handler.cleanup_connection(ctx.connection_id).unwrap();
-            module.stop().await.unwrap();
+            stop_resource_fixture(&module, &dir).await;
             assert!(
                 no_agents,
                 "a module's own process-tree uncertainty is not an agent declaration"
@@ -372,7 +371,7 @@ async fn exercise_agent_commands_with_validation(
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             handler.cleanup_connection(ctx.connection_id).unwrap();
-            module.stop().await.unwrap();
+            stop_resource_fixture(&module, &dir).await;
             return;
         }
         if at_capacity {
@@ -384,7 +383,7 @@ async fn exercise_agent_commands_with_validation(
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
             handler.cleanup_connection(ctx.connection_id).unwrap();
-            module.stop().await.unwrap();
+            stop_resource_fixture(&module, &dir).await;
             assert_eq!(error.code, "agent_roots_full");
             assert_eq!(
                 handler.resource_tracker.loss_diagnostics()["resource-module"]["lost_identities"],
@@ -491,7 +490,10 @@ async fn exercise_agent_commands_with_validation(
                 let frame =
                     Frame::build(FrameType::Request, control_flags(), 0, 0, 900, Vec::new())
                         .unwrap();
-                let replies = handler.handle_supervisor_list(frame).await.unwrap();
+                let replies = {
+                    let _readers = crate::subtree_resources::fault_read_guard().await;
+                    handler.handle_supervisor_list(frame).await.unwrap()
+                };
                 let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
                 if body["modules"][0].get("tree").is_some()
                     && body["modules"][0]["cpu_last_hour"].get("bound").is_some()
@@ -505,7 +507,7 @@ async fn exercise_agent_commands_with_validation(
                 if tokio::time::Instant::now() >= deadline {
                     fs::write(dir.join("finish-root"), "").unwrap();
                     handler.cleanup_connection(ctx.connection_id).unwrap();
-                    module.stop().await.unwrap();
+                    stop_resource_fixture(&module, &dir).await;
                     panic!("populated list diagnostics never became available: {body}");
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -591,7 +593,7 @@ async fn exercise_agent_commands_with_validation(
         );
         handler.resource_tracker.clear_validation_table_for_test();
         handler.cleanup_connection(ctx.connection_id).unwrap();
-        module.stop().await.unwrap();
+        stop_resource_fixture(&module, &dir).await;
         // Decode only after the command was reaped and its module stopped, so
         // a decoder regression cannot strand the live process fixture.
         if let Some((body, generation)) = published_body {

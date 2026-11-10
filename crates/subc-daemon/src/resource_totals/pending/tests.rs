@@ -478,3 +478,107 @@ fn metadata_only_retention_dedupes_and_cannot_commit_after_cancel_or_at_capacity
     );
     assert_eq!(tracker.root_counts_for_test("test-module").1, 1);
 }
+
+#[tokio::test]
+async fn a_retention_wake_replaces_a_predeclaration_cached_walk_and_validates_the_start() {
+    let fixture = Fixture::new();
+    let tracker = &fixture.tracker;
+    let cached = Arc::new(fixture.table(10, Some(10), false));
+    *tracker.cache.lock().unwrap() = Some((Instant::now(), Arc::clone(&cached)));
+    let arrival = tracker.declaration_arrival();
+    tracker
+        .retain_started(
+            "test-module",
+            1,
+            fixture.module_pid,
+            &[fixture.root],
+            arrival,
+            &CommitFence::default(),
+        )
+        .unwrap();
+    let reads = tracker.inject_sampler_tables_for_test([fixture.table(11, Some(100), false)]);
+    let fresh = tracker.table().await.unwrap();
+    assert!(
+        !Arc::ptr_eq(&cached, &fresh),
+        "the retention wake must not reuse a pre-declaration walk"
+    );
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
+    let mut state = tracker.state.lock().unwrap();
+    let module = state.modules.get_mut("test-module").unwrap();
+    module.validate_pending("test-module", 1, Some(&fixture.target()), &fresh, 0);
+    assert!(module.pending.is_empty());
+    assert!(module.roots.contains_key(&fixture.root));
+    assert_eq!(module.roots[&fixture.root].acceptance_cpu, Some(100));
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_sampler_has_no_retry_reads_before_the_next_minute() {
+    let tracker = Arc::new(Tracker::default());
+    let mut minute = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    let next = tokio::spawn(async move { tracker.next_sample(&mut minute).await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(59)).await;
+    assert!(
+        !next.is_finished(),
+        "an idle daemon must not request retry walks"
+    );
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        next.await.unwrap(),
+        "the first read is the regular minute sample"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn retained_starts_request_another_read_after_five_seconds() {
+    let fixture = Fixture::new();
+    let tracker = Arc::new(fixture.tracker);
+    tracker
+        .retain_started(
+            "test-module",
+            1,
+            fixture.module_pid,
+            &[fixture.root],
+            tracker.declaration_arrival(),
+            &CommitFence::default(),
+        )
+        .unwrap();
+    tracker.wake.notified().await;
+    let mut minute = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(60),
+        Duration::from_secs(60),
+    );
+    let next = tokio::spawn(async move { tracker.next_sample(&mut minute).await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(4)).await;
+    assert!(!next.is_finished());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        !next.await.unwrap(),
+        "pending roots request a non-minute read"
+    );
+}
+
+#[test]
+fn metadata_only_pending_that_never_becomes_readable_still_expires_at_sixty_seconds() {
+    let mut fixture = Fixture::new();
+    fixture.module.pend_at(
+        1,
+        fixture.module_pid,
+        fixture.root,
+        fixture.tracker.declaration_arrival(),
+        0,
+    );
+    for seconds in (5..60).step_by(5) {
+        fixture.module.clock.set(Duration::from_secs(seconds));
+        fixture.tick(&fixture.table(seconds, Some(100), true));
+        assert_eq!(fixture.module.pending.len(), 1);
+    }
+    fixture.module.clock.set(Duration::from_secs(60));
+    fixture.tick(&fixture.table(60, Some(100), true));
+    assert!(fixture.module.pending.is_empty());
+    assert!(fixture.module.roots.is_empty());
+}

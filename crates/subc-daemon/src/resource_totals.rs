@@ -62,6 +62,10 @@ pub(crate) struct Tracker {
     revision_conflicts: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     validation_table: Mutex<Option<ValidationTable>>,
+    #[cfg(test)]
+    sampler_tables: Arc<Mutex<std::collections::VecDeque<ProcessTable>>>,
+    #[cfg(test)]
+    sampler_reads: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(test)]
@@ -378,6 +382,28 @@ impl Tracker {
     #[cfg(test)]
     pub(crate) fn clear_validation_table_for_test(&self) {
         *self.validation_table.lock().unwrap() = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_sampler_tables_for_test(
+        &self,
+        tables: impl IntoIterator<Item = ProcessTable>,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        *self.sampler_tables.lock().unwrap() = tables.into_iter().collect();
+        Arc::clone(&self.sampler_reads)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn read_with_native_table_for_test(
+        self: &Arc<Self>,
+        modules: Vec<SupervisedModule>,
+        sample: bool,
+        caller: &'static str,
+    ) -> Readings {
+        // These fixtures check attribution, not native acquisition latency.
+        // Collect a fresh real table outside the bounded sampler reader pool.
+        self.inject_sampler_tables_for_test([ProcessTable::read().unwrap()]);
+        self.read(modules, sample, caller).await
     }
 
     fn validation_table(&self) -> Option<ProcessTable> {
@@ -885,6 +911,19 @@ impl Tracker {
         applied
     }
 
+    fn cached_table_covers_pending(&self, table: &ProcessTable) -> bool {
+        let Ok(state) = self.state.try_lock() else {
+            return false;
+        };
+        let pending_after = state
+            .modules
+            .values()
+            .filter_map(Module::oldest_pending_declaration)
+            .min();
+        pending_after
+            .is_none_or(|declared| table.started_at().is_some_and(|began| began > declared))
+    }
+
     async fn table(&self) -> Option<Arc<ProcessTable>> {
         {
             let Ok(cache) = self.cache.try_lock() else {
@@ -896,7 +935,8 @@ impl Tracker {
                 return None;
             };
             if let Some((at, table)) = cache.as_ref() {
-                if at.elapsed() < Duration::from_secs(1) {
+                if at.elapsed() < Duration::from_secs(1) && self.cached_table_covers_pending(table)
+                {
                     return Some(Arc::clone(table));
                 }
             }
@@ -917,13 +957,25 @@ impl Tracker {
         }
         let refresh = Refresh(Arc::clone(&self.refreshing));
         let cache = Arc::clone(&self.cache);
+        #[cfg(test)]
+        let supplied = Arc::clone(&self.sampler_tables);
+        #[cfg(test)]
+        let reads = Arc::clone(&self.sampler_reads);
         crate::subtree_resources::bounded(
             read_deadline(),
             move |_| {
                 let _refresh = refresh;
                 // Publish even a late result. No cache or attribution lock is
                 // held while walking the host's process table.
-                let table = Arc::new(ProcessTable::read().map_err(|error| {
+                #[cfg(test)]
+                let table = {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    let table = supplied.lock().unwrap().pop_front();
+                    table.map_or_else(ProcessTable::read, Ok)
+                };
+                #[cfg(not(test))]
+                let table = ProcessTable::read();
+                let table = Arc::new(table.map_err(|error| {
                     tracing::debug!(cause = "unreadable", phase = "process_table", %error, "resource pass incomplete");
                 }).ok()?);
                 let Ok(mut cache) = cache.try_lock() else {
@@ -2008,23 +2060,18 @@ pub(crate) fn spawn(
         let mut minute = tokio::time::interval(Duration::from_secs(60));
         minute.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            #[cfg(windows)]
-            {
-                tokio::select! {
-                    _ = minute.tick() => { tracker.read(supervisor.list(), true, "resource_sampler").await; }
-                    _ = tracker.wake.notified() => { tracker.read(supervisor.list(), false, "agent_commands").await; }
-                    _ = tokio::time::sleep(Duration::from_secs(5)), if tracker.has_live_roots() => {
-                        tracker.read(supervisor.list(), false, "agent_commands").await;
-                    }
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                tokio::select! {
-                    _ = minute.tick() => { tracker.read(supervisor.list(), true, "resource_sampler").await; }
-                    _ = tracker.wake.notified() => { tracker.read(supervisor.list(), false, "agent_commands").await; }
-                }
-            }
+            let sample = tracker.next_sample(&mut minute).await;
+            tracker
+                .read(
+                    supervisor.list(),
+                    sample,
+                    if sample {
+                        "resource_sampler"
+                    } else {
+                        "agent_commands"
+                    },
+                )
+                .await;
             if owner.upgrade().is_none() {
                 break;
             }
@@ -2032,15 +2079,27 @@ pub(crate) fn spawn(
     });
 }
 
-#[cfg(windows)]
 impl Tracker {
-    fn has_live_roots(&self) -> bool {
+    async fn next_sample(&self, minute: &mut tokio::time::Interval) -> bool {
+        tokio::select! {
+            _ = minute.tick() => true,
+            _ = self.wake.notified() => false,
+            // macOS walks take 0.2–1.2 s, so declarations often miss the 200 ms
+            // window and depend on fresh retries before pending starts expire.
+            _ = tokio::time::sleep(Duration::from_secs(5)), if self.needs_retry() => false,
+        }
+    }
+
+    fn needs_retry(&self) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .modules
             .values()
-            .any(|module| !module.pending.is_empty() || module.roots.values().any(|root| root.live))
+            .any(|module| {
+                !module.pending.is_empty()
+                    || (cfg!(windows) && module.roots.values().any(|root| root.live))
+            })
     }
 }
 

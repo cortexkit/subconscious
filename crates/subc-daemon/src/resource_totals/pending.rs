@@ -14,6 +14,13 @@ pub(super) struct PendingRoot {
 }
 
 impl Module {
+    pub(super) fn oldest_pending_declaration(&self) -> Option<Instant> {
+        self.pending
+            .values()
+            .map(|pending| pending.declared_at)
+            .min()
+    }
+
     pub(super) fn pending_key(&self, root: AgentCommandRoot) -> Option<AgentCommandRoot> {
         self.pending.keys().copied().find(|known| {
             known.pid == root.pid

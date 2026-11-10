@@ -667,7 +667,7 @@ async fn windows_declared_tree(contained: bool) {
         "a snapshot from before acceptance cannot move CPU"
     );
     assert!(
-        tracker.has_live_roots(),
+        tracker.needs_retry(),
         "a snapshot from before declaration must not disable the command tick"
     );
     writeln!(root.stdin.as_mut().unwrap(), "burn").unwrap();
@@ -713,7 +713,7 @@ async fn windows_declared_tree(contained: bool) {
         let after_exit = tick(&tracker, &launch).await;
         assert!(after_exit.cpu_ms >= after.cpu_ms);
         assert!(
-            !tracker.has_live_roots(),
+            !tracker.needs_retry(),
             "exited roots must stop the five-second tick"
         );
     }
@@ -861,12 +861,19 @@ fn windows_finish_reference_respects_rounded_job_counter_growth() {
 
 #[tokio::test]
 async fn process_walk_is_shared_within_a_second() {
+    let _readers = crate::subtree_resources::fault_read_guard().await;
     let tracker = Arc::new(Tracker::default());
+    let reads = tracker.inject_sampler_tables_for_test((1..=2).map(|revision| {
+        ProcessTable::from_test_members(revision, revision, Vec::new(), Vec::new())
+    }));
     let first = tracker.table().await.unwrap();
     let shared = tracker.table().await.unwrap();
     assert!(Arc::ptr_eq(&first, &shared));
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
     tracker.cache.lock().unwrap().as_mut().unwrap().0 = Instant::now() - Duration::from_secs(2);
     let fresh = tracker.table().await.unwrap();
+    assert_eq!(fresh.revision(), 2);
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
     assert!(
         !Arc::ptr_eq(&first, &fresh),
         "expired snapshots must trigger a new process walk"

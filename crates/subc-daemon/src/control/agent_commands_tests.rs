@@ -109,6 +109,7 @@ async fn exercise_agent_commands_with_validation(
     at_capacity: bool,
     delayed: DelayedDeclaration,
 ) {
+    let _readers = crate::subtree_resources::fault_read_guard().await;
     use std::fs;
     use subc_protocol::session::{AgentCommandFinished, AgentCommandRoot};
     async fn measured(
@@ -120,7 +121,7 @@ async fn exercise_agent_commands_with_validation(
         loop {
             let readings = handler
                 .resource_tracker
-                .read(handle.list(), true, "test")
+                .read_with_native_table_for_test(handle.list(), true, "test")
                 .await;
             if readings
                 .agent_commands
@@ -231,7 +232,7 @@ async fn exercise_agent_commands_with_validation(
         let before_declaration = loop {
             let reading = handler
                 .resource_tracker
-                .read(handle.list(), true, "test")
+                .read_with_native_table_for_test(handle.list(), true, "test")
                 .await;
             if reading.agent_commands.is_some()
                 && reading
@@ -355,7 +356,7 @@ async fn exercise_agent_commands_with_validation(
                 );
                 let readings = handler
                     .resource_tracker
-                    .read(handle.list(), true, "test")
+                    .read_with_native_table_for_test(handle.list(), true, "test")
                     .await;
                 let agents = &readings.agent_commands.as_ref().unwrap()[0];
                 assert_eq!(agents.process_count, 0);
@@ -481,7 +482,11 @@ async fn exercise_agent_commands_with_validation(
             let body = loop {
                 handler
                     .resource_tracker
-                    .read(handle.list(), true, "published_reader_fixture")
+                    .read_with_native_table_for_test(
+                        handle.list(),
+                        true,
+                        "published_reader_fixture",
+                    )
                     .await;
                 let frame =
                     Frame::build(FrameType::Request, control_flags(), 0, 0, 900, Vec::new())

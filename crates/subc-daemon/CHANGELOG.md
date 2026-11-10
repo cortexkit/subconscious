@@ -3,6 +3,7 @@
 ## 0.44.8
 
 - Retain agent-command starts pending validation when its deadline or revision retries are exhausted, without extending the validation window. Acknowledge start-only batches; retain starts but return retryable `busy` for unapplied finished/known entries in mixed batches. Keep retries idempotent, isolate declaration tests from native walk cost, and configure the rescan test's required macOS launch helper.
+- Bypass pre-declaration cached walks when validating pending starts and retry every five seconds while pending starts remain, on every platform, without extra idle walks or extending their 60-second expiry. Isolate cache and pipeline-budget fixtures from native process-walk latency and unrelated reader-pool contention.
 
 ## 0.44.7
 

@@ -15,6 +15,7 @@ import { debuglog } from "node:util";
 
 import { AuthError, authenticateClient } from "./auth.js";
 import { attestationInteger, callerOrigin, readRouteOpenTarget, type CallerOrigin, type ProviderDeclarations, type RouteOpenTarget } from "./attestation.js";
+import { ClaimError, isRetryableClaimCode } from "./claim.js";
 import { ConnectionFileError, readConnectionFile, readConnectionFileWithLocalEndpoint, type ConnectionInfo, type ConnectionInfoWithLocalEndpoint } from "./connection-file.js";
 import {
   AdmissionClass,
@@ -29,6 +30,7 @@ import {
   type Frame,
 } from "./envelope.js";
 import { launchNonceOrUndefinedAsync } from "./launch-nonce.js";
+import { bindConsumer, boundIdentityOverride, hasClaimBinding, registrationOwner } from "./registration-channel.js";
 import { RequestGate, type RequestSlot } from "./request-gate.js";
 import type { ManifestProvenance, Principal } from "./provider.js";
 import {
@@ -1385,6 +1387,7 @@ export class SubcClient {
     }
     try {
       await authenticateClient(sock, conn, deadline);
+      await bindConsumer(sock, deadline);
     } catch (err) {
       sock.close();
       throw err;
@@ -1823,7 +1826,7 @@ export class SubcClient {
         outcome = {
           handle: await this.sendRouteOpen(cached.target, cached.identity, {
             scope: cached.scope,
-            consumerIdentity: cached.consumerIdentity ?? null,
+            consumerIdentity: cached.consumerIdentity ?? (hasClaimBinding() ? undefined : null),
             reverseRequests: cached.reverseRequests,
           }, deadline),
         };
@@ -2090,7 +2093,7 @@ export class SubcClient {
       try {
         const handle = await this.routeOpen(cached.target, cached.identity, {
           scope: cached.scope,
-          consumerIdentity: cached.consumerIdentity ?? null,
+          consumerIdentity: cached.consumerIdentity ?? (hasClaimBinding() ? undefined : null),
           reverseRequests: cached.reverseRequests,
         });
         if (cached.closed) {
@@ -2613,6 +2616,7 @@ export class SubcClient {
 }
 
 export function isConsumerReconnectTransient(err: unknown): boolean {
+  if (err instanceof ClaimError) return isRetryableClaimCode(err.code);
   if (err instanceof SocketClosedError || err instanceof SocketTimeoutError) return true;
   if (err instanceof SocketWriteNotQueuedError || err instanceof SocketWriteQueuedError) return true;
   if (err instanceof SubcCallError) return err.kind === "not_sent" || err.kind === "outcome_unknown";
@@ -2861,6 +2865,8 @@ function validatedRouteScope(scope: RouteScope | undefined): RouteScope | undefi
 }
 
 async function routeOpenConsumerIdentity(opts: RouteOpenOptions = {}): Promise<ConsumerIdentity | undefined> {
+  boundIdentityOverride(opts.consumerIdentity);
+  if (registrationOwner().named || hasClaimBinding()) return undefined;
   if (opts.consumerIdentity !== undefined) return opts.consumerIdentity ?? undefined;
   const moduleId = process.env[SUBC_MODULE_ID_ENV];
   // The nonce comes from the one process-wide accessor, never straight from the

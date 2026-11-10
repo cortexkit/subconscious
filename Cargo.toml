@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "clients/subc-registration-native",
     "crates/subc-protocol",
     "crates/subc-config",
     "crates/subc-control",

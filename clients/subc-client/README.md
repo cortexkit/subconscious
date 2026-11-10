@@ -336,3 +336,80 @@ all three XDG homes so tests cannot reach the operator's daemon data or config.
 | `src/client.ts` | `SubcClient`: route handles, channel-0 RPCs, epoch-aware corr-mux |
 | `src/launch-nonce.ts` | the one launch-nonce reader: descriptor 3 or the environment copy, cached |
 | `src/provider.ts` | provider bind publication, epoch validation, and routed serving |
+# Supervised registration channels
+
+Modules using the registration channel declare `registration_channel: true` in
+their manifest. The SDK validates and adopts the process's one inherited channel
+at import, sets close-on-exec before children can be spawned, and caches the
+decision. It uses that channel for HELLO and provider traffic, never reconnects
+it (even with `reconnectOnDrop: true`), and exits on its EOF. Start the provider
+before opening consumer connections: one process-wide broker mints fresh,
+single-use `self` claims over that registration. Minting or presenting a claim
+cannot fall back to `direct`; a refused presentation closes its connection.
+Per-request consumer identity overrides are refused on a claim-bound connection.
+Ordinary children inherit no channel and connect as `direct`, even if its public
+environment metadata was inherited. Nonce-only providers still authenticate on the TCP listener and echo their launch nonce in HELLO.
+
+## Native code and distribution
+
+`clients/subc-registration-native` owns the N-API v8 addon. It shares socket,
+close-on-exec and Windows pipe server-PID validation with `subc-os`. A plain
+client never loads the addon. A process with registration metadata but without
+the matching binary is not supervised; attempting provider registration refuses
+and exits instead of falling back to the listener.
+
+The SDK ships **six** native builds, under its `native/` directory:
+`subc-registration-{linux,darwin,win32}-{x64,arm64}.node`, plus the native
+package's loader and declarations. Selection uses the running process's platform
+and architecture (including emulation). The loader only loads the adjacent file:
+no environment override, system search, download or install-time compilation.
+These binaries are loaded code and must be pinned with the SDK inside the
+module's release directory, whose code the daemon verifies before launch (the
+admitted bundle). Release assembly builds the six targets on their
+native toolchains and collects them in `native/`; the prepublish check refuses an
+incomplete six-target bundle. This does not add release CI or claim the unbuilt
+targets were qualified.
+
+For development and SDK tests, run `bun run build:native` in this package first.
+It builds the new Rust crate in the normal Cargo target directory and stages the
+host binary with the loader in `native/`. On Windows it builds the MSVC target
+matching the Node process's architecture. Run `bun run typecheck` and
+`bun test tests/claim.test.ts tests/registration-channel.test.ts`. In CI or remote
+verification, build the addon in the same job that runs these tests. Artifacts
+are not committed.
+
+## Explicit helper handoff
+
+Agent shells, tools and plugins get no claims. Only an explicitly requested
+helper receives a `helper` claim, through a one-read inherited pipe (a
+single-instance, PID-checked named pipe on Windows). Keep the normal
+`ChildProcess` so stdio, exit events and cancellation remain available:
+
+```ts
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { prepareHelperClaim } from "@cortexkit/subc-client";
+
+const handoff = prepareHelperClaim(3);
+const child = spawn(command, args, {
+  env: { ...process.env, ...handoff.environment }, // public pipe metadata only
+  stdio: handoff.childFd === null
+    ? ["pipe", "pipe", "pipe"]
+    : ["pipe", "pipe", "pipe", handoff.childFd],
+});
+child.once("error", () => handoff.abort());
+try {
+  await once(child, "spawn");
+  await handoff.complete(child.pid!); // mints now, writes once to this child
+} catch (error) {
+  handoff.abort();
+  throw error;
+}
+```
+
+Keep the child alive until completion returns to prevent PID reuse. Abort on a
+spawn error; abort/drop writes no claim. On Unix, only the stdio duplicate is
+inheritable and completion closes the parent's copy of the child end before
+writing. The helper's SDK presents the claim as the first post-handshake frame.
+A helper needing another connection must request a new handoff from its owner;
+there is no refresh token. Never put claims in argv, environment values or logs.

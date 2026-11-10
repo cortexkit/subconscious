@@ -1,0 +1,157 @@
+import { createRequire } from "node:module";
+import { Duplex } from "node:stream";
+import { ClaimBroker, ClaimError, readClaimRefusal, readClaimPresentReply } from "./claim.js";
+import { SubcSocket } from "./socket.js";
+import { FrameType, Priority, buildFlags, buildFrame, encodeFrame } from "./envelope.js";
+
+interface NativeChannel { read(): Promise<Buffer>; write(bytes: Buffer): Promise<void>; close(): void }
+interface NativeHandoff {
+  environment: Record<string, string>; childFd: number | null;
+  complete(pid: number, claim: string): Promise<void>; abort(): void;
+}
+interface Native {
+  supervised(): boolean; registrationRefusal(): string | null;
+  takeRegistrationChannel(): NativeChannel | null;
+  prepareHelperClaim(slot: number): NativeHandoff;
+  helperClaim(): Promise<string | null>;
+}
+let addon: Native | undefined;
+function native(): Native {
+  return addon ??= createRequire(import.meta.url)("../native/index.js") as Native;
+}
+
+/** Native reads and writes remain on the N-API runtime, including
+ * Windows duplex pipes using asynchronous I/O. Node never opens a second handle under the pipe name. */
+class RegistrationDuplex extends Duplex {
+  constructor(private readonly channel: NativeChannel) { super(); }
+  override _read(): void {
+    void this.channel.read().then(bytes => {
+      if (bytes.length === 0) this.push(null); else this.push(bytes);
+    }, () => this.destroy(new Error("registration channel read failed")));
+  }
+  override _write(bytes: Buffer, _encoding: BufferEncoding, callback: (error?: Error | null) => void): void {
+    void this.channel.write(bytes).then(() => callback(), () => callback(new Error("registration channel write failed")));
+  }
+  override _destroy(error: Error | null, callback: (error: Error | null) => void): void {
+    this.channel.close(); callback(error);
+  }
+}
+
+export function registrationNamed(): boolean {
+  return process.platform === "win32" ? process.env.SUBC_REGISTRATION_PIPE !== undefined : process.env.SUBC_REGISTRATION_FD !== undefined;
+}
+
+/** There is one owner even when two SDK module copies are imported. The native
+ * decision is process-cached too, and refuses a second transfer of the handle. */
+class RegistrationOwner {
+  readonly supervised: boolean;
+  readonly missing: boolean;
+  private socket?: SubcSocket;
+  private taken = false;
+  helperTaken = false;
+  broker?: ClaimBroker;
+  readonly named = registrationNamed();
+  constructor() {
+    if (!this.named) { this.supervised = false; this.missing = false; return; }
+    let helper: Native;
+    try { helper = native(); }
+    catch { this.supervised = false; this.missing = true; return; }
+    this.missing = false;
+    this.supervised = helper.supervised();
+    const refusal = helper.registrationRefusal();
+    if (refusal) console.warn(`subc registration refused: ${refusal}`);
+    if (this.supervised) {
+      const channel = helper.takeRegistrationChannel();
+      if (!channel) throw new ClaimError("registration_adoption_failed");
+      const stream = new RegistrationDuplex(channel);
+      // EOF cannot be repaired by reconnecting. Defer exit one turn so pending
+      // socket readers observe closure and provider lifecycle hooks can run.
+      stream.once("end", () => setImmediate(() => process.exit(1)));
+      stream.once("error", () => setImmediate(() => process.exit(1)));
+      this.socket = SubcSocket.adopt(stream);
+    }
+  }
+  take(): SubcSocket | undefined {
+    if (this.missing) {
+      setImmediate(() => process.exit(1));
+      throw new ClaimError("registration_native_unavailable");
+    }
+    if (!this.supervised) return undefined;
+    if (this.taken) throw new ClaimError("registration_already_taken");
+    this.taken = true;
+    return this.socket!;
+  }
+  bind(request: ConstructorParameters<typeof ClaimBroker>[0]): void {
+    if (this.broker || !this.supervised) throw new ClaimError("registration_owner_conflict");
+    this.broker = new ClaimBroker(request);
+  }
+}
+const key = Symbol.for("@cortexkit/subc-client.registration-owner/v1");
+const globals = globalThis as typeof globalThis & { [key]?: RegistrationOwner };
+export function registrationOwner(): RegistrationOwner { return globals[key] ??= new RegistrationOwner(); }
+
+export async function bindConsumer(sock: SubcSocket, deadline: number): Promise<void> {
+  const owner = registrationOwner();
+  let claim: string | undefined;
+  if (owner.supervised) {
+    if (!owner.broker) throw new ClaimError("registration_not_ready");
+    claim = await owner.broker.mint({purpose: "self"});
+  } else if (process.env.SUBC_HELPER_CLAIM_FD !== undefined || process.env.SUBC_HELPER_CLAIM_PIPE !== undefined) {
+    if (owner.helperTaken) throw new ClaimError("helper_claim_already_taken");
+    owner.helperTaken = true;
+    claim = await native().helperClaim() ?? undefined;
+    if (!claim) throw new ClaimError("helper_claim_unavailable");
+  }
+  if (!claim) return;
+  try {
+    const frame = buildFrame(FrameType.Request, buildFlags(false, Priority.Passive, false), 0, 0, 1n,
+      new TextEncoder().encode(JSON.stringify({op: "claim.present", claim})));
+    await sock.write(encodeFrame(frame), deadline);
+    const response = await sock.readFrame(deadline, deadline);
+    const body = JSON.parse(new TextDecoder().decode(response.body)) as { op?: string; code?: string; detail?: unknown };
+    if (response.header.corr !== 1n || response.header.channel !== 0) throw new ClaimError("invalid_claim_reply");
+    if (response.header.ty === FrameType.Error) throw readClaimRefusal(body);
+    if (response.header.ty !== FrameType.Response) throw new ClaimError("invalid_claim_reply");
+    readClaimPresentReply(body);
+  } catch (error) { sock.close(); throw error; }
+}
+
+export function boundIdentityOverride(value: unknown): void {
+  if (hasClaimBinding() && value !== undefined) throw new ClaimError("claim_identity_conflict");
+}
+export function hasClaimBinding(): boolean {
+  const owner = registrationOwner();
+  return owner.supervised || owner.helperTaken;
+}
+
+export interface HelperClaimHandoff {
+  readonly environment: Readonly<Record<string, string>>;
+  readonly childFd: number | null;
+  /** Complete only after spawn emits its spawn event. Retain the ChildProcess
+   * until completion, and call abort on its error event. No claim enters env. */
+  complete(childPid: number): Promise<void>;
+  abort(): void;
+}
+
+/** Reserve before child_process.spawn. Unix: put childFd at stdio[childSlot]
+ * and merge environment; Windows: merge environment, leaving stdio unchanged. */
+export function prepareHelperClaim(childSlot = 3): HelperClaimHandoff {
+  const owner = registrationOwner();
+  if (!owner.supervised || !owner.broker) throw new ClaimError("registration_not_ready");
+  const prepared = native().prepareHelperClaim(childSlot);
+  let active = true;
+  return {
+    environment: Object.freeze(prepared.environment), childFd: prepared.childFd,
+    async complete(pid) {
+      if (!active || !Number.isSafeInteger(pid) || pid < 1) throw new ClaimError("invalid_helper_handoff");
+      active = false;
+      try { await prepared.complete(pid, await owner.broker!.mint({purpose: "helper"})); }
+      catch (error) { prepared.abort(); throw error; }
+    },
+    abort() { active = false; prepared.abort(); },
+  };
+}
+
+// Validate immediately when a supervised process imports the SDK, before it can
+// launch ordinary children. Plain clients never load the native addon.
+if (registrationNamed()) registrationOwner();

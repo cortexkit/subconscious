@@ -1,0 +1,10 @@
+{
+  "name": "@cortexkit/subc-registration-native",
+  "version": "0.1.0",
+  "description": "Bundle-local N-API registration channel and one-read helper handoffs",
+  "license": "MIT",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": ["index.js", "index.d.ts", "*.node"],
+  "engines": {"node": ">=18"}
+}

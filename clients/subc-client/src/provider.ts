@@ -15,6 +15,7 @@ import {
 } from "./client.js";
 import { ConnectionFileError, readConnectionFile, type ConnectionInfo } from "./connection-file.js";
 import { readCaller, type CallerAttestation } from "./attestation.js";
+import { registrationOwner } from "./registration-channel.js";
 import {
   scopeEndWire, scopeInteger, scopeRecordWire,
   type ScopeApplyReply, type ScopeEnd, type ScopeEndResult, type ScopeRecord, type ScopeSyncReply,
@@ -92,6 +93,7 @@ export interface RichUiDescriptor {
 }
 
 export interface ManifestInput {
+  registration_channel?: boolean;
   module_id: string;
   module_version: string;
   protocol_ver: number;
@@ -804,6 +806,14 @@ export class SubcProvider {
     const normalized = await normalizeProviderConnectOptions(opts);
     const opened = await SubcProvider.openConnection(normalized);
     const provider = new SubcProvider(opened.sock, opened.conn, normalized, opened.ack);
+    const owner = registrationOwner();
+    if (owner.supervised) {
+      owner.bind((body) => provider.configControl(body));
+      void provider.closed.then(() => {
+        owner.broker?.close();
+        setImmediate(() => process.exit(1));
+      });
+    }
     await provider.config?.refresh();
     return provider;
   }
@@ -831,7 +841,7 @@ export class SubcProvider {
     const conn = await readConnectionFile(opts.connectionFile);
     const deadline = Date.now() + (opts.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS);
     const endpoint = conn.endpoints[0]!;
-    const sock = await SubcSocket.connect(endpoint.host, endpoint.port, deadline);
+    const sock = registrationOwner().take() ?? await SubcSocket.connect(endpoint.host, endpoint.port, deadline);
     try {
       onSocket?.(sock);
       await authenticateClient(sock, conn, deadline);
@@ -1621,16 +1631,18 @@ function nonEmpty(value: string | undefined): string | undefined {
 async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Promise<NormalizedSubcProviderConnectOptions> {
   if (opts.config?.anchorRetryMs !== undefined && (!Number.isInteger(opts.config.anchorRetryMs)
     || opts.config.anchorRetryMs < 1 || opts.config.anchorRetryMs > 30000)) throw new Error("anchorRetryMs must be 1..30000");
-  // The environment is read once here. The daemon injects both variables when it
-  // spawns a module; together they mark the process as supervised, and the nonce
-  // is also what HELLO echoes for a reserved module_id.
+  const owner = registrationOwner();
+  // Nonce-only providers retain the legacy restart policy. A named channel
+  // never falls back to that bearer identity, even if validation refused it.
   const envModuleId = nonEmpty(process.env[SUBC_MODULE_ID_ENV]);
   // The nonce comes from the process-wide accessor, which reads the daemon's
   // descriptor at most once. A refused descriptor fails the connect, unless the
   // caller supplied the nonce itself, in which case it only means "not
   // supervised".
   let processNonce: string | undefined;
-  if (opts.launchNonce === undefined) {
+  if (owner.named) {
+    if (opts.launchNonce !== undefined) throw new SubcProviderError("channel registration cannot override identity", "claim_identity_conflict");
+  } else if (opts.launchNonce === undefined) {
     try {
       processNonce = (await processLaunchNonce())?.value;
     } catch (error) {
@@ -1641,7 +1653,7 @@ async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions)
     processNonce = (await launchNonceOrUndefinedAsync())?.value;
   }
   const envLaunchNonce = nonEmpty(processNonce);
-  const supervised = envModuleId !== undefined && envLaunchNonce !== undefined;
+  const supervised = owner.supervised || (envModuleId !== undefined && envLaunchNonce !== undefined);
   return {
     connectionFile: opts.connectionFile,
     manifest: opts.manifest,
@@ -1660,7 +1672,7 @@ async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions)
     bodyReadTimeoutMs: opts.bodyReadTimeoutMs,
     onConnectionState: opts.onConnectionState,
     launchNonce: nonEmpty(opts.launchNonce ?? envLaunchNonce),
-    reconnectOnDrop: opts.reconnectOnDrop ?? !supervised,
+    reconnectOnDrop: owner.supervised ? false : opts.reconnectOnDrop ?? !supervised,
   };
 }
 
@@ -1807,6 +1819,7 @@ function bindRejection(
 export function normalizeManifest(manifest: ManifestInput, sentNonce: string | undefined): ManifestInput {
   return {
     module_id: manifest.module_id,
+    ...(manifest.registration_channel === undefined ? {} : {registration_channel: manifest.registration_channel}),
     module_version: manifest.module_version,
     protocol_ver: manifest.protocol_ver,
     trust_tier: manifest.trust_tier,

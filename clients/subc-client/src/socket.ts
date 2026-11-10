@@ -5,6 +5,7 @@
 // deadline passes, or the socket ends.
 
 import net from "node:net";
+import type { Duplex } from "node:stream";
 
 import {
   decodeHeader,
@@ -84,7 +85,7 @@ interface Waiter {
 export type ReadDeadline = number | { idleTimeoutMs: number };
 
 export class SubcSocket {
-  private readonly sock: net.Socket;
+  private readonly sock: Duplex & { localPort?: number };
   private chunks: Buffer[] = [];
   private buffered = 0;
   private waiter: Waiter | null = null;
@@ -97,7 +98,7 @@ export class SubcSocket {
     return this.buffered;
   }
 
-  private constructor(sock: net.Socket) {
+  private constructor(sock: Duplex & { localPort?: number }) {
     this.sock = sock;
     sock.on("data", (chunk: Buffer) => {
       this.chunks.push(chunk);
@@ -142,6 +143,9 @@ export class SubcSocket {
   static connect(host: string, port: number, deadlineMs: number): Promise<SubcSocket> {
     return SubcSocket.connectTo({ host, port }, `${host}:${port}`, deadlineMs);
   }
+
+  /** Adopt an already validated, uniquely owned registration transport. */
+  static adopt(stream: Duplex): SubcSocket { return new SubcSocket(stream); }
 
   static connectLocal(path: string, deadlineMs: number): Promise<SubcSocket> {
     return SubcSocket.connectTo({ path }, path, deadlineMs);

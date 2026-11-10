@@ -167,3 +167,7 @@ export {
 } from "./provider.js";
 export type { CallerAttestation, CallerClaim, CallerOrigin, ProviderDeclarations, RouteOpenTarget } from "./attestation.js";
 export { ACCEPTS_CLOSE_REASONS, CAPABILITY_PROBE_TIMEOUT } from "./client.js";
+export { prepareHelperClaim } from "./registration-channel.js";
+export type { HelperClaimHandoff } from "./registration-channel.js";
+export { isRetryableClaimCode, ClaimError, readClaimMintRequest, readClaimMintReply, readClaimPresentRequest, readClaimPresentReply, readClaimRefusal } from "./claim.js";
+export type { ClaimPurpose, ClaimMintRequest, ClaimMintReply, ClaimPresentRequest, ClaimPresentReply, ClaimRateLimitedDetail, ClaimRefusalCode } from "./claim.js";

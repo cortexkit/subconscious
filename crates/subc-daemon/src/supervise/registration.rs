@@ -569,7 +569,10 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn registration_channel_service_reuses_authenticated_frames_and_never_reconnects() {
-        let (handle, registry, control) = setup();
+        let (handle, registry, _) = setup();
+        let forwarding = Arc::new(crate::ForwardingTable::default());
+        let control = crate::ControlHandler::with_forwarding(registry.clone(), forwarding.clone())
+            .with_supervisor(handle.clone());
         let router = Arc::new(crate::Router::with_control_handler(Arc::new(control)));
         let (auth, info) = auth();
         router.install_registration_service(auth);
@@ -587,7 +590,19 @@ mod tests {
         subc_transport::authenticate_client(&mut child, &info, Duration::from_secs(2))
             .await
             .unwrap();
-        subc_transport::write_frame(&mut child, &hello("channel-module"))
+        let mut body: subc_protocol::ModuleHelloBody =
+            serde_json::from_slice(&hello("channel-module").body).unwrap();
+        body.control_ops = Some(vec!["health.check".into()]);
+        let registration = Frame::build(
+            FrameType::Hello,
+            super::super::control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        subc_transport::write_frame(&mut child, &registration)
             .await
             .unwrap();
         assert_eq!(
@@ -652,6 +667,85 @@ mod tests {
                 .ty,
             FrameType::Response
         );
+        let started = tokio::time::Instant::now();
+        let pending = forwarding
+            .begin_health_probe_rpc_for(
+                "channel-module",
+                "health.check",
+                started,
+                started + Duration::from_secs(2),
+            )
+            .unwrap();
+        let health = Frame::build(
+            FrameType::Request,
+            super::super::control_flags(),
+            0,
+            0,
+            pending.corr,
+            serde_json::to_vec(&subc_protocol::session::ModuleControlRequest::HealthCheck {})
+                .unwrap(),
+        )
+        .unwrap();
+        pending.module_sink.send(health).await.unwrap();
+        let health = tokio::time::timeout(
+            Duration::from_secs(2),
+            subc_transport::read_frame(&mut child),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&health.body).unwrap(),
+            json!({"op":"health.check"})
+        );
+        let reply =
+            json!({"op":"health.check", "status":"degraded", "detail":"channel health reply"});
+        let response = Frame::build(
+            FrameType::Response,
+            super::super::control_flags(),
+            0,
+            0,
+            health.header.corr,
+            serde_json::to_vec(&reply).unwrap(),
+        )
+        .unwrap();
+        subc_transport::write_frame(&mut child, &response)
+            .await
+            .unwrap();
+        match tokio::time::timeout(Duration::from_secs(2), pending.receiver)
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            crate::forwarding::ModuleControlRpcOutcome::Response(response) => {
+                assert_eq!(serde_json::to_value(response).unwrap(), reply)
+            }
+            other => panic!("health reply did not traverse the channel: {other:?}"),
+        }
+        let push_body =
+            serde_json::to_vec(&subc_protocol::config::ConfigChanged::new(7, Vec::new())).unwrap();
+        let push = Frame::build(
+            FrameType::Push,
+            super::super::control_flags(),
+            0,
+            0,
+            0,
+            push_body.clone(),
+        )
+        .unwrap();
+        pending.module_sink.send(push).await.unwrap();
+        let pushed = tokio::time::timeout(
+            Duration::from_secs(2),
+            subc_transport::read_frame(&mut child),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(pushed.header.ty, FrameType::Push);
+        assert_eq!(pushed.body, push_body);
+        drop(pending.module_sink);
         spawn.retire();
         assert!(tokio::time::timeout(
             Duration::from_secs(2),

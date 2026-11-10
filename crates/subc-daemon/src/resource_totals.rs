@@ -60,6 +60,22 @@ pub(crate) struct Tracker {
     own_probe: Option<OwnProbe>,
     #[cfg(test)]
     revision_conflicts: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    validation_table: Mutex<Option<ValidationTable>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ValidationTable {
+    table: ProcessTable,
+    first_delay: Option<Duration>,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DeclarationArrival {
+    queued_at: Duration,
+    declared_at: Instant,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -251,6 +267,64 @@ struct OmittedRoot {
 }
 
 impl Tracker {
+    pub(crate) fn declaration_arrival(&self) -> DeclarationArrival {
+        DeclarationArrival {
+            queued_at: self.clock.now(),
+            declared_at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn retain_started(
+        &self,
+        module_id: &str,
+        generation: u128,
+        module_pid: u32,
+        started: &[AgentCommandRoot],
+        arrival: DeclarationArrival,
+        fence: &CommitFence,
+    ) -> Option<Committed> {
+        let losses = self.declaration_loss(module_id);
+        let mut state = self.state.try_lock().ok()?;
+        if !fence.claim_commit() {
+            return None;
+        }
+        let module = state.modules.entry(module_id.to_owned()).or_default();
+        module.set_clock(self.clock.clone());
+        module.declaration_loss = losses;
+        let mut rejected = Vec::new();
+        let mut lost = Vec::new();
+        let now = now_ms();
+        for &root in started {
+            let result = module.pend_at(generation, module_pid, root, arrival, now);
+            if result.log_rejected {
+                rejected.push(root);
+            }
+            if result.full {
+                lost.push(root);
+            }
+        }
+        let recovered = declaration_loss::recover(module, started, None);
+        declaration_loss::commit(&module.declaration_loss, &recovered, None, &lost);
+        state.revision = state.revision.wrapping_add(1);
+        self.wake.notify_one();
+        Some(Committed {
+            rejected,
+            roots_full: !lost.is_empty(),
+            _retired: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_counts_for_test(&self, module_id: &str) -> (usize, usize, usize) {
+        let state = self.state.lock().unwrap();
+        let module = &state.modules[module_id];
+        (
+            module.roots.len(),
+            module.pending.len(),
+            module.finished.len(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_model_loss_for_test(&self, id: &str) {
         self.state
@@ -284,6 +358,43 @@ impl Tracker {
     #[cfg(test)]
     pub(crate) fn inject_revision_conflicts(&self, count: usize) {
         self.revision_conflicts.store(count, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_validation_table_for_test(
+        &self,
+        table: ProcessTable,
+        first_delay: Duration,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *self.validation_table.lock().unwrap() = Some(ValidationTable {
+            table,
+            first_delay: Some(first_delay),
+            reads: Arc::clone(&reads),
+        });
+        reads
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_validation_table_for_test(&self) {
+        *self.validation_table.lock().unwrap() = None;
+    }
+
+    fn validation_table(&self) -> Option<ProcessTable> {
+        #[cfg(test)]
+        {
+            let injected = self.validation_table.lock().unwrap().as_mut().map(|read| {
+                read.reads.fetch_add(1, Ordering::SeqCst);
+                (read.table.clone(), read.first_delay.take())
+            });
+            if let Some((table, delay)) = injected {
+                if let Some(delay) = delay {
+                    std::thread::sleep(delay);
+                }
+                return Some(table);
+            }
+        }
+        ProcessTable::read().ok()
     }
     #[cfg(all(test, windows))]
     pub(crate) fn command_process(
@@ -371,7 +482,7 @@ impl Tracker {
         // can cause a retry. Even a failed first read closes the finish window;
         // a later attempt cannot borrow subsequently observed CPU.
         let first_pass = receipt.finish_until.is_none();
-        let snapshot = validation::Snapshot::read(&target);
+        let snapshot = validation::Snapshot::read_with(&target, || self.validation_table());
         let finish_until = *receipt.finish_until.get_or_insert_with(|| {
             snapshot
                 .as_ref()

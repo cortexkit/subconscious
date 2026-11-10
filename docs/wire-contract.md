@@ -159,15 +159,17 @@ the module's complete live root set. Start times come from
 within that platform's kernel timestamp resolution. A started root must still
 be live with that identity and must be a direct child of the module at the
 check. Invalid roots are ignored independently and logged once per identity;
-they do not refuse the batch. Starts whose ownership snapshot is incomplete
+they do not refuse the batch. Starts whose ownership snapshot is incomplete,
+or whose validation exceeds its deadline or contention budget,
 remain pending for up to 60 seconds, count toward root capacity, and begin
 prospective attribution only when validated by a later observation. `known` only
 re-confirms identities already
 accepted in this launch, or in a previous launch that retained the same Linux
 cgroup or Windows job object across the module's restart. It never accepts a new identity, the module itself or an ancestor.
 A live identity keeps its accounting baseline even after being finished, so
-re-declaring it cannot replay CPU. A module has at most 1,024 live roots. The successful `RESPONSE` body is `{}`. An
-older daemon returns `unsupported_control_frame`; the Rust module SDK maps
+re-declaring it cannot replay CPU. A module has at most 1,024 live roots. The successful `RESPONSE` body is `{}`.
+After validation falls back to pending retention, a `busy` reply means the batch's started roots were retained pending validation and its finished and known entries were not applied, so retrying the same batch is safe.
+An older daemon returns `unsupported_control_frame`; the Rust module SDK maps
 that refusal to `AgentCommandsError::Unsupported` without closing the connection.
 Declarations are applied serially per supervised connection. At most four may
 be in flight: an excess request receives an immediate retryable `busy`, not

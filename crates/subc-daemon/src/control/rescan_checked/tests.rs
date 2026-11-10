@@ -45,9 +45,12 @@ impl Rig {
     fn new(config: &Path, incarnation: &str) -> Self {
         let registry = Arc::new(Registry::default());
         let handle = SupervisorHandle::new();
-        let supervisor = Supervisor::new(registry.clone(), RestartPolicy::new(0, Duration::ZERO))
-            .with_handle(handle.clone())
-            .with_daemon_incarnation(incarnation.to_string());
+        // Native macOS tests need the launch helper that execs the child with
+        // the daemon's privacy identity, even for a child with no control protocol.
+        let supervisor =
+            Supervisor::new_for_test(registry.clone(), RestartPolicy::new(0, Duration::ZERO))
+                .with_handle(handle.clone())
+                .with_daemon_incarnation(incarnation.to_string());
         let ledger = ScratchDir::new("rescan-checked-ledger");
         let handler = ControlHandler::new(registry)
             .with_supervisor(handle)

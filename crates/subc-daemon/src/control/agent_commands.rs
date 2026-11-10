@@ -3,6 +3,12 @@ use subc_protocol::session::{AgentCommandFinished, AgentCommandRoot};
 mod queue;
 pub(super) use queue::Queues;
 
+struct DeclarationValidation<'a> {
+    fence: &'a crate::resource_totals::CommitFence,
+    arrival: crate::resource_totals::DeclarationArrival,
+    defer: Option<&'static str>,
+}
+
 pub(super) fn check_batch(
     frame: &Frame,
     started: usize,
@@ -51,10 +57,16 @@ impl ControlHandler {
         self.handle_agent_commands_fenced(
             connection_id,
             frame,
-            started,
-            finished,
-            known,
-            &crate::resource_totals::CommitFence::default(),
+            crate::resource_totals::Declaration {
+                started,
+                finished,
+                known,
+            },
+            DeclarationValidation {
+                fence: &crate::resource_totals::CommitFence::default(),
+                arrival: self.resource_tracker.declaration_arrival(),
+                defer: None,
+            },
         )
     }
 
@@ -62,16 +74,14 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
         frame: Frame,
-        started: Vec<AgentCommandRoot>,
-        finished: Vec<AgentCommandFinished>,
-        known: Option<Vec<AgentCommandRoot>>,
-        fence: &crate::resource_totals::CommitFence,
+        batch: crate::resource_totals::Declaration,
+        validation: DeclarationValidation<'_>,
     ) -> Result<Vec<Frame>, RouterError> {
         if let Some(error) = check_batch(
             &frame,
-            started.len(),
-            finished.len(),
-            known.as_ref().map_or(0, Vec::len),
+            batch.started.len(),
+            batch.finished.len(),
+            batch.known.as_ref().map_or(0, Vec::len),
         )? {
             return Ok(vec![error]);
         }
@@ -101,13 +111,13 @@ impl ControlHandler {
                 "agent commands require the module's current supervised launch",
             )?]);
         };
-        let launch = module.resource_launch().ok_or_else(|| {
-            RouterError::backend(
-                0,
-                frame.header.corr,
+        let Some(launch) = module.resource_launch() else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "busy",
                 "module launch snapshot is busy; retry",
-            )
-        })?;
+            )?]);
+        };
         let Some(pid) = launch.pid.filter(|_| launch.enabled && launch.alive) else {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -115,6 +125,44 @@ impl ControlHandler {
                 "declaring module has no live process",
             )?]);
         };
+        if let Some(reason) = validation.defer {
+            if batch.started.is_empty() {
+                return Ok(vec![control_error_frame(&frame, "busy", reason)?]);
+            }
+            // Retention changes only bounded declaration metadata. The cancelled
+            // validator cannot publish, and a fresh sampler must prove ownership
+            // before any of these roots can move CPU into an agent row.
+            let retained = self.supervisor.with_current_resource_launch(
+                &id,
+                nonce.as_deref().unwrap_or_default(),
+                &launch,
+                || {
+                    self.resource_tracker.retain_started(
+                        &id,
+                        launch.generation(),
+                        pid,
+                        &batch.started,
+                        validation.arrival,
+                        validation.fence,
+                    )
+                },
+            );
+            return match retained {
+                Err(crate::supervise::ResourceCommitError::Changed) => Ok(vec![control_error_frame(
+                    &frame, "not_supervised", "the declaring module launch changed during retention",
+                )?]),
+                Ok(Some(retained)) if retained.roots_full => Ok(vec![control_error_frame(
+                    &frame, subc_protocol::error_codes::AGENT_ROOTS_FULL,
+                    "live agent command root limit reached; retry unaccepted roots after capacity is available",
+                )?]),
+                Ok(Some(_)) if batch.finished.is_empty() && batch.known.is_none() => {
+                    Ok(vec![control_response_body_frame(
+                        &frame, &serde_json::json!({}), "pending agent command acknowledgement",
+                    )?])
+                }
+                _ => Ok(vec![control_error_frame(&frame, "busy", reason)?]),
+            };
+        }
         let Some(_start) = subc_os::start_time(pid).filter(|start| launch.start == Some(*start))
         else {
             return Ok(vec![control_error_frame(
@@ -130,11 +178,7 @@ impl ControlHandler {
                 launch.generation(),
                 pid,
                 launch.target.clone(),
-                crate::resource_totals::Declaration {
-                    started: started.clone(),
-                    finished: finished.clone(),
-                    known: known.clone(),
-                },
+                batch.clone(),
                 &mut receipt,
             );
             let Some(prepared) = prepared else {
@@ -142,19 +186,19 @@ impl ControlHandler {
                     std::thread::yield_now();
                     continue;
                 }
-                return Err(RouterError::backend(
-                    0,
-                    frame.header.corr,
-                    "process ownership or membership is unknown; retry",
-                ));
+                break;
             };
             let committed = self.supervisor.with_current_resource_launch(
                 &id,
                 nonce.as_deref().unwrap_or_default(),
                 &launch,
                 || {
-                    self.resource_tracker
-                        .commit_fenced(&id, launch.generation(), prepared, fence)
+                    self.resource_tracker.commit_fenced(
+                        &id,
+                        launch.generation(),
+                        prepared,
+                        validation.fence,
+                    )
                 },
             );
             let rejected = match committed {
@@ -164,11 +208,7 @@ impl ControlHandler {
                         std::thread::yield_now();
                         continue;
                     }
-                    return Ok(vec![control_error_frame(
-                        &frame,
-                        "busy",
-                        "module launch commit is busy; retry",
-                    )?]);
+                    break;
                 }
                 Err(crate::supervise::ResourceCommitError::Changed) => {
                     return Ok(vec![control_error_frame(
@@ -183,11 +223,7 @@ impl ControlHandler {
                 continue;
             }
             let Some(rejected) = rejected else {
-                return Ok(vec![control_error_frame(
-                    &frame,
-                    "busy",
-                    "resource state is busy after revalidation; retry",
-                )?]);
+                break;
             };
             let roots_full = rejected.roots_full;
             for root in rejected.rejected {
@@ -211,10 +247,14 @@ impl ControlHandler {
                 "agent command acknowledgement",
             )?]);
         }
-        Ok(vec![control_error_frame(
-            &frame,
-            "busy",
-            "resource accounting could not commit; retry",
-        )?])
+        self.handle_agent_commands_fenced(
+            connection_id,
+            frame,
+            batch,
+            DeclarationValidation {
+                defer: Some("resource state is busy after revalidation; retry uncompleted finished and known entries"),
+                ..validation
+            },
+        )
     }
 }

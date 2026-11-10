@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.44.8
+
+- Retain agent-command starts pending validation when its deadline or revision retries are exhausted, without extending the validation window. Acknowledge start-only batches; retain starts but return retryable `busy` for unapplied finished/known entries in mixed batches. Keep retries idempotent, isolate declaration tests from native walk cost, and configure the rescan test's required macOS launch helper.
+
 ## 0.44.7
 
 - Retain agent-command starts whose ownership snapshots are incomplete, reserving root capacity for up to 60 seconds and revalidating on fresh observations. Begin prospective CPU attribution only after acceptance; drop exited or expired pending roots without moving earlier CPU. Keep declaration replies unchanged and wait for acceptance in the Windows finish-accounting fixture.

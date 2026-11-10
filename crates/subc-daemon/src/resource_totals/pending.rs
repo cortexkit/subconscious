@@ -33,8 +33,42 @@ impl Module {
         table: &ProcessTable,
         now: u64,
     ) -> Acceptance {
-        if self.pending_key(root).is_some()
-            || self.trusted_key(root).is_some()
+        let already_pending = self.pending_key(root).is_some();
+        let result = self.pend_at(
+            generation,
+            self.pid.expect("declaration module pid"),
+            root,
+            DeclarationArrival {
+                queued_at: self.clock.now(),
+                declared_at: Instant::now(),
+            },
+            now,
+        );
+        if !already_pending {
+            if let Some(key) = self.pending_key(root) {
+                let pending = self.pending.get_mut(&key).unwrap();
+                pending.sequence = pending.sequence.max(table.revision());
+            }
+        }
+        result
+    }
+
+    pub(super) fn pend_at(
+        &mut self,
+        generation: u128,
+        module_pid: u32,
+        root: AgentCommandRoot,
+        arrival: DeclarationArrival,
+        now: u64,
+    ) -> Acceptance {
+        if let Some(key) = self.pending_key(root) {
+            let pending = &self.pending[&key];
+            if pending.generation == generation && pending.module_pid == module_pid {
+                return Acceptance::default();
+            }
+            self.pending.remove(&key);
+        }
+        if self.trusted_key(root).is_some()
             || self
                 .finished
                 .keys()
@@ -59,10 +93,10 @@ impl Module {
             root,
             PendingRoot {
                 generation,
-                module_pid: self.pid.expect("declaration module pid"),
-                queued_at: self.clock.now(),
-                declared_at: Instant::now(),
-                sequence: table.revision(),
+                module_pid,
+                queued_at: arrival.queued_at,
+                declared_at: arrival.declared_at,
+                sequence: self.table_revision,
             },
         );
         Acceptance::default()

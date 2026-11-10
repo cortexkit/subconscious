@@ -54,8 +54,18 @@ async fn sampler_revision_conflicts_are_revalidated_before_the_reply() {
 }
 
 #[tokio::test]
-async fn persistent_revision_contention_is_retryable_busy_not_unsupervised() {
+async fn persistent_revision_contention_retains_starts_pending_validation() {
     exercise_agent_commands(4).await;
+}
+
+#[tokio::test]
+async fn slow_agent_command_validation_retains_starts_pending_validation() {
+    exercise_agent_commands_with_validation(0, false, false, DelayedDeclaration::Started).await;
+}
+
+#[tokio::test]
+async fn slow_mixed_agent_commands_retain_starts_and_retry_without_double_credit() {
+    exercise_agent_commands_with_validation(0, false, false, DelayedDeclaration::Mixed).await;
 }
 
 #[tokio::test]
@@ -76,6 +86,28 @@ async fn exercise_agent_commands_with_decoder(
     conflicts: usize,
     published_reader: bool,
     at_capacity: bool,
+) {
+    exercise_agent_commands_with_validation(
+        conflicts,
+        published_reader,
+        at_capacity,
+        DelayedDeclaration::None,
+    )
+    .await;
+}
+
+#[derive(Clone, Copy)]
+enum DelayedDeclaration {
+    None,
+    Started,
+    Mixed,
+}
+
+async fn exercise_agent_commands_with_validation(
+    conflicts: usize,
+    published_reader: bool,
+    at_capacity: bool,
+    delayed: DelayedDeclaration,
 ) {
     use std::fs;
     use subc_protocol::session::{AgentCommandFinished, AgentCommandRoot};
@@ -239,9 +271,29 @@ async fn exercise_agent_commands_with_decoder(
         }
         let batch = ModuleControlRequestFromModule::AgentCommands {
             started: vec![foreign, root],
-            finished: Vec::new(),
-            known: None,
+            finished: if matches!(delayed, DelayedDeclaration::Mixed) {
+                vec![AgentCommandFinished {
+                    pid: root.pid,
+                    start_time_ms: root.start_time_ms,
+                    cpu_ms: Some(u64::MAX),
+                }]
+            } else {
+                Vec::new()
+            },
+            known: matches!(delayed, DelayedDeclaration::Mixed).then(Vec::new),
         };
+        // Inject the walk, not the queue: revision retries must exercise real
+        // validation without depending on the host's process-table walk cost.
+        let validation_reads = handler.resource_tracker.inject_validation_table_for_test(
+            subc_os::ProcessTable::read().unwrap(),
+            if !matches!(delayed, DelayedDeclaration::None) {
+                // Keep the native reader blocked beyond the unchanged 200 ms
+                // validation window so expiry, rather than contention, replies.
+                Duration::from_secs(1)
+            } else {
+                Duration::ZERO
+            },
+        );
         handler
             .resource_tracker
             .inject_revision_conflicts(conflicts);
@@ -258,10 +310,70 @@ async fn exercise_agent_commands_with_decoder(
             replies.is_empty(),
             "agent validation must be dispatched away from the connection reader"
         );
-        let mut replies = [tokio::time::timeout(Duration::from_secs(2), wire.recv())
+        let replies = [tokio::time::timeout(Duration::from_secs(2), wire.recv())
             .await
             .unwrap()
             .unwrap()];
+        if matches!(delayed, DelayedDeclaration::Mixed) {
+            let error: ErrorBody = serde_json::from_slice(&replies[0].body).unwrap();
+            assert_eq!(error.code, "busy");
+            assert!(error.message.contains("validation timed out"));
+            assert!(validation_reads.load(std::sync::atomic::Ordering::SeqCst) > 0);
+            assert_eq!(
+                handler
+                    .resource_tracker
+                    .root_counts_for_test("resource-module"),
+                (0, 2, 0)
+            );
+            // The same mixed batch must complete on retry: starts dedupe, the
+            // finish stops attribution, and known=[] removes pending roots.
+            handler.resource_tracker.inject_validation_table_for_test(
+                subc_os::ProcessTable::read().unwrap(),
+                Duration::ZERO,
+            );
+            for corr in [22, 23] {
+                handler
+                    .handle_control_frame(&ctx, request(corr, &batch))
+                    .await
+                    .unwrap();
+                let reply = tokio::time::timeout(Duration::from_secs(2), wire.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    reply.header.ty,
+                    FrameType::Response,
+                    "{}",
+                    String::from_utf8_lossy(&reply.body)
+                );
+                assert_eq!(
+                    handler
+                        .resource_tracker
+                        .root_counts_for_test("resource-module")
+                        .1,
+                    0
+                );
+                let readings = handler
+                    .resource_tracker
+                    .read(handle.list(), true, "test")
+                    .await;
+                let agents = &readings.agent_commands.as_ref().unwrap()[0];
+                assert_eq!(agents.process_count, 0);
+                assert_eq!(
+                    agents.cpu_ms, 0,
+                    "a mixed retry cannot replay the pre-acceptance burn"
+                );
+            }
+            fs::write(dir.join("burn-root"), "").unwrap();
+            fs::write(dir.join("finish-root"), "").unwrap();
+            while !dir.join("reaped").exists() {
+                assert!(tokio::time::Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            handler.cleanup_connection(ctx.connection_id).unwrap();
+            module.stop().await.unwrap();
+            return;
+        }
         if at_capacity {
             let error: ErrorBody = serde_json::from_slice(&replies[0].body).unwrap();
             fs::write(dir.join("burn-root"), "").unwrap();
@@ -279,31 +391,33 @@ async fn exercise_agent_commands_with_decoder(
             );
             return;
         }
-        if conflicts >= 4 {
-            let error: ErrorBody = serde_json::from_slice(&replies[0].body).unwrap();
-            assert_eq!(error.code, "busy");
-            let loss_rows = handler
-                .resource_tracker
-                .read(handle.list(), false, "test")
-                .await
-                .agent_commands
-                .unwrap_or_default();
+        if conflicts >= 4 || matches!(delayed, DelayedDeclaration::Started) {
             assert_eq!(
-                loss_rows.len(),
-                1,
-                "loss-only zero rows must remain visible"
+                replies[0].header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&replies[0].body)
             );
-            assert_eq!((loss_rows[0].cpu_ms, loss_rows[0].process_count), (0, 0));
-            assert_eq!(loss_rows[0].bound, Some(subc_control::ResourceBound::Lower));
-            handler
-                .handle_control_frame(&ctx, request(22, &batch))
-                .await
-                .unwrap();
-            replies = [tokio::time::timeout(Duration::from_secs(2), wire.recv())
-                .await
-                .unwrap()
-                .unwrap()];
+            assert_eq!(
+                handler
+                    .resource_tracker
+                    .root_counts_for_test("resource-module"),
+                (0, 2, 0)
+            );
         }
+        if conflicts >= 4 {
+            assert_eq!(
+                validation_reads.load(std::sync::atomic::Ordering::SeqCst),
+                4
+            );
+        }
+        if conflicts < 4 && matches!(delayed, DelayedDeclaration::None) {
+            assert_eq!(
+                validation_reads.load(std::sync::atomic::Ordering::SeqCst),
+                conflicts + 1
+            );
+        }
+        handler.resource_tracker.clear_validation_table_for_test();
         assert_eq!(
             replies[0].header.ty,
             FrameType::Response,
@@ -429,6 +543,10 @@ async fn exercise_agent_commands_with_decoder(
             }],
             known: Some(Vec::new()),
         };
+        handler.resource_tracker.inject_validation_table_for_test(
+            subc_os::ProcessTable::read().unwrap(),
+            Duration::ZERO,
+        );
         let replies = handler
             .handle_control_frame(&ctx, request(4, &batch))
             .await
@@ -466,6 +584,7 @@ async fn exercise_agent_commands_with_decoder(
             credited,
             "duplicate finish must be idempotent"
         );
+        handler.resource_tracker.clear_validation_table_for_test();
         handler.cleanup_connection(ctx.connection_id).unwrap();
         module.stop().await.unwrap();
         // Decode only after the command was reaped and its module stopped, so

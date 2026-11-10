@@ -39,9 +39,17 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
+    #[cfg(test)]
     pub(super) fn read(target: &crate::subtree_resources::Target) -> Option<Self> {
+        Self::read_with(target, || ProcessTable::read().ok())
+    }
+
+    pub(super) fn read_with(
+        target: &crate::subtree_resources::Target,
+        read_table: impl FnOnce() -> Option<ProcessTable>,
+    ) -> Option<Self> {
         let before_cpu = target.counter_cpu();
-        let table = ProcessTable::read().ok()?;
+        let table = read_table()?;
         #[cfg(unix)]
         let scope = target
             .has_container()

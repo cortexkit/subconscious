@@ -1,5 +1,5 @@
 use super::*;
-use crate::resource_totals::{CommitFence, Declaration};
+use crate::resource_totals::{CommitFence, Declaration, DeclarationArrival};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Weak,
@@ -8,6 +8,8 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 mod refusals;
 
 const IN_FLIGHT: usize = 4;
+// Native macOS process-table walks measured 104–131 ms, so even one revision
+// conflict can exhaust this window. Retain starts on expiry; other entries must stay retryable.
 const VALIDATION_WINDOW: Duration = Duration::from_millis(200);
 const REPLY_WINDOW: Duration = Duration::from_millis(200);
 
@@ -30,6 +32,7 @@ struct Work {
     frame: Frame,
     batch: Declaration,
     fence: Arc<CommitFence>,
+    arrival: DeclarationArrival,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -96,6 +99,7 @@ impl Queues {
         frame: Frame,
         batch: Declaration,
     ) -> Result<Vec<Frame>, RouterError> {
+        let arrival = handler.resource_tracker.declaration_arrival();
         if let Some(error) = super::check_batch(
             &frame,
             batch.started.len(),
@@ -151,6 +155,7 @@ impl Queues {
             frame,
             batch,
             fence,
+            arrival,
             _permit: permit,
         });
         if let Err(error) = sent {
@@ -217,15 +222,19 @@ async fn run(queue: Weak<Queue>, mut receiver: mpsc::Receiver<Work>) {
         let corr = work.frame.header.corr;
         let started = work.batch.started.clone();
         let fence = Arc::clone(&work.fence);
+        let retention = Arc::new(CommitFence::default());
         let reply = validate(
             work.handler,
             work.ctx.connection_id,
             work.frame.clone(),
             work.batch,
             work.fence,
+            Arc::clone(&retention),
+            work.arrival,
         )
         .await;
         if !fence.committed()
+            && !retention.committed()
             && reply.as_ref().map_or(true, |frames| {
                 frames
                     .iter()
@@ -263,32 +272,60 @@ async fn validate(
     frame: Frame,
     batch: Declaration,
     fence: Arc<CommitFence>,
+    retention: Arc<CommitFence>,
+    arrival: DeclarationArrival,
 ) -> Result<Vec<Frame>, RouterError> {
     static SLOTS: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
     // Declarations have their own bounded readers, not the list/sampler pool.
     let slots = SLOTS.get_or_init(|| Arc::new(Semaphore::new(4)));
     let deadline = tokio::time::Instant::now() + VALIDATION_WINDOW;
     let corr = frame.header.corr;
-    let timed_out = || RouterError::backend(0, corr, "agent command validation timed out; retry");
-    let permit = tokio::time::timeout_at(deadline, Arc::clone(slots).acquire_owned())
-        .await
-        .map_err(|_| timed_out())?
-        .map_err(|_| timed_out())?;
+    let timeout_frame = frame.clone();
+    let pending_handler = handler.clone();
+    let pending_batch = batch.clone();
+    let timed_out = || {
+        control_error_frame(
+            &timeout_frame,
+            "busy",
+            "agent command validation timed out; retry",
+        )
+        .map(|reply| vec![reply])
+    };
+    let retain = || {
+        pending_handler.handle_agent_commands_fenced(
+            connection,
+            timeout_frame.clone(),
+            pending_batch.clone(),
+            DeclarationValidation {
+                fence: &retention,
+                arrival,
+                defer: Some("agent command validation timed out; retry uncompleted finished and known entries"),
+            },
+        )
+    };
+    let permit = match tokio::time::timeout_at(deadline, Arc::clone(slots).acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        _ if fence.cancel_for_retention() => return retain(),
+        _ => return timed_out(),
+    };
     let worker_fence = Arc::clone(&fence);
     let mut worker = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         handler.handle_agent_commands_fenced(
             connection,
             frame,
-            batch.started,
-            batch.finished,
-            batch.known,
-            &worker_fence,
+            batch,
+            DeclarationValidation {
+                fence: &worker_fence,
+                arrival,
+                defer: None,
+            },
         )
     });
     match tokio::time::timeout_at(deadline, &mut worker).await {
         Ok(result) => result.map_err(|error| RouterError::backend(0, corr, error.to_string()))?,
-        Err(_) if fence.cancel() => Err(timed_out()),
+        Err(_) if fence.cancel_for_retention() => retain(),
+        Err(_) if !fence.committed() => timed_out(),
         // The atomic commit decision preceded the timeout. Its short mutation
         // must supply the actual reply, never an error claiming it was cancelled.
         Err(_) => worker

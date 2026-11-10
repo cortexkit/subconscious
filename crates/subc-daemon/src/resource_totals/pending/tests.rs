@@ -365,3 +365,116 @@ fn pending_validation_uses_the_current_launch_membership_not_the_declaration_tar
     );
     assert_eq!(fixture.module.cpu_model.rows(), (145, 0, 145));
 }
+
+#[test]
+fn metadata_only_pending_requires_a_fresh_walk_above_the_sequence_floor() {
+    let mut fixture = Fixture::new();
+    fixture.module.table_revision = 10;
+    let earlier = fixture.table(11, Some(10), false);
+    let arrival = fixture.tracker.declaration_arrival();
+    fixture
+        .module
+        .pend_at(1, fixture.module_pid, fixture.root, arrival, 0);
+    assert_eq!(fixture.module.pending[&fixture.root].sequence, 10);
+    fixture.tick(&earlier);
+    assert!(
+        fixture.module.roots.is_empty(),
+        "a pre-arrival walk is not proof"
+    );
+    fixture.tick(&fixture.table(10, Some(50), false));
+    assert!(
+        fixture.module.roots.is_empty(),
+        "the sequence floor is exclusive"
+    );
+    fixture.tick(&fixture.table(12, Some(100), false)).unwrap();
+    assert!(fixture.module.pending.is_empty());
+    assert_eq!(fixture.module.cpu_model.rows(), (120, 0, 120));
+    fixture.tick(&fixture.table(13, Some(125), false)).unwrap();
+    assert_eq!(fixture.module.cpu_model.rows(), (120, 25, 145));
+}
+
+#[test]
+fn metadata_only_pending_retries_preserve_arrival_and_sixty_second_expiry() {
+    let mut fixture = Fixture::new();
+    let arrival = fixture.tracker.declaration_arrival();
+    fixture.module.clock.set(Duration::from_secs(30));
+    fixture
+        .module
+        .pend_at(1, fixture.module_pid, fixture.root, arrival, 0);
+    fixture.module.clock.set(Duration::from_millis(59_999));
+    fixture.module.pend_at(
+        1,
+        fixture.module_pid,
+        fixture.root,
+        fixture.tracker.declaration_arrival(),
+        0,
+    );
+    assert_eq!(fixture.module.pending.len(), 1);
+    assert_eq!(
+        fixture.module.pending[&fixture.root].queued_at,
+        Duration::ZERO
+    );
+    assert_eq!(
+        fixture.module.pending[&fixture.root].declared_at,
+        arrival.declared_at
+    );
+    fixture.module.clock.set(Duration::from_secs(60));
+    fixture.tick(&fixture.table(1, Some(10), false));
+    assert!(fixture.module.pending.is_empty());
+    assert!(fixture.module.roots.is_empty());
+}
+
+#[test]
+fn metadata_only_retention_dedupes_and_cannot_commit_after_cancel_or_at_capacity() {
+    let fixture = Fixture::new();
+    let tracker = &fixture.tracker;
+    let arrival = tracker.declaration_arrival();
+    let cancelled = CommitFence::default();
+    assert!(cancelled.cancel());
+    assert!(tracker
+        .retain_started(
+            "test-module",
+            1,
+            fixture.module_pid,
+            &[fixture.root],
+            arrival,
+            &cancelled
+        )
+        .is_none());
+    assert!(tracker.state.lock().unwrap().modules.is_empty());
+    for _ in 0..2 {
+        assert!(
+            !tracker
+                .retain_started(
+                    "test-module",
+                    1,
+                    fixture.module_pid,
+                    &[fixture.root, fixture.root],
+                    arrival,
+                    &CommitFence::default()
+                )
+                .unwrap()
+                .roots_full
+        );
+    }
+    assert_eq!(tracker.root_counts_for_test("test-module"), (0, 1, 0));
+    tracker.fill_root_capacity_for_test("test-module");
+    let extra = AgentCommandRoot {
+        pid: u32::MAX,
+        start_time_ms: 1,
+    };
+    assert!(
+        tracker
+            .retain_started(
+                "test-module",
+                1,
+                fixture.module_pid,
+                &[extra],
+                arrival,
+                &CommitFence::default()
+            )
+            .unwrap()
+            .roots_full
+    );
+    assert_eq!(tracker.root_counts_for_test("test-module").1, 1);
+}

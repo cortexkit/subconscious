@@ -24,7 +24,9 @@ use subc_protocol::{
     BindIdentity, RouteTarget,
 };
 
+pub use subc_protocol::peer::CallerOrigin as CatalogOrigin;
 pub use subc_protocol::RouteCloseReason;
+use subc_protocol::{peer::MAX_ATTESTATION_INTEGER, provider_declarations::ProviderDeclarations};
 
 mod activity;
 pub use activity::*;
@@ -136,6 +138,7 @@ pub mod ops {
     pub const SERVER_DESCRIBE: &str = "server.describe";
     pub const DAEMON_SHUTDOWN_INTENT: &str = "daemon.shutdown_intent";
     pub const CATALOG_LIST: &str = "catalog.list";
+    pub const CATALOG_WATCH: &str = "catalog.watch";
     pub const ROUTE_OPEN: &str = "route.open";
     pub const ROUTE_POLL: &str = "route.poll";
     pub const ROUTE_CLOSING: &str = "route.closing";
@@ -556,6 +559,293 @@ pub enum ClientControlResponse {
         #[serde(flatten)]
         terminals: TerminalHistory,
     },
+}
+
+/// Capability required before sending `accepts_close_reasons` on `route.open`.
+pub const ROUTE_CLOSE_REASONS_CAPABILITY: &str = "route-close-reasons/v1";
+
+/// Optional request keys kept outside the exhaustive `RouteOpen` variant so
+/// existing construction sites and destructures remain source-compatible.
+/// SDKs send these keys only after observing [`ROUTE_CLOSE_REASONS_CAPABILITY`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteOpenRequestExt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepts_close_reasons: Option<Vec<String>>,
+}
+
+impl RouteOpenRequestExt {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_accepts_close_reasons(mut self, reasons: Option<Vec<String>>) -> Self {
+        self.accepts_close_reasons = reasons;
+        self
+    }
+
+    /// Read the companion keys from the same JSON body as the existing request.
+    pub fn read_from(body: &serde_json::Value) -> serde_json::Result<Self> {
+        require_route_open_object(body)?;
+        serde_json::from_value(body.clone())
+    }
+
+    /// Write companion keys into an existing request body, replacing stale keys.
+    /// Empty companions omit their keys rather than writing `null`.
+    pub fn write_to(&self, body: &mut serde_json::Value) -> serde_json::Result<()> {
+        write_route_open_ext(body, self, &["accepts_close_reasons"])
+    }
+}
+
+/// Optional reply keys kept beside, rather than inside, the exhaustive
+/// `RouteOpen` variant so existing emitters and readers need no source changes.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteOpenReplyExt {
+    /// An absent or incomplete target establishes no marked spawn.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_route_open_target"
+    )]
+    pub target: Option<RouteOpenTarget>,
+}
+
+impl RouteOpenReplyExt {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_target(mut self, target: Option<RouteOpenTarget>) -> Self {
+        self.target = target;
+        self
+    }
+
+    /// Read target facts from the same JSON body as the existing reply.
+    pub fn read_from(body: &serde_json::Value) -> serde_json::Result<Self> {
+        require_route_open_object(body)?;
+        serde_json::from_value(body.clone())
+    }
+
+    /// Write target facts into an existing reply body, replacing a stale target.
+    /// An empty companion removes the key rather than writing `null`.
+    pub fn write_to(&self, body: &mut serde_json::Value) -> serde_json::Result<()> {
+        write_route_open_ext(body, self, &["target"])
+    }
+}
+
+fn require_route_open_object(body: &serde_json::Value) -> serde_json::Result<()> {
+    if body.is_object()
+        && body.get("op").and_then(serde_json::Value::as_str) == Some(ops::ROUTE_OPEN)
+    {
+        Ok(())
+    } else {
+        Err(serde_json::Error::custom(
+            "expected a route.open body object",
+        ))
+    }
+}
+
+fn write_route_open_ext(
+    body: &mut serde_json::Value,
+    ext: &impl Serialize,
+    keys: &[&str],
+) -> serde_json::Result<()> {
+    require_route_open_object(body)?;
+    let serde_json::Value::Object(fields) = serde_json::to_value(ext)? else {
+        unreachable!("route.open companions serialize as objects");
+    };
+    let object = body.as_object_mut().expect("validated route.open object");
+    for key in keys {
+        object.remove(*key);
+    }
+    object.extend(fields);
+    Ok(())
+}
+
+/// A target kind unknown to this reader never establishes a supervised spawn.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteOpenTargetKind {
+    Spawn,
+    Prefix,
+    Unsupervised,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Daemon-attested target facts. Spawn-only keys are ignored for all other kinds,
+/// which are always unmarked. Incomplete targets decode as absent in the reply.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RouteOpenTarget {
+    pub incarnation: String,
+    pub kind: RouteOpenTargetKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authority_epoch: Option<u64>,
+    pub first_party: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_declarations_digest: Option<String>,
+}
+
+impl RouteOpenTarget {
+    /// Construct target facts using the same validation and per-kind rules as
+    /// the wire reader, including the cross-language integer bound.
+    pub fn new(
+        incarnation: impl Into<String>,
+        kind: RouteOpenTargetKind,
+        spawn: Option<u64>,
+        authority_epoch: Option<u64>,
+        first_party: bool,
+        approved_declarations_digest: Option<String>,
+    ) -> serde_json::Result<Self> {
+        serde_json::from_value(serde_json::json!({
+            "incarnation": incarnation.into(), "kind": kind,
+            "spawn": spawn, "authority_epoch": authority_epoch,
+            "first_party": first_party,
+            "approved_declarations_digest": approved_declarations_digest,
+        }))
+    }
+}
+
+impl<'de> Deserialize<'de> for RouteOpenTarget {
+    fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        decode_route_open_target(serde_json::Value::deserialize(decoder)?)
+            .map_err(D::Error::custom)?
+            .ok_or_else(|| D::Error::custom("incomplete route.open target"))
+    }
+}
+
+fn deserialize_route_open_target<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<RouteOpenTarget>, D::Error> {
+    decode_route_open_target(serde_json::Value::deserialize(decoder)?).map_err(D::Error::custom)
+}
+
+fn decode_route_open_target(
+    mut value: serde_json::Value,
+) -> serde_json::Result<Option<RouteOpenTarget>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| serde_json::Error::custom("expected target object"))?;
+    let is_spawn = object.get("kind").and_then(serde_json::Value::as_str) == Some("spawn");
+    if is_spawn {
+        // Validate even an incomplete spawn: rounding must not alias identities.
+        for field in ["spawn", "authority_epoch"] {
+            if let Some(integer) = object.get(field) {
+                deserialize_optional_attestation_integer(integer)?;
+            }
+        }
+    } else {
+        for field in ["spawn", "authority_epoch", "approved_declarations_digest"] {
+            object.remove(field);
+        }
+    }
+    if ["incarnation", "kind", "first_party"]
+        .iter()
+        .any(|key| object.get(*key).is_none_or(serde_json::Value::is_null))
+        || (is_spawn
+            && ["spawn", "authority_epoch", "approved_declarations_digest"]
+                .iter()
+                .any(|key| object.get(*key).is_none_or(serde_json::Value::is_null)))
+    {
+        return Ok(None);
+    }
+    #[derive(Deserialize)]
+    struct Wire {
+        incarnation: String,
+        kind: RouteOpenTargetKind,
+        spawn: Option<u64>,
+        authority_epoch: Option<u64>,
+        first_party: bool,
+        approved_declarations_digest: Option<String>,
+    }
+    let wire: Wire = serde_json::from_value(value)?;
+    Ok(Some(RouteOpenTarget {
+        incarnation: wire.incarnation,
+        kind: wire.kind,
+        spawn: wire.spawn,
+        authority_epoch: wire.authority_epoch,
+        first_party: is_spawn && wire.first_party,
+        approved_declarations_digest: wire.approved_declarations_digest,
+    }))
+}
+
+fn deserialize_optional_attestation_integer<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<u64>, D::Error> {
+    let value = Option::<u64>::deserialize(decoder)?;
+    if value.is_some_and(|integer| integer > MAX_ATTESTATION_INTEGER) {
+        return Err(D::Error::custom("attestation integer exceeds 2^53-1"));
+    }
+    Ok(value)
+}
+
+/// Channel-0 subscription request, framed like `activity.subscribe`. It stays
+/// outside the exhaustive control enums; defining it does not advertise the op.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+#[serde(tag = "op", rename = "catalog.watch")]
+pub struct CatalogWatchRequest {}
+
+impl CatalogWatchRequest {
+    pub const OP: &'static str = ops::CATALOG_WATCH;
+
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+/// One channel-0 subscription response on the request's correlation id, with
+/// RESPONSE and MORE set, like `activity.subscribe`. There is no separate ACK:
+/// the first push carries the current generation, then advances may coalesce.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "op", rename = "catalog.watch")]
+pub struct CatalogWatchResponse {
+    pub generation: u64,
+}
+
+impl CatalogWatchResponse {
+    pub const OP: &'static str = ops::CATALOG_WATCH;
+
+    pub fn new(generation: u64) -> Self {
+        Self { generation }
+    }
+}
+
+impl<'de> Deserialize<'de> for CatalogWatchRequest {
+    fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "op")]
+        enum Wire {
+            #[serde(rename = "catalog.watch")]
+            Body {},
+        }
+        let Wire::Body {} = Wire::deserialize(decoder)?;
+        Ok(Self::new())
+    }
+}
+
+impl<'de> Deserialize<'de> for CatalogWatchResponse {
+    fn deserialize<D: Deserializer<'de>>(decoder: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(tag = "op")]
+        enum Wire {
+            #[serde(rename = "catalog.watch")]
+            Body { generation: u64 },
+        }
+        let Wire::Body { generation } = Wire::deserialize(decoder)?;
+        Ok(Self::new(generation))
+    }
 }
 
 /// Daemon-originated channel-0 control push body.
@@ -2098,6 +2388,30 @@ pub struct CatalogEntry {
     /// module or swap candidate.
     #[serde(default, skip_serializing_if = "is_false")]
     pub nonce_verified: bool,
+    /// Active-spawn discovery facts, never an authorization source. Older
+    /// daemons omit these fields; absence confers no first-party mark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_attestation_integer"
+    )]
+    pub spawn: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_party: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<CatalogOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_declarations_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_declarations_digest: Option<String>,
+    /// Whole declaration sets appear only on a filtered catalog read. Provider
+    /// objects retain unknown keys; requested entries are not approval evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_declarations: Option<ProviderDeclarations>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_declarations: Option<ProviderDeclarations>,
 }
 
 impl CatalogEntry {
@@ -2126,6 +2440,14 @@ impl CatalogEntry {
             rich_ui: None,
             role_declarations: BTreeMap::new(),
             nonce_verified: false,
+            incarnation: None,
+            spawn: None,
+            first_party: None,
+            origin: None,
+            requested_declarations_digest: None,
+            approved_declarations_digest: None,
+            approved_declarations: None,
+            requested_declarations: None,
         }
     }
 
@@ -3594,5 +3916,326 @@ mod launch_nonce_redaction_tests {
         };
         let printed = format!("{request:?}");
         assert!(!printed.contains(NONCE), "launch nonce printed: {printed}");
+    }
+}
+
+#[cfg(test)]
+mod reader_skew_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn catalog() -> Value {
+        json!({"module_id": "provider", "roles": [], "control_ops": []})
+    }
+
+    fn reply() -> Value {
+        json!({"op": "route.open", "route_channel": 7, "route_epoch": 11})
+    }
+
+    fn target() -> Value {
+        json!({
+            "incarnation": "daemon", "kind": "spawn", "spawn": 17,
+            "authority_epoch": 23, "first_party": true,
+            "approved_declarations_digest": "approved"
+        })
+    }
+
+    fn request() -> Value {
+        json!({
+            "op": "route.open",
+            "target": {"kind": "tool_provider", "module_id": "provider"},
+            "identity": {"harness": "test", "session": "session-1"}
+        })
+    }
+
+    #[test]
+    fn reader_skew_catalog_optional_spawn_fields_and_legacy_omission() {
+        let old: CatalogEntry = serde_json::from_value(catalog()).unwrap();
+        let built = CatalogEntry::new("provider", vec![], vec![]);
+        assert_eq!(old, built);
+        assert_eq!(old.first_party, None);
+        let old_bytes = serde_json::to_value(&old).unwrap();
+        let additions = json!({
+            "incarnation": "daemon", "spawn": 17, "first_party": false,
+            "origin": "development", "requested_declarations_digest": "requested",
+            "approved_declarations_digest": "approved"
+        });
+        let mut body = catalog();
+        for (key, value) in additions.as_object().unwrap() {
+            assert!(old_bytes.get(key).is_none(), "{key}");
+            body[key] = value.clone();
+        }
+        let decoded: CatalogEntry = serde_json::from_value(body).unwrap();
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        for (key, value) in additions.as_object().unwrap() {
+            assert_eq!(&encoded[key], value, "{key}");
+        }
+        assert_eq!(decoded.first_party, Some(false));
+        assert_eq!(decoded.origin, Some(CatalogOrigin::Development));
+    }
+
+    #[test]
+    fn reader_skew_catalog_filtered_declarations_keep_provider_owned_keys() {
+        let mut body = catalog();
+        body["requested_declarations"] = json!({"provider": {"future": {"scope": ["write"]}}});
+        body["approved_declarations"] = json!({"provider": {"future": {"scope": ["read"]}}});
+        let decoded: CatalogEntry = serde_json::from_value(body.clone()).unwrap();
+        let encoded = serde_json::to_value(decoded).unwrap();
+        for key in ["requested_declarations", "approved_declarations"] {
+            assert_eq!(encoded[key], body[key]);
+        }
+        let unfiltered: CatalogEntry = serde_json::from_value(catalog()).unwrap();
+        assert_eq!(unfiltered.approved_declarations, None);
+        assert_eq!(unfiltered.requested_declarations, None);
+    }
+
+    #[test]
+    fn reader_skew_catalog_unknown_origin_is_other() {
+        let mut body = catalog();
+        body["origin"] = json!("future-origin");
+        let decoded: CatalogEntry = serde_json::from_value(body).unwrap();
+        assert_eq!(decoded.origin, Some(CatalogOrigin::Other));
+    }
+
+    #[test]
+    fn reader_skew_catalog_spawn_refuses_unsafe_integers() {
+        let mut body = catalog();
+        body["spawn"] = json!(9_007_199_254_740_991_u64);
+        let decoded: CatalogEntry = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(decoded.spawn, Some(9_007_199_254_740_991));
+        for invalid in [
+            json!(9_007_199_254_740_992_u64),
+            json!(-1),
+            json!(1.5),
+            json!("17"),
+        ] {
+            body["spawn"] = invalid;
+            assert!(serde_json::from_value::<CatalogEntry>(body.clone()).is_err());
+        }
+    }
+
+    #[test]
+    fn reader_skew_catalog_watch_request_uses_subscription_op() {
+        let body = json!({"op": "catalog.watch"});
+        let request: CatalogWatchRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(request, CatalogWatchRequest::new());
+        assert_eq!(serde_json::to_value(request).unwrap(), body);
+        assert_eq!(CatalogWatchRequest::OP, "catalog.watch");
+        for invalid in [json!({}), json!({"op": "activity.subscribe"})] {
+            assert!(serde_json::from_value::<CatalogWatchRequest>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn reader_skew_catalog_watch_push_carries_generation_without_ack() {
+        for generation in [0, 19, 42] {
+            let body = json!({"op": "catalog.watch", "generation": generation});
+            let push: CatalogWatchResponse = serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(push, CatalogWatchResponse::new(generation));
+            assert_eq!(serde_json::to_value(push).unwrap(), body);
+        }
+        assert_eq!(CatalogWatchResponse::OP, "catalog.watch");
+        for invalid in [
+            json!({"op": "catalog.watch"}),
+            json!({"op": "activity.subscribe", "generation": 1}),
+        ] {
+            assert!(serde_json::from_value::<CatalogWatchResponse>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn reader_skew_route_open_reply_helpers_preserve_existing_decoder() {
+        let mut body = reply();
+        let legacy: ClientControlResponse = serde_json::from_value(body.clone()).unwrap();
+        let empty = RouteOpenReplyExt::read_from(&body).unwrap();
+        assert_eq!(empty, RouteOpenReplyExt::new());
+        empty.write_to(&mut body).unwrap();
+        assert_eq!(body, reply());
+        body["target"] = target();
+        let decoded = RouteOpenReplyExt::read_from(&body).unwrap();
+        assert_eq!(
+            decoded.target.as_ref().unwrap().kind,
+            RouteOpenTargetKind::Spawn
+        );
+        let mut encoded = reply();
+        RouteOpenReplyExt::new()
+            .with_target(decoded.target)
+            .write_to(&mut encoded)
+            .unwrap();
+        assert_eq!(encoded, body);
+        assert_eq!(
+            serde_json::from_value::<ClientControlResponse>(encoded.clone()).unwrap(),
+            legacy
+        );
+        RouteOpenReplyExt::new().write_to(&mut encoded).unwrap();
+        assert_eq!(encoded, reply());
+    }
+
+    #[test]
+    fn reader_skew_route_open_incomplete_target_is_unmarked() {
+        let mut body = reply();
+        body["target"] = target();
+        assert!(RouteOpenReplyExt::read_from(&body)
+            .unwrap()
+            .target
+            .is_some());
+        for key in [
+            "incarnation",
+            "kind",
+            "spawn",
+            "authority_epoch",
+            "first_party",
+            "approved_declarations_digest",
+        ] {
+            let mut incomplete = body.clone();
+            incomplete["target"].as_object_mut().unwrap().remove(key);
+            assert_eq!(
+                RouteOpenReplyExt::read_from(&incomplete).unwrap().target,
+                None,
+                "{key}"
+            );
+        }
+        body["target"] = Value::Null;
+        assert_eq!(RouteOpenReplyExt::read_from(&body).unwrap().target, None);
+    }
+
+    #[test]
+    fn reader_skew_route_open_non_spawn_kinds_ignore_spawn_authority() {
+        for (kind, expected) in [
+            ("prefix", RouteOpenTargetKind::Prefix),
+            ("unsupervised", RouteOpenTargetKind::Unsupervised),
+        ] {
+            let mut body = reply();
+            body["target"] = target();
+            body["target"]["kind"] = json!(kind);
+            // Spawn-only keys are not parsed, even when a future kind reuses them.
+            body["target"]["spawn"] = json!("not-a-spawn");
+            body["target"]["authority_epoch"] = json!(9_007_199_254_740_992_u64);
+            body["target"]["approved_declarations_digest"] = json!(["not-a-digest"]);
+            let ext = RouteOpenReplyExt::read_from(&body).unwrap();
+            let target = ext.target.as_ref().unwrap();
+            assert_eq!(target.kind, expected);
+            assert_eq!(target.spawn, None);
+            assert_eq!(target.authority_epoch, None);
+            assert_eq!(target.approved_declarations_digest, None);
+            assert!(!target.first_party);
+            let mut encoded = reply();
+            ext.write_to(&mut encoded).unwrap();
+            for key in ["spawn", "authority_epoch", "approved_declarations_digest"] {
+                assert!(encoded["target"].get(key).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn reader_skew_route_open_unknown_kind_is_not_spawn() {
+        let mut body = reply();
+        body["target"] = target();
+        body["target"]["kind"] = json!("future-kind");
+        let ext = RouteOpenReplyExt::read_from(&body).unwrap();
+        let target = ext.target.unwrap();
+        assert_eq!(target.kind, RouteOpenTargetKind::Unknown);
+        assert_eq!(target.spawn, None);
+        assert_eq!(target.authority_epoch, None);
+        assert_eq!(target.approved_declarations_digest, None);
+        assert!(!target.first_party);
+    }
+
+    #[test]
+    fn reader_skew_route_open_spawn_and_epoch_refuse_unsafe_integers() {
+        for field in ["spawn", "authority_epoch"] {
+            let mut body = reply();
+            body["target"] = target();
+            body["target"][field] = json!(9_007_199_254_740_991_u64);
+            let ext = RouteOpenReplyExt::read_from(&body).unwrap();
+            assert_eq!(
+                serde_json::to_value(ext).unwrap()["target"][field],
+                9_007_199_254_740_991_u64
+            );
+            for invalid in [
+                json!(9_007_199_254_740_992_u64),
+                json!(-1),
+                json!(1.5),
+                json!("17"),
+            ] {
+                body["target"][field] = invalid;
+                assert!(RouteOpenReplyExt::read_from(&body).is_err(), "{field}");
+                let mut incomplete = body.clone();
+                incomplete["target"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("incarnation");
+                assert!(
+                    RouteOpenReplyExt::read_from(&incomplete).is_err(),
+                    "{field}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reader_skew_route_open_request_helpers_preserve_existing_decoder() {
+        let mut body = request();
+        let legacy: ClientControlRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(
+            RouteOpenRequestExt::read_from(&body).unwrap(),
+            RouteOpenRequestExt::new()
+        );
+        RouteOpenRequestExt::new().write_to(&mut body).unwrap();
+        assert_eq!(body, request());
+        body["accepts_close_reasons"] = json!(["authority_changed", "future-reason"]);
+        let decoded = RouteOpenRequestExt::read_from(&body).unwrap();
+        assert_eq!(
+            decoded.accepts_close_reasons,
+            Some(vec!["authority_changed".into(), "future-reason".into()])
+        );
+        let mut encoded = request();
+        RouteOpenRequestExt::new()
+            .with_accepts_close_reasons(decoded.accepts_close_reasons)
+            .write_to(&mut encoded)
+            .unwrap();
+        assert_eq!(encoded, body);
+        assert_eq!(
+            serde_json::from_value::<ClientControlRequest>(encoded.clone()).unwrap(),
+            legacy
+        );
+        RouteOpenRequestExt::new().write_to(&mut encoded).unwrap();
+        assert_eq!(encoded, request());
+        assert_eq!(ROUTE_CLOSE_REASONS_CAPABILITY, "route-close-reasons/v1");
+    }
+
+    #[test]
+    fn reader_skew_route_open_helpers_refuse_other_bodies() {
+        for mut body in [json!({}), json!([]), json!({"op": "catalog.list"})] {
+            assert!(RouteOpenRequestExt::read_from(&body).is_err());
+            assert!(RouteOpenReplyExt::read_from(&body).is_err());
+            assert!(RouteOpenRequestExt::new().write_to(&mut body).is_err());
+            assert!(RouteOpenReplyExt::new().write_to(&mut body).is_err());
+        }
+    }
+
+    #[test]
+    fn reader_skew_route_open_target_constructor_validates_like_reader() {
+        let spawn = RouteOpenTarget::new(
+            "daemon",
+            RouteOpenTargetKind::Spawn,
+            Some(17),
+            Some(23),
+            true,
+            Some("approved".into()),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(spawn).unwrap(), target());
+        for (spawn, epoch) in [(9_007_199_254_740_992, 23), (17, 9_007_199_254_740_992)] {
+            assert!(RouteOpenTarget::new(
+                "daemon",
+                RouteOpenTargetKind::Spawn,
+                Some(spawn),
+                Some(epoch),
+                true,
+                Some("approved".into())
+            )
+            .is_err());
+        }
     }
 }

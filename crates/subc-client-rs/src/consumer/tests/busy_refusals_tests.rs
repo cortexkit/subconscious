@@ -27,7 +27,8 @@ async fn assert_pending<F: Future>(mut future: Pin<&mut F>) {
 
 impl Rig {
     fn new(total: Option<usize>, watches: Option<usize>) -> Self {
-        let mut shared = Shared::new(PathBuf::from("unused"), ConsumerOptions::default());
+        let mut shared =
+            reader_skew_tests::legacy_shared(PathBuf::from("unused"), ConsumerOptions::default());
         shared.identity_from_environment = false;
         let shared = Arc::new(shared);
         let (tx, rx) = mpsc::channel(128);

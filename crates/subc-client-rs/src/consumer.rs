@@ -18,10 +18,12 @@ use sha2::{Digest, Sha256};
 pub use subc_control::SupervisorEntry;
 use subc_control::{
     CatalogEntry, ClientControlRequest, ClientControlResponse, ConsumerIdentity, PollKind,
+    RouteOpenReplyExt, RouteOpenRequestExt, ROUTE_CLOSE_REASONS_CAPABILITY,
 };
 /// The spawn snapshot types, re-exported so a caller of
 /// [`SubcConsumer::spawn_snapshot`] needs no direct `subc-control` dependency.
 pub use subc_control::{LiveSpawn, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot};
+pub use subc_control::{RouteOpenTarget, RouteOpenTargetKind};
 /// The scope a route is opened under, re-exported so a caller of
 /// [`SubcConsumer::open_route_scoped`] can name the type from this crate.
 pub use subc_protocol::scope::ScopeSelector;
@@ -49,6 +51,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+// Describe is a daemon-local control read. A daemon that cannot answer within
+// two seconds is overloaded or hung; leave the rest of the route's budget for
+// opening without the optional close-reason declaration.
+const CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const DEFAULT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 // Sized against a real module restart, not a single bind: the daemon drains the
 // module's routes (up to 30s), waits for the old process to stop (up to its stop
@@ -90,7 +96,13 @@ mod slots;
 use slots::*;
 mod reservation;
 pub use reservation::{CorrelationId, PendingReply, RequestBody, RequestReservation};
+mod catalog;
 mod supervisor_ops;
+use catalog::decode_route_open_response;
+pub use catalog::CatalogSubscription;
+
+#[cfg(test)]
+mod reader_skew_tests;
 
 #[cfg(test)]
 mod connection_ops_tests;
@@ -774,6 +786,7 @@ pub struct ControlPush {
 pub enum RouteCloseReason {
     Reload,
     Restart,
+    AuthorityChanged,
     Disable,
     Crash,
     CapabilityDenied,
@@ -783,6 +796,21 @@ pub enum RouteCloseReason {
     ScopeParentEnded,
     Unknown(String),
 }
+
+/// Close reasons understood by this SDK, declared only after the daemon
+/// advertises `route-close-reasons/v1` so older daemons see unchanged requests.
+pub const ACCEPTED_CLOSE_REASONS: &[&str] = &[
+    "reload",
+    "restart",
+    "authority_changed",
+    "disable",
+    "crash",
+    "capability_denied",
+    "scope_ended",
+    "scope_carrier_removed",
+    "scope_delegation_changed",
+    "scope_parent_ended",
+];
 
 /// Why a route ended. Even a planned closure can leave a call's outcome unknown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -807,6 +835,7 @@ impl RouteCloseReason {
         match reason {
             "reload" => Self::Reload,
             "restart" => Self::Restart,
+            "authority_changed" => Self::AuthorityChanged,
             "disable" => Self::Disable,
             "crash" => Self::Crash,
             "capability_denied" => Self::CapabilityDenied,
@@ -821,7 +850,9 @@ impl RouteCloseReason {
     /// Unknown reasons take the strictest action: never reopen on their behalf.
     pub fn disposition(&self) -> RouteCloseDisposition {
         match self {
-            Self::Reload | Self::Restart => RouteCloseDisposition::MayReopen,
+            Self::Reload | Self::Restart | Self::AuthorityChanged => {
+                RouteCloseDisposition::MayReopen
+            }
             Self::Disable
             | Self::Crash
             | Self::CapabilityDenied
@@ -1582,12 +1613,14 @@ impl SubcConsumer {
             request_window,
             watch_window,
             ..
-        } = serde_json::from_slice(&body).map_err(|err| {
-            CallError::not_sent_with_cause(
-                format!("failed to decode route.open response: {err}"),
-                NotSentCause::RouteOpenAbandoned,
-            )
-        })?
+        } = decode_route_open_response(&body)
+            .map_err(|err| {
+                CallError::not_sent_with_cause(
+                    format!("failed to decode route.open response: {err}"),
+                    NotSentCause::RouteOpenAbandoned,
+                )
+            })?
+            .0
         else {
             return Err(CallError::not_sent_with_cause(
                 "route.open returned an unexpected control response",
@@ -3442,12 +3475,16 @@ struct Shared {
     /// holds one connection at a time and a dropped connection fails every open
     /// in flight on it, so one semaphore is a per-connection limit.
     route_open_slots: Semaphore,
+    // Serialize the first description lookup, not ordinary opens. The cached
+    // result belongs to Inner's generation and is reset on reconnect.
+    route_description: tokio::sync::Mutex<()>,
 }
 
 struct Inner {
     generation: u64,
     daemon_origin_trusted: bool,
     daemon_ver: String,
+    accepts_close_reasons: Option<bool>,
     epoch: u64,
     next_corr: Option<u64>,
     writer: Option<mpsc::Sender<WriteCommand>>,
@@ -3457,6 +3494,7 @@ struct Inner {
     route_by_channel: HashMap<u16, RouteKey>,
     one_shot_routes: HashMap<u16, RouteState>,
     route_epochs: HashMap<u16, RouteHandle>,
+    route_targets: HashMap<RouteHandle, RouteOpenTarget>,
     retired_routes: HashSet<RouteHandle>,
     retirement_goodbyes: HashSet<RouteHandle>,
     route_modules: HashMap<u16, String>,
@@ -3574,6 +3612,7 @@ impl Inner {
         }
         if self.route_epochs.get(&handle.channel) == Some(&handle) {
             self.route_epochs.remove(&handle.channel);
+            self.route_targets.remove(&handle);
             self.push_event_receivers.remove(&handle);
         }
         release_reverse_request_registry(handle);
@@ -3650,6 +3689,7 @@ impl Inner {
     }
 
     fn drain_routes(&mut self) -> Vec<RouteState> {
+        self.route_targets.clear();
         for (_, slot) in self.wire_slots.drain() {
             slot.release();
         }
@@ -3698,6 +3738,7 @@ impl Shared {
                 generation: 1,
                 daemon_origin_trusted: false,
                 daemon_ver: String::new(),
+                accepts_close_reasons: None,
                 epoch: 1,
                 next_corr: Some(1),
                 writer: None,
@@ -3707,6 +3748,7 @@ impl Shared {
                 route_by_channel: HashMap::new(),
                 one_shot_routes: HashMap::new(),
                 route_epochs: HashMap::new(),
+                route_targets: HashMap::new(),
                 retired_routes: HashSet::new(),
                 retirement_goodbyes: HashSet::new(),
                 route_modules: HashMap::new(),
@@ -3734,6 +3776,7 @@ impl Shared {
             pushes_dropped_receiver_full: AtomicU64::new(0),
             random_unit: Box::new(default_random_unit),
             route_open_slots: Semaphore::new(MAX_ROUTE_OPENS_IN_FLIGHT),
+            route_description: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -3822,6 +3865,7 @@ impl Shared {
             };
             inner.close_routes();
             inner.route_epochs.clear();
+            inner.route_targets.clear();
             inner.route_modules.clear();
             inner.route_end_reasons.clear();
             inner.legacy_channel_reasons.clear();
@@ -3829,6 +3873,7 @@ impl Shared {
             inner.writer = Some(tx);
             inner.daemon_origin_trusted = opened.daemon_origin_trusted;
             inner.daemon_ver = opened.daemon_ver;
+            inner.accepts_close_reasons = None;
             self.last_inbound_ms.store(0, Ordering::Release);
             (
                 generation,
@@ -4272,13 +4317,12 @@ impl Shared {
                 Ok(TerminalFrame::Response {
                     generation, body, ..
                 }) => {
-                    let response =
-                        serde_json::from_slice::<ClientControlResponse>(&body).map_err(|err| {
-                            CallError::not_sent_with_cause(
-                                format!("failed to decode route.open response: {err}"),
-                                NotSentCause::RouteOpenAbandoned,
-                            )
-                        })?;
+                    let (response, _) = decode_route_open_response(&body).map_err(|err| {
+                        CallError::not_sent_with_cause(
+                            format!("failed to decode route.open response: {err}"),
+                            NotSentCause::RouteOpenAbandoned,
+                        )
+                    })?;
                     let ClientControlResponse::RouteOpen {
                         route_channel,
                         route_epoch,
@@ -4413,6 +4457,17 @@ impl Shared {
         route_open_reverse_requests: Option<ReverseRequestRegistry>,
     ) -> Result<TerminalFrame, CallError> {
         self.ensure_connected_for_call(deadline).await?;
+        if retain_late_route_open {
+            {
+                let inner = self.lock_inner();
+                if !daemon_version_at_least(&inner.daemon_ver, (0, 39, 0)) {
+                    return Err(CallError::DaemonTooOld {
+                        daemon_ver: inner.daemon_ver.clone(),
+                    });
+                }
+            }
+            self.describe_route_close_reasons(deadline).await?;
+        }
         self.send_request(RequestSend {
             binary: false,
             expected_handle: None,
@@ -4426,6 +4481,54 @@ impl Shared {
             route_open_reverse_requests,
         })
         .await
+    }
+
+    async fn describe_route_close_reasons(
+        self: &Arc<Self>,
+        deadline: Instant,
+    ) -> Result<(), CallError> {
+        let _lookup = timeout_at(deadline, self.route_description.lock())
+            .await
+            .map_err(|_| CallError::not_sent("deadline waiting for server.describe"))?;
+        loop {
+            self.ensure_connected_for_call(deadline).await?;
+            let generation = {
+                let inner = self.lock_inner();
+                if inner.accepts_close_reasons.is_some() {
+                    return Ok(());
+                }
+                inner.generation
+            };
+            // Description is advisory. A refused, malformed or unanswered lookup
+            // must not prevent opening routes to a daemon that predates the key.
+            let reply = self
+                .send_request(RequestSend {
+                    binary: false,
+                    expected_handle: None,
+                    channel: 0,
+                    epoch: 0,
+                    body: br#"{"op":"server.describe"}"#.to_vec(),
+                    priority: Priority::Interactive,
+                    admission_class: AdmissionClass::Normal,
+                    deadline: deadline.min(Instant::now() + CAPABILITY_PROBE_TIMEOUT),
+                    retain_late_route_open: false,
+                    route_open_reverse_requests: None,
+                })
+                .await;
+            let supported = match reply {
+                Ok(TerminalFrame::Response { body, .. }) => {
+                    matches!(serde_json::from_slice::<ClientControlResponse>(&body),
+                        Ok(ClientControlResponse::ServerDescribe { capabilities, .. })
+                        if capabilities.iter().any(|cap| cap == ROUTE_CLOSE_REASONS_CAPABILITY))
+                }
+                _ => false,
+            };
+            let mut inner = self.lock_inner();
+            if inner.generation == generation {
+                inner.accepts_close_reasons = Some(supported);
+                return Ok(());
+            }
+        }
     }
 
     async fn send_request(
@@ -4526,7 +4629,7 @@ impl Shared {
         let (key, writer) = self.allocate_request(expected_handle, channel, epoch)?;
         let generation = key.generation;
 
-        let frame = Frame::build(
+        let mut frame = Frame::build(
             FrameType::Request,
             Flags::new(binary, priority, false).with_admission_class(admission_class),
             channel,
@@ -4550,6 +4653,32 @@ impl Shared {
                 return Err(CallError::DaemonTooOld {
                     daemon_ver: inner.daemon_ver.clone(),
                 });
+            }
+            if retain_late_route_open {
+                let supported = inner.accepts_close_reasons.ok_or_else(|| {
+                    CallError::not_sent("connection changed before route.open capability discovery")
+                })?;
+                let mut body: serde_json::Value = serde_json::from_slice(&frame.body)
+                    .map_err(|err| CallError::not_sent(format!("invalid route.open: {err}")))?;
+                RouteOpenRequestExt::new()
+                    .with_accepts_close_reasons(supported.then(|| {
+                        ACCEPTED_CLOSE_REASONS
+                            .iter()
+                            .map(|reason| (*reason).to_string())
+                            .collect()
+                    }))
+                    .write_to(&mut body)
+                    .map_err(|err| CallError::not_sent(format!("invalid route.open: {err}")))?;
+                frame = Frame::build(
+                    FrameType::Request,
+                    frame.header.flags,
+                    channel,
+                    epoch,
+                    key.corr,
+                    serde_json::to_vec(&body)
+                        .map_err(|err| CallError::not_sent(err.to_string()))?,
+                )
+                .map_err(|err| CallError::not_sent(err.to_string()))?;
             }
             if let Some(expected) = expected_handle {
                 if inner.route_epochs.get(&expected.channel) != Some(&expected)
@@ -5549,6 +5678,7 @@ impl Shared {
         inner.retirement_goodbyes.remove(&handle);
         if inner.route_epochs.get(&handle.channel) == Some(&handle) {
             let installed = inner.route_epochs.remove(&handle.channel).unwrap();
+            inner.route_targets.remove(&handle);
             inner.push_event_receivers.remove(&handle);
             release_reverse_request_registry(installed);
         }
@@ -6685,11 +6815,14 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
         && frame.header.ty == FrameType::Response
         && shared.pending_expects_route_open(key)
     {
-        if let Ok(ClientControlResponse::RouteOpen {
-            route_channel,
-            route_epoch,
-            ..
-        }) = serde_json::from_slice::<ClientControlResponse>(&frame.body)
+        if let Ok((
+            ClientControlResponse::RouteOpen {
+                route_channel,
+                route_epoch,
+                ..
+            },
+            authority,
+        )) = decode_route_open_response(&frame.body)
         {
             let reverse_requests = shared
                 .pending_route_open_reverse_requests(key)
@@ -6699,12 +6832,15 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
                 .pending
                 .get(&key)
                 .and_then(|entry| entry.route_open_module.clone());
-            shared.install_ingress_handle(RouteHandle::new_consumer(
-                route_channel,
-                route_epoch,
-                generation,
-                reverse_requests,
-            ));
+            let handle =
+                RouteHandle::new_consumer(route_channel, route_epoch, generation, reverse_requests);
+            shared.install_ingress_handle(handle);
+            if let Some(target) = authority.target {
+                let mut inner = shared.lock_inner();
+                if inner.route_epochs.get(&handle.channel) == Some(&handle) {
+                    inner.route_targets.insert(handle, target);
+                }
+            }
             if let Some(module) = module {
                 shared
                     .lock_inner()
@@ -6867,6 +7003,7 @@ impl Shared {
             inner.legacy_channel_reasons.remove(&handle.channel);
             inner.route_modules.remove(&handle.channel);
             if let Some(previous) = inner.route_epochs.insert(handle.channel, handle) {
+                inner.route_targets.remove(&previous);
                 if previous.reverse_request_registry_id() != handle.reverse_request_registry_id() {
                     release_reverse_request_registry(previous);
                 }
@@ -6882,6 +7019,7 @@ impl Shared {
             }
             inner.release_wire_slots(handle);
             let installed = inner.route_epochs.remove(&handle.channel).unwrap();
+            inner.route_targets.remove(&handle);
             inner.retired_routes.remove(&handle);
             inner.retirement_goodbyes.remove(&handle);
             inner.push_event_receivers.remove(&handle);
@@ -7430,7 +7568,7 @@ mod tests {
     }
 
     fn writer_test_shared() -> Arc<Shared> {
-        Arc::new(Shared::new(
+        Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions {
                 reconnect_backoff: RetryBackoff {
@@ -8407,7 +8545,7 @@ mod tests {
 
     #[tokio::test]
     async fn newer_drop_supersedes_reconnect_and_ignores_stale_completion() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -8464,7 +8602,10 @@ mod tests {
 
     #[test]
     fn two_routes_record_distinct_reasons_and_reuse_clears_channel() {
-        let shared = Arc::new(Shared::new(PathBuf::new(), ConsumerOptions::default()));
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
+            PathBuf::new(),
+            ConsumerOptions::default(),
+        ));
         let (writer, _rx) = mpsc::channel(8);
         shared.lock_inner().writer = Some(writer);
         shared.lock_inner().daemon_ver = "0.39.0".into();
@@ -8507,7 +8648,7 @@ mod tests {
 
     #[test]
     fn legacy_route_push_falls_back_only_when_channels_are_absent() {
-        let shared = Shared::new(PathBuf::new(), ConsumerOptions::default());
+        let shared = reader_skew_tests::legacy_shared(PathBuf::new(), ConsumerOptions::default());
         shared
             .lock_inner()
             .route_modules
@@ -8534,7 +8675,10 @@ mod tests {
     #[tokio::test]
     async fn sdk_teardown_paths_attach_caller_and_connection_loss_reasons() {
         for local in [true, false] {
-            let shared = Arc::new(Shared::new(PathBuf::new(), ConsumerOptions::default()));
+            let shared = Arc::new(reader_skew_tests::legacy_shared(
+                PathBuf::new(),
+                ConsumerOptions::default(),
+            ));
             let (writer, _writer_rx) = mpsc::channel(8);
             shared.lock_inner().writer = Some(writer);
             shared.lock_inner().daemon_ver = "0.39.0".into();
@@ -8637,7 +8781,7 @@ mod tests {
         // attempts into the retry condition (the 3.1s-effective-budget defect)
         // stops the loop at 2 and fails the `> 2` assertion by name.
         async fn reject_route_open_attempts(code: &str, deadline: Duration) -> (usize, CallError) {
-            let shared = Arc::new(Shared::new(
+            let shared = Arc::new(reader_skew_tests::legacy_shared(
                 PathBuf::from("/tmp/does-not-exist"),
                 ConsumerOptions::default(),
             ));
@@ -8750,7 +8894,7 @@ mod tests {
     fn route_open_stand_in(
         random_unit: Box<dyn Fn() -> f64 + Send + Sync>,
     ) -> (Arc<Shared>, Arc<SubcConsumer>, mpsc::Receiver<WriteCommand>) {
-        let mut shared = Shared::new(
+        let mut shared = reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         );
@@ -9366,7 +9510,7 @@ mod tests {
         // while a route.open is in flight (channel not yet cached) must flip the
         // opening's `closed` flag, so the lead opener re-checks it before installing and
         // GOODBYEs the channel it opened instead of caching it.
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -10551,7 +10695,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_epoch_ingress_drops_without_settling_matching_corr() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -10609,7 +10753,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_poll_response_must_echo_expected_handle_before_settling() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -10661,7 +10805,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_connection_handle_emits_no_request_cancel_or_goodbye() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -10741,7 +10885,7 @@ mod tests {
 
     #[tokio::test]
     async fn late_route_open_queues_goodbye_and_full_queue_closes_connection() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -10774,7 +10918,7 @@ mod tests {
         assert_eq!(cleanup.header.ty, FrameType::Goodbye);
         assert_eq!((cleanup.header.channel, cleanup.header.epoch), (12, 7));
 
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions {
                 reconnect_backoff: RetryBackoff {
@@ -10821,7 +10965,7 @@ mod tests {
 
     #[tokio::test]
     async fn correlation_allocator_emits_max_once_then_closes_without_reuse() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions {
                 reconnect_backoff: RetryBackoff {
@@ -10882,7 +11026,7 @@ mod tests {
 
     #[tokio::test]
     async fn managed_call_deadline_bounds_flow_control_wait() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -10973,7 +11117,7 @@ mod tests {
 
     #[tokio::test]
     async fn admitted_route_open_emits_one_frame_without_retrying_daemon_errors() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions {
                 call_timeout: Duration::from_secs(1),
@@ -11274,7 +11418,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_open_waiter_deadline_is_not_sent_without_writing() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -11326,7 +11470,7 @@ mod tests {
     // subscription must therefore report NotSent, not OutcomeUnknown: callers
     // use that distinction to decide whether a non-idempotent retry is safe.
     async fn managed_op_with_unanswered_route_open(subscribe: bool) -> CallError {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -11418,7 +11562,7 @@ mod tests {
 
     #[tokio::test]
     async fn route_poll_deadline_bounds_writer_capacity() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -11463,7 +11607,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscription_deadline_bounds_writer_capacity() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -11575,7 +11719,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_list_sends_an_unfiltered_channel_zero_request() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -11620,7 +11764,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_snapshot_sends_a_channel_zero_request_and_returns_the_snapshot() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -11670,7 +11814,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_snapshot_refusal_keeps_the_daemon_code() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/does-not-exist"),
             ConsumerOptions::default(),
         ));
@@ -11934,7 +12078,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_completion_between_wait_decision_and_registration_wakes_caller() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/subc-client-rs-reconnect-wakeup"),
             ConsumerOptions::default(),
         ));
@@ -11964,7 +12108,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_list_deadline_is_not_sent_when_reconnection_stays_down() {
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             PathBuf::from("/tmp/subc-client-rs-catalog-list-unavailable"),
             ConsumerOptions {
                 call_timeout: Duration::from_millis(25),
@@ -11994,7 +12138,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        let shared = Arc::new(Shared::new(
+        let shared = Arc::new(reader_skew_tests::legacy_shared(
             path,
             ConsumerOptions {
                 call_timeout: Duration::from_millis(100),

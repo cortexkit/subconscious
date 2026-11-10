@@ -12,25 +12,25 @@ pub mod test_support;
 pub use activity::*;
 pub use consumer::{
     is_retryable_route_open_code, AppOpenError, CallError, CallOptions, CallReply, CancelHandle,
-    CancelOutcome, CatalogList, CloseRouteOptions, ConnectionFacts, ConnectionState,
-    ConsumerCapabilityError, ConsumerError, ConsumerOptions, ControlPush, CorrelationId,
-    HealthProbeResponse, NotSentCause, OutcomeUnknownCause, PendingReply, PushEvent, RequestBody,
-    RequestReservation, RetryBackoff, ReverseRequestContext, ReverseRequestError,
+    CancelOutcome, CatalogList, CatalogSubscription, CloseRouteOptions, ConnectionFacts,
+    ConnectionState, ConsumerCapabilityError, ConsumerError, ConsumerOptions, ControlPush,
+    CorrelationId, HealthProbeResponse, NotSentCause, OutcomeUnknownCause, PendingReply, PushEvent,
+    RequestBody, RequestReservation, RetryBackoff, ReverseRequestContext, ReverseRequestError,
     ReverseRequestRegistrationError, ReverseRequestRegistry, RouteCloseDisposition,
-    RouteCloseReason, RouteEndReason, RoutePollResult, ScopeBindProofRefusal, ScopeSelector,
-    ServerDescription, SpawnStreamError, SpawnSubscription, StderrTailResponse, SubcConsumer,
-    SubscribeOptions, Subscription, SubscriptionClosed, SubscriptionEnd, SupervisorAck,
-    SupervisorEntry, SupervisorHealthResponse, SupervisorListResponse,
-    SupervisorProvenanceResponse, DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW,
-    DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH, SPAWN_CURSOR_TOO_OLD,
-    SPAWN_SUBSCRIBER_LAGGED,
+    RouteCloseReason, RouteEndReason, RouteOpenTarget, RouteOpenTargetKind, RoutePollResult,
+    ScopeBindProofRefusal, ScopeSelector, ServerDescription, SpawnStreamError, SpawnSubscription,
+    StderrTailResponse, SubcConsumer, SubscribeOptions, Subscription, SubscriptionClosed,
+    SubscriptionEnd, SupervisorAck, SupervisorEntry, SupervisorHealthResponse,
+    SupervisorListResponse, SupervisorProvenanceResponse, ACCEPTED_CLOSE_REASONS,
+    DEFAULT_CALL_TIMEOUT, DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE,
+    SPAWN_CURSOR_INCARNATION_MISMATCH, SPAWN_CURSOR_TOO_OLD, SPAWN_SUBSCRIBER_LAGGED,
 };
 pub use operator_app::{operator_app_candidates, operator_app_path, OperatorAppPathError};
 pub use policy_cache::{
     PolicyResolveError, PolicyResolver, PolicyResolverConfig, PolicyResolverFootprint,
     PolicyVerdict, ProjectRef, Subject, DEFAULT_POLICY_RESOLVER_MODULE_ID,
 };
-pub use subc_control::{AppOpenReply, AppOpenStatus};
+pub use subc_control::{AppOpenReply, AppOpenStatus, CatalogOrigin, CatalogWatchResponse};
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -2214,8 +2214,12 @@ pub struct RouteBindRequest {
     ///   `operator.confirm`. Released daemons switch this policy off, so they
     ///   never send it yet.
     ///
-    /// The two keys decode together. If they don't decode, the bind still
-    /// reaches [`ModuleHandler::on_bind`] with both absent and a warning is
+    /// - `caller` is sent only for `caller-attestation/v1`. Automatic provider
+    ///   permission grants require a well-formed caller with claim `own` and `first_party: true`.
+    ///   An absent or incomplete caller establishes no first-party mark.
+    ///
+    /// The peer keys decode together. If they don't decode, the bind still
+    /// reaches [`ModuleHandler::on_bind`] with all absent and a warning is
     /// logged, so a handler that admits only on `operator_app` refuses it.
     pub peer: subc_protocol::peer::RouteBindPeer,
 }
@@ -3374,7 +3378,7 @@ where
             }
             let handle = module_handle.route_handle(route_channel, epoch);
             // The peer keys sit beside the bind's members in the same body.
-            // They decode as one value: if either is malformed both read as
+            // They decode as one value: if any is malformed all read as
             // absent, and the bind still goes to `on_bind`, which decides.
             let peer =
                 match serde_json::from_slice::<subc_protocol::peer::RouteBindPeer>(&frame.body) {

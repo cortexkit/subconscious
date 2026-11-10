@@ -221,3 +221,93 @@ async fn module_harness_preserves_explicit_call_mode() {
     );
     harness.shutdown().await;
 }
+
+fn caller_attestation() -> serde_json::Value {
+    json!({"incarnation":"daemon-1", "spawn":7, "authority_epoch":3,
+        "claim":"own", "first_party":true, "origin":"release",
+        "approved_declarations_digest":"approved",
+        "declaration":{"future":true}, "declaration_digest":"entry"})
+}
+
+#[tokio::test]
+async fn reader_skew_caller_reaches_bind_and_missing_fields_are_unmarked() {
+    assert_route_bind_remains_exhaustively_destructurable();
+    let caller = caller_attestation();
+    let request = decoded_bind_with(None, None, json!({"caller":caller})).await;
+    let observed = request.peer.caller.unwrap();
+    assert_eq!(observed.incarnation, "daemon-1");
+    assert_eq!(observed.spawn, 7);
+    assert_eq!(observed.authority_epoch, 3);
+    assert_eq!(observed.claim, subc_protocol::peer::CallerClaim::Own);
+    assert!(observed.first_party);
+    assert_eq!(observed.origin, subc_protocol::peer::CallerOrigin::Release);
+    assert_eq!(observed.declaration.unwrap()["future"], true);
+    assert_eq!(observed.declaration_digest.as_deref(), Some("entry"));
+    assert_eq!(observed.approved_declarations_digest, "approved");
+    assert!(decoded_bind(None, None).await.peer.caller.is_none());
+    for field in [
+        "incarnation",
+        "spawn",
+        "authority_epoch",
+        "claim",
+        "first_party",
+        "origin",
+        "approved_declarations_digest",
+    ] {
+        let mut incomplete = caller_attestation();
+        incomplete.as_object_mut().unwrap().remove(field);
+        let request = decoded_bind_with(None, None, json!({"caller":incomplete})).await;
+        assert!(
+            request.peer.caller.is_none(),
+            "missing {field} must be unmarked"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reader_skew_caller_unknown_values_and_malformed_integers_never_grant() {
+    let mut caller = caller_attestation();
+    caller["claim"] = json!("future");
+    caller["origin"] = json!("future");
+    let request = decoded_bind_with(None, None, json!({"caller":caller})).await;
+    let caller = request.peer.caller.unwrap();
+    assert_eq!(caller.claim, subc_protocol::peer::CallerClaim::Unknown);
+    assert_eq!(caller.origin, subc_protocol::peer::CallerOrigin::Other);
+    for field in ["spawn", "authority_epoch"] {
+        let mut malformed = caller_attestation();
+        malformed[field] = json!(1_u64 << 53);
+        let request = decoded_bind_with(None, None, json!({"caller":malformed})).await;
+        assert!(
+            request.peer.caller.is_none(),
+            "unsafe {field} must be unmarked"
+        );
+    }
+    let request = decoded_bind_with(None, None, json!({"caller":"malformed"})).await;
+    assert!(request.peer.caller.is_none());
+}
+
+fn assert_route_bind_remains_exhaustively_destructurable() {
+    // No catch-all is needed: caller remains a flattened companion key.
+    let bind: ModuleControlRequest = serde_json::from_value(json!({
+        "op":"route.bind", "route_channel":7, "epoch":1,
+        "target":RouteTarget::ToolProvider { module_id:"provider".into() },
+        "identity":BindIdentity::new("test", "reader"), "caller":caller_attestation()
+    }))
+    .unwrap();
+    let ModuleControlRequest::RouteBind {
+        route_channel,
+        epoch,
+        target: _,
+        identity: _,
+        principal: _,
+        consumer_capabilities: _,
+        role_versions: _,
+        admission_facts: _,
+        scope: _,
+        call_mode: _,
+    } = bind
+    else {
+        panic!("expected bind")
+    };
+    assert_eq!((route_channel, epoch), (7, 1));
+}

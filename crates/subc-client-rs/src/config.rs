@@ -20,7 +20,7 @@
 //! struct Counter { user_file: String, value: Mutex<serde_json::Value> }
 //! fn schema() -> serde_json::Value {
 //!     json!({"$schema":"https://json-schema.org/draft/2020-12/schema",
-//!       "type":"object","properties":{"count":{"type":"integer",
+//!       "type":"object","unevaluatedProperties":false,"properties":{"count":{"type":"integer",
 //!       "description":"Counter value","default":0,"x-ck-apply":"live",
 //!       "x-ck-layers":["user"]}}})
 //! }
@@ -32,10 +32,14 @@
 //!         .collect::<Result<Vec<_>, &str>>().map_err(str::to_owned)?;
 //!     let tuple = schema.review_tuple(&layers, &ValidationContext::new("counter", None))
 //!         .map_err(|_| "invalid counter configuration")?;
-//!     let old = request.base.as_ref().map(|v| v.effective.clone()).unwrap_or(schema.defaults());
+//!     let old = request.base.as_ref().map(|v| v.effective.clone()).unwrap_or(json!({"count":null}));
+//!     let old_source = request.base.as_ref().and_then(|v| v.sources.get("/count")).copied().unwrap_or(Layer::Default);
+//!     if old["count"] == tuple.effective["count"] && old_source == tuple.sources["/count"] {
+//!         return Ok(ConfigReviewReply::new(vec![], vec![]));
+//!     }
 //!     let mut field = FieldChange::new("counter", "/count", RecordedValue::new(old["count"].clone()),
 //!         RecordedValue::new(tuple.effective["count"].clone()), ApplyKind::Live);
-//!     field.old_source = request.base.as_ref().and_then(|v| v.sources.get("/count")).copied().unwrap_or(Layer::Default);
+//!     field.old_source = old_source;
 //!     field.new_source = tuple.sources["/count"];
 //!     Ok(ConfigReviewReply::new(vec![field], vec![]))
 //! }

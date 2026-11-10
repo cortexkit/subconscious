@@ -2,6 +2,8 @@
 
 ## 0.25.0
 
+- Correct the adopting sample's closed schema and review of absent or unchanged
+  fields; exercise the sample against a gate-capable daemon.
 - Providers retain HELLO_ACK `subc_capabilities` across registration and reconnect.
 - Add opt-in module configuration delivery through the provider's `config` option:
   declare per connection, pure review, immutable views, pending-generation ACK/NACK,

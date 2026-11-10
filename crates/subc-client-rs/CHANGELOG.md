@@ -2,6 +2,8 @@
 
 ## 0.34.3
 
+- Correct the adopting sample's closed schema and review of absent or unchanged
+  fields; exercise the documented hooks against a gate-capable daemon.
 - Add optional `ModuleHandler` configuration hooks: declare once, review immutable
   snapshots, apply complete views, and observe wire-named delivery/refusal states.
   Existing handlers advertise and send no new operations. Only a daemon without

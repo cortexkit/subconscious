@@ -427,7 +427,7 @@ impl SupervisedChild {
 
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         let result = self.child.try_wait();
-        if matches!(result, Ok(Some(_))) {
+        if !matches!(result, Ok(None)) {
             if let Some(binding) = &self._program_binding {
                 binding.retire();
             }
@@ -583,11 +583,22 @@ impl SupervisedChild {
                     .to_string(),
             ),
             Ok(Ok(_)) => match self.child.try_wait() {
-                // Empty EOF is the exec acknowledgement. A real module may exit
-                // immediately, including with a reserved trampoline status; no
-                // image is admitted, and its ordinary exit contract stays intact.
-                Ok(Some(_status)) => None,
-                Err(error) => Some(format!("privacy identity trampoline wait failed: {error}")),
+                // Confirmation also runs directly from actor and swap setup.
+                // Revoke at exit observation, before either caller can await.
+                Ok(Some(_status)) => {
+                    if let Some(binding) = &self._program_binding {
+                        binding.retire();
+                    }
+                    // Empty EOF acknowledges exec; preserve the real module's
+                    // ordinary exit contract, including trampoline-like statuses.
+                    None
+                }
+                Err(error) => {
+                    if let Some(binding) = &self._program_binding {
+                        binding.retire();
+                    }
+                    Some(format!("privacy identity trampoline wait failed: {error}"))
+                }
                 Ok(None) => {
                     let image = observe_spawned_image(self.pid);
                     if let Some(image) = image.filter(|image| {
@@ -620,8 +631,15 @@ impl SupervisedChild {
                         // Keep pending in self across await so cancellation does
                         // not discard validation or reset its original deadline.
                         match tokio::time::timeout_at(pending.deadline, self.child.wait()).await {
-                            Ok(Ok(_status)) => None,
-                            Ok(Err(error)) => Some(format!("privacy identity trampoline wait failed: {error}")),
+                            Ok(result) => {
+                                if let Some(binding) = &self._program_binding {
+                                    binding.retire();
+                                }
+                                match result {
+                                    Ok(_status) => None,
+                                    Err(error) => Some(format!("privacy identity trampoline wait failed: {error}")),
+                                }
+                            },
                             Err(_) => Some("privacy identity module executable remained unreadable until the 5s exec deadline".to_string()),
                         }
                     } else {
@@ -630,6 +648,10 @@ impl SupervisedChild {
                 }
             },
         };
+        #[cfg(test)]
+        if let Some(binding) = &self._program_binding {
+            binding.pause_after_wait_for_test().await;
+        }
         if cause.is_none() && self.report_ready.get().is_some() && pending.gated {
             let publication = pending.admission_binding.clone();
             let live = self.live_program_binding.clone();
@@ -665,8 +687,7 @@ impl SupervisedChild {
         let cause = match result {
             Ok(Ok(())) => None,
             Ok(Err(error))
-                if error.code != "program_refused"
-                    && self.child.try_wait().ok().flatten().is_some() =>
+                if error.code != "program_refused" && self.try_wait().ok().flatten().is_some() =>
             {
                 None
             }
@@ -2231,6 +2252,8 @@ struct SupervisedConfiguration {
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
     program_bindings: program_binding::ProgramBindings,
+    #[cfg(test)]
+    identity_sample_pause: Arc<Mutex<Option<IdentitySamplePause>>>,
     restart_intent: Arc<Mutex<DaemonRestartIntent>>,
     activity: Arc<Mutex<Option<crate::activity::ActivityLedger>>>,
     activity_images: Arc<Mutex<HashMap<String, activity::ActivityImage>>>,
@@ -2289,6 +2312,13 @@ pub struct SupervisorHandle {
     /// this daemon-wide ordering, a rescan could retire or update a module while a
     /// concurrent reload still held its old handle and launch specification.
     operation_lock: Arc<AsyncMutex<()>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct IdentitySamplePause {
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
 
 /// Told when a swap has promoted its candidate to be the module's active
@@ -2519,12 +2549,16 @@ impl SupervisorHandle {
 
     pub(crate) fn apply_identity_configuration(&self, spec: &ModuleSpec) {
         self.set_reserved_prefixes(&spec.module_id, &spec.reserved_prefixes);
-        let spawn_nonce = self
+        let current_nonces = self
             .spawn_nonces
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&spec.module_id)
-            .cloned();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let spawn_nonce = current_nonces.get(&spec.module_id).cloned();
+        #[cfg(test)]
+        if let Some(pause) = self.identity_sample_pause.lock().unwrap().take() {
+            pause.reached.send(()).unwrap();
+            pause.release.recv().unwrap();
+        }
         let mut reserved_nonces = self
             .reserved_nonces
             .lock()
@@ -2537,6 +2571,7 @@ impl SupervisorHandle {
             reserved_nonces.insert(spec.module_id.clone(), spawn_nonce);
         }
         drop(reserved_nonces);
+        drop(current_nonces);
         self.refresh_program_binding_nonces(&spec.module_id);
         // A later unreserved declaration must not silently unreserve an id that
         // was retained after its reserved configuration was removed. The explicit

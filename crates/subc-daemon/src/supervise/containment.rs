@@ -448,6 +448,20 @@ impl CarriedContainment {
                             Ok(None) => sleep(Duration::from_millis(1)).await,
                             Err(error) => {
                                 warn!(module_id = %self.module_id, %error, "carried process-group pin reap failed");
+                                let binding = self
+                                    .binding_retirement
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .as_ref()
+                                    .and_then(|hook| hook.upgrade());
+                                // A failed wait cannot prove the child is alive.
+                                if let Some(binding) = &binding {
+                                    binding.retire();
+                                }
+                                #[cfg(all(test, target_os = "linux"))]
+                                if let Some(binding) = &binding {
+                                    binding.pause_after_wait_for_test().await;
+                                }
                                 break;
                             }
                         }
@@ -1022,6 +1036,95 @@ impl Drop for ProcessChild {
 #[cfg(all(test, unix))]
 mod anchor_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn config_recovery_r5_carried_pin_wait_error_retires_before_cleanup() {
+        let mut command = Command::new("/bin/sleep");
+        command.arg("600").process_group(0).kill_on_drop(true);
+        let mut leader = command.spawn().unwrap();
+        let pid = leader.id().unwrap();
+        let birth = subc_os::process_group::inspect(pid)
+            .unwrap()
+            .unwrap()
+            .start_time;
+        let handle = SupervisorHandle::new();
+        handle.set_spawn_nonce("pin-error", "dead".into());
+        handle.set_reserved_nonce("pin-error", "dead".into());
+        let publication = handle
+            .begin_program_binding("pin-error", SpawnRole::Plain)
+            .unwrap();
+        handle.release_program_binding_witnesses_for_test();
+        leader.start_kill().unwrap();
+        // An external reap makes the owned Tokio pin return a real ECHILD.
+        rustix::process::waitpid(
+            rustix::process::Pid::from_raw(pid as i32),
+            rustix::process::WaitOptions::empty(),
+        )
+        .unwrap();
+        let container = Arc::new(CarriedContainment {
+            binding_retirement: Mutex::new(Some(publication.retirement_hook())),
+            module_id: "pin-error".into(),
+            counters: crate::observability::DaemonCounters::default(),
+            cleanup_block: Mutex::new(None),
+            group_signals: Mutex::new(None),
+            resource: Resource::Group {
+                identity: LaunchIdentity::capture().unwrap(),
+                pgid: pid,
+                created_start_time: Some(birth),
+                anchor_lost: std::sync::atomic::AtomicBool::new(false),
+                pin: Mutex::new(Some(leader)),
+                pending_pin: std::sync::atomic::AtomicBool::new(false),
+            },
+            roster: Mutex::new(None),
+            terminated: std::sync::atomic::AtomicBool::new(false),
+            ending: std::sync::atomic::AtomicBool::new(false),
+            admitting: std::sync::atomic::AtomicBool::new(false),
+            admission_changed: tokio::sync::Notify::new(),
+            cleanup_finished: tokio::sync::Notify::new(),
+            hard_killed: std::sync::atomic::AtomicBool::new(false),
+            kill_notify: tokio::sync::Notify::new(),
+        });
+        let (uncertain, release) = handle.pause_program_binding_exit_for_test("pin-error", "dead");
+        let terminating = tokio::spawn({
+            let container = container.clone();
+            async move { container.terminate().await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), uncertain)
+            .await
+            .unwrap()
+            .unwrap();
+        let handler =
+            crate::ControlHandler::new(Arc::new(Registry::default())).with_supervisor(handle);
+        let hello = subc_protocol::ModuleHelloBody {
+            manifest: subc_protocol::manifest::ModuleManifest::builder("pin-error", "1.0.0")
+                .build(),
+            protocol_ver: subc_protocol::PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: Some("dead".into()),
+        };
+        let reply = handler
+            .handle_control(
+                ConnectionId::new(99),
+                subc_protocol::Frame::build(
+                    subc_protocol::FrameType::Hello,
+                    control_flags(),
+                    0,
+                    0,
+                    1,
+                    serde_json::to_vec(&hello).unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        terminating.await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&reply[0].body).unwrap()["code"],
+            "program_refused",
+            "pin wait errors must revoke before group recovery awaits"
+        );
+    }
 
     #[tokio::test]
     async fn mismatched_pin_birth_refuses_every_group_signal_and_join() {

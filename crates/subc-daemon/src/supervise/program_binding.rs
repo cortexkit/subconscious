@@ -6,13 +6,13 @@ pub(super) struct ProgramBindingRecords {
     retired: HashMap<(String, String), ProgramBindingEntry>,
     acceptable: HashSet<(String, String)>,
     configured: HashSet<String>,
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, unix))]
     exit_pause: Option<ProgramBindingExitPause>,
 }
 type ProgramBindingTable = Mutex<ProgramBindingRecords>;
 pub(super) type ProgramBindings = Arc<ProgramBindingTable>;
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 #[derive(Debug)]
 struct ProgramBindingExitPause {
     key: (String, String),
@@ -23,8 +23,8 @@ struct ProgramBindingExitPause {
 // A negative record must survive child death: no record means an ungated legacy
 // launch, so erasing it would let the dead child's nonce bypass image checks.
 // Retain refusals for every nonce still accepted by identity, consumer or swap
-// admission. There are at most three: a respawn can outlive an old swap's drain.
-// Rotation and swap closure prune only nonces no acceptance surface recognizes.
+// admission. Keep a refusal for as long as any acceptance surface recognizes
+// its nonce; rotation and swap closure prune only nonces outside that union.
 // Configured-owner metadata survives unstamp so a later exit still records refusal.
 // Retirement refuses only the dead nonce, not a later unstamped spawn's fresh nonce.
 #[derive(Clone, Debug)]
@@ -52,14 +52,26 @@ pub(super) struct ProgramBindingRetirement {
     bindings: std::sync::Weak<ProgramBindingTable>,
     key: (String, String),
     retired: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    upgrade_pause: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
 }
 
 #[cfg(unix)]
 impl ProgramBindingRetirement {
     pub(super) fn upgrade(&self) -> Option<ProgramBindingPublication> {
+        // Drop uses the strong signal count to identify the last publication.
+        // Acquire live first so a failed live upgrade cannot make that final
+        // Drop skip retirement because a temporary extra signal owner exists.
+        let live = self.live.upgrade()?;
+        #[cfg(test)]
+        if let Some(pause) = &self.upgrade_pause {
+            pause.0.wait();
+            pause.1.wait();
+        }
+        let signal = self.signal.upgrade()?;
         Some(ProgramBindingPublication {
-            signal: self.signal.upgrade()?,
-            live: self.live.upgrade()?,
+            signal,
+            live,
             bindings: self.bindings.clone(),
             key: self.key.clone(),
             retired: self.retired.clone(),
@@ -76,9 +88,11 @@ impl ProgramBindingPublication {
             bindings: self.bindings.clone(),
             key: self.key.clone(),
             retired: self.retired.clone(),
+            #[cfg(test)]
+            upgrade_pause: None,
         }
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, unix))]
     pub(super) async fn pause_after_wait_for_test(&self) {
         let pause = self.bindings.upgrade().and_then(|bindings| {
             let mut records = bindings.lock().unwrap();
@@ -164,6 +178,10 @@ impl Drop for ProgramBindingPublication {
 
 impl SupervisorHandle {
     #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn release_program_binding_witnesses_for_test(&self) {
+        self.program_bindings.lock().unwrap().active.clear();
+    }
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) async fn close_actor_commands_for_test(&self, module: &mut SupervisedModule) {
         // Preserve nonce authority while reproducing receiver closure, rather
         // than retiring the configured identity or aborting its monitor task.
@@ -218,7 +236,7 @@ impl SupervisorHandle {
             .acceptable
             .extend(accepted.into_iter().map(|nonce| (module.to_owned(), nonce)));
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, unix))]
     pub(crate) fn pause_program_binding_exit_for_test(
         &self,
         module: &str,

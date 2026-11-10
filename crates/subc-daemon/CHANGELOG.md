@@ -2,6 +2,11 @@
 
 ## 0.41.10
 
+- Retire binding authority at direct macOS privacy-confirmation exit observations
+  and on uncertain synchronous waits. Publish identity reservations atomically
+  with their launch-nonce sample. Upgrade a carried retirement hook's live holder
+  before its signal, so a partial upgrade cannot suppress last-publication cleanup.
+
 - Retain a separate dead-binding refusal for every nonce still recognized by
   current, reserved or draining-swap admission; prune only after rotation or swap
   closure removes its last acceptance surface. Retire registration-timeout reaps

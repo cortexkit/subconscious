@@ -236,3 +236,226 @@ fn config_recovery_carried_retirement_hook_does_not_keep_publication_alive() {
     assert!(handle.has_program_binding_record("hook", "nonce"));
     assert!(!handle.has_live_verified_program_binding("hook", "nonce"));
 }
+
+fn retired_nonce_hello_code(
+    handle: SupervisorHandle,
+    module: &str,
+    nonce: &str,
+) -> serde_json::Value {
+    let handler = crate::ControlHandler::new(Arc::new(Registry::default())).with_supervisor(handle);
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder(module, "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: Some(nonce.into()),
+    };
+    let reply = handler
+        .handle_control(
+            crate::ConnectionId::new(98),
+            subc_protocol::Frame::build(
+                subc_protocol::FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                1,
+                serde_json::to_vec(&hello).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    serde_json::from_slice::<serde_json::Value>(&reply[0].body).unwrap()["code"].clone()
+}
+
+#[test]
+fn config_recovery_r5_identity_configuration_cannot_reaccept_rotated_dead_nonce() {
+    let handle = SupervisorHandle::new();
+    handle.set_spawn_nonce("identity-race", "dead".into());
+    handle.set_reserved_nonce("identity-race", "dead".into());
+    let publication = handle
+        .begin_program_binding("identity-race", SpawnRole::Plain)
+        .unwrap();
+    handle.program_bindings.lock().unwrap().active.clear();
+    publication.retire();
+    let spec = ModuleSpec {
+        module_id: "identity-race".into(),
+        program: "not-executed".into(),
+        args: Vec::new(),
+        env: Vec::new(),
+        reserved: true,
+        reserved_prefixes: Vec::new(),
+        protocol: ModuleProtocol::None,
+        overlap: Default::default(),
+        carry_containment: false,
+    };
+    let (reached, sampled) = std::sync::mpsc::channel();
+    let (release, resumed) = std::sync::mpsc::channel();
+    *handle.identity_sample_pause.lock().unwrap() = Some(IdentitySamplePause {
+        reached,
+        release: resumed,
+    });
+    let applying = std::thread::spawn({
+        let handle = handle.clone();
+        move || handle.apply_identity_configuration(&spec)
+    });
+    sampled.recv().unwrap();
+    // If the sample lock was released, complete rotation inside the old gap.
+    // With atomic sampling, the same real setter must wait until publication.
+    let rotation_can_complete = handle.spawn_nonces.try_lock().is_ok();
+    let (rotated, rotation_finished) = std::sync::mpsc::channel();
+    let rotating = std::thread::spawn({
+        let handle = handle.clone();
+        move || {
+            handle.set_spawn_nonce("identity-race", "fresh".into());
+            handle.set_reserved_nonce("identity-race", "fresh".into());
+            rotated.send(()).unwrap();
+        }
+    });
+    if rotation_can_complete {
+        rotation_finished.recv().unwrap();
+    }
+    release.send(()).unwrap();
+    applying.join().unwrap();
+    rotating.join().unwrap();
+    assert_eq!(
+        handle.reserved_nonces.lock().unwrap().get("identity-race"),
+        Some(&Some("fresh".into())),
+        "configuration must not resurrect its stale sample after rotation"
+    );
+    assert!(!handle.has_program_binding_record("identity-race", "dead"));
+    assert_eq!(
+        retired_nonce_hello_code(handle, "identity-race", "dead"),
+        "reserved_module"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn config_recovery_r5_partial_hook_upgrade_cannot_skip_last_publication_retirement() {
+    let handle = SupervisorHandle::new();
+    handle.set_spawn_nonce("hook-race", "dead".into());
+    handle.set_reserved_nonce("hook-race", "dead".into());
+    let publication = handle
+        .begin_program_binding("hook-race", SpawnRole::Plain)
+        .unwrap();
+    let mut hook = publication.retirement_hook();
+    handle.program_bindings.lock().unwrap().active.clear();
+    let pause = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+    hook.upgrade_pause = Some(pause.clone());
+    let upgrading = std::thread::spawn(move || hook.upgrade());
+    pause.0.wait();
+    drop(publication);
+    pause.1.wait();
+    assert!(upgrading.join().unwrap().is_none());
+    assert_eq!(
+        retired_nonce_hello_code(handle, "hook-race", "dead"),
+        "program_refused",
+        "a failed partial upgrade must not hide the last publication from Drop"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn config_recovery_r5_wrapper_wait_error_retires_before_return() {
+    let supervisor =
+        Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
+    let spec = ModuleSpec {
+        module_id: "wait-error".into(),
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "exit 0".into()],
+        env: Vec::new(),
+        reserved: false,
+        reserved_prefixes: Vec::new(),
+        protocol: ModuleProtocol::None,
+        overlap: Default::default(),
+        carry_containment: false,
+    };
+    let mut child = spawn_and_mark_running(
+        &spec,
+        &supervisor.runtime_config(),
+        &Arc::new(Mutex::new(SupervisorSnapshot::starting())),
+    )
+    .unwrap();
+    let handle = SupervisorHandle::new();
+    handle.set_spawn_nonce("wait-error", "dead".into());
+    handle.set_reserved_nonce("wait-error", "dead".into());
+    child._program_binding = handle.begin_program_binding("wait-error", SpawnRole::Plain);
+    handle.program_bindings.lock().unwrap().active.clear();
+    // Reap outside Tokio to exercise its real ECHILD result without replacing
+    // the production polling result or losing ownership of a living process.
+    rustix::process::waitpid(
+        rustix::process::Pid::from_raw(child.pid as i32),
+        rustix::process::WaitOptions::empty(),
+    )
+    .unwrap();
+    let result = child.try_wait();
+    let code = retired_nonce_hello_code(handle, "wait-error", "dead");
+    let _ = child.finish_exit(false).await;
+    assert_eq!(
+        result.unwrap_err().raw_os_error(),
+        Some(rustix::io::Errno::CHILD.raw_os_error())
+    );
+    assert_eq!(
+        code, "program_refused",
+        "an uncertain wait must revoke before any later work"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn config_recovery_r5_direct_privacy_confirmation_retires_before_return() {
+    let supervisor =
+        Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
+    let spec = ModuleSpec {
+        module_id: "privacy-reap".into(),
+        program: "/bin/sh".into(),
+        args: vec!["-c".into(), "exit 0".into()],
+        env: Vec::new(),
+        reserved: false,
+        reserved_prefixes: Vec::new(),
+        protocol: ModuleProtocol::None,
+        overlap: Default::default(),
+        carry_containment: false,
+    };
+    let mut child = spawn_and_mark_running(
+        &spec,
+        &supervisor.runtime_config(),
+        &Arc::new(Mutex::new(SupervisorSnapshot::starting())),
+    )
+    .unwrap();
+    assert!(
+        child.privacy_exec.is_some(),
+        "the real trampoline handshake must be pending"
+    );
+    let handle = SupervisorHandle::new();
+    handle.set_spawn_nonce("privacy-reap", "dead".into());
+    handle.set_reserved_nonce("privacy-reap", "dead".into());
+    child._program_binding = handle.begin_program_binding("privacy-reap", SpawnRole::Plain);
+    // Reproduce unstamp's witness release while keeping the current reserved nonce.
+    handle.program_bindings.lock().unwrap().active.clear();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while subc_os::child_exit::observe(child.pid).unwrap().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (reaped, release) = handle.pause_program_binding_exit_for_test("privacy-reap", "dead");
+    let confirming = tokio::spawn(async move {
+        // Deliberately do not call SupervisedChild::wait: both actor and swap
+        // creation call confirmation directly before their next awaited work.
+        child.confirm_privacy_exec().await;
+        child
+    });
+    tokio::time::timeout(Duration::from_secs(5), reaped)
+        .await
+        .unwrap()
+        .unwrap();
+    let code = retired_nonce_hello_code(handle, "privacy-reap", "dead");
+    release.send(()).unwrap();
+    let mut child = confirming.await.unwrap();
+    child.finish_exit(false).await.unwrap();
+    assert_eq!(
+        code, "program_refused",
+        "direct privacy-confirmation reap must revoke before commands or health probing can await"
+    );
+}

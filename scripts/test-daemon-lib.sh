@@ -46,7 +46,10 @@ deps=$(dirname "$test_binary")
 printf '%s\n' "$helpers" | awk '{print $3}' | while read -r helper; do
   [ -n "$helper" ] || continue
   for dir in "$deps" "$(dirname "$deps")"; do
-    [ "$(dirname "$helper")" = "$dir" ] || cp "$helper" "$dir/"
+    # Skip a destination that already is this file: cargo hard-links built
+    # binaries between the two folders, and Windows paths may be spelled
+    # differently, so compare files rather than path strings.
+    [ "$helper" -ef "$dir/$(basename "$helper")" ] || cp "$helper" "$dir/"
   done
 done
 exec "$test_binary" "$@"

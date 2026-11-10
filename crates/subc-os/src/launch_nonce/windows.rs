@@ -30,8 +30,8 @@ use windows_sys::Win32::{
     },
     Storage::FileSystem::{
         CreateFileW, FlushFileBuffers, ReadFile, WriteFile, FILE_FLAG_FIRST_PIPE_INSTANCE,
-        FILE_FLAG_OVERLAPPED, OPEN_EXISTING, PIPE_ACCESS_OUTBOUND, SECURITY_IDENTIFICATION,
-        SECURITY_SQOS_PRESENT,
+        FILE_FLAG_OVERLAPPED, FILE_WRITE_DATA, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
+        PIPE_ACCESS_OUTBOUND, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     },
     System::{
         Pipes::{
@@ -96,7 +96,19 @@ impl LaunchNoncePipeHandoff {
     }
 
     fn reserve_with_names(mut next: impl FnMut() -> io::Result<String>) -> io::Result<Self> {
-        let security = user_security_descriptor()?;
+        Self::reserve_access(&mut next, PIPE_ACCESS_OUTBOUND)
+    }
+
+    fn reserve_access(
+        mut next: impl FnMut() -> io::Result<String>,
+        access: u32,
+    ) -> io::Result<Self> {
+        let duplex = access == PIPE_ACCESS_DUPLEX;
+        let security = user_security_descriptor(if duplex {
+            CLIENT_ACCESS | FILE_WRITE_DATA
+        } else {
+            CLIENT_ACCESS
+        })?;
         let attrs = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: security.0,
@@ -111,11 +123,11 @@ impl LaunchNoncePipeHandoff {
             let result = owned(unsafe {
                 CreateNamedPipeW(
                     path.as_ptr(),
-                    PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+                    access | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
                     PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                     1,
                     MAX_NONCE_BYTES as u32,
-                    0,
+                    if duplex { MAX_NONCE_BYTES as u32 } else { 0 },
                     0,
                     &attrs,
                 )
@@ -253,6 +265,55 @@ impl LaunchNoncePipeHandoff {
             }
             drop(operation);
             return flush_delivery(self.pipe, process, deadline, cancelled, consumed.clone());
+        }
+    }
+}
+
+impl LaunchNoncePipeHandoff {
+    pub(crate) fn registration() -> io::Result<Self> {
+        Self::reserve_access(random_name, PIPE_ACCESS_DUPLEX)
+    }
+
+    pub(crate) fn accept_registration(
+        self,
+        pid: u32,
+        deadline: Instant,
+    ) -> io::Result<std::fs::File> {
+        // SAFETY: a fresh, non-inheritable process handle pins the child's PID.
+        let process = owned(unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) })?;
+        let handle = self.pipe.as_raw_handle();
+        loop {
+            // SAFETY: the pinned process handle is open for synchronization.
+            if Instant::now() >= deadline
+                || unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } == WAIT_OBJECT_0
+            {
+                return Err(timeout());
+            }
+            let mut operation = Operation::new(handle)?;
+            // SAFETY: the OVERLAPPED and event stay live until cancellation or completion.
+            if unsafe { ConnectNamedPipe(handle, &mut operation.overlapped) } == 0 {
+                let error = io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(code) if code == ERROR_PIPE_CONNECTED as i32 => {}
+                    Some(code) if code == ERROR_IO_PENDING as i32 => {
+                        operation.pending = true;
+                        operation.wait(deadline, Some(&process), None)?;
+                    }
+                    _ => return Err(error),
+                }
+            }
+            drop(operation);
+            let mut client_pid = 0;
+            // SAFETY: connected server handle and writable PID output. No reads precede this check.
+            if unsafe { GetNamedPipeClientProcessId(handle, &mut client_pid) } != 0
+                && client_pid == pid
+            {
+                return Ok(std::fs::File::from(self.pipe));
+            }
+            // SAFETY: disconnect only our client; keep the original first-instance handle.
+            if unsafe { DisconnectNamedPipe(handle) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
         }
     }
 }
@@ -426,7 +487,7 @@ impl Drop for LocalAllocation {
     }
 }
 
-fn user_security_descriptor() -> io::Result<LocalAllocation> {
+fn user_security_descriptor(client_access: u32) -> io::Result<LocalAllocation> {
     let mut token = null_mut();
     // SAFETY: current process pseudo-handle is valid; output points to initialized storage.
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
@@ -469,10 +530,11 @@ fn user_security_descriptor() -> io::Result<LocalAllocation> {
     drop(sid_allocation);
     // libuv's read-only fallback also requests FILE_WRITE_ATTRIBUTES to set
     // its own handle's read mode: https://github.com/nodejs/node/blob/main/deps/uv/src/win/pipe.c#L139-L194.
-    // Grant that bit, GENERIC_READ and SYNCHRONIZE only. GENERIC_WRITE includes
-    // FILE_CREATE_PIPE_INSTANCE and must never be granted to clients.
+    // Grant that bit, GENERIC_READ and SYNCHRONIZE. Duplex registration also
+    // grants FILE_WRITE_DATA, but never GENERIC_WRITE: it includes the right
+    // to create another server instance under the same name.
     let sddl = wide(OsStr::new(&format!(
-        "D:P(A;;0x{CLIENT_ACCESS:08x};;;{sid_text})"
+        "D:P(A;;0x{client_access:08x};;;{sid_text})"
     )));
     let mut descriptor = null_mut();
     // SAFETY: null-terminated SDDL and valid output pointer; revision 1 is SDDL_REVISION_1.
@@ -707,6 +769,7 @@ mod registration_channel_tests {
         "launch_nonce::windows::registration_channel_tests::registration_channel_contract";
     const HELPER_TEST: &str =
         "launch_nonce::windows::registration_channel_tests::helper_claim_handoff_contract";
+    const SERVER_TEST: &str = "launch_nonce::windows::registration_channel_tests::registration_server_rejects_foreign_and_retains_instance";
     const MODE: &str = "SUBC_OS_REGISTRATION_TEST_MODE";
     const CLAIM: &str = "test-helper-claim-not-for-logs";
 
@@ -786,6 +849,91 @@ mod registration_channel_tests {
             assert_eq!(byte, b'x');
         }
         Ok(count)
+    }
+
+    #[test]
+    fn registration_server_rejects_foreign_and_retains_instance() {
+        if std::env::var_os(MODE).is_some() {
+            let mut release = [0];
+            std::io::stdin().read_exact(&mut release).unwrap();
+            let pipe: OwnedHandle = take_registration_channel()
+                .unwrap()
+                .unwrap()
+                .into_file()
+                .into();
+            assert_eq!(transfer(&pipe, true).unwrap(), 1);
+            assert_eq!(transfer(&pipe, false).unwrap(), 1);
+            return;
+        }
+        let pipe = RegistrationPipe::new().unwrap();
+        let name = pipe.name().to_owned();
+        let mut process = child(SERVER_TEST, "direct-child")
+            .env(REGISTRATION_PIPE_ENV, &name)
+            .env(DAEMON_PID_ENV, std::process::id().to_string())
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let path = wide(OsStr::new(&name));
+        // SAFETY: a live pipe name and non-inheritable overlapped client handle.
+        let foreign = owned(unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_READ | FILE_WRITE_DATA,
+                0,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
+                null_mut(),
+            )
+        })
+        .unwrap();
+        assert_eq!(transfer(&foreign, true).unwrap(), 1);
+        let pid = process.id();
+        let accepting =
+            std::thread::spawn(move || pipe.accept(pid, Instant::now() + Duration::from_secs(5)));
+        let read = transfer(&foreign, false);
+        assert!(matches!(&read, Ok(0)) || read.as_ref().err().is_some_and(pipe_eof));
+        // Neither a second instance nor a replacement first instance is allowed
+        // after rejection. The original handle must reserve the name throughout.
+        for flags in [0, FILE_FLAG_FIRST_PIPE_INSTANCE] {
+            // SAFETY: valid name; an accidentally successful handle is closed below.
+            assert!(owned(unsafe {
+                CreateNamedPipeW(
+                    path.as_ptr(),
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | flags,
+                    PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                    1,
+                    512,
+                    512,
+                    0,
+                    null(),
+                )
+            })
+            .is_err());
+        }
+        process.stdin.take().unwrap().write_all(b"x").unwrap();
+        let server: OwnedHandle = accepting.join().unwrap().unwrap().into();
+        let mut accepted_pid = 0;
+        // SAFETY: accepted pipe and scalar output.
+        assert_ne!(
+            unsafe { GetNamedPipeClientProcessId(server.as_raw_handle(), &mut accepted_pid) },
+            0
+        );
+        assert_eq!(accepted_pid, pid);
+        assert_eq!(transfer(&server, false).unwrap(), 1);
+        assert_eq!(transfer(&server, true).unwrap(), 1);
+        success(process.wait_with_output().unwrap());
+    }
+
+    #[test]
+    fn registration_server_uses_registration_deadline() {
+        let pipe = RegistrationPipe::new().unwrap();
+        let deadline = Instant::now() + Duration::from_millis(1100);
+        // The legacy nonce server expires at one second. Registration retains
+        // its instance until the caller's deadline, even without a client.
+        let result = pipe.accept(std::process::id(), deadline);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(Instant::now() >= deadline);
     }
 
     #[test]

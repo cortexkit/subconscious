@@ -83,6 +83,8 @@ mod missing_path_tests;
 mod program_binding_tests;
 #[cfg(all(test, windows))]
 mod program_binding_windows_tests;
+#[cfg(all(test, windows))]
+mod windows_channel_tests;
 pub use config_exit_failure::ModuleStopReason;
 #[cfg(all(test, unix))]
 mod config_exit_hold_tests;
@@ -323,10 +325,15 @@ fn privacy_command(
     ))
 }
 
+#[cfg(unix)]
+type SpawnRegistrationChannel = std::os::unix::net::UnixStream;
+#[cfg(windows)]
+type SpawnRegistrationChannel = subc_os::registration_channel::RegistrationPipe;
+
 struct SupervisedChild {
     /// Owned daemon endpoint, retained for the per-spawn registration service.
-    #[cfg(unix)]
-    registration_channel: Option<std::os::unix::net::UnixStream>,
+    #[cfg(any(unix, windows))]
+    registration_channel: Option<SpawnRegistrationChannel>,
     live_program_binding: Option<Arc<content_binding::LiveProgramBinding>>,
     registered_config_connection: Option<ConnectionId>,
     admission_base: Option<subc_config::Digest>,
@@ -432,7 +439,7 @@ impl SupervisedChild {
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         let result = self.child.try_wait();
         if !matches!(result, Ok(None)) {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             self.registration_channel.take();
             if let Some(binding) = &self._program_binding {
                 binding.retire();
@@ -452,7 +459,7 @@ impl SupervisedChild {
         // caller releases it after recording the exit (`release_roster`), and
         // dropping the handle releases it too.
         let result = self.child.wait().await;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         self.registration_channel.take();
         // All plain and swap waits pass here. Revoke the reaped child's nonce
         // before cgroup cleanup, stderr draining or exit observation can await.
@@ -10130,6 +10137,33 @@ fn apply_child_env(command: &mut Command, spec: &ModuleSpec) {
 }
 
 #[cfg(windows)]
+fn prepare_windows_registration_pipe(
+    command: &mut Command,
+    spec: &ModuleSpec,
+) -> Result<Option<SpawnRegistrationChannel>, SuperviseError> {
+    if spec.protocol == ModuleProtocol::None {
+        return Ok(None);
+    }
+    let pipe = subc_os::registration_channel::RegistrationPipe::new().map_err(|source| {
+        SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source,
+            cgroup_path: None,
+        }
+    })?;
+    command
+        .env(
+            subc_os::registration_channel::REGISTRATION_PIPE_ENV,
+            pipe.name(),
+        )
+        .env(
+            subc_os::registration_channel::DAEMON_PID_ENV,
+            std::process::id().to_string(),
+        );
+    Ok(Some(pipe))
+}
+
+#[cfg(windows)]
 fn prepare_windows_nonce_pipe(
     command: &mut Command,
     spec: &ModuleSpec,
@@ -10368,8 +10402,8 @@ impl Drop for AsyncInitialIdentity<'_> {
 /// this value returns, the async caller validates its launch witness and creates
 /// and publishes the child without another await.
 struct PreparedChild {
-    #[cfg(unix)]
-    registration_channel: Option<std::os::unix::net::UnixStream>,
+    #[cfg(any(unix, windows))]
+    registration_channel: Option<SpawnRegistrationChannel>,
     config_context: Option<config_delivery::ConfigDelivery>,
     binding_publication: Option<ProgramBindingPublication>,
     launch_spec: ModuleSpec,
@@ -10888,6 +10922,8 @@ fn prepare_child_in_slot(
     } else {
         None
     };
+    #[cfg(windows)]
+    let registration_channel = prepare_windows_registration_pipe(&mut command, spec)?;
     let binding_publication = if spawn_admission
         .as_ref()
         .is_some_and(|admission| admission.launch.is_some())
@@ -11076,7 +11112,7 @@ fn prepare_child_in_slot(
         }
     }
     Ok(PreparedChild {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         registration_channel,
         config_context: delivery_context.map(|delivery| delivery.runtime()),
         binding_publication,
@@ -11178,7 +11214,7 @@ fn launch_child_in_slot(
             pending.expected = expected_image;
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let registration_channel = prepared.registration_channel;
     #[cfg(windows)]
     let image_capture = prepared.image_capture;
@@ -11581,7 +11617,7 @@ fn launch_child_in_slot(
     #[cfg(not(any(target_os = "linux", windows)))]
     let subtree_target = crate::subtree_resources::Target::Unavailable("unsupported_platform");
     let mut supervised = SupervisedChild {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         registration_channel,
         live_program_binding: None,
         registered_config_connection: None,

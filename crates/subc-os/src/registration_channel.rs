@@ -36,6 +36,31 @@ pub const HELPER_CLAIM_FD_ENV: &str = "SUBC_HELPER_CLAIM_FD";
 pub const HELPER_CLAIM_PIPE_ENV: &str = "SUBC_HELPER_CLAIM_PIPE";
 pub const HELPER_PARENT_PID_ENV: &str = "SUBC_HELPER_PARENT_PID";
 
+/// A single duplex registration instance reserved before process creation.
+/// Retaining this value keeps the name reserved even after a foreign client is
+/// disconnected. No stream is exposed until the direct child's PID is checked.
+#[cfg(windows)]
+pub struct RegistrationPipe(crate::LaunchNoncePipeHandoff);
+
+#[cfg(windows)]
+impl RegistrationPipe {
+    pub fn new() -> std::io::Result<Self> {
+        crate::LaunchNoncePipeHandoff::registration().map(Self)
+    }
+
+    pub fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    /// Accept only the owned child's connection, without reading any bytes.
+    /// The caller must still own the child while its process handle is pinned.
+    /// Use the spawn's registration deadline, not the legacy nonce serve window.
+    /// The returned file owns an overlapped handle, not a synchronous stream.
+    pub fn accept(self, pid: u32, deadline: std::time::Instant) -> std::io::Result<std::fs::File> {
+        self.0.accept_registration(pid, deadline)
+    }
+}
+
 /// Parent-owned sources for the final, allocation-free descriptor placement.
 /// Sources stay above all three reserved slots so stdio setup and placement
 /// callbacks cannot overwrite one before it is copied.
@@ -490,10 +515,10 @@ mod windows {
         time::{Duration, Instant},
     };
     use windows_sys::Win32::{
-        Foundation::{ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE},
+        Foundation::{ERROR_PIPE_BUSY, GENERIC_READ, INVALID_HANDLE_VALUE},
         Storage::FileSystem::{
-            CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING, SECURITY_IDENTIFICATION,
-            SECURITY_SQOS_PRESENT,
+            CreateFileW, FILE_FLAG_OVERLAPPED, FILE_WRITE_DATA, OPEN_EXISTING,
+            SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
         },
         System::Pipes::GetNamedPipeServerProcessId,
     };
@@ -514,7 +539,9 @@ mod windows {
             let handle = unsafe {
                 CreateFileW(
                     name.as_ptr(),
-                    GENERIC_READ | GENERIC_WRITE,
+                    // GENERIC_WRITE also requests FILE_CREATE_PIPE_INSTANCE.
+                    // A client needs data writes, never server-creation rights.
+                    GENERIC_READ | FILE_WRITE_DATA,
                     0,
                     null(),
                     OPEN_EXISTING,

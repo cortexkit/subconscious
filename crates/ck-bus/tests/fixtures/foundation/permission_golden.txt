@@ -342,6 +342,32 @@ allow prefrontal-routing publish ck.box_goldenfixture.effect.dead
 allow prefrontal-routing publish ck.box_goldenfixture.event.prefrontal-routing.>
 allow prefrontal-routing subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
 allow prefrontal-routing subscribe _INBOX.prefrontal-routing.>
+allow striatum publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EFFECT.*.>
+allow striatum publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum.>
+allow striatum publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
+allow striatum publish $JS.ACK.CK_BOX_GOLDENFIXTURE_WAKE.*.>
+allow striatum publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS
+allow striatum publish $JS.API.CONSUMER.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
+allow striatum publish $JS.API.CONSUMER.DELETE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
+allow striatum publish $JS.API.CONSUMER.DURABLE.CREATE.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
+allow striatum publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EFFECT.*
+allow striatum publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum
+allow striatum publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_PEER.*
+allow striatum publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_WAKE.*
+allow striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EFFECT.*
+allow striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum
+allow striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_PEER.*
+allow striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_WAKE.*
+allow striatum publish $JS.API.DIRECT.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS.>
+allow striatum publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_EFFECT
+allow striatum publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_PEER
+allow striatum publish $JS.API.STREAM.INFO.CK_BOX_GOLDENFIXTURE_WAKE
+allow striatum publish $JS.API.STREAM.INFO.KV_CK_BOX_GOLDENFIXTURE_CENSUS
+allow striatum publish $JS.API.STREAM.MSG.GET.KV_CK_BOX_GOLDENFIXTURE_CENSUS
+allow striatum publish ck.box_goldenfixture.effect.dead
+allow striatum publish ck.box_goldenfixture.event.striatum.>
+allow striatum subscribe $KV.CK_BOX_GOLDENFIXTURE_CENSUS.>
+allow striatum subscribe _INBOX.striatum.>
 allow thalamus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EFFECT.*.>
 allow thalamus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus.>
 allow thalamus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_PEER.*.>
@@ -451,6 +477,7 @@ expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDE
 expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_cerebellum foreign-event-durable
 expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context foreign-event-durable
 expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
+expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum foreign-event-durable
 expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus foreign-event-durable
 expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness foreign-event-durable
 expect-refused delivery-authority publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_ROOM.m_ckbus foreign-room-durable
@@ -518,6 +545,7 @@ expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_
 expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context foreign-event-durable
 expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
 expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
+expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum foreign-event-durable
 expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus foreign-event-durable
 expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness foreign-event-durable
 expect-refused astrocyte publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
@@ -549,6 +577,7 @@ expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVEN
 expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context foreign-event-durable
 expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
 expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
+expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum foreign-event-durable
 expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus foreign-event-durable
 expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness foreign-event-durable
 expect-refused broca publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
@@ -579,6 +608,7 @@ expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE
 expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context foreign-event-durable
 expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
 expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
+expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum foreign-event-durable
 expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus foreign-event-durable
 expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness foreign-event-durable
 expect-refused cerebellum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
@@ -610,6 +640,7 @@ expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXT
 expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_cerebellum foreign-event-durable
 expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
 expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
+expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum foreign-event-durable
 expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus foreign-event-durable
 expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness foreign-event-durable
 expect-refused magic-context publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
@@ -641,6 +672,7 @@ expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDE
 expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_cerebellum foreign-event-durable
 expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context foreign-event-durable
 expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
+expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum foreign-event-durable
 expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus foreign-event-durable
 expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness foreign-event-durable
 expect-refused prefrontal-routing publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
@@ -656,6 +688,38 @@ expect-refused prefrontal-routing publish ck.box_goldenfixture.event.broca.run.v
 expect-refused prefrontal-routing publish ck.box_goldenfixture.event.insula.quota_sampled.v1 foreign-module-event
 expect-refused prefrontal-routing publish ck.box_goldenfixture.inbox.head.*.ready core-delivery-publish
 expect-refused prefrontal-routing publish ck.box_goldenfixture.inbox.worker.*.ready core-delivery-publish
+expect-refused striatum publish $JS.ACK.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core.> core-delivery-durable
+expect-refused striatum publish $JS.ACK.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead.> bus-diagnostic-durable
+expect-refused striatum publish $JS.ACK.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core.> core-delivery-durable
+expect-refused striatum publish $JS.API.CONSUMER.CREATE.CK_BOX_GOLDENFIXTURE_EVENT event-consumer-create
+expect-refused striatum publish $JS.API.CONSUMER.DELETE.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum event-consumer-delete
+expect-refused striatum publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core core-delivery-durable
+expect-refused striatum publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead bus-diagnostic-durable
+expect-refused striatum publish $JS.API.CONSUMER.INFO.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
+expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core core-delivery-durable
+expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead bus-diagnostic-durable
+expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_astrocyte foreign-event-durable
+expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_basal foreign-event-durable
+expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_broca foreign-event-durable
+expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_cerebellum foreign-event-durable
+expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context foreign-event-durable
+expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
+expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
+expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus foreign-event-durable
+expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness foreign-event-durable
+expect-refused striatum publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
+expect-refused striatum publish $JS.API.STREAM.MSG.GET.CK_BOX_GOLDENFIXTURE_EVENT event-direct-read
+expect-refused striatum publish ck.box_goldenfixture.core_work.campaign.*.run core-delivery-publish
+expect-refused striatum publish ck.box_goldenfixture.core_work.consult.*.run core-delivery-publish
+expect-refused striatum publish ck.box_goldenfixture.core_work.effect.*.run core-delivery-publish
+expect-refused striatum publish ck.box_goldenfixture.core_work.hire.*.run core-delivery-publish
+expect-refused striatum publish ck.box_goldenfixture.core_work.spec.*.run core-delivery-publish
+expect-refused striatum publish ck.box_goldenfixture.core_work.work.*.run core-delivery-publish
+expect-refused striatum publish ck.box_goldenfixture.delivery.dead core-delivery-publish
+expect-refused striatum publish ck.box_goldenfixture.event.broca.run.v1 foreign-module-event
+expect-refused striatum publish ck.box_goldenfixture.event.insula.quota_sampled.v1 foreign-module-event
+expect-refused striatum publish ck.box_goldenfixture.inbox.head.*.ready core-delivery-publish
+expect-refused striatum publish ck.box_goldenfixture.inbox.worker.*.ready core-delivery-publish
 expect-refused thalamus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_CORE_WORK.m_prefrontal-core.> core-delivery-durable
 expect-refused thalamus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_DELIVERY_DEAD.c_ckbus_dead.> bus-diagnostic-durable
 expect-refused thalamus publish $JS.ACK.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core.> core-delivery-durable
@@ -673,6 +737,7 @@ expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_E
 expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context foreign-event-durable
 expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
 expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
+expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum foreign-event-durable
 expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus-harness foreign-event-durable
 expect-refused thalamus publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
 expect-refused thalamus publish $JS.API.STREAM.MSG.GET.CK_BOX_GOLDENFIXTURE_EVENT event-direct-read
@@ -704,6 +769,7 @@ expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENF
 expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_magic-context foreign-event-durable
 expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-core foreign-event-durable
 expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_prefrontal-routing foreign-event-durable
+expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_striatum foreign-event-durable
 expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_EVENT.m_thalamus foreign-event-durable
 expect-refused thalamus-harness publish $JS.API.CONSUMER.MSG.NEXT.CK_BOX_GOLDENFIXTURE_INBOX.m_prefrontal-core core-delivery-durable
 expect-refused thalamus-harness publish $JS.API.STREAM.MSG.GET.CK_BOX_GOLDENFIXTURE_EVENT event-direct-read

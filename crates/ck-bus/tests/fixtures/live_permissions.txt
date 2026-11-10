@@ -26,6 +26,10 @@ allow prefrontal-routing publish ck.box_goldenfixture.live.prefrontal-routing.>
 allow prefrontal-routing subscribe ck.box_goldenfixture.live.broca.step.finished.v1
 allow prefrontal-routing subscribe ck.box_goldenfixture.live.insula.>
 allow prefrontal-routing subscribe ck.box_goldenfixture.live.thalamus-harness.step.finished.v1
+allow striatum publish ck.box_goldenfixture.live.striatum.>
+allow striatum subscribe ck.box_goldenfixture.live.broca.step.finished.v1
+allow striatum subscribe ck.box_goldenfixture.live.insula.>
+allow striatum subscribe ck.box_goldenfixture.live.thalamus-harness.step.finished.v1
 allow thalamus publish ck.box_goldenfixture.live.thalamus.>
 allow thalamus subscribe ck.box_goldenfixture.live.magic-context.compaction.>
 allow thalamus-harness publish ck.box_goldenfixture.live.thalamus-harness.>
@@ -45,6 +49,8 @@ expect-refused magic-context publish ck.box_goldenfixture.live.broca.run.v1 fore
 expect-refused magic-context publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
 expect-refused prefrontal-routing publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused prefrontal-routing publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
+expect-refused striatum publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
+expect-refused striatum publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
 expect-refused thalamus publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live
 expect-refused thalamus publish ck.box_goldenfixture.live.insula.quota_sampled.v1 foreign-module-live
 expect-refused thalamus-harness publish ck.box_goldenfixture.live.broca.run.v1 foreign-module-live

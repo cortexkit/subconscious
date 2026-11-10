@@ -439,6 +439,8 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
         .expect("magic-context's issued participant grant");
     let routing = grants::issued_grant(&account, "prefrontal-routing", "prefrontal-routing", &[])
         .expect("prefrontal-routing's issued participant grant");
+    let striatum = grants::issued_grant(&account, "striatum", "striatum", &[])
+        .expect("striatum's issued participant grant");
     let thalamus_harness =
         grants::issued_grant(&account, "thalamus-harness", "thalamus-harness", &[])
             .expect("thalamus-harness's issued participant grant");
@@ -456,6 +458,7 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
         (Principal::EventConsumer("broca"), &broca),
         (Principal::EventConsumer("magic-context"), &magic_context),
         (Principal::EventConsumer("prefrontal-routing"), &routing),
+        (Principal::EventConsumer("striatum"), &striatum),
         (
             Principal::EventConsumer("thalamus-harness"),
             &thalamus_harness,
@@ -624,9 +627,9 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "276a9054566885f3251a65499541ea3e3d09d866"
+        "400c43874a4fba610c4f8f3eaff183a989fe5bb1"
     );
-    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.3.2");
+    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.3.4");
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),
         ("permission_golden.txt", "golden_sha256"),

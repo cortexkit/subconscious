@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.4
+
+- The routing module's new id, `striatum`, gets the same bus access as `prefrontal-routing`, from the shared bus naming tables (cortexkit-bus-naming 0.3.4) that define each module's event durable and live-hint reads: its own event durable `m_striatum` reading Insula's quota events, the runners' content-free `step.finished.v1` live hints, and the standard participant grants for its own id. Bootstrap creates `m_striatum` beside `m_prefrontal-routing`, which is unchanged. The new id stays reserved and disabled in the daemon until the routing module moves.
+
 ## 0.6.3
 
 - `m_prefrontal-core` also reads Basal's fifth flow-instance lifecycle event, `event.basal.flow_instance_rescheduled.v1` (cortexkit-bus-naming 0.3.3). Bootstrap adds the subject to the existing durable's filter in place and keeps its position in the stream. Basal already publishes under `event.basal.>`; core's delivery-authority grant gains the matching content-free hint subject, `live.basal.flow_instance_rescheduled.v1`, as for the other four.

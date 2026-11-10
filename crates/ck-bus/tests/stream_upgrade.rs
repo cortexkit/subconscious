@@ -956,6 +956,10 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
             vec![format!("ck.{}.event.insula.>", plane.names.account())],
         ),
         (
+            "m_striatum",
+            vec![format!("ck.{}.event.insula.>", plane.names.account())],
+        ),
+        (
             "m_magic-context",
             vec![
                 format!(

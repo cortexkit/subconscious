@@ -2128,14 +2128,16 @@ impl ControlHandler {
                 // Channel-0 cancellation withdraws approvals and subscriptions
                 // and fences pending agent declarations;
                 // successful cancellation has no ordinary reply.
+                // A config Apply may also own an OS prompt. Cancel that prompt
+                // before config cancellation can report the request handled.
                 if self
                     .agent_declarations
                     .cancel(ctx.connection_id, frame.header.corr)
-                    || self.cancel_config_approval(ctx.connection_id, frame.header.corr)
                     || self
                         .forwarding
                         .operator_confirms()
                         .cancel(ctx.connection_id, frame.header.corr)
+                    || self.cancel_config_approval(ctx.connection_id, frame.header.corr)
                     || self
                         .supervisor
                         .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)

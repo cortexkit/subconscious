@@ -379,6 +379,44 @@ mod unix_tests {
     }
 
     #[test]
+    fn combined_slot_pre_exec_is_allocation_free() {
+        if !in_isolated_process() {
+            return;
+        }
+        use crate::registration_channel::{registration_socketpair, ChildDescriptorSlots};
+        let mut slots = ChildDescriptorSlots::default();
+        slots.nonce(LaunchNonceHandoff::new(NONCE).unwrap());
+        let (_parent, child, _) = registration_socketpair().unwrap();
+        slots.channel(child).unwrap();
+        let (_reader, writer) = std::io::pipe().unwrap();
+        let _reader = crate::registration_channel::outside_child_slots(_reader.into()).unwrap();
+        slots.acknowledgement(writer.into()).unwrap();
+        for source in slots.sources.iter().flatten() {
+            assert!(source.as_raw_fd() >= 6);
+        }
+        let before = allocations();
+        let placed = slots.place();
+        let refused = crate::registration_channel::place_descriptor(-1, 250);
+        let after = allocations();
+        assert!(placed.is_ok());
+        assert!(refused.is_err());
+        assert_eq!(after - before, 0, "combined slot placement allocated");
+        for slot in 3..=5 {
+            // SAFETY: this isolated process owns the copies just placed here.
+            #[allow(unsafe_code)]
+            let flags = unsafe { libc::fcntl(slot, libc::F_GETFD) };
+            assert_eq!(flags, 0, "slot {slot} must survive exec");
+        }
+        let mut nonce = String::new();
+        // SAFETY: the slot is a fresh duplicate, not owned by another value.
+        #[allow(unsafe_code)]
+        unsafe { File::from_raw_fd(3) }
+            .read_to_string(&mut nonce)
+            .unwrap();
+        assert_eq!(nonce, NONCE);
+    }
+
+    #[test]
     fn the_pre_exec_step_does_not_allocate() {
         if !in_isolated_process() {
             return;

@@ -54,13 +54,14 @@ fn main() {
         .unwrap();
         return;
     }
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .env("SUBC_RESOURCE_FIXTURE_BURN", "1")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
+    let mut child = subc_os::child_spawn::spawn(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .env("SUBC_RESOURCE_FIXTURE_BURN", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
+    )
+    .unwrap();
     assert!(child.wait().unwrap().success());
     std::fs::write(dir.join("reaped"), "").unwrap();
     loop {

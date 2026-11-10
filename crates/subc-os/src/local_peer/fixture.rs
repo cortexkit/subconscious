@@ -18,7 +18,7 @@ pub struct SignedPeerFixture {
 }
 
 fn run(command: &mut Command) {
-    let output = command.output().expect("fixture tool starts");
+    let output = crate::child_spawn::output(command).expect("fixture tool starts");
     assert!(
         output.status.success(),
         "{command:?}: {}",
@@ -67,11 +67,12 @@ impl SignedPeerFixture {
             sign.arg("--entitlements").arg(entitlements);
         }
         run(sign.arg(&binary));
-        let child = Command::new(binary)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .spawn()
-            .unwrap();
+        let child = crate::child_spawn::spawn(
+            Command::new(binary)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null()),
+        )
+        .unwrap();
         Self { child, directory }
     }
 

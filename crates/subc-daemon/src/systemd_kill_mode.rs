@@ -131,9 +131,16 @@ pub(crate) async fn warn_if_kill_mode_defeats_ordered_shutdown() {
     command
         .args(["show", "-p", "KillMode", "-p", "LoadState", "--", &unit])
         .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
-    let output = match tokio::time::timeout(SYSTEMCTL_TIMEOUT, command.output()).await {
+    let output = match tokio::time::timeout(SYSTEMCTL_TIMEOUT, async {
+        subc_os::child_spawn::tokio_spawn(&mut command)?
+            .wait_with_output()
+            .await
+    })
+    .await
+    {
         Ok(Ok(output)) if output.status.success() => String::from_utf8(output.stdout).ok(),
         Ok(Ok(output)) => {
             tracing::debug!(unit, status = %output.status, "systemctl show failed; not checking the unit's KillMode");

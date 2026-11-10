@@ -270,7 +270,7 @@ impl Gate {
         let runtime = tokio::runtime::Handle::current();
         attempt.spawning = Some(std::thread::spawn(move || {
             let _runtime = runtime.enter();
-            command.spawn()
+            subc_os::child_spawn::tokio_spawn(&mut command)
         }));
         #[cfg(test)]
         checkpoint(roster, &spec.module_id, "before_pid_report", None)?;

@@ -378,7 +378,7 @@ mod macos {
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::null());
-        let mut child = command.spawn()?;
+        let mut child = crate::child_spawn::spawn(&mut command)?;
         drop(command);
         let result = (|| {
             let answer = read_until_eof(reader, deadline, 256)?;

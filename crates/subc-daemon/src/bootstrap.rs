@@ -1005,14 +1005,14 @@ const NOFILE_TARGET: u64 = 65536;
 #[cfg(unix)]
 fn raise_nofile_limit() {
     #[cfg(target_os = "macos")]
-    let ceiling = std::process::Command::new("/usr/sbin/sysctl")
-        .args(["-n", "kern.maxfilesperproc"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0);
+    let ceiling = subc_os::child_spawn::output(
+        std::process::Command::new("/usr/sbin/sysctl").args(["-n", "kern.maxfilesperproc"]),
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .and_then(|output| String::from_utf8(output.stdout).ok())
+    .and_then(|value| value.trim().parse::<u64>().ok())
+    .filter(|value| *value > 0);
     #[cfg(not(target_os = "macos"))]
     let ceiling = None;
     raise_nofile_limit_with_ceiling(ceiling);

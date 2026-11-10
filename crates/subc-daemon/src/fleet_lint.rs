@@ -428,7 +428,12 @@ async fn read_manifest(
         .arg("--manifest")
         .stdin(Stdio::null())
         .kill_on_drop(true);
-    let output = match time::timeout(manifest_timeout, command.output()).await {
+    let output = match time::timeout(
+        manifest_timeout,
+        subc_os::child_spawn::tokio_output(&mut command),
+    )
+    .await
+    {
         Ok(Ok(output)) => output,
         Ok(Err(_)) => return Err(OperationalClass::ProgramNotExecutable),
         Err(_) => return Err(OperationalClass::ManifestTimeout),

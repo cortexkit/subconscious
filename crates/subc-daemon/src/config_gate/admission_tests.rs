@@ -76,6 +76,18 @@ fn approve(_rig: &Rig, owner: &RuntimeOwner, kind: PlanKind) -> u64 {
 }
 
 #[test]
+fn unix_channel_gated_admission_records_withhold_nonce() {
+    let rig = rig();
+    let owner = rig.owner("channel-only");
+    rig.stamp(&owner);
+    let spec = spec(&rig);
+    let admission = owner.prepare_spawn(&spec).unwrap();
+    crate::supervise::unix_channel_placement_tests::assert_channel_only_admission(
+        &spec, &admission,
+    );
+}
+
+#[test]
 fn config_admission_changed_binary_is_held_and_refused_once_per_identity() {
     let rig = rig();
     let owner = rig.owner("binary");

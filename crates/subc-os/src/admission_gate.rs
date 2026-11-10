@@ -5,6 +5,8 @@
 //! Serialize gate lifetimes before calling `install`: overlapping pre-exec
 //! children could otherwise inherit each other's writers and prevent EOF when
 //! their parent dies. Other children must exec without waiting on these gates.
+//! Gate report and permission pipes stay at fd 6 or above, outside stdio (0-2),
+//! the legacy nonce (3), registration channel (4), and exec acknowledgement (5).
 
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -37,8 +39,8 @@ pub struct PlacementBarrier {
 impl AdmissionGate {
     /// Register PID reporting before any callback that can block in child
     /// placement. Install the returned `PlacementBarrier` after those callbacks
-    /// and before `LaunchNonceHandoff::install_last` replaces descriptor 3.
-    /// Every descriptor remains CLOEXEC and is outside stdio and nonce fd 3.
+    /// and before `ChildDescriptorSlots` fills slots 3-5.
+    /// Every descriptor remains CLOEXEC and is outside the reserved slots.
     pub fn install(command: &mut Command) -> io::Result<(Self, PlacementBarrier)> {
         let (ready, report) = io::pipe()?;
         let (permission, go) = io::pipe()?;
@@ -194,12 +196,12 @@ impl AdmissionGate {
 }
 
 fn outside_stdio(fd: OwnedFd) -> io::Result<OwnedFd> {
-    if fd.as_raw_fd() > 3 {
+    if fd.as_raw_fd() >= 6 {
         return Ok(fd);
     }
     // SAFETY: duplicate a live descriptor above the launch-reserved range.
     #[allow(unsafe_code)]
-    let copy = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 4) };
+    let copy = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 6) };
     if copy < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -309,6 +311,45 @@ mod tests {
     use super::*;
     use cortexkit_test_support::ScratchDir;
     static GATES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn admission_sources_avoid_all_reserved_slots() {
+        const ISOLATED: &str = "SUBC_ADMISSION_SLOT_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["admission_sources_avoid_all_reserved_slots", "--nocapture"])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let file = std::fs::File::open("/dev/null").unwrap();
+        // SAFETY: this isolated test owns slot 4, and no other test runs here.
+        #[allow(unsafe_code)]
+        let reserved = unsafe {
+            assert_eq!(libc::dup2(file.as_raw_fd(), 4), 4);
+            OwnedFd::from_raw_fd(4)
+        };
+        let moved = outside_stdio(reserved).unwrap();
+        assert!(
+            moved.as_raw_fd() >= 6,
+            "gate source collided with a child slot"
+        );
+        let mut command = Command::new("/bin/true");
+        let (gate, _placement) = AdmissionGate::install(&mut command).unwrap();
+        for fd in gate.descriptors {
+            assert!(fd >= 6);
+            // SAFETY: these four descriptors are still owned by the gate/command.
+            #[allow(unsafe_code)]
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+    }
 
     struct OwnedReportedChild(u32, u64);
     impl OwnedReportedChild {

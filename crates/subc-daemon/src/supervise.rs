@@ -73,6 +73,8 @@ mod carried_job_tests;
 mod config_delivery;
 mod content_binding;
 mod program_binding;
+#[cfg(all(test, unix))]
+pub(crate) mod unix_channel_placement_tests;
 use program_binding::ProgramBindingPublication;
 mod config_exit_failure;
 #[cfg(all(test, any(target_os = "linux", windows)))]
@@ -206,18 +208,19 @@ pub(crate) fn test_privacy_trampoline() -> PathBuf {
 #[cfg(target_os = "macos")]
 fn probe_privacy_trampoline(path: &std::path::Path) -> Result<(), String> {
     use std::io::Read;
-    let mut probe = std::process::Command::new(path)
-        .args(["__disclaim-exec", "--probe-suspended"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            format!(
-                "privacy trampoline probe failed for {}: {error}",
-                path.display()
-            )
-        })?;
+    let mut probe = subc_os::child_spawn::spawn(
+        std::process::Command::new(path)
+            .args(["__disclaim-exec", "--probe-suspended"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .map_err(|error| {
+        format!(
+            "privacy trampoline probe failed for {}: {error}",
+            path.display()
+        )
+    })?;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let status = loop {
         match probe.try_wait() {
@@ -321,6 +324,9 @@ fn privacy_command(
 }
 
 struct SupervisedChild {
+    /// Owned daemon endpoint, retained for the per-spawn registration service.
+    #[cfg(unix)]
+    registration_channel: Option<std::os::unix::net::UnixStream>,
     live_program_binding: Option<Arc<content_binding::LiveProgramBinding>>,
     registered_config_connection: Option<ConnectionId>,
     admission_base: Option<subc_config::Digest>,
@@ -426,6 +432,8 @@ impl SupervisedChild {
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         let result = self.child.try_wait();
         if !matches!(result, Ok(None)) {
+            #[cfg(unix)]
+            self.registration_channel.take();
             if let Some(binding) = &self._program_binding {
                 binding.retire();
             }
@@ -444,6 +452,8 @@ impl SupervisedChild {
         // caller releases it after recording the exit (`release_roster`), and
         // dropping the handle releases it too.
         let result = self.child.wait().await;
+        #[cfg(unix)]
+        self.registration_channel.take();
         // All plain and swap waits pass here. Revoke the reaped child's nonce
         // before cgroup cleanup, stderr draining or exit observation can await.
         if let Some(binding) = &self._program_binding {
@@ -9968,7 +9978,7 @@ fn untrack_if_registration_released(
 /// `SUBC_MODULE_ID` is set on every path since an unread variable is inert.
 ///
 /// The plain-spawn form, kept for the tests that assert its plan; spawns go
-/// through [`apply_wire_spawn_args_for_role`].
+/// through [`apply_wire_spawn_args_for_admission`].
 #[cfg(test)]
 fn apply_wire_spawn_args(
     command: &mut Command,
@@ -9986,7 +9996,7 @@ fn apply_wire_spawn_args(
 }
 
 /// The read end of a spawn's launch-nonce pipe, prepared by
-/// [`apply_wire_spawn_args_for_role`] and installed as the child's descriptor 3
+/// [`apply_wire_spawn_args_for_admission`] and installed as the child's descriptor 3
 /// by the last pre-exec step, just before `spawn()`. Windows prepares a named
 /// server before spawn and authenticates its client after the child exists.
 #[cfg(unix)]
@@ -10009,19 +10019,28 @@ type NonceHandoff = std::convert::Infallible;
 /// a pipe whose read end the child gets as descriptor 3, named by
 /// `SUBC_LAUNCH_NONCE_FD=3:<pipe inode>`: unlike the environment, another
 /// process of the same user cannot read it with `ps eww`. That handoff is
-/// returned rather than installed here, because installing it replaces
-/// whatever the child has at descriptor 3 and so must be the last pre-exec
-/// step. Later in `spawn_child_in_slot`, `apply_cgroup_placement` first registers
-/// the Linux callback that writes the process into its cgroup. Only after that
-/// does `handoff.install_last` register the descriptor-3 replacement, so it
-/// cannot close a descriptor the cgroup callback still needs.
+/// returned rather than installed here. The combined descriptor placement runs
+/// after the cgroup callback and placement barrier, so replacing slots 3-5
+/// cannot close a descriptor either callback still needs.
 /// Windows keeps SUBC_LAUNCH_NONCE as well until every module reads the named pipe.
+#[cfg(test)]
 fn apply_wire_spawn_args_for_role(
     command: &mut Command,
     spec: &ModuleSpec,
     connection_file_path: Option<&std::path::Path>,
     handle: Option<&SupervisorHandle>,
     role: SpawnRole,
+) -> Result<Option<NonceHandoff>, SuperviseError> {
+    apply_wire_spawn_args_for_admission(command, spec, connection_file_path, handle, role, None)
+}
+
+fn apply_wire_spawn_args_for_admission(
+    command: &mut Command,
+    spec: &ModuleSpec,
+    connection_file_path: Option<&std::path::Path>,
+    handle: Option<&SupervisorHandle>,
+    role: SpawnRole,
+    admission: Option<&crate::config_gate::runtime::SpawnAdmission>,
 ) -> Result<Option<NonceHandoff>, SuperviseError> {
     command.env(SUBC_MODULE_ID_ENV, &spec.module_id);
     // SUBC_LAUNCH_NONCE_FD is removed for every child, `protocol: "none"`
@@ -10036,11 +10055,41 @@ fn apply_wire_spawn_args_for_role(
     }
     // Remove inherited or configured copies too: withholding must mean absent.
     command.env_remove(SUBC_LAUNCH_NONCE_ENV);
+    command.env_remove(subc_os::registration_channel::REGISTRATION_FD_ENV);
+    command.env_remove(subc_os::registration_channel::REGISTRATION_PIPE_ENV);
+    command.env_remove(subc_os::registration_channel::DAEMON_PID_ENV);
     if spec.protocol == ModuleProtocol::None {
         return Ok(None);
     }
     if let Some(connection_file_path) = connection_file_path {
         command.arg(SUBC_ARG).arg(connection_file_path);
+    }
+
+    if admission.is_some_and(|admission| admission.approved_base().is_some()) {
+        // An approved admission record requires registration over the inherited
+        // channel, with no launch nonce. Remove prior nonce records before the
+        // replacement exists; a module config flag cannot select this policy.
+        if let Some(handle) = handle {
+            handle
+                .spawn_nonces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&spec.module_id);
+            handle
+                .reserved_nonces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&spec.module_id);
+            if role == SpawnRole::SwapCandidate {
+                handle
+                    .swaps
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&spec.module_id);
+            }
+            handle.refresh_program_binding_nonces(&spec.module_id);
+        }
+        return Ok(None);
     }
 
     // Every subc-wire spawn receives a fresh one-time launch nonce for consumer
@@ -10344,6 +10393,8 @@ impl Drop for AsyncInitialIdentity<'_> {
 /// this value returns, the async caller validates its launch witness and creates
 /// and publishes the child without another await.
 struct PreparedChild {
+    #[cfg(unix)]
+    registration_channel: Option<std::os::unix::net::UnixStream>,
     config_context: Option<config_delivery::ConfigDelivery>,
     binding_publication: Option<ProgramBindingPublication>,
     launch_spec: ModuleSpec,
@@ -10367,8 +10418,6 @@ struct PreparedChild {
     output_sink: ChildOutputSink,
     #[cfg(target_os = "macos")]
     privacy_exec: Option<PrivacyExec>,
-    #[cfg(target_os = "macos")]
-    exec_ack: subc_os::privacy_identity::ExecAcknowledgement,
     #[cfg(windows)]
     image_capture: subc_os::ExecutableCapture,
     #[cfg(windows)]
@@ -10829,8 +10878,41 @@ fn prepare_child_in_slot(
     // wins over anything ambient.
     apply_child_env(&mut command, spec);
     apply_spawn_role(&mut command, role);
-    let nonce_handoff =
-        apply_wire_spawn_args_for_role(&mut command, spec, connection_file_path, handle, role)?;
+    let nonce_handoff = apply_wire_spawn_args_for_admission(
+        &mut command,
+        spec,
+        connection_file_path,
+        handle,
+        role,
+        spawn_admission.as_ref(),
+    )?;
+    #[cfg(unix)]
+    let mut slots = subc_os::registration_channel::ChildDescriptorSlots::default();
+    #[cfg(unix)]
+    let registration_channel = if spec.protocol == ModuleProtocol::Subc {
+        let (parent, child, metadata) = subc_os::registration_channel::registration_socketpair()
+            .map_err(|source| SuperviseError::Spawn {
+                program: spec.program.clone(),
+                source,
+                cgroup_path: None,
+            })?;
+        slots
+            .channel(child)
+            .map_err(|source| SuperviseError::Spawn {
+                program: spec.program.clone(),
+                source,
+                cgroup_path: None,
+            })?;
+        command
+            .env(subc_os::registration_channel::REGISTRATION_FD_ENV, metadata)
+            .env(
+                subc_os::registration_channel::DAEMON_PID_ENV,
+                std::process::id().to_string(),
+            );
+        Some(parent)
+    } else {
+        None
+    };
     let binding_publication = if spawn_admission
         .as_ref()
         .is_some_and(|admission| admission.launch.is_some())
@@ -10890,8 +10972,6 @@ fn prepare_child_in_slot(
     } else {
         None
     };
-    #[cfg(target_os = "macos")]
-    exec_ack.install(command.as_std_mut());
     #[cfg(target_os = "linux")]
     if let Some(path) = &cgroup_path {
         apply_cgroup_placement(&mut command, spec, path)?;
@@ -10953,12 +11033,22 @@ fn prepare_child_in_slot(
     if let Some(gate) = &mut admission_gate {
         gate.install_placement(&mut command);
     }
-    // The LAST pre-exec step, after the cgroup placement above: installing the
-    // nonce at descriptor 3 replaces whatever the child had there, which could
-    // be the descriptor an earlier step writes through.
+    // Fill all reserved slots in one allocation-free step, after placement has
+    // stopped using descriptors that the fixed slots may replace.
     #[cfg(unix)]
-    if let Some(handoff) = nonce_handoff {
-        handoff.install_last(command.as_std_mut());
+    {
+        if let Some(handoff) = nonce_handoff {
+            slots.nonce(handoff);
+        }
+        #[cfg(target_os = "macos")]
+        slots
+            .acknowledgement(exec_ack.into_descriptor())
+            .map_err(|source| SuperviseError::Spawn {
+                program: spec.program.clone(),
+                source,
+                cgroup_path: cgroup_path.clone(),
+            })?;
+        slots.install(command.as_std_mut());
     }
     #[cfg(not(any(unix, windows)))]
     let _ = nonce_handoff;
@@ -11011,6 +11101,8 @@ fn prepare_child_in_slot(
         }
     }
     Ok(PreparedChild {
+        #[cfg(unix)]
+        registration_channel,
         config_context: delivery_context.map(|delivery| delivery.runtime()),
         binding_publication,
         launch_spec,
@@ -11034,8 +11126,6 @@ fn prepare_child_in_slot(
         output_sink,
         #[cfg(target_os = "macos")]
         privacy_exec,
-        #[cfg(target_os = "macos")]
-        exec_ack,
         #[cfg(windows)]
         image_capture,
         #[cfg(windows)]
@@ -11113,8 +11203,8 @@ fn launch_child_in_slot(
             pending.expected = expected_image;
         }
     }
-    #[cfg(target_os = "macos")]
-    let exec_ack = prepared.exec_ack;
+    #[cfg(unix)]
+    let registration_channel = prepared.registration_channel;
     #[cfg(windows)]
     let image_capture = prepared.image_capture;
     #[cfg(windows)]
@@ -11141,10 +11231,17 @@ fn launch_child_in_slot(
                     }),
             )
             .map(|(child, admitted)| (child, Some(admitted))),
-        None => command.spawn().map(|child| (child, None)),
+        None => {
+            let spawned =
+                subc_os::child_spawn::tokio_spawn(&mut command).map(|child| (child, None));
+            // The callback owns all child-only sources. Closing them here is
+            // necessary for channel EOF and macOS exec acknowledgement EOF.
+            drop(command);
+            spawned
+        }
     };
     #[cfg(not(unix))]
-    let spawned = command.spawn();
+    let spawned = subc_os::child_spawn::tokio_spawn(&mut command);
     let spawned = match spawned {
         Ok(child) => child,
         Err(source) => {
@@ -11177,12 +11274,6 @@ fn launch_child_in_slot(
     let mut child = spawned;
     #[cfg(test)]
     spawn_record_tests::after_create(&child, spec);
-    // The parent must close its writer now: the acknowledgement pipe reports EOF
-    // only when every writer is gone, and the child's copy closes when the
-    // trampoline replaces itself with the module. Command holds only an integer
-    // in its pre_exec callback, not another writer.
-    #[cfg(target_os = "macos")]
-    drop(exec_ack);
 
     // Bind while the child is still suspended, before job assignment resumes it.
     // Keeping the executable handle open across CreateProcessW denies rename
@@ -11515,6 +11606,8 @@ fn launch_child_in_slot(
     #[cfg(not(any(target_os = "linux", windows)))]
     let subtree_target = crate::subtree_resources::Target::Unavailable("unsupported_platform");
     let mut supervised = SupervisedChild {
+        #[cfg(unix)]
+        registration_channel,
         live_program_binding: None,
         registered_config_connection: None,
         admission_base,
@@ -12006,12 +12099,13 @@ fn resume_suspended_child(pid: u32, spec: &ModuleSpec) -> Result<(), SuperviseEr
         // Kill it here rather than leaving a suspended process for the caller
         // to notice; `kill_on_drop` would eventually do this, but the module
         // would have been reported as running in between.
-        let _ = std::process::Command::new("taskkill.exe")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = subc_os::child_spawn::status(
+            std::process::Command::new("taskkill.exe")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null()),
+        );
         return Err(SuperviseError::Spawn {
             program: spec.program.clone(),
             source,
@@ -19126,6 +19220,7 @@ mod cgroup_placement_tests {
             .expect("spawn short-lived child");
         let pid = child.id().expect("spawned child has pid");
         let mut child = SupervisedChild {
+            registration_channel: None,
             live_program_binding: None,
             registered_config_connection: None,
             admission_base: None,

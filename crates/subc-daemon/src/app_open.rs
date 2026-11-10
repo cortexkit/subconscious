@@ -574,7 +574,7 @@ impl ControlHandler {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let mut child = command.spawn().map_err(|error| {
+        let mut child = subc_os::child_spawn::spawn(&mut command).map_err(|error| {
             AppOpenRefusal::not_installed(format!(
                 "installed file {} could not be started: {error}",
                 path.display()
@@ -615,7 +615,7 @@ impl ControlHandler {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|error| {
+        let mut child = subc_os::child_spawn::tokio_spawn(&mut command).map_err(|error| {
             AppOpenRefusal::not_installed(format!("transient scope could not start: {error}"))
         })?;
         let stdout = child.stdout.take().ok_or_else(|| {
@@ -852,7 +852,7 @@ impl ControlHandler {
         // `app.open` sends no launch arguments: the wire carries only the app id.
         #[cfg(test)]
         self.windows_spawn_attempts.fetch_add(1, Ordering::Relaxed);
-        let mut child = command.spawn().map_err(|error| {
+        let mut child = subc_os::child_spawn::spawn(&mut command).map_err(|error| {
             AppOpenRefusal::verification_failed(format!(
                 "installed file {} could not be started: {error}",
                 path.display()

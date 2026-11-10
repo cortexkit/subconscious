@@ -36,6 +36,119 @@ pub const HELPER_CLAIM_FD_ENV: &str = "SUBC_HELPER_CLAIM_FD";
 pub const HELPER_CLAIM_PIPE_ENV: &str = "SUBC_HELPER_CLAIM_PIPE";
 pub const HELPER_PARENT_PID_ENV: &str = "SUBC_HELPER_PARENT_PID";
 
+/// Parent-owned sources for the final, allocation-free descriptor placement.
+/// Sources stay above all three reserved slots so stdio setup and placement
+/// callbacks cannot overwrite one before it is copied.
+#[cfg(unix)]
+#[derive(Default)]
+pub struct ChildDescriptorSlots {
+    pub(crate) sources: [Option<std::os::fd::OwnedFd>; 3],
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+impl ChildDescriptorSlots {
+    pub fn nonce(&mut self, nonce: crate::LaunchNonceHandoff) {
+        self.sources[0] = Some(nonce.into_descriptor());
+    }
+
+    pub fn channel(&mut self, channel: std::os::fd::OwnedFd) -> std::io::Result<()> {
+        self.sources[1] = Some(outside_child_slots(channel)?);
+        Ok(())
+    }
+
+    pub fn acknowledgement(&mut self, ack: std::os::fd::OwnedFd) -> std::io::Result<()> {
+        self.sources[2] = Some(outside_child_slots(ack)?);
+        Ok(())
+    }
+
+    /// Install after the placement barrier. Drop the command immediately after
+    /// spawn to close the parent's copies of the child-only descriptors.
+    pub fn install(self, command: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: sources are owned by the callback. Only dup2 and fcntl run in
+        // the forked child; no allocation, destructors or locks run there.
+        unsafe { command.pre_exec(move || self.place()) };
+    }
+
+    pub(crate) fn place(&self) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        for (index, source) in self.sources.iter().enumerate() {
+            if let Some(source) = source {
+                let slot = index as i32 + 3;
+                // SAFETY: parent preparation owns all sources above slot 5.
+                place_descriptor(source.as_raw_fd(), slot)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn place_descriptor(source: i32, slot: i32) -> std::io::Result<()> {
+    // SAFETY: callers retain the source across fork. Both calls are
+    // async-signal-safe, and an errno-only error needs no allocation.
+    if unsafe { libc::dup2(source, slot) } == -1
+        || unsafe { libc::fcntl(slot, libc::F_SETFD, 0) } == -1
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn outside_child_slots(
+    descriptor: std::os::fd::OwnedFd,
+) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // SAFETY: duplicate a live descriptor, retaining CLOEXEC in the parent.
+    let copy = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 6) };
+    if copy == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a new descriptor owned only here.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(copy) })
+}
+
+/// A socketpair ready for a supervised Unix spawn. Creation and Darwin's
+/// CLOEXEC setup hold the same lock as every daemon fork.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn registration_socketpair(
+) -> std::io::Result<(std::os::unix::net::UnixStream, std::os::fd::OwnedFd, String)> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let _guard = crate::child_spawn::creation_lock();
+    let mut pair = [-1; 2];
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
+    // SAFETY: socketpair writes exactly two descriptors into the local array.
+    if unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, pair.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: both newly created descriptors are uniquely owned here.
+    let (parent, child) = unsafe { (OwnedFd::from_raw_fd(pair[0]), OwnedFd::from_raw_fd(pair[1])) };
+    #[cfg(not(target_os = "linux"))]
+    for fd in [&parent, &child] {
+        // SAFETY: creation and flag setup are serialized against every fork.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    let parent = outside_child_slots(parent)?;
+    let child = outside_child_slots(child)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat initializes the local buffer on success.
+    if unsafe { libc::fstat(child.as_raw_fd(), stat.as_mut_ptr()) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let inode = unsafe { stat.assume_init() }.st_ino;
+    Ok((parent.into(), child, format!("4:{inode}")))
+}
+
 /// Why a named channel was not adopted. No variant contains a path or a secret.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -255,7 +368,7 @@ mod unix {
         result == 0 && addr.sun_family as i32 == libc::AF_UNIX && no_path
     }
 
-    fn peer_pid(fd: RawFd) -> Option<u32> {
+    pub(super) fn peer_pid(fd: RawFd) -> Option<u32> {
         #[cfg(target_os = "linux")]
         {
             // SAFETY: SO_PEERCRED fills a ucred of the declared size.
@@ -297,6 +410,14 @@ mod unix {
     }
 
     pub(super) fn adopt(value: &OsStr, daemon: u32) -> Decision {
+        adopt_with_stat(value, daemon, stat)
+    }
+
+    pub(super) fn adopt_with_stat(
+        value: &OsStr,
+        daemon: u32,
+        stat: impl Fn(RawFd) -> io::Result<libc::stat>,
+    ) -> Decision {
         let validate = || {
             let (fd, inode) = value
                 .to_str()
@@ -312,8 +433,10 @@ mod unix {
             }
             // Darwin commonly reports zero for socket inodes. A nonzero inode
             // remains binding; zero falls back to socket names and peer PID.
-            let usable_inode = !cfg!(target_os = "macos") || stat.st_ino != 0;
-            if usable_inode && stat.st_ino as u64 != inode {
+            // ino_t is narrower than u64 on some Unix targets.
+            #[allow(clippy::unnecessary_cast)]
+            let actual_inode = stat.st_ino as u64;
+            if !inode_matches(actual_inode, inode) {
                 return Err(RegistrationRefusal::WrongInode);
             }
             if !unnamed(fd, false) || !unnamed(fd, true) {
@@ -346,6 +469,10 @@ mod unix {
             Ok(RegistrationChannel { stream })
         };
         Decision::validated(channel)
+    }
+
+    pub(super) fn inode_matches(actual: u64, expected: u64) -> bool {
+        (cfg!(target_os = "macos") && actual == 0) || actual == expected
     }
 }
 
@@ -588,6 +715,85 @@ mod tests {
     const HELPER_TEST: &str = "registration_channel::tests::helper_claim_handoff_contract";
     const MODE: &str = "SUBC_OS_REGISTRATION_TEST_MODE";
     const CLAIM: &str = "test-helper-claim-not-for-logs";
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_zero_inode_retains_socket_names_and_peer_pid_checks() {
+        fn no_inode(fd: i32) -> std::io::Result<libc::stat> {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: the writable output is read only after successful fstat.
+            if unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let mut stat = unsafe { stat.assume_init() };
+            stat.st_ino = 0;
+            Ok(stat)
+        }
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let fd = stream.into_raw_fd();
+        let decision =
+            unix::adopt_with_stat(format!("{fd}:999").as_ref(), std::process::id(), no_inode);
+        assert!(
+            decision.supervised,
+            "zero inode socketpair refused: {:?}",
+            decision.refusal
+        );
+        drop(decision.take().unwrap());
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let value = format!("{}:999", stream.as_raw_fd());
+        assert_eq!(
+            unix::adopt_with_stat(value.as_ref(), std::process::id() + 1, no_inode).refusal,
+            Some(RegistrationRefusal::WrongPeer)
+        );
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let value = format!("{}:999", file.as_raw_fd());
+        assert_eq!(
+            unix::adopt_with_stat(value.as_ref(), std::process::id(), no_inode).refusal,
+            Some(RegistrationRefusal::NotSocket)
+        );
+        // A relative address stays below Darwin's sockaddr_un path limit even
+        // when the checkout or the test runner's scratch root has a long name.
+        let path =
+            std::path::PathBuf::from(format!("target/scratch/zero-inode-{}", std::process::id()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        let stream = UnixStream::connect(&path).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let value = format!("{}:999", stream.as_raw_fd());
+        assert_eq!(
+            unix::adopt_with_stat(value.as_ref(), std::process::id(), no_inode).refusal,
+            Some(RegistrationRefusal::NamedSocket)
+        );
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+        eprintln!("Darwin zero-inode fallback: socketpair adopted; non-socket, named peer and wrong peer PID refused");
+    }
+
+    #[test]
+    fn unix_channel_parent_prepares_cloexec_sources() {
+        let (parent, child, metadata) = registration_socketpair().unwrap();
+        for fd in [parent.as_raw_fd(), child.as_raw_fd()] {
+            assert!(fd >= 6, "socket source collided with a reserved slot");
+            // SAFETY: inspect flags on these owned descriptors.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+        let actual = inode(child.as_raw_fd());
+        assert_eq!(metadata, format!("4:{actual}"));
+        let peer = unix::peer_pid(child.as_raw_fd());
+        eprintln!(
+            "socketpair: peer_pid={peer:?} inode={actual} usable_inode={} both_cloexec=true",
+            actual != 0
+        );
+        assert_eq!(peer, Some(std::process::id()));
+        assert!(unix::inode_matches(actual, actual));
+        assert!(!unix::inode_matches(12, 13));
+        #[cfg(target_os = "macos")]
+        assert!(
+            unix::inode_matches(0, 13),
+            "zero inode must retain the other three validators"
+        );
+    }
 
     fn child(test: &str, mode: &str) -> Command {
         let mut command = Command::new(std::env::current_exe().unwrap());

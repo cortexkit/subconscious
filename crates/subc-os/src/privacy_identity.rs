@@ -7,7 +7,7 @@
 //! `POSIX_SPAWN_SETEXEC`, a Darwin flag that replaces the calling process's
 //! image in place (like `execve`) instead of creating a child, after marking the
 //! spawn as disclaiming responsibility. The module keeps the trampoline's pid,
-//! process group, pipes and fd-3 launch-nonce descriptor, and becomes its own
+//! process group, pipes and inherited registration descriptors, and becomes its own
 //! responsible process.
 //!
 //! Use [`DisclaimedCommand`] for children of modules as well as supervisors. The
@@ -16,6 +16,10 @@
 //! and refuse to launch children if it fails. On non-macOS platforms the builder
 //! launches the program directly, the trampoline path is unused, and both probe
 //! and confirmation succeed immediately.
+//! Supervised children reserve fd 3 for an ungated nonce, fd 4 for the
+//! registration channel and fd 5 for the exec acknowledgement. Acknowledgement
+//! sources stay CLOEXEC at fd 6 or above before spawn so stdio cannot overwrite
+//! them; the final descriptor placement inherits only slot 5 to the trampoline.
 //!
 //! Supervised admission uses a separate v2 mode: the daemon probes with
 //! `__disclaim-exec --probe-suspended`, then sends
@@ -533,12 +537,11 @@ mod macos {
                     return Err(io::Error::last_os_error());
                 }
             }
-            // SAFETY: duplicates the owned descriptor to number 4 or higher, so it
-            // cannot collide with stdio (0-2) or the launch-nonce descriptor the
-            // child receives as fd 3. The parent copy stays CLOEXEC; only our
+            // SAFETY: duplicates the owned descriptor above the reserved slots
+            // for stdio, nonce, registration and acknowledgement. The parent copy stays CLOEXEC; only our
             // child clears that flag.
             #[allow(unsafe_code)]
-            let fd = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 4) };
+            let fd = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 6) };
             if fd == -1 {
                 return Err(io::Error::last_os_error());
             }
@@ -549,24 +552,31 @@ mod macos {
         }
 
         pub fn fd(&self) -> i32 {
-            self.writer.as_raw_fd()
+            5
+        }
+
+        /// Transfer the parent source to the supervisor's combined placement.
+        pub fn into_descriptor(self) -> OwnedFd {
+            self.writer
         }
 
         pub(super) fn into_writer(self) -> OwnedFd {
             self.writer
         }
 
-        /// Register before the final nonce handoff. Retain `self` until spawn
+        /// Compatibility handoff for callers without other inherited slots.
+        /// Supervisors use the combined `ChildDescriptorSlots` placement instead.
+        /// Retain `self` until spawn
         /// returns, then drop it and the Command so the parent holds no writer.
         pub fn install(&self, command: &mut std::process::Command) {
             use std::os::unix::process::CommandExt;
-            let fd = self.fd();
+            let fd = self.writer.as_raw_fd();
             // SAFETY: pre_exec makes only fcntl calls, allocates nothing, and
             // touches no Rust locks. The captured descriptor is kept alive by
             // the caller until spawn completes and is never fd 3 or stdio.
             #[allow(unsafe_code)]
             unsafe {
-                command.pre_exec(move || inherit_writer(fd));
+                command.pre_exec(move || crate::registration_channel::place_descriptor(fd, 5));
             }
         }
 
@@ -574,27 +584,54 @@ mod macos {
         /// dropped first. Dropping the command after spawn releases the parent's
         /// writer so the reader can observe EOF.
         pub(super) fn install_owned(self, command: &mut std::process::Command) {
-            use std::os::unix::process::CommandExt;
-            // SAFETY: the closure owns the descriptor and uses only fcntl. It
-            // cannot outlive its descriptor or acquire a Rust lock after fork.
-            #[allow(unsafe_code)]
-            unsafe {
-                command.pre_exec(move || inherit_writer(self.fd()));
-            }
+            let mut slots = crate::registration_channel::ChildDescriptorSlots::default();
+            // pipe() already placed the source above all reserved slots.
+            slots.sources[2] = Some(self.writer);
+            slots.install(command);
         }
     }
 
-    fn inherit_writer(fd: i32) -> io::Result<()> {
-        // SAFETY: the installing hook retains the descriptor through spawn.
-        // Only async-signal-safe fcntl calls execute here, with no allocation.
-        #[allow(unsafe_code)]
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            if flags == -1 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
-                return Err(io::Error::last_os_error());
-            }
+    #[cfg(test)]
+    #[test]
+    fn acknowledgement_source_avoids_channel_slot_and_inherits_slot_five() {
+        const ISOLATED: &str = "SUBC_ACK_SLOT_TEST";
+        if std::env::var_os(ISOLATED).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "acknowledgement_source_avoids_channel_slot_and_inherits_slot_five",
+                    "--nocapture",
+                ])
+                .env(ISOLATED, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
         }
-        Ok(())
+        let (_reader, ack) = ExecAcknowledgement::pipe().unwrap();
+        assert!(
+            ack.writer.as_raw_fd() >= 6,
+            "ack source collided with a child slot"
+        );
+        assert_eq!(ack.fd(), 5);
+        // SAFETY: inspect the parent-owned source before spawn.
+        #[allow(unsafe_code)]
+        let flags = unsafe { libc::fcntl(ack.writer.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        let mut command = std::process::Command::new("/usr/bin/python3");
+        command.args(["-c", "import fcntl,stat,os; assert fcntl.fcntl(5,fcntl.F_GETFD)==0; assert stat.S_ISFIFO(os.fstat(5).st_mode)"]);
+        let mut slots = crate::registration_channel::ChildDescriptorSlots::default();
+        slots.acknowledgement(ack.into_descriptor()).unwrap();
+        slots.install(&mut command);
+        let output = crate::child_spawn::output(&mut command).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// Execute `<ack fd> <program> <args...>` as a new responsible process.

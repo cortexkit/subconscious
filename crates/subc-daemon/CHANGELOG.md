@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.44.9
+
+- Advertise and serve `catalog.update_role_declarations` on registered module connections. Replace or clear the whole map atomically; refuse invalid maps with `invalid_role_declarations` and preserve the previous catalog entry. Require protocol 0.36.3 and control 0.38.3.
+
 ## 0.44.8
 
 - Retain agent-command starts pending validation when its deadline or revision retries are exhausted, without extending the validation window. Acknowledge start-only batches; retain starts but return retryable `busy` for unapplied finished/known entries in mixed batches. Keep retries idempotent, isolate declaration tests from native walk cost, and configure the rescan test's required macOS launch helper.

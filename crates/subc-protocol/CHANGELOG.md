@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.36.3
+
+- Add `catalog.update_role_declarations` module control request and ACK bodies. Expose the shared role-declaration validator for strict live updates while retaining lenient HELLO decoding.
+
 ## 0.36.2
 
 - Add typed route.authorize scope/expected/reply bodies and route-authorize/v1, plus terminal federated_stamp_required and route_authorize_not_permitted codes.

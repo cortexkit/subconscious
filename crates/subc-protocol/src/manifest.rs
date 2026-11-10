@@ -562,7 +562,7 @@ impl<'de> Deserialize<'de> for ModuleManifest {
     }
 }
 
-/// Why a complete role-declaration map must be dropped without refusing HELLO.
+/// Why a role-declaration map is invalid. HELLO drops it; live updates refuse it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoleDeclarationsError(&'static str);
 
@@ -583,7 +583,11 @@ pub fn validate_hello_role_declarations(hello: &Value) -> Result<(), RoleDeclara
     )
 }
 
-fn validate_role_declarations_value(value: Option<&Value>) -> Result<(), RoleDeclarationsError> {
+/// Check object shape, capability-name keys and the compact whole-map byte cap.
+/// An absent value is allowed for manifests that omit declarations.
+pub fn validate_role_declarations_value(
+    value: Option<&Value>,
+) -> Result<(), RoleDeclarationsError> {
     let Some(value) = value else {
         return Ok(());
     };

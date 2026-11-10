@@ -29,8 +29,9 @@ use subc_protocol::{
         validate_hello_display_name, validate_hello_event_declarations,
         validate_hello_flow_operations, validate_hello_operation_deferral,
         validate_hello_rich_ui_descriptor, validate_hello_role_declarations,
-        validate_hello_self_signal_declarations, CapabilityDeclarations, CapabilityNeed,
-        Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
+        validate_hello_self_signal_declarations, validate_role_declarations_value,
+        CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
+        ProviderRole,
     },
     peer::{ObservedPeer, RouteBindPeer, OBSERVED_PEER_CAPABILITY, OPERATOR_APP_CAPABILITY},
     scope::{
@@ -42,7 +43,7 @@ use subc_protocol::{
         validate_role_versions, HealthReport, ModuleControlPush, ModuleControlRequest,
         ModuleControlRequestFromModule, ModuleControlResponse, ModuleControlResponseToModule,
         OperatorConfirmRequest, MODULE_CONTROL_OP_HEALTH_CHECK, MODULE_TO_SUBC_OP_CATALOG_UPDATE,
-        ROLE_VERSIONS_FIELD,
+        MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS, ROLE_VERSIONS_FIELD,
     },
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
     Priority, RouteTarget, PROTOCOL_VERSION,
@@ -138,6 +139,7 @@ use rescan_checked::{RescanMode, RescanPlan};
 
 const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
     MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+    MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS,
     "supervisor.live_roots",
     "supervisor.agent_commands",
     SCOPE_SYNC_OP,
@@ -3477,6 +3479,13 @@ impl ControlHandler {
                 capabilities,
                 ready,
             } => self.handle_catalog_update(connection_id, frame, provides, capabilities, ready),
+            ModuleControlRequestFromModule::CatalogUpdateRoleDeclarations { role_declarations } => {
+                self.handle_catalog_update_role_declarations(
+                    connection_id,
+                    frame,
+                    role_declarations,
+                )
+            }
             ModuleControlRequestFromModule::LiveRoots {} => {
                 let registered = self
                     .registry
@@ -4092,6 +4101,41 @@ impl ControlHandler {
             &response,
             "ModuleControlResponseToModule::ScopeDescribe",
         )?])
+    }
+
+    fn handle_catalog_update_role_declarations(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+        role_declarations: serde_json::Value,
+    ) -> Result<Vec<Frame>, RouterError> {
+        if let Err(err) = validate_role_declarations_value(Some(&role_declarations)) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_role_declarations",
+                err.to_string(),
+            )?]);
+        }
+        let declarations = serde_json::from_value(role_declarations)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        if self
+            .registry
+            .replace_role_declarations_for_connection(connection_id, declarations)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+            .is_none()
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "not_registered",
+                "catalog.update_role_declarations requires an active module registration owned by this connection",
+            )?]);
+        }
+        control_response_body_frame(
+            &frame,
+            &ModuleControlResponseToModule::CatalogUpdateRoleDeclarations {},
+            "ModuleControlResponseToModule::CatalogUpdateRoleDeclarations",
+        )
+        .map(|frame| vec![frame])
     }
 
     fn handle_catalog_update(
@@ -8440,6 +8484,9 @@ fn principal_label(principal: &Principal) -> String {
 fn module_control_request_op(request: &ModuleControlRequestFromModule) -> &'static str {
     match request {
         ModuleControlRequestFromModule::CatalogUpdate { .. } => MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+        ModuleControlRequestFromModule::CatalogUpdateRoleDeclarations { .. } => {
+            MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS
+        }
         ModuleControlRequestFromModule::LiveRoots {} => "supervisor.live_roots",
         ModuleControlRequestFromModule::ScopeSync { .. } => SCOPE_SYNC_OP,
         ModuleControlRequestFromModule::ScopeApply { .. } => SCOPE_APPLY_OP,
@@ -10073,6 +10120,9 @@ mod tests {
         assert!(ack
             .subc_ops
             .contains(&MODULE_TO_SUBC_OP_CATALOG_UPDATE.to_string()));
+        assert!(ack
+            .subc_ops
+            .contains(&MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS.to_string()));
 
         let registration = registry.get_module("aft").unwrap().unwrap();
         assert_eq!(registration.negotiated_ver, PROTOCOL_VERSION);
@@ -10512,6 +10562,172 @@ mod tests {
             serde_json::to_vec(&body).unwrap(),
         )
         .unwrap()
+    }
+
+    fn update_role_declarations_frame(declarations: Value) -> Frame {
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            303,
+            serde_json::to_vec(&json!({
+                "op": "catalog.update_role_declarations",
+                "role_declarations": declarations,
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn role_declarations_update_replaces_then_clears_catalog() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let (ctx, mut rx) = route_ctx(ConnectionId::new(301));
+        let initial = json!({"media-provider/v1": {"engines": ["old"]}, "old/v1": {}});
+        hello_via_sink(
+            &handler,
+            &ctx,
+            &mut rx,
+            hello_with_role_declarations(initial.clone()),
+        )
+        .await;
+        assert_eq!(
+            role_declarations_catalog(&handler).0["role_declarations"],
+            initial
+        );
+        let before = registry.get_module("role-test").unwrap().unwrap();
+        for declarations in [
+            json!({"media-provider/v1": {"engines": ["new"]}}),
+            json!({}),
+        ] {
+            let response = handler
+                .handle_control_frame(&ctx, update_role_declarations_frame(declarations.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response[0].header.ty, FrameType::Response);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&response[0].body).unwrap(),
+                json!({"op": "catalog.update_role_declarations"})
+            );
+            let (raw, entry) = role_declarations_catalog(&handler);
+            assert_eq!(
+                serde_json::to_value(entry.role_declarations).unwrap(),
+                declarations
+            );
+            if declarations.as_object().unwrap().is_empty() {
+                assert!(raw.get("role_declarations").is_none());
+            } else {
+                assert_eq!(raw["role_declarations"], declarations);
+            }
+            let after = registry.get_module("role-test").unwrap().unwrap();
+            let mut expected = before.manifest.clone();
+            expected.role_declarations = serde_json::from_value(declarations).unwrap();
+            assert_eq!(after.manifest, expected);
+            assert_eq!(after.ready, before.ready);
+        }
+    }
+
+    #[tokio::test]
+    async fn role_declarations_update_refuses_invalid_maps_without_changing_catalog() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(registry);
+        let (ctx, mut rx) = route_ctx(ConnectionId::new(301));
+        let initial = json!({"media-provider/v1": {"engines": ["old"]}});
+        hello_via_sink(
+            &handler,
+            &ctx,
+            &mut rx,
+            hello_with_role_declarations(initial.clone()),
+        )
+        .await;
+        for (invalid, reason) in [
+            (json!(null), "role_declarations must be an object"),
+            (json!([]), "role_declarations must be an object"),
+            (
+                json!({"bad key": {}}),
+                "role_declarations key must use capability-name grammar",
+            ),
+            (
+                json!({"media-provider/v1": []}),
+                "role_declarations values must be objects",
+            ),
+            (
+                json!({"media-provider/v1": {"padding": "x".repeat(16384)}}),
+                "role_declarations exceeds 16384 compact JSON bytes",
+            ),
+        ] {
+            let response = handler
+                .handle_control_frame(&ctx, update_role_declarations_frame(invalid))
+                .await
+                .unwrap();
+            let error = parse_error(&response[0]);
+            assert_eq!(error["code"], "invalid_role_declarations");
+            assert_eq!(error["message"], reason);
+            assert_eq!(
+                role_declarations_catalog(&handler).0["role_declarations"],
+                initial
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn role_declarations_update_is_owned_by_the_registered_connection() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let (owner, mut owner_rx) = route_ctx(ConnectionId::new(301));
+        let initial = json!({"media-provider/v1": {"engines": ["old"]}});
+        hello_via_sink(
+            &handler,
+            &owner,
+            &mut owner_rx,
+            hello_with_role_declarations(initial.clone()),
+        )
+        .await;
+        let (other, mut other_rx) = route_ctx(ConnectionId::new(302));
+        let replacement = json!({"media-provider/v1": {"engines": ["other"]}});
+        let response = handler
+            .handle_control_frame(&other, update_role_declarations_frame(replacement.clone()))
+            .await
+            .unwrap();
+        assert_eq!(parse_error(&response[0])["code"], "not_registered");
+        hello_via_sink(
+            &handler,
+            &other,
+            &mut other_rx,
+            hello_frame("other", PROTOCOL_VERSION, 304),
+        )
+        .await;
+        let response = handler
+            .handle_control_frame(&other, update_role_declarations_frame(replacement.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response[0].header.ty, FrameType::Response);
+        assert_eq!(
+            serde_json::to_value(
+                registry
+                    .get_module("role-test")
+                    .unwrap()
+                    .unwrap()
+                    .manifest
+                    .role_declarations
+            )
+            .unwrap(),
+            initial
+        );
+        assert_eq!(
+            serde_json::to_value(
+                registry
+                    .get_module("other")
+                    .unwrap()
+                    .unwrap()
+                    .manifest
+                    .role_declarations
+            )
+            .unwrap(),
+            replacement
+        );
     }
 
     fn role_declarations_catalog(handler: &ControlHandler) -> (Value, CatalogEntry) {

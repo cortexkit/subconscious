@@ -22,6 +22,8 @@ use crate::{
 
 pub const MODULE_CONTROL_OP_HEALTH_CHECK: &str = "health.check";
 pub const MODULE_TO_SUBC_OP_CATALOG_UPDATE: &str = "catalog.update";
+pub const MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS: &str =
+    "catalog.update_role_declarations";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -198,6 +200,14 @@ pub enum ModuleControlRequestFromModule {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ready: Option<bool>,
     },
+    /// Replace the complete role-declaration map; an empty object clears it.
+    #[serde(rename = "catalog.update_role_declarations")]
+    CatalogUpdateRoleDeclarations {
+        /// Kept raw so malformed maps receive a reasoned daemon refusal rather
+        /// than being dropped by the manifest's lenient HELLO decoding.
+        #[serde(deserialize_with = "Value::deserialize")]
+        role_declarations: Value,
+    },
     #[serde(rename = "supervisor.live_roots")]
     LiveRoots {},
     /// Attribute agent-requested command roots to the declaring module.
@@ -274,6 +284,8 @@ pub struct LiveRoot {
 pub enum ModuleControlResponseToModule {
     #[serde(rename = "catalog.update")]
     CatalogUpdate {},
+    #[serde(rename = "catalog.update_role_declarations")]
+    CatalogUpdateRoleDeclarations {},
     #[serde(rename = "supervisor.live_roots")]
     LiveRoots {
         roots: Vec<LiveRoot>,
@@ -576,6 +588,26 @@ fn is_role_version(version: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_update_role_declarations_wire_round_trip() {
+        for declarations in [
+            serde_json::json!({"media-provider/v1": {"engines": ["image"]}}),
+            serde_json::json!({}),
+        ] {
+            let body = serde_json::json!({
+                "op": "catalog.update_role_declarations",
+                "role_declarations": declarations,
+            });
+            let request: ModuleControlRequestFromModule =
+                serde_json::from_value(body.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), body);
+        }
+        let body = serde_json::json!({"op": "catalog.update_role_declarations"});
+        let response: ModuleControlResponseToModule = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), body);
+        assert!(serde_json::from_value::<ModuleControlRequestFromModule>(body).is_err());
+    }
 
     fn map(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries

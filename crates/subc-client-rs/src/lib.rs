@@ -35,7 +35,7 @@ pub use policy_cache::{
 pub use subc_control::{AppOpenReply, AppOpenStatus};
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     env,
     error::Error,
     ffi::OsString,
@@ -82,7 +82,7 @@ use subc_protocol::{
         ModuleControlCommand, ModuleControlRequest, ModuleControlRequestFromModule,
         ModuleControlResponse, ModuleControlResponseToModule, OperatorConfirmKind,
         OperatorConfirmReply, OperatorConfirmRequest, MODULE_CONTROL_OP_HEALTH_CHECK,
-        MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+        MODULE_TO_SUBC_OP_CATALOG_UPDATE, MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS,
     },
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
@@ -490,6 +490,7 @@ struct ModuleHandleShared {
     negotiated_ver: u8,
     daemon_capabilities: Vec<String>,
     supports_catalog_update: bool,
+    supports_role_declarations_update: bool,
     supports_live_roots: bool,
     supports_agent_commands: bool,
     supports_scope_sync: bool,
@@ -563,6 +564,10 @@ impl ModuleHandle {
                     .subc_ops
                     .iter()
                     .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE),
+                supports_role_declarations_update: ack
+                    .subc_ops
+                    .iter()
+                    .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS),
                 supports_live_roots: ack.subc_ops.iter().any(|op| op == "supervisor.live_roots"),
                 supports_agent_commands: ack
                     .subc_ops
@@ -660,6 +665,58 @@ impl ModuleHandle {
         provides: Vec<ProviderRole>,
     ) -> Result<(), CatalogUpdateError> {
         self.catalog_update_inner(Some(provides), None, None).await
+    }
+
+    /// Replace this module's complete registered role-declaration map in place.
+    ///
+    /// An empty map (`{}` on the wire) clears all declarations. Requires
+    /// subc-daemon 0.44.9 or later; returns [`CatalogUpdateError::NotSupported`]
+    /// without sending when HELLO_ACK does not advertise the operation. Invalid
+    /// declarations are refused by the daemon as [`CatalogUpdateError::Rejected`],
+    /// preserving the previous map and the refusal's code and reason.
+    pub async fn update_role_declarations(
+        &self,
+        role_declarations: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<(), CatalogUpdateError> {
+        if !self.shared.supports_role_declarations_update {
+            return Err(CatalogUpdateError::NotSupported);
+        }
+        let body = serde_json::to_vec(
+            &ModuleControlRequestFromModule::CatalogUpdateRoleDeclarations {
+                role_declarations: serde_json::to_value(role_declarations)
+                    .map_err(|err| CatalogUpdateError::Protocol(err.to_string()))?,
+            },
+        )
+        .map_err(|err| CatalogUpdateError::Protocol(err.to_string()))?;
+        let (corr, writer, rx) = self.shared.begin_catalog_update()?;
+        let _pending = CatalogUpdateGuard {
+            shared: self.shared.clone(),
+            corr,
+        };
+        let frame = Frame::build_with_version(
+            self.shared.negotiated_ver,
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .map_err(|err| CatalogUpdateError::Protocol(err.to_string()))?;
+        if writer.send(frame).await.is_err() {
+            return Err(CatalogUpdateError::ConnectionClosed);
+        }
+        match timeout(CATALOG_UPDATE_TIMEOUT, rx).await {
+            Ok(Ok(Ok(reply))) => match reply.control()? {
+                ModuleControlResponseToModule::CatalogUpdateRoleDeclarations {} => Ok(()),
+                _ => Err(CatalogUpdateError::Protocol(
+                    "unexpected catalog.update_role_declarations response".into(),
+                )),
+            },
+            Ok(Ok(Err(err))) => Err(err),
+            Ok(Err(_)) => Err(CatalogUpdateError::ConnectionClosed),
+            Err(_) => Err(CatalogUpdateError::Timeout),
+        }
     }
 
     /// Replace provider roles and attest a new static capability declaration.
@@ -1688,7 +1745,8 @@ impl OperatorConfirmError {
 
 impl Error for OperatorConfirmError {}
 
-/// Errors returned by [`ModuleHandle::catalog_update`] and [`ModuleHandle::set_ready`].
+/// Errors returned by [`ModuleHandle::catalog_update`], [`ModuleHandle::set_ready`]
+/// and [`ModuleHandle::update_role_declarations`].
 #[derive(Debug)]
 pub enum CatalogUpdateError {
     NotSupported,
@@ -4140,6 +4198,67 @@ mod tests {
 
     fn json_body(body: &[u8]) -> serde_json::Value {
         serde_json::from_slice(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn role_declarations_update_requires_its_own_advertised_op() {
+        for ops in [vec![], vec![MODULE_TO_SUBC_OP_CATALOG_UPDATE]] {
+            let (handle, mut rx) = test_module_handle(&ops);
+            assert!(matches!(
+                handle.update_role_declarations(BTreeMap::new()).await,
+                Err(CatalogUpdateError::NotSupported)
+            ));
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn role_declarations_update_sends_map_and_preserves_refusal() {
+        let (handle, mut rx) =
+            test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS]);
+        let initial_roles = vec![test_provider_role(&["original"])];
+        handle.shared.lock_inner().current_provides = Some(initial_roles.clone());
+        for declarations in [
+            json!({"media-provider/v1": {"engines": ["image"]}}),
+            json!({}),
+        ] {
+            let map = serde_json::from_value(declarations.clone()).unwrap();
+            let (result, ()) = tokio::join!(handle.update_role_declarations(map), async {
+                let frame = rx.recv().await.unwrap();
+                assert_eq!(frame.header.ty, FrameType::Request);
+                assert_eq!(frame.header.channel, 0);
+                assert_eq!(
+                    json_body(&frame.body),
+                    json!({"op": "catalog.update_role_declarations", "role_declarations": declarations})
+                );
+                handle.handle_control_reply(control_reply(
+                    FrameType::Response,
+                    frame.header.corr,
+                    serde_json::to_vec(&json!({"op": "catalog.update_role_declarations"})).unwrap(),
+                ));
+            });
+            result.unwrap();
+        }
+        let (result, ()) = tokio::join!(handle.update_role_declarations(BTreeMap::new()), async {
+            let frame = rx.recv().await.unwrap();
+            handle.handle_control_reply(control_reply(FrameType::Error, frame.header.corr,
+                serde_json::to_vec(&json!({"code": "invalid_role_declarations", "message": "role_declarations key must use capability-name grammar"})).unwrap()));
+        });
+        let Err(CatalogUpdateError::Rejected(body)) = result else {
+            panic!("expected typed refusal")
+        };
+        assert_eq!(body.code, "invalid_role_declarations");
+        assert_eq!(
+            body.message,
+            "role_declarations key must use capability-name grammar"
+        );
+        assert_eq!(
+            handle.shared.lock_inner().current_provides,
+            Some(initial_roles)
+        );
     }
 
     async fn ack_catalog_update(

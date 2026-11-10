@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.38.4
+
+- Add `ModuleHandle::update_role_declarations` for daemon 0.44.9 or later. Gate sends on HELLO_ACK advertisement, replace or clear the whole map, and preserve typed daemon refusals. Require protocol 0.36.3 and control 0.38.3.
+
 ## 0.38.3
 
 - Add typed `ModuleHandle::route_authorize` on registered module connections,

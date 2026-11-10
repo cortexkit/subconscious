@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.21.4
+
+- Raise dependency pins to subc-daemon 0.44.9, subc-client-rs 0.38.4, subc-control 0.38.3 and subc-protocol 0.36.3.
+
 ## 0.21.3
 
 - Require subc-client-rs 0.38.0 for scoped managed calls and watches. This dependency-only patch keeps wire behavior unchanged.

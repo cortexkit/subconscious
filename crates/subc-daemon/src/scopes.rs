@@ -34,20 +34,52 @@ use subc_protocol::{
     error_codes,
     manifest::CapabilityDeclarations,
     scope::{
-        ParentState, ScopeEnd, ScopeEndOutcome, ScopeEndResult, ScopeEnded, ScopeParent,
-        ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector, ScopeStamp, ScopeStatus,
-        AGENT_RUN_SCOPES_CAPABILITY, FLOW_SCOPES_CAPABILITY, MAX_CARRIER_TARGETS,
-        MAX_LIVE_SCOPES_PER_OWNER, MAX_SCOPE_ATTRIBUTE_BYTES, MAX_SCOPE_EXPIRY_AHEAD_MS,
-        MAX_SCOPE_TOMBSTONES_PER_OWNER, WORKER_RUNS_CAPABILITY,
+        FederatedAttributes, ParentState, ScopeAttributes, ScopeEnd, ScopeEndOutcome,
+        ScopeEndResult, ScopeEnded, ScopeKind, ScopeParent, ScopeRecord, ScopeRecordOutcome,
+        ScopeRecordResult, ScopeSelector, ScopeStamp, ScopeStatus, AGENT_RUN_SCOPES_CAPABILITY,
+        FLOW_SCOPES_CAPABILITY, MAX_CARRIER_TARGETS, MAX_LIVE_SCOPES_PER_OWNER,
+        MAX_SCOPE_ATTRIBUTE_BYTES, MAX_SCOPE_EXPIRY_AHEAD_MS, MAX_SCOPE_TOMBSTONES_PER_OWNER,
+        WORKER_RUNS_CAPABILITY,
     },
     Principal, RouteCloseReason,
 };
 
 use crate::registry::ConnectionId;
 
+pub(crate) mod admission;
+
 /// The code a malformed sync body is refused with, the same one the control
 /// plane uses for any body that does not parse.
 const INVALID_CONTROL_BODY: &str = "invalid_control_body";
+
+fn same_federated_identity(
+    a: Option<&FederatedAttributes>,
+    b: Option<&FederatedAttributes>,
+) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.same_identity(b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// Display renames refresh the stored record without changing the [`ScopeTag`]
+/// fence used to validate in-flight binds.
+/// Preserve structural equality for every other field, including future fields.
+fn same_record_identity(a: &ScopeRecord, b: &ScopeRecord) -> bool {
+    if a == b {
+        return true;
+    }
+    if !same_federated_identity(
+        a.attributes.federated.as_ref(),
+        b.attributes.federated.as_ref(),
+    ) {
+        return false;
+    }
+    let mut comparable = a.clone();
+    comparable.attributes.federated = b.attributes.federated.clone();
+    comparable == *b
+}
 
 /// The launch nonce each module connection presented in its HELLO, kept so the
 /// scope table can tell whether a connection belongs to its module's current
@@ -153,17 +185,14 @@ pub(crate) struct ScopeTagChange {
 }
 
 /// Which live routes a change to one scope closes (the drain table in
-/// `docs/designs/daemon-scopes.md`). Only changes that take authority away
-/// close anything: the scope ending, a carrier or one of its target modules
-/// removed, `delegates` turned off or `agent_id` changed, or the parent
-/// ending. Any other change leaves routes up even though their stamp now
-/// carries an older version, because that stamp grants nothing the current
-/// record no longer grants.
+/// `docs/scopes.md`). Ending a scope or its parent closes routes, as does
+/// changing any identity input used to derive a remote claim, including enabling
+/// delegation. Removing a carrier or target closes only its affected routes.
+/// Adding carriers or targets leaves existing routes and in-flight calls alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ScopeDrain {
     /// Nothing: a carrier or target added, `child_owners` changed, a parent
-    /// link going from pending to linked, or any other change that narrows
-    /// no one's authority.
+    /// link going from pending to linked, or a change to no identity input.
     Nothing,
     /// Every route under the scope, with this reason.
     All(RouteCloseReason),
@@ -246,11 +275,16 @@ fn drain_for_change(before: &LiveScope, after: &LiveScope) -> ScopeDrain {
     }
     let before_attributes = &before.record.attributes;
     let after_attributes = &after.record.attributes;
-    if (before_attributes.delegates && !after_attributes.delegates)
+    if before_attributes.delegates != after_attributes.delegates
         || before_attributes.agent_id != after_attributes.agent_id
         || before_attributes.on_behalf_of_agent != after_attributes.on_behalf_of_agent
         || before_attributes.flow_id != after_attributes.flow_id
         || before_attributes.run_id != after_attributes.run_id
+        || before_attributes.flow_version != after_attributes.flow_version
+        || before_attributes.flow_code_hash != after_attributes.flow_code_hash
+        || before_attributes.flow_install_id != after_attributes.flow_install_id
+        || before.record.kind != after.record.kind
+        || before.owner_authorized != after.owner_authorized
     {
         drain = drain.widen(ScopeDrain::All(RouteCloseReason::ScopeDelegationChanged));
     }
@@ -312,12 +346,16 @@ impl ScopeBindLease {
 impl BoundScope {
     /// Called only after the target acknowledges `route.bind` and the
     /// acknowledgement is accepted.
-    pub(crate) fn record_served(&self, module_id: &str) {
-        self._lease
+    pub(crate) fn record_served(&self, module_id: &str, verified_prefix_owner: Option<&str>) {
+        let mut served = self
+            ._lease
             .served_modules
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(module_id.to_owned());
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        served.insert(module_id.to_owned());
+        if let Some(owner) = verified_prefix_owner {
+            served.insert(owner.to_owned());
+        }
     }
 
     pub(crate) fn commit_presence(&self) {
@@ -340,6 +378,8 @@ pub(crate) struct ScopeAdmission {
     pub(crate) owner: String,
     pub(crate) stamp: ScopeStamp,
     pub(crate) tag: ScopeTag,
+    /// Daemon-only routing instruction, kept outside the provider stamp.
+    pub(crate) stamp_required: bool,
 }
 
 /// Refuse before relaying a flow bind unless the target promises flow
@@ -351,6 +391,7 @@ pub(crate) fn check_target_flow_support(
     target_module: &str,
     capabilities: Option<&CapabilityDeclarations>,
 ) -> Result<(), ScopeAdmissionRefusal> {
+    check_target_federated_support(stamp, target_module, capabilities)?;
     if stamp.attributes.flow_id.is_none() {
         return Ok(());
     }
@@ -369,6 +410,57 @@ pub(crate) fn check_target_flow_support(
              '{CALL_MODES_CAPABILITY}' or '{FLOW_SCOPES_CAPABILITY}', required for a scope carrying flow_id"
         ),
     })
+}
+
+pub(crate) fn target_supports_federated(capabilities: Option<&CapabilityDeclarations>) -> bool {
+    capabilities.is_some_and(|caps| {
+        caps.provides
+            .iter()
+            .any(|cap| cap == subc_protocol::scope::SCOPE_FEDERATED_CAPABILITY)
+    })
+}
+
+/// An unstamped route can inherit permissions shared by all programs on a paired peer.
+/// Runs and flows must never fall back to those shared permissions.
+pub(crate) fn check_target_federated_support(
+    stamp: &ScopeStamp,
+    target_module: &str,
+    capabilities: Option<&CapabilityDeclarations>,
+) -> Result<(), ScopeAdmissionRefusal> {
+    use subc_protocol::scope::RemoteClaim;
+    if stamp.kind == ScopeKind::Federated
+        && !target_supports_federated(capabilities)
+        && stamp
+            .attributes
+            .federated
+            .as_ref()
+            .and_then(|facts| facts.remote_claim.as_ref())
+            .is_some_and(|claim| {
+                matches!(claim, RemoteClaim::Flow { .. } | RemoteClaim::Run { .. })
+            })
+    {
+        return Err(ScopeAdmissionRefusal {
+            code: error_codes::TARGET_FEDERATED_UNSUPPORTED,
+            message: format!("target module '{target_module}' does not provide scope-federated/v1"),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn check_target_required_stamp(
+    required: bool,
+    target_module: &str,
+    capabilities: Option<&CapabilityDeclarations>,
+) -> Result<(), ScopeAdmissionRefusal> {
+    if required && !target_supports_federated(capabilities) {
+        return Err(ScopeAdmissionRefusal {
+            code: error_codes::FEDERATED_STAMP_REQUIRED,
+            message: format!(
+                "target module '{target_module}' cannot receive the required federated stamp"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// A worker run: a run scope attributed to an agent through
@@ -499,6 +591,7 @@ pub(crate) struct ScopeDescription {
 #[derive(Debug, Clone)]
 struct LiveScope {
     record: ScopeRecord,
+    owner_authorized: bool,
     version: u64,
     /// `None` exactly when the record has no parent.
     parent_state: Option<ParentState>,
@@ -593,6 +686,7 @@ struct OwnerScopes {
 
 /// All scopes, per owner, for one daemon incarnation.
 pub(crate) struct ScopeTable {
+    federated_owner: String,
     /// Module ids whose scopes may carry authority attributes. Fixed for
     /// the daemon's life: the config key is restart-required, so no live route
     /// can hold an `owner_authorized` stamp its owner has since lost.
@@ -639,6 +733,7 @@ struct LinkCycleCache<'a> {
 impl ScopeTable {
     pub(crate) fn new(authority_owners: impl IntoIterator<Item = String>) -> Self {
         Self {
+            federated_owner: crate::daemon_config::default_federated_scope_owner(),
             authority_owners: authority_owners.into_iter().collect(),
             owners: HashMap::new(),
             last_version: 0,
@@ -648,6 +743,15 @@ impl ScopeTable {
             #[cfg(test)]
             idle_check_hook: None,
         }
+    }
+
+    pub(crate) fn with_federated_owner(mut self, owner: String) -> Self {
+        self.federated_owner = owner;
+        self
+    }
+
+    pub(crate) fn is_federated_owner(&self, owner: &Principal) -> bool {
+        reserved_module_id(owner) == Some(self.federated_owner.as_str())
     }
 
     pub(crate) fn set_wall_clock(&mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) {
@@ -729,7 +833,7 @@ impl ScopeTable {
     }
 
     fn owner_authorized(&self, owner: &str) -> bool {
-        self.authority_owners.contains(owner)
+        owner != self.federated_owner && self.authority_owners.contains(owner)
     }
 
     fn next_version(&mut self) -> u64 {
@@ -945,6 +1049,7 @@ impl ScopeTable {
             let held = state.live.get(&record.scope_ref);
             let refusal = refusals
                 .remove(&index)
+                .or_else(|| self.federated_refusal(owner, record, held))
                 .or_else(|| {
                     Self::record_refusal(record, held, &state.tombstones, owner_authorized, now)
                 })
@@ -1118,7 +1223,11 @@ impl ScopeTable {
                 (Some(_), None) => Some(ParentState::Pending),
             };
             let version = match held {
-                Some(held) if held.record == record && held.parent_state == parent_state => {
+                Some(held)
+                    if same_record_identity(&held.record, &record)
+                        && held.parent_state == parent_state
+                        && held.owner_authorized == owner_authorized =>
+                {
                     held.version
                 }
                 _ => self.next_version(),
@@ -1127,6 +1236,7 @@ impl ScopeTable {
                 scope_ref,
                 LiveScope {
                     record,
+                    owner_authorized,
                     version,
                     parent_state,
                     binds: held.map(|held| Arc::clone(&held.binds)).unwrap_or_default(),
@@ -1266,6 +1376,12 @@ impl ScopeTable {
         }
         let mut seen = HashSet::new();
         for record in scopes {
+            if let Some(attributes) = &record.attributes.federated {
+                attributes.validate().map_err(|message| SyncRefusal {
+                    code: INVALID_CONTROL_BODY,
+                    message,
+                })?;
+            }
             if let Some(project_id) = &record.project_id {
                 subc_protocol::scope::validate_project_id(project_id).map_err(|message| {
                     SyncRefusal {
@@ -1383,6 +1499,63 @@ impl ScopeTable {
         Ok(())
     }
 
+    fn federated_refusal(
+        &self,
+        owner: &str,
+        record: &ScopeRecord,
+        held: Option<&LiveScope>,
+    ) -> Option<RecordRefusal> {
+        let federated = record.kind == ScopeKind::Federated;
+        if (owner == self.federated_owner) != federated
+            || federated != record.attributes.federated.is_some()
+            || (federated && (record.workdir.is_some() || record.project_id.is_some()))
+            || (federated
+                && record.attributes
+                    != ScopeAttributes::new().with_federated(record.attributes.federated.clone()))
+        {
+            return Some((error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
+                "only the configured federated owner may own federated records, which require federated attributes and forbid local identity attributes".to_string()));
+        }
+        if federated
+            && record
+                .carriers
+                .iter()
+                .any(|carrier| carrier.targets.is_none())
+        {
+            return Some((
+                error_codes::SCOPE_CARRIER_TARGETS_INVALID,
+                "federated carrier entries require explicit targets".to_string(),
+            ));
+        }
+        if record.child_owners.iter().any(|child| {
+            let child = reserved_module_id(child);
+            if federated {
+                child != Some(owner)
+            } else {
+                child == Some(self.federated_owner.as_str())
+            }
+        }) {
+            return Some((
+                error_codes::SCOPE_PARENT_NOT_PERMITTED,
+                "child_owners cannot cross the federated owner boundary".to_string(),
+            ));
+        }
+        if held.is_some_and(|held| {
+            held.record.scope_epoch == record.scope_epoch
+                && !same_federated_identity(
+                    held.record.attributes.federated.as_ref(),
+                    record.attributes.federated.as_ref(),
+                )
+        }) {
+            return Some((
+                error_codes::SCOPE_FEDERATED_CHANGED,
+                "federated attributes are fixed for the scope epoch; use a higher epoch"
+                    .to_string(),
+            ));
+        }
+        None
+    }
+
     /// The checks one record fails or passes on its own, before parent links.
     fn record_refusal(
         record: &ScopeRecord,
@@ -1405,7 +1578,10 @@ impl ScopeTable {
                 }
             }
         }
-        if !record.attributes.is_empty() && !owner_authorized {
+        if record.attributes
+            != ScopeAttributes::new().with_federated(record.attributes.federated.clone())
+            && !owner_authorized
+        {
             return Some((
                 error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
                 "agent_id, on_behalf_of_agent, delegates, flow_id, flow_version, flow_code_hash, flow_install_id and run_id may be set only by an owner listed in \
@@ -1595,6 +1771,11 @@ impl ScopeTable {
         let Some(parent_owner) = reserved_module_id(&parent.owner) else {
             return Err("a parent's owner must be a supervised module".to_string());
         };
+        if (owner == self.federated_owner || parent_owner == self.federated_owner)
+            && owner != parent_owner
+        {
+            return Err("federated parent links must stay within the federated owner".to_string());
+        }
         let parent_owner_synced = parent_owner == owner
             || self
                 .owners
@@ -1935,6 +2116,16 @@ impl ScopeTable {
         selector: &ScopeSelector,
         owner_configured: bool,
     ) -> Result<ScopeAdmission, ScopeAdmissionRefusal> {
+        let (owner, scope) = self.resolve(selector, owner_configured)?;
+        self.check_carrier(scope, owner, opener, target_module)?;
+        Ok(Self::admission_stamp(owner, scope, selector))
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        selector: &'a ScopeSelector,
+        owner_configured: bool,
+    ) -> Result<(&'a str, &'a LiveScope), ScopeAdmissionRefusal> {
         let refuse = |code: &'static str, message: String| ScopeAdmissionRefusal { code, message };
         let Some(scope_epoch) = selector.scope_epoch else {
             return Err(refuse(
@@ -1988,6 +2179,17 @@ impl ScopeTable {
                 format!("scope '{scope_ref}' of {owner} deadline {deadline} has passed"),
             ));
         }
+        Ok((owner, scope))
+    }
+
+    fn check_carrier(
+        &self,
+        scope: &LiveScope,
+        owner: &str,
+        opener: &Principal,
+        target_module: &str,
+    ) -> Result<(), ScopeAdmissionRefusal> {
+        let scope_ref = &scope.record.scope_ref;
         if reserved_module_id(opener) != Some(owner) {
             let permitted = match carrier_allowance(&scope.record, opener) {
                 None => false,
@@ -1995,32 +2197,43 @@ impl ScopeTable {
                 Some(Some(targets)) => targets.contains(target_module),
             };
             if !permitted {
-                return Err(refuse(
-                    error_codes::SCOPE_NOT_CARRIER,
-                    format!(
+                return Err(ScopeAdmissionRefusal {
+                    code: error_codes::SCOPE_NOT_CARRIER,
+                    message: format!(
                         "the opener is not the owner or a carrier of scope '{scope_ref}' of \
                          {owner} permitted to open to '{target_module}'"
                     ),
-                ));
+                });
             }
         }
-        Ok(ScopeAdmission {
+        Ok(())
+    }
+
+    fn admission_stamp(owner: &str, scope: &LiveScope, selector: &ScopeSelector) -> ScopeAdmission {
+        let mut attributes = scope.record.attributes.clone();
+        let stamp_required = attributes.federated.as_mut().is_some_and(|facts| {
+            let required = facts.stamp_required;
+            facts.stamp_required = false;
+            required
+        });
+        ScopeAdmission {
             owner: owner.to_string(),
+            stamp_required,
             stamp: ScopeStamp::new(
                 selector.owner.clone(),
-                scope_ref.clone(),
-                scope_epoch,
+                selector.scope_ref.clone(),
+                scope.record.scope_epoch,
                 scope.record.kind,
             )
             .with_workdir(scope.record.workdir.clone())
             .with_project_id(scope.record.project_id.clone())
             .with_parent(scope.record.parent.clone())
             .with_parent_state(scope.parent_state)
-            .with_attributes(scope.record.attributes.clone())
-            .with_owner_authorized(self.owner_authorized(owner))
+            .with_attributes(attributes)
+            .with_owner_authorized(scope.owner_authorized)
             .with_expires_at_ms(scope.record.expires_at_ms),
             tag: scope.tag(),
-        })
+        }
     }
 
     /// The caller supplies its registered module id, never another owner's id.
@@ -2089,7 +2302,7 @@ impl ScopeTable {
                     .with_parent(scope.record.parent.clone())
                     .with_parent_state(scope.parent_state)
                     .with_attributes(scope.record.attributes.clone())
-                    .with_owner_authorized(self.owner_authorized(owner_id))
+                    .with_owner_authorized(scope.owner_authorized)
                     .with_expires_at_ms(scope.record.expires_at_ms),
                 ),
             };
@@ -2120,6 +2333,9 @@ mod tests {
     use super::*;
 
     const PREFRONTAL: &str = "prefrontal-core";
+    mod federated {
+        include!("scope_federated_table_tests.rs");
+    }
     const MAGIC: &str = "magic-context";
     const BROCA: &str = "broca";
     const AFT: &str = "aft";
@@ -2251,13 +2467,13 @@ mod tests {
             .unwrap();
         let bound = table.reserve_bind(&admission, &reserved(PREFRONTAL), conn(1), false);
         assert_eq!(table.served_by(PREFRONTAL, "s", 1, "tool"), NotServed);
-        bound.record_served("tool");
+        bound.record_served("tool", None);
         assert_eq!(table.served_by(PREFRONTAL, "s", 1, "tool"), Served);
         assert_eq!(table.served_by("other", "s", 1, "tool"), Unknown);
         sync(&mut table, PREFRONTAL, conn(1), 2, vec![head("s", 1)]);
         assert_eq!(table.served_by(PREFRONTAL, "s", 1, "tool"), Served);
         sync(&mut table, PREFRONTAL, conn(1), 3, vec![head("s", 2)]);
-        bound.record_served("late-tool");
+        bound.record_served("late-tool", None);
         assert_eq!(table.served_by(PREFRONTAL, "s", 1, "tool"), Unknown);
         assert_eq!(table.served_by(PREFRONTAL, "s", 2, "late-tool"), NotServed);
         sync(&mut table, PREFRONTAL, conn(1), 4, vec![]);

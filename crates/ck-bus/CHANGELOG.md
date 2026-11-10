@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.6.4
+
+- The routing module's new id, `striatum`, gets the same bus access as `prefrontal-routing`, from the shared bus naming tables (cortexkit-bus-naming 0.3.4) that define each module's event durable and live-hint reads: its own event durable `m_striatum` reading Insula's quota events, the runners' content-free `step.finished.v1` live hints, and the standard participant grants for its own id. Bootstrap creates `m_striatum` beside `m_prefrontal-routing`, which is unchanged. The new id stays reserved and disabled in the daemon until the routing module moves.
+
+## 0.6.3
+
+- `m_prefrontal-core` also reads Basal's fifth flow-instance lifecycle event, `event.basal.flow_instance_rescheduled.v1` (cortexkit-bus-naming 0.3.3). Bootstrap adds the subject to the existing durable's filter in place and keeps its position in the stream. Basal already publishes under `event.basal.>`; core's delivery-authority grant gains the matching content-free hint subject, `live.basal.flow_instance_rescheduled.v1`, as for the other four.
+
+## 0.6.2
+
+- Require subc-client-rs 0.38.0 for scoped managed calls and watches. This dependency-only patch keeps wire behavior unchanged.
+
+## 0.6.1
+
+- Refresh daemon/control and Rust-client requirements for the extensible supervisor resource API. This dependency-only release keeps bus wire behavior unchanged.
+
+## 0.6.0
+
+- Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.
+
+## 0.5.6
+
+- Raise dependency floors for the resource-accounting wire release.
+
+## 0.5.5
+
+- Adopt cortexkit-bus-naming 0.3.2, replacing the routing change in 0.5.4,
+  which was never placed (deployed). `prefrontal-routing`'s durable returns to Insula quota
+  events only; its exact runner step hints are plain live subscriptions, with no
+  additional JetStream rights. Bootstrap updates existing durable filters in
+  place, preserving their delivered positions.
+- Derive live subscriptions from both code-reviewed reader allowlists and refresh the
+  permission goldens. The removed `thalamus-pi` runner no longer contributes any
+  reader or permission rows; existing orphaned durables are not deleted.
+
+## 0.5.4
+
+- Adopt cortexkit-bus-naming 0.3.1 so `prefrontal-routing` can read the exact
+  `broca.step.finished.v1` and `thalamus-harness.step.finished.v1` events and live
+  hints for per-model speed statistics. Bootstrap updates its existing event
+  durable's filters in place, preserving its delivered position; other live
+  subjects remain refused.
+
+## 0.5.3
+
+- Test only: the revocation tests' severed-socket check waits for the client's
+  `disconnected` event instead of polling its connection state. A kicked client
+  whose credential is still valid reconnects at once, so the state poll could
+  miss the disconnect and fail at random. No change to the binary.
+
 ## 0.5.2
 
 - Move the subc-daemon dev-dependency requirement to 0.40.0; no behavior change for the binary.

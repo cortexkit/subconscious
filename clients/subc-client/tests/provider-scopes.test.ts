@@ -3,10 +3,11 @@ import { readFileSync } from "node:fs";
 import {
   buildFlags, buildFrame, decodeHeader, FrameType, HEADER_LEN, Priority,
   SubcProvider, SubcProviderError,
-  type Frame, type ScopeRecord,
+  type Frame, type ScopeRecord, type RemoteClaim,
 } from "../src/index.js";
 
 import { rejectionOf, throwerOf } from "./settle.js";
+import { scopeRecordWire } from "../src/scope.js";
 
 const FLAGS = buildFlags(false, Priority.Passive, false);
 
@@ -27,10 +28,29 @@ const full: ScopeRecord = {
   },
 };
 const minimal: ScopeRecord = { scope_ref: "session-minimal", scope_epoch: 0, kind: "head" };
+const federated: ScopeRecord = {
+  scope_ref: "peer", scope_epoch: 1, kind: "federated",
+  attributes: { federated: {
+    peer_class: "computer", peer_fingerprint: "a".repeat(32), pairing_id: "pair:1", peer_name: "Peer",
+    remote_claim: { kind: "flow", flow_id: "flow", flow_version: Number.MAX_SAFE_INTEGER, flow_install_id: "install", flow_code_hash: "b".repeat(64), flow_name: "Remote Flow" },
+  } },
+};
+function withClaim(remote_claim: RemoteClaim | null | undefined): ScopeRecord {
+  return { ...federated, attributes: { federated: { ...federated.attributes!.federated!, remote_claim } } };
+}
+const federatedNull = withClaim(null);
+const federatedClaimCases = [
+  ["federated-agent", withClaim({ kind: "agent", agent_id: "remote-agent", agent_name: "Remote Agent" })],
+  ["federated-worker", withClaim({ kind: "worker", owner_module_id: "worker-owner", worker_ref: "c".repeat(64), on_behalf_of: "remote-agent", agent_name: "Delegating Agent" })],
+  ["federated-run", withClaim({ kind: "run", agent_id: "remote-agent", agent_name: "Remote Agent" })],
+  ["federated-claimless", withClaim(undefined)],
+  ["federated-claimless", federatedNull],
+] as const;
 const defaulted: ScopeRecord = {
   ...minimal, workdir: null, project_id: null, bind_proof_sha256: null,
   replace_only_if_idle: false, expires_at_ms: null, parent: null, child_owners: [], carriers: [],
   attributes: {
+    federated: null,
     agent_id: null, on_behalf_of_agent: null, delegates: false,
     flow_id: null, flow_version: null, flow_code_hash: null, flow_install_id: null, run_id: null,
   },
@@ -70,9 +90,40 @@ async function sent(writes: Frame[], count = 1) {
 }
 
 describe("provider scope control", () => {
-  for (const [name, record] of [["full", full], ["minimal", minimal], ["minimal", defaulted]] as const) {
+  test("federated names are optional and invalid display names are dropped on every claim kind", () => {
+    for (const claim of [
+      { kind: "agent", agent_id: "agent" }, { kind: "run", agent_id: "agent" },
+      { kind: "worker", owner_module_id: "owner", worker_ref: "a".repeat(64), on_behalf_of: "agent" },
+      { kind: "flow", flow_id: "flow", flow_version: 1, flow_install_id: "install", flow_code_hash: "a".repeat(64) },
+    ] as const) {
+      const key = claim.kind === "flow" ? "flow_name" : "agent_name";
+      const encoded = (name: unknown) => JSON.parse(JSON.stringify(scopeRecordWire(withClaim({ ...claim, [key]: name } as RemoteClaim)))).attributes.federated.remote_claim;
+      for (const name of ["Name", "é".repeat(80), "🦀".repeat(80)]) expect(encoded(name)).toEqual({ ...claim, [key]: name });
+      for (const name of [undefined, null, "", "x".repeat(81), "\n", "\u007f", "\u0085", "\u061c", "\u200e", "\u202e", "\u2069", "\ud800", 7, {}]) expect(encoded(name)).toEqual(claim);
+    }
+  });
+  for (const remote_claim of [false, 0, "", true, 1, "agent", []]) {
+    test(`federated refuses non-object remote_claim ${JSON.stringify(remote_claim)}`, () => {
+      const record = { ...federated, attributes: { federated: { ...federated.attributes!.federated!, remote_claim } } } as unknown as ScopeRecord;
+      expect(() => scopeRecordWire(record)).toThrow(TypeError);
+    });
+  }
+  test("federated inputs keep strict nested fields and safe flow versions", () => {
+    expect(scopeRecordWire(federated)).toMatchObject({ attributes: { federated: { remote_claim: { kind: "flow", flow_version: Number.MAX_SAFE_INTEGER } } } });
+    for (const patch of [
+      { unexpected: true },
+      { remote_claim: { ...federated.attributes!.federated!.remote_claim, unexpected: true } },
+      { remote_claim: { kind: "future" } },
+      ...[0, Number.MAX_SAFE_INTEGER + 1].map((flow_version) => ({ remote_claim: { kind: "flow", flow_id: "flow", flow_version, flow_install_id: "install", flow_code_hash: "a".repeat(64) } })),
+    ]) {
+      const record = { ...federated, attributes: { federated: { ...federated.attributes!.federated, ...patch } } } as ScopeRecord;
+      expect(() => scopeRecordWire(record)).toThrow();
+    }
+    expect(scopeRecordWire({ ...minimal, kind: "future-kind" })).toMatchObject({ kind: "future-kind" });
+  });
+  for (const [name, record] of [["full", full], ["minimal", minimal], ["minimal", defaulted], ["federated", federated], ...federatedClaimCases] as const) {
     for (const op of ["sync", "apply"] as const) {
-      test(`${op} ${name}${record === defaulted ? " defaults" : ""} matches Rust request bytes`, async () => {
+      test(`${op} ${name}${record === defaulted ? " defaults" : record === federatedNull ? " null" : ""} matches Rust request bytes`, async () => {
         const h = harness();
         const result = op === "sync" ? h.provider.scopeSync(7, [record])
           : h.provider.scopeApply(8, [record], [{ scope_ref: "old", scope_epoch: 1 }]);

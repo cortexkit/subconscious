@@ -63,6 +63,11 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
     }
     assert_golden("catalog_entry", &catalog_entry());
     assert_golden(
+        "catalog_entry_display_name",
+        &CatalogEntry::new("named-provider", vec![], vec![])
+            .with_display_name(Some("Routing".to_string())),
+    );
+    assert_golden(
         "catalog_entry_with_role_declarations",
         &CatalogEntry::new("role-test", vec![], vec![]).with_role_declarations(
             serde_json::from_value(serde_json::json!({
@@ -120,42 +125,42 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
         digest: digest.to_string(),
     };
     let verdicts = [
-        PendingReloadVerdict {
-            path: ReloadPathAgreement::Mismatch {
+        PendingReloadVerdict::new(
+            ReloadPathAgreement::Mismatch {
                 configured: "/bin/new".into(),
                 spawned_from: "/bin/old".into(),
             },
-            image: RunningImageAgreement::Match {
+            RunningImageAgreement::Match {
                 evidence: evidence("old"),
             },
-            spec: Some(LaunchSpecAgreement::Mismatch),
-        },
-        PendingReloadVerdict {
-            path: ReloadPathAgreement::Match,
-            image: RunningImageAgreement::Mismatch {
+        )
+        .with_spec(Some(LaunchSpecAgreement::Mismatch)),
+        PendingReloadVerdict::new(
+            ReloadPathAgreement::Match,
+            RunningImageAgreement::Mismatch {
                 running: evidence("old"),
                 disk: evidence("new"),
             },
-            spec: Some(LaunchSpecAgreement::Match),
-        },
-        PendingReloadVerdict {
-            path: ReloadPathAgreement::Unavailable {
+        )
+        .with_spec(Some(LaunchSpecAgreement::Match)),
+        PendingReloadVerdict::new(
+            ReloadPathAgreement::Unavailable {
                 reason: ReloadPathUnavailableReason::NotRunning,
             },
-            image: RunningImageAgreement::Unavailable {
+            RunningImageAgreement::Unavailable {
                 reason: RunningImageUnavailableReason::NotRunning,
             },
-            spec: Some(LaunchSpecAgreement::Unavailable {
-                reason: LaunchSpecUnavailableReason::NotRunning,
-            }),
-        },
-        PendingReloadVerdict {
-            path: ReloadPathAgreement::Match,
-            image: RunningImageAgreement::Match {
+        )
+        .with_spec(Some(LaunchSpecAgreement::Unavailable {
+            reason: LaunchSpecUnavailableReason::NotRunning,
+        })),
+        PendingReloadVerdict::new(
+            ReloadPathAgreement::Match,
+            RunningImageAgreement::Match {
                 evidence: evidence("same"),
             },
-            spec: None,
-        },
+        )
+        .with_spec(None),
     ];
     assert_golden(
         "supervisor_entry_reload_verdict_states",
@@ -183,20 +188,19 @@ fn control_wire_shapes_match_golden_json_and_round_trip() {
     assert_golden(
         "supervisor_entry_resource_states",
         &[
-            ChildResourceUsage::Measured(ChildResourceReading {
-                memory_bytes: 431_222_784,
-                memory_kind: ChildMemoryKind::PhysFootprint,
-                swap_bytes: None,
-                cpu_user_ms: 83_417,
-                cpu_system_ms: 12_905,
-            }),
-            ChildResourceUsage::Measured(ChildResourceReading {
-                memory_bytes: 212_992_000,
-                memory_kind: ChildMemoryKind::ResidentSet,
-                swap_bytes: Some(4_096),
-                cpu_user_ms: 1_250,
-                cpu_system_ms: 310,
-            }),
+            ChildResourceUsage::Measured(
+                ChildResourceReading::new(
+                    431_222_784,
+                    ChildMemoryKind::PhysFootprint,
+                    83_417,
+                    12_905,
+                )
+                .with_swap_bytes(None),
+            ),
+            ChildResourceUsage::Measured(
+                ChildResourceReading::new(212_992_000, ChildMemoryKind::ResidentSet, 1_250, 310)
+                    .with_swap_bytes(Some(4_096)),
+            ),
             ChildResourceUsage::Unavailable {
                 reason: ChildResourceUnavailableReason::NotRunning,
             },
@@ -777,6 +781,8 @@ fn client_control_responses() -> Vec<(&'static str, ClientControlResponse)> {
             ClientControlResponse::SupervisorList {
                 generation: 7,
                 modules: vec![supervisor_entry()],
+                daemon: None,
+                agent_commands: None,
             },
         ),
         (

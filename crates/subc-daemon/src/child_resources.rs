@@ -7,6 +7,16 @@ use subc_control::{
     ChildMemoryKind, ChildResourceReading, ChildResourceUnavailableReason, ChildResourceUsage,
 };
 
+/// The daemon must never include its reaped module children's CPU.
+pub(crate) fn read_own(pid: u32) -> ChildResourceUsage {
+    match subc_os::resource_usage(pid) {
+        Some(usage) => ChildResourceUsage::Measured(reading(usage)),
+        None => ChildResourceUsage::Unavailable {
+            reason: ChildResourceUnavailableReason::Unreadable,
+        },
+    }
+}
+
 /// The resources of the process the supervisor spawned as `pid`.
 ///
 /// `expected_start_time` is the kernel start time recorded at spawn, where the
@@ -85,22 +95,82 @@ fn read_with(
 fn reading(usage: subc_os::ResourceUsage) -> ChildResourceReading {
     let millis =
         |duration: std::time::Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-    ChildResourceReading {
-        memory_bytes: usage.memory_bytes,
-        memory_kind: match usage.memory_kind {
+    ChildResourceReading::new(
+        usage.memory_bytes,
+        match usage.memory_kind {
             subc_os::MemoryKind::PhysFootprint => ChildMemoryKind::PhysFootprint,
             subc_os::MemoryKind::ResidentSet => ChildMemoryKind::ResidentSet,
             subc_os::MemoryKind::WindowsWorkingSet => ChildMemoryKind::WindowsWorkingSet,
         },
-        swap_bytes: usage.swap_bytes,
-        cpu_user_ms: millis(usage.cpu_user),
-        cpu_system_ms: millis(usage.cpu_system),
-    }
+        millis(usage.cpu_user),
+        millis(usage.cpu_system),
+    )
+    .with_swap_bytes(usage.swap_bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn own_reader_does_not_charge_a_reaped_cpu_burning_child() {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "child_resources::tests::own_reader_fixture",
+                "--nocapture",
+            ])
+            .env("RESOURCE_OWN_FIXTURE", "parent")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "isolated own-resource fixture: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn own_reader_fixture() {
+        let Ok(mode) = std::env::var("RESOURCE_OWN_FIXTURE") else {
+            return;
+        };
+        let pid = std::process::id();
+        if mode == "burn" {
+            let start = subc_os::resource_usage(pid).unwrap();
+            let before = (start.cpu_user + start.cpu_system).as_millis();
+            loop {
+                for n in 0..100_000_u64 {
+                    std::hint::black_box(n.wrapping_mul(97));
+                }
+                let now = subc_os::resource_usage(pid).unwrap();
+                if (now.cpu_user + now.cpu_system).as_millis() >= before + 400 {
+                    break;
+                }
+            }
+            return;
+        }
+        let own = |reading| match reading {
+            ChildResourceUsage::Measured(reading) => reading.cpu_user_ms + reading.cpu_system_ms,
+            other => panic!("own reading unavailable: {other:?}"),
+        };
+        let before = own(read_own(pid));
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "child_resources::tests::own_reader_fixture"])
+            .env("RESOURCE_OWN_FIXTURE", "burn")
+            .output()
+            .unwrap();
+        assert!(child.status.success());
+        let after = own(read_own(pid));
+        let table = subc_os::ProcessTable::read().unwrap();
+        assert!(table.process(pid).unwrap().reaped_cpu_ms.unwrap() >= 400);
+        assert!(
+            after.saturating_sub(before) < 400,
+            "reaped child CPU was charged to the daemon"
+        );
+    }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn usage() -> subc_os::ResourceUsage {
@@ -157,13 +227,15 @@ mod tests {
         );
         assert_eq!(
             actual,
-            ChildResourceUsage::Measured(ChildResourceReading {
-                memory_bytes: 7 * 1024 * 1024,
-                memory_kind: ChildMemoryKind::ResidentSet,
-                swap_bytes: Some(4096),
-                cpu_user_ms: 1_250,
-                cpu_system_ms: 310,
-            })
+            ChildResourceUsage::Measured(
+                ChildResourceReading::new(
+                    7 * 1024 * 1024,
+                    ChildMemoryKind::ResidentSet,
+                    1_250,
+                    310
+                )
+                .with_swap_bytes(Some(4096))
+            )
         );
     }
 

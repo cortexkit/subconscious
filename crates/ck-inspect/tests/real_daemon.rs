@@ -83,7 +83,7 @@ async fn stripped_helper_profile_uses_module_dsym_symbols() {
     let bundle = root
         .path()
         .join("data/cortexkit/load/dsym")
-        .join(uuid)
+        .join(&uuid)
         .join("symbols.dSYM");
     fs::create_dir_all(bundle.parent().unwrap()).unwrap();
     run(Command::new("/usr/bin/dsymutil")
@@ -201,6 +201,17 @@ async fn stripped_helper_profile_uses_module_dsym_symbols() {
         frames.contains(&"inspect_busy_loop"),
         "stripped busy function must be named from its separate dSYM: {profile}"
     );
+    let outcome = profile["result"]["symbolization"]
+        .as_array()
+        .expect("stripped image must have a symbolization outcome")
+        .iter()
+        .find(|outcome| outcome["uuid"] == uuid)
+        .expect("symbolization must report the running helper's UUID");
+    assert_eq!(outcome["status"], "complete", "{profile}");
+    assert_eq!(outcome["unresolved"], 0, "{profile}");
+    assert!(outcome["resolved"].as_u64().unwrap() > 0, "{profile}");
+    assert!(outcome.get("reason").is_none(), "{profile}");
+    println!("live dSYM symbolization: {outcome}");
     println!("live dSYM named frame: inspect_busy_loop");
     consumer.close().await;
 }

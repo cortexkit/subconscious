@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.0
+
+- Adopt subc-client-rs 0.38.0 for scoped managed calls and watches. This is a breaking Rust dependency upgrade because the public API exposes SDK types; downstream users must upgrade their SDK dependency too. No wire behavior changes.
+
+## 0.5.0
+
+- Adopt Rust client 0.37 and its control 0.38 type family. Public credential-resolver construction accepts the new `ConsumerIdentity`, and handler methods/trait implementations expose the new SDK types, so this is a breaking Rust dependency release. Adapter wire behavior is unchanged.
+
+## 0.4.0
+
+- Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.
+
+## 0.3.0
+
+- Raise dependency floors for the resource-accounting wire release; the public dependency types require a breaking minor version.
+
 ## 0.2.1
 
 - Adopt compatible dependency requirements for the updated route-open control types; no behavior change.

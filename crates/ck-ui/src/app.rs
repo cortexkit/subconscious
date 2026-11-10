@@ -269,7 +269,10 @@ impl App {
 
     fn selected<'a>(&self, snap: &'a Snapshot) -> Option<&'a Module> {
         let mods = &snap.modules.data;
-        mods.get(self.mod_sel.min(mods.len().saturating_sub(1)))
+        mods.get(
+            self.mod_sel
+                .min(screens::modules::row_count(snap).saturating_sub(1)),
+        )
     }
 
     /// The log view's data for the selected module, or an empty panel while
@@ -640,13 +643,13 @@ impl App {
             KeyCode::Char('r') if self.tab == Tab::Modules => return self.restart(snap),
             KeyCode::Char('s') if self.tab == Tab::Modules => return self.stop_or_start(snap),
             KeyCode::Char('m') if self.tab == Tab::Modules && snap.serves.all_metrics => {
-                if snap.modules.data.is_empty() {
+                if self.selected(snap).is_none() {
                     return false;
                 }
                 self.metrics = Some(0);
             }
             KeyCode::Char('l') if self.tab == Tab::Modules => {
-                if snap.modules.data.is_empty() {
+                if self.selected(snap).is_none() {
                     return false;
                 }
                 self.log = Some(LogState::default());
@@ -1418,7 +1421,7 @@ impl App {
                 let rows = screens::home::attention_rows(w, h, snap.attention().len());
                 (&mut self.home_sel, rows)
             }
-            Tab::Modules => (&mut self.mod_sel, snap.modules.data.len()),
+            Tab::Modules => (&mut self.mod_sel, screens::modules::row_count(snap)),
             Tab::Activity => return self.move_activity(delta, snap),
             Tab::Usage => return self.move_usage(delta, snap),
             Tab::Agents => return self.move_agents(delta, snap),
@@ -1492,8 +1495,7 @@ impl App {
                 if self.tab == Tab::Modules {
                     let l = screens::modules::layout(w, h);
                     if x >= 1 && x < 1 + l.lw {
-                        let len = snap.modules.data.len();
-                        if let Some(i) = screens::modules::module_at(w, h, len, self.mod_sel, y) {
+                        if let Some(i) = screens::modules::row_at(w, h, snap, self.mod_sel, y) {
                             self.mod_sel = i;
                             return true;
                         }

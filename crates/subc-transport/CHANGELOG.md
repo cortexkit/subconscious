@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.17.0
+
+- Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.
+
+## 0.16.0
+
+- Raise dependency floors for the resource-accounting wire release; the public dependency types require a breaking minor version.
+
 ## 0.15.0
 
 - Breaking: upgrade public frame and decoding types to protocol 0.34. Upgrade transport and protocol together so consumers do not mix incompatible Rust types. Handshake, connection-file and frame-envelope encodings are unchanged.

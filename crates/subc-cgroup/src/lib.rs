@@ -22,6 +22,9 @@ pub use freeze::{
 mod path;
 pub use path::kill_path;
 
+mod cpu;
+pub use cpu::{process_ids, read_cpu_ms};
+
 mod memory;
 pub use memory::{read_memory, read_memory_counted, MemoryReadError, MemoryReading, MemorySource};
 

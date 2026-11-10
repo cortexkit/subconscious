@@ -18,6 +18,14 @@
   is present. Describe refusal or failure keeps the connection usable without
   the field. Existing public enum case lists and public initializer signatures
   are unchanged.
+- Read optional `BoardLaneItem.etaSource` (`eta_source` on the wire): `wait` when the
+  board module derived the ETA from what the item waits on. Kept as an open string;
+  absent stays nil.
+- Federated scope management replies preserve optional `agent_name` and `flow_name` for display only. They arrive already validated by the daemon; generic dictionary decoding remains unchanged, with no new typed scope API.
+- Mirror optional operation_deferral catalog metadata as CatalogEntry.operationDeferral.
+
+- Read optional `CatalogEntry.displayName` from `catalog.list`; absent names
+  remain nil so apps can fall back to the bare `moduleId`.
 
 - Tag session subscriptions only when the route negotiated credit windows;
   older daemons keep the original subscription frame flags.

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.0
+
+- Adopt subc-client-rs 0.38.0 for scoped managed calls and watches. This is a breaking Rust dependency upgrade because the public API exposes SDK types; downstream users must upgrade their SDK dependency too. No wire behavior changes.
+
+## 0.6.0
+
+- Adopt control 0.38 and Rust client 0.37. `PrivateDaemon::control` and `HarnessSigner::answer` expose those dependencies' nominal types, so their upgrade requires a breaking Rust release. Test rig behavior is unchanged.
+
+## 0.5.0
+
+- Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.
+
+## 0.4.0
+
+- Raise dependency floors for the resource-accounting wire release; the public dependency types require a breaking minor version.
+
 ## 0.3.1
 
 - Adopt compatible dependency requirements for the updated route-open control types; no behavior change.

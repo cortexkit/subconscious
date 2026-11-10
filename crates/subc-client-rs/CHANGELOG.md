@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.34.3
+## Unreleased
 
 - Correct the adopting sample's closed schema and review of absent or unchanged
   fields; exercise the documented hooks against a gate-capable daemon.
@@ -12,6 +12,67 @@
   no-approved-config detail when no view exists, and retry `anchor_pending`
   reports on the next change hint. Configuration work does not block the reader,
   health checks, drain hooks or stop. Re-export shared schema helpers for reviews.
+
+## 0.38.3
+
+- Add typed `ModuleHandle::route_authorize` on registered module connections,
+  gated by the daemon's advertised operation. Judgments about the route,
+  including authorization refusals, are returned as values. Daemon call refusals,
+  including `route_authorize_not_permitted` for an asking module that may not use
+  the operation, remain `ScopeCallError::Refused` with their code and message.
+
+## 0.38.2
+
+- Route and handle closes are now cancel-safe: dropping a close during a drain or
+  writer-capacity wait still settles pending requests and queues exactly one
+  GOODBYE. Abandoned closes use the connection's ordered retirement queue and keep
+  the channel occupied until GOODBYE is queued or the connection dies.
+
+## 0.38.1
+
+- Route closes now wait for writer capacity before returning, so callers may release
+  per-route budget without leaking a daemon route when the writer queue is full.
+  Deadline-retired routes also retain their GOODBYEs in order until queued; both
+  paths keep the channel occupied until teardown is queued or the connection dies.
+
+## 0.38.0
+
+- Add `CallOptions.scope` for every managed call, including cancellable calls,
+  framed uploads and binary replies, and `SubscribeOptions.scope` for managed
+  watches. `CloseRouteOptions.scope` closes only the matching cached route.
+  Scoped calls and watches share the existing cache,
+  keyed separately by owner, ref and epoch. Scope refusals and route closure use
+  the same retry and delivery guarantees as unscoped calls. A later call after
+  a scope-related close opens a fresh route; the daemon refuses it as
+  `scope_ended` for an old epoch or `scope_not_live` if the ref is gone, without
+  a client-side tombstone. Closing a watch's scope ends the watch rather than
+  automatically reopening it under another selector.
+- **Rust migration:** exhaustive `CallOptions`, `SubscribeOptions` and
+  `CloseRouteOptions` literals must add `scope: None`
+  (or the desired selector). Callers using `..Default::default()` change nothing.
+  `open_route` rejects a scope in its options: use `open_route_scoped`, whose
+  explicit selector must agree with any selector in the options. Already-open
+  handle requests, watches, handle closes, reserved sends and one-shot
+  admission-facts opens reject a scope in their options rather than silently
+  ignoring it. There is no wire change.
+
+## 0.37.0
+
+- Adopt control 0.38's extensible supervisor resource and reload-verdict types. This is a breaking Rust dependency upgrade because the SDK re-exports control types and returns them in public supervisor responses. Use their `new` constructors and `with_*` builders instead of external resource struct literals; the new root-only `tree.own` remains optional on the wire.
+
+## 0.36.0
+
+- Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.
+
+## 0.35.0
+
+- Expose `AgentCommandsError::is_retryable`, sharing declaration refusal classes with the protocol. Retries use fresh correlations and, for a closed queue, a current supervised connection; the SDK does not retry automatically.
+
+- Add ModuleHandle::agent_commands with typed unsupported/refused outcomes that leave the module connection open. Return daemon and agent-command resources with supervisor lists. Adopt the breaking protocol/control/transport types exposed by the SDK.
+
+## 0.34.3
+
+- Require protocol 0.34.5 and control 0.35.1, exposing the additive optional display name through the re-exported `CatalogEntry`.
 
 ## 0.34.2
 

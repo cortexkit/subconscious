@@ -1,4 +1,6 @@
-use crate::profile::{Profile, Stack, Thread};
+use crate::profile::{
+    Profile, Stack, Symbolization, SymbolizationReason, SymbolizationStatus, Thread,
+};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -34,37 +36,46 @@ fn binary_image(line: &str) -> Option<(String, BinaryImage)> {
     ))
 }
 
-fn dwarf_file(dsym_root: &Path, uuid: &str) -> Option<PathBuf> {
+fn dwarf_file(dsym_root: &Path, uuid: &str) -> Result<PathBuf, SymbolizationReason> {
+    use SymbolizationReason::{DebugFileAmbiguous, DebugFileMissing};
+    let entries = |path: &Path| {
+        std::fs::read_dir(path)
+            .and_then(|entries| entries.collect::<Result<Vec<_>, _>>())
+            .map_err(|_| DebugFileMissing)
+    };
     // Compare the spelling even on case-insensitive filesystems.
-    let uuid_dir = std::fs::read_dir(dsym_root)
-        .ok()?
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?
+    let uuid_dir = entries(dsym_root)?
         .into_iter()
-        .find(|entry| entry.file_name() == uuid)?;
+        .find(|entry| entry.file_name() == uuid)
+        .ok_or(DebugFileMissing)?;
     // Enumerate names rather than guessing the DWARF name from the image: build
     // tools can give the debug file a different name from the installed binary.
-    let bundles: Vec<_> = std::fs::read_dir(uuid_dir.path())
-        .ok()?
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?
+    let bundles: Vec<_> = entries(&uuid_dir.path())?
         .into_iter()
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "dSYM"))
         .collect();
     let [bundle] = bundles.as_slice() else {
-        return None;
+        return Err(if bundles.is_empty() {
+            DebugFileMissing
+        } else {
+            DebugFileAmbiguous
+        });
     };
     if !bundle.path().is_dir() {
-        return None;
+        return Err(DebugFileMissing);
     }
-    let files: Vec<_> = std::fs::read_dir(bundle.path().join("Contents/Resources/DWARF"))
-        .ok()?
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
+    let files = entries(&bundle.path().join("Contents/Resources/DWARF"))?;
     let [file] = files.as_slice() else {
-        return None;
+        return Err(if files.is_empty() {
+            DebugFileMissing
+        } else {
+            DebugFileAmbiguous
+        });
     };
-    file.path().is_file().then(|| file.path())
+    file.path()
+        .is_file()
+        .then(|| file.path())
+        .ok_or(DebugFileMissing)
 }
 
 struct Node {
@@ -223,11 +234,47 @@ pub(crate) struct Sample {
     images: BTreeMap<String, BinaryImage>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SymbolizerError {
+    Missing,
+    Failed,
+    DeadlineBeforeStart,
+    DeadlineMidRun,
+}
+
+fn symbolization_log(
+    module_id: &str,
+    outcome: &Symbolization,
+    deadline_phase: Option<&str>,
+    elapsed_ms: u128,
+) -> String {
+    // Quote fields as JSON so an image name cannot inject another log line.
+    // Use only the image basename, never a debug-file or executable path.
+    let image = Path::new(&outcome.image)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let mut fields = serde_json::json!({
+        "module_id": module_id,
+        "image": image,
+        "uuid": outcome.uuid,
+        "status": outcome.status,
+        "reason": outcome.reason,
+        "resolved": outcome.resolved,
+        "unresolved": outcome.unresolved,
+        "elapsed_ms": elapsed_ms,
+    });
+    if let Some(phase) = deadline_phase {
+        fields["deadline_phase"] = phase.into();
+    }
+    format!("INFO profile symbolization {fields}")
+}
+
 impl Sample {
     pub(crate) async fn symbolize_with<F, Fut>(&mut self, dsym_root: &Path, mut atos: F)
     where
         F: FnMut(PathBuf, u64, Vec<u64>) -> Fut,
-        Fut: std::future::Future<Output = Option<String>>,
+        Fut: std::future::Future<Output = Result<String, SymbolizerError>>,
     {
         let mut unresolved = BTreeMap::<String, BTreeMap<String, u64>>::new();
         for frame in self
@@ -250,37 +297,93 @@ impl Sample {
                 continue;
             };
             let frames = unresolved.entry(name.into()).or_default();
-            if frames.len() < 256 {
-                frames.insert(frame.clone(), address);
-            }
+            frames.insert(frame.clone(), address);
         }
         let mut replacements = BTreeMap::new();
         for (name, frames) in unresolved {
+            let started = std::time::Instant::now();
             let image = &self.images[&name];
-            let Some(dwarf) = dwarf_file(dsym_root, &image.uuid) else {
-                continue;
-            };
-            let addresses = frames.values().copied().collect();
-            let Some(output) = atos(dwarf, image.load_address, addresses).await else {
-                continue;
-            };
-            for ((frame, address), line) in frames.into_iter().zip(output.lines()) {
-                let symbol = line.split(" (in ").next().unwrap_or(line).trim();
-                // atos echoes unresolved addresses rather than reporting an error.
-                if symbol.is_empty()
-                    || symbol.starts_with("???")
-                    || symbol
-                        .strip_prefix("0x")
-                        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
-                        == Some(address)
-                {
-                    continue;
-                }
-                let symbol = frame_name(symbol);
-                if symbol != "<unknown>" {
-                    replacements.insert(frame, symbol);
+            let addresses: Vec<_> = frames
+                .values()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .take(256)
+                .collect();
+            let mut named = BTreeMap::new();
+            let mut reason = None;
+            let mut deadline_phase = None;
+            match dwarf_file(dsym_root, &image.uuid) {
+                Err(error) => reason = Some(error),
+                Ok(dwarf) => match atos(dwarf, image.load_address, addresses.clone()).await {
+                    Err(error) => {
+                        reason = Some(match error {
+                            SymbolizerError::Missing => SymbolizationReason::SymbolizerMissing,
+                            SymbolizerError::Failed => SymbolizationReason::SymbolizerFailed,
+                            SymbolizerError::DeadlineBeforeStart => {
+                                deadline_phase = Some("before_start");
+                                SymbolizationReason::Deadline
+                            }
+                            SymbolizerError::DeadlineMidRun => {
+                                deadline_phase = Some("mid_run");
+                                SymbolizationReason::Deadline
+                            }
+                        })
+                    }
+                    Ok(output) => {
+                        for (address, line) in addresses.iter().zip(output.lines()) {
+                            let symbol = line.split(" (in ").next().unwrap_or(line).trim();
+                            // atos echoes unresolved addresses rather than reporting an error.
+                            if symbol.is_empty()
+                                || symbol.starts_with("???")
+                                || symbol
+                                    .strip_prefix("0x")
+                                    .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                                    == Some(*address)
+                            {
+                                continue;
+                            }
+                            let symbol = frame_name(symbol);
+                            if symbol != "<unknown>" {
+                                named.insert(*address, symbol);
+                            }
+                        }
+                        // Report the first failing stage: attempted addresses precede
+                        // the tail that was never sent because of the address cap.
+                        if named.len() < addresses.len() {
+                            reason = Some(SymbolizationReason::Unresolved);
+                        } else if frames.values().any(|address| !named.contains_key(address)) {
+                            reason = Some(SymbolizationReason::AddressCap);
+                        }
+                    }
+                },
+            }
+            let mut resolved = 0;
+            for (frame, address) in &frames {
+                if let Some(symbol) = named.get(address) {
+                    replacements.insert(frame.clone(), symbol.clone());
+                    resolved += 1;
                 }
             }
+            let outcome = Symbolization::new(
+                name,
+                image.uuid.clone(),
+                resolved,
+                frames.len() - resolved,
+                reason,
+            );
+            if outcome.status != SymbolizationStatus::Complete {
+                eprintln!(
+                    "{}",
+                    symbolization_log(
+                        &self.profile.module_id,
+                        &outcome,
+                        deadline_phase,
+                        started.elapsed().as_millis()
+                    )
+                );
+            }
+            self.profile.symbolization.push(outcome);
         }
         for frame in self
             .profile
@@ -416,22 +519,100 @@ mod tests {
     }
 
     #[test]
+    fn symbolization_log_distinguishes_deadlines_without_paths_or_stacks() {
+        let outcome = super::Symbolization::new(
+            "/Users/private/build/helper\nforged".into(),
+            UUID.into(),
+            0,
+            2,
+            Some(super::SymbolizationReason::Deadline),
+        );
+        for phase in ["before_start", "mid_run"] {
+            let line = super::symbolization_log("fixture", &outcome, Some(phase), 17);
+            let fields: serde_json::Value =
+                serde_json::from_str(line.strip_prefix("INFO profile symbolization ").unwrap())
+                    .unwrap();
+            assert_eq!(
+                fields,
+                serde_json::json!({
+                    "module_id":"fixture", "image":"helper\nforged", "uuid":UUID,
+                    "status":"none", "reason":"deadline", "resolved":0, "unresolved":2,
+                    "elapsed_ms":17, "deadline_phase":phase
+                })
+            );
+            assert_eq!(line.lines().count(), 1);
+            assert!(!line.contains("/Users"));
+            assert!(!line.contains("frames"));
+        }
+    }
+
+    #[tokio::test]
+    async fn symbolization_execution_errors_report_images_in_name_order() {
+        use super::{SymbolizationReason, SymbolizerError};
+        let root = tempfile::tempdir().unwrap();
+        make_dwarf(root.path(), UUID, "helper.dSYM");
+        let graph = format!("Call graph:\n  2 Thread_1\n    1 ???  (in zebra)  load address 0x1000 + 0x10  [0x0]\n    1 ???  (in alpha)  load address 0x1000 + 0x20  [0x0]\nBinary Images:\n0x1000 - 0x2000 zebra (1) <{UUID}> /zebra\n0x1000 - 0x2000 alpha (1) <{UUID}> /alpha\n");
+        for (error, reason) in [
+            (
+                SymbolizerError::Missing,
+                SymbolizationReason::SymbolizerMissing,
+            ),
+            (
+                SymbolizerError::Failed,
+                SymbolizationReason::SymbolizerFailed,
+            ),
+            (
+                SymbolizerError::DeadlineBeforeStart,
+                SymbolizationReason::Deadline,
+            ),
+            (
+                SymbolizerError::DeadlineMidRun,
+                SymbolizationReason::Deadline,
+            ),
+        ] {
+            let mut sample = super::parse(&graph, profile()).unwrap();
+            let mut addresses_seen = Vec::new();
+            sample
+                .symbolize_with(root.path(), |_, _, addresses| {
+                    addresses_seen.extend(addresses);
+                    std::future::ready(Err(error))
+                })
+                .await;
+            assert_eq!(addresses_seen, [0x1020, 0x1010]);
+            let result = sample.finish();
+            assert_eq!(
+                result
+                    .symbolization
+                    .iter()
+                    .map(|outcome| outcome.image.as_str())
+                    .collect::<Vec<_>>(),
+                ["alpha", "zebra"]
+            );
+            for outcome in result.symbolization {
+                assert_eq!(outcome.reason, Some(reason));
+                assert_eq!(outcome.resolved, 0);
+                assert_eq!(outcome.unresolved, 1);
+            }
+        }
+    }
+
+    #[test]
     fn dwarf_lookup_requires_one_bundle_and_one_file() {
         let root = tempfile::tempdir().unwrap();
-        assert!(dwarf_file(root.path(), UUID).is_none());
+        assert!(dwarf_file(root.path(), UUID).is_err());
         std::fs::create_dir(root.path().join(UUID)).unwrap();
-        assert!(dwarf_file(root.path(), UUID).is_none());
+        assert!(dwarf_file(root.path(), UUID).is_err());
         let file = make_dwarf(root.path(), UUID, "helper.dSYM");
-        assert_eq!(dwarf_file(root.path(), UUID), Some(file.clone()));
+        assert_eq!(dwarf_file(root.path(), UUID), Ok(file.clone()));
         std::fs::remove_file(&file).unwrap();
-        assert!(dwarf_file(root.path(), UUID).is_none());
+        assert!(dwarf_file(root.path(), UUID).is_err());
         std::fs::write(&file, b"debug info").unwrap();
         let second = file.with_file_name("another");
         std::fs::write(&second, b"debug info").unwrap();
-        assert!(dwarf_file(root.path(), UUID).is_none());
+        assert!(dwarf_file(root.path(), UUID).is_err());
         std::fs::remove_file(second).unwrap();
         make_dwarf(root.path(), UUID, "second.dSYM");
-        assert!(dwarf_file(root.path(), UUID).is_none());
+        assert!(dwarf_file(root.path(), UUID).is_err());
     }
 
     #[test]
@@ -442,7 +623,7 @@ mod tests {
         ] {
             let root = tempfile::tempdir().unwrap();
             make_dwarf(root.path(), &folder, "helper.dSYM");
-            assert!(dwarf_file(root.path(), UUID).is_none());
+            assert!(dwarf_file(root.path(), UUID).is_err());
         }
     }
 
@@ -472,7 +653,7 @@ mod tests {
             assert_eq!(file, dwarf);
             assert_eq!(load, 0x1000);
             assert_eq!(addresses, [0x1010, 0x1020, 0x1030, 0x1040, 0x1050]);
-            std::future::ready(Some("_ZN4test4main17h0123456789abcdefE (in helper) (file.rs:1)\n_RNvC6_123foo3bar (in helper) (file.rs:2)\ntest::main (in helper) (file.rs:3)\n0x1040\nother (in helper) (file.rs:4)\n".into()))
+            std::future::ready(Ok("_ZN4test4main17h0123456789abcdefE (in helper) (file.rs:1)\n_RNvC6_123foo3bar (in helper) (file.rs:2)\ntest::main (in helper) (file.rs:3)\n0x1040\nother (in helper) (file.rs:4)\n".into()))
         }).await;
         assert_eq!(calls, 1);
         let result = sample.finish();
@@ -506,7 +687,7 @@ mod tests {
             .symbolize_with(root.path(), |_, _, addresses| {
                 calls += 1;
                 assert_eq!(addresses.len(), 256);
-                std::future::ready(None)
+                std::future::ready(Err(super::SymbolizerError::Failed))
             })
             .await;
         assert_eq!(calls, 1);

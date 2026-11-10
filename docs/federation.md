@@ -59,6 +59,16 @@ Federation needs two subc-core primitives: P1 refreshes a catalog without reconn
   - **Honest threat model:** P2 is **not a same-user barrier** — under subc's same-host model a same-user process can already read the connection key and the owner's env nonce, and is inside the trust floor. P2 protects against accidental id collisions and lower-trust/different-user processes, exactly like the existing exact-id reservation; the design claims no more. WHICH peer namespaces the fed-module creates under `fed:` is fed-module policy (profile-driven), not P2 enforcement.
   The federation module registers peer catalogs as `fed:<peer-pubkey-fingerprint>:<module>`. Builds on the shipped spawn-attestation machinery; the delta is delimiter-aware prefix matching + owner-module mapping.
 
+  **Scope service credit:** when a re-export's HELLO proves the reserved-prefix
+  owner's spawn nonce, the daemon retains that verified owner on the connection
+  registration. An acknowledged scoped `route.bind` credits both the re-export
+  id and its owner in [`scope.served_by`](scopes.md#service-history-scopeserved_by).
+  Thus a re-export under `fed:` credits `callosum` as well, allowing machine-status
+  notices to come from Callosum's own connection even after the re-export is
+  withdrawn. Refused or unacknowledged binds credit neither. This is a generic
+  reserved-prefix rule: matching an id string without prefix-owner nonce
+  verification, including an exact-id reservation, never grants owner credit.
+
 Both primitives are independently testable, land before the federation module exists, and keep the thin-core rule honest: subc-core gains generic REGISTRY capabilities, zero federation logic.
 
 ---

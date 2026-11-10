@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.4.4
+
+- Tests only: write test scripts through a `sh` child instead of `std::fs::write`, so a
+  thread forking for another test can't hold a writable descriptor on a script being
+  launched (Linux `ETXTBSY`, seen as "cannot start sampler" in CI), and publish the
+  symbolizer fixture's pid with a rename so the test never reads an empty file.
+
+## 0.4.3
+
+- Require subc-client-rs 0.38.0 for scoped managed calls and watches. This dependency-only patch keeps wire behavior unchanged.
+
+## 0.4.2
+
+- Refresh control and Rust-client requirements for the extensible supervisor resource API; inspection behavior is unchanged.
+
+## 0.4.1
+
+- Add optional per-image macOS profile `symbolization` outcomes with distinct-frame counts and fixed failure reasons. Preserve offset frames and successful profiles on symbolization failures; distinguish an exhausted deadline before launch from a killed symbolizer in info-level stderr diagnostics without debug-file paths or stacks.
+- Include symbolization outcomes in the existing 16 KiB reply budget, truncating them last. The reply field is additive and optional: readers must ignore unknown object members. Existing typed replies accept absent outcomes and unknown members; Linux replies are unchanged.
+
+## 0.4.0
+
+- Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.
+
+## 0.3.0
+
+- Raise dependency floors for the resource-accounting wire release; the public dependency types require a breaking minor version.
+
 ## 0.2.1
 
 - Adopt compatible dependency requirements for the updated route-open control types; no behavior change.

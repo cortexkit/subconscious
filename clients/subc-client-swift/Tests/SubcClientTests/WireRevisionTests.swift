@@ -354,6 +354,21 @@ final class ClientWireRevisionTests: XCTestCase {
         XCTAssertEqual(extra["enabled"] as? Bool, true)
     }
 
+    func testScopeDescribeGoldenReplyPreservesFederatedDisplayNames() throws {
+        for (kind, field, name) in [
+            ("agent", "agent_name", "Remote Agent"),
+            ("flow", "flow_name", "Remote Flow")
+        ] {
+            let reply = try scopeDescribeGoldenReply("scope-describe-federated-\(kind)")
+            let scope = try XCTUnwrap(reply["scope"] as? [String: Any])
+            let attributes = try XCTUnwrap(scope["attributes"] as? [String: Any])
+            let facts = try XCTUnwrap(attributes["federated"] as? [String: Any])
+            let claim = try XCTUnwrap(facts["remote_claim"] as? [String: Any])
+            XCTAssertEqual(claim["kind"] as? String, kind)
+            XCTAssertEqual(claim[field] as? String, name)
+        }
+    }
+
     func testScopeDescribeLegacyGoldenReplyHasNoDeadline() throws {
         let reply = try scopeDescribeGoldenReply("scope-describe-legacy")
         let scope = try XCTUnwrap(reply["scope"] as? [String: Any])
@@ -388,6 +403,39 @@ final class ClientWireRevisionTests: XCTestCase {
         let client = SubcClient(transport: transport)
         XCTAssertTrue(try client.catalogList().isEmpty)
         XCTAssertTrue(transport.bytes.isEmpty)
+    }
+
+    func testCatalogListReadsDisplayNameAndToleratesAbsence() throws {
+        let transport = ScriptedTransport()
+        try transport.append(makeFrame(
+            ty: .response,
+            channel: 0,
+            epoch: 0,
+            corr: 1,
+            json: ["modules": [
+                ["module_id": "named-provider", "display_name": "Routing", "roles": [], "control_ops": [], "future_field": true],
+                ["module_id": "legacy-provider", "roles": [], "control_ops": []],
+            ]]
+        ))
+        let modules = try SubcClient(transport: transport).catalogList()
+        XCTAssertEqual(modules.count, 2)
+        XCTAssertEqual(modules[0].displayName, "Routing")
+        XCTAssertNil(modules[1].displayName)
+    }
+
+    func testCatalogListMirrorsOperationDeferral() throws {
+        let transport = ScriptedTransport()
+        try transport.append(makeFrame(
+            ty: .response, channel: 0, epoch: 0, corr: 1,
+            json: ["modules": [
+                ["module_id": "provider", "roles": [], "control_ops": [],
+                 "operation_deferral": ["tool:read": true, "management:reset": true]],
+                ["module_id": "legacy", "roles": [], "control_ops": []],
+            ]]
+        ))
+        let modules = try SubcClient(transport: transport).catalogList()
+        XCTAssertEqual(modules[0].operationDeferral, ["tool:read": true, "management:reset": true])
+        XCTAssertNil(modules[1].operationDeferral)
     }
 
     func testCatalogListReturnsDeclaredBusEvents() throws {

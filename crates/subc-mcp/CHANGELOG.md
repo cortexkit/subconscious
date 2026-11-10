@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.2.2
+
+- Require subc-client-rs 0.38.0 for scoped managed calls and watches. This dependency-only patch keeps wire behavior unchanged.
+
+## 0.2.1
+
+- Refresh daemon/control and Rust-client requirements for the extensible supervisor resource API. MCP behavior is unchanged.
+
+## 0.2.0
+
+- Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.
+
+## 0.1.59
+
+- Raise dependency floors for the resource-accounting wire release.
+
 ## 0.1.58
 
 - Move the subc-daemon dev-dependency requirement to 0.40.0; no behavior change for the binary.

@@ -18,6 +18,8 @@ fn roster(running: bool) -> Value {
             SupervisorHealthStatus::Ok,
         )
         .with_drain_timeout_ms(Some(5100))],
+        daemon: None,
+        agent_commands: None,
     })
     .unwrap()
 }

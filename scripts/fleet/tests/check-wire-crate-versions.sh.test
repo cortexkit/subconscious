@@ -218,10 +218,58 @@ TOML
   printf '%s\n' "$output" | grep -Eq 'consumer.*subc-protocol.*0\.33\.1.*0\.33\.2'
 }
 
+published_decoder_fixture() {
+  new_fixture "$1"
+  replace crates/subc-daemon/Cargo.toml '\[dependencies\]' "$2"
+  replace crates/subc-daemon/Cargo.toml 'subc-protocol = .*' "$3"
+  bump_protocol
+  change_daemon
+  commit_changes
+}
+
+published_registry_dev_pin() {
+  published_decoder_fixture published_registry_dev_pin '[dev-dependencies]' \
+    'old_wire = { package = "subc-protocol", version = "=0.33.1" }'
+  run_check 0
+}
+
+published_registry_target_dev_pin() {
+  published_decoder_fixture published_registry_target_dev_pin "[target.'cfg(unix)'.dev-dependencies]" \
+    'old_wire = { package = "subc-protocol", version = "=0.33.1" }'
+  run_check 0
+}
+
+published_registry_production_pin_is_stale() {
+  published_decoder_fixture published_registry_production_pin_is_stale '[dependencies]' \
+    'old_wire = { package = "subc-protocol", version = "=0.33.1" }'
+  assert_stale_requirement
+}
+
+published_path_dev_pin_is_stale() {
+  published_decoder_fixture published_path_dev_pin_is_stale '[dev-dependencies]' \
+    'old_wire = { package = "subc-protocol", path = "../subc-protocol", version = "=0.33.1" }'
+  assert_stale_requirement
+}
+
+published_registry_nonexact_dev_is_stale() {
+  published_decoder_fixture published_registry_nonexact_dev_is_stale '[dev-dependencies]' \
+    'old_wire = { package = "subc-protocol", version = "^0.33.1" }'
+  assert_stale_requirement
+}
+
+published_registry_unrenamed_dev_is_stale() {
+  published_decoder_fixture published_registry_unrenamed_dev_is_stale '[dev-dependencies]' \
+    'subc-protocol = { version = "=0.33.1" }'
+  assert_stale_requirement
+}
+
 tests=(stale_requirement updated_requirement unchanged_dependent manifest_only_dependent
   comment_only_dependent version_only_dependency_bump no_dependency_bump
   renamed_target_dependency committed_requirements_only requirement_operators
-  inherited_dependency dependent_outside_crates)
+  inherited_dependency dependent_outside_crates published_registry_dev_pin
+  published_registry_target_dev_pin published_registry_production_pin_is_stale
+  published_path_dev_pin_is_stale published_registry_nonexact_dev_is_stale
+  published_registry_unrenamed_dev_is_stale)
 count=0
 for test in "${tests[@]}"; do # nonempty-array: literal test list
   if [ "${1:-all}" != all ] && [ "$1" != "$test" ]; then

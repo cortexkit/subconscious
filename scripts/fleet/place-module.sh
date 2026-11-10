@@ -71,11 +71,13 @@
 #   place-module.sh --module <id> --staged <path> [--dest <path>] [--path-face <name>]
 #                   --marker <string> [--control <string>] [--old-control <string>]
 #                   --tool-defs <unchanged|additive|unregistered|changed|none> [--host-restart-window]
-#                   [--no-restart [--reexec-safe]] [--allow-debuggable <ask_id>]
+#                   [--terminal | --no-restart [--reexec-safe]] [--allow-debuggable <ask_id>]
 #   place-module.sh --module <id> --rollback <stamp> [--dest <path>]
-#                   [--restore-store <path>] [--no-restart]
+#                   [--restore-store <path>] [--terminal | --no-restart]
 #   place-module.sh --module <id> --staged <path> [--dest <path>] --marker <string> --install
 #                   (a module's FIRST install: no running binary, never restarts)
+#   <ask_id> is the id (ask_<hex>) of the approval request in which the operator
+#   approved this debuggable placement; it is recorded with the agent's asks.
 #
 # Refuses (exit 2) before touching the destination if any pre-arm fails.
 #
@@ -88,6 +90,7 @@ set -euo pipefail
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
 MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; REEXEC_SAFE=0; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; ALLOW_UNSTAMPED=0; INSTALL=0; ROLLBACK=""; RESTORE_STORE=""; TOOL_DEFS=""; HOST_RESTART_WINDOW=0; ALLOW_DEBUGGABLE=""
+TERMINAL=0
 
 while (($# > 0)); do
   case "$1" in
@@ -128,6 +131,9 @@ while (($# > 0)); do
     --migrates) MIGRATES="$2"; shift 2 ;;
     --check-only) shift ;;  # now the default; accepted so older call sites keep working
     --no-restart) RESTART=0; shift ;;
+    # Restart may keep a module's process container and its host processes.
+    # Stop ends that container before placing a build that cannot adopt them.
+    --terminal) TERMINAL=1; shift ;;
     # Some modules start helper processes by re-executing their own binary path
     # while they run, and check that the helper is the same build. Swapping that
     # binary without a restart makes every later helper start fail the check
@@ -172,6 +178,10 @@ while (($# > 0)); do
 done
 
 [ -n "$MODULE" ] || { echo "REFUSED: --module is required" >&2; exit 2; }
+if [ "$TERMINAL" -eq 1 ] && [ "$RESTART" -eq 0 ]; then
+  echo "REFUSED: --terminal requires starting the module again; cannot combine with --no-restart or --install" >&2
+  exit 2
+fi
 if [ -n "$ALLOW_DEBUGGABLE" ]; then
   [[ "$ALLOW_DEBUGGABLE" =~ ^ask_[0-9a-f]{8,}$ ]] || { echo "REFUSED: --allow-debuggable takes the id of the operator's approving ask (ask_<hex>), not '$ALLOW_DEBUGGABLE'" >&2; exit 2; }
   [ "$INSTALL" -eq 0 ] && [ -z "$ROLLBACK" ] || { echo "REFUSED: --allow-debuggable is only for placing a staged build over a running module, never a first install or a rollback" >&2; exit 2; }
@@ -281,7 +291,16 @@ else
 fi
 
 say() { printf '%s\n' "$*"; }
-refuse() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
+# After a terminal stop the module stays down until something starts it, so
+# every later refusal says so rather than leaving a stopped module unexplained.
+TERMINAL_STOPPED=0
+refuse() {
+  printf 'REFUSED: %s\n' "$*" >&2
+  if [ "$TERMINAL_STOPPED" -eq 1 ]; then
+    printf 'NOTE: %s is stopped (terminal placement); start it with: ck module start %s\n' "$MODULE" "$MODULE" >&2
+  fi
+  exit 2
+}
 
 # A release daemon cannot admit replaced bytes through the development bypass.
 # Check before mutation, including --no-restart and rollback placements.
@@ -556,10 +575,51 @@ for name in sorted(seen):
   return 0
 }
 
+# Provenance holds the daemon-observed pid; module status has no pid and pgrep
+# can omit ancestors on macOS. Record identity before stop to detect pid reuse.
+terminal_stop() {
+  local pid pgid started current_started stop_out attempt group_empty
+  pid=$(ck --json provenance "$MODULE" | python3 -c '
+import json, sys
+pid = json.load(sys.stdin)["modules"][0]["daemon_observed"]["pid"]
+if type(pid) is not int or pid <= 0:
+    raise SystemExit("no daemon-observed process pid")
+print(pid)
+') || refuse "cannot read the daemon-observed pid for '$MODULE'; nothing placed"
+  started=$(ps -o lstart= -p "$pid") \
+    || refuse "cannot record the start time of pid $pid; nothing placed"
+  [ -n "$started" ] || refuse "no start time for pid $pid; nothing placed"
+  pgid=$(ps -o pgid= -p "$pid") \
+    || refuse "cannot record the process group of pid $pid; nothing placed"
+  pgid=${pgid//[[:space:]]/}
+  [[ "$pgid" =~ ^[1-9][0-9]*$ ]] || refuse "invalid process group for pid $pid; nothing placed"
+
+  if ! stop_out=$(ck module stop "$MODULE" 2>&1); then
+    refuse "could not stop '$MODULE' before terminal placement: $stop_out"
+  fi
+  TERMINAL_STOPPED=1
+  [ -z "$stop_out" ] || printf '%s\n' "$stop_out" | tail -1
+  for ((attempt=0; attempt<=60; attempt++)); do
+    current_started=$(ps -o lstart= -p "$pid" 2>/dev/null || true)
+    group_empty=0
+    # Enumerate every process: ps -g selects sessions on Linux, and pgrep can
+    # hide ancestors on macOS, including a kept host running this placement.
+    if ps -axo pgid=,pid= | awk -v group="$pgid" '$1 == group {found=1} END {exit found}'; then
+      group_empty=1
+    fi
+    if [ "$current_started" != "$started" ] && [ "$group_empty" -eq 1 ]; then
+      say "terminal placement: kept host processes were ended"
+      return 0
+    fi
+    if [ "$attempt" -lt 60 ]; then sleep 1; fi
+  done
+  refuse "container not empty after stop; nothing placed"
+}
+
 rollback_mode() {
   local rollback_file rollback_sidecar rollback_digest sidecar_digest current_backup backup_tmp
   local current_digest backup_digest store_snapshot store_saved_dir suffix restore_suffix source_path saved_path
-  local integrity_output integrity_status placed_digest placed_version restart_out
+  local integrity_output integrity_status placed_digest placed_version restart_out restart_verb
   rollback_file="$STAGING/$(basename "$DEST").rollback-$ROLLBACK"
   rollback_sidecar="$rollback_file.sha256"
   [ -f "$rollback_file" ] || refuse "rollback snapshot not found: $rollback_file"
@@ -595,6 +655,8 @@ rollback_mode() {
   fi
 
   config_gate_preflight
+  if [ "$TERMINAL" -eq 1 ]; then terminal_stop; fi
+
   mkdir -p "$STAGING"
   current_backup="$STAGING/$(basename "$DEST").rollback-$(date -u +%Y%m%dT%H%M%SZ)"
   [ ! -e "$current_backup" ] || refuse "a rollback snapshot already exists for this UTC second: $current_backup"
@@ -616,10 +678,12 @@ rollback_mode() {
 
   if [ -n "$RESTORE_STORE" ]; then
     local stop_out
-    if ! stop_out=$(ck module stop "$MODULE" 2>&1); then
-      refuse "could not stop '$MODULE' before restoring its store: $stop_out"
+    if [ "$TERMINAL" -eq 0 ]; then
+      if ! stop_out=$(ck module stop "$MODULE" 2>&1); then
+        refuse "could not stop '$MODULE' before restoring its store: $stop_out"
+      fi
+      [ -z "$stop_out" ] || printf '%s\n' "$stop_out" | tail -1
     fi
-    [ -z "$stop_out" ] || printf '%s\n' "$stop_out" | tail -1
     store_saved_dir=$(mktemp -d "$STAGING/.${MODULE}.store-set-aside.XXXXXX") \
       || refuse "could not create an owner-only store preservation folder in $STAGING"
     chmod 700 "$store_saved_dir"
@@ -683,10 +747,15 @@ rollback_mode() {
   say "rolled back to $ROLLBACK"
 
   if [ "$RESTART" -eq 1 ]; then
-    say "=== restart"
-    if [ -n "$RESTORE_STORE" ]; then
+    restart_verb=restart
+    if [ "$TERMINAL" -eq 1 ]; then restart_verb=start; fi
+    say "=== $restart_verb"
+    if [ -n "$RESTORE_STORE" ] || [ "$TERMINAL" -eq 1 ]; then
       if ! restart_out=$(ck module start "$MODULE" 2>&1); then
-        refuse "start of '$MODULE' failed after rollback; the restored binary and store are on disk: ${restart_out}"
+        if [ -n "$RESTORE_STORE" ]; then
+          refuse "start of '$MODULE' failed after rollback; the restored binary and store are on disk: ${restart_out}"
+        fi
+        refuse "start of '$MODULE' failed after terminal rollback; the restored binary is on disk: ${restart_out}"
       fi
     else
       if ! restart_out=$(ck module restart "$MODULE" 2>&1); then
@@ -694,7 +763,7 @@ rollback_mode() {
       fi
     fi
     printf '%s\n' "$restart_out" | tail -1
-    say "$(date -u +%FT%TZ) restart initiated -- verify on a lane opened AFTER this point:"
+    say "$(date -u +%FT%TZ) $restart_verb initiated -- verify on a lane opened AFTER this point:"
     say "  ck --json provenance $MODULE | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"modules\"][0][\"daemon_observed\"][\"pid\"])'"
     say "  then inode proc-vs-disk on that pid, which is the only proof it runs these bytes"
     say "  logs: event in the module's r2 sink ~/.local/share/cortexkit/$MODULE/logs/$MODULE.<YYYY-MM-DD>.log (timestamped)"
@@ -1456,6 +1525,7 @@ if [ "$PLACE" != "1" ]; then
 fi
 
 config_gate_preflight
+if [ "$TERMINAL" -eq 1 ]; then terminal_stop; fi
 
 if [ "$INSTALL" -eq 1 ]; then
   say "=== rollback"
@@ -1499,62 +1569,19 @@ if [ -n "$MIGRATES" ]; then
   # Named for the module as well as the store file: several modules keep a
   # store.db, and snapshots sharing a name could not be pruned per module.
   store_rb="$STAGING/$MODULE.$(basename "$MIGRATES").rollback-$(date -u +%Y%m%dT%H%M%SZ)"
-  # sqlite3 .backup, NOT cp: the module holds the store open with a live -wal,
+  # A consistent copy, NOT cp: the module holds the store open with a live -wal,
   # and cp captures a torn .db beside a WAL it does not include -- a snapshot
-  # that restores to a state which never existed. .backup is the online backup
-  # API and is WAL-correct against a running writer.
-  # `mode=ro` is right HERE because --migrates runs while the module still holds
-  # the store open, so a -wal exists. It is not a universal choice: on a WAL-less
-  # whole-db artifact (this snapshot itself, once written) mode=ro REFUSES with
-  # error 14 on some SQLite builds and `immutable=1` is the honest reader
-  # instead. Flag by artifact, not by preference (CKCRED, 2026-09-19).
-  #
-  # THE READER IS CHOSEN BY THE ARTIFACT, and the discriminator is whether a
-  # RECOVERY SIDECAR EXISTS -- not whether the module happens to be running.
-  # immutable=1 promises the file cannot change, so it skips BOTH recovery
-  # mechanisms (the WAL and a rollback/hot journal) and the skipped read
-  # SUCCEEDS without error.
-  #
-  #   sidecar present  -> mode=ro, and REFUSE on failure with NO FALLBACK.
-  #                       immutable=1 would succeed and silently omit every
-  #                       transaction in the -wal, which is the worst possible
-  #                       outcome for a rollback artifact.
-  #   NO sidecar       -> the store was closed cleanly (or is a whole-db
-  #                       artifact), there is nothing to replay, and
-  #                       immutable=1 is the HONEST reader. mode=ro REFUSES
-  #                       here with error 14 on some SQLite builds, so keying
-  #                       the choice on "did mode=ro fail" blocks a legitimate
-  #                       placement on a cleanly-stopped module.
-  #
-  # An earlier revision keyed on the failure rather than the sidecar and would
-  # have refused engram's RB-2 door: module parked, store cleanly checkpointed,
-  # no -wal, mode=ro error 14. The concern the no-fallback guard was written for
-  # (dropping a WAL) cannot arise when there is no WAL to drop.
-  # (CKCRED + CEREB, 2026-09-19.)
-  # A store snapshot holds the module's whole database (vendor payloads,
-  # transcripts, audit rows), so it is created owner-only. sqlite3 creates the
-  # file under the process umask, which is usually 022 and would leave a copy of
-  # a 0600 store readable by every account that can enter the staging dir.
-  : > "$store_rb" && chmod 600 "$store_rb" \
-    || refuse "could not create $store_rb owner-only; nothing has been placed"
-  if [ -f "$MIGRATES-wal" ] || [ -f "$MIGRATES-journal" ]; then
-    say "store has a recovery sidecar; reading mode=ro (no immutable fallback)"
-    sqlite3 "file:$MIGRATES?mode=ro" ".backup $store_rb" 2>/dev/null \
-      || refuse "store snapshot failed for $MIGRATES; nothing has been placed.
-        A -wal or -journal is present, so a read-only open must replay it and
-        could not. Start the module and re-run, or copy the .db AND its sidecar
-        to a scratch dir and snapshot the copy. Do NOT reach for immutable=1:
-        it would succeed and silently omit the sidecar."
-  else
-    say "store has NO recovery sidecar (cleanly closed); reading immutable=1"
-    sqlite3 "file:$MIGRATES?immutable=1" ".backup $store_rb" 2>/dev/null \
-      || refuse "store snapshot failed for $MIGRATES; nothing has been placed.
-        No -wal or -journal is present and immutable=1 still could not read it,
-        so the file is damaged or is not a SQLite database."
-  fi
-  [ -s "$store_rb" ] || refuse "store snapshot $store_rb is empty; nothing has been placed"
-  [ "$(stat -f %Lp "$store_rb" 2>/dev/null || stat -c %a "$store_rb")" = 600 ] \
-    || refuse "store snapshot $store_rb is not owner-only (0600); nothing has been placed"
+  # that restores to a state which never existed. snapshot-store.sh takes the
+  # copy in one read transaction (VACUUM INTO), so the module's own writes
+  # can't restart it the way they restart sqlite3's .backup, picks the reader
+  # by whether a recovery sidecar exists, creates the file owner-only (0600),
+  # and checks it before anything is placed. Its header explains both choices.
+  snapshot_out=$("$(dirname "$0")/snapshot-store.sh" "$MIGRATES" "$store_rb" 2>&1) \
+    || refuse "store snapshot failed for $MIGRATES; nothing has been placed.
+        $snapshot_out
+        Do NOT reach for immutable=1 while a -wal or -journal exists: it would
+        succeed and silently omit the sidecar."
+  say "$snapshot_out"
   (cd "$STAGING" && shasum -a 256 "$(basename "$store_rb")" > "$(basename "$store_rb").sha256")
   say "store rollback $(basename "$store_rb") ($(stat -f %z "$store_rb" 2>/dev/null || stat -c %s "$store_rb") bytes)"
   # --migrates says a migration MAY run, not that one did, so this line states
@@ -1640,7 +1667,9 @@ if [ "$INSTALL" -eq 1 ]; then
 fi
 
 if [ "$RESTART" -eq 1 ]; then
-  say "=== restart"
+  restart_verb=restart
+  if [ "$TERMINAL" -eq 1 ]; then restart_verb=start; fi
+  say "=== $restart_verb"
   # TCP PORT PRESSURE. A module whose start-up work opens many short-lived
   # TCP connections can use up the automatic local-port range (about 16k
   # ports with the default macOS settings) while its own health checks pass.
@@ -1649,8 +1678,8 @@ if [ "$RESTART" -eq 1 ]; then
   # local connects failed with os error 49. Connections a process closed can
   # stay in TIME_WAIT after their descriptors are gone, so per-process socket
   # listings miss them; the kernel's system-wide TCP PCB count includes them.
-  # On macOS, forward placements with a restart sample that count before the
-  # restart and again after it. Rollback restarts and other systems skip it.
+  # On macOS, forward placements sample that count before the restart (or
+  # terminal start) and again after it. Rollbacks and other systems skip it.
   # A failed read is ignored (`|| true`): this check only ever warns.
   tcp_before=""
   if [ "$(uname)" = Darwin ]; then
@@ -1658,11 +1687,17 @@ if [ "$RESTART" -eq 1 ]; then
   fi
   # Checked, not piped away: a refused restart leaves the module on the old
   # inode with the new bytes on disk, which reads as placed.
-  if ! restart_out=$(ck module restart "$MODULE" 2>&1); then
-    refuse "restart of '$MODULE' failed after placement; the new bytes are on disk but the module still runs the old inode: ${restart_out}"
+  if [ "$TERMINAL" -eq 1 ]; then
+    if ! restart_out=$(ck module start "$MODULE" 2>&1); then
+      refuse "start of '$MODULE' failed after terminal placement; the new bytes are on disk: ${restart_out}"
+    fi
+  else
+    if ! restart_out=$(ck module restart "$MODULE" 2>&1); then
+      refuse "restart of '$MODULE' failed after placement; the new bytes are on disk but the module still runs the old inode: ${restart_out}"
+    fi
   fi
   printf '%s\n' "$restart_out" | tail -1
-    say "$(date -u +%FT%TZ) restart initiated -- verify on a lane opened AFTER this point:"
+    say "$(date -u +%FT%TZ) $restart_verb initiated -- verify on a lane opened AFTER this point:"
     # THE PID COMES FROM PROVENANCE, NOT FROM `pgrep` AND NOT FROM `module status`.
     #
     #   ck module status -> SupervisorEntry, 17 fields, NO pid. It answers
@@ -1693,13 +1728,13 @@ if [ "$RESTART" -eq 1 ]; then
   if [ -n "$tcp_before" ]; then
     sleep 20
     tcp_after=$(sysctl -n net.inet.tcp.pcbcount 2>/dev/null || true)
-    say "tcp pcbcount: $tcp_before before restart, $tcp_after after the restart command plus a 20 s wait"
+    say "tcp pcbcount: $tcp_before before $restart_verb, $tcp_after after the $restart_verb command plus a 20 s wait"
     # A net rise of 2,000 system-wide PCBs across that window is an
     # investigation threshold, not a measured connection rate: other activity
     # can add PCBs and expiring TIME_WAIT entries can hide some. At the
     # window's length it's roughly 100 new connections a second.
     if [ -n "$tcp_after" ] && [ $((tcp_after - tcp_before)) -ge 2000 ]; then
-      say "WARNING: the system-wide TCP PCB count rose by $((tcp_after - tcp_before)) across the restart window; investigate connection churn, starting with '$MODULE's start-up work"
+      say "WARNING: the system-wide TCP PCB count rose by $((tcp_after - tcp_before)) across the $restart_verb window; investigate connection churn, starting with '$MODULE's start-up work"
     fi
   fi
   # Measure whether the new build changed the store, rather than assume it from

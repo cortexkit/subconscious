@@ -66,6 +66,103 @@ pub(crate) fn start_time(pid: u32) -> Option<u64> {
     start_time_from_stat(&stat)
 }
 
+pub(crate) fn read_identity(pid: u32) -> crate::IdentityRead {
+    use crate::IdentityRead;
+    if raw_pid(pid).is_none() {
+        return IdentityRead::Unknown;
+    }
+    identity_from_read(std::fs::read_to_string(format!("/proc/{pid}/stat")), || {
+        !exists(pid)
+    })
+}
+
+fn identity_from_read(
+    stat: io::Result<String>,
+    absent: impl FnOnce() -> bool,
+) -> crate::IdentityRead {
+    use crate::IdentityRead;
+    match stat {
+        Ok(stat) => identity_from_stat(&stat),
+        // A hidden procfs entry is not proof of exit: hidepid can hide a live PID.
+        Err(error)
+            if (error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH))
+                && absent() =>
+        {
+            IdentityRead::Gone
+        }
+        Err(_) => IdentityRead::Unknown,
+    }
+}
+
+fn identity_from_stat(stat: &str) -> crate::IdentityRead {
+    use crate::IdentityRead;
+    let Some((_, fields)) = stat.rsplit_once(')') else {
+        return IdentityRead::Unknown;
+    };
+    let mut fields = fields.split_whitespace();
+    let state = fields.next();
+    let Some(flags) = fields.nth(5).and_then(|flags| flags.parse::<u64>().ok()) else {
+        return IdentityRead::Unknown;
+    };
+    // Linux sets PF_EXITING (field 9, bit 2) before removing the process's
+    // memory map. State can still be R while /proc/<pid>/status has no VmRSS.
+    // This is confirmed exit, not an unreadable live process or a zero RSS.
+    if matches!(state, Some("Z" | "X" | "x")) || flags & 0x4 != 0 {
+        IdentityRead::Gone
+    } else {
+        start_time_from_stat(stat).map_or(IdentityRead::Unknown, IdentityRead::Alive)
+    }
+}
+
+#[cfg(test)]
+mod exit_flag_tests {
+    #[test]
+    fn an_exiting_procfs_read_with_esrch_is_confirmed_gone_only_if_absent() {
+        use crate::IdentityRead;
+        assert_eq!(
+            super::identity_from_read(Err(std::io::Error::from_raw_os_error(libc::ESRCH)), || true),
+            IdentityRead::Gone
+        );
+        assert_eq!(
+            super::identity_from_read(Err(std::io::Error::from_raw_os_error(libc::ESRCH)), || {
+                false
+            }),
+            IdentityRead::Unknown
+        );
+        assert_eq!(
+            super::identity_from_read(Err(std::io::Error::from_raw_os_error(libc::EACCES)), || {
+                true
+            }),
+            IdentityRead::Unknown
+        );
+    }
+
+    #[test]
+    fn exiting_flag_confirms_exit_before_the_zombie_state() {
+        let mut fields = ["0"; 22];
+        fields[0] = "R";
+        fields[6] = "4194316";
+        fields[19] = "424242";
+        let stat = format!("123 (worker) {}", fields.join(" "));
+        assert_eq!(
+            super::identity_from_stat(&stat),
+            crate::IdentityRead::Gone,
+            "PF_EXITING is set before exit_mm removes memory and before the state becomes Z"
+        );
+        fields[6] = "4194304";
+        assert_eq!(
+            super::identity_from_stat(&format!("123 (worker) {}", fields.join(" "))),
+            crate::IdentityRead::Alive(424242)
+        );
+        fields[6] = "invalid";
+        assert_eq!(
+            super::identity_from_stat(&format!("123 (worker) {}", fields.join(" "))),
+            crate::IdentityRead::Unknown
+        );
+    }
+}
+
 pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     parent_pid_from_stat(&stat)
@@ -103,8 +200,33 @@ pub(crate) fn start_time_from_stat(stat: &str) -> Option<u64> {
 /// when the kernel reports it. Both files cover the process itself: threads
 /// are included, children are not.
 pub(crate) fn resource_usage(pid: u32) -> Option<ResourceUsage> {
+    resource_usage_with_children(pid, false)
+}
+
+pub(crate) fn resource_usage_with_children(pid: u32, children: bool) -> Option<ResourceUsage> {
+    let (mut usage, child_user, child_system) = resource_usage_parts(pid)?;
+    if children {
+        usage.cpu_user += child_user;
+        usage.cpu_system += child_system;
+    }
+    Some(usage)
+}
+
+pub(crate) fn resource_usage_parts(
+    pid: u32,
+) -> Option<(ResourceUsage, std::time::Duration, std::time::Duration)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (user_ticks, system_ticks) = cpu_ticks_from_stat(&stat)?;
+    let fields: Vec<_> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    let child = |index: usize| {
+        fields
+            .get(index)?
+            .parse::<i64>()
+            .ok()
+            .map(|n| n.max(0) as u64)
+    };
+    let child_user = child(13)?;
+    let child_system = child(14)?;
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let (memory_bytes, swap_bytes) = memory_from_status(&status)?;
     let ticks_per_second = rustix::param::clock_ticks_per_second().max(1);
@@ -112,13 +234,17 @@ pub(crate) fn resource_usage(pid: u32) -> Option<ResourceUsage> {
         let nanos = u128::from(count) * 1_000_000_000 / u128::from(ticks_per_second);
         std::time::Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
     };
-    Some(ResourceUsage {
-        memory_bytes,
-        memory_kind: MemoryKind::ResidentSet,
-        swap_bytes,
-        cpu_user: ticks(user_ticks),
-        cpu_system: ticks(system_ticks),
-    })
+    Some((
+        ResourceUsage {
+            memory_bytes,
+            memory_kind: MemoryKind::ResidentSet,
+            swap_bytes,
+            cpu_user: ticks(user_ticks),
+            cpu_system: ticks(system_ticks),
+        },
+        ticks(child_user),
+        ticks(child_system),
+    ))
 }
 
 /// `utime` and `stime` of `/proc/<pid>/stat`, or `None` for a zombie or a

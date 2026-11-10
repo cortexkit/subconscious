@@ -27,7 +27,7 @@ against the shared record `crates/subc-protocol/tests/golden/decision_tables.jso
 
 Both SDKs delegate to `subc_protocol::error_codes::is_retryable_route_open`
 (`crates/subc-protocol/src/lib.rs`); the TypeScript copy also refuses
-`capability_forbidden`, `target_flow_unsupported`,
+`capability_forbidden`, `target_flow_unsupported`, `target_federated_unsupported`,
 `target_agent_run_unsupported` and the two `scope_bind_proof_*` codes
 explicitly. An unknown code is terminal.
 

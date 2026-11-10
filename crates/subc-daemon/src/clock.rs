@@ -13,7 +13,7 @@ pub(crate) fn wall_now_ms() -> u64 {
 
 // All production monotonic readings pass through this binding, not Instant:
 // Instant stops during sleep on macOS.
-fn monotonic_now() -> Duration {
+pub(crate) fn monotonic_now() -> Duration {
     subc_uptime::suspend_inclusive_now()
 }
 

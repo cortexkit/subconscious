@@ -531,6 +531,10 @@ public struct BoardLaneItem: Codable, Equatable {
     public var wait: BoardLaneWait?
     /// When the owner expects the item done, in Unix milliseconds.
     public var etaMs: Int64?
+    /// Where `etaMs` came from: `wait` when the module derived it from what
+    /// the item waits on, otherwise the owner set it. Open string, so a value
+    /// this build doesn't know is kept as sent.
+    public var etaSource: String?
     /// When the item last changed state, in Unix milliseconds.
     public var changedAtMs: Int64?
     /// What the owner does next on this item, at most 300 characters.
@@ -540,13 +544,15 @@ public struct BoardLaneItem: Codable, Equatable {
 
     public init(
         id: String, text: String, state: String, wait: BoardLaneWait? = nil,
-        etaMs: Int64? = nil, changedAtMs: Int64? = nil, followUp: String? = nil, noteRef: String? = nil
+        etaMs: Int64? = nil, changedAtMs: Int64? = nil, followUp: String? = nil, noteRef: String? = nil,
+        etaSource: String? = nil
     ) {
         self.id = id
         self.text = text
         self.state = state
         self.wait = wait
         self.etaMs = etaMs
+        self.etaSource = etaSource
         self.changedAtMs = changedAtMs
         self.followUp = followUp
         self.noteRef = noteRef
@@ -561,6 +567,7 @@ public struct BoardLaneItem: Codable, Equatable {
         state = try c.either("state")
         wait = try c.eitherIfPresent("wait")
         etaMs = try c.eitherIfPresent("etaMs")
+        etaSource = try c.eitherIfPresent("etaSource")
         changedAtMs = try c.eitherIfPresent("changedAtMs")
         followUp = try c.eitherIfPresent("followUp")
         noteRef = try c.eitherIfPresent("noteRef")
@@ -573,6 +580,7 @@ public struct BoardLaneItem: Codable, Equatable {
         try c.encode(state, forKey: .named("state"))
         try c.encodeIfPresent(wait, forKey: .named("wait"))
         try c.encodeIfPresent(etaMs, forKey: .named("etaMs"))
+        try c.encodeIfPresent(etaSource, forKey: .named("etaSource"))
         try c.encodeIfPresent(changedAtMs, forKey: .named("changedAtMs"))
         try c.encodeIfPresent(followUp, forKey: .named("followUp"))
         try c.encodeIfPresent(noteRef, forKey: .named("noteRef"))

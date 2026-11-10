@@ -138,6 +138,309 @@ numbers.
 - A `REQUEST` naming an installed channel with an older epoch is answered with
   `stale_route_epoch`; other frame kinds are dropped. Test: `module_request_on_stale_epoch_receives_stale_route_epoch` (`crates/subc-daemon/src/router.rs`).
 
+### Module-originated channel-0 requests
+
+Registered modules send `catalog.update`, `supervisor.live_roots`, `scope.sync`,
+`scope.apply` and `scope.describe` as channel-0 `REQUEST` frames. Their bodies
+are defined by `subc_protocol::session::ModuleControlRequestFromModule`.
+
+`supervisor.agent_commands` is restricted further: only the current supervised
+launch's own connection may declare its commands. Consumer, unsupervised and
+stale-launch connections receive an `ERROR` with code `not_supervised`; the
+connection stays open. The request body is:
+
+```json
+{"op":"supervisor.agent_commands","started":[{"pid":42,"start_time_ms":1700000000123}],"finished":[{"pid":41,"start_time_ms":1700000000000,"cpu_ms":250}],"known":[{"pid":42,"start_time_ms":1700000000123}]}
+```
+
+`started` and `finished` are required arrays; `known` is optional and replaces
+the module's complete live root set. Start times come from
+`subc_os::process_start_time_ms`: milliseconds since the Unix epoch, compared
+within that platform's kernel timestamp resolution. A started root must still
+be live with that identity and must be a direct child of the module at the
+check. Invalid roots are ignored independently and logged once per identity;
+they do not refuse the batch. `known` only re-confirms identities already
+accepted in this launch, or in a previous launch that retained the same Linux
+cgroup or Windows job object across the module's restart. It never accepts a new identity, the module itself or an ancestor.
+A live identity keeps its accounting baseline even after being finished, so
+re-declaring it cannot replay CPU. A module has at most 1,024 live roots. The successful `RESPONSE` body is `{}`. An
+older daemon returns `unsupported_control_frame`; the Rust module SDK maps
+that refusal to `AgentCommandsError::Unsupported` without closing the connection.
+Declarations are applied serially per supervised connection. At most four may
+be in flight: an excess request receives an immediate retryable `busy`, not
+reader backpressure, so tool routes and Cancel/Goodbye remain readable. Each
+reply has a 200 ms send deadline. Contended commits revalidate up to four times
+before asking the caller to retry. `supervisor.list` also admits at most four
+detached requests per handler, returning `busy` above that limit; synchronous
+status reads run on blocking workers rather than the async reader's runtime.
+Busy refusals first use nonblocking egress. When egress is full, a separate
+per-connection sender retains at most four refusals, including its active send,
+each with a 200 ms deadline. Further overflow or expiry drops the refusal rather
+than parking or closing the shared supervised connection. The per-module
+`server.describe.counters.agent_command_refusals_dropped_by_module` diagnostic
+counts those drops. A dropped refusal gives the caller no reply: its own call
+timeout ends with outcome unknown. Re-sending `started` or `finished` for the
+same accepted native identity is accounting-idempotent and cannot reset the
+acceptance baseline or settle the same CPU twice.
+
+The dropped-refusal map accepts registered module ids only and retains at most
+1,024 labels. A consumer connection's dropped busy refusal, or a refusal dropped
+for a registered module beyond that label cap, increments the scalar
+`agent_command_refusals_dropped_unlabelled` instead of growing the map. Busy
+`supervisor.list` replies use this same nonblocking, bounded refusal path.
+A refused, cancelled or timed-out `started` batch leaves a coverage gap even
+though its CPU remains module-side. Its cumulative agents reading stays lower:
+lost lifetime CPU is never repaired. Samples spanning that gap carry uncertainty
+until the root is verified gone or an accepted replay restores current coverage.
+Those sample flags determine the returned hour's bound, not elapsed time alone.
+A cached process walk
+that began before the refused declaration cannot establish that confirmation.
+Unknown liveness cannot
+expire a gap. `server.describe.counters.agent_command_declaration_loss_by_module`
+reports `lost_identities` and an independent `overflow` boolean. Each module
+retains at most 1,024 lost identities. Overflow clears only after a successful
+complete `known` reconciliation **and** one hour since the most recent overflow.
+A receipt cannot acknowledge a later overflow event. A full reconciliation
+includes every accepted root not verified gone after explicit starts/finishes.
+A partial `known` still replaces the live set, but omitted live roots become
+lost identities and the replacement cannot recover overflow. Mere contention
+on the short metadata-update lock is not overflow. The verified live-root cap
+returns retryable `agent_roots_full`, recording only the unaccepted roots as
+coverage loss; valid peers in that batch remain accepted. A loss-only row is
+emitted even at zero CPU and zero tracked live processes.
+The daemon retains the validated native identity of a live root removed by a
+partial replacement, so it can recognize a later resumption or confirmed exit.
+These omitted-root proofs retain at most 1,024 identities; excess proofs set the
+same overflow marker. A walk begun before a proof's accepted identity cannot
+prune it. Resumed roots use the canonical verified identity, including when a
+caller uses a different epoch-millisecond value within the platform's allowed
+timestamp precision.
+
+Oversized declaration arrays are refused before loss-metadata locking or
+identity scanning. These retry rules apply to `supervisor.agent_commands`, not
+to the separate decision about whether a refused `route.open` may be reopened:
+`agent_roots_full` and `busy` may be retried after capacity/commit contention
+clears; `duplicate_correlation` needs a fresh correlation; `declaration_closed`
+needs a current supervised connection. `AgentCommandsError::is_retryable` exposes
+these classes without automatically retrying. Timeout/closed-connection outcomes
+may be retried for the same identities because declaration replay is idempotent;
+an unknown refusal code is not presumed retryable.
+
+An agents row is shown only after an accepted declaration in the current launch,
+for inherited active commands, for attributed CPU still in the returned hour,
+or for a recorded declaration loss/overflow. A module that never declared agents
+does not acquire an agents row from its own process-tree uncertainty.
+When the hour is unavailable, nonzero attributed CPU conservatively keeps its
+row until a measured zero hour can show that no current-hour work remains.
+The resource stack covers modules whose resource state is present now.
+Disabling or removing a module discards its resource history, so its past-hour
+contribution also leaves the stack total. A configured disabled entry may still
+appear in the supervisor's module list; that does not retain its resource stack.
+
+The daemon attributes declared live subtrees and finished CPU to
+`supervisor.list.agent_commands`. **Agent CPU counts from when the daemon first
+measured the declared command.** That first successful measurement establishes
+its baseline: historical CPU stays in the module row and is never transferred.
+If a module restart retains the same cgroup or job object, it also retains the
+command baseline. When a restart instead replaces the native container,
+already credited lifetime CPU remains, but a surviving old command is
+rebaselined at its first successful measurement in the new domain. Its
+ambiguous transition receives no new outside credit. The reading becomes a
+lower bound only if that command's counter moved across the transition; a
+stationary survivor does not introduce lost CPU. On Unix, when a declared root leads
+its own session (`setsid`), processes in that session count too, even if they
+were reparented away from the root.
+
+`finished.cpu_ms` is an optional, **bounded classification claim**, not an
+independent source of CPU. On Unix the daemon reads the declaring process's
+own reaped-child CPU, including when a cgroup supplies the tree counter. Only
+unclaimed increases seen after that command's last successful measurement and
+no later than the earlier of its first confirmed root-exit observation and its
+finish's first validation pass are eligible. That first pass takes the native
+counter and process table together before attribution work; it may start as
+late as the bounded ordered queue permits (four in-flight declarations, 200 ms
+each for validation and reply), not at network arrival. The initial observation sequence is pinned
+even if commit contention requires newer validation snapshots. No later sampler
+or retry can extend its eligibility window. A finish may move at most
+`max(0, cpu_ms - acceptance_baseline - already_credited)` from that module's
+row to its agents row, capped by that remaining pool and funded module CPU.
+The acceptance baseline excludes CPU consumed before declaration. Earlier
+finishes consume the same pool once, oldest eligible first. Unclaimed increments survive zero-delta
+reads for at most five minutes (`REAP_POOL_RETENTION_MS`), with a hard limit of
+256 per module, oldest evicted. Ages use suspend-inclusive monotonic elapsed
+time, not wall-clock labels, so a clock correction cannot stretch retention.
+This lets a finish classify a tail a preceding
+sampler already observed. A declarer can mislabel at most its own other reaped
+children within that interval; it cannot increase measured module-plus-agents CPU or spend another
+module's counter. Missing reports, unreadable reap counters, unknown acceptance
+baselines, expired funding and unsatisfied claims leave CPU module-side and
+mark the agents row `bound: "lower"`.
+Funding excludes live module-own CPU reserved in each observation and is used
+oldest eligible first, never by stealing a newer module-own minute. Its timing
+metadata has the same five-minute and 256-entry limits. When that metadata has
+expired, the daemon leaves the ambiguous part module-side/lower instead of
+inventing a newer consumption time.
+
+Previously measured, post-acceptance command CPU that did not receive agent
+credit may still be classified at its original observation, capped by that
+root's retained uncredited measurement and matching funding in that same
+observation. At most 256 such entries per module survive for five minutes past
+measurement; dropping an entry makes agents lower. A report's genuine new tail
+may use only funding after its last successful measurement. Expired measured
+CPU never becomes a new tail and cannot borrow a newer child's funding.
+
+On Windows reports do not fund CPU: a retained identity-specific root handle
+is read after exit is confirmed, re-reading if exit raced an earlier read.
+If a finish or live-set replacement arrives while a Windows root is still alive,
+the first validation pass freezes its last observed counters and live membership.
+Later root/member work remains module-side; it is not missing CPU and does not
+itself create a lower bound. Already measured/pending CPU and retained exited
+descendants may still be credited once, up to the CPU captured at that snapshot
+and only when the measured module/command counters cover it.
+Never-sampled breakaway descendants cannot be reconstructed and make the
+agents row a lower bound. The daemon measures at declaration, finish and
+sampler wakes on every platform. An accepted
+command with no successful measurement keeps its CPU in the module row; the
+agents row includes `unmeasured_finished` so a reader can describe its CPU as
+"at least" rather than interpreting a fabricated zero as complete.
+Discarding an exited Windows identity with unknown final CPU or membership also
+marks the agents reading lower, including an exit during its first observation.
+A subsequent clean pass cannot erase that missing final counter.
+
+A cgroup/job counter retains exited work. Windows pinned process handles
+retain final CPU and fixed job membership. Each observation records the
+accounting-state revision it started from; it is discarded if that state has
+already changed, rather than applying the same exited CPU twice. Process-tree counters instead retain a monotone floor:
+each identity's own CPU is counted once; vanished members' last counters remain
+counted, and an ancestor's later reaped-children increases first absorb those
+vanished counters. Only the excess adds CPU. Consequently **on macOS the
+numbers are a floor**, not an exact reconstruction of orphan reaping. Linux
+without a delegated cgroup has the same limit. Such tree/agents readings carry
+`bound: "lower"`; an absent `bound` means exact. Memory and process count are
+current readings and are not CPU bounds.
+
+On Linux with a cgroup, the measured domain is **CPU consumed inside the
+module's cgroup, plus CPU of agent commands confirmed outside it at both ends
+of an interval**. For a root's prospective delta `r` and cgroup progress `c`:
+
+- Inside at both endpoints: agents receives `min(r, c)` from new cgroup progress;
+  module keeps the remainder. The combined `c` is exact for the cgroup.
+- Outside at both endpoints, or mixed endpoints: the module keeps `c`, and
+  agents receives only `max(0, r - c)`. The interval's total is `max(c, r)`, a
+  lower bound when both deltas are nonzero. Disjoint roots share one overlap
+  budget; the same cgroup CPU cannot suppress outside demand twice.
+
+An unobserved excursion outside followed by return to the cgroup is outside
+the inside/inside measured domain. Such migration requires a deliberate
+`cgroup.procs` write by the module's own user; endpoint reads cannot reconstruct
+it. Endpoint-based inside attribution is not proof that those CPU units were
+physically inside throughout. Those same units may therefore still explain an
+outside command's increment rather than prove additional outside CPU. A cumulative reading that has become a floor retains
+`bound: "lower"` thereafter: a later exact interval cannot recover missing CPU.
+
+Module CPU plus agents CPU equals measured CPU. A bounded finish may explicitly
+decrease the module row by exactly the agents row's gain, never below its
+prospective funding floor. Otherwise rows do not decrease. Past minutes may be
+reclassified between those two rows, at the measured buckets that funded the
+tail, never at the later reply time. The combined module-plus-agents CPU for any minute is unchanged;
+CPU funded before the current hour creates no current-hour CPU. The unsigned
+hourly deltas therefore still sum to the same measured total over identical
+window endpoints. Baselines and declarations themselves create no CPU. A
+finished command's confirmed inside CPU is accounted once, never replayed.
+Transfer suffixes are selected by monotonic observation sequence, never by wall
+time. Same-millisecond samples or a backward clock correction cannot charge an
+earlier observation. Both histories and cumulative allocations are checked
+before either row changes; if a part cannot move in full, neither side moves
+and the agents reading is marked lower. History coverage remains wall-clock
+time, independently of that ordering.
+
+`supervisor.list` optionally includes `tree` and `cpu_last_hour` on each module,
+plus response-level `daemon` and `agent_commands`. A tree reports cumulative
+`cpu_ms`, current `memory_bytes`, `memory_kind`, `process_count`, `source`
+(`cgroup`, `job`, `process_tree`) and up to eight `groups` ordered by memory.
+`tree.groups` contains child processes only: the module's root identity is
+excluded, but children with the same program name remain in their group.
+An optional `tree.own: {cpu_ms, memory_bytes, bound?}` reports the root process's
+attributed share separately. It is omitted when that share is unknown or the
+tree is unavailable. Its memory is current root memory, capped by the row.
+Each group's and the root's `cpu_ms` is funded attributed credit earned by its
+currently live identities, not their raw native counter. Agent groups start at
+zero at the accepted baseline. The module's root and child groups may subdivide
+the module's initial counter using live own CPU, largest first (ties by PID then
+native start), capped by that row's measured CPU. A newly observed module-owned
+process reserves the CPU it had already used from the module's available credit,
+so a later agent command reported as finished can't claim that same CPU for the
+agents row. New agent identities start at zero attributed
+CPU at their first accepted measurement; their historical CPU stays module-side.
+The module's `own` plus all emitted child groups never exceeds the module row's
+attributed CPU or memory. The eight-group cap and retired or unattributed
+history can leave part of the row unrepresented. Agent groups likewise never
+exceed their agents row. A group's and `own`'s optional `bound: "lower"` follow
+their row and mark only CPU, not memory. Finished-command CPU is counted once.
+Only the unclassified portion confirmed by the daemon's counters and available
+module funding may transfer between rows.
+
+In the Rust control API, `TreeReading`, `ProcessGroup`, `TreeOwn`, `CpuLastHour`,
+`DaemonResources`, `AgentCommandResources`, `ChildResourceReading`, and
+`PendingReloadVerdict` are non-exhaustive, like `SupervisorEntry`. Construct them
+with required-field `new` functions and `with_*` builders instead of external
+struct literals. Optional values default to absent and groups to empty. This
+Rust source migration requires the breaking control 0.38 / daemon 0.44 release;
+it does not change JSON decoding.
+
+The old memory-only `subtree` member is replaced by `tree`. Unknown readings
+are omitted. Tree readings and the daemon and agents rows optionally carry
+`measured_at_ms`, Unix-epoch milliseconds of their resource measurement, not the
+reply time. A list returns the last committed measurements immediately. When
+the committed view is older than two seconds, the list requests one background
+refresh; concurrent lists do not start another walk or wait for it. The minute
+sampler continues independently and records only its own completed observations.
+An incomplete background pass (for example admission, deadline or attribution
+contention) changes neither the committed measurements nor their reasons or
+timestamps; a later list may retry. Debug logs describe the incomplete pass.
+`cpu_last_hour` is `{cpu_ms, covered_ms, bound?}` across retained wall-clock
+samples: 61 points cover 60 one-minute intervals. A changed process identity
+credits the replacement's total; a same-process process-tree floor retains already observed departed work, so
+later CPU from surviving members is not lost when the current tree sum falls.
+
+The cumulative `bound` is sticky: missing lifetime CPU is never repaired after
+a loss. The optional `cpu_last_hour.bound: "lower"` is derived from uncertainty
+flags stored on exactly the samples used for that CPU figure. It is lower if
+and only if any returned sample is flagged, including a process-tree minute
+retained after a source switch or backward wall step. It becomes exact when
+those samples leave the returned window, not merely because another clock aged
+a loss marker. Retention and diagnostic overflow ages still use the
+suspend-inclusive monotonic clock. A renderer draws "≥" on the hour figure
+from `cpu_last_hour.bound` only, and on cumulative CPU from its cumulative
+`bound`. Older published readers ignore the new optional hourly member.
+Unreadable resources/identity reject a new tree measurement, never a numeric
+partial sum. A confirmed exited child is removed from live members. Its CPU is
+recovered from the operating system's totals for exited children whose parent
+has collected their exit status, without counting the child's old sample twice.
+Unknown identity failures and PID reuse still reject the related tree.
+`tree_unavailable` is an open set of reasons: `not_yet_measured` means no tree
+has been measured for this launch, `not_running` means the module is stopped,
+`unreadable` means a required process could not be read for a reason other than
+confirmed exit, and `launch_changed` means a stale launch transition was refused.
+A failed newer observation retains the last committed tree and its older
+`measured_at_ms` alongside the reason; it never fabricates an empty or zero tree.
+Trees from a previous launch are not reused. Hourly history remains attached
+even when the newest tree measurement fails. Readers must tolerate future
+reasons. Skipped image probes likewise say `not_yet_measured`, not
+`hash_failed`. Optional nested members tolerate omission; absent `groups`
+means no live program groups. Required numeric measurements remain required
+and cannot decode as zero. Readers must ignore unknown object members. The daemon's own resources
+never include its reaped module children's CPU.
+
+On Linux, `/proc` visibility also matters. A `hidepid` restriction can make a
+listed PID's identity or parent unreadable. Unless it is confirmed gone, the
+reader cannot exclude that identity from a tree and omits the affected reading
+rather than inventing a partial numeric result. `hidepid=2` can hide other-user
+PIDs from enumeration entirely; a process-table walk cannot prove their
+absence behind that mount. Cross-user accounting needs a visible `/proc` view
+or module containment; an uncontained walk is not an authoritative cross-user
+memory census. Its CPU remains the documented process-tree lower bound.
+
 ### Request credits
 
 Each route channel admits a bounded number of in-flight requests, set by the
@@ -212,7 +515,7 @@ crate does not know. The terminal codes the daemon emits on `route.open` are
 `capability_forbidden`, `admission_facts_not_permitted`,
 `admission_facts_target_not_allowed`, `op_not_allowed` (the target did not
 grant `route.bind`), `route_limit` (no free route channel), `forwarding_error`,
-`target_flow_unsupported`, `target_agent_run_unsupported`, and the `scope_*`
+`target_flow_unsupported`, `target_federated_unsupported`, `target_agent_run_unsupported`, and the `scope_*`
 admission refusals in [`scopes.md`](scopes.md) section 5a, including
 `scope_bind_proof_required` and `scope_bind_proof_mismatch`. This is the list
 in `crates/subc-protocol/tests/golden/decision_tables.json`.

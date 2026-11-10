@@ -20,6 +20,10 @@ use crate::time::{ago, js_round};
 use super::overlays::wrap;
 use super::{fmt_cpu, fmt_mem, window, View, UNKNOWN};
 
+mod resources;
+
+pub use resources::{resource_mode, row_at, row_count};
+
 /// The table's geometry at a window size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
@@ -142,6 +146,10 @@ pub fn module_at(w: i32, h: i32, len: usize, sel: usize, y: i32) -> Option<usize
 }
 
 pub fn draw(c: &mut Canvas, v: &View) {
+    if resource_mode(v.snap) {
+        resources::draw(c, v);
+        return;
+    }
     let snap = v.snap;
     chrome(
         c,
@@ -376,10 +384,16 @@ fn pane(c: &mut Canvas, v: &View, sel: usize, lw: i32) {
     // a heading and two sparklines, a blank, a heading and at least two log
     // lines. The module's sentence and metrics share what is left.
     let last = c.h - 4;
-    let keep = 10;
+    let keep = if m.resources.is_some() { 15 } else { 10 };
     let mut room = (last + 1 - y - keep).max(1);
-    // The module's own sentence, in full and wrapped, as far as room allows.
-    for line in wrap(&m.summary, dw.max(1) as usize) {
+    // The tree pane keeps a single health line so process evidence has room;
+    // the legacy pane can use the remaining space for the wrapped sentence.
+    let summary = if m.resources.is_some() {
+        vec![trunc(&m.summary, dw.max(1) as usize)]
+    } else {
+        wrap(&m.summary, dw.max(1) as usize)
+    };
+    for line in summary {
         if room == 0 {
             break;
         }
@@ -441,19 +455,30 @@ fn pane(c: &mut Canvas, v: &View, sel: usize, lw: i32) {
     heading(c, x, y, dw, "CPU and memory", "last 10 min");
     y += 2;
     let n = (dw - 8).max(0) as usize;
-    if m.cpu_history.iter().any(|c| c.is_finite()) {
-        let max = m.cpu_history.iter().copied().fold(f64::MIN, f64::max) * 1.1;
-        let cpu = window(&m.cpu_history, v.spark_offset(), n);
+    let cpu_history = m
+        .resources
+        .as_ref()
+        .map_or(&m.cpu_history, |r| &r.cpu_history);
+    let memory_history = m
+        .resources
+        .as_ref()
+        .map_or(&m.memory_history, |r| &r.memory_history);
+    if cpu_history.iter().any(|c| c.is_finite()) {
+        let max = cpu_history.iter().copied().fold(f64::MIN, f64::max) * 1.1;
+        let cpu = window(cpu_history, v.spark_offset(), n);
         spark(c, x, y, cpu, Fg::Acc, Some(max), 0.0);
     }
     c.right(
         x + dw,
         y,
-        &m.cpu_percent.map_or_else(|| UNKNOWN.to_string(), fmt_cpu),
+        &m.resources.as_ref().map_or_else(
+            || m.cpu_percent.map_or_else(|| UNKNOWN.to_string(), fmt_cpu),
+            resources::cpu_text,
+        ),
         St::NONE,
     );
     y += 1;
-    let mem = window(&m.memory_history, 0, n);
+    let mem = window(memory_history, 0, n);
     if !mem.is_empty() {
         let max = mem.iter().copied().fold(f64::MIN, f64::max);
         let min = mem.iter().copied().fold(f64::MAX, f64::min);
@@ -462,11 +487,34 @@ fn pane(c: &mut Canvas, v: &View, sel: usize, lw: i32) {
     c.right(
         x + dw,
         y,
-        &m.memory_mb.map_or_else(|| UNKNOWN.to_string(), fmt_mem),
+        &m.resources
+            .as_ref()
+            .map_or(m.memory_mb, |r| r.memory_mb)
+            .map_or_else(|| UNKNOWN.to_string(), fmt_mem),
         St::D,
     );
 
-    y += 2;
+    if let Some(usage) = &m.resources {
+        y += 1;
+        resources::last_hour(c, x, y, dw, usage);
+        y += 2;
+        y = resources::processes(c, x, y, dw, usage);
+        if v.snap.resource_rows.iter().any(|r| {
+            matches!(&r.kind,
+            crate::model::ResourceRowKind::Agents { via } if via == &m.id)
+        }) {
+            c.put(
+                x,
+                y,
+                &trunc("Agents' commands have their own row", dw.max(0) as usize),
+                St::D,
+            );
+            y += 1;
+        }
+        y += 1;
+    } else {
+        y += 2;
+    }
     heading(c, x, y, dw, "Log", "");
     let (dot, dot_st) = live_dot(v.tick);
     c.right(x + dw - 2, y, "live", St::D);

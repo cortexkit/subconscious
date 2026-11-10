@@ -130,10 +130,17 @@ printf '[source.crates-io]\nreplace-with = "fixture"\n\n[source.fixture]\nregist
 
 # Lock generation contacts only the local file registry above. Cargo then has
 # its local index cache, so all metadata checks, including this one, run offline.
-(cd "$replace_root" && cargo generate-lockfile --manifest-path Cargo.toml)
+# Both runs use a throwaway Cargo home: the fixture index cache must not land in
+# the developer's real one, and a build server's shared Cargo home is read-only.
+# Lock generation sets CARGO_NET_OFFLINE=false explicitly: the "network" here is
+# the file:// index above, and an environment that exports offline mode (as
+# remote build jobs do) would otherwise find the empty Cargo home has no index.
+replace_cargo_home="$test_root/replace/cargo-home"
+mkdir -p "$replace_cargo_home"
+(cd "$replace_root" && CARGO_HOME="$replace_cargo_home" CARGO_NET_OFFLINE=false cargo generate-lockfile --manifest-path Cargo.toml)
 replace_output="$test_root/replace-output"
 replace_status=0
-(cd "$replace_root" && CARGO_NET_OFFLINE=true bash "$check" Cargo.toml) >"$replace_output" 2>&1 || replace_status=$?
+(cd "$replace_root" && CARGO_HOME="$replace_cargo_home" CARGO_NET_OFFLINE=true bash "$check" Cargo.toml) >"$replace_output" 2>&1 || replace_status=$?
 expect_violation "$replace_status" "$replace_output" "$replace_dependency" '[replace] fixture'
 printf 'PASS: external [replace] path rejected and named\n'
 

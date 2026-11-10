@@ -1,3 +1,6 @@
+#[path = "control/list_diagnostics.rs"]
+pub(crate) mod list_diagnostics;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
@@ -7,6 +10,7 @@ use std::{
     time::{Duration, Instant as StdInstant},
 };
 
+use crate::scopes::admission::denied_capability;
 use serde::{Deserialize, Serialize};
 use subc_control::{
     ops, CapabilityRequirementStatus, CatalogEntry, ClientControlPush, ClientControlRequest,
@@ -22,7 +26,8 @@ use subc_protocol::{
     error_codes,
     manifest::{
         validate_hello_capability_grammar, validate_hello_confirm_operations,
-        validate_hello_event_declarations, validate_hello_flow_operations,
+        validate_hello_display_name, validate_hello_event_declarations,
+        validate_hello_flow_operations, validate_hello_operation_deferral,
         validate_hello_rich_ui_descriptor, validate_hello_role_declarations,
         validate_hello_self_signal_declarations, CapabilityDeclarations, CapabilityNeed,
         Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
@@ -72,8 +77,8 @@ use crate::{
     server::MAX_PENDING_ROUTE_BINDS_PER_TARGET,
     stderr_tail::{CaptureState, TailEntry},
     supervise::{
-        validate_spec, ModuleProcessLiveness, ReservedHelloRejection, SpawnSubscribeRefusal,
-        SupervisorHandle, SwapHelloAdmission,
+        validate_spec, ModuleProcessLiveness, ReservedHelloRejection, ReservedHelloVerification,
+        SpawnSubscribeRefusal, SupervisorHandle, SwapHelloAdmission,
     },
     ConnectedClients, DaemonCounters, Frame, ProjectRootId, Supervisor,
 };
@@ -142,15 +147,18 @@ mod config_advertisement_tests;
 mod config_gate;
 mod scope_expiry;
 
+mod agent_commands;
 mod rescan_checked;
 use rescan_checked::{RescanMode, RescanPlan};
 
 const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
     MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     "supervisor.live_roots",
+    "supervisor.agent_commands",
     SCOPE_SYNC_OP,
     SCOPE_APPLY_OP,
     SCOPE_DESCRIBE_OP,
+    subc_protocol::scope::ROUTE_AUTHORIZE_OP,
     "operator.confirm",
 ];
 
@@ -234,11 +242,7 @@ fn reload_verdict(
             },
         },
     };
-    PendingReloadVerdict {
-        path,
-        image,
-        spec: None,
-    }
+    PendingReloadVerdict::new(path, image)
 }
 
 fn launch_spec_agreement(
@@ -327,6 +331,7 @@ struct SupervisorRescanContext {
     admission_facts_carrier_module_id: Option<String>,
     admission_facts_targets: Option<Vec<String>>,
     scope_authority_owners: Vec<String>,
+    federated_scope_owner: String,
     privileged_operator_prompt: PrivilegedOperatorPrompt,
     /// Counts executed rescans that set out to change the supervised modules'
     /// staged or applied configuration, counted before the first change so a
@@ -376,6 +381,9 @@ pub struct ControlHandler {
     forwarding: Arc<ForwardingTable>,
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
     supervisor: SupervisorHandle,
+    pub(crate) resource_tracker: Arc<crate::resource_totals::Tracker>,
+    agent_declarations: agent_commands::Queues,
+    list_admission: Arc<tokio::sync::Semaphore>,
     subc_capabilities: Arc<[String]>,
     /// Daemon-wide route.bind relay budget. Used as the fallback when the
     /// target module has no per-module override in
@@ -421,6 +429,7 @@ pub struct ControlHandler {
     /// The configured `scope_authority_owners`, kept so a rescan can report a
     /// changed value as needing a daemon restart; rescan never applies it.
     scope_authority_owners: Vec<String>,
+    federated_scope_owner: String,
     /// Fixed at startup so rescan cannot change the policy that guards rescan itself.
     privileged_operator_prompt: PrivilegedOperatorPrompt,
     /// The local and peer address of each accepted TCP client connection, read
@@ -1027,6 +1036,11 @@ impl ControlHandler {
             forwarding,
             process_liveness: None,
             supervisor: SupervisorHandle::new(),
+            resource_tracker: Arc::new(crate::resource_totals::Tracker::new(
+                env!("CARGO_PKG_VERSION").to_owned(),
+            )),
+            agent_declarations: agent_commands::Queues::default(),
+            list_admission: Arc::new(tokio::sync::Semaphore::new(4)),
             subc_capabilities: Arc::from([
                 CAP_MANIFEST_REGISTRATION.to_string(),
                 CAP_CHANNEL_LIFECYCLE.to_string(),
@@ -1034,6 +1048,7 @@ impl ControlHandler {
                 CAP_SESSION_ATTACH.to_string(),
                 CAP_ADMISSION_FACTS_RELAY.to_string(),
                 CAP_SCOPES_V1.to_string(),
+                subc_protocol::scope::SCOPE_FEDERATED_CAPABILITY.to_string(),
                 CAP_ROUTE_ROLE_VERSIONS_V1.to_string(),
                 subc_protocol::manifest::CAP_CATALOG_EVENTS_V1.to_string(),
                 subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1.to_string(),
@@ -1063,6 +1078,7 @@ impl ControlHandler {
             ))),
             scope_deadline_added: Arc::new(tokio::sync::Notify::new()),
             scope_authority_owners: crate::daemon_config::default_scope_authority_owners(),
+            federated_scope_owner: crate::daemon_config::default_federated_scope_owner(),
             privileged_operator_prompt: PrivilegedOperatorPrompt::default(),
             caller_endpoints: Arc::new(Mutex::new(HashMap::new())),
             build_class_warned: Arc::new(Mutex::new(HashSet::new())),
@@ -1160,8 +1176,21 @@ impl ControlHandler {
     /// Replaces the scope table with an empty one under the new list, so call it
     /// while building the handler, before any module can sync.
     pub fn with_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
-        self.scopes = Arc::new(RwLock::new(ScopeTable::new(owners.iter().cloned())));
+        self.scopes = Arc::new(RwLock::new(
+            ScopeTable::new(owners.iter().cloned())
+                .with_federated_owner(self.federated_scope_owner.clone()),
+        ));
         self.scope_authority_owners = owners;
+        self
+    }
+
+    /// Set the exclusive federated owner while building the handler, before syncs.
+    pub fn with_federated_scope_owner(mut self, owner: String) -> Self {
+        self.scopes = Arc::new(RwLock::new(
+            ScopeTable::new(self.scope_authority_owners.iter().cloned())
+                .with_federated_owner(owner.clone()),
+        ));
+        self.federated_scope_owner = owner;
         self
     }
 
@@ -1365,6 +1394,7 @@ impl ControlHandler {
             admission_facts_carrier_module_id: self.admission_facts_carrier_module_id.clone(),
             admission_facts_targets: self.admission_facts_targets.clone(),
             scope_authority_owners: self.scope_authority_owners.clone(),
+            federated_scope_owner: self.federated_scope_owner.clone(),
             privileged_operator_prompt: self.privileged_operator_prompt,
             generation: Arc::default(),
         });
@@ -2095,13 +2125,17 @@ impl ControlHandler {
             }
             FrameType::Goodbye => self.handle_goodbye(ctx.connection_id),
             FrameType::Cancel => {
-                // A Cancel on channel 0 withdraws a held approval or subscription.
-                // Successful cancellation has no ordinary reply.
+                // Channel-0 cancellation withdraws approvals and subscriptions
+                // and fences pending agent declarations;
+                // successful cancellation has no ordinary reply.
                 if self
-                    .forwarding
-                    .operator_confirms()
+                    .agent_declarations
                     .cancel(ctx.connection_id, frame.header.corr)
                     || self.cancel_config_approval(ctx.connection_id, frame.header.corr)
+                    || self
+                        .forwarding
+                        .operator_confirms()
+                        .cancel(ctx.connection_id, frame.header.corr)
                     || self
                         .supervisor
                         .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)
@@ -2216,6 +2250,26 @@ impl ControlHandler {
                     let op = module_control_request_op(&request);
                     let corr = frame.header.corr;
                     log_control_dispatch_arrival(op, ctx.connection_id, corr);
+                    if let ModuleControlRequestFromModule::AgentCommands {
+                        started,
+                        finished,
+                        known,
+                    } = request
+                    {
+                        return self
+                            .agent_declarations
+                            .enqueue(
+                                self,
+                                ctx,
+                                frame,
+                                crate::resource_totals::Declaration {
+                                    started,
+                                    finished,
+                                    known,
+                                },
+                            )
+                            .await;
+                    }
                     let result =
                         self.handle_module_control_request(ctx.connection_id, frame, request);
                     log_slow_control_dispatch(
@@ -2229,10 +2283,22 @@ impl ControlHandler {
                 }
 
                 if is_known_module_request_op(&frame.body) {
+                    let is_agents = serde_json::from_slice::<ControlOpProbe>(&frame.body)
+                        .is_ok_and(|probe| probe.op == "supervisor.agent_commands");
+                    let code = if is_agents {
+                        "not_supervised"
+                    } else if op
+                        .as_ref()
+                        .is_some_and(|probe| probe.op == subc_protocol::scope::ROUTE_AUTHORIZE_OP)
+                    {
+                        error_codes::ROUTE_AUTHORIZE_NOT_PERMITTED
+                    } else {
+                        "not_registered"
+                    };
                     return Ok(vec![control_error_frame(
                         &frame,
-                        "not_registered",
-                        "catalog.update requires an active module registration owned by this connection",
+                        code,
+                        "module-originated control requests require the module's own registered connection",
                     )?]);
                 }
 
@@ -2356,6 +2422,7 @@ impl ControlHandler {
         if let Some(runtime) = &self.config_runtime {
             runtime.disconnected(connection_id);
         }
+        self.agent_declarations.close(connection_id);
         let end_reason = if requested_reason == RegistrationEndReason::ConnectionClosed {
             self.registry
                 .get_module_by_connection(connection_id)?
@@ -2682,6 +2749,13 @@ impl ControlHandler {
                 return Ok(vec![control_error_frame(&frame, code, error.detail)?]);
             }
         }
+        if let Err(err) = validate_hello_display_name(&hello_value) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_manifest",
+                err.to_string(),
+            )?]);
+        }
         if let Err(err) = validate_hello_capability_grammar(&hello_value) {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -2727,6 +2801,14 @@ impl ControlHandler {
                 .as_str()
                 .unwrap_or("<unknown>");
             warn!(module_id, %reason, "dropping whole role_declarations map from HELLO");
+        }
+        if let Err(reason) = validate_hello_operation_deferral(&hello_value) {
+            let module_id = hello_value
+                .get("manifest")
+                .and_then(|m| m.get("module_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            warn!(module_id, %reason, "dropping operation_deferral from HELLO");
         }
         if let Err(reason) = validate_hello_flow_operations(&hello_value) {
             let module_id = hello_value["manifest"]["module_id"]
@@ -2905,8 +2987,11 @@ impl ControlHandler {
         // Other registrations receive this catalog fact only when reserved-module
         // policy required and accepted a nonce; unreserved registrations require
         // no nonce check.
-        let nonce_verified = if swap_candidate {
-            true
+        let verification = if swap_candidate {
+            ReservedHelloVerification {
+                nonce_verified: true,
+                prefix_owner: None,
+            }
         } else {
             match self.supervisor.reserved_hello_verification(
                 &hello.manifest.module_id,
@@ -3005,7 +3090,7 @@ impl ControlHandler {
                 negotiated_ver,
                 connection_id,
                 control_ops,
-                nonce_verified,
+                verification.nonce_verified,
             ) {
             Ok(registration) => registration,
             Err(RegistryError::DuplicateModuleId { module_id }) => {
@@ -3058,7 +3143,10 @@ impl ControlHandler {
                 negotiated_ver,
                 concurrency,
                 sink,
-                hello_ack,
+                crate::forwarding::ModuleHelloAck {
+                    frame: hello_ack,
+                    verified_prefix_owner: verification.prefix_owner,
+                },
             ) {
                 // Forwarding registration failed, so there is no forwarding
                 // state to tear down. Remove the registry entry, which was never
@@ -3446,11 +3534,24 @@ impl ControlHandler {
                 kind,
             } => self.handle_route_poll(ctx, frame, route_channel, route_epoch, kind),
             ClientControlRequest::SupervisorList {} => {
+                let Ok(permit) = Arc::clone(&self.list_admission).try_acquire_owned() else {
+                    self.agent_declarations.refuse(
+                        self,
+                        ctx,
+                        control_error_frame(
+                            &frame,
+                            "busy",
+                            "supervisor list work is at capacity; retry",
+                        )?,
+                    );
+                    return Ok(Vec::new());
+                };
                 // Filesystem-backed diagnostics must not hold up this connection's reader.
                 let handler = self.clone();
                 let sink = ctx.egress.clone();
                 tokio::spawn(
                     async move {
+                        let _permit = permit;
                         let result = handler.handle_supervisor_list(frame.clone()).await;
                         let replies = match result {
                             Ok(replies) => replies,
@@ -3461,7 +3562,11 @@ impl ControlHandler {
                             }
                         };
                         for reply in replies {
-                            if sink.send(reply).await.is_err() {
+                            if !matches!(
+                                tokio::time::timeout(Duration::from_millis(200), sink.send(reply))
+                                    .await,
+                                Ok(Ok(()))
+                            ) {
                                 break;
                             }
                         }
@@ -3643,6 +3748,19 @@ impl ControlHandler {
         request: ModuleControlRequestFromModule,
     ) -> Result<Vec<Frame>, RouterError> {
         match request {
+            ModuleControlRequestFromModule::RouteAuthorize {
+                principal,
+                scope,
+                target,
+                expected,
+            } => self.handle_route_authorize(
+                connection_id,
+                frame,
+                principal,
+                scope,
+                target,
+                expected,
+            ),
             ModuleControlRequestFromModule::CatalogUpdate {
                 provides,
                 capabilities,
@@ -3666,6 +3784,11 @@ impl ControlHandler {
                     "ModuleControlResponseToModule::LiveRoots",
                 )?])
             }
+            ModuleControlRequestFromModule::AgentCommands {
+                started,
+                finished,
+                known,
+            } => self.handle_agent_commands(connection_id, frame, started, finished, known),
             ModuleControlRequestFromModule::ScopeSync { generation, scopes } => {
                 self.handle_scope_sync(connection_id, frame, generation, scopes)
             }
@@ -3677,6 +3800,11 @@ impl ControlHandler {
             ModuleControlRequestFromModule::ScopeDescribe { owner, scope_ref } => {
                 self.handle_scope_describe(connection_id, frame, owner, scope_ref)
             }
+            _ => Ok(vec![control_error_frame(
+                &frame,
+                "unsupported_control_frame",
+                "unsupported module control operation",
+            )?]),
         }
     }
 
@@ -4036,6 +4164,75 @@ impl ControlHandler {
         scope_expiry::ScopeExpiryContext::new(self).close_scope_drained_routes(drained);
     }
 
+    fn handle_route_authorize(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+        principal: Principal,
+        scope: subc_protocol::scope::RouteAuthorizeScope,
+        target: String,
+        expected: subc_protocol::scope::RouteAuthorizeExpected,
+    ) -> Result<Vec<Frame>, RouterError> {
+        use crate::scopes::admission::{admit_route, AdmissionMode};
+        use subc_protocol::scope::{
+            RouteAuthorizeOutcome, RouteAuthorizeResponse, ROUTE_AUTHORIZE_CAPABILITY,
+        };
+        let registry = self
+            .registry
+            .route_admission_snapshot()
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let owner_configured = match &scope.owner {
+            Principal::Reserved { module_id } => self.supervisor.is_configured(module_id),
+            _ => false,
+        };
+        let selector = ScopeSelector::new(scope.owner, scope.scope_ref, Some(scope.epoch));
+        let answer = {
+            let scopes = self.scopes.read().unwrap_or_else(|p| p.into_inner());
+            let permitted = registry
+                .iter()
+                .find(|r| r.connection_id == connection_id)
+                .is_some_and(|r| {
+                    scopes.is_federated_owner(&Principal::Reserved {
+                        module_id: r.manifest.module_id.clone(),
+                    }) && r.manifest.capabilities.as_ref().is_some_and(|caps| {
+                        caps.provides
+                            .iter()
+                            .any(|cap| cap == ROUTE_AUTHORIZE_CAPABILITY)
+                    })
+                });
+            if !permitted {
+                drop(scopes);
+                return Ok(vec![control_error_frame(&frame, error_codes::ROUTE_AUTHORIZE_NOT_PERMITTED,
+                    "route.authorize requires the configured federated owner's route-authorize/v1 registration")?]);
+            }
+            admit_route(
+                &scopes,
+                &registry,
+                &principal,
+                &target,
+                Some(&selector),
+                owner_configured,
+                AdmissionMode::Authorize(&expected),
+            )
+        };
+        let response = match answer {
+            Ok(admission) => {
+                let mut response = RouteAuthorizeResponse::new(
+                    RouteAuthorizeOutcome::Authorized,
+                    "route admission authorized",
+                );
+                response.content_version = admission.content_version;
+                response
+            }
+            Err(refusal) => refusal.response(),
+        };
+        Ok(vec![control_response_body_frame(
+            &frame,
+            &response,
+            "RouteAuthorizeResponse",
+        )?])
+    }
+
     /// `scope.describe`: any registered module may read any scope, because a
     /// provider must read the scope a route it serves is stamped with.
     fn handle_scope_describe(
@@ -4056,11 +4253,34 @@ impl ControlHandler {
                 "scope.describe requires an active module registration owned by this connection",
             )?]);
         };
-        let mut description = self
+        let scopes = self
             .scopes
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .describe(&owner, &scope_ref);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if scopes.is_federated_owner(&owner)
+            && !crate::scopes::target_supports_federated(registered.manifest.capabilities.as_ref())
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                error_codes::SCOPE_FEDERATED_UNSUPPORTED,
+                "scope.describe of the federated owner requires scope-federated/v1",
+            )?]);
+        }
+        let mut description = scopes.describe(&owner, &scope_ref);
+        drop(scopes);
+        if owner
+            != (Principal::Reserved {
+                module_id: registered.manifest.module_id.clone(),
+            })
+        {
+            if let Some(facts) = description
+                .stamp
+                .as_mut()
+                .and_then(|stamp| stamp.attributes.federated.as_mut())
+            {
+                facts.stamp_required = false;
+            }
+        }
         // Describe readers also decode strict ScopeAttributes. Attribution is
         // safe to omit unless the requesting module declares it understands it.
         if !registered
@@ -4190,10 +4410,13 @@ impl ControlHandler {
             )?]);
         }
 
-        let updated = self
-            .registry
-            .replace_catalog_for_connection(connection_id, provides, capabilities, ready)
-            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let updated = match self.registry.replace_catalog_for_connection(connection_id, provides, capabilities, ready) {
+            Err(crate::registry::RegistryError::FederatedCapabilityChanged) => return Ok(vec![control_error_frame(
+                &frame, error_codes::CATALOG_UPDATE_FROZEN_CAPABILITY,
+                "scope-federated/v1 is fixed at HELLO; re-register on a new connection to change it",
+            )?]),
+            result => result.map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?,
+        };
         if updated.is_none() {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -4562,6 +4785,12 @@ impl ControlHandler {
         // diagnostic endpoint must still answer if the forwarding lock is
         // contended.
         let mut counters = self.counters.snapshot();
+        let losses = self.resource_tracker.loss_diagnostics();
+        if losses.as_object().is_some_and(|losses| !losses.is_empty()) {
+            if let Some(obj) = counters.as_object_mut() {
+                obj.insert("agent_command_declaration_loss_by_module".into(), losses);
+            }
+        }
         if let (Some(ledger), Some(obj)) = (&self.activity, counters.as_object_mut()) {
             obj.insert(
                 "activity_unparseable_lines".into(),
@@ -4657,6 +4886,7 @@ impl ControlHandler {
                     registration.control_ops,
                 )
                 .with_ready(not_ready.is_none())
+                .with_display_name(registration.manifest.display_name)
                 .with_not_ready(not_ready)
                 .with_module_version(Some(registration.manifest.module_version))
                 .with_provenance(registration.manifest.provenance)
@@ -4666,6 +4896,7 @@ impl ControlHandler {
                 .with_operation_delivery(registration.manifest.operation_delivery)
                 .with_operation_payload(registration.manifest.operation_payload)
                 .with_flow_operations(registration.manifest.flow_operations)
+                .with_operation_deferral(registration.manifest.operation_deferral)
                 .with_confirm_operations(registration.manifest.confirm_operations)
                 .with_rich_ui(registration.manifest.rich_ui)
                 .with_role_declarations(registration.manifest.role_declarations)
@@ -5145,10 +5376,12 @@ impl ControlHandler {
         // IF THE HANDSHAKE EVER ADMITS A PRINCIPAL THAT IS NOT THIS USER -- a
         // remote transport, a sandboxed caller, a shared-host mode -- THAT
         // PREMISE DIES AND THESE THREE REPLIES MUST COLLAPSE INTO ONE.
-        let Some(registration) = self
+        let admission_registry = self
             .registry
-            .get_module(&target_module_id)
-            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+            .route_admission_snapshot()
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let Some(registration) =
+            crate::scopes::admission::registered_target(&admission_registry, &target_module_id)
         else {
             if let Some((status, warming)) =
                 self.supervisor_status(&target_module_id, frame.header.corr)?
@@ -5214,7 +5447,9 @@ impl ControlHandler {
         // Best-effort only: registry readiness and forwarding reservation use
         // different locks, so a module can flip readiness between this read and
         // the relay. Modules must still tolerate an `on_bind` while not ready.
-        if !registration.ready {
+        if crate::scopes::admission::target_registration(&admission_registry, &target_module_id)
+            .is_err()
+        {
             self.counters
                 .increment_route_open_refused(ROUTE_OPEN_REFUSED_DECLARED_NOT_READY);
             info!(
@@ -5264,7 +5499,7 @@ impl ControlHandler {
         // goes away stay bound: nothing here tears them down, and the module
         // answers them as it can. Like the readiness read above this is
         // best-effort against a provider registering or leaving concurrently.
-        if let Some(capability) = self.first_unprovided_required_capability(&registration) {
+        if let Some(capability) = self.first_unprovided_required_capability(registration) {
             self.counters
                 .increment_route_open_refused(ROUTE_OPEN_REFUSED_REQUIRED_CAPABILITY_UNPROVIDED);
             info!(
@@ -5437,10 +5672,9 @@ impl ControlHandler {
             module_id: opening_module_id,
         } = &principal
         {
-            if let Some(opening_registration) = self
-                .registry
-                .get_module(opening_module_id)
-                .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+            if let Some(opening_registration) = admission_registry
+                .iter()
+                .find(|r| r.manifest.module_id == *opening_module_id)
             {
                 if let Some(capability) =
                     denied_capability(&opening_registration.manifest, &registration.manifest)
@@ -5508,8 +5742,8 @@ impl ControlHandler {
         // compared with the published one at commit, so a sync between here
         // and the module's ack refuses the open instead of binding a stamp
         // that is no longer true.
-        let (bound_scope, mut scope_stamp) = match &scope {
-            None => (None, None),
+        let (bound_scope, mut scope_stamp, stamp_required) = match &scope {
+            None => (None, None, false),
             Some(selector) => {
                 let owner_configured = match &selector.owner {
                     // A reserved owner counts as configured from before its
@@ -5524,37 +5758,37 @@ impl ControlHandler {
                     .scopes
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let admitted = scopes
-                    .admit(&principal, &target_module_id, selector, owner_configured)
-                    .and_then(|admission| {
-                        crate::scopes::check_target_flow_support(
-                            &admission.stamp,
-                            &target_module_id,
-                            registration.manifest.capabilities.as_ref(),
-                        )?;
-                        crate::scopes::check_target_agent_run_support(
-                            &admission.stamp,
-                            &target_module_id,
-                            registration.manifest.capabilities.as_ref(),
-                        )?;
-                        let bound = scopes.reserve_bind(
-                            &admission,
-                            &principal,
-                            ctx.connection_id,
-                            selector.hold_presence,
-                        );
-                        Ok((admission, bound))
-                    });
+                let admitted = crate::scopes::admission::admit_route(
+                    &scopes,
+                    &admission_registry,
+                    &principal,
+                    &target_module_id,
+                    Some(selector),
+                    owner_configured,
+                    crate::scopes::admission::AdmissionMode::Open,
+                )
+                .map(|route| {
+                    let admission = route.scope.expect("scoped admission");
+                    let bound = scopes.reserve_bind(
+                        &admission,
+                        &principal,
+                        ctx.connection_id,
+                        selector.hold_presence,
+                    );
+                    (admission, bound)
+                });
                 match admitted {
-                    Ok((admission, bound)) => (Some(bound), Some(admission.stamp)),
+                    Ok((admission, bound)) => {
+                        (Some(bound), Some(admission.stamp), admission.stamp_required)
+                    }
                     Err(refusal) => {
                         return Ok(vec![self.route_open_refusal_frame(
                             ctx,
                             &caller,
                             &frame,
                             &target_module_id,
-                            refusal.code,
-                            refusal.code,
+                            refusal.code.unwrap_or(error_codes::TARGET_UNAVAILABLE),
+                            refusal.code.unwrap_or(error_codes::TARGET_UNAVAILABLE),
                             refusal.message,
                         )?]);
                     }
@@ -5745,15 +5979,19 @@ impl ControlHandler {
                 )?]);
             }
         }
-        if let Some(stamp) = scope_stamp
-            .as_ref()
-            .filter(|stamp| stamp.attributes.flow_id.is_some() || stamp.attributes.run_id.is_some())
-        {
-            if let Err(refusal) = crate::scopes::check_target_flow_support(
-                stamp,
+        if let Some(stamp) = scope_stamp.as_ref() {
+            if let Err(refusal) = crate::scopes::check_target_required_stamp(
+                stamp_required,
                 &target_module_id,
                 relay_capabilities,
             )
+            .and_then(|()| {
+                crate::scopes::check_target_flow_support(
+                    stamp,
+                    &target_module_id,
+                    relay_capabilities,
+                )
+            })
             .and_then(|()| {
                 crate::scopes::check_target_agent_run_support(
                     stamp,
@@ -5776,6 +6014,14 @@ impl ControlHandler {
 
         // Older readers may reject unknown fields. Select optional fields from
         // the captured endpoint's declaration, including on unscoped binds.
+        if scope_stamp
+            .as_ref()
+            .is_some_and(|stamp| stamp.kind == subc_protocol::scope::ScopeKind::Federated)
+            && !crate::scopes::target_supports_federated(relay_capabilities)
+        {
+            // Keep bound_scope: even an unstamped legacy route belongs to this epoch.
+            scope_stamp = None;
+        }
         if !relay_capabilities.is_some_and(|caps| {
             caps.provides
                 .iter()
@@ -6120,6 +6366,25 @@ impl ControlHandler {
     }
 
     async fn handle_supervisor_list(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        // Status/configuration snapshots may wait on synchronous supervisor
+        // locks. Keep that work off the connection's async runtime thread.
+        let handler = self.clone();
+        let runtime = tokio::runtime::Handle::current();
+        // The blocking pool does not inherit the control request's tracing
+        // subscriber. Preserve it so slow snapshot-lock warnings stay visible.
+        let subscriber = tracing::dispatcher::get_default(Clone::clone);
+        let corr = frame.header.corr;
+        tokio::task::spawn_blocking(move || {
+            runtime.block_on(
+                list_diagnostics::scope(handler.handle_supervisor_list_inner(frame))
+                    .with_subscriber(subscriber),
+            )
+        })
+        .await
+        .map_err(|error| RouterError::backend(0, corr, error.to_string()))?
+    }
+
+    async fn handle_supervisor_list_inner(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
         use crate::config_gate::runtime::ApprovedDaemonView;
         let approved = self
             .config_runtime
@@ -6131,13 +6396,9 @@ impl ControlHandler {
             .generation()
             .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
         let supervised = self.supervisor.list();
-        let targets = supervised
-            .iter()
-            .map(|module| module.subtree_target())
-            .collect();
-        let subtree = tokio::spawn(crate::subtree_resources::read(targets));
-        let mut modules = Vec::new();
-        for module in supervised {
+        let mut statuses = BTreeMap::new();
+        let mut not_running = BTreeSet::new();
+        for module in &supervised {
             let status = module.status_for_control("list").map_err(|err| {
                 RouterError::backend(
                     0,
@@ -6145,6 +6406,35 @@ impl ControlHandler {
                     format!("failed to read supervisor status: {err}"),
                 )
             })?;
+            if !status.enabled || !status.process_alive {
+                not_running.insert(module.module_id().to_owned());
+            }
+            statuses.insert(module.module_id().to_owned(), status);
+        }
+        // Legacy per-process diagnostics keep their shared optional budget.
+        // The cached tree and accounting export below does not spend it.
+        let mut process_resources = BTreeMap::new();
+        for module in &supervised {
+            process_resources.insert(
+                module.module_id().to_owned(),
+                crate::subtree_resources::read_process(module.clone()).await,
+            );
+        }
+        // Image evidence uses the same optional deadline, but an exhausted
+        // budget must not suppress the committed resource view.
+        let mut image_readings = BTreeMap::new();
+        for module in &supervised {
+            image_readings.insert(
+                module.module_id().to_owned(),
+                module.running_image_agreement().await,
+            );
+        }
+        let readings = self.resource_tracker.list(supervised.clone());
+        let mut modules = Vec::new();
+        for module in supervised {
+            let status = statuses
+                .remove(module.module_id())
+                .expect("each supervised module has a status snapshot");
             let (configured, _) = module.configuration().map_err(|err| {
                 RouterError::backend(
                     0,
@@ -6159,11 +6449,10 @@ impl ControlHandler {
                     format!("failed to read retry time: {err}"),
                 )
             })?;
-            // Status and configuration snapshots release their locks before the image probe awaits.
-            let image = module.running_image_agreement().await;
-            // Read per request so the figure is current when the operator asks;
-            // the daemon samples nothing in between.
-            let resources = Some(crate::subtree_resources::read_process(module.clone()).await);
+            let image = image_readings
+                .remove(module.module_id())
+                .expect("each supervised module has an image snapshot");
+            let resources = process_resources.remove(module.module_id());
             let mut verdict =
                 reload_verdict(&configured.program, status.spawned_from.as_deref(), image);
             verdict.spec = Some(launch_spec_agreement(
@@ -6218,18 +6507,33 @@ impl ControlHandler {
                 .with_resources(resources),
             );
         }
-        let readings = subtree
-            .await
-            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
-        for (module, reading) in modules.iter_mut().zip(readings) {
-            if reading.reason.as_deref() == Some("timeout") {
-                crate::subtree_resources::log_timeout(&module.module_id, "subtree");
+        for module in &mut modules {
+            if let Some((tree, hour)) = readings.modules.get(&module.module_id) {
+                module.tree = tree.clone();
+                module.cpu_last_hour = hour.clone();
             }
-            module.subtree = Some(reading);
+            module.tree_unavailable = readings
+                .reasons
+                .get(&module.module_id)
+                .map(|reason| (*reason).to_owned());
+            if module.tree.is_none() {
+                module.tree_unavailable = Some(
+                    if not_running.contains(&module.module_id) {
+                        "not_running"
+                    } else if let Some(reason) = readings.reasons.get(&module.module_id) {
+                        reason
+                    } else {
+                        "not_yet_measured"
+                    }
+                    .to_owned(),
+                );
+            }
         }
         let response = ClientControlResponse::SupervisorList {
             generation,
             modules,
+            daemon: readings.daemon,
+            agent_commands: readings.agent_commands,
         };
         Ok(vec![control_response_body_frame(
             &frame,
@@ -6826,6 +7130,7 @@ impl ControlHandler {
             admission_facts_carrier_module_id,
             admission_facts_targets,
             scope_authority_owners,
+            federated_scope_owner,
             privileged_operator_prompt,
             modules,
             reserved_capabilities,
@@ -6835,6 +7140,7 @@ impl ControlHandler {
             config.admission_facts_carrier_module_id,
             config.admission_facts_targets,
             config.scope_authority_owners,
+            config.federated_scope_owner,
             config.privileged_operator_prompt,
             config.modules,
             config.reserved_capabilities,
@@ -6861,6 +7167,9 @@ impl ControlHandler {
                 }
                 RestartRequiredSection::ScopeAuthorityOwners => {
                     scope_authority_owners != context.scope_authority_owners
+                }
+                RestartRequiredSection::FederatedScopeOwner => {
+                    federated_scope_owner != context.federated_scope_owner
                 }
                 RestartRequiredSection::PrivilegedOperatorPrompt => {
                     privileged_operator_prompt != context.privileged_operator_prompt
@@ -7128,7 +7437,13 @@ impl ControlHandler {
             let launch_changed = *current_spec != configured_module.module_spec();
             let configuration_changed =
                 launch_changed || *current_health != configured_module.health;
-            let enabled_changed = *current_enabled != configured_module.enabled;
+            // Applying a rescan also replaces the recorded config value, even
+            // when an operator already put the runtime in the requested state.
+            let enabled_changed = *current_enabled != configured_module.enabled
+                || self
+                    .capability_evaluator
+                    .configured_enabled(module_id)
+                    .is_some_and(|enabled| enabled != configured_module.enabled);
             if configuration_changed {
                 configuration_changes.insert(module_id.clone());
             }
@@ -7260,7 +7575,7 @@ impl ControlHandler {
         }
 
         for module_id in configured.keys() {
-            let Some((module, _, _, _)) = current.get(module_id) else {
+            let Some((module, _, _, current_enabled)) = current.get(module_id) else {
                 continue;
             };
             let configured_module = configured
@@ -7280,7 +7595,9 @@ impl ControlHandler {
                         )
                     })?;
             }
-            if enabled_changes.contains(module_id) {
+            // Config-only drift is applied by the evaluator's config update;
+            // do not turn it into a runtime start or stop.
+            if *current_enabled != configured_module.enabled {
                 // A rescan that starts or stops a module applies an operator's
                 // edit to the config, so the resulting outage was asked for.
                 self.route_outages.mark_operator_action(module_id);
@@ -8430,6 +8747,8 @@ fn route_open_scope_label(stamp: &subc_protocol::scope::ScopeStamp) -> String {
         ScopeKind::Head => "head",
         ScopeKind::Worker => "worker",
         ScopeKind::Ephemeral => "ephemeral",
+        ScopeKind::Federated => "federated",
+        _ => "unknown",
     };
     format!(
         "{kind}/{}/{}@{}",
@@ -8471,6 +8790,11 @@ fn module_control_request_op(request: &ModuleControlRequestFromModule) -> &'stat
         ModuleControlRequestFromModule::ScopeSync { .. } => SCOPE_SYNC_OP,
         ModuleControlRequestFromModule::ScopeApply { .. } => SCOPE_APPLY_OP,
         ModuleControlRequestFromModule::ScopeDescribe { .. } => SCOPE_DESCRIBE_OP,
+        ModuleControlRequestFromModule::RouteAuthorize { .. } => {
+            subc_protocol::scope::ROUTE_AUTHORIZE_OP
+        }
+        ModuleControlRequestFromModule::AgentCommands { .. } => "supervisor.agent_commands",
+        _ => "unsupported",
     }
 }
 
@@ -8626,26 +8950,6 @@ fn capability_census_trigger(
             .must_never_reach
             .iter()
             .any(|capability| !old_denies.contains(capability))
-}
-
-/// Find the first capability an attested opener denies that an attested target
-/// claims. Both manifests are live registry records, never cached or client data.
-fn denied_capability<'a>(
-    opening_manifest: &'a ModuleManifest,
-    target_manifest: &ModuleManifest,
-) -> Option<&'a str> {
-    let opening_capabilities = opening_manifest.capabilities.as_ref()?;
-    let target_capabilities = target_manifest.capabilities.as_ref()?;
-    opening_capabilities
-        .must_never_reach
-        .iter()
-        .find(|denied| {
-            target_capabilities
-                .provides
-                .iter()
-                .any(|provided| provided == *denied)
-        })
-        .map(String::as_str)
 }
 
 fn catalog_update_frozen_field_message(
@@ -9032,6 +9336,8 @@ pub(crate) fn send_route_control_pushes(
 
 #[cfg(test)]
 mod tests {
+    include!("control/agent_commands_tests.rs");
+    include!("control/resource_revision_tests.rs");
     #[tokio::test]
     async fn route_busy_wait_attribution_resolves_targets_instead_of_trusting_selectors() {
         let registry = Arc::new(Registry::default());
@@ -10122,6 +10428,51 @@ mod tests {
         assert_eq!(registration.state, ChannelState::Active);
         assert_eq!(registration.connection_id, conn);
         assert_eq!(registration.control_ops, module_baseline_control_ops());
+        assert!(registration.manifest.display_name.is_none());
+    }
+
+    #[test]
+    fn hello_display_name_refuses_invalid_manifest_by_field() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        for (index, invalid) in [
+            json!(""),
+            json!("a".repeat(41)),
+            json!(" Routing"),
+            json!("a\nb"),
+            json!("a\u{202e}b"),
+            json!(7),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let module_id = format!("bad-display-name-{index}");
+            let mut body = serde_json::to_value(ModuleHelloBody {
+                manifest: manifest(&module_id, PROTOCOL_VERSION),
+                protocol_ver: PROTOCOL_VERSION,
+                control_ops: None,
+                launch_nonce: None,
+            })
+            .unwrap();
+            body["manifest"]["display_name"] = invalid;
+            let hello = Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                7,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            let response = handler
+                .handle_control(ConnectionId::new(100 + index as u64), hello)
+                .unwrap();
+            assert_eq!(response[0].header.ty, FrameType::Error);
+            let error = parse_error(&response[0]);
+            assert_eq!(error["code"], "invalid_manifest");
+            assert!(error["message"].as_str().unwrap().contains("display_name"));
+            assert!(registry.get_module(&module_id).unwrap().is_none());
+        }
     }
 
     #[test]
@@ -10723,6 +11074,80 @@ mod tests {
         let (raw, entry) = role_declarations_catalog(&handler);
         assert!(raw.get("flow_operations").is_none());
         assert_eq!(entry.flow_operations, None);
+    }
+
+    #[test]
+    fn operation_deferral_hello_accepts_valid_and_invalid_maps_and_catalog_relays_only_valid() {
+        let oversized: serde_json::Map<String, Value> = (0..257)
+            .map(|n| (format!("tool:t{n}"), json!(true)))
+            .collect();
+        for (capabilities, map, valid) in [
+            (
+                json!(["scope-federated/v1"]),
+                json!({"tool:read":true,"management:reset":true}),
+                true,
+            ),
+            (json!(["scope-federated/v1"]), json!({}), true),
+            (json!([]), json!({"tool:read":true}), false),
+            (
+                json!(["scope-federated/v1"]),
+                json!({"tool:valid":true,"tool:bad":false}),
+                false,
+            ),
+            (
+                json!(["scope-federated/v1"]),
+                json!({"tool:valid":true,"management:missing":true}),
+                false,
+            ),
+            (
+                json!(["scope-federated/v1"]),
+                Value::Object(oversized),
+                false,
+            ),
+        ] {
+            let capture = EventCapture::default();
+            let _subscriber = tracing::subscriber::set_default(
+                tracing_subscriber::registry().with(capture.clone()),
+            );
+            let registry = Arc::new(Registry::default());
+            let handler = ControlHandler::new(Arc::clone(&registry));
+            let hello = hello_with_flow_operations(capabilities, None);
+            let mut body: Value = serde_json::from_slice(&hello.body).unwrap();
+            body["manifest"]["operation_deferral"] = map.clone();
+            let hello = Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                401,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            let response = handler
+                .handle_control(ConnectionId::new(401), hello)
+                .unwrap();
+            assert_eq!(response[0].header.ty, FrameType::HelloAck);
+            let (raw, entry) = role_declarations_catalog(&handler);
+            if valid {
+                assert_eq!(raw["operation_deferral"], map);
+                assert_eq!(
+                    serde_json::to_value(entry.operation_deferral.unwrap()).unwrap(),
+                    map
+                );
+            } else {
+                assert!(entry.operation_deferral.is_none());
+                assert!(raw.get("operation_deferral").is_none());
+                assert_eq!(
+                    capture
+                        .events()
+                        .iter()
+                        .filter(|event| event.fields.get("message").map(String::as_str)
+                            == Some("dropping operation_deferral from HELLO"))
+                        .count(),
+                    1
+                );
+            }
+        }
     }
 
     fn assert_hello_drops_flow_operations_with_warning(
@@ -14326,6 +14751,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_module_tree_is_not_running_instead_of_permanently_pending() {
+        let registry = Arc::new(Registry::default());
+        let handle = SupervisorHandle::new();
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone());
+        supervisor
+            .supervise_configured(
+                crate::ModuleSpec {
+                    module_id: "disabled-resource-reading".into(),
+                    program: std::env::current_exe().unwrap(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    reserved: false,
+                    reserved_prefixes: Vec::new(),
+                    protocol: ModuleProtocol::None,
+                    overlap: Default::default(),
+                    carry_containment: false,
+                },
+                false,
+            )
+            .unwrap();
+        let handler = ControlHandler::new(registry).with_supervisor(handle);
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+        let replies = handler.handle_supervisor_list(frame).await.unwrap();
+        let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
+        assert!(body["modules"][0].get("tree").is_none());
+        assert_eq!(body["modules"][0]["tree_unavailable"], "not_running");
+    }
+
+    #[tokio::test]
+    async fn supervisor_list_reads_process_resources_before_a_stalled_tree() {
+        let _guard = crate::subtree_resources::fault_read_guard().await;
+        let dir = cortexkit_test_support::ScratchDir::new("list-process-priority");
+        let registry = Arc::new(Registry::default());
+        let handle = SupervisorHandle::new();
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone());
+        let module = supervisor
+            .spawn(crate::ModuleSpec {
+                carry_containment: false,
+                module_id: "list-process-priority".into(),
+                program: std::env::current_exe().unwrap(),
+                args: vec![
+                    "--exact".into(),
+                    "control::tests::pid_resource_read_fixture".into(),
+                ],
+                env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                    .into_iter()
+                    .map(|key| (key.into(), dir.display().to_string()))
+                    .chain(std::iter::once((
+                        "SUBC_SUBTREE_PID_FIXTURE".into(),
+                        "1".into(),
+                    )))
+                    .collect(),
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::None,
+                overlap: Default::default(),
+            })
+            .unwrap();
+        let ready_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let image = module.running_image_agreement().await;
+            if matches!(image, subc_control::RunningImageAgreement::Match { .. }) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < ready_deadline,
+                "the fixture process never became observable: {image:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (target, release, _) = crate::subtree_resources::held();
+        module.set_subtree_target_for_test(target);
+        let handler = ControlHandler::new(registry).with_supervisor(handle);
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+        let replies = handler.handle_supervisor_list(frame).await.unwrap();
+        drop(release);
+        module.stop().await.unwrap();
+        let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
+        assert_eq!(
+            body["modules"][0]["resources"]["status"], "measured",
+            "the optional tree timeout must not discard the process reading: {body}"
+        );
+        assert!(body["modules"][0].get("tree").is_none());
+        assert_eq!(body["modules"][0]["tree_unavailable"], "not_yet_measured");
+        assert_eq!(
+            body["modules"][0]["pending_reload"]["image"]["status"], "match",
+            "the tree timeout must not hide a completed image observation"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn cold_explicit_provenance_completes_while_list_stays_bounded() {
+        let mut handler = ControlHandler::new(Arc::new(Registry::default()))
+            .with_daemon_provenance(
+                std::process::id(),
+                0,
+                Some(std::env::current_exe().unwrap()),
+                None,
+                None,
+            );
+        let (probe, release, began) = ExecutableIdentityProbe::held();
+        handler.daemon_provenance.probe = probe;
+        let observe = |handler: ControlHandler, corr| {
+            tokio::spawn(async move {
+                let (ctx, _) = route_ctx(ConnectionId::new(corr));
+                let frame =
+                    Frame::build(FrameType::Request, control_flags(), 0, 0, corr, Vec::new())
+                        .unwrap();
+                handler
+                    .handle_supervisor_provenance(&ctx, frame, None)
+                    .await
+                    .unwrap()
+            })
+        };
+        let explicit = observe(handler.clone(), 114);
+        began.await.unwrap();
+        let concurrent = observe(handler.clone(), 115);
+        // Keep explicit provenance waiting on its first image observation beyond
+        // the list deadline; release it only after the concurrent list replies.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 2, Vec::new()).unwrap();
+        let list = tokio::time::timeout(
+            Duration::from_secs(1),
+            handler.handle_supervisor_list(frame),
+        )
+        .await;
+        let explicit_was_pending = !explicit.is_finished() && !concurrent.is_finished();
+        drop(release);
+        let replies = explicit.await.unwrap();
+        let concurrent_replies = concurrent.await.unwrap();
+        assert!(
+            explicit_was_pending,
+            "explicit provenance must await the full observation"
+        );
+        let list = list
+            .expect("a concurrent explicit probe must not stall list")
+            .unwrap();
+        let list_body: Value = serde_json::from_slice(&list[0].body).unwrap();
+        assert_eq!(list_body["op"], "supervisor.list");
+        for replies in [replies, concurrent_replies] {
+            let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
+            assert_eq!(
+                body["daemon"]["daemon_observed"]["running_image"]["status"],
+                "match"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn supervisor_list_slow_subtree_does_not_hold_connection_reader() {
         let _guard = crate::subtree_resources::fault_read_guard().await;
         let registry = Arc::new(Registry::default());
@@ -14345,10 +14922,17 @@ mod tests {
                     protocol: ModuleProtocol::Subc,
                     overlap: Default::default(),
                 },
-                false,
+                true,
             )
             .unwrap();
         let (target, release, began) = crate::subtree_resources::held();
+        // Optional list work may be skipped when its deadline is already spent.
+        // Establish the stalled fixture before asking the list to observe it.
+        let stalled_target = target.clone();
+        let stalled = tokio::task::spawn_blocking(move || {
+            stalled_target.tree(&subc_os::ProcessTable::default())
+        });
+        began.await.unwrap();
         module.set_subtree_target_for_test(target);
         let handler = ControlHandler::new(registry).with_supervisor(handle);
         let (ctx, mut rx) = route_ctx(ConnectionId::new(112));
@@ -14366,7 +14950,6 @@ mod tests {
             replies.is_empty(),
             "list reply must be detached from the connection reader"
         );
-        began.await.unwrap();
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 2, Vec::new()).unwrap();
         let replies = handler
             .handle_client_control_request(
@@ -14388,20 +14971,138 @@ mod tests {
             .unwrap();
         release.send(()).unwrap();
         drop(release);
+        stalled.await.unwrap();
         let body: Value = serde_json::from_slice(&reply.frame.body).unwrap();
-        assert_eq!(body["modules"][0]["subtree"]["source"], "unavailable");
-        assert_eq!(body["modules"][0]["subtree"]["reason"], "timeout");
-        assert_eq!(
-            body["modules"][0]["subtree"]["process_count"], 1,
-            "a count obtained before the stalled read must survive timeout"
+        assert!(
+            body["modules"][0].get("tree").is_none(),
+            "an unknown tree reading must be omitted after the bounded read expires"
         );
+        // Lists export completed work rather than measuring synchronously.
+        // Complete a refresh after the fixture is released before asserting
+        // that a later list contains its measured tree.
+        handler
+            .resource_tracker
+            .read(handler.supervisor.list(), false, "released_tree_fixture")
+            .await;
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 3, Vec::new()).unwrap();
         let replies = handler.handle_supervisor_list(frame).await.unwrap();
         let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
         assert_eq!(
-            body["modules"][0]["subtree"]["source"], "process_sum",
-            "the next request must read afresh"
+            body["modules"][0]["tree"]["source"], "process_tree",
+            "the next request must export the completed refresh"
         );
+        assert_eq!(body["modules"][0]["tree"]["process_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn supervisor_list_expired_budget_keeps_committed_accounting_rows() {
+        use subc_control::{
+            AgentCommandResources, ChildMemoryKind, ChildResourceReading,
+            ChildResourceUnavailableReason, ChildResourceUsage, CpuLastHour, DaemonResources,
+            TreeReading, TreeSource,
+        };
+        let registry = Arc::new(Registry::default());
+        let handle = SupervisorHandle::new();
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone());
+        supervisor
+            .supervise_configured(
+                crate::ModuleSpec {
+                    carry_containment: false,
+                    module_id: "budget-worker".into(),
+                    program: PathBuf::from("disabled-module"),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    reserved: false,
+                    reserved_prefixes: Vec::new(),
+                    protocol: ModuleProtocol::Subc,
+                    overlap: Default::default(),
+                },
+                true,
+            )
+            .unwrap();
+        let handler = ControlHandler::new(registry).with_supervisor(handle);
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap();
+        let measured = now - 1_000;
+        let hour = CpuLastHour::new(100, 60_000);
+        let daemon = DaemonResources::new(7, 1, "test")
+            .with_measured_at_ms(Some(measured))
+            .with_resources(Some(ChildResourceUsage::Measured(
+                ChildResourceReading::new(20, ChildMemoryKind::ResidentSet, 10, 0),
+            )))
+            .with_cpu_last_hour(Some(hour.clone()));
+        let agents = AgentCommandResources::new("budget-worker", 50, 30, 1)
+            .with_measured_at_ms(Some(measured))
+            .with_cpu_last_hour(Some(hour.clone()));
+        let tree = TreeReading::new(
+            150,
+            50,
+            ChildMemoryKind::ResidentSet,
+            1,
+            TreeSource::ProcessTree,
+        )
+        .with_measured_at_ms(Some(measured));
+        handler.resource_tracker.seed_committed_for_test(
+            &handler.supervisor.list(),
+            crate::resource_totals::Readings {
+                modules: BTreeMap::from([("budget-worker".into(), (Some(tree), Some(hour)))]),
+                daemon: Some(daemon),
+                agent_commands: Some(vec![agents]),
+                ..Default::default()
+            },
+            now,
+        );
+        list_diagnostics::scope(async {
+            tokio::time::sleep(Duration::from_millis(110)).await;
+            assert!(list_diagnostics::deadline().unwrap() <= tokio::time::Instant::now());
+            let request =
+                Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+            let replies = handler.handle_supervisor_list_inner(request).await.unwrap();
+            let ClientControlResponse::SupervisorList {
+                modules,
+                daemon,
+                agent_commands,
+                ..
+            } = serde_json::from_slice(&replies[0].body).unwrap()
+            else {
+                panic!("expected a list response")
+            };
+            assert!(matches!(
+                modules[0].resources,
+                Some(ChildResourceUsage::Unavailable {
+                    reason: ChildResourceUnavailableReason::Unreadable
+                })
+            ));
+            assert_eq!(
+                (
+                    modules[0].tree.as_ref().unwrap().cpu_ms,
+                    modules[0].tree.as_ref().unwrap().measured_at_ms
+                ),
+                (150, Some(measured))
+            );
+            let daemon = daemon.unwrap();
+            let agents = agent_commands.unwrap();
+            assert_eq!(daemon.measured_at_ms, Some(measured));
+            assert_eq!(
+                (agents.len(), agents[0].cpu_ms, agents[0].measured_at_ms),
+                (1, 50, Some(measured))
+            );
+            for hour in [
+                modules[0].cpu_last_hour.as_ref(),
+                daemon.cpu_last_hour.as_ref(),
+                agents[0].cpu_last_hour.as_ref(),
+            ] {
+                let hour = hour.unwrap();
+                assert_eq!((hour.cpu_ms, hour.covered_ms), (100, 60_000));
+            }
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -14449,8 +15150,8 @@ mod tests {
                 body["modules"][0].get("configured_enabled"),
                 configured.map(Value::Bool).as_ref()
             );
-            assert_eq!(body["modules"][0]["subtree"]["source"], "unavailable");
-            assert_eq!(body["modules"][0]["subtree"]["reason"], "not_running");
+            assert!(body["modules"][0].get("tree").is_none());
+            assert!(body["modules"][0].get("subtree").is_none());
         }
     }
 
@@ -17710,6 +18411,12 @@ mod tests {
         }
         mod call_modes {
             include!("scope_call_mode_tests.rs");
+        }
+        mod federated {
+            include!("scope_federated_tests.rs");
+        }
+        mod authorize {
+            include!("route_authorize_tests.rs");
         }
         #[tokio::test]
         async fn served_by_dispatch_bypasses_exhaustive_decoder_and_requires_registration() {

@@ -29,6 +29,8 @@ const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
     ROUTE_OPEN_REFUSED_REQUIRED_CAPABILITY_UNPROVIDED,
     "target_unavailable",
     subc_protocol::error_codes::TARGET_FLOW_UNSUPPORTED,
+    subc_protocol::error_codes::TARGET_FEDERATED_UNSUPPORTED,
+    subc_protocol::error_codes::FEDERATED_STAMP_REQUIRED,
     subc_protocol::error_codes::TARGET_AGENT_RUN_UNSUPPORTED,
     "module_removed",
     "module_no_protocol",
@@ -166,6 +168,8 @@ pub struct DaemonCounters {
     // Per-module maps and the rate window are daemon-lifetime diagnostics only:
     // they deliberately reset on restart instead of becoming durable daemon state.
     module_frames_dropped_no_route_by_module: Arc<Mutex<HashMap<String, u64>>>,
+    agent_command_refusals_dropped_by_module: Arc<Mutex<HashMap<String, u64>>>,
+    agent_command_refusals_dropped_unlabelled: Arc<std::sync::atomic::AtomicU64>,
     route_open_refused_by_code: Arc<Mutex<HashMap<String, u64>>>,
     route_open_accepted_by_principal: Arc<Mutex<HashMap<String, u64>>>,
     module_frames_dropped_no_route_window: Arc<Mutex<DropWindow>>,
@@ -306,6 +310,20 @@ impl DaemonCounters {
             "module_frames_dropped_no_route_by_module",
             &self.module_frames_dropped_no_route_by_module,
         );
+        insert_nonempty_counts(
+            &mut snapshot,
+            "agent_command_refusals_dropped_by_module",
+            &self.agent_command_refusals_dropped_by_module,
+        );
+        let unlabelled = self
+            .agent_command_refusals_dropped_unlabelled
+            .load(Ordering::Relaxed);
+        if unlabelled != 0 {
+            snapshot.insert(
+                "agent_command_refusals_dropped_unlabelled".into(),
+                unlabelled.into(),
+            );
+        }
         snapshot.insert(
             "module_frames_dropped_released_route".into(),
             self.module_frames_dropped_released_route
@@ -471,6 +489,32 @@ impl DaemonCounters {
             .record(tokio::time::Instant::now());
     }
 
+    pub(crate) fn increment_agent_command_refusal_dropped(
+        &self,
+        module_id: Option<&str>,
+        registry: &crate::registry::Registry,
+    ) {
+        let Some(module_id) =
+            module_id.filter(|id| registry.get_module(id).ok().flatten().is_some())
+        else {
+            self.agent_command_refusals_dropped_unlabelled
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let mut counts = self
+            .agent_command_refusals_dropped_by_module
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = counts.get_mut(module_id) {
+            *count = count.saturating_add(1);
+        } else if counts.len() < MAX_AGENT_REFUSAL_MODULES {
+            counts.insert(module_id.to_owned(), 1);
+        } else {
+            self.agent_command_refusals_dropped_unlabelled
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Count a dropped module frame whose (channel, epoch) the daemon had
     /// allocated on that connection and since released. Called in addition to
     /// [`Self::increment_module_frames_dropped_no_route`], never instead of it.
@@ -555,6 +599,47 @@ impl DaemonCounters {
     pub(crate) fn increment_carried_containment_anchor_lost(&self) {
         self.carried_containment_anchor_lost
             .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+const MAX_AGENT_REFUSAL_MODULES: usize = 1_024;
+
+#[cfg(test)]
+mod refusal_label_tests {
+    use super::*;
+
+    #[test]
+    fn dropped_refusal_labels_require_registration_and_stop_at_the_hard_cap() {
+        let registry = crate::Registry::default();
+        let counters = DaemonCounters::default();
+        counters.increment_agent_command_refusal_dropped(Some("unregistered"), &registry);
+        assert!(counters
+            .snapshot()
+            .get("agent_command_refusals_dropped_by_module")
+            .is_none());
+        for index in 0..=1_024 {
+            let id = format!("registered-{index}");
+            registry
+                .register_with_control_ops(
+                    subc_protocol::manifest::ModuleManifest::builder(&id, "0.1.0")
+                        .protocol_ver(1)
+                        .build(),
+                    1,
+                    crate::ConnectionId::new(index as u64 + 1),
+                    Vec::new(),
+                )
+                .unwrap();
+            counters.increment_agent_command_refusal_dropped(Some(&id), &registry);
+        }
+        counters.increment_agent_command_refusal_dropped(Some("registered-0"), &registry);
+        let snapshot = counters.snapshot();
+        let labels = snapshot["agent_command_refusals_dropped_by_module"]
+            .as_object()
+            .unwrap();
+        assert_eq!(labels.len(), 1_024);
+        assert_eq!(labels["registered-0"], 2);
+        assert!(!labels.contains_key("registered-1024"));
+        assert_eq!(snapshot["agent_command_refusals_dropped_unlabelled"], 2);
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "subc-os"
-version = "0.1.33"
+version = "0.1.32"
 edition = "2021"
 license = "MIT"
 publish = true
@@ -50,6 +50,7 @@ rustix = { version = "1", default-features = false, features = ["process", "std"
 [target.'cfg(windows)'.dependencies]
 tokio = { version = "1", optional = true, features = ["net"] }
 windows-sys = { version = "0.61", features = [
+    "Wdk_System_SystemInformation",
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
@@ -64,6 +65,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
 ] }
 
 # Tests measure busy work on the thread's own CPU clock, a reading independent

@@ -28,6 +28,32 @@ fn catalog_constructor_matches_wire_defaults() {
 }
 
 #[test]
+fn catalog_display_name_reads_present_and_absent_fields() {
+    let entry: CatalogEntry = serde_json::from_value(json!({
+        "module_id": "named-provider", "display_name": "Routing",
+        "roles": [], "control_ops": [], "future_field": true
+    }))
+    .unwrap();
+    assert_eq!(entry.display_name.as_deref(), Some("Routing"));
+    assert_eq!(
+        serde_json::to_value(&entry).unwrap()["display_name"],
+        "Routing"
+    );
+    let absent = entry.with_display_name(None);
+    assert!(serde_json::to_value(&absent)
+        .unwrap()
+        .get("display_name")
+        .is_none());
+    assert_eq!(
+        serde_json::from_value::<CatalogEntry>(json!({
+            "module_id": "named-provider", "roles": [], "control_ops": []
+        }))
+        .unwrap(),
+        absent
+    );
+}
+
+#[test]
 fn catalog_provenance_uses_manifest_shape_and_keeps_catalog_decoding_lenient() {
     let provenance_bytes = br#"{"build_git_sha":"0123456789abcdef0123456789abcdef01234567","build_lock_digest":"abababababababababababababababababababababababababababababababab","wire_crate_version":"0.34.0","store_schema_version":"7","launch_nonce_source":"fd"}"#;
     let provenance: ManifestProvenance = serde_json::from_slice(provenance_bytes).unwrap();
@@ -153,13 +179,15 @@ fn supervisor_builders_set_and_clear_every_defaulted_field() {
         .clone()
         .with_protocol(ModuleProtocol::None)
         .with_launch_nonce_env(Some(false))
-        .with_pending_reload(Some(PendingReloadVerdict {
-            path: ReloadPathAgreement::Match,
-            image: RunningImageAgreement::Unavailable {
-                reason: RunningImageUnavailableReason::NotRunning,
-            },
-            spec: None,
-        }))
+        .with_pending_reload(Some(
+            PendingReloadVerdict::new(
+                ReloadPathAgreement::Match,
+                RunningImageAgreement::Unavailable {
+                    reason: RunningImageUnavailableReason::NotRunning,
+                },
+            )
+            .with_spec(None),
+        ))
         .with_last_probe_ms(Some(101))
         .with_last_exit_code(Some(2))
         .with_last_exit_signal(Some(3))

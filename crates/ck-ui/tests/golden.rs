@@ -12,6 +12,9 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::Terminal;
 
+#[path = "fixtures/resource_snapshot.rs"]
+mod resource_fixture;
+
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden");
 
 /// The design frames' state: broca selected in Modules, "br" typed in the
@@ -117,6 +120,27 @@ fn check_at(name: &str, app: &App, snap: &Snapshot, now: Timestamp) {
     );
 }
 
+fn check_resource_frame(name: &str, app: &App, snap: &Snapshot) {
+    check(name, app, snap);
+    let (w, h) = name.rsplit('-').next().unwrap().split_once('x').unwrap();
+    let buf = render_at(
+        app,
+        snap,
+        w.parse().unwrap(),
+        h.parse().unwrap(),
+        Snapshot::fixture_now(),
+    );
+    for (ext, rows) in [("txt", glyph_rows(&buf)), ("styles", style_runs(&buf))] {
+        let actual = rows.join("\n") + "\n";
+        let expected = std::fs::read(format!("{GOLDEN}/{name}.{ext}")).unwrap();
+        assert_eq!(
+            actual.as_bytes(),
+            expected,
+            "{name}.{ext} must match byte for byte"
+        );
+    }
+}
+
 #[test]
 fn home_80x24() {
     check("home-80x24", &app(), &Snapshot::fixture());
@@ -137,6 +161,28 @@ fn modules_120x36() {
     let mut app = app();
     app.tab = Tab::Modules;
     check("modules-120x36", &app, &Snapshot::fixture());
+}
+
+#[test]
+fn modules_resource_frames() {
+    for name in resource_fixture::FRAMES {
+        let (snap, selected) = resource_fixture::frame(name);
+        let mut app = app();
+        app.tab = Tab::Modules;
+        app.mod_sel = selected;
+        check_resource_frame(name, &app, &snap);
+    }
+}
+
+#[test]
+fn modules_older_daemon_keeps_the_legacy_frames() {
+    let snap = Snapshot::fixture();
+    assert!(snap.modules.data.iter().all(|m| m.resources.is_none()));
+    assert!(snap.resource_rows.is_empty());
+    let mut app = app();
+    app.tab = Tab::Modules;
+    check("modules-120x36", &app, &snap);
+    check("modules-160x48", &app, &snap);
 }
 
 /// What the design's Save overlay says saving does: broca needs a restart

@@ -1265,6 +1265,105 @@ async fn rescan_preview_reports_an_enabled_flip_it_would_apply() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rescan_preview_matches_apply_for_config_and_runtime_enabled_drift() {
+    for (name, configured_enabled, runtime_enabled, file_enabled) in [
+        ("stopped-disabling", true, false, false),
+        ("running-disabling", true, true, false),
+        ("stopped-enabling", true, false, true),
+        ("started-enabling", false, true, true),
+    ] {
+        let module_id = "enabled-drift";
+        let daemon = RunningDaemon::start(
+            name,
+            Some(config_doc([
+                stub_module(module_id, configured_enabled, []),
+                stub_module("unchanged", false, []),
+            ])),
+        )
+        .await;
+        wait_for_supervisor_entry(
+            &daemon.connection_file_path,
+            module_id,
+            |entry| entry.enabled == configured_enabled && entry.live == configured_enabled,
+            STATE_TIMEOUT,
+        )
+        .await;
+        let mut client = wait_for_client(&daemon.connection_file_path, START_TIMEOUT).await;
+        if runtime_enabled != configured_enabled {
+            let ack = control_rpc_on_stream(
+                &mut client,
+                1,
+                ClientControlRequest::SupervisorSetEnabled {
+                    module_id: module_id.into(),
+                    enabled: runtime_enabled,
+                },
+            )
+            .await;
+            assert!(matches!(
+                ack,
+                ClientControlResponse::SupervisorAck { applied: true, .. }
+            ));
+        }
+        let before = wait_for_supervisor_entry(
+            &daemon.connection_file_path,
+            module_id,
+            |entry| entry.enabled == runtime_enabled && entry.live == runtime_enabled,
+            STATE_TIMEOUT,
+        )
+        .await;
+        assert_eq!(before.configured_enabled, Some(configured_enabled));
+        let retained_route = if runtime_enabled && file_enabled {
+            let route = open_route(&mut client, module_id, 2).await;
+            let pid = call_tool(&mut client, route, 3, "_test.pid").await;
+            Some((route, pid))
+        } else {
+            None
+        };
+
+        fs::write(
+            &daemon.config_path,
+            config_doc([
+                stub_module(module_id, file_enabled, []),
+                stub_module("unchanged", false, []),
+            ]),
+        )
+        .unwrap();
+        let preview = supervisor_rescan_with(&daemon.connection_file_path, 4, true).await;
+        assert_eq!(preview.enabled_changes, [module_id], "{name}: {preview:?}");
+        assert_eq!(preview.unchanged, 1, "{name}: {preview:?}");
+        assert!(preview.added.is_empty());
+        assert!(preview.removed.is_empty());
+        assert!(preview.changed_pending_reload.is_empty());
+        let after_preview = wait_for_supervisor_entry(
+            &daemon.connection_file_path,
+            module_id,
+            |entry| entry.enabled == runtime_enabled && entry.live == runtime_enabled,
+            STATE_TIMEOUT,
+        )
+        .await;
+        assert_eq!(after_preview.configured_enabled, Some(configured_enabled));
+
+        let applied = supervisor_rescan_with(&daemon.connection_file_path, 5, false).await;
+        assert_eq!(applied.enabled_changes, preview.enabled_changes, "{name}");
+        assert_eq!(applied.unchanged, preview.unchanged, "{name}");
+        let after = wait_for_supervisor_entry(
+            &daemon.connection_file_path,
+            module_id,
+            |entry| entry.enabled == file_enabled && entry.live == file_enabled,
+            STATE_TIMEOUT,
+        )
+        .await;
+        assert_eq!(after.configured_enabled, Some(file_enabled), "{name}");
+        if let Some((route, pid)) = retained_route {
+            assert_eq!(call_tool(&mut client, route, 6, "_test.pid").await, pid);
+        }
+        let second_preview = supervisor_rescan_with(&daemon.connection_file_path, 7, true).await;
+        assert!(second_preview.enabled_changes.is_empty(), "{name}");
+        assert_eq!(second_preview.unchanged, 2, "{name}: {second_preview:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rescan_applies_enabled_flips_without_daemon_restart() {
     let module_id = "rescan-enabled";
     let daemon = RunningDaemon::start(

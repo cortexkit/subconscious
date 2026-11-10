@@ -50,9 +50,40 @@ pub(crate) fn spawned_file_identity(path: &Path) -> Option<SpawnedFileIdentity> 
 pub(crate) struct ExecutableIdentityProbe {
     #[cfg(target_os = "linux")]
     cache: Arc<Mutex<ImageDigestCache>>,
+    #[cfg(test)]
+    stalled: Option<std::sync::Arc<StalledProbe>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct StalledProbe {
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl ExecutableIdentityProbe {
+    #[cfg(test)]
+    pub(crate) fn held() -> (
+        Self,
+        std::sync::mpsc::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (entered, began) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                stalled: Some(std::sync::Arc::new(StalledProbe {
+                    release: std::sync::Mutex::new(wait),
+                    entered: std::sync::Mutex::new(Some(entered)),
+                })),
+                #[cfg(target_os = "linux")]
+                cache: Default::default(),
+            },
+            release,
+            began,
+        )
+    }
+
     pub(crate) async fn observe(
         &self,
         pid: Option<u32>,
@@ -60,6 +91,69 @@ impl ExecutableIdentityProbe {
         _spawned_identity: Option<SpawnedFileIdentity>,
         expected_start_time: Option<u64>,
     ) -> RunningImageAgreement {
+        if pid.is_none() {
+            return unavailable(RunningImageUnavailableReason::NotRunning);
+        }
+        if spawned_from.is_none() {
+            return unavailable(RunningImageUnavailableReason::SpawnedPathUnreadable);
+        }
+        let probe = self.clone();
+        let spawned_from = spawned_from.map(Path::to_path_buf);
+        static SLOTS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+            std::sync::OnceLock::new();
+        let slots = SLOTS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(2)));
+        let deadline = crate::control::list_diagnostics::deadline();
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return unavailable(RunningImageUnavailableReason::NotYetMeasured);
+        }
+        let read = async {
+            let permit = std::sync::Arc::clone(slots).acquire_owned().await.ok()?;
+            tokio::task::spawn_blocking(move || {
+                // Keep admission until the syscall or hash really finishes, even
+                // when the request has already returned an unknown observation.
+                let _permit = permit;
+                let reading = probe.observe_blocking(
+                    pid,
+                    spawned_from.as_deref(),
+                    _spawned_identity,
+                    expected_start_time,
+                    deadline.is_none(),
+                );
+                (reading, tokio::time::Instant::now())
+            })
+            .await
+            .ok()
+        };
+        if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, read).await {
+                Ok(Some((reading, finished))) if finished < deadline => reading,
+                _ => unavailable(RunningImageUnavailableReason::NotYetMeasured),
+            }
+        } else {
+            // Explicit provenance reads finish their observation; only optional
+            // list diagnostics trade completeness for a response deadline.
+            read.await.map_or_else(
+                || unavailable(RunningImageUnavailableReason::HashFailed),
+                |(reading, _)| reading,
+            )
+        }
+    }
+
+    fn observe_blocking(
+        &self,
+        pid: Option<u32>,
+        spawned_from: Option<&Path>,
+        _spawned_identity: Option<SpawnedFileIdentity>,
+        expected_start_time: Option<u64>,
+        _wait_for_cache: bool,
+    ) -> RunningImageAgreement {
+        #[cfg(test)]
+        if let Some(stalled) = &self.stalled {
+            if let Some(entered) = stalled.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+            }
+            let _ = stalled.release.lock().unwrap().recv();
+        }
         let Some(pid) = pid else {
             return unavailable(RunningImageUnavailableReason::NotRunning);
         };
@@ -82,7 +176,7 @@ impl ExecutableIdentityProbe {
             let cache = Arc::clone(&self.cache);
             let running_path = PathBuf::from(format!("/proc/{pid}/exe"));
             let spawned_from = spawned_from.to_path_buf();
-            tokio::task::spawn_blocking(move || {
+            {
                 let running = match File::open(&running_path) {
                     Ok(file) => file,
                     Err(error) => {
@@ -114,13 +208,18 @@ impl ExecutableIdentityProbe {
                 if !exe_link_names_spawned_path(pid, &spawned_from) {
                     return unavailable(RunningImageUnavailableReason::ProcessIdentityUnconfirmed);
                 }
-                let mut cache = cache
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                // Optional list reads must not queue behind an ongoing hash.
+                // Explicit provenance waits for that complete observation.
+                let cache = if _wait_for_cache {
+                    cache.lock().ok()
+                } else {
+                    cache.try_lock().ok()
+                };
+                let Some(mut cache) = cache else {
+                    return unavailable(RunningImageUnavailableReason::NotYetMeasured);
+                };
                 compare_opened_descriptor(&mut cache, &running_path, running, &spawned_from)
-            })
-            .await
-            .unwrap_or_else(|_| unavailable(RunningImageUnavailableReason::HashFailed))
+            }
         }
 
         #[cfg(target_os = "macos")]
@@ -223,18 +322,9 @@ pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
         .and_then(|stat| process_start_time_from_stat(&stat))
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
     subc_os::start_time(pid)
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn process_start_time(pid: u32) -> Option<u64> {
-    subc_os::Process::open(pid)
-        .ok()
-        .flatten()?
-        .observe()
-        .map(|image| image.start_time)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -395,6 +485,29 @@ impl ImageDigestCache {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn image_probe_stalled_reader_has_a_bounded_reply() {
+        let (probe, release, _) = super::ExecutableIdentityProbe::held();
+        let executable = std::env::current_exe().unwrap();
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::control::list_diagnostics::scope(probe.observe(
+                Some(std::process::id()),
+                Some(&executable),
+                None,
+                None,
+            )),
+        )
+        .await;
+        // Release only after the caller receives its answer. Dropping also
+        // releases the blocking worker when an assertion below fails.
+        drop(release);
+        assert_eq!(
+            reply.expect("the image reader never returns, but the request must"),
+            super::unavailable(subc_control::RunningImageUnavailableReason::NotYetMeasured),
+        );
+    }
+
     use cortexkit_test_support::ScratchDir;
     // Only the linux sha256 tests open files directly, and only non-linux
     // platforms assert the unavailable arm; each import gates with its users

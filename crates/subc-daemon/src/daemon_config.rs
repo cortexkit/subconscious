@@ -52,16 +52,18 @@ pub enum RestartRequiredSection {
     AdmissionFactsCarrierModuleId,
     AdmissionFactsTargets,
     ScopeAuthorityOwners,
+    FederatedScopeOwner,
     PrivilegedOperatorPrompt,
 }
 
 impl RestartRequiredSection {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Port,
         Self::Storage,
         Self::AdmissionFactsCarrierModuleId,
         Self::AdmissionFactsTargets,
         Self::ScopeAuthorityOwners,
+        Self::FederatedScopeOwner,
         Self::PrivilegedOperatorPrompt,
     ];
 
@@ -72,6 +74,7 @@ impl RestartRequiredSection {
             Self::AdmissionFactsCarrierModuleId => "admission_facts_carrier_module_id",
             Self::AdmissionFactsTargets => "admission_facts_targets",
             Self::ScopeAuthorityOwners => "scope_authority_owners",
+            Self::FederatedScopeOwner => "federated_scope_owner",
             Self::PrivilegedOperatorPrompt => "privileged_operator_prompt",
         }
     }
@@ -90,6 +93,10 @@ pub enum PrivilegedOperatorPrompt {
 /// runtime, the same module that carries admission facts today.
 pub fn default_scope_authority_owners() -> Vec<String> {
     vec!["prefrontal-core".to_string()]
+}
+
+pub fn default_federated_scope_owner() -> String {
+    "callosum".to_string()
 }
 
 /// Refused at parse time by both layers (daemon-wide and per-module) — `0`
@@ -193,6 +200,8 @@ pub struct DaemonConfig {
     /// would leave live routes holding an `owner_authorized` stamp the owner no
     /// longer has, and a restart closes every route.
     pub scope_authority_owners: Vec<String>,
+    /// Exact reserved module id allowed to own federated scopes. Restart-required.
+    pub federated_scope_owner: String,
     /// Capability names reserved to one module id. The binding may name a module
     /// that is not configured yet so an operator can reserve an interface before
     /// installing its provider.
@@ -415,6 +424,8 @@ struct RawDaemonConfig {
     admission_facts_targets: Option<Vec<String>>,
     #[serde(default)]
     scope_authority_owners: Option<Vec<String>>,
+    #[serde(default = "default_federated_scope_owner")]
+    federated_scope_owner: String,
     #[serde(default)]
     reserved_capabilities: BTreeMap<String, String>,
 }
@@ -953,6 +964,12 @@ fn parse_doc_with_activity(
     let scope_authority_owners = raw
         .scope_authority_owners
         .unwrap_or_else(default_scope_authority_owners);
+    subc_protocol::manifest::validate_module_id(&raw.federated_scope_owner).map_err(|error| {
+        DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: format!("federated_scope_owner: {error}"),
+        }
+    })?;
     if scope_authority_owners.iter().any(|owner| owner.is_empty()) {
         return Err(DaemonConfigError::InvalidValue {
             path: path.to_path_buf(),
@@ -1010,6 +1027,7 @@ fn parse_doc_with_activity(
             admission_facts_carrier_module_id: raw.admission_facts_carrier_module_id,
             admission_facts_targets: raw.admission_facts_targets,
             scope_authority_owners,
+            federated_scope_owner: raw.federated_scope_owner,
             reserved_capabilities: raw.reserved_capabilities,
         },
         raw.activity,
@@ -1835,6 +1853,7 @@ mod tests {
                 "admission_facts_carrier_module_id",
                 "admission_facts_targets",
                 "scope_authority_owners",
+                "federated_scope_owner",
                 "privileged_operator_prompt",
             ]
         );
@@ -1878,6 +1897,31 @@ mod tests {
     fn scope_authority_owners_defaults_to_the_session_runtime() {
         let config = parse_doc(r#"{ "version": 1 }"#, Path::new("/tmp/subc.jsonc")).unwrap();
         assert_eq!(config.scope_authority_owners, vec!["prefrontal-core"]);
+    }
+
+    #[test]
+    fn federated_scope_owner_defaults_and_is_validated_and_restart_required() {
+        let config = parse_doc(r#"{ "version": 1 }"#, Path::new("/fixture/subc.jsonc")).unwrap();
+        assert_eq!(config.federated_scope_owner, "callosum");
+        assert!(!config
+            .scope_authority_owners
+            .contains(&config.federated_scope_owner));
+        let configured = parse_doc(
+            r#"{ "version": 1, "federated_scope_owner": "peer-carrier" }"#,
+            Path::new("/fixture/subc.jsonc"),
+        )
+        .unwrap();
+        assert_eq!(configured.federated_scope_owner, "peer-carrier");
+        assert!(RestartRequiredSection::ALL.contains(&RestartRequiredSection::FederatedScopeOwner));
+        for invalid in ["", "..", "a/b", "a\\b"] {
+            let body = serde_json::json!({"version": 1, "federated_scope_owner": invalid});
+            assert!(
+                parse_doc(&body.to_string(), Path::new("/fixture/subc.jsonc"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("federated_scope_owner")
+            );
+        }
     }
 
     #[test]

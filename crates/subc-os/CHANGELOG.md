@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.33
+## Unreleased
 
 - Expose typed macOS process code-directory hashes through a safe `csops`
   wrapper. Extract approved per-slice and alternate hashes from one retained
@@ -16,18 +16,12 @@
   substituted FIFOs. Verify regular-file type on the retained Unix or Windows
   handle before returning it to a caller.
 
-## 0.1.32
-
 - Expose file-object identity from a retained file handle on Unix and Windows.
   Share the complete Windows volume/file-id query with executable capture.
-
-## 0.1.31
 
 - Add `durable_replace` for already-synced files: rename plus parent-directory
   sync on Unix, and write-through replacement on Windows without a weaker
   fallback. Configuration authority publication uses this flush boundary.
-
-## 0.1.30
 
 - Add the safe `config_keychain` API for a team-signed macOS daemon's sealing
   key, content-bound anchor and monotonic revision high-water. Access denial
@@ -35,6 +29,27 @@
 - Add a file-backed key-store seam and `ckdev-os-keychain` fixture, available
   only with `test-support` and a development executable name. Keys and encoded
   copies use zeroizing storage and debug output redacts the key.
+
+## 0.1.32
+
+- Enumerate Windows process creation identities with their parent and program names, and compare them against retained process handles instead of the adjustable wall clock. Clock rollback can no longer silently drop live processes; PID reuse remains explicit uncertainty.
+
+## 0.1.31
+
+- Distinguish confirmed process exits from unreadable identities during Linux and macOS tree walks. Drop exited children instead of invalidating their parent's reading, without counting an exited child's CPU beside its parent's reaped counter. Unknown identities and PID reuse still reject the related tree.
+- Cover live child churn with a bounded Linux/macOS integration test and preserve deterministic no-double-counting checks at both identity fences.
+- Recognize Linux's `PF_EXITING` flag before the zombie state: memory can already be gone while the process still reports state `R`. Keep malformed flags and genuine read failures unknown rather than treating missing memory as zero.
+- Treat an exiting procfs read's `ESRCH` (no such process) like a missing record only after an independent absence check; hidden live PIDs and permission failures remain unknown.
+
+## 0.1.30
+
+- Reject partial Toolhelp enumerations on Windows and failed Mach timebase reads on macOS instead of reporting successful but incorrect resources. Native macOS coverage verifies that an unreaped zombie is excluded without poisoning an unrelated tree.
+- Read a protected macOS process's current parent through its validated sysctl record when BSD process info is denied, so unrelated protected processes do not make every module tree unavailable.
+- Fence complete process walks against exits during resource reads, expose ordered walk revisions and separate identity uncertainty from confirmed exit. Structural tree ownership remains queryable when only a resource counter is unavailable.
+- Keep own and reaped-child CPU from the same native snapshot separate for membership-aware accounting. Unreadable members and unresolved related identities invalidate a tree instead of silently producing a partial sum.
+
+- Convert Linux process start times against the current boot-time value so clock steps do not split SDK and daemon identities. Windows snapshots now retain pinned process handles, and a pinned process can report its final CPU after exit.
+- Add read-only process-tree CPU/memory snapshots with Unix reaped-child and session accounting, program groups, PID-reuse checks, and a shared Unix-epoch millisecond process start-time helper.
 
 ## 0.1.29
 

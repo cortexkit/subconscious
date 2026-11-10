@@ -44,11 +44,18 @@ window is one second. The profile value, inside `{"result": ...}`, is:
 {"module_id":"worker","pid":123,"seconds":1,"method":"sample","threads":[{"name":"worker","samples":90,"busy_samples":50,"stacks":[{"count":50,"frames":["work","main"]}]}],"idle_threads":2,"truncated":false}
 ```
 
+The optional macOS-only `symbolization` member is an array of
+`{image, uuid, status, reason?, resolved, unresolved}` objects, described below.
+It is absent when no image needed symbolization (and on Linux). Readers must
+ignore unknown object members, including on nested objects, so additive reply
+fields remain wire-compatible.
+
 `method` is an open string. New public Rust result structs are non-exhaustive and
 have constructors. The whole reply, envelope included, stays within 16 KiB.
 `--json` prints the value inside `result`; `ckni --json` adds the
-`ck.module.resources/v1` or `ck.module.profile/v1` schema. Plain output prints all
-values from the bounded result. Missing or stopped `inspect` is a one-line CLI
+`ck.module.resources/v1` or `ck.module.profile/v1` schema. Plain output renders
+resource and stack summaries; use JSON for the full bounded result, including
+symbolization outcomes. Missing or stopped `inspect` is a one-line CLI
 refusal (exit 1) pointing to `ck setup` or daemon config. This workspace does not
 add an installer component; manual configuration is sufficient.
 
@@ -127,7 +134,8 @@ names are not recognized.
 The profiler reads image load addresses and UUIDs from `sample`'s `Binary Images:`
 section. For unresolved `image+0xOFFSET` frames with a matching bundle, it invokes
 `/usr/bin/atos` without a shell, at most once per image and with at most 256
-distinct addresses per image. Symbolization uses only the time remaining in the
+distinct addresses per image, selected in ascending numeric order. Images are
+processed in name order. Symbolization uses only the time remaining in the
 existing `seconds + 5` deadline; an overrun kills only the symbolizer process.
 Names lose image/source suffixes and Rust symbol hashes, just like other sampled
 frames. Stacks that become identical are merged before stack ranking and limits,
@@ -136,6 +144,49 @@ then the existing 16 KiB reply budget is applied.
 Missing or ambiguous debug files, a missing or failed symbolizer, timeouts, and
 addresses the symbolizer cannot resolve leave `image+0xOFFSET` intact. None of
 these conditions fails a profile. Linux `proc_threads` profiles are unchanged.
+
+For each image with unresolved offset frames and a `Binary Images:` record,
+`symbolization` reports its image name, normalized UUID, and counts of distinct
+original frames named (`resolved`) or left as offsets (`unresolved`). Repeated
+appearances of the same frame count once. Counts cover the captured frames
+before stack merging, ranking and truncation, including addresses over the cap.
+`status` is one of:
+
+- `complete`: all frames were named; `reason` is absent.
+- `partial`: some frames were named and some remain offsets.
+- `none`: no frames were named.
+
+For `partial` and `none`, `reason` is required and is one of:
+
+| Reason | Meaning |
+| --- | --- |
+| `debug_file_missing` | No matching UUID directory, bundle or usable DWARF file (including an unreadable layout). |
+| `debug_file_ambiguous` | More than one dSYM bundle or DWARF entry. |
+| `symbolizer_missing` | The symbolizer executable could not be found. |
+| `symbolizer_failed` | The symbolizer could not be started or waited for, exited non-zero, or its output could not be read as text. |
+| `deadline` | The shared deadline was already spent before launch, or the symbolizer was killed mid-run. |
+| `address_cap` | More than 256 distinct addresses were present; the unsent tail remains offsets. |
+| `unresolved` | The symbolizer ran but returned no name for one or more attempted addresses (including missing output lines). |
+
+When multiple reasons apply, the first failing stage in pipeline order wins:
+debug-file lookup, symbolizer execution/deadline, unnamed attempted addresses,
+then the unsent address-cap tail. The order is deterministic. For example:
+
+```json
+{"module_id":"worker","pid":123,"seconds":1,"method":"sample","threads":[{"name":"worker","samples":2,"busy_samples":2,"stacks":[{"count":1,"frames":["work"]},{"count":1,"frames":["helper+0x20"]}]}],"idle_threads":0,"truncated":false,"symbolization":[{"image":"helper","uuid":"D9F36BE8D4E23E7AA29C8B8BA9E6219A","status":"partial","reason":"unresolved","resolved":1,"unresolved":1}]}
+```
+
+Every non-`complete` image also emits one `INFO profile symbolization` stderr
+line with module id, image basename, UUID, status, reason, counts and elapsed
+milliseconds. Deadline lines additionally identify `deadline_phase` as
+`before_start` (no symbolizer launched) or `mid_run` (symbolizer killed). Logs
+contain neither debug-file paths nor stack contents. No extra dependency or
+logging configuration is needed.
+
+The outcomes are included in the 16 KiB reply budget. Stacks and then threads
+are truncated first; outcomes are truncated last, from the end of image-name
+order, and `truncated` is set whenever the budget drops data. The array can be
+omitted entirely if the budget removes every outcome.
 
 ## Typed refusals
 

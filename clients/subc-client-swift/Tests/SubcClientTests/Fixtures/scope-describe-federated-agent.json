@@ -1,0 +1,40 @@
+{
+  "daemon_incarnation": "daemon-0001",
+  "op": "scope.describe",
+  "owner_configured": true,
+  "owner_synced": true,
+  "scope": {
+    "attributes": {
+      "federated": {
+        "pairing_id": "pair:1",
+        "peer_class": "computer",
+        "peer_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "peer_name": "Peer",
+        "remote_claim": {
+          "agent_id": "remote-agent",
+          "agent_name": "Remote Agent",
+          "kind": "agent"
+        }
+      }
+    },
+    "kind": "federated",
+    "owner": {
+      "kind": "reserved",
+      "module_id": "callosum"
+    },
+    "owner_authorized": false,
+    "parent": {
+      "owner": {
+        "kind": "reserved",
+        "module_id": "prefrontal-core"
+      },
+      "ref": "head-0",
+      "scope_epoch": 2
+    },
+    "parent_state": "linked",
+    "ref": "head-1",
+    "scope_epoch": 3
+  },
+  "scope_epoch": 3,
+  "status": "live"
+}

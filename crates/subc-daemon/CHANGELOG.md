@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.41.10
+## Unreleased
 
 - Report live opted-in modules with no approved configuration as gated, and hint
   connections whose configuration replies waited for a recovered anchor. Add an
@@ -252,8 +252,6 @@
   installation. Queue an immediate ordinary supervisor probe, bind its result
   to the child and policy installation, and recover once on failure or timeout.
 
-## 0.41.9
-
 - Bind desktop approval to the complete immutable plan actually flushed to the
   same live connection. Recheck its digest/revision and desktop identity after
   presence; replacement, disconnect, expiry and consumption discard the binding.
@@ -267,8 +265,6 @@
   are available. Attempt OS confirmation only when its provider is ready and,
   on Linux, the per-user polkit policy is installed.
 
-## 0.41.8
-
 - Share the 64 MiB authority-store read and publication bound. Before publishing,
   prune the oldest unprotected history into permanent audit summaries, or refuse
   `store_too_large` without changing committed bytes when protected versions do
@@ -276,8 +272,6 @@
 - Protect the daemon's two most recent distinct approved input versions, ignoring
   development generations and duplicate carriers, alongside module tuple heads
   in both recent-count and byte-pressure pruning.
-
-## 0.41.7
 
 - Own immutable configuration captures and approval state behind one serialized
   daemon owner. Retain approved raw layer bytes alongside redacted diagnostic
@@ -290,22 +284,14 @@
   idle plans after one hour, and preserve the approved old schema's redaction
   and apply policy across declaration transitions.
 
-## 0.41.6
-
 - Read the configuration authority store through a no-follow, nonblocking
   regular-file handle and enforce a 64 MiB read bound. Refuse substituted
   symlinks, FIFOs and oversized files as unverified stores.
 
-## 0.41.5
-
 - Raise the operating-system helper requirement with the co-bumped daemon.
-
-## 0.41.4
 
 - Clarify the separation between redacted diagnostic captures and approved raw
   delivery bytes, which may contain vault reference strings but never secrets.
-
-## 0.41.3
 
 - Add immutable configuration planning and approval over the durable store,
   read-set freshness, reverse-configuration rollback and bound consent/v1 cards.
@@ -316,8 +302,6 @@
   returns `config_gate_inactive` until runtime snapshot and delivery wiring is
   installed; the config capability is not yet advertised.
 
-## 0.41.2
-
 - Add the configuration store engine: owner-only atomic publication, sealed
   content MACs and anchors, digest-only integrity checks, recovery exits and
   revision high-water handling. Approval and delivery remain blocked while an
@@ -327,9 +311,84 @@
 - Add isolated file-key, root, failure and pause hooks behind `test-support`
   and the development executable-name check.
 
+- Explicitly accept subc-presence's non-interactive policy authorization for legacy privileged-operation prompts and module `operator.confirm` requests, preserving their existing behavior.
+
+## 0.44.5
+
+- Add owner-restricted route.authorize over shared pure route admission, with exact claim matching and restart-stable content versions. Ordinary opens keep their existing refusal precedence; authorization does not promise transient availability.
+- Refuse federated_stamp_required at admission and captured-connection relay instead of stripping required stamps. Never expose the daemon instruction to providers or non-owner describe readers.
+- Validate operation_deferral at HELLO, warn and drop the whole invalid map, and relay valid metadata through catalog.list. Require protocol 0.36.2 and control 0.38.2.
+
+## 0.44.4
+
+- Use clock-independent Windows process snapshots so a backward wall-clock adjustment cannot hide live agent-command roots or silently reduce their resource trees. Add native Windows coverage for declaring a live contained command after clock rollback.
+
+## 0.44.3
+
+- Adopt protocol 0.36.1 remote display names. Drop invalid names at decode; accept same-epoch name-only updates and serve the new name without invalidating in-flight binds, draining routes or losing service history. Pairing-roster and claim identity facts remain fixed for the epoch.
+
+## 0.44.2
+
+- Serve `supervisor.list` resources from committed measurements without walking processes inside the list's diagnostics budget. Lists older than two seconds request a single background refresh; minute samples serialize with refreshes and use their own completed walk. No refresh timer runs without list callers.
+- Retain successful trees and their measurement timestamps when a newer walk is unreadable or rejects a launch transition. Report `unreadable` and `launch_changed` reasons, keep hourly history independent of current-tree failures, and never reuse a tree across module launches.
+- Leave the committed view unchanged when a background pass cannot complete; log admission, deadline and state-contention causes at debug level instead of assigning an inaccurate wire reason.
+- Adopt the confirmed-exit process reader so exited children no longer void their parent's tree. Recover their CPU from the operating system's parent accounting without counting it twice.
+
+## 0.44.1
+
+- Credit acknowledged scoped binds to both the target registration and its reserved-prefix owner when HELLO verified that owner's spawn nonce. Keep this identity fact on the connection, so later prefix-policy changes cannot grant service credit retroactively. Refused and unacknowledged binds still credit nobody; `scope.served_by` keeps its existing reply shape.
+
+## 0.44.0
+
+- Construct all supervisor resource and pending-reload wire structs through their extensible control API, rather than public struct literals. Tree resource and reload-verdict JSON stays unchanged.
+- Report the module root's funded share separately as optional `tree.own`, and keep only child processes in `tree.groups`, even when root and children share a program name. Preserve initial CPU funding and row bounds; cap root plus emitted child groups by the attributed row's CPU and memory. Adopt control 0.38's breaking Rust construction API.
+
+## 0.43.1
+
+- Correct the native Windows finished-command test's reference to respect the independently rounded job CPU increase. Fixed 100 ns counters now cover the one-millisecond difference between a combined job total and individually rounded process endpoints. Production accounting is unchanged and continues to conserve measured job CPU without a tolerance.
+
+## 0.43.0
+
+- Add restart-required `federated_scope_owner` (default `callosum`), exclusive scope-kind ownership and epoch-fixed paired-peer facts. Parent and child-owner links cannot cross that owner boundary.
+- Advertise `scope-federated/v1`; gate federated bind stamps and describe replies by the target/reader manifest, preserving legacy unstamped binds and epoch tracking. Federated flow/run claims refuse unsupported targets at admission and relay.
+- **Behavior changes:** enabling `delegates` within an epoch now drains that scope's existing routes, just as disabling it does. Describing a federated scope without `scope-federated/v1` is refused, even before owner re-sync.
+- Freeze `scope-federated/v1` membership at HELLO; `catalog.update` refuses additions and removals as `catalog_update_frozen_capability` under the registry lock. Re-register on a new connection to change it.
+- Refuse local `workdir`/`project_id` and untargeted carrier entries on federated records.
+- Adopt non-exhaustive protocol 0.36 scope kinds. **Rust migration:** add a wildcard arm to `ScopeKind` matches; existing non-declaring wire readers remain unchanged.
+
+## 0.42.0
+
+- Preserve hourly uncertainty when the last inherited command finishes or is swept after a restart. On Windows, keep the first validation pass's per-process finish counters across declaration retries; later attempts cannot attribute additional CPU, while independent live sampler credit stays monotone. Stopped commands report no live program groups.
+- Derive hourly CPU bounds from uncertainty retained on the same samples as the hour figure, including across clock corrections and source changes. Omit agents rows for modules with no declarations or command history, while keeping inherited active commands and current-hour CPU visible.
+- On Windows, freeze live command attribution at the finish/replacement snapshot and leave later work module-side. Limit saved identities for roots omitted by a replacement, and do not remove them using process walks begun before declaration acceptance. Match resumed roots to their validated native identity, and reject oversized batches before loss tracking. Share declaration refusal retry classes with the SDK.
+
+- When missing command identities exceed the bounded tracking set, keep agents' hourly CPU marked as a lower bound for a full hour after that overflow and until a complete validated resync. A partial resync keeps missing live commands marked as gaps in CPU attribution. Return retryable `agent_roots_full` at the live-root cap, show rows with a zero CPU lower bound, and deliver duplicate/closed-queue refusals without blocking the shared connection reader.
+- Age attribution metadata with the suspend-inclusive monotonic clock and report separate, expiring hourly CPU bounds while retaining cumulative loss markers. Validate native Windows totals against raw per-identity reader inputs rather than derived accounting counters.
+
+- Order finished-CPU transfers by monotonic observation sequence and check both rows before reclassification, so clock corrections and tied timestamps cannot panic accounting or lose CPU. Protect first-seen module-owned work and cap finish eligibility at its first validation or confirmed-exit observation; consume eligible reaped work oldest first.
+- Preserve missing-command coverage after refused or timed-out declarations, with bounded per-identity diagnostics and replay recovery. Keep list refusals off the connection reader when its reply queue is full, cap registered-module refusal labels, and retain lower bounds after lost Windows final counters. Verify list and status decoding against the published control crate.
+- Bound Unix finished-command claims by daemon-observed reaped CPU and the module CPU measured since the command was accepted; reclassify the original sampled minutes without changing the total measured CPU. Missing final command CPU keeps the reported totals lower bounds. Declaration and list admission now refuse excess work immediately instead of parking readers, and stalled reply sends expire.
+- Keep refusal delivery off the shared module reader even when its writer is full; bound the fallback queue and expose dropped refusals per module in `server.describe` counters. Replayed command identities remain idempotent.
+- Account for declared command CPU prospectively from its first successful measurement, retaining monotone lifetime rows and Unix CPU lower bounds that retain observed exited work without counting it again when a parent reaps it. Serialize declarations with four in-flight replies per connection; timeout cancellation and accounting commit share one atomic decision.
+- Restrict command resynchronization to previously accepted identities in the current launch or its carried container. Distinguish pending observations from stopped processes and real image-hash failures; keep required resource numbers strict while allowing optional diagnostics to be omitted.
+
+- Identify unavailable tree measurements with the additive `tree_unavailable: "not_yet_measured"` reason instead of making a startup read look like an older daemon without tree support. Measured tree counters remain absent until a safe reading is available.
+- Bound optional `supervisor.list` diagnostics to one 100 ms budget and prioritize per-process resource readings and completed image observations over process-table walks. `ck module list` can briefly show an unknown image status immediately after a start while the bounded background hash finishes. Explicit provenance requests still wait for their complete image observation.
+- Bound agent-command validation away from connection readers, reject oversized batches and overlapping command roots, and recheck the declaring launch before committing. Unknown or contended resource reads no longer erase attribution facts or claim an empty agents row.
+- Expire launch-scoped command state and ten-minute tombstones without requiring a successful process-table read. Keep bounded hourly histories and settled totals through restarts, and key carried-container accounting to the actual cgroup or job rather than its path or process launch.
+- Preserve CPU high-water marks through partial reads and expire stopped histories by wall time. Limit CPU transferred from a module to its agents to work already measured inside that module, preserving cumulative and hourly totals; finish reports cannot inflate daemon-confirmed CPU. Windows in-job commands retain exited-descendant CPU and settle the pinned root's final counter without double counting it.
+- Report the configured daemon version consistently with the handshake and server description.
+- Preserve readable cgroup/job totals even when no live process remains, and use container membership for process counts.
+- Account for complete module trees and separately declared agent commands, cache process-table reads, report daemon resources, and retain 60 minutes of sampled CPU. Finished commands are debited once from their originating module. Windows command trees keep the CPU of members that have already exited, as last sampled. Adopt the breaking `ModuleControlRequestFromModule::AgentCommands` request variant and the optional supervisor resource fields.
+
+## 0.41.2
+
+- Refuse HELLO manifests with invalid `display_name` as malformed manifests and mirror accepted names in `catalog.list`. Require protocol 0.34.5 and control 0.35.1.
+
 ## 0.41.1
 
-- Explicitly accept subc-presence's non-interactive policy authorization for legacy privileged-operation prompts and module `operator.confirm` requests, preserving their existing behavior.
+- Report recorded configuration enabled-state changes in rescan previews even
+  when the module is already in the requested runtime state.
 
 ## 0.41.0
 
@@ -1036,3 +1095,7 @@
 - `route.open` checks `role_versions` with `subc_protocol::session::validate_role_versions` before anything else. A malformed map is refused as terminal `invalid_request` with `detail.field = "role_versions"`, and the module never sees a bind. An empty map becomes no field. A well-formed map is forwarded unchanged on the module's `route.bind`.
 - `route-role-versions/v1` is advertised in HELLO_ACK and `server.describe`.
 - The route.open refusal counter gains the `invalid_request` key.
+
+## Unreleased
+
+- Bound running-image probes and share a short deadline across list diagnostics, returning unknown resource readings instead of delaying control replies.

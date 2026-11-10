@@ -40,6 +40,9 @@ pub const MAX_CONFIRM_OPERATIONS: usize = 256;
 #[non_exhaustive]
 pub struct ModuleManifest {
     pub module_id: String,
+    /// Human-readable module name. Apps fall back to `module_id` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub module_version: String,
     pub protocol_ver: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,6 +157,11 @@ pub struct ModuleManifest {
     /// and older daemons silently drop the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_operations: Option<Vec<String>>,
+    /// Operations safe to defer, keyed by `tool:<name>` or `management:<name>`.
+    /// Invalid maps are dropped whole; HELLO remains accepted. Only meaningful
+    /// with scope-federated/v1. The daemon relays, but never enforces, this map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_deferral: Option<BTreeMap<String, bool>>,
     /// Management operations this module guards by asking the person through
     /// `operator.confirm` before it acts.
     ///
@@ -198,6 +206,7 @@ pub struct ModuleManifest {
 #[derive(Debug, Clone)]
 pub struct ModuleManifestBuilder {
     module_id: String,
+    display_name: Option<String>,
     module_version: String,
     protocol_ver: u8,
     trust_tier: Option<TrustTier>,
@@ -213,6 +222,7 @@ pub struct ModuleManifestBuilder {
     operation_delivery: BTreeMap<String, OperationDelivery>,
     operation_payload: BTreeMap<String, OperationPayload>,
     flow_operations: Option<Vec<String>>,
+    operation_deferral: Option<BTreeMap<String, bool>>,
     confirm_operations: Option<Vec<String>>,
     rich_ui: Option<RichUiDescriptor>,
     role_declarations: BTreeMap<String, serde_json::Map<String, Value>>,
@@ -233,6 +243,7 @@ impl ModuleManifest {
     ) -> ModuleManifestBuilder {
         ModuleManifestBuilder {
             module_id: module_id.into(),
+            display_name: None,
             module_version: module_version.into(),
             protocol_ver: PROTOCOL_VERSION,
             trust_tier: None,
@@ -248,6 +259,7 @@ impl ModuleManifest {
             operation_delivery: BTreeMap::new(),
             operation_payload: BTreeMap::new(),
             flow_operations: None,
+            operation_deferral: None,
             confirm_operations: None,
             rich_ui: None,
             role_declarations: BTreeMap::new(),
@@ -273,6 +285,15 @@ impl ModuleManifest {
 }
 
 impl ModuleManifestBuilder {
+    /// Sets an optional display name, refusing invalid text without normalizing it.
+    pub fn display_name(mut self, display_name: Option<String>) -> Result<Self, DisplayNameError> {
+        if let Some(value) = &display_name {
+            validate_display_name(value)?;
+        }
+        self.display_name = display_name;
+        Ok(self)
+    }
+
     /// Overrides the linked protocol version for compatibility fixtures.
     pub fn protocol_ver(mut self, protocol_ver: u8) -> Self {
         self.protocol_ver = protocol_ver;
@@ -372,6 +393,12 @@ impl ModuleManifestBuilder {
         self
     }
 
+    /// Declares operations that may run after a paired computer reconnects.
+    pub fn operation_deferral(mut self, operations: Option<BTreeMap<String, bool>>) -> Self {
+        self.operation_deferral = operations;
+        self
+    }
+
     /// Declares the management operations guarded with `operator.confirm`.
     ///
     /// `None` (the default) leaves the answer unknown and preserves legacy wire
@@ -409,6 +436,7 @@ impl ModuleManifestBuilder {
     pub fn build(self) -> ModuleManifest {
         ModuleManifest {
             module_id: self.module_id,
+            display_name: self.display_name,
             module_version: self.module_version,
             protocol_ver: self.protocol_ver,
             trust_tier: self.trust_tier,
@@ -424,6 +452,7 @@ impl ModuleManifestBuilder {
             operation_delivery: self.operation_delivery,
             operation_payload: self.operation_payload,
             flow_operations: self.flow_operations,
+            operation_deferral: self.operation_deferral,
             confirm_operations: self.confirm_operations,
             rich_ui: self.rich_ui,
             role_declarations: self.role_declarations,
@@ -454,6 +483,8 @@ impl ModuleManifestBuilder {
 #[derive(Deserialize)]
 struct ModuleManifestWire {
     module_id: String,
+    #[serde(default)]
+    display_name: Option<String>,
     module_version: String,
     protocol_ver: u8,
     #[serde(default)]
@@ -482,6 +513,8 @@ struct ModuleManifestWire {
     // Kept raw so an invalid list can be dropped rather than refusing HELLO.
     #[serde(default)]
     flow_operations: Option<Value>,
+    #[serde(default)]
+    operation_deferral: Option<Value>,
     // Kept raw for the same reason as `flow_operations`.
     #[serde(default)]
     confirm_operations: Option<Value>,
@@ -513,6 +546,8 @@ impl<'de> Deserialize<'de> for ModuleManifest {
             .transpose()
             .map_err(D::Error::custom)?;
         let mut builder = Self::builder(wire.module_id, wire.module_version)
+            .display_name(wire.display_name)
+            .map_err(D::Error::custom)?
             .protocol_ver(wire.protocol_ver)
             .trust_tier(wire.trust_tier);
         if let Some(ready) = wire.ready {
@@ -552,6 +587,9 @@ impl<'de> Deserialize<'de> for ModuleManifest {
         manifest.flow_operations = wire
             .flow_operations
             .and_then(|value| decode_flow_operations(&manifest, &value).ok());
+        manifest.operation_deferral = wire
+            .operation_deferral
+            .and_then(|value| decode_operation_deferral(&manifest, &value).ok());
         manifest.confirm_operations = wire
             .confirm_operations
             .and_then(|value| decode_confirm_operations(&manifest, &value).ok());
@@ -657,6 +695,78 @@ impl RichUiDescriptor {
             self.bytes,
             u64::from(self.chunks),
         )
+    }
+}
+
+/// A malformed display name, reported without echoing untrusted text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayNameError(&'static str);
+
+impl fmt::Display for DisplayNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid manifest display_name: {}", self.0)
+    }
+}
+
+impl std::error::Error for DisplayNameError {}
+
+/// Validates display text without trimming or truncating it.
+///
+/// Names contain 1–40 Unicode scalar values, are already trimmed, and contain
+/// neither Unicode Cc controls nor bidi formatting characters.
+pub fn validate_display_name(value: &str) -> Result<(), DisplayNameError> {
+    if value.trim() != value || !(1..=40).contains(&value.chars().count()) {
+        return Err(DisplayNameError(
+            "must be trimmed text of 1 to 40 characters",
+        ));
+    }
+    validate_plain_text(value, 40)
+}
+
+/// Check the module-id rule used at daemon registration, without sanitizing it.
+pub fn validate_module_id(module_id: &str) -> Result<(), String> {
+    if module_id.is_empty() {
+        return Err("empty".to_string());
+    }
+    if module_id.contains('/') || module_id.contains('\\') {
+        return Err("contains a path separator".to_string());
+    }
+    if module_id == "." || module_id == ".." {
+        return Err("is a dot path component".to_string());
+    }
+    if module_id.chars().any(|c| c.is_control()) {
+        return Err("contains a control character".to_string());
+    }
+    if module_id.len() > 255 {
+        return Err("is longer than 255 bytes".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_plain_text(value: &str, max: usize) -> Result<(), DisplayNameError> {
+    if value.is_empty() || value.chars().count() > max {
+        return Err(DisplayNameError(
+            "text length is outside the permitted bounds",
+        ));
+    }
+    if value.chars().any(|ch| {
+        ch.is_control()
+            || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    }) {
+        return Err(DisplayNameError("must not contain control or bidi formatting characters"));
+    }
+    Ok(())
+}
+
+/// Checks the display name before HELLO decoding, retaining malformed-field context.
+pub fn validate_hello_display_name(hello: &Value) -> Result<(), DisplayNameError> {
+    match hello
+        .get("manifest")
+        .and_then(|manifest| manifest.get("display_name"))
+    {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(value)) => validate_display_name(value),
+        Some(_) => Err(DisplayNameError("must be a string")),
     }
 }
 
@@ -2567,6 +2677,85 @@ pub fn validate_hello_flow_operations(hello: &Value) -> Result<(), FlowOperation
     decode_flow_operations(&manifest, value).map(|_| ())
 }
 
+/// Maximum number of deferred-operation declarations in one manifest.
+pub const MAX_OPERATION_DEFERRAL: usize = 256;
+
+fn decode_operation_deferral(
+    manifest: &ModuleManifest,
+    value: &Value,
+) -> Result<BTreeMap<String, bool>, String> {
+    if !manifest.capabilities.as_ref().is_some_and(|caps| {
+        caps.provides
+            .iter()
+            .any(|cap| cap == crate::scope::SCOPE_FEDERATED_CAPABILITY)
+    }) {
+        return Err("operation_deferral requires scope-federated/v1".into());
+    }
+    let operations = value
+        .as_object()
+        .ok_or("operation_deferral must be an object")?;
+    if operations.len() > MAX_OPERATION_DEFERRAL {
+        return Err(format!(
+            "operation_deferral exceeds {MAX_OPERATION_DEFERRAL} entries"
+        ));
+    }
+    for (key, value) in operations {
+        let (surface, name) = key
+            .split_once(':')
+            .ok_or("operation_deferral keys require a surface prefix")?;
+        // Operation names share the federated catalog's printable-ASCII grammar;
+        // colon is reserved for the surface separator and dots are allowed.
+        if !matches!(surface, "tool" | "management")
+            || name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|b| (0x21..=0x7e).contains(&b) && b != b':')
+        {
+            return Err(format!("invalid operation_deferral key '{key}'"));
+        }
+        if value != &Value::Bool(true) {
+            return Err(format!("operation_deferral value for '{key}' must be true"));
+        }
+        if surface == "management" && !manifest.provides.iter().any(|role| matches!(role,
+            ProviderRole::ManagementSurface { operations, .. } if operations.iter().any(|op| op.name == name))) {
+            return Err(format!("operation_deferral names undeclared management operation '{name}'"));
+        }
+    }
+    Ok(operations.keys().map(|key| (key.clone(), true)).collect())
+}
+
+impl ModuleManifest {
+    /// Check producer-constructed deferred-operation declarations against this manifest.
+    pub fn validate_operation_deferral(&self) -> Result<(), String> {
+        match &self.operation_deferral {
+            Some(operations) => decode_operation_deferral(
+                self,
+                &serde_json::to_value(operations).expect("serializable map"),
+            )
+            .map(|_| ()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Warn about advisory metadata that the lenient manifest decoder drops whole.
+pub fn validate_hello_operation_deferral(hello: &Value) -> Result<(), String> {
+    let Some(manifest_value) = hello.get("manifest") else {
+        return Ok(());
+    };
+    let Some(value) = manifest_value
+        .get("operation_deferral")
+        .filter(|v| !v.is_null())
+    else {
+        return Ok(());
+    };
+    let Ok(manifest) = ModuleManifest::deserialize(manifest_value) else {
+        return Ok(());
+    };
+    decode_operation_deferral(&manifest, value).map(|_| ())
+}
+
 /// Why a [`ModuleManifest::confirm_operations`] list is dropped.
 ///
 /// A dropped list leaves the manifest as if the module had not declared one;
@@ -2919,6 +3108,7 @@ mod tests {
 
         assert_eq!(manifest.module_id, "builder-defaults");
         assert_eq!(manifest.module_version, "2.0.0");
+        assert_eq!(manifest.display_name, None);
         assert_eq!(manifest.protocol_ver, PROTOCOL_VERSION);
         assert_eq!(manifest.trust_tier, None);
         assert!(manifest.provides.is_empty());
@@ -2930,6 +3120,7 @@ mod tests {
 
         let encoded = serde_json::to_value(&manifest).expect("builder manifest serializes");
         for optional in [
+            "display_name",
             "trust_tier",
             "consumes",
             "bindings",
@@ -2950,6 +3141,8 @@ mod tests {
     #[test]
     fn fully_populated_builder_manifest_matches_the_literal_wire_golden() {
         let manifest = ModuleManifest::builder("full-builder", "2.0.0")
+            .display_name(Some("Example".to_string()))
+            .unwrap()
             .trust_tier(Some(TrustTier::Reviewed))
             .bindings(Some(Bindings {
                 storage: StorageBinding {
@@ -3009,8 +3202,74 @@ mod tests {
         assert_eq!(
             serde_json::to_vec(&manifest).expect("builder manifest serializes"),
             include_bytes!("../tests/golden/module_manifest_builder_full.json"),
-            "the builder must preserve the prior fully populated literal wire bytes"
+            "the builder must match the fully populated manifest wire bytes"
         );
+    }
+
+    #[test]
+    fn display_name_validator_enforces_scalar_bounds_and_safe_text() {
+        for valid in [
+            "Routing".to_string(),
+            "名".repeat(40),
+            "a".repeat(40),
+            "e\u{301}".repeat(20),
+        ] {
+            assert!(validate_display_name(&valid).is_ok(), "{valid:?}");
+        }
+        let mut invalid = vec![
+            "".to_string(),
+            "a".repeat(41),
+            "名".repeat(41),
+            " Routing".to_string(),
+            "Routing ".to_string(),
+            "\u{2003}Routing".to_string(),
+            "a\nb".to_string(),
+            "a\u{0085}b".to_string(),
+            "a\u{007f}b".to_string(),
+        ];
+        for code in [0x061c, 0x200e, 0x200f]
+            .into_iter()
+            .chain(0x202a..=0x202e)
+            .chain(0x2066..=0x2069)
+        {
+            invalid.push(format!("a{}b", char::from_u32(code).unwrap()));
+        }
+        let accepted: Vec<_> = invalid
+            .iter()
+            .filter(|value| validate_display_name(value).is_ok())
+            .collect();
+        assert!(
+            accepted.is_empty(),
+            "invalid display names accepted: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn display_name_builder_refuses_invalid_value() {
+        let error = ModuleManifest::builder("provider", "1.0.0")
+            .display_name(Some(" Routing".to_string()))
+            .unwrap_err();
+        assert!(error.to_string().contains("display_name"));
+    }
+
+    #[test]
+    fn display_name_manifest_round_trips_and_keeps_unknown_fields_lenient() {
+        let manifest = ModuleManifest::builder("provider", "1.0.0")
+            .display_name(Some("Routing".to_string()))
+            .unwrap()
+            .build();
+        let mut wire = serde_json::to_value(&manifest).unwrap();
+        assert_eq!(wire["display_name"], "Routing");
+        wire["future_manifest_field"] = json!(true);
+        assert_eq!(
+            serde_json::from_value::<ModuleManifest>(wire.clone()).unwrap(),
+            manifest
+        );
+        wire["display_name"] = json!("bad\nname");
+        assert!(serde_json::from_value::<ModuleManifest>(wire)
+            .unwrap_err()
+            .to_string()
+            .contains("display_name"));
     }
 
     #[test]

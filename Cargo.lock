@@ -457,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.5.2"
+version = "0.6.4"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -476,10 +476,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control",
+ "subc-control 0.38.2",
  "subc-daemon",
  "subc-jsonc",
- "subc-protocol",
+ "subc-protocol 0.36.2",
  "subc-transport",
  "syn 2.0.118",
  "tempfile",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "ck-inspect"
-version = "0.2.1"
+version = "0.4.4"
 dependencies = [
  "async-trait",
  "ck-inspect",
@@ -500,15 +500,15 @@ dependencies = [
  "serde",
  "serde_json",
  "subc-client-rs",
- "subc-control",
- "subc-protocol",
+ "subc-control 0.38.2",
+ "subc-protocol 0.36.2",
  "tempfile",
  "tokio",
 ]
 
 [[package]]
 name = "ck-ui"
-version = "0.3.2"
+version = "0.7.0"
 dependencies = [
  "chrono",
  "ck-ui",
@@ -522,10 +522,10 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control",
+ "subc-control 0.38.2",
  "subc-jsonc",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.36.2",
  "subc-transport",
  "tokio",
  "unicode-width 0.2.2",
@@ -645,9 +645,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-naming"
-version = "0.3.0"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e16c5108ecf662e02c706490b2cda97607d6b1c36bb47fc1d60d4acfe3c86d3"
+checksum = "059309f7503eba557d5c1bcf1dfcf59f8fa978516ed0827cf79ecb62ff7fc07a"
 
 [[package]]
 name = "cortexkit-bus-nats"
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-testkit"
-version = "0.3.1"
+version = "0.7.0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -677,9 +677,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control",
+ "subc-control 0.38.2",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.36.2",
  "subc-transport",
  "tempfile",
  "tokio",
@@ -1731,7 +1731,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-stdio-adapter"
-version = "0.2.1"
+version = "0.6.0"
 dependencies = [
  "cortexkit-log",
  "cortexkit-test-support",
@@ -1741,7 +1741,7 @@ dependencies = [
  "subc-client-rs",
  "subc-jobobject",
  "subc-jsonc",
- "subc-protocol",
+ "subc-protocol 0.36.2",
  "tokio",
  "tokio-util",
  "tracing",
@@ -2833,7 +2833,7 @@ dependencies = [
 
 [[package]]
 name = "subc-cgroup"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "cortexkit-test-support",
  "tokio",
@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.34.3"
+version = "0.38.3"
 dependencies = [
  "async-trait",
  "cortexkit-paths",
@@ -2851,9 +2851,9 @@ dependencies = [
  "sha2",
  "socket2",
  "subc-config",
- "subc-control",
+ "subc-control 0.38.2",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.36.2",
  "subc-transport",
  "syn 2.0.118",
  "tokio",
@@ -2874,17 +2874,28 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.35.1"
+version = "0.35.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f1e0f415e8932f5102368a2d90e0087ada8d1b9cfdd91218cc10669b6b192e8"
+dependencies = [
+ "serde",
+ "serde_json",
+ "subc-protocol 0.34.5",
+]
+
+[[package]]
+name = "subc-control"
+version = "0.38.2"
 dependencies = [
  "serde",
  "serde_json",
  "subc-config",
- "subc-protocol",
+ "subc-protocol 0.36.2",
 ]
 
 [[package]]
 name = "subc-core"
-version = "0.20.164"
+version = "0.21.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -2904,13 +2915,13 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control",
+ "subc-control 0.38.2",
  "subc-core",
  "subc-daemon",
  "subc-jsonc",
  "subc-os",
  "subc-presence",
- "subc-protocol",
+ "subc-protocol 0.36.2",
  "subc-transport",
  "tempfile",
  "terminal_size",
@@ -2922,7 +2933,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.41.10"
+version = "0.44.5"
 dependencies = [
  "base64",
  "cortexkit-log",
@@ -2941,12 +2952,13 @@ dependencies = [
  "sha2",
  "subc-cgroup",
  "subc-config",
- "subc-control",
+ "subc-control 0.35.0",
+ "subc-control 0.38.2",
  "subc-jobobject",
  "subc-jsonc",
  "subc-os",
  "subc-presence",
- "subc-protocol",
+ "subc-protocol 0.36.2",
  "subc-transport",
  "subc-uptime",
  "subtle",
@@ -2957,19 +2969,19 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon-consumer"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "cortexkit-test-support",
  "serde_json",
  "subc-daemon",
- "subc-protocol",
+ "subc-protocol 0.36.2",
  "subc-transport",
  "tokio",
 ]
 
 [[package]]
 name = "subc-jobobject"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "cortexkit-test-support",
  "tokio",
@@ -2986,7 +2998,7 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.58"
+version = "0.2.2"
 dependencies = [
  "cortexkit-log",
  "cortexkit-paths",
@@ -2997,11 +3009,11 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-client-rs",
- "subc-control",
+ "subc-control 0.38.2",
  "subc-daemon",
  "subc-jsonc",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.36.2",
  "subc-transport",
  "tokio",
  "tracing",
@@ -3009,7 +3021,7 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.33"
+version = "0.1.32"
 dependencies = [
  "cortexkit-test-support",
  "libc",
@@ -3022,7 +3034,7 @@ dependencies = [
 
 [[package]]
 name = "subc-presence"
-version = "0.2.1"
+version = "0.2.0"
 dependencies = [
  "block2",
  "objc2",
@@ -3038,6 +3050,16 @@ dependencies = [
 [[package]]
 name = "subc-protocol"
 version = "0.34.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd0af7074ac8e70aee159aae8d2c26662cc98f0ad5450541e8083ec9c715f202"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "subc-protocol"
+version = "0.36.2"
 dependencies = [
  "base64",
  "serde",
@@ -3047,7 +3069,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.15.0"
+version = "0.17.0"
 dependencies = [
  "cortexkit-test-support",
  "getrandom 0.2.17",
@@ -3057,7 +3079,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subc-os",
- "subc-protocol",
+ "subc-protocol 0.36.2",
  "subtle",
  "tokio",
 ]

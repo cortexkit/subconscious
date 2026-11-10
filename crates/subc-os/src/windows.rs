@@ -267,6 +267,17 @@ fn times(handle: HANDLE) -> Option<(u64, u64, u64)> {
     Some((ticks(creation), ticks(kernel), ticks(user)))
 }
 
+pub(crate) fn cumulative_cpu_ms(process: &Process) -> Option<u64> {
+    let (_, kernel, user) = times(process.handle.as_raw_handle())?;
+    Some(kernel.saturating_add(user) / 10_000)
+}
+
+impl std::os::windows::io::AsRawHandle for Process {
+    fn as_raw_handle(&self) -> std::os::windows::io::RawHandle {
+        self.handle.as_raw_handle()
+    }
+}
+
 pub(crate) fn parent_pid(pid: u32) -> Option<u32> {
     // Query-only handles also work for ancestors we may not terminate. Holding
     // the child handle prevents its pid from being reused during the snapshot.
@@ -426,3 +437,6 @@ pub(crate) fn resource_usage(process: &Process) -> Option<ResourceUsage> {
         cpu_system: duration(kernel),
     })
 }
+
+mod process_snapshot;
+pub(crate) use process_snapshot::process_entries;

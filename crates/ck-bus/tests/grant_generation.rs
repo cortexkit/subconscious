@@ -227,6 +227,7 @@ fn live_subscriptions_preserve_event_reader_boundaries() {
     let participant = grants::issued_grant(&account, "runner-one", "credential", &[]).unwrap();
     let authority = grants::issued_grant(&account, "prefrontal-core", "credential", &[]).unwrap();
     let flow = grants::issued_grant(&account, "basal", "credential", &[]).unwrap();
+    let routing = grants::issued_grant(&account, "prefrontal-routing", "credential", &[]).unwrap();
     for (grant, allowed, refused) in [
         (
             &participant,
@@ -256,6 +257,22 @@ fn live_subscriptions_preserve_event_reader_boundaries() {
             ],
             vec!["ck.otheraccount.live.runner-one.step.finished.v1"],
         ),
+        (
+            &routing,
+            vec![
+                "ck.box_livefixture.live.insula.quota_sampled.v1",
+                "ck.box_livefixture.live.broca.step.finished.v1",
+                "ck.box_livefixture.live.thalamus-harness.step.finished.v1",
+            ],
+            vec![
+                "ck.box_livefixture.live.broca.run.v1",
+                "ck.box_livefixture.live.thalamus-harness.run.v1",
+                "ck.box_livefixture.live.thalamus.step.finished.v1",
+                "ck.box_livefixture.live.thalamus-pi.step.finished.v1",
+                "ck.box_livefixture.live.magic-context.compaction.started.v1",
+                "ck.box_livefixture.live.*.step.finished.v1",
+            ],
+        ),
     ] {
         for subject in allowed {
             assert!(
@@ -275,6 +292,77 @@ fn live_subscriptions_preserve_event_reader_boundaries() {
                 "unauthorized live subscribe must be refused: {subject}"
             );
         }
+    }
+}
+
+#[test]
+fn naming_032_routing_live_hints_grant_no_step_durable_rights() {
+    let account = grants::derive_account("box_livefixture").unwrap();
+    let routing = grants::issued_grant(&account, "prefrontal-routing", "credential", &[]).unwrap();
+    assert_eq!(
+        routing.subscribe_allow(),
+        &BTreeSet::from([
+            "$KV.CK_BOX_LIVEFIXTURE_CENSUS.>".to_owned(),
+            "_INBOX.credential.>".to_owned(),
+            "ck.box_livefixture.live.broca.step.finished.v1".to_owned(),
+            "ck.box_livefixture.live.insula.>".to_owned(),
+            "ck.box_livefixture.live.thalamus-harness.step.finished.v1".to_owned(),
+        ])
+    );
+    let permits = |subject: &str| {
+        routing
+            .publish_allow()
+            .iter()
+            .any(|pattern| subject_matches(pattern, subject))
+    };
+    for subject in [
+        "$JS.API.CONSUMER.CREATE.CK_BOX_LIVEFIXTURE_EVENT",
+        "$JS.API.CONSUMER.CREATE.CK_BOX_LIVEFIXTURE_EVENT.m_prefrontal-routing",
+        "$JS.API.CONSUMER.CREATE.CK_BOX_LIVEFIXTURE_EVENT.m_prefrontal-routing.ck.box_livefixture.event.broca.step.finished.v1",
+        "$JS.API.CONSUMER.DURABLE.CREATE.CK_BOX_LIVEFIXTURE_EVENT.m_prefrontal-routing",
+        "$JS.ACK.CK_BOX_LIVEFIXTURE_EVENT.m_broca.1",
+        "$JS.ACK.CK_BOX_LIVEFIXTURE_EVENT.m_thalamus-harness.1",
+    ] {
+        assert!(!permits(subject), "live hint must not grant {subject}");
+    }
+
+    // ACK subjects name a durable, not an event subject. A quota ACK is safe only
+    // when the durable's filters exclude every step event the live reader observes.
+    let readers = cortexkit_bus_naming::event_consumer_specs(&account).unwrap();
+    for reader in readers {
+        let ack = format!(
+            "$JS.ACK.{}.{}.1",
+            account.streams().event,
+            reader.consumer.durable
+        );
+        if permits(&ack) {
+            assert_eq!(reader.consumer.durable, "m_prefrontal-routing");
+            for step in ["broca", "thalamus-harness", "thalamus"] {
+                let subject = format!("ck.box_livefixture.event.{step}.step.finished.v1");
+                assert!(
+                    reader
+                        .consumer
+                        .filter_subjects
+                        .iter()
+                        .all(|filter| !subject_matches(filter, &subject)),
+                    "routing must not be able to ACK step events: {subject}"
+                );
+            }
+        }
+    }
+    assert!(permits(
+        "$JS.ACK.CK_BOX_LIVEFIXTURE_EVENT.m_prefrontal-routing.1"
+    ));
+}
+
+#[test]
+fn naming_032_permission_document_has_no_thalamus_pi_rows() {
+    let document = grants::render_fixture_document(PINNED_GOLDEN_FIXTURE).unwrap();
+    for line in document.lines() {
+        assert!(
+            !line.contains("thalamus-pi"),
+            "removed runner permission row: {line}"
+        );
     }
 }
 
@@ -351,13 +439,13 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
         .expect("magic-context's issued participant grant");
     let routing = grants::issued_grant(&account, "prefrontal-routing", "prefrontal-routing", &[])
         .expect("prefrontal-routing's issued participant grant");
+    let striatum = grants::issued_grant(&account, "striatum", "striatum", &[])
+        .expect("striatum's issued participant grant");
     let thalamus_harness =
         grants::issued_grant(&account, "thalamus-harness", "thalamus-harness", &[])
             .expect("thalamus-harness's issued participant grant");
     let thalamus = grants::issued_grant(&account, "thalamus", "thalamus", &[])
         .expect("thalamus's issued participant grant");
-    let thalamus_pi = grants::issued_grant(&account, "thalamus-pi", "thalamus-pi", &[])
-        .expect("thalamus-pi's issued participant grant");
     let cerebellum = grants::issued_grant(&account, "cerebellum", "cerebellum", &[])
         .expect("cerebellum's issued participant grant");
     let by_role = [
@@ -370,12 +458,12 @@ fn grant_generation_emits_each_role_set_from_the_pinned_literals() {
         (Principal::EventConsumer("broca"), &broca),
         (Principal::EventConsumer("magic-context"), &magic_context),
         (Principal::EventConsumer("prefrontal-routing"), &routing),
+        (Principal::EventConsumer("striatum"), &striatum),
         (
             Principal::EventConsumer("thalamus-harness"),
             &thalamus_harness,
         ),
         (Principal::EventConsumer("thalamus"), &thalamus),
-        (Principal::EventConsumer("thalamus-pi"), &thalamus_pi),
         (Principal::EventConsumer("cerebellum"), &cerebellum),
     ];
 
@@ -539,9 +627,9 @@ fn vendored_foundation_and_golden_match_their_source_record() {
     // so it moves with the pin in Cargo.toml.
     assert_eq!(
         field("golden_commit"),
-        "a8b73bf89a277d96fcbb4f6ff83bd0799b2fd4aa"
+        "400c43874a4fba610c4f8f3eaff183a989fe5bb1"
     );
-    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.3.0");
+    assert_eq!(field("golden_crate_version"), "cortexkit-bus-naming 0.3.4");
     for (file, digest_field) in [
         ("nats-message-plane-foundation.md", "source_sha256"),
         ("permission_golden.txt", "golden_sha256"),

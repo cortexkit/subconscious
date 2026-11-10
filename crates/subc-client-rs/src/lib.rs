@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
 pub mod activity;
+mod agent_commands;
 pub mod config;
+pub use agent_commands::AgentCommandsError;
+pub use subc_protocol::session::{AgentCommandFinished, AgentCommandRoot};
 pub mod consumer;
 mod operator_app;
 pub mod policy_cache;
@@ -54,6 +57,10 @@ pub use async_trait::async_trait;
 pub use subc_control::{CatalogEntry, ConsumerIdentity};
 mod scope_served_by;
 pub use scope_served_by::{ScopeServedByAnswer, ScopeServedByReply};
+mod route_authorize;
+pub use route_authorize::{
+    RouteAuthorizeExpected, RouteAuthorizeOutcome, RouteAuthorizeResponse, RouteAuthorizeScope,
+};
 mod request_pools;
 use request_pools::{wait_for_permit, DispatchPools, PermitWaitOutcome, WaitingRequest};
 pub use request_pools::{RequestClass, RequestPool, RequestPoolSnapshot, RequestPools};
@@ -321,10 +328,28 @@ pub struct ScopeDescribeReply {
     pub scope: Option<ScopeStamp>,
 }
 
-type CatalogUpdateReply =
-    oneshot::Sender<Result<ModuleControlResponseToModule, CatalogUpdateError>>;
-type CatalogUpdateWaiter =
-    oneshot::Receiver<Result<ModuleControlResponseToModule, CatalogUpdateError>>;
+// The protocol's module-control enum predates the separately typed authorization
+// reply. Keep both wire types in the same correlation table and deadline path.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum ModuleControlReply {
+    Control(Box<ModuleControlResponseToModule>),
+    RouteAuthorize(RouteAuthorizeResponse),
+}
+
+impl ModuleControlReply {
+    fn control(self) -> Result<ModuleControlResponseToModule, CatalogUpdateError> {
+        match self {
+            Self::Control(reply) => Ok(*reply),
+            other => Err(CatalogUpdateError::Protocol(format!(
+                "unexpected module control response: {other:?}"
+            ))),
+        }
+    }
+}
+
+type CatalogUpdateReply = oneshot::Sender<Result<ModuleControlReply, CatalogUpdateError>>;
+type CatalogUpdateWaiter = oneshot::Receiver<Result<ModuleControlReply, CatalogUpdateError>>;
 type CatalogUpdateRequest = (u64, mpsc::Sender<Frame>, CatalogUpdateWaiter);
 type OperatorConfirmRequestWaiter = (u64, mpsc::Sender<Frame>, oneshot::Receiver<Frame>);
 
@@ -467,9 +492,11 @@ struct ModuleHandleShared {
     daemon_capabilities: Vec<String>,
     supports_catalog_update: bool,
     supports_live_roots: bool,
+    supports_agent_commands: bool,
     supports_scope_sync: bool,
     supports_scope_apply: bool,
     supports_scope_describe: bool,
+    supports_route_authorize: bool,
     supports_operator_confirm: bool,
     supports_activity: bool,
     connection_runtime: tokio::runtime::Handle,
@@ -494,6 +521,7 @@ struct ModuleHandleState {
     pending_activity_records: HashMap<u64, oneshot::Sender<Frame>>,
     pending_scope_served_by: HashMap<u64, oneshot::Sender<Frame>>,
     pending_config_calls: HashMap<u64, oneshot::Sender<Frame>>,
+    pending_agent_commands: HashMap<u64, oneshot::Sender<Frame>>,
     current_provides: Option<Vec<ProviderRole>>,
     catalog_changes: VecDeque<CatalogChange>,
     closed: bool,
@@ -539,9 +567,17 @@ impl ModuleHandle {
                     .iter()
                     .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE),
                 supports_live_roots: ack.subc_ops.iter().any(|op| op == "supervisor.live_roots"),
+                supports_agent_commands: ack
+                    .subc_ops
+                    .iter()
+                    .any(|op| op == "supervisor.agent_commands"),
                 supports_scope_sync: ack.subc_ops.iter().any(|op| op == SCOPE_SYNC_OP),
                 supports_scope_apply: ack.subc_ops.iter().any(|op| op == SCOPE_APPLY_OP),
                 supports_scope_describe: ack.subc_ops.iter().any(|op| op == SCOPE_DESCRIBE_OP),
+                supports_route_authorize: ack
+                    .subc_ops
+                    .iter()
+                    .any(|op| op == subc_protocol::scope::ROUTE_AUTHORIZE_OP),
                 supports_operator_confirm: ack.subc_ops.iter().any(|op| op == OPERATOR_CONFIRM_OP),
                 supports_activity: ack
                     .subc_capabilities
@@ -569,6 +605,7 @@ impl ModuleHandle {
                     pending_activity_records: HashMap::new(),
                     pending_scope_served_by: HashMap::new(),
                     pending_config_calls: HashMap::new(),
+                    pending_agent_commands: HashMap::new(),
                     current_provides: None,
                     catalog_changes: VecDeque::new(),
                     closed: false,
@@ -741,7 +778,12 @@ impl ModuleHandle {
         permit.send(frame);
         drop(send_guard);
 
-        match timeout(CATALOG_UPDATE_TIMEOUT, rx).await {
+        match timeout(CATALOG_UPDATE_TIMEOUT, async {
+            rx.await
+                .map(|reply| reply.and_then(ModuleControlReply::control))
+        })
+        .await
+        {
             Ok(Ok(Ok(ModuleControlResponseToModule::CatalogUpdate {}))) => Ok(()),
             Ok(Ok(Ok(_))) => Err(CatalogUpdateError::Protocol(
                 "unexpected catalog.update response".into(),
@@ -780,7 +822,12 @@ impl ModuleHandle {
             self.shared.remove_pending_catalog_update(corr);
             return Err(CatalogUpdateError::ConnectionClosed);
         }
-        match timeout(CATALOG_UPDATE_TIMEOUT, rx).await {
+        match timeout(CATALOG_UPDATE_TIMEOUT, async {
+            rx.await
+                .map(|reply| reply.and_then(ModuleControlReply::control))
+        })
+        .await
+        {
             Ok(Ok(Ok(ModuleControlResponseToModule::LiveRoots {
                 roots,
                 unknown_root_bindings,
@@ -826,7 +873,12 @@ impl ModuleHandle {
             return Err(ScopeCallError::NotSupported { op: SCOPE_SYNC_OP });
         }
         let request = ModuleControlRequestFromModule::ScopeSync { generation, scopes };
-        match self.scope_call(SCOPE_SYNC_OP, &request).await? {
+        match self
+            .scope_call(SCOPE_SYNC_OP, &request)
+            .await?
+            .control()
+            .map_err(ScopeCallError::from_control_error)?
+        {
             ModuleControlResponseToModule::ScopeSync {
                 generation,
                 results,
@@ -866,7 +918,12 @@ impl ModuleHandle {
             upsert,
             end,
         };
-        match self.scope_call(SCOPE_APPLY_OP, &request).await? {
+        match self
+            .scope_call(SCOPE_APPLY_OP, &request)
+            .await?
+            .control()
+            .map_err(ScopeCallError::from_control_error)?
+        {
             ModuleControlResponseToModule::ScopeApply {
                 generation,
                 results,
@@ -902,7 +959,12 @@ impl ModuleHandle {
             });
         }
         let request = ModuleControlRequestFromModule::ScopeDescribe { owner, scope_ref };
-        match self.scope_call(SCOPE_DESCRIBE_OP, &request).await? {
+        match self
+            .scope_call(SCOPE_DESCRIBE_OP, &request)
+            .await?
+            .control()
+            .map_err(ScopeCallError::from_control_error)?
+        {
             ModuleControlResponseToModule::ScopeDescribe {
                 status,
                 scope_epoch,
@@ -1153,7 +1215,7 @@ impl ModuleHandle {
         &self,
         op: &'static str,
         request: &ModuleControlRequestFromModule,
-    ) -> Result<ModuleControlResponseToModule, ScopeCallError> {
+    ) -> Result<ModuleControlReply, ScopeCallError> {
         let body = serde_json::to_vec(request).map_err(|err| {
             ScopeCallError::Protocol(format!("failed to encode {op} request body: {err}"))
         })?;
@@ -1300,6 +1362,15 @@ impl ModuleHandle {
             let _ = reply.send(frame);
             return true;
         }
+        if let Some(reply) = self
+            .shared
+            .lock_inner()
+            .pending_agent_commands
+            .remove(&frame.header.corr)
+        {
+            let _ = reply.send(frame);
+            return true;
+        }
         let served_by_reply = self
             .shared
             .lock_inner()
@@ -1331,12 +1402,12 @@ impl ModuleHandle {
             return false;
         };
         let result = match frame.header.ty {
-            FrameType::Response => serde_json::from_slice::<ModuleControlResponseToModule>(
-                &frame.body,
-            )
-            .map_err(|err| {
-                CatalogUpdateError::Protocol(format!("invalid module control response body: {err}"))
-            }),
+            FrameType::Response => serde_json::from_slice::<ModuleControlReply>(&frame.body)
+                .map_err(|err| {
+                    CatalogUpdateError::Protocol(format!(
+                        "invalid module control response body: {err}"
+                    ))
+                }),
             FrameType::Error => match serde_json::from_slice::<ErrorBody>(&frame.body) {
                 Ok(body) => Err(match body.code.as_str() {
                     "catalog_update_frozen_field" => CatalogUpdateError::FrozenField(body),
@@ -1352,7 +1423,14 @@ impl ModuleHandle {
             ))),
         };
         let outcome = match &result {
-            Ok(ModuleControlResponseToModule::CatalogUpdate {}) => CatalogChangeOutcome::Accepted,
+            Ok(ModuleControlReply::Control(reply))
+                if matches!(
+                    reply.as_ref(),
+                    ModuleControlResponseToModule::CatalogUpdate {}
+                ) =>
+            {
+                CatalogChangeOutcome::Accepted
+            }
             Err(CatalogUpdateError::FrozenField(_))
             | Err(CatalogUpdateError::NotRegistered(_))
             | Err(CatalogUpdateError::Rejected(_)) => CatalogChangeOutcome::Rejected,
@@ -1466,6 +1544,7 @@ impl ModuleHandleShared {
             inner.pending_activity_records.clear();
             inner.pending_scope_served_by.clear();
             inner.pending_config_calls.clear();
+            inner.pending_agent_commands.clear();
             inner
                 .pending_catalog_updates
                 .drain()
@@ -4310,6 +4389,170 @@ mod tests {
 
     fn control_reply(ty: FrameType, corr: u64, body: Vec<u8>) -> Frame {
         Frame::build(ty, control_flags(), 0, 0, corr, body).unwrap()
+    }
+
+    async fn authorize_for_test(
+        handle: &ModuleHandle,
+    ) -> Result<RouteAuthorizeResponse, ScopeCallError> {
+        handle
+            .route_authorize(
+                Principal::Direct,
+                RouteAuthorizeScope::new(
+                    Principal::Reserved {
+                        module_id: "owner".into(),
+                    },
+                    "stored-scope",
+                    7,
+                ),
+                "target".into(),
+                RouteAuthorizeExpected::new(
+                    subc_protocol::scope::ScopeKind::Head,
+                    &subc_protocol::scope::ScopeAttributes::default(),
+                ),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn route_authorize_requires_advertised_operation() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let ack = ModuleHelloAckBody {
+            negotiated_ver: PROTOCOL_VERSION,
+            subc_ops: vec![],
+            // A module-provided capability is not the daemon's op advertisement.
+            subc_capabilities: vec![subc_protocol::scope::ROUTE_AUTHORIZE_CAPABILITY.into()],
+            storage: None,
+            machine_id: None,
+        };
+        let handle = ModuleHandle::new(
+            &ack,
+            tx,
+            1,
+            CancellationToken::new(),
+            tokio::runtime::Handle::current(),
+        );
+        let result = timeout(Duration::from_millis(100), authorize_for_test(&handle))
+            .await
+            .expect("an unsupported operation must return without sending or awaiting a reply");
+        assert_eq!(
+            result,
+            Err(ScopeCallError::NotSupported {
+                op: subc_protocol::scope::ROUTE_AUTHORIZE_OP,
+            })
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "unsupported calls must send nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_authorize_decodes_every_answer_and_permission_refusal() {
+        use RouteAuthorizeOutcome::*;
+        let (handle, mut rx) = test_module_handle(&[subc_protocol::scope::ROUTE_AUTHORIZE_OP]);
+        for (wire, outcome, code) in [
+            ("authorized", Authorized, None),
+            ("scope_ended", ScopeEnded, Some("scope_not_live")),
+            ("indeterminate", Indeterminate, Some("scope_not_synced")),
+            ("epoch_changed", EpochChanged, Some("scope_ended")),
+            ("claim_changed", ClaimChanged, None),
+            (
+                "proof_required",
+                ProofRequired,
+                Some("scope_bind_proof_required"),
+            ),
+            ("not_authorized", NotAuthorized, Some("scope_not_carrier")),
+            ("target_absent", TargetAbsent, None),
+        ] {
+            let caller = handle.clone();
+            let pending = tokio::spawn(async move { authorize_for_test(&caller).await });
+            let request = rx.recv().await.unwrap();
+            assert_eq!(request.header.ty, FrameType::Request);
+            assert_eq!(request.header.channel, 0);
+            assert_eq!(request.header.ver, PROTOCOL_VERSION);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+                serde_json::json!({
+                    "op": "route.authorize", "principal": {"kind": "direct"},
+                    "scope": {"owner": {"kind": "reserved", "module_id": "owner"},
+                              "ref": "stored-scope", "epoch": 7},
+                    "target": "target", "expected": {"kind": "head"}
+                })
+            );
+            let content_version = (outcome == Authorized).then_some("sha256:content");
+            let mut body = serde_json::json!({
+                "op": "route.authorize", "outcome": wire, "message": "judgment"
+            });
+            if let Some(code) = code {
+                body["route_open_code"] = code.into();
+            }
+            if let Some(version) = content_version {
+                body["content_version"] = version.into();
+            }
+            assert!(handle.handle_control_reply(control_reply(
+                FrameType::Response,
+                request.header.corr,
+                serde_json::to_vec(&body).unwrap(),
+            )));
+            let reply = pending.await.unwrap().unwrap();
+            assert_eq!(reply.outcome, outcome);
+            assert_eq!(reply.message, "judgment");
+            assert_eq!(reply.route_open_code.as_deref(), code);
+            assert_eq!(reply.content_version.as_deref(), content_version);
+        }
+
+        for (code, message) in [
+            ("route_authorize_not_permitted", "not the configured owner"),
+            ("not_registered", "connection is not registered"),
+            ("unexpected", "a future daemon call refusal"),
+        ] {
+            let caller = handle.clone();
+            let pending = tokio::spawn(async move { authorize_for_test(&caller).await });
+            let request = rx.recv().await.unwrap();
+            assert!(handle.handle_control_reply(control_reply(
+                FrameType::Error,
+                request.header.corr,
+                serde_json::to_vec(&serde_json::json!({"code": code, "message": message})).unwrap(),
+            )));
+            assert_eq!(
+                pending.await.unwrap(),
+                Err(ScopeCallError::Refused {
+                    code: code.into(),
+                    message: message.into(),
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn route_authorize_rejects_malformed_and_unexpected_replies() {
+        let (handle, mut rx) = test_module_handle(&[subc_protocol::scope::ROUTE_AUTHORIZE_OP]);
+        for (ty, body) in [
+            (FrameType::Response, r#"{"op":"catalog.update"}"#),
+            (
+                FrameType::Response,
+                r#"{"op":"route.authorize","outcome":"authorized"}"#,
+            ),
+            (
+                FrameType::Response,
+                r#"{"op":"route.authorize","outcome":"future","message":"new"}"#,
+            ),
+            (FrameType::Error, "not json"),
+            (FrameType::Request, "{}"),
+        ] {
+            let caller = handle.clone();
+            let pending = tokio::spawn(async move { authorize_for_test(&caller).await });
+            let request = rx.recv().await.unwrap();
+            assert!(handle.handle_control_reply(control_reply(
+                ty,
+                request.header.corr,
+                body.as_bytes().to_vec(),
+            )));
+            assert!(
+                matches!(pending.await.unwrap(), Err(ScopeCallError::Protocol(_))),
+                "{body}"
+            );
+        }
     }
 
     #[tokio::test]

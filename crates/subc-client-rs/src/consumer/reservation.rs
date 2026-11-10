@@ -41,8 +41,8 @@ impl RequestReservation {
         self.key.corr
     }
 
-    /// Synchronously and infallibly hand the request to the connection's writer
-    /// queue. No reply polling or socket I/O happens here.
+    /// Synchronously hand the request to the connection's writer queue.
+    /// No reply polling or socket I/O happens here.
     ///
     /// Queued is not on the wire. If the connection fails after queuing, before
     /// or after writing, `PendingReply` returns the same connection-loss errors
@@ -55,7 +55,17 @@ impl RequestReservation {
     /// Only `opts.priority` and `opts.admission_class` apply to this already-open
     /// route. The deadline supplied to [`SubcConsumer::reserve`] governs the
     /// entire request, including the reply; `opts.timeout` does not replace it.
+    /// A non-`None` `opts.scope` is an argument error returned by the reply,
+    /// without queuing a frame. Select the scope when opening the route instead.
     pub fn send(self, body: RequestBody, opts: CallOptions) -> (CorrelationId, PendingReply) {
+        if let Err(err) = opts.reject_scope() {
+            return (
+                self.key.corr,
+                PendingReply {
+                    future: Box::pin(async move { Err(err) }),
+                },
+            );
+        }
         let mut frame = body.0;
         frame.header.channel = self.key.channel;
         frame.header.epoch = self.key.epoch;

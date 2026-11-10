@@ -13,30 +13,36 @@ const CK_AUTH_SHA256: &str = "64245680ce56fd31dd07813a2100d065aba4cce5b98ab29245
 /// developer's or runner's own keyring.
 const SECRET_SERVICE_BUS_ENV: &str = "SUBC_TEST_SECRET_SERVICE_BUS";
 
-/// Downloads and unpacks the pinned ck-auth into `root`, returning its path.
+/// Uses a pre-fetched archive when supplied, otherwise downloads the pinned
+/// ck-auth, and verifies it before unpacking into `root`.
 fn published_ck_auth(root: &ScratchDir) -> PathBuf {
-    let archive = root.join("ck-auth.zip");
-    let download = Command::new("curl")
-        .args([
-            "--fail",
-            "--location",
-            "--silent",
-            "--show-error",
-            "--retry",
-            "3",
-            "--max-time",
-            "120",
-        ])
-        .arg(CK_AUTH_URL)
-        .arg("--output")
-        .arg(&archive)
-        .output()
-        .expect("curl is required for the published ck-auth regression");
-    assert!(
-        download.status.success(),
-        "download: {}",
-        String::from_utf8_lossy(&download.stderr)
-    );
+    let archive = if let Some(path) = std::env::var_os("SUBC_TEST_CK_AUTH_ZIP") {
+        PathBuf::from(path)
+    } else {
+        let archive = root.join("ck-auth.zip");
+        let download = Command::new("curl")
+            .args([
+                "--fail",
+                "--location",
+                "--silent",
+                "--show-error",
+                "--retry",
+                "3",
+                "--max-time",
+                "120",
+            ])
+            .arg(CK_AUTH_URL)
+            .arg("--output")
+            .arg(&archive)
+            .output()
+            .expect("curl is required for the published ck-auth regression");
+        assert!(
+            download.status.success(),
+            "download: {}",
+            String::from_utf8_lossy(&download.stderr)
+        );
+        archive
+    };
     assert_eq!(
         format!("{:x}", Sha256::digest(fs::read(&archive).unwrap())),
         CK_AUTH_SHA256,
@@ -57,6 +63,34 @@ fn published_ck_auth(root: &ScratchDir) -> PathBuf {
     let auth = root.join("ck-auth");
     assert!(auth.is_file(), "archive must contain ck-auth");
     auth
+}
+
+#[test]
+fn published_ck_auth_rejects_wrong_prefetched_archive() {
+    let root = ScratchDir::new("setup-published-ck-auth-wrong-archive");
+    let archive = root.join("wrong.zip");
+    fs::write(&archive, b"not the pinned ck-auth archive").unwrap();
+    // A subprocess isolates the archive override from tests running in parallel.
+    let result = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "setup::apply::real_auth_tests::published_ck_auth_bootstrap_respects_key_store_selection",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("SUBC_TEST_CK_AUTH_ZIP", archive)
+        .output()
+        .unwrap();
+    let output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!result.status.success(), "{output}");
+    assert!(
+        output.contains("published ck-auth archive checksum"),
+        "{output}"
+    );
 }
 
 /// A private home for one case. Each case gets its own, because a refused

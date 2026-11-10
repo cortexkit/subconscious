@@ -525,6 +525,13 @@ struct ModuleConnection {
     sink: FrameSink,
     negotiated_ver: u8,
     concurrency: Concurrency,
+    // Captured at HELLO, not inferred from the id or a later prefix policy.
+    verified_prefix_owner: Option<String>,
+}
+
+pub(crate) struct ModuleHelloAck {
+    pub(crate) frame: Frame,
+    pub(crate) verified_prefix_owner: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1027,7 +1034,7 @@ impl ForwardingTable {
         negotiated_ver: u8,
         concurrency: Concurrency,
         sink: FrameSink,
-        hello_ack: Frame,
+        hello_ack: ModuleHelloAck,
     ) -> Result<ModuleEndpointId, ForwardingError> {
         self.register_module_connection_inner(
             connection_id,
@@ -1046,7 +1053,7 @@ impl ForwardingTable {
         negotiated_ver: u8,
         concurrency: Concurrency,
         sink: FrameSink,
-        hello_ack: Option<Frame>,
+        hello_ack: Option<ModuleHelloAck>,
     ) -> Result<ModuleEndpointId, ForwardingError> {
         let mut inner = self.write_inner()?;
         if inner.daemon_draining || inner.closing_connections.contains(&connection_id) {
@@ -1055,7 +1062,10 @@ impl ForwardingTable {
         check_module_connection_role_locked(&inner, connection_id)?;
         // Every refusal check has passed and nothing has been mutated yet, so
         // a failed enqueue leaves the table exactly as it was.
-        enqueue_hello_ack_locked(&sink, connection_id, hello_ack)?;
+        let verified_prefix_owner = hello_ack
+            .as_ref()
+            .and_then(|hello| hello.verified_prefix_owner.clone());
+        enqueue_hello_ack_locked(&sink, connection_id, hello_ack.map(|hello| hello.frame))?;
 
         inner.next_generation = inner.next_generation.checked_add(1).unwrap_or(1);
         let endpoint = ModuleEndpointId {
@@ -1075,6 +1085,7 @@ impl ForwardingTable {
                 sink,
                 negotiated_ver,
                 concurrency,
+                verified_prefix_owner,
             },
         );
         drop(inner);
@@ -1200,6 +1211,7 @@ impl ForwardingTable {
                 sink,
                 negotiated_ver,
                 concurrency,
+                verified_prefix_owner: None,
             },
         );
         Ok(endpoint)
@@ -3622,7 +3634,7 @@ fn commit_route_locked(
     // Publish history before notifying the opener, so a subsequent
     // `scope.served_by` query sees the acknowledged bind.
     if let Some(scope) = &binding.scope {
-        scope.record_served(&binding.module_id);
+        scope.record_served(&binding.module_id, module.verified_prefix_owner.as_deref());
     }
 
     // Sending through the reserved slot cannot fail, but it reports a receiver
@@ -4329,7 +4341,10 @@ mod tests {
                 2,
                 Concurrency::ModuleManaged,
                 FrameSink::new(closed_tx),
-                test_hello_ack(1),
+                ModuleHelloAck {
+                    frame: test_hello_ack(1),
+                    verified_prefix_owner: None
+                },
             ),
             Err(ForwardingError::ModuleEgressUnavailable {
                 connection_id: closed
@@ -4347,7 +4362,10 @@ mod tests {
                 2,
                 Concurrency::ModuleManaged,
                 full_sink.clone(),
-                test_hello_ack(2),
+                ModuleHelloAck {
+                    frame: test_hello_ack(2),
+                    verified_prefix_owner: None
+                },
             ),
             Err(ForwardingError::ModuleEgressUnavailable {
                 connection_id: full
@@ -4403,7 +4421,10 @@ mod tests {
                 2,
                 Concurrency::ModuleManaged,
                 FrameSink::new(active_tx),
-                test_hello_ack(11),
+                ModuleHelloAck {
+                    frame: test_hello_ack(11),
+                    verified_prefix_owner: None,
+                },
             )
             .unwrap();
         let (candidate_tx, mut candidate_rx) = mpsc::channel(8);

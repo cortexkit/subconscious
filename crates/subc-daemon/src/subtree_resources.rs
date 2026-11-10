@@ -1,12 +1,12 @@
 //! Bounded report-only reads, isolated from supervisor actors and connection readers.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, OnceLock,
-    },
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
+#[cfg(test)]
 use subc_control::SubtreeReading;
 
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_millis(200);
@@ -75,7 +75,203 @@ impl PartialEq for Target {
     }
 }
 
+// Kernel container counters remain readable after the last member exits.
+// An empty group list must not hide those cumulative CPU and memory totals.
+#[cfg(any(target_os = "linux", windows))]
+fn container_reading(
+    usage: Option<subc_os::TreeUsage>,
+    source: subc_control::TreeSource,
+) -> subc_control::TreeReading {
+    usage
+        .map(|usage| crate::resource_totals::wire(usage, source.clone()))
+        .unwrap_or_else(|| {
+            subc_control::TreeReading::new(
+                0,
+                0,
+                if source == subc_control::TreeSource::Job {
+                    subc_control::ChildMemoryKind::WindowsWorkingSet
+                } else {
+                    subc_control::ChildMemoryKind::Unknown("cgroup_memory".to_owned())
+                },
+                0,
+                source,
+            )
+        })
+}
+
 impl Target {
+    pub(crate) fn counter_cpu(&self) -> Option<(u128, u64)> {
+        match self {
+            #[cfg(test)]
+            Self::Held(_) => Some((self.counter_identity()?, 0)),
+            #[cfg(target_os = "linux")]
+            Self::Cgroup(path) => Some((
+                self.counter_identity()?,
+                subc_cgroup::read_cpu_ms(path).ok()?,
+            )),
+            #[cfg(windows)]
+            Self::Job(job) => {
+                let owner = job.upgrade()?;
+                let query = owner.try_lock().ok()?.query().ok()?;
+                Some((job.as_ptr() as usize as u128, query.cpu_ms().ok()?))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn counter_identity(&self) -> Option<u128> {
+        match self {
+            #[cfg(test)]
+            Self::Held(read) => Some(Arc::as_ptr(read) as usize as u128),
+            #[cfg(target_os = "linux")]
+            Self::Cgroup(path) => {
+                use std::os::unix::fs::MetadataExt;
+                let stat = std::fs::metadata(path).ok()?;
+                Some((u128::from(stat.dev()) << 64) | u128::from(stat.ino()))
+            }
+            #[cfg(windows)]
+            Self::Job(job) => Some(job.as_ptr() as usize as u128),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn contains_identity(
+        &self,
+        pid: u32,
+        start: u64,
+        process: &subc_os::Process,
+    ) -> Option<bool> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Cgroup(path) => {
+                let groups = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+                let group = groups.lines().find_map(|line| line.strip_prefix("0::"))?;
+                let actual =
+                    std::path::Path::new("/sys/fs/cgroup").join(group.trim_start_matches('/'));
+                let member = actual.starts_with(path);
+                (subc_os::start_time(pid) == Some(start)).then_some(member)
+            }
+            #[cfg(windows)]
+            Self::Job(owner) => {
+                let owner = owner.upgrade()?;
+                let query = owner.try_lock().ok()?.query().ok()?;
+                query.contains_process(process).ok()
+            }
+            Self::Unavailable("read_failed") => None,
+            _ => {
+                let _ = (pid, start, process);
+                Some(false)
+            }
+        }
+    }
+
+    pub(crate) fn has_container(&self) -> bool {
+        match self {
+            #[cfg(test)]
+            Self::Held(_) => true,
+            #[cfg(target_os = "linux")]
+            Self::Cgroup(_) => true,
+            #[cfg(windows)]
+            Self::Job(_) => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn process_ids(&self) -> Option<Vec<u32>> {
+        let deadline = Instant::now() + READ_TIMEOUT;
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Cgroup(path) => subc_cgroup::process_ids(path, deadline).ok(),
+            #[cfg(windows)]
+            Self::Job(owner) => owner
+                .upgrade()?
+                .try_lock()
+                .ok()?
+                .query()
+                .ok()?
+                .process_ids(deadline)
+                .ok(),
+            _ => {
+                let _ = deadline;
+                None
+            }
+        }
+    }
+
+    pub(crate) fn tree(
+        &self,
+        table: &subc_os::ProcessTable,
+    ) -> Option<(
+        subc_control::TreeReading,
+        std::collections::BTreeSet<(u32, u64)>,
+    )> {
+        #[cfg(test)]
+        if matches!(self, Self::Held(_)) {
+            self.clone()
+                .read(Instant::now() + READ_TIMEOUT, &AtomicU64::new(0));
+            return Some((
+                subc_control::TreeReading::new(
+                    0,
+                    1,
+                    subc_control::ChildMemoryKind::ResidentSet,
+                    1,
+                    subc_control::TreeSource::ProcessTree,
+                ),
+                Default::default(),
+            ));
+        }
+        let pids = self.process_ids()?;
+        let members: Vec<_> = pids
+            .into_iter()
+            .map(|pid| {
+                let member = table.process(pid)?;
+                (subc_os::start_time(pid) == Some(member.start_time)).then(|| member.clone())
+            })
+            .collect::<Option<_>>()?;
+        let identities: std::collections::BTreeSet<_> = members
+            .iter()
+            .map(|member| (member.pid, member.start_time))
+            .collect();
+        let empty = members.is_empty();
+        let usage = subc_os::ProcessTable::sum(members);
+        if !empty && usage.is_none() {
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        if let Self::Cgroup(path) = self {
+            let mut reading = container_reading(usage, subc_control::TreeSource::Cgroup);
+            reading.cpu_ms = subc_cgroup::read_cpu_ms(path).ok()?;
+            let memory = subc_cgroup::read_memory(
+                path,
+                std::path::Path::new("/proc"),
+                Instant::now() + READ_TIMEOUT,
+            )
+            .ok()?;
+            reading.memory_bytes = memory.memory_bytes;
+            reading.process_count = memory.process_count;
+            reading.memory_kind = if memory.source == subc_cgroup::MemorySource::CgroupMemory {
+                subc_control::ChildMemoryKind::Unknown("cgroup_memory".to_owned())
+            } else {
+                subc_control::ChildMemoryKind::ResidentSet
+            };
+            return Some((reading, identities));
+        }
+        #[cfg(windows)]
+        if let Self::Job(owner) = self {
+            let query = owner.upgrade()?.try_lock().ok()?.query().ok()?;
+            let mut reading = container_reading(usage, subc_control::TreeSource::Job);
+            reading.cpu_ms = query.cpu_ms().ok()?;
+            let memory = query.memory(Instant::now() + READ_TIMEOUT).ok()?;
+            reading.memory_bytes = memory.memory_bytes;
+            reading.process_count = memory.process_count;
+            return Some((reading, identities));
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        let _ = (usage, identities);
+        None
+    }
+
+    #[cfg(test)]
     fn read(self, deadline: Instant, counted: &AtomicU64) -> SubtreeReading {
         #[cfg(not(any(test, target_os = "linux", windows)))]
         let _ = counted;
@@ -151,6 +347,7 @@ impl Target {
 }
 
 #[cfg(any(target_os = "linux", windows))]
+#[cfg(test)]
 fn unavailable(error: &std::io::Error) -> SubtreeReading {
     SubtreeReading::unavailable(if error.kind() == std::io::ErrorKind::TimedOut {
         "timeout"
@@ -159,6 +356,7 @@ fn unavailable(error: &std::io::Error) -> SubtreeReading {
     })
 }
 
+#[cfg(test)]
 pub(crate) async fn read(targets: Vec<Target>) -> Vec<SubtreeReading> {
     let mut readings = vec![SubtreeReading::unavailable("read_failed"); targets.len()];
     let mut tasks = tokio::task::JoinSet::new();
@@ -179,6 +377,7 @@ pub(crate) async fn read(targets: Vec<Target>) -> Vec<SubtreeReading> {
     readings
 }
 
+#[cfg(test)]
 async fn read_target(target: Target) -> SubtreeReading {
     if matches!(target, Target::Unavailable(_)) {
         return target.read(Instant::now() + READ_TIMEOUT, &AtomicU64::new(u64::MAX));
@@ -204,8 +403,11 @@ pub(crate) async fn read_process(
     module: crate::supervise::SupervisedModule,
 ) -> subc_control::ChildResourceUsage {
     let module_id = module.module_id().to_string();
+    let deadline = Instant::now() + READ_TIMEOUT;
+    let deadline = crate::control::list_diagnostics::deadline()
+        .map_or(deadline, |list| deadline.min(list.into_std()));
     bounded(
-        Instant::now() + READ_TIMEOUT,
+        deadline,
         move |_| module.child_resource_usage(),
         move |reason| {
             if reason == "timeout" {
@@ -245,7 +447,7 @@ fn should_log_timeout(
     true
 }
 
-async fn bounded<T: Send + 'static>(
+pub(crate) async fn bounded<T: Send + 'static>(
     deadline: Instant,
     read: impl FnOnce(Instant) -> T + Send + 'static,
     unavailable: impl Fn(&'static str) -> T,
@@ -253,6 +455,11 @@ async fn bounded<T: Send + 'static>(
     static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let slots = SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_READERS)));
     if Instant::now() >= deadline {
+        tracing::debug!(
+            cause = "deadline",
+            phase = "before_admission",
+            "resource read incomplete"
+        );
         return unavailable("timeout");
     }
     let Ok(Ok(permit)) = tokio::time::timeout(
@@ -261,9 +468,19 @@ async fn bounded<T: Send + 'static>(
     )
     .await
     else {
+        tracing::debug!(
+            cause = "admission",
+            phase = "reader_pool",
+            "resource read incomplete"
+        );
         return unavailable("timeout");
     };
     if Instant::now() >= deadline {
+        tracing::debug!(
+            cause = "deadline",
+            phase = "after_admission",
+            "resource read incomplete"
+        );
         return unavailable("timeout");
     }
     let task = tokio::task::spawn_blocking(move || {
@@ -277,15 +494,74 @@ async fn bounded<T: Send + 'static>(
         // A delayed runtime poll must not let a completed but overdue read
         // win the race against the timer.
         Ok(Ok((reading, finished))) if finished < deadline => reading,
-        Ok(Ok(_)) => unavailable("timeout"),
-        Ok(Err(_)) => unavailable("read_failed"),
-        Err(_) => unavailable("timeout"),
+        Ok(Ok(_)) => {
+            tracing::debug!(
+                cause = "deadline",
+                phase = "late_completion",
+                "resource read incomplete"
+            );
+            unavailable("timeout")
+        }
+        Ok(Err(error)) => {
+            tracing::debug!(cause = "read_failed", phase = "blocking_task", %error, "resource read incomplete");
+            unavailable("read_failed")
+        }
+        Err(_) => {
+            tracing::debug!(
+                cause = "deadline",
+                phase = "blocking_task",
+                "resource read incomplete"
+            );
+            unavailable("timeout")
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_membership_rechecks_the_same_native_start_identity() {
+        let pid = std::process::id();
+        let process = subc_os::Process::open(pid).unwrap().unwrap();
+        let start = process.observe().unwrap().start_time;
+        let target = Target::Cgroup("/sys/fs/cgroup".into());
+        assert_eq!(target.contains_identity(pid, start, &process), Some(true));
+        assert_eq!(target.contains_identity(pid, start + 1, &process), None);
+        assert_eq!(
+            Target::Unavailable("read_failed").contains_identity(pid, start, &process),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_counter_identity_changes_when_a_path_is_recreated() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+            "../../target/scratch/counter-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        let old_directory = std::fs::File::open(&path).unwrap();
+        let target = Target::Cgroup(path.clone());
+        let before = target.counter_identity().unwrap();
+        assert_eq!(target.counter_identity(), Some(before));
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let after = target.counter_identity().unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        drop(old_directory);
+        assert_ne!(
+            before, after,
+            "a recreated path must not inherit the old counter"
+        );
+    }
 
     #[test]
     fn timeout_logs_are_limited_per_module_for_one_minute() {

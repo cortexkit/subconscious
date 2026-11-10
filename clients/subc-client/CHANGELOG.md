@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.25.0
+## Unreleased
 
 - Correct the adopting sample's closed schema and review of absent or unchanged
   fields; exercise the sample against a gate-capable daemon.
@@ -12,6 +12,24 @@
   file bytes. Only a daemon lacking `config.gate` permits the legacy file reader.
 - Add a small adopting sample and isolated unstamped daemon coverage, plus
   golden-driven wire tests for stamped delivery, refusals and unknown statuses.
+
+## 0.24.4
+
+- Expose optional CatalogEntry.operation_deferral metadata mirrored from provider manifests.
+
+## 0.24.3
+
+- Add optional display-only `agent_name` and `flow_name` remote-claim input fields. Omit invalid names without refusing the claim: the same 1–80 Unicode scalar plain-text rule as `peer_name`, excluding controls and bidi formatting. Names never identify a caller. Generic management replies remain unmodified; the daemon validates names before serving them.
+
+## 0.24.2
+
+- Reject non-object non-null `remote_claim` inputs rather than silently dropping falsy values. Null and undefined both omit the claim, matching Rust. Shared Rust/TypeScript request fixtures cover all claim kinds and absence.
+
+- Add federated scope input types and strict nested request serialization, matched to Rust golden fixtures. Unknown scope-kind strings remain representable; the provider still ignores stamp fields it does not model. Treat `target_federated_unsupported` as a terminal route-open refusal.
+
+## 0.24.1
+
+- Expose optional `CatalogEntry.display_name` from module manifests. Apps fall back to `module_id` when absent; older catalog replies remain compatible.
 
 ## 0.24.0
 

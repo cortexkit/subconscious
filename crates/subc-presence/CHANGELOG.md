@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1
+## Unreleased
 
 - Report an authorized non-interactive polkit preflight as `Outcome::AuthorizedWithoutPrompt`, distinct from an interactive approval, so callers can require a person to confirm a request.
 

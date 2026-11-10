@@ -571,6 +571,10 @@ async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_du
                     "ck.{}.event.basal.flow_instance_expired.v1",
                     names.account()
                 ),
+                format!(
+                    "ck.{}.event.basal.flow_instance_rescheduled.v1",
+                    names.account()
+                ),
             ],
         ),
         (
@@ -584,7 +588,6 @@ async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_du
                     names.account()
                 ),
                 format!("ck.{}.event.thalamus.step.finished.v1", names.account()),
-                format!("ck.{}.event.thalamus-pi.step.finished.v1", names.account()),
             ],
         ),
         (
@@ -598,7 +601,6 @@ async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_du
             vec![
                 format!("ck.{}.event.thalamus-harness.compaction.>", names.account()),
                 format!("ck.{}.event.thalamus.compaction.>", names.account()),
-                format!("ck.{}.event.thalamus-pi.compaction.>", names.account()),
                 format!("ck.{}.event.broca.compaction.>", names.account()),
             ],
         ),
@@ -620,14 +622,6 @@ async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_du
         ),
         (
             streams.event.clone(),
-            "m_thalamus-pi",
-            vec![format!(
-                "ck.{}.event.magic-context.compaction.>",
-                names.account()
-            )],
-        ),
-        (
-            streams.event.clone(),
             "m_broca",
             vec![format!(
                 "ck.{}.event.magic-context.compaction.>",
@@ -640,8 +634,6 @@ async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_du
             [
                 "thalamus-harness.turn_started",
                 "thalamus-harness.turn_ended",
-                "thalamus-pi.turn_started",
-                "thalamus-pi.turn_ended",
             ]
             .iter()
             .map(|event| format!("ck.{}.event.{event}.v1", names.account()))
@@ -938,6 +930,10 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
                     "ck.{}.event.basal.flow_instance_expired.v1",
                     plane.names.account()
                 ),
+                format!(
+                    "ck.{}.event.basal.flow_instance_rescheduled.v1",
+                    plane.names.account()
+                ),
             ],
         ),
         (
@@ -953,14 +949,14 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
                     "ck.{}.event.thalamus.step.finished.v1",
                     plane.names.account()
                 ),
-                format!(
-                    "ck.{}.event.thalamus-pi.step.finished.v1",
-                    plane.names.account()
-                ),
             ],
         ),
         (
             "m_prefrontal-routing",
+            vec![format!("ck.{}.event.insula.>", plane.names.account())],
+        ),
+        (
+            "m_striatum",
             vec![format!("ck.{}.event.insula.>", plane.names.account())],
         ),
         (
@@ -971,10 +967,6 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
                     plane.names.account()
                 ),
                 format!("ck.{}.event.thalamus.compaction.>", plane.names.account()),
-                format!(
-                    "ck.{}.event.thalamus-pi.compaction.>",
-                    plane.names.account()
-                ),
                 format!("ck.{}.event.broca.compaction.>", plane.names.account()),
             ],
         ),
@@ -993,13 +985,6 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
             )],
         ),
         (
-            "m_thalamus-pi",
-            vec![format!(
-                "ck.{}.event.magic-context.compaction.>",
-                plane.names.account()
-            )],
-        ),
-        (
             "m_broca",
             vec![format!(
                 "ck.{}.event.magic-context.compaction.>",
@@ -1011,8 +996,6 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
             [
                 "thalamus-harness.turn_started",
                 "thalamus-harness.turn_ended",
-                "thalamus-pi.turn_started",
-                "thalamus-pi.turn_ended",
             ]
             .iter()
             .map(|event| format!("ck.{}.event.{event}.v1", plane.names.account()))
@@ -1071,7 +1054,6 @@ async fn second_bootstrap_keeps_event_durable_creation_times_and_ack_floors() {
         "m_magic-context",
         "m_thalamus-harness",
         "m_thalamus",
-        "m_thalamus-pi",
         "m_broca",
         "m_cerebellum",
     ];
@@ -1118,6 +1100,61 @@ async fn bootstrap_updates_event_filters_and_limits_in_place_preserving_ack_floo
         .unwrap();
     drop(plane.bootstrap().await);
     assert_eq!(plane.cursor("m_prefrontal-core").await, before);
+    plane.server.stop().await;
+}
+
+#[tokio::test]
+async fn naming_032_bootstrap_removes_routing_step_filters_preserving_delivered_position() {
+    let _gate = harness::acceptance_gate().await;
+    let Some(plane) = UpgradePlane::start().await else {
+        return;
+    };
+    drop(plane.bootstrap().await);
+    let durable = "m_prefrontal-routing";
+    let mut old = plane.consumer(durable).await.cached_info().config.clone();
+    old.filter_subject.clear();
+    old.filter_subjects = vec![
+        format!("ck.{}.event.insula.>", plane.names.account()),
+        format!("ck.{}.event.broca.step.finished.v1", plane.names.account()),
+        format!(
+            "ck.{}.event.thalamus-harness.step.finished.v1",
+            plane.names.account()
+        ),
+    ];
+    plane
+        .js
+        .update_consumer_on_stream(old, &plane.names.streams().event)
+        .await
+        .unwrap();
+    let sequence = plane.store_event("insula", "signal").await;
+    assert_eq!(plane.ack_one(durable).await, sequence);
+    plane.store_event("broca", "step.finished").await;
+    plane.store_event("thalamus-harness", "step.finished").await;
+    let before = plane.cursor(durable).await;
+    assert_eq!(before["num_pending"], 2);
+
+    drop(plane.bootstrap().await);
+    let after = plane.cursor(durable).await;
+    assert_eq!(
+        plane
+            .consumer(durable)
+            .await
+            .get_info()
+            .await
+            .unwrap()
+            .config
+            .filter_subjects,
+        vec![format!("ck.{}.event.insula.>", plane.names.account())]
+    );
+    for field in ["created", "ack_floor", "delivered", "num_ack_pending"] {
+        assert_eq!(after[field], before[field], "{durable} must keep {field}");
+    }
+    assert_eq!(after["num_pending"], 0);
+    plane.store_event("broca", "step.finished").await;
+    plane.store_event("thalamus-harness", "step.finished").await;
+    assert_eq!(plane.cursor(durable).await["num_pending"], 0);
+    let quota = plane.store_event("insula", "quota_sampled").await;
+    assert_eq!(plane.ack_one(durable).await, quota);
     plane.server.stop().await;
 }
 

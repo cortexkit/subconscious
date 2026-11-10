@@ -1,10 +1,41 @@
 # Changelog
 
-## 0.35.1
+## Unreleased
 
 - Expose each generation's approval channel in config status and history.
 - Add standalone config-gate client requests, plan views, status and responses;
   preserve the legacy exhaustive control enums and require capability opt-in.
+
+## 0.38.2
+
+- Mirror optional operation_deferral metadata in non-exhaustive CatalogEntry, omitted when absent. Require protocol 0.36.2.
+
+## 0.38.1
+
+- Add optional `measured_at_ms` timestamps to tree, daemon and agents resource readings. Omitted timestamps remain compatible with older frames; readers ignore unknown additions. A retained tree can accompany an open-set `tree_unavailable` reason describing a failed newer observation.
+
+## 0.38.0
+
+- **Rust migration:** `TreeReading`, `ProcessGroup`, `TreeOwn`, `CpuLastHour`, `DaemonResources`, `AgentCommandResources`, `ChildResourceReading`, and `PendingReloadVerdict` are now non-exhaustive. Replace external struct literals with their required-field `new` constructors and `with_*` builders; optional metadata defaults to absent or empty. This keeps future optional resource fields source-compatible. `SupervisorEntry` already uses this construction API. JSON field names and decoding remain unchanged.
+- Add optional `TreeReading.own: TreeOwn` for the module root's attributed CPU and memory, with the row's optional CPU lower bound. `tree.groups` now contains only child processes, retaining children whose program name matches the root. Root and emitted child-group shares cannot exceed their module row; older JSON readers ignore `own`.
+
+## 0.37.0
+
+- Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.
+
+## 0.36.0
+
+- Add an optional `cpu_last_hour.bound` independently of the cumulative CPU bound, so a recent-hour uncertainty can expire without claiming lost lifetime CPU was recovered.
+
+- Program groups report only live processes' CPU already credited to their module or agents total, with optional lower-bound metadata. The groups' CPU sum cannot exceed that enclosing total, which also retains exited processes' work.
+- Add optional CPU lower-bound and unmeasured-finish metadata. Omitted program groups decode as none, while required resource numbers still reject omission rather than becoming zero.
+
+- Add optional `SupervisorEntry.tree_unavailable`, an open snake_case reason string for a missing tree measurement. `not_yet_measured` distinguishes a reporting daemon from an older daemon without resource-tree support; measured tree fields remain unchanged.
+- Report cumulative module-tree CPU/memory, program groups, daemon resources, agent-command totals and sampled last-hour CPU. Unknown readings remain optional. Replace the memory-only SupervisorEntry.subtree member with tree. Adopt the breaking protocol release.
+
+## 0.35.1
+
+- Add optional `CatalogEntry::display_name` and `with_display_name`. Absence preserves existing catalog JSON; non-exhaustive construction keeps the Rust API additive. Require protocol 0.34.5.
 
 ## 0.35.0
 

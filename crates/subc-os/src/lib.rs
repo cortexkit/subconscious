@@ -232,6 +232,127 @@ pub fn start_time(pid: u32) -> Option<u64> {
     }
 }
 
+/// Snapshot probes distinguish an exited process from a failed identity read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IdentityRead {
+    Alive(u64),
+    #[cfg_attr(windows, allow(dead_code))]
+    // Windows retains its existing unknown-on-observe-failure policy.
+    Gone,
+    Unknown,
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod identity_read_tests {
+    use super::*;
+
+    #[test]
+    fn identity_probe_distinguishes_alive_gone_and_invalid() {
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while read_identity(pid) != IdentityRead::Gone {
+            assert!(
+                std::time::Instant::now() < until,
+                "an exited owned child must become gone before reaping"
+            );
+            std::thread::yield_now();
+        }
+        child.wait().unwrap();
+        assert_eq!(
+            read_identity(pid),
+            IdentityRead::Gone,
+            "a missing owned PID is gone"
+        );
+        assert_eq!(read_identity(0), IdentityRead::Unknown);
+        assert!(matches!(
+            read_identity(std::process::id()),
+            IdentityRead::Alive(_)
+        ));
+    }
+}
+
+#[cfg(not(windows))]
+fn read_identity(pid: u32) -> IdentityRead {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        platform::read_identity(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        start_time(pid).map_or(IdentityRead::Unknown, IdentityRead::Alive)
+    }
+}
+
+mod process_tree;
+pub use process_tree::{ProcessGroup, ProcessMember, ProcessTable, TreeUsage};
+
+/// Kernel process creation time, in milliseconds since the Unix epoch.
+///
+/// Linux combines procfs boot time (whole seconds) with start ticks (usually
+/// 10 ms precision). macOS truncates microseconds and Windows truncates 100 ns
+/// FILETIME ticks to milliseconds. Use [`process_start_time_precision_ms`] when
+/// comparing a declaration made by another process; this is not a unique ID
+/// for two starts within the kernel's timestamp resolution.
+pub fn process_start_time_ms(pid: u32) -> Option<u64> {
+    start_time_ms_from_native(start_time(pid)?)
+}
+
+fn start_time_ms_from_native(raw: u64) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_start_time_ms(raw, || std::fs::read_to_string("/proc/stat").ok())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(raw / 1_000)
+    }
+    #[cfg(windows)]
+    {
+        (raw / 10_000).checked_sub(11_644_473_600_000)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = raw;
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_start_time_ms(raw: u64, read_boot: impl FnOnce() -> Option<String>) -> Option<u64> {
+    // Realtime clock steps change the boot-time value in the `btime` line.
+    // The daemon and a newly started client
+    // must both convert against the current value, not a per-process cache.
+    let boot = read_boot()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime ")?.parse::<u64>().ok())?;
+    boot.checked_mul(1_000)?
+        .checked_add(raw.checked_mul(1_000)? / rustix::param::clock_ticks_per_second().max(1))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn linux_start_identity_uses_fresh_boot_time_after_clock_step() {
+    let before = linux_start_time_ms(100, || Some("btime 1000\n".into())).unwrap();
+    let after = linux_start_time_ms(100, || Some("btime 1002\n".into())).unwrap();
+    assert_eq!(after - before, 2_000);
+}
+
+/// Resolution used by [`process_start_time_ms`], rounded up to milliseconds.
+pub fn process_start_time_precision_ms() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        1_000_u64.div_ceil(rustix::param::clock_ticks_per_second().max(1))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        1
+    }
+}
+
 /// The parent pid reported by the kernel, or `None` when it cannot be read.
 /// On Windows a reused parent pid (created after the child) is rejected.
 pub fn parent_pid(pid: u32) -> Option<u32> {
@@ -477,6 +598,13 @@ impl Process {
     #[cfg(windows)]
     pub fn resource_usage(&self) -> Option<ResourceUsage> {
         windows::resource_usage(self)
+    }
+
+    /// Cumulative CPU read from the retained Windows process handle, including
+    /// after exit. Unlike working-set observations, final CPU remains available.
+    #[cfg(windows)]
+    pub fn cumulative_cpu_ms(&self) -> Option<u64> {
+        windows::cumulative_cpu_ms(self)
     }
 
     /// Send `signal` to the process.

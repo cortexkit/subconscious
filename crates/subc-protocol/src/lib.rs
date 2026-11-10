@@ -59,9 +59,10 @@ mod reader_skew;
 
 /// Canonical error codes emitted by subc.
 ///
-/// Error frames remain extensible strings, but daemon-owned outcomes need
-/// identical spelling across the daemon and SDK retry policies.
+/// Error frames remain extensible strings; daemon-owned refusals need identical
+/// spelling and operation-specific retry policies across the daemon and SDKs.
 pub mod error_codes {
+    pub const CATALOG_UPDATE_FROZEN_CAPABILITY: &str = "catalog_update_frozen_capability";
     use crate::Flags;
 
     /// No approved configuration is available. Keep the last view, never fall
@@ -123,6 +124,22 @@ pub mod error_codes {
         )
     }
 
+    /// Whether an agent declaration may be retried with a fresh correlation
+    /// and, for a closed declaration queue, a current supervised connection.
+    pub fn is_retryable_agent_commands(code: &str) -> bool {
+        matches!(
+            code,
+            AGENT_ROOTS_FULL | DECLARATION_CLOSED | DUPLICATE_CORRELATION | "busy"
+        )
+    }
+
+    /// RETRYABLE after live command capacity is available; accepted batch peers remain committed.
+    pub const AGENT_ROOTS_FULL: &str = "agent_roots_full";
+    /// RETRYABLE on a current supervised connection, not on the closed declaration queue.
+    pub const DECLARATION_CLOSED: &str = "declaration_closed";
+    /// RETRYABLE with a fresh correlation; the original declaration remains in flight.
+    pub const DUPLICATE_CORRELATION: &str = "duplicate_correlation";
+
     pub const UNKNOWN_CHANNEL: &str = "unknown_channel";
     pub const STALE_ROUTE_EPOCH: &str = "stale_route_epoch";
     /// A caller or target authority epoch changed before the bind committed.
@@ -164,6 +181,12 @@ pub mod error_codes {
     /// alone does not promise flow behaviour, and removing it would silently
     /// change the identity.
     pub const TARGET_FLOW_UNSUPPORTED: &str = "target_flow_unsupported";
+    /// The target cannot safely receive a federated flow or run claim.
+    pub const TARGET_FEDERATED_UNSUPPORTED: &str = "target_federated_unsupported";
+    /// A describe reader has not declared the federated provider contract.
+    pub const SCOPE_FEDERATED_UNSUPPORTED: &str = "scope_federated_unsupported";
+    /// Federated facts cannot change within a scope epoch.
+    pub const SCOPE_FEDERATED_CHANGED: &str = "scope_federated_changed";
     /// An agent-run-scoped route targets a module providing neither
     /// `agent-run-scopes/v1` nor `call-modes/v1`, or a delegating run targets a
     /// module without `call-modes/v1`. TERMINAL: removing `run_id` or delegation
@@ -351,6 +374,8 @@ pub mod error_codes {
         if matches!(
             code,
             TARGET_FLOW_UNSUPPORTED
+                | FEDERATED_STAMP_REQUIRED
+                | TARGET_FEDERATED_UNSUPPORTED
                 | TARGET_AGENT_RUN_UNSUPPORTED
                 | SCOPE_BIND_PROOF_REQUIRED
                 | SCOPE_BIND_PROOF_MISMATCH
@@ -371,6 +396,11 @@ pub mod error_codes {
                 | STALE_AUTHORITY_EPOCH
         )
     }
+
+    /// The scope requires a federated stamp, but the target cannot read one.
+    pub const FEDERATED_STAMP_REQUIRED: &str = "federated_stamp_required";
+    /// Only the configured federated owner with route-authorize/v1 may ask.
+    pub const ROUTE_AUTHORIZE_NOT_PERMITTED: &str = "route_authorize_not_permitted";
 
     /// Whether the caller should evict this established route, reopen it, and
     /// resend the request once. Consumers mapping route death to their own
@@ -396,6 +426,24 @@ pub mod error_codes {
     /// errors, and errors on routes without the opt-in, prove no non-delivery.
     pub fn is_route_busy_retryable(flags: Flags, code: &str, route_opted_in: bool) -> bool {
         route_opted_in && flags.is_daemon_origin() && code == ROUTE_BUSY
+    }
+
+    #[cfg(test)]
+    mod agent_command_tests {
+        #[test]
+        fn agent_declaration_refusals_have_explicit_retry_classes() {
+            for (code, retry) in [
+                ("agent_roots_full", true),
+                ("busy", true),
+                ("duplicate_correlation", true),
+                ("declaration_closed", true),
+                ("not_supervised", false),
+                ("invalid_request", false),
+                ("future_code", false),
+            ] {
+                assert_eq!(super::is_retryable_agent_commands(code), retry, "{code}");
+            }
+        }
     }
 }
 

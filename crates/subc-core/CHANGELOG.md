@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.20.164
+## Unreleased
 
 - Add `ck config` status, plan, apply-by-digest, stamp, unstamp, history,
   rollback and development program placement. Preserve the complete daemon
@@ -9,22 +9,43 @@
 - Require subc-daemon 0.41.10 or newer for connection-bound configuration delivery
   and pending ACK visibility until the authority-store anchor commits.
 
-## 0.20.163
-
 - Require subc-daemon 0.41.9 or newer so configuration approval binds to a
   complete plan delivered to a verified desktop and requires interactive OS
   confirmation. No development identity verifier is shipped.
 
-## 0.20.162
-
 - Raise the daemon dependency floor for bounded authority-store publication and
   protected daemon configuration history.
-
-## 0.20.161
 
 - Accept a single absolute `ck-subc --config-store-root` service argument while
   refusing relative, duplicated and otherwise unknown startup arguments. Without
   that argument the daemon opens no configuration authority store.
+
+## 0.21.3
+
+- Require subc-client-rs 0.38.0 for scoped managed calls and watches. This dependency-only patch keeps wire behavior unchanged.
+
+## 0.21.2
+
+- Test-only: accept a pre-fetched, SHA-256-verified published ck-auth archive so Linux CI can cache the pinned release without changing bootstrap coverage. Cache the pinned nats-server archive in CI as well, with checksum verification and download retries on cache misses.
+
+## 0.21.1
+
+- Refresh the daemon, control, Rust-client and UI requirements for extensible supervisor resources. CLI and executable behavior is unchanged.
+
+## 0.21.0
+
+- Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.
+
+## 0.20.162
+
+- Show cumulative tree CPU separately from own-process resources; prefix only CPU lower bounds with `≥`. Stopped modules report `not running`, distinct from a pending first measurement.
+- `ck module list` can briefly show an unknown reload verdict immediately after a module starts while the daemon finishes its bounded image observation. Per-process resource readings take priority over optional tree diagnostics.
+- Show `not measured yet` for a new daemon's pending tree measurement, retaining `not reported by this daemon` for older daemons. Unknown unavailability reasons render as `not measured` without guessing a cause.
+- Read the new cumulative tree resource field when displaying module memory, retaining the process-only resource display. Update fixture expectations because tree replaces unavailable memory-only subtree readings on non-container platforms.
+
+## 0.20.161
+
+- Ship daemon 0.41.2 with validated optional module display names in `catalog.list`, and cover registration and catalog projection with an isolated child-daemon integration test. Refresh co-bumped wire-crate requirements.
 
 ## 0.20.160
 

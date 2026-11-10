@@ -133,8 +133,12 @@ async fn describe_connection_reports_tcp_and_local_listener_on_real_daemon() {
 }
 
 #[test]
-fn route_option_legacy_struct_literals_and_default_updates_still_compile() {
+fn route_option_struct_literals_with_scope_and_default_updates_compile() {
+    assert!(CallOptions::default().scope.is_none());
+    assert!(SubscribeOptions::default().scope.is_none());
+    assert!(CloseRouteOptions::default().scope.is_none());
     let _full_call = CallOptions {
+        scope: None,
         timeout: Duration::from_secs(30),
         priority: Priority::Interactive,
         admission_class: subc_protocol::AdmissionClass::Normal,
@@ -145,8 +149,21 @@ fn route_option_legacy_struct_literals_and_default_updates_still_compile() {
         role_versions: None,
     };
     let _full_close = CloseRouteOptions {
+        scope: None,
         drain: false,
         drain_timeout: Duration::from_secs(30),
+        consumer_identity: None,
+        reverse_requests: ReverseRequestRegistry::new(),
+        role_versions: None,
+    };
+    let _full_subscribe = SubscribeOptions {
+        scope: None,
+        priority: Priority::Interactive,
+        admission_class: subc_protocol::AdmissionClass::Normal,
+        event_buffer: 16,
+        route_retry: RetryBackoff::default(),
+        route_retry_deadline: Duration::from_secs(90),
+        route_open_timeout: Duration::from_secs(30),
         consumer_identity: None,
         reverse_requests: ReverseRequestRegistry::new(),
         role_versions: None,
@@ -5975,6 +5992,52 @@ fn sdk_scope_owner() -> Principal {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn route_authorize_unknown_target_is_an_absent_answer() {
+    use subc_client_rs::{RouteAuthorizeExpected, RouteAuthorizeOutcome, RouteAuthorizeScope};
+    use subc_protocol::scope::{ScopeAttributes, ROUTE_AUTHORIZE_CAPABILITY};
+
+    let mut run = run_scope_owner_with_config(
+        json!([sync_step(
+            1,
+            json!([{
+                "ref": "stored-source", "scope_epoch": 1, "kind": "head",
+                "carriers": [{"principal": {"kind": "direct"}}],
+            }])
+        )]),
+        json!({
+            "federated_scope_owner": SDK_SCOPE_READER,
+            "scope_authority_owners": [SDK_SCOPE_OWNER],
+        }),
+    )
+    .await;
+    assert_eq!(
+        run.results[0]["ok"]["results"][0]["outcome"], "created",
+        "{:?}",
+        run.results
+    );
+    let (authorizer, serve_task) = spawn_inline_module(
+        &run.daemon.connection_file,
+        inline_capability_module_manifest(SDK_SCOPE_READER, Some(ROUTE_AUTHORIZE_CAPABILITY)),
+    )
+    .await;
+    let answer = authorizer
+        .route_authorize(
+            Principal::Direct,
+            RouteAuthorizeScope::new(sdk_scope_owner(), "stored-source", 1),
+            "never-registered-target".into(),
+            RouteAuthorizeExpected::new(ScopeKind::Head, &ScopeAttributes::default()),
+        )
+        .await
+        .expect("an absent target is an authorization answer, not a call error");
+    assert_eq!(answer.outcome, RouteAuthorizeOutcome::TargetAbsent);
+    assert_eq!(answer.route_open_code, None);
+    assert_eq!(answer.content_version, None);
+    assert!(!answer.message.is_empty());
+    run.daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
 fn sync_step(generation: u64, scopes: Value) -> Value {
     json!({ "op": "sync", "generation": generation, "scopes": scopes })
 }
@@ -6604,3 +6667,5 @@ mod binary_replies;
 
 #[path = "real_daemon/config_gate.rs"]
 mod config_gate;
+#[path = "real_daemon/managed_scopes.rs"]
+mod managed_scopes;

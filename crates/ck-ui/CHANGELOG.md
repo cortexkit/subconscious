@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.0
+
+- Adopt subc-client-rs 0.38.0 for scoped managed calls and watches. This is a breaking Rust dependency upgrade because the public API exposes SDK types; downstream users must upgrade their SDK dependency too. No wire behavior changes.
+
+## 0.6.0
+
+- Show module process trees, hourly CPU in cores, daemon and agents' command rows, and a pinned whole-stack total in Modules; preserve the older daemon view when tree accounting is absent.
+- Show the module's own process, from the optional `tree.own` reading, before its child-only program groups, and show no own-process line when the reading is absent.
+- Adopt control 0.38 and Rust client 0.37. Public live-state fields and mapping/settings methods now expose that control type family, requiring a breaking Rust dependency release. Rendering behavior is unchanged.
+
+## 0.5.0
+
+- Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.
+
+## 0.4.0
+
+- Raise dependency floors for the resource-accounting wire release; the public dependency types require a breaking minor version.
+
 ## 0.3.2
 
 - Add the named-computer picker and an explicit forget action, including recovery when forgetting only partly succeeds.

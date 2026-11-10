@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.34.5
+## Unreleased
 
 - Add standalone, opt-in `config.review`, `config.declare`, `config.get`,
   `config.applied` and `config.changed` bodies and the `config.gate` capability.
@@ -16,6 +16,33 @@
   `subc-protocol` release. Add `subc-config` and `base64` dependencies; no new
   Cargo features are enabled. Snapshot bytes use canonical padded base64 and
   decode only when their raw-byte digest matches.
+
+## 0.36.2
+
+- Add typed route.authorize scope/expected/reply bodies and route-authorize/v1, plus terminal federated_stamp_required and route_authorize_not_permitted codes.
+- Add epoch-fixed FederatedAttributes.stamp_required (omitted when false) and bounded operation_deferral manifest metadata, dropped whole when invalid.
+
+## 0.36.1
+
+- Add optional display-only `agent_name` on agent, run and worker remote claims, and `flow_name` on flow claims, with builders preserving existing constructors. Names follow `peer_name`'s 1–80 Unicode scalar plain-text rule; decoding drops invalid names without rejecting the claim. Absent names are omitted, never serialized as null.
+- Add `RemoteClaim::same_identity` and `FederatedAttributes::same_identity` for comparisons excluding only remote display names. Structural equality still detects display changes.
+
+## 0.36.0
+
+- Add federated scope kinds, typed paired-peer attributes and strict remote claims, shared validation, and the `scope-federated/v1` capability. Non-federated attributes omit the new member.
+- Add terminal `target_federated_unsupported` plus `scope_federated_unsupported` and `scope_federated_changed`.
+- Add `catalog_update_frozen_capability`; make every `RemoteClaim` struct-like variant non-exhaustive with public constructors. Use the constructors instead of variant literals and include `..` in field patterns.
+- **Breaking Rust API:** `ScopeKind` adds `Federated` and is now non-exhaustive. Add a wildcard arm to every `ScopeKind` match when adopting this version. New peer-class and remote-claim enums are non-exhaustive from their first release.
+
+## 0.35.0
+
+- Name capacity, closed-queue and duplicate-correlation agent declaration refusals and expose their operation-specific retry classification without changing route-open retry policy.
+
+- Add the supervised supervisor.agent_commands module request with epoch-millisecond process identities and optional reap totals. The new request variant and non-exhaustive request enum require a breaking minor release; unknown module requests can be handled without exhaustive downstream matches in future releases.
+
+## 0.34.5
+
+- Add optional `ModuleManifest::display_name`, a fallible builder setter, and shared display-name validation for trimmed, bounded plain text. The manifest remains non-exhaustive and unknown top-level fields remain lenient.
 
 ## 0.34.4
 

@@ -40,6 +40,8 @@
     "stale_authority_epoch": "retryable",
     "target_agent_run_unsupported": "terminal",
     "target_flow_unsupported": "terminal",
+    "target_federated_unsupported": "terminal",
+    "federated_stamp_required": "terminal",
     "target_unavailable": "retryable",
     "unknown_module": "terminal"
   },

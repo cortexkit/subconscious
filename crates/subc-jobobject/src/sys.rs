@@ -30,8 +30,9 @@ use windows_sys::Win32::{
         },
         JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
-            JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation,
-            QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+            JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+            TerminateJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
             JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         },
@@ -284,6 +285,58 @@ impl std::error::Error for JobMemoryError {
 }
 
 impl JobQuery {
+    /// Confirm membership through the caller's retained process handle, not a
+    /// numeric PID which could have been reused since enumeration.
+    pub fn contains_process(
+        &self,
+        process: &impl std::os::windows::io::AsRawHandle,
+    ) -> io::Result<bool> {
+        let mut member = 0;
+        // SAFETY: both borrowed handles stay owned throughout this query and
+        // the BOOL output slot is valid. No process or job is modified.
+        if unsafe {
+            IsProcessInJob(
+                process.as_raw_handle(),
+                self.handle.as_raw_handle(),
+                &mut member,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(member != 0)
+    }
+
+    /// Cumulative job CPU, including processes that have already exited.
+    pub fn cpu_ms(&self) -> io::Result<u64> {
+        // SAFETY: the accounting structure is a plain C output buffer.
+        let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: the query-only handle is live and the output size matches the class.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.handle.as_raw_handle(),
+                JobObjectBasicAccountingInformation,
+                std::ptr::from_mut(&mut accounting).cast(),
+                size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((accounting.TotalUserTime.max(0) as u64)
+            .saturating_add(accounting.TotalKernelTime.max(0) as u64)
+            / 10_000)
+    }
+
+    /// Live job membership for joining one shared process-table snapshot.
+    pub fn process_ids(&self, deadline: Instant) -> io::Result<Vec<u32>> {
+        self.members(deadline)?
+            .into_iter()
+            .map(|pid| u32::try_from(pid).map_err(io::Error::other))
+            .collect()
+    }
+
     fn check(deadline: Instant) -> io::Result<()> {
         if Instant::now() >= deadline {
             Err(io::Error::new(

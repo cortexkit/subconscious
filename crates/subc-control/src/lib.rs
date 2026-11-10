@@ -96,6 +96,8 @@ pub use connection_describe::*;
 
 mod subtree;
 pub use subtree::*;
+mod tree;
+pub use tree::*;
 
 /// Daemon-spawned consumer identity presented on route.open.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -517,6 +519,10 @@ pub enum ClientControlResponse {
     SupervisorList {
         generation: u64,
         modules: Vec<SupervisorEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        daemon: Option<DaemonResources>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_commands: Option<Vec<AgentCommandResources>>,
     },
     #[serde(rename = "supervisor.spawn_snapshot")]
     SupervisorSpawnSnapshot {
@@ -1095,12 +1101,46 @@ pub struct SupervisorObservedProcess {
 
 /// Independent comparisons of configured path, launch spec and running image at list time.
 /// An absent verdict means the daemon predates this field, not agreement.
+///
+/// Use [`PendingReloadVerdict::new`] rather than an external struct literal:
+///
+/// ```compile_fail,E0639
+/// use subc_control::{PendingReloadVerdict, ReloadPathAgreement, RunningImageAgreement,
+///     RunningImageUnavailableReason};
+/// let verdict = PendingReloadVerdict {
+///     path: ReloadPathAgreement::Match,
+///     image: RunningImageAgreement::Unavailable {
+///         reason: RunningImageUnavailableReason::NotRunning,
+///     },
+///     spec: None,
+/// };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct PendingReloadVerdict {
     pub path: ReloadPathAgreement,
     pub image: RunningImageAgreement,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<LaunchSpecAgreement>,
+}
+
+impl PendingReloadVerdict {
+    /// Create the path and image comparisons without a launch-spec verdict.
+    #[must_use]
+    pub fn new(path: ReloadPathAgreement, image: RunningImageAgreement) -> Self {
+        Self {
+            path,
+            image,
+            spec: None,
+        }
+    }
+
+    /// Set or clear the comparison of launch specifications.
+    #[must_use]
+    pub fn with_spec(mut self, spec: Option<LaunchSpecAgreement>) -> Self {
+        self.spec = spec;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -1259,6 +1299,7 @@ open_string_enum! {
     /// Reasons why an executable identity could not be observed.
     RunningImageUnavailableReason {
         NotRunning => "not_running",
+        NotYetMeasured => "not_yet_measured",
         UnsupportedPlatform => "unsupported_platform",
         RunningExecutableUnreadable => "running_executable_unreadable",
         RunningExecutablePermissionDenied => "running_executable_permission_denied",
@@ -2359,6 +2400,9 @@ pub enum PollKind {
 #[non_exhaustive]
 pub struct CatalogEntry {
     pub module_id: String,
+    /// Module-declared human-readable name. Apps fall back to `module_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     /// Whether the registered module currently accepts new route binds.
     ///
     /// This is the module's EFFECTIVE readiness: its own declared readiness
@@ -2434,6 +2478,9 @@ pub struct CatalogEntry {
     /// from before the field. The daemon relays it and never enforces it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_operations: Option<Vec<String>>,
+    /// Deferred-operation declarations mirrored from the registered manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_deferral: Option<BTreeMap<String, bool>>,
     /// Management operations the module guards with `operator.confirm`,
     /// mirrored unchanged from its manifest. Absent means the module did not
     /// say (or declared an invalid list, which the daemon dropped), so a reader
@@ -2480,6 +2527,13 @@ pub struct CatalogEntry {
 }
 
 impl CatalogEntry {
+    /// Sets the optional module-declared display name.
+    #[must_use]
+    pub fn with_display_name(mut self, display_name: Option<String>) -> Self {
+        self.display_name = display_name;
+        self
+    }
+
     /// Construct an entry with its required fields and wire-compatible defaults.
     #[must_use]
     pub fn new(
@@ -2490,6 +2544,7 @@ impl CatalogEntry {
         Self {
             module_id: module_id.into(),
             ready: default_true(),
+            display_name: None,
             not_ready: None,
             module_version: None,
             provenance: None,
@@ -2501,6 +2556,7 @@ impl CatalogEntry {
             operation_delivery: BTreeMap::new(),
             operation_payload: BTreeMap::new(),
             flow_operations: None,
+            operation_deferral: None,
             confirm_operations: None,
             rich_ui: None,
             role_declarations: BTreeMap::new(),
@@ -2531,6 +2587,13 @@ impl CatalogEntry {
     #[must_use]
     pub fn with_flow_operations(mut self, flow_operations: Option<Vec<String>>) -> Self {
         self.flow_operations = flow_operations;
+        self
+    }
+
+    /// Set deferred-operation declarations mirrored from the manifest.
+    #[must_use]
+    pub fn with_operation_deferral(mut self, operations: Option<BTreeMap<String, bool>>) -> Self {
+        self.operation_deferral = operations;
         self
     }
 
@@ -2930,10 +2993,19 @@ pub struct SupervisorEntry {
     /// mistaken for a process using nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<ChildResourceUsage>,
-    /// Memory including child processes, with its measurement source. Report
-    /// only; absence means the daemon does not report one.
+    /// Cumulative CPU and current memory including child processes, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subtree: Option<SubtreeReading>,
+    pub tree: Option<TreeReading>,
+    /// Why this reporting daemon has no tree reading for this response.
+    /// `not_yet_measured` means this launch has no measurement; `unreadable`
+    /// and `launch_changed` can accompany a retained, older tree. `not_running`
+    /// marks a stopped module. Future reasons remain valid open-set strings.
+    /// Absence alone does not establish tree support.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_unavailable: Option<String>,
+    /// CPU used across the wall-clock interval covered by retained samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_last_hour: Option<CpuLastHour>,
 }
 
 impl SupervisorEntry {
@@ -2981,7 +3053,9 @@ impl SupervisorEntry {
             restart_backoff_ms: None,
             restart_max_backoff_ms: None,
             resources: None,
-            subtree: None,
+            tree: None,
+            tree_unavailable: None,
+            cpu_last_hour: None,
         }
     }
 
@@ -3131,8 +3205,15 @@ impl SupervisorEntry {
 
     /// Attach a report-only reading covering the module's process container.
     #[must_use]
-    pub fn with_subtree(mut self, subtree: Option<SubtreeReading>) -> Self {
-        self.subtree = subtree;
+    pub fn with_tree(mut self, tree: Option<TreeReading>) -> Self {
+        self.tree = tree;
+        self
+    }
+
+    /// Explain an absent tree reading without manufacturing numeric counters.
+    #[must_use]
+    pub fn with_tree_unavailable(mut self, reason: Option<String>) -> Self {
+        self.tree_unavailable = reason;
         self
     }
 }
@@ -3154,7 +3235,9 @@ pub enum ChildResourceUsage {
 }
 
 /// One reading of a module process's memory and CPU time.
+/// Use [`ChildResourceReading::new`] and its builders so future fields stay additive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChildResourceReading {
     /// Memory in bytes, measured as `memory_kind` says. The figures differ
     /// by platform and are not comparable across kinds.
@@ -3171,6 +3254,32 @@ pub struct ChildResourceReading {
     /// CPU time spent in the kernel on the process's behalf since it started,
     /// in milliseconds.
     pub cpu_system_ms: u64,
+}
+
+impl ChildResourceReading {
+    /// Create a process reading without optional swap accounting.
+    #[must_use]
+    pub fn new(
+        memory_bytes: u64,
+        memory_kind: ChildMemoryKind,
+        cpu_user_ms: u64,
+        cpu_system_ms: u64,
+    ) -> Self {
+        Self {
+            memory_bytes,
+            memory_kind,
+            cpu_user_ms,
+            cpu_system_ms,
+            swap_bytes: None,
+        }
+    }
+
+    /// Set or clear swap bytes where the platform can measure them.
+    #[must_use]
+    pub fn with_swap_bytes(mut self, swap_bytes: Option<u64>) -> Self {
+        self.swap_bytes = swap_bytes;
+        self
+    }
 }
 
 open_string_enum! {

@@ -243,7 +243,11 @@ async fn assert_opaque_round_trip(
     let poll = route_poll_frame(case.corr_base + 1, ack.route_channel, ack.route_epoch);
     write_frame(&mut client, &poll).await.unwrap();
     client.flush().await.unwrap();
-    let poll_reply = read_frame_timeout(&mut client).await;
+    let poll_reply = read_frame_timeout(
+        &mut client,
+        &format!("{} route.poll corr={}", case.archetype, case.corr_base + 1),
+    )
+    .await;
     assert_route_poll_status_none(&poll_reply, case.corr_base + 1);
     used_channel0_ops.insert(ops::ROUTE_POLL);
     observed_frame_types.push(FrameType::Request);
@@ -259,7 +263,16 @@ async fn assert_opaque_round_trip(
     write_frame(&mut client, &request).await.unwrap();
     client.flush().await.unwrap();
 
-    let response = read_frame_timeout(&mut client).await;
+    let response = read_frame_timeout(
+        &mut client,
+        &format!(
+            "{} data RESPONSE channel={} corr={}",
+            case.archetype,
+            ack.route_channel,
+            case.corr_base + 2
+        ),
+    )
+    .await;
     observed_frame_types.push(response.header.ty);
     assert_eq!(
         response.header.ty,
@@ -490,7 +503,7 @@ async fn assert_unknown_domain_op_is_not_smuggled_into_channel0(
     write_frame(&mut client, &frame).await.unwrap();
     client.flush().await.unwrap();
 
-    let error = read_frame_timeout(&mut client).await;
+    let error = read_frame_timeout(&mut client, "unknown channel-0 operation ERROR corr=30").await;
     observed_frame_types.push(error.header.ty);
     assert_eq!(error.header.ty, FrameType::Error);
     assert_eq!(error.header.channel, 0);
@@ -514,7 +527,7 @@ where
         .await
         .unwrap();
     client.flush().await.unwrap();
-    let frame = read_frame_timeout(client).await;
+    let frame = read_frame_timeout(client, &format!("{op} RESPONSE corr={corr}")).await;
     assert_eq!(frame.header.ty, FrameType::Response);
     assert_eq!(frame.header.channel, 0);
     assert_eq!(frame.header.corr, corr);
@@ -551,7 +564,7 @@ where
         .unwrap();
     client.flush().await.unwrap();
 
-    let ack_frame = read_frame_timeout(client).await;
+    let ack_frame = read_frame_timeout(client, &format!("route.open RESPONSE corr={corr}")).await;
     assert_eq!(ack_frame.header.ty, FrameType::Response);
     assert_eq!(ack_frame.header.channel, 0);
     assert_eq!(ack_frame.header.corr, corr);
@@ -639,7 +652,8 @@ where
     let mut response = None;
 
     for _ in 0..2 {
-        let frame = read_frame_timeout(stream).await;
+        let frame = read_frame_timeout(stream,
+            &format!("bus PUSH/RESPONSE channel={route_channel} corr={response_corr}; push_seen={} response_seen={}", push.is_some(), response.is_some())).await;
         assert_eq!(frame.header.channel, route_channel);
         match frame.header.ty {
             FrameType::Push if push.is_none() => {
@@ -665,7 +679,11 @@ async fn read_push<S>(stream: &mut S, route_channel: u16) -> Frame
 where
     S: AsyncRead + Unpin,
 {
-    let frame = read_frame_timeout(stream).await;
+    let frame = read_frame_timeout(
+        stream,
+        &format!("bus subscriber PUSH channel={route_channel}"),
+    )
+    .await;
     assert_push(&frame, route_channel);
     frame
 }
@@ -677,7 +695,7 @@ fn assert_push(frame: &Frame, route_channel: u16) {
     assert_eq!(frame.body, b"push-event");
 }
 
-async fn read_frame_timeout<S>(stream: &mut S) -> Frame
+async fn read_frame_timeout<S>(stream: &mut S, expected: &str) -> Frame
 where
     S: AsyncRead + Unpin,
 {
@@ -688,7 +706,7 @@ where
             .expect("connection should stay open")
     })
     .await
-    .expect("timed out waiting for frame")
+    .unwrap_or_else(|error| panic!("timed out waiting for {expected}: {error}"))
 }
 
 fn supervisor(server: &TestServer, max_restarts: u32, backoff: Duration) -> Supervisor {

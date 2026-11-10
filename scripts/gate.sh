@@ -210,6 +210,8 @@ fast_check() {
       step 'Module reexec guard fixtures' bash scripts/fleet/tests/place-module-reexec.sh
       step 'Module debuggable placement fixtures' bash scripts/fleet/tests/place-module-debuggable.sh
       step 'Module rollback fixtures' bash scripts/fleet/tests/place-module-rollback.sh
+      step 'Module terminal placement fixtures' bash scripts/fleet/tests/place-module-terminal.sh
+      step 'Store snapshot fixtures' bash scripts/fleet/tests/snapshot-store.sh
       step 'Signing identity fixtures (stubbed tools)' bash scripts/release/test-macos-sign-notarize.sh
       step 'Unix release archive fixtures' bash scripts/release/test-package-unix-archives.sh
       step 'Unpublished crate detector fixtures' bash scripts/release/tests/unpublished-wire-crates.sh.test ;;

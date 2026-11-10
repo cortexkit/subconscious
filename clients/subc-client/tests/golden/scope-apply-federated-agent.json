@@ -1,0 +1,1 @@
+{"op":"scope.apply","generation":8,"upsert":[{"ref":"peer","scope_epoch":1,"kind":"federated","attributes":{"federated":{"peer_class":"computer","peer_fingerprint":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pairing_id":"pair:1","peer_name":"Peer","remote_claim":{"kind":"agent","agent_id":"remote-agent","agent_name":"Remote Agent"}}}}],"end":[{"ref":"old","scope_epoch":1}]}

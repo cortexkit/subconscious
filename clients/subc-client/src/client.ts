@@ -210,6 +210,8 @@ export interface CatalogEntry {
   approved_declarations_digest?: string;
   requested_declarations?: ProviderDeclarations;
   approved_declarations?: ProviderDeclarations;
+  /** Module-declared name; apps fall back to module_id when absent. */
+  display_name?: string;
   /** Build provenance from the registered manifest; absent when undeclared or on older daemons. */
   provenance?: ManifestProvenance;
   roles: unknown[];
@@ -222,6 +224,8 @@ export interface CatalogEntry {
   events?: CatalogEventDeclaration[] | null;
   /** Open delivery strings mirrored from the manifest; absent entries are unary. */
   operation_delivery?: Record<string, string>;
+  /** Operations declared safe to defer, keyed by tool:<name> or management:<name>. */
+  operation_deferral?: Record<string, true>;
   /** Opaque rich-UI descriptor for the provider's manifest, mirrored from HELLO. */
   rich_ui?: CatalogRichUiDescriptor;
   /** Opaque per-role objects mirrored unchanged from the registered manifest. */
@@ -2659,6 +2663,7 @@ export function isRetryableRouteOpenCode(code: string | undefined): boolean {
   if (code === "capability_forbidden") return false;
   // Targets must explicitly opt into flow and agent-run scope behaviour.
   if (code === "target_flow_unsupported") return false;
+  if (code === "target_federated_unsupported") return false;
   if (code === "target_agent_run_unsupported") return false;
   if (code === "scope_bind_proof_required" || code === "scope_bind_proof_mismatch") return false;
   if (code === "scope_epoch_in_use") return false;

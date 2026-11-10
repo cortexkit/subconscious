@@ -18,6 +18,7 @@ pub mod apply;
 pub mod computer;
 pub mod map;
 pub mod pairing;
+pub mod resources;
 mod run;
 pub mod schedule;
 pub mod settings;
@@ -362,6 +363,7 @@ pub struct State {
     /// Starts and exits, newest first.
     pub process_events: Vec<ProcessEvent>,
     pub cpu: CpuTracker,
+    pub resources: resources::Resources,
     /// ck's own build-server load samples, for motor builds that send no
     /// history.
     pub build_samples: Vec<f64>,
@@ -455,6 +457,7 @@ impl State {
             spawn_open: false,
             process_events: Vec::new(),
             cpu: CpuTracker::default(),
+            resources: resources::Resources::default(),
             build_samples: Vec::new(),
             build_sample_at: None,
             usage: Part::default(),
@@ -720,10 +723,22 @@ impl State {
         self.note_statuses(at);
     }
 
+    /// Keeps response-level resources on the same poll as the module roster.
+    pub fn record_supervisor_list(
+        &mut self,
+        list: subc_client_rs::SupervisorListResponse,
+        at: Timestamp,
+    ) {
+        self.resources
+            .record_extra(list.daemon, list.agent_commands, at);
+        self.record_roster(list.modules, at);
+    }
+
     /// Records the CPU and memory readings a roster carries, without
     /// publishing the roster. A CPU percent needs two readings of the same
     /// process, so the first roster at startup goes only here.
     pub fn record_cpu(&mut self, roster: &[SupervisorEntry], at: Timestamp) {
+        self.resources.record_modules(roster, at);
         for e in roster {
             let pid = self.processes.get(&e.module_id).map(|p| p.pid);
             match map::resource_reading(e) {
@@ -965,6 +980,7 @@ pub fn assemble(state: &State, now: Timestamp) -> Snapshot {
     });
 
     Snapshot {
+        resource_rows: state.resources.rows(),
         host,
         daemon,
         modules,
@@ -1232,6 +1248,7 @@ fn module_view(state: &State, e: &SupervisorEntry) -> Module {
         commit,
         cpu_percent: cpu,
         memory_mb: mem,
+        resources: state.resources.module(e),
         summary,
         routes: serving.as_ref().map(|s| s.len() as u32),
         serving,

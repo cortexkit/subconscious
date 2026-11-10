@@ -417,7 +417,10 @@ async fn operator_confirm_uses_separate_table_and_shared_corr_allocator() {
         serde_json::json!({"op": "catalog.update"}),
     ));
     assert!(matches!(
-        catalog_rx.await.unwrap(),
+        catalog_rx
+            .await
+            .unwrap()
+            .and_then(ModuleControlReply::control),
         Ok(ModuleControlResponseToModule::CatalogUpdate {})
     ));
 }

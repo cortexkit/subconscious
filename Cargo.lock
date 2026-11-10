@@ -2841,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.38.2"
+version = "0.38.3"
 dependencies = [
  "async-trait",
  "cortexkit-paths",

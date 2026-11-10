@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.38.3
+
+- Add typed `ModuleHandle::route_authorize` on registered module connections,
+  gated by the daemon's advertised operation. Judgments about the route,
+  including authorization refusals, are returned as values. Daemon call refusals,
+  including `route_authorize_not_permitted` for an asking module that may not use
+  the operation, remain `ScopeCallError::Refused` with their code and message.
+
 ## 0.38.2
 
 - Route and handle closes are now cancel-safe: dropping a close during a drain or

@@ -163,7 +163,11 @@ mod tests {
         inventory(&root, &root, &mut found);
         let expected = BTreeMap::from([
             ("app_open.rs", 2),
+            // Resource-accounting helper inputs, never daemon startup overrides.
+            ("bin/ckdev-resource-helper.rs", 2),
             ("bootstrap.rs", 10),
+            // The isolated process CPU/memory reader fixture is test-only.
+            ("child_resources.rs", 1),
             ("config_gate/program.rs", 1),
             ("config_gate/runtime.rs", 1),
             ("config_store/writer_lock.rs", 1),

@@ -103,6 +103,7 @@ pub mod privacy_identity;
 #[cfg(unix)]
 pub mod process_group;
 pub mod process_identity;
+pub mod registration_channel;
 pub mod socket_peer;
 #[cfg_attr(not(windows), path = "windows_acl_noop.rs")]
 pub mod windows_acl;
@@ -115,6 +116,11 @@ pub use launch_nonce::{
 
 #[cfg(windows)]
 pub use launch_nonce::{LaunchNoncePipeDelivery, LaunchNoncePipeHandoff};
+
+pub use registration_channel::{
+    registration_refusal, supervised, take_registration_channel, RegistrationChannel,
+    RegistrationChannelError, RegistrationRefusal,
+};
 
 #[cfg(target_os = "linux")]
 mod linux;

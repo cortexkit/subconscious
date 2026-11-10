@@ -36,7 +36,7 @@ use windows_sys::Win32::{
     System::{
         Pipes::{
             ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-            PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+            GetNamedPipeServerProcessId, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
         },
         Threading::{
             CreateEventW, GetCurrentProcess, OpenProcess, OpenProcessToken, WaitForSingleObject,
@@ -162,6 +162,18 @@ impl LaunchNoncePipeHandoff {
         cancelled: &AtomicBool,
         consumed: &Arc<OnceLock<()>>,
     ) -> io::Result<()> {
+        self.deliver_with_policy(pid, process, deadline, cancelled, consumed, false)
+    }
+
+    fn deliver_with_policy(
+        self,
+        pid: u32,
+        process: &OwnedHandle,
+        deadline: Instant,
+        cancelled: &AtomicBool,
+        consumed: &Arc<OnceLock<()>>,
+        reject_foreign: bool,
+    ) -> io::Result<()> {
         let handle = self.pipe.as_raw_handle();
         loop {
             // SAFETY: the process handle is pinned and was opened for synchronization.
@@ -195,6 +207,12 @@ impl LaunchNoncePipeHandoff {
                 // keep the server handle so nobody can re-create this name.
                 // SAFETY: handle is our server instance.
                 unsafe { DisconnectNamedPipe(handle) };
+                if reject_foreign {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "unexpected helper pipe client",
+                    ));
+                }
                 if Instant::now() >= deadline || cancelled.load(Ordering::Acquire) {
                     return Err(timeout());
                 }
@@ -226,6 +244,50 @@ impl LaunchNoncePipeHandoff {
             drop(operation);
             return flush_delivery(self.pipe, process, deadline, cancelled, consumed.clone());
         }
+    }
+}
+
+/// Bound helper startup and flushing so a helper that never reads cannot keep
+/// its owner's handoff alive indefinitely. Expiry closes the reserved instance.
+pub const HELPER_CLAIM_CONNECT_WINDOW: Duration = Duration::from_secs(5);
+
+/// A one-use helper pipe. Neither its Debug output nor its environment metadata
+/// includes the claim. Unlike the daemon's legacy nonce server, a foreign client
+/// ends this handoff instead of retrying with the real helper.
+pub struct HelperClaimHandoff(LaunchNoncePipeHandoff);
+impl std::fmt::Debug for HelperClaimHandoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HelperClaimHandoff(<redacted>)")
+    }
+}
+
+impl HelperClaimHandoff {
+    pub fn new(claim: &str) -> io::Result<Self> {
+        crate::registration_channel::check_claim(claim)?;
+        Ok(Self(LaunchNoncePipeHandoff::new(claim)?))
+    }
+
+    /// Set only public metadata before spawn. The helper's stdin is untouched.
+    pub fn configure(&self, command: &mut std::process::Command) {
+        use crate::registration_channel::{HELPER_CLAIM_PIPE_ENV, HELPER_PARENT_PID_ENV};
+        command
+            .env(HELPER_CLAIM_PIPE_ENV, self.0.name())
+            .env(HELPER_PARENT_PID_ENV, std::process::id().to_string());
+    }
+
+    /// Call after spawn with the live helper's PID. The caller retains its
+    /// child until this bounded delivery returns, preventing PID reuse.
+    pub fn serve(self, pid: u32) -> io::Result<()> {
+        // SAFETY: a fresh, non-inheritable process handle pins the live child.
+        let process = owned(unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) })?;
+        self.0.deliver_with_policy(
+            pid,
+            &process,
+            Instant::now() + HELPER_CLAIM_CONNECT_WINDOW,
+            &AtomicBool::new(false),
+            &Arc::new(OnceLock::new()),
+            true,
+        )
     }
 }
 
@@ -496,6 +558,21 @@ pub(super) fn read_pipe(name: &OsStr) -> Cached {
     read_open_pipe(open_pipe(name)?)
 }
 
+pub(crate) fn read_helper_pipe(
+    name: &OsStr,
+    parent: u32,
+) -> Result<Option<String>, LaunchNonceError> {
+    let pipe = open_pipe(name)?;
+    let mut server = 0;
+    // SAFETY: live pipe and valid output pointer; no bytes have been read.
+    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut server) } == 0
+        || server != parent
+    {
+        return Err(LaunchNonceError::PipeUnreadable { errno: None });
+    }
+    read_open_pipe(pipe).map(|nonce| nonce.map(|nonce| nonce.value))
+}
+
 fn open_pipe(name: &OsStr) -> Result<OwnedHandle, LaunchNonceError> {
     let path = wide(name);
     if path.len() <= 1 || path[..path.len() - 1].contains(&0) {
@@ -590,6 +667,267 @@ fn pipe_eof(error: &io::Error) -> bool {
 fn pipe_unreadable(error: io::Error) -> LaunchNonceError {
     LaunchNonceError::PipeUnreadable {
         errno: error.raw_os_error(),
+    }
+}
+
+#[cfg(test)]
+mod registration_channel_tests {
+    use super::*;
+    use crate::registration_channel::*;
+    use std::{
+        io::{Read, Write},
+        process::{Command, Stdio},
+    };
+    use windows_sys::Win32::{
+        Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT},
+        Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+    };
+
+    const CHANNEL_TEST: &str =
+        "launch_nonce::windows::registration_channel_tests::registration_channel_contract";
+    const HELPER_TEST: &str =
+        "launch_nonce::windows::registration_channel_tests::helper_claim_handoff_contract";
+    const MODE: &str = "SUBC_OS_REGISTRATION_TEST_MODE";
+    const CLAIM: &str = "test-helper-claim-not-for-logs";
+
+    fn child(test: &str, mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([test, "--exact", "--nocapture"])
+            .env(MODE, mode)
+            .env_remove(HELPER_CLAIM_PIPE_ENV)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+    fn success(output: std::process::Output) {
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(CLAIM));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(CLAIM));
+    }
+    fn begin_connect(pipe: &OwnedHandle) -> Box<Operation> {
+        // The pending OVERLAPPED must not move when returned to the caller.
+        let mut operation = Box::new(Operation::new(pipe.as_raw_handle()).unwrap());
+        // SAFETY: the operation pins the OVERLAPPED until completion.
+        if unsafe { ConnectNamedPipe(pipe.as_raw_handle(), &mut operation.overlapped) } == 0 {
+            match io::Error::last_os_error().raw_os_error() {
+                Some(code) if code == ERROR_PIPE_CONNECTED as i32 => {}
+                Some(code) if code == ERROR_IO_PENDING as i32 => {
+                    operation.pending = true;
+                }
+                other => panic!("connect failed: {other:?}"),
+            }
+        }
+        operation
+    }
+    fn finish_connect(operation: &mut Operation) {
+        if operation.pending {
+            operation
+                .wait(Instant::now() + READ_WINDOW, None, None)
+                .unwrap();
+        }
+    }
+    fn transfer(pipe: &OwnedHandle, writing: bool) -> io::Result<u32> {
+        let mut byte = b'x';
+        let mut operation = Operation::new(pipe.as_raw_handle())?;
+        // SAFETY: byte and OVERLAPPED stay live until completion or cancellation.
+        let result = unsafe {
+            if writing {
+                WriteFile(
+                    pipe.as_raw_handle(),
+                    &byte,
+                    1,
+                    null_mut(),
+                    &mut operation.overlapped,
+                )
+            } else {
+                ReadFile(
+                    pipe.as_raw_handle(),
+                    &mut byte,
+                    1,
+                    null_mut(),
+                    &mut operation.overlapped,
+                )
+            }
+        };
+        if result == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+                return Err(error);
+            }
+            operation.pending = true;
+        }
+        let count = operation.wait(Instant::now() + READ_WINDOW, None, None)?;
+        if count > 0 {
+            assert_eq!(byte, b'x');
+        }
+        Ok(count)
+    }
+
+    #[test]
+    fn registration_channel_contract() {
+        if let Ok(mode) = std::env::var(MODE) {
+            let good = mode == "channel-good";
+            assert_eq!(supervised(), good);
+            if good {
+                let file = take_registration_channel().unwrap().unwrap().into_file();
+                let pipe: OwnedHandle = file.into();
+                let mut flags = 0;
+                // SAFETY: retained handle and scalar output.
+                assert_ne!(
+                    unsafe { GetHandleInformation(pipe.as_raw_handle(), &mut flags) },
+                    0
+                );
+                assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+                assert!(supervised());
+                assert!(matches!(
+                    take_registration_channel(),
+                    Err(RegistrationChannelError::AlreadyTaken)
+                ));
+                assert_eq!(transfer(&pipe, true).unwrap(), 1, "duplex client write");
+                assert_eq!(transfer(&pipe, false).unwrap(), 1, "duplex client read");
+            } else {
+                assert!(take_registration_channel().unwrap().is_none());
+                assert_eq!(
+                    registration_refusal(),
+                    Some(if mode == "channel-foreign-server" {
+                        RegistrationRefusal::WrongPeer
+                    } else {
+                        RegistrationRefusal::NotOpen
+                    })
+                );
+            }
+            return;
+        }
+        for good in [true, false] {
+            let name = random_name().unwrap();
+            let path = wide(OsStr::new(&name));
+            // SAFETY: unique name, non-inheritable single-instance duplex pipe.
+            let pipe = owned(unsafe {
+                CreateNamedPipeW(
+                    path.as_ptr(),
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | FILE_FLAG_OVERLAPPED,
+                    PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                    1,
+                    512,
+                    512,
+                    0,
+                    null(),
+                )
+            })
+            .unwrap();
+            // Arm connect before the child can open, validate and immediately
+            // close a refused pipe, so the test cannot miss that connection.
+            let mut connecting = begin_connect(&pipe);
+            let process = child(
+                CHANNEL_TEST,
+                if good {
+                    "channel-good"
+                } else {
+                    "channel-foreign-server"
+                },
+            )
+            .env(REGISTRATION_PIPE_ENV, name)
+            .env(
+                DAEMON_PID_ENV,
+                (std::process::id() + u32::from(!good)).to_string(),
+            )
+            .spawn()
+            .unwrap();
+            finish_connect(&mut connecting);
+            if good {
+                assert_eq!(transfer(&pipe, false).unwrap(), 1);
+                assert_eq!(transfer(&pipe, true).unwrap(), 1);
+            } else {
+                let read = transfer(&pipe, false);
+                assert!(
+                    matches!(&read, Ok(0)) || read.as_ref().err().is_some_and(pipe_eof),
+                    "foreign-server check must precede every write"
+                );
+            }
+            success(process.wait_with_output().unwrap());
+        }
+        success(
+            child(CHANNEL_TEST, "channel-missing")
+                .env(REGISTRATION_PIPE_ENV, random_name().unwrap())
+                .env(DAEMON_PID_ENV, std::process::id().to_string())
+                .output()
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn helper_claim_handoff_contract() {
+        if let Ok(mode) = std::env::var(MODE) {
+            if mode == "helper-good" {
+                let claim = helper_claim().unwrap().unwrap();
+                assert!(claim.value() == CLAIM, "claim mismatch");
+                assert!(!format!("{claim:?}").contains(CLAIM));
+                assert!(matches!(
+                    helper_claim(),
+                    Err(HelperClaimError::AlreadyTaken)
+                ));
+                let mut stdin = String::new();
+                std::io::stdin().read_to_string(&mut stdin).unwrap();
+                assert_eq!(stdin, "stdio-still-available");
+            } else {
+                // The parent releases stdin only after the foreign client's
+                // one-use handoff has closed, without relying on scheduling.
+                let mut release = [0];
+                std::io::stdin().read_exact(&mut release).unwrap();
+                assert!(
+                    helper_claim().is_err(),
+                    "foreign client must poison this handoff"
+                );
+            }
+            return;
+        }
+        let handoff = HelperClaimHandoff::new(CLAIM).unwrap();
+        assert!(!format!("{handoff:?}").contains(CLAIM));
+        let mut command = child(HELPER_TEST, "helper-good");
+        command.stdin(Stdio::piped());
+        handoff.configure(&mut command);
+        assert!(!format!("{command:?}").contains(CLAIM));
+        let mut process = command.spawn().unwrap();
+        process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"stdio-still-available")
+            .unwrap();
+        handoff.serve(process.id()).unwrap();
+        success(process.wait_with_output().unwrap());
+
+        let handoff = HelperClaimHandoff::new(CLAIM).unwrap();
+        let name = handoff.0.name().to_owned();
+        let mut command = child(HELPER_TEST, "helper-poisoned");
+        command.stdin(Stdio::piped());
+        handoff.configure(&mut command);
+        let mut process = command.spawn().unwrap();
+        // Connect as this process, not the spawned helper, before serving.
+        let foreign = open_pipe(OsStr::new(&name)).unwrap();
+        assert!(handoff.serve(process.id()).is_err());
+        assert!(matches!(
+            read_open_pipe(foreign),
+            Err(LaunchNonceError::PipeEmpty)
+        ));
+        process.stdin.take().unwrap().write_all(b"x").unwrap();
+        success(process.wait_with_output().unwrap());
+
+        // A counterfeit server is refused before the helper reads any bytes.
+        let pipe = LaunchNoncePipeHandoff::new(CLAIM).unwrap();
+        let name = pipe.name().to_owned();
+        let mut connecting = begin_connect(&pipe.pipe);
+        let reader =
+            std::thread::spawn(move || read_helper_pipe(OsStr::new(&name), std::process::id() + 1));
+        finish_connect(&mut connecting);
+        assert!(reader.join().unwrap().is_err());
+        assert!(HelperClaimHandoff::new("").is_err());
+        assert!(HelperClaimHandoff::new(&"x".repeat(513)).is_err());
     }
 }
 

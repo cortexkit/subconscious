@@ -109,10 +109,47 @@ plus SDK routes, Prefrontal has six direct readers). The module's test opens a r
 has read from the descriptor. Because the accessor never clears the environment, a missed reader
   still works while an environment copy is available; after the Unix producer removes that copy, a missed reader cannot rely on it, so lint and the census must verify migration before removal.
 
-Helper processes a module starts that must connect as the module (not agent children) get the
-nonce the same way the module did: over a one-read pipe the module creates and hands to the helper,
-read by the same accessor. Never in argv, never in the environment, never in a file, because all
-three are readable by a same-user process. `subc-os` exposes the handoff for modules to use.
+### Registration channels and explicit helpers
+
+The module-to-helper `LaunchNonceHandoff` API is replaced by
+`subc_os::registration_channel::HelperClaimHandoff`. **This changes only the
+module-to-helper handoff. The daemon's nonce delivery to ungated spawns is
+unchanged**, including the Unix descriptor and Windows rollout fallback described
+above. `LaunchNonceHandoff` remains available for that daemon path.
+
+A channel-aware module mints a single-use `helper` claim over its primary
+registration channel and hands that claim to an explicit helper, never an agent
+child. The helper consumes `helper_claim()` and presents the claim on its own
+connection. A reconnect requires a fresh claim from the owner; there is no refresh
+token. A claim never enters argv, an environment variable, a file or a log line.
+Both claim and handoff `Debug` output are redacted. The handoff accepts at most
+512 bytes, so preparing the Unix pipe cannot block waiting for an unspawned reader.
+
+On Unix, `HelperClaimHandoff::new(claim)` prepares an inherited one-read pipe;
+`install_last(&mut command)` installs it at descriptor 3 after other pre-exec
+hooks and sets only `SUBC_HELPER_CLAIM_FD=<fd>:<inode>`. The helper's accessor
+validates, reads and closes the pipe once. Its stdin remains available.
+
+On Windows, `new(claim)` reserves a unique, single-instance named pipe.
+`configure(&mut command)` sets only `SUBC_HELPER_CLAIM_PIPE` and
+`SUBC_HELPER_PARENT_PID`. After spawn, the owner calls `serve(child.id())` while
+retaining the child. The server checks the client's PID before writing, and the
+helper checks the server's PID before reading. A foreign client terminates the
+handoff without receiving the claim. The five-second
+`HELPER_CLAIM_CONNECT_WINDOW` bounds connection and delivery. This named-pipe
+variant avoids commandeering stdin, which helpers may use for stdio protocols.
+
+The process-wide registration accessors are separate from the nonce accessor:
+`supervised()` caches validation once, `take_registration_channel()` transfers
+the single transport once, and `registration_refusal()` explains a refused
+handoff without exposing descriptor numbers or paths. A second take after
+successful validation returns `AlreadyTaken`, never an unsupervised result.
+Unix validation checks socket type, inode (unless Darwin reports no usable
+inode), unnamed local and peer Unix addresses, and the daemon's peer PID before
+setting close-on-exec. Windows opens duplex and verifies the server PID before
+writing anything. Children inheriting only the registration variable are not
+supervised. Call an accessor before spawning anything so no child can inherit
+the registration descriptor before close-on-exec is set.
 
 ## 5. Reader migration and deployment verification
 
@@ -122,8 +159,9 @@ three are readable by a same-user process. `subc-os` exposes the handoff for mod
   `WrongPipe`), so its route opens carry no identity (they are `direct`) and a `serve()` in it fails
   HELLO with `LaunchNonce(NotOpen)`. It never falls back to the environment copy. That is the
   intended end state of section 3, and it arrives with each module's own switch release, not with
-  the daemon. A helper that must act as the module gets the nonce through the handoff. `ck`, or a
-  test, run in a shell a module spawned without stripping `SUBC_*` is affected the same way.
+  the daemon. An explicit helper instead receives a fresh `helper` claim through the handoff above.
+  Any ordinary command or test run in a shell a module spawned without stripping
+  `SUBC_*` is affected the same way.
 - **A module that has not switched yet** never reads descriptor 3, so its children inherit the
   unread pipe along with the environment copy they already inherit today. That adds no exposure the
   environment copy does not already have, and it ends when the module switches.

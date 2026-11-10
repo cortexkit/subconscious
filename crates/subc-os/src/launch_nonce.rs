@@ -307,8 +307,20 @@ fn pipe_or_permitted_env(pipe: Cached, fallback: Option<LaunchNonce>) -> Cached 
 #[cfg(unix)]
 pub use unix::LaunchNonceHandoff;
 
+#[cfg(unix)]
+pub(crate) fn read_helper_descriptor(
+    value: &std::ffi::OsStr,
+) -> Result<Option<String>, LaunchNonceError> {
+    unix::read_descriptor(value, &AtomicUsize::new(0)).map(|nonce| nonce.map(|nonce| nonce.value))
+}
+
 #[cfg(windows)]
 pub use windows::{LaunchNoncePipeDelivery, LaunchNoncePipeHandoff};
+
+#[cfg(windows)]
+pub(crate) use windows::read_helper_pipe;
+#[cfg(windows)]
+pub use windows::{HelperClaimHandoff, HELPER_CLAIM_CONNECT_WINDOW};
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -329,22 +341,10 @@ mod unix {
     /// The daemon half of the handoff, prepared before the spawn: a pipe that
     /// already holds the nonce, its write end closed, and its inode.
     ///
-    /// A module uses the same type to hand its own nonce to a helper process
-    /// that must connect as the module: never in argv, the environment or a
-    /// file, all of which another same-user process can read.
-    ///
-    /// ```no_run
-    /// # fn helper(nonce: &str) -> std::io::Result<()> {
-    /// use subc_os::launch_nonce::{LaunchNonceHandoff, LAUNCH_NONCE_FD_ENV};
-    ///
-    /// let mut command = std::process::Command::new("helper");
-    /// let handoff = LaunchNonceHandoff::new(nonce)?;
-    /// command.env(LAUNCH_NONCE_FD_ENV, handoff.fd_env_value());
-    /// // After every other pre-exec step the command has.
-    /// handoff.install_last(&mut command);
-    /// command.spawn()?;
-    /// # Ok(()) }
-    /// ```
+    /// This remains the daemon's legacy handoff to ungated spawns. A module
+    /// handing authority to a helper uses
+    /// [`HelperClaimHandoff`](crate::registration_channel::HelperClaimHandoff),
+    /// not its launch nonce.
     #[derive(Debug)]
     pub struct LaunchNonceHandoff {
         read_end: OwnedFd,

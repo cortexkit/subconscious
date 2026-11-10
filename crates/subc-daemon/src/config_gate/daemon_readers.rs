@@ -1,6 +1,43 @@
 use super::*;
 use crate::daemon_config::{ActivityConfig, DaemonConfig};
 
+#[derive(Clone)]
+pub(crate) enum ApprovedDaemonView {
+    NotStamped,
+    Unavailable,
+    Approved {
+        generation: u64,
+        config: std::sync::Arc<DaemonConfig>,
+    },
+}
+
+impl ApprovedDaemonView {
+    pub(super) fn from_store(store: &ConfigStore, recovering: bool, previous: &Self) -> Self {
+        let (state, body) = store.loaded_admission_state();
+        if recovering || store.loaded_anchor_pending() {
+            return Self::Unavailable;
+        }
+        match state {
+            StoreState::Unstamped => return Self::NotStamped,
+            StoreState::StoreMissing | StoreState::StoreUnverified => return Self::Unavailable,
+            StoreState::Stamped => {}
+        }
+        if matches!(previous, Self::Approved { generation, .. } if *generation == body.last_generation)
+        {
+            return previous.clone();
+        }
+        body.generations
+            .get(&body.last_generation)
+            .and_then(|entry| entry.delivery.as_ref())
+            .and_then(|snapshot| parse_daemon(snapshot).ok())
+            .map(|config| Self::Approved {
+                generation: body.last_generation,
+                config: std::sync::Arc::new(config),
+            })
+            .unwrap_or(Self::Unavailable)
+    }
+}
+
 fn parse_daemon(snapshot: &DeliverySnapshot) -> Result<DaemonConfig> {
     let layer = snapshot
         .daemon
@@ -15,6 +52,15 @@ fn parse_daemon(snapshot: &DeliverySnapshot) -> Result<DaemonConfig> {
 }
 
 impl RuntimeOwner {
+    /// Polling list readers clone verified memory only; they never join a
+    /// publication's store lock, disk checks or platform keychain work.
+    pub(crate) fn approved_daemon_view(&self) -> ApprovedDaemonView {
+        self.approved_daemon
+            .read()
+            .map(|view| view.clone())
+            .unwrap_or(ApprovedDaemonView::Unavailable)
+    }
+
     /// A file snapshot is proposal data only. Candidate previews must not call
     /// this path because their text belongs to the client, not the filesystem.
     pub(crate) fn observe_file_proposal(&self) -> Result<()> {

@@ -6120,13 +6120,12 @@ impl ControlHandler {
     }
 
     async fn handle_supervisor_list(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
-        let approved = if let Some(owner) = &self.config_runtime {
-            owner
-                .on_blocking(|owner| owner.approved_daemon_configuration())
-                .await
-        } else {
-            Ok(None)
-        };
+        use crate::config_gate::runtime::ApprovedDaemonView;
+        let approved = self
+            .config_runtime
+            .as_ref()
+            .map(|owner| owner.approved_daemon_view())
+            .unwrap_or(ApprovedDaemonView::NotStamped);
         let generation = self
             .registry
             .generation()
@@ -6174,15 +6173,17 @@ impl ControlHandler {
             ));
             let pending_reload = Some(verdict);
             let configured_enabled = match &approved {
-                Ok(Some(approved)) => approved
+                ApprovedDaemonView::Approved {
+                    config: approved, ..
+                } => approved
                     .modules
                     .iter()
                     .find(|module| module.module_id == status.module_id)
                     .map(|module| module.enabled),
-                Ok(None) => self
+                ApprovedDaemonView::NotStamped => self
                     .capability_evaluator
                     .configured_enabled(&status.module_id),
-                Err(_) => None,
+                ApprovedDaemonView::Unavailable => None,
             };
             // Keep the retired policy field on the wire for one release so
             // existing status consumers still receive the platform policy.

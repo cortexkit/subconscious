@@ -348,6 +348,12 @@ impl ConfigStore {
                 .unwrap_or(&self.envelope.body),
         )
     }
+
+    /// The cache publisher has already verified authority under its owner lock.
+    /// Observe the anchor barrier without repeating disk or keychain checks.
+    pub(crate) fn loaded_anchor_pending(&self) -> bool {
+        self.pending_anchor.is_some()
+    }
     /// Recheck a launch witness after a full authority check on a blocking
     /// worker. This is only loaded state, never a replacement for `check`.
     pub(crate) fn loaded_module_generation(&self, module: &str) -> Option<u64> {

@@ -328,3 +328,108 @@ async fn config_readers_release_reserved_uses_approved_removal_not_proposed_read
     assert_eq!(reply["applied"], true, "{reply}");
     assert_eq!(owner.status().unwrap().pending_proposals, 1);
 }
+
+#[tokio::test]
+async fn config_readers_list_does_not_wait_for_configuration_publication() {
+    let rig = Rig::new();
+    let owner = Arc::new(rig.owner("reader-nonblocking-list"));
+    rig.stamp(&owner);
+    let (handler, module, _) = handler(&rig, owner.clone()).await;
+    let (locked, ready) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let held_owner = owner.clone();
+    let publisher = std::thread::spawn(move || {
+        let _state = held_owner.lock().unwrap();
+        locked.send(()).unwrap();
+        released.recv().unwrap();
+    });
+    ready.recv().unwrap();
+    let response = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        request(&handler, json!({"op":"supervisor.list"})),
+    )
+    .await;
+    release.send(()).unwrap();
+    publisher.join().unwrap();
+    module.stop().await.unwrap();
+    let response = response.expect("supervisor.list waited for configuration publication");
+    assert_eq!(
+        response["modules"][0]["configured_enabled"], true,
+        "{response}"
+    );
+    assert_eq!(response["modules"][0]["enabled"], false, "{response}");
+    std::fs::write(
+        rig.path.join("store").join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert_eq!(owner.status().unwrap().state, "store_unverified");
+    let response = request(&handler, json!({"op":"supervisor.list"})).await;
+    assert!(
+        response["modules"][0].get("configured_enabled").is_none(),
+        "{response}"
+    );
+}
+
+#[test]
+fn config_readers_cached_view_tracks_commits_boot_and_detected_tamper() {
+    fn approved(
+        owner: &RuntimeOwner,
+        expected_generation: u64,
+        enabled: bool,
+    ) -> Arc<crate::daemon_config::DaemonConfig> {
+        match owner.approved_daemon_view() {
+            ApprovedDaemonView::Approved { generation, config } => {
+                assert_eq!(generation, expected_generation);
+                assert_eq!(config.modules[0].enabled, enabled);
+                config
+            }
+            _ => panic!("expected verified approved configuration"),
+        }
+    }
+    let rig = Rig::new();
+    let owner = rig.owner("reader-cache");
+    assert!(matches!(
+        owner.approved_daemon_view(),
+        ApprovedDaemonView::NotStamped
+    ));
+    rig.stamp(&owner);
+    let first = approved(&owner, 1, true);
+    owner.status().unwrap();
+    assert!(
+        Arc::ptr_eq(&first, &approved(&owner, 1, true)),
+        "unchanged generations retain the parsed view"
+    );
+    std::fs::write(
+        rig.path.join("subc.jsonc"),
+        json!({"version":1,"modules":{
+            "a":{"program":rig.path.join("program"),"enabled":false}
+        }})
+        .to_string(),
+    )
+    .unwrap();
+    assert_eq!(commit(&owner, PlanKind::Change), 2);
+    approved(&owner, 2, false);
+    drop(owner);
+    let owner = rig.owner("reader-cache-restart");
+    approved(&owner, 2, false);
+    assert_eq!(commit(&owner, PlanKind::Rollback(1)), 3);
+    approved(&owner, 3, true);
+    assert_eq!(commit(&owner, PlanKind::Unstamp), 4);
+    assert!(matches!(
+        owner.approved_daemon_view(),
+        ApprovedDaemonView::NotStamped
+    ));
+    assert_eq!(rig.stamp(&owner), 5);
+    approved(&owner, 5, false);
+    std::fs::write(
+        rig.path.join("store").join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert_eq!(owner.status().unwrap().state, "store_unverified");
+    assert!(matches!(
+        owner.approved_daemon_view(),
+        ApprovedDaemonView::Unavailable
+    ));
+}

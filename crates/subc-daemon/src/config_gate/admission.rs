@@ -365,6 +365,7 @@ impl RuntimeOwner {
                 &self.admission,
                 &self.delivery_changed,
                 &self.module_gates,
+                &self.approved_daemon,
             );
             Self::check_authority(&mut state, false)?;
             AdmissionCache::from_state(&state)

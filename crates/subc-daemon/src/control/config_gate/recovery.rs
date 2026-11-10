@@ -25,6 +25,11 @@ impl ControlHandler {
         frame: &Frame,
         op: Option<&str>,
     ) -> Result<Option<Frame>, RouterError> {
+        // List is allowed even in recovery and is polled continuously. Its
+        // cached view must not wait for authority verification or publication.
+        if op == Some("supervisor.list") {
+            return Ok(None);
+        }
         let Some(owner) = self.config_runtime.clone() else {
             return Ok(None);
         };

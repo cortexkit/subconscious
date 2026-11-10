@@ -33,6 +33,7 @@ pub struct RuntimeOwner {
     #[cfg(test)]
     spawn_exec_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     admission: std::sync::RwLock<admission::AdmissionCache>,
+    approved_daemon: std::sync::RwLock<ApprovedDaemonView>,
     inner: Mutex<OwnerState>,
     capturer: ConfigCapturer,
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
@@ -415,6 +416,7 @@ struct OwnerGuard<'a>(
     &'a std::sync::RwLock<admission::AdmissionCache>,
     &'a tokio::sync::Notify,
     &'a Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    &'a std::sync::RwLock<ApprovedDaemonView>,
 );
 impl std::ops::Deref for OwnerGuard<'_> {
     type Target = OwnerState;
@@ -429,6 +431,19 @@ impl std::ops::DerefMut for OwnerGuard<'_> {
 }
 impl Drop for OwnerGuard<'_> {
     fn drop(&mut self) {
+        // Project committed or invalidated authority before releasing its owner.
+        // Parse changed generations outside the cheap reader lock, then publish
+        // only the Arc; list polling never waits for store or keychain work.
+        let previous = self
+            .4
+            .read()
+            .map(|view| view.clone())
+            .unwrap_or(ApprovedDaemonView::Unavailable);
+        let next =
+            ApprovedDaemonView::from_store(&self.0.store, self.0.recovery_exit_hold, &previous);
+        if let Ok(mut view) = self.4.write() {
+            *view = next;
+        }
         // Volatile holds follow the same lifetime as their durable records.
         // Approving another program identity retires the previous identity's
         // volatile hold, even if that previous identity is later approved again.
@@ -533,6 +548,7 @@ pub(crate) use admission::SpawnAdmission;
 mod approval_request;
 #[path = "daemon_readers.rs"]
 mod daemon_readers;
+pub(crate) use daemon_readers::ApprovedDaemonView;
 #[path = "phone.rs"]
 mod phone;
 pub(crate) use approval_request::{ApprovalRequest, ApprovalRequestGuard, CancelApprovalRequest};
@@ -614,6 +630,11 @@ impl RuntimeOwner {
     pub fn new(incarnation: String, mut store: ConfigStore, capturer: ConfigCapturer) -> Self {
         let initial_generation = store.body().map(|body| body.last_generation).unwrap_or(0);
         let admission = std::sync::RwLock::new(admission::AdmissionCache::from_store(&store));
+        let approved_daemon = std::sync::RwLock::new(ApprovedDaemonView::from_store(
+            &store,
+            false,
+            &ApprovedDaemonView::Unavailable,
+        ));
         Self {
             #[cfg(test)]
             warm_restart_pause: Mutex::new(None),
@@ -626,6 +647,7 @@ impl RuntimeOwner {
             #[cfg(test)]
             spawn_exec_hook: Mutex::new(None),
             admission,
+            approved_daemon,
             inner: Mutex::new(OwnerState {
                 gate: ConfigGate::new(incarnation),
                 store,
@@ -732,9 +754,13 @@ impl RuntimeOwner {
                     &self.admission,
                     &self.delivery_changed,
                     &self.module_gates,
+                    &self.approved_daemon,
                 )
             })
             .map_err(|_| {
+                if let Ok(mut view) = self.approved_daemon.write() {
+                    *view = ApprovedDaemonView::Unavailable;
+                }
                 GateError::new("config_unavailable", "configuration owner lock is poisoned")
             })?;
         self.drain_canceled_approvals(&mut guard);
@@ -758,6 +784,7 @@ impl RuntimeOwner {
                 &self.admission,
                 &self.delivery_changed,
                 &self.module_gates,
+                &self.approved_daemon,
             ),
         })
     }

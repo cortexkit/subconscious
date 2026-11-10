@@ -2,6 +2,10 @@
 
 ## 0.41.10
 
+- Keep approved daemon configuration in a separately published memory view, so
+  polled supervisor lists do not wait for configuration publication, disk checks
+  or the platform keychain. Invalidate the view when authority becomes unverified.
+
 - Record file-preview proposals without recording client candidate text, and
   read approved daemon entries for reservation release and configured enabled
   reporting. Report approved-but-inactive daemon settings separately from

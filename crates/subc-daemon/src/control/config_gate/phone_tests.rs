@@ -78,18 +78,14 @@ impl Fixture {
         std::fs::create_dir_all(path.join("store")).unwrap();
         std::fs::create_dir_all(path.join("cortexkit")).unwrap();
         std::fs::copy("/bin/sh", path.join("program")).unwrap();
-        // macOS needs the signed system image. Run the dummy holder directly:
-        // a shell may exec sleep before its own image can be confirmed.
-        let phone_program = if cfg!(target_os = "macos") {
-            std::path::PathBuf::from("/bin/sleep")
-        } else {
-            path.join("program")
-        };
+        // Keep the dummy phone surface's native image stable for content verification:
+        // a shell can exec sleep after its own image was sampled.
+        let phone_program = std::path::PathBuf::from("/bin/sleep");
         std::fs::write(
             path.join("subc.jsonc"),
             serde_json::to_vec(&json!({"version":1,"modules":{
                 "a":{"program":path.join("program")},
-                "callosum":{"program":phone_program,"args":if cfg!(target_os = "macos") { json!(["600"]) } else { json!(["-c","sleep 600"]) },"reserved":true,
+                "callosum":{"program":phone_program,"args":["600"],"reserved":true,
                     "overlap": if lifecycle { "safe" } else { "exclusive" }}
             }}))
             .unwrap(),
@@ -162,6 +158,9 @@ impl Fixture {
         let registry = Arc::new(Registry::default());
         let forwarding = Arc::new(crate::ForwardingTable::default());
         let handle = SupervisorHandle::new();
+        if lifecycle {
+            handle.capture_registration_channels_for_test();
+        }
         let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
             .with_handle(handle.clone())
             .with_forwarding(forwarding.clone())
@@ -191,7 +190,13 @@ impl Fixture {
         } else {
             supervisor.spawn(spec).unwrap()
         };
-        let nonce = handle.spawn_launch_nonce_for("callosum").unwrap();
+        let nonce = handle.spawn_launch_nonce_for("callosum");
+        if lifecycle {
+            handle
+                .registration_for_test("callosum")
+                .unwrap()
+                .bind(PHONE);
+        }
         let handler = Arc::new(
             ControlHandler::with_forwarding(registry.clone(), forwarding.clone())
                 .with_supervisor(handle)
@@ -208,7 +213,7 @@ impl Fixture {
             .hello_launch_nonces
             .lock()
             .unwrap()
-            .record(PHONE, Some(&nonce));
+            .record(PHONE, nonce.as_deref());
         let mut manifest =
             subc_protocol::manifest::ModuleManifest::builder("callosum", "1.0.0").build();
         manifest.ready = Some(true);
@@ -346,6 +351,76 @@ impl Fixture {
         self.module.stop().await.unwrap();
         drop(self.scratch);
     }
+}
+
+#[tokio::test]
+async fn config_phone_channel_surface_requires_current_live_binding() {
+    let fixture = Fixture::build(true).await;
+    let registration = fixture
+        .handler
+        .registry
+        .get_module("callosum")
+        .unwrap()
+        .unwrap();
+    let old = fixture
+        .handler
+        .supervisor
+        .registration_spawn(PHONE)
+        .unwrap();
+    assert!(fixture.handler.config_phone_surface().await.is_some());
+    fixture
+        .handler
+        .supervisor
+        .forget_registration_connection(PHONE);
+    assert!(
+        fixture.handler.config_phone_surface().await.is_none(),
+        "a claimed module id without its channel binding is not a phone surface"
+    );
+    old.bind(PHONE);
+    assert!(fixture.handler.config_phone_surface().await.is_some());
+    let previous = fixture.module.status().unwrap().spawn_generation;
+    fixture.module.restart(None).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fixture.module.status().unwrap().spawn_generation <= previous
+            || fixture.module.status().unwrap().pid.is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|error| {
+        panic!(
+            "replacement launch did not become current: {error}; {:?}",
+            fixture.module.status()
+        )
+    });
+    fixture
+        .handler
+        .registry
+        .deregister_connection(PHONE)
+        .unwrap();
+    fixture
+        .handler
+        .registry
+        .register_unpublished_verified_with_control_ops(
+            registration.manifest,
+            subc_protocol::PROTOCOL_VERSION,
+            PHONE,
+            registration.control_ops,
+            true,
+        )
+        .unwrap();
+    fixture
+        .handler
+        .registry
+        .publish_registration(PHONE)
+        .unwrap();
+    old.bind(PHONE);
+    assert!(
+        fixture.handler.config_phone_surface().await.is_none(),
+        "the previous launch's channel cannot vouch for the replacement generation"
+    );
+    fixture.stop().await;
 }
 
 #[tokio::test]

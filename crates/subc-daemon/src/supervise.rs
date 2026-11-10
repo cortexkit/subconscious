@@ -74,6 +74,8 @@ mod config_delivery;
 mod content_binding;
 mod program_binding;
 mod registration;
+#[cfg(all(test, unix))]
+pub(crate) use registration::RegistrationProof;
 pub(crate) use registration::RegistrationSpawn;
 #[cfg(all(test, unix))]
 pub(crate) mod unix_channel_placement_tests;
@@ -347,6 +349,9 @@ fn privacy_command(
 type SpawnRegistrationChannel = std::os::unix::net::UnixStream;
 #[cfg(windows)]
 type SpawnRegistrationChannel = subc_os::registration_channel::RegistrationPipe;
+#[cfg(all(test, any(unix, windows)))]
+type CapturedRegistrationChannels =
+    Arc<Mutex<Option<Vec<(Arc<RegistrationSpawn>, SpawnRegistrationChannel)>>>>;
 
 struct SupervisedChild {
     registration_spawn: Option<Arc<RegistrationSpawn>>,
@@ -2352,6 +2357,8 @@ struct SupervisedConfiguration {
 /// launch nonces recorded at spawn are checked by the same daemon instance.
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
+    #[cfg(all(test, any(unix, windows)))]
+    registration_test_channels: CapturedRegistrationChannels,
     registration_service: Arc<Mutex<Option<registration::RegistrationService>>>,
     registration_connections: Arc<Mutex<HashMap<ConnectionId, Arc<RegistrationSpawn>>>>,
     program_bindings: program_binding::ProgramBindings,
@@ -2886,7 +2893,7 @@ impl SupervisorHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(module_id)
             .map(|swap| swap.candidate_nonce.clone());
-        let Some(nonce) = candidate_nonce else {
+        let Some(nonce) = candidate_nonce.filter(|nonce| !nonce.is_empty()) else {
             return;
         };
         self.set_spawn_nonce(module_id, nonce.clone());
@@ -11898,6 +11905,9 @@ fn launch_child_in_slot(
         registration.commit();
     }
     if let Some(spawn) = &supervised.registration_spawn {
+        if let Some(identity) = supervised.process_identity {
+            let _ = spawn.identity.set(identity);
+        }
         if supervised.spawn_failure.is_some() {
             spawn.refuse();
         } else if binding_ready {

@@ -80,6 +80,10 @@ impl ProgramBindingRetirement {
 }
 
 impl ProgramBindingPublication {
+    #[cfg(all(test, unix))]
+    pub(super) fn key_for_test(&self) -> &str {
+        &self.key.1
+    }
     pub(super) fn check(&self) -> Result<(), crate::config_gate::GateError> {
         if *self.signal.borrow() != Some(true)
             || self.retired.load(std::sync::atomic::Ordering::Acquire)
@@ -200,6 +204,14 @@ impl Drop for ProgramBindingPublication {
     fn drop(&mut self) {
         if Arc::strong_count(&self.signal) == 1 {
             self.retire();
+            if self.key.1.starts_with("channel:") {
+                if let Some(bindings) = self.bindings.upgrade() {
+                    let mut records = bindings.lock().unwrap_or_else(|p| p.into_inner());
+                    records.active.remove(&self.key);
+                    records.retired.remove(&self.key);
+                    records.acceptable.remove(&self.key);
+                }
+            }
         }
     }
 }
@@ -253,13 +265,15 @@ impl SupervisorHandle {
             .program_bindings
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        records.active.retain(|(owner, nonce), _| {
+            owner != module || nonce.starts_with("channel:") || accepted.contains(nonce)
+        });
+        records.retired.retain(|(owner, nonce), _| {
+            owner != module || nonce.starts_with("channel:") || accepted.contains(nonce)
+        });
         records
-            .active
-            .retain(|(owner, nonce), _| owner != module || accepted.contains(nonce));
-        records
-            .retired
-            .retain(|(owner, nonce), _| owner != module || accepted.contains(nonce));
-        records.acceptable.retain(|(owner, _)| owner != module);
+            .acceptable
+            .retain(|(owner, key)| owner != module || key.starts_with("channel:"));
         records
             .acceptable
             .extend(accepted.into_iter().map(|nonce| (module.to_owned(), nonce)));
@@ -306,7 +320,7 @@ impl SupervisorHandle {
             }
         });
     }
-    #[cfg(all(test, any(windows, target_os = "linux")))]
+    #[cfg(all(test, windows))]
     pub(crate) fn candidate_launch_nonce_for_test(&self, module: &str) -> Option<String> {
         self.swaps
             .lock()
@@ -471,17 +485,20 @@ impl SupervisorHandle {
         let (sender, receiver) = tokio::sync::watch::channel(None);
         // A channel-only launch has no nonce-table entry. Its owned publication
         // supplies a launch-verification signal without creating a bearer secret.
-        let Some(nonce) = nonce else {
-            return Some(ProgramBindingPublication {
-                signal: Arc::new(sender),
-                live: Arc::new(Mutex::new(std::sync::Weak::new())),
-                bindings: std::sync::Weak::new(),
-                key: (module.to_owned(), String::new()),
-                retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            });
-        };
+        let nonce = nonce.unwrap_or_else(|| {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "channel:{}",
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        });
         let mut bindings = self.program_bindings.lock().ok()?;
         bindings.configured.insert(module.to_owned());
+        if nonce.starts_with("channel:") {
+            bindings
+                .acceptable
+                .insert((module.to_owned(), nonce.clone()));
+        }
         if role == SpawnRole::Plain {
             bindings.active.retain(|(owner, _), _| owner != module);
         }

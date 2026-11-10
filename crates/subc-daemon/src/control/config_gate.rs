@@ -906,21 +906,41 @@ impl ControlHandler {
         {
             return None;
         }
-        let admission = self.review_admission();
-        let reviewer = registration.clone();
-        config_work(runtime.clone(), move |_| admission.check(&reviewer))
-            .await
-            .ok()?;
+        let channel = self
+            .supervisor
+            .registration_spawn(registration.connection_id);
+        if channel.is_some()
+            && !self
+                .forwarding
+                .active_module_endpoint("callosum")
+                .ok()
+                .flatten()
+                .is_some_and(|endpoint| endpoint.connection_id == registration.connection_id)
+        {
+            return None;
+        }
+        if channel.is_none() {
+            let admission = self.review_admission();
+            let reviewer = registration.clone();
+            config_work(runtime.clone(), move |_| admission.check(&reviewer))
+                .await
+                .ok()?;
+        }
         let module = self.supervisor.get("callosum")?;
         let status = module.status().ok()?;
         let (spec, _) = module.configuration().ok()?;
-        let nonce = self.supervisor.spawn_launch_nonce_for("callosum")?;
-        if !self
+        let nonce = self
             .hello_launch_nonces
             .lock()
             .ok()?
-            .presented(registration.connection_id, Some(&nonce))
-            || !spec.reserved
+            .nonce(registration.connection_id)
+            .map(str::to_owned);
+        if !self.supervisor.registration_is_current_live(
+            &self.registry,
+            "callosum",
+            registration.connection_id,
+            nonce.as_deref(),
+        ) || !spec.reserved
             || !status.enabled
             || !status.process_alive
             || !status.registration_active
@@ -934,6 +954,14 @@ impl ControlHandler {
         .await
         .ok()??;
         if !approved.enabled || approved.module_spec() != spec {
+            return None;
+        }
+        if !self.supervisor.registration_is_current_live(
+            &self.registry,
+            "callosum",
+            registration.connection_id,
+            nonce.as_deref(),
+        ) {
             return None;
         }
         Some(crate::config_gate::PhoneSurface {

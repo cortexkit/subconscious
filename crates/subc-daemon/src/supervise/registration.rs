@@ -22,6 +22,7 @@ pub(crate) struct RegistrationSpawn {
     hello_seen: AtomicBool,
     launch: tokio::sync::watch::Sender<LaunchState>,
     binding: Option<ProgramBindingPublication>,
+    pub(super) identity: std::sync::OnceLock<ProcessIdentity>,
     connections: Weak<Mutex<HashMap<ConnectionId, Arc<RegistrationSpawn>>>>,
 }
 
@@ -39,6 +40,7 @@ impl RegistrationSpawn {
             hello_seen: AtomicBool::new(false),
             launch,
             binding,
+            identity: std::sync::OnceLock::new(),
             connections: Arc::downgrade(&handle.registration_connections),
         })
     }
@@ -139,6 +141,90 @@ pub(crate) struct RegistrationService {
 }
 
 impl SupervisorHandle {
+    #[cfg(all(test, unix))]
+    pub(crate) fn capture_registration_channels_for_test(&self) {
+        *self.registration_test_channels.lock().unwrap() = Some(Vec::new());
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn registration_for_test(&self, module: &str) -> Option<Arc<RegistrationSpawn>> {
+        self.registration_test_channels
+            .lock()
+            .unwrap()
+            .as_ref()?
+            .iter()
+            .rev()
+            .find(|(spawn, _)| spawn.module_id == module)
+            .map(|(spawn, _)| spawn.clone())
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn registration_proof_for_test(&self, module: &str) -> Option<RegistrationProof> {
+        if let Some(nonce) = self.spawn_nonce(module) {
+            return Some(nonce.into());
+        }
+        let channel = self.registration_for_test(module)?;
+        Some(RegistrationProof {
+            key: channel.binding.as_ref()?.key_for_test().into(),
+            channel: Some(channel),
+        })
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn candidate_registration_proof_for_test(
+        &self,
+        module: &str,
+    ) -> Option<RegistrationProof> {
+        let channel = self.registration_for_test(module)?;
+        if !channel.is_candidate() {
+            return None;
+        }
+        Some(RegistrationProof {
+            key: channel.binding.as_ref()?.key_for_test().into(),
+            channel: Some(channel),
+        })
+    }
+    /// Both proofs name the registration connection, not merely its module ID.
+    /// A process birth identity ties a channel to the current launch snapshot,
+    /// excluding candidates before promotion and incumbents after promotion.
+    pub(crate) fn registration_is_current_live(
+        &self,
+        registry: &Registry,
+        module: &str,
+        connection: ConnectionId,
+        nonce: Option<&str>,
+    ) -> bool {
+        if !registry
+            .get_module(module)
+            .ok()
+            .flatten()
+            .is_some_and(|registration| registration.connection_id == connection)
+        {
+            return false;
+        }
+        let Some(child) = self.get(module) else {
+            return false;
+        };
+        let Some(launch) = child.resource_launch() else {
+            return false;
+        };
+        if !launch.enabled || !launch.alive {
+            return false;
+        }
+        if let Some(spawn) = self.registration_spawn(connection) {
+            return spawn.module_id == module
+                && spawn.check().is_ok()
+                && spawn.identity.get().is_some_and(|identity| {
+                    launch.pid == Some(identity.pid) && launch.start == Some(identity.start_time)
+                });
+        }
+        nonce.is_some_and(|presented| {
+            self.spawn_nonce(module).is_some_and(|current| {
+                !presented.is_empty() && constant_time_eq(current.as_bytes(), presented.as_bytes())
+            })
+        })
+    }
+
     pub(crate) fn install_registration_service(
         &self,
         router: Weak<crate::Router>,
@@ -180,6 +266,14 @@ impl SupervisorHandle {
         pid: u32,
         timeout: Duration,
     ) {
+        #[cfg(test)]
+        {
+            let mut captured = self.registration_test_channels.lock().unwrap();
+            if let Some(channels) = &mut *captured {
+                channels.push((spawn, channel));
+                return;
+            }
+        }
         let service = self
             .registration_service
             .lock()
@@ -232,6 +326,55 @@ impl SupervisorHandle {
             let _ = serve.await;
             spawn.retire();
         });
+    }
+}
+
+/// A unit fixture owns the daemon endpoint while it dispatches HELLO directly,
+/// without a socket reader. Its table key locates a channel; it is not sent as a
+/// launch nonce. Full transport tests use the authenticated service instead.
+#[cfg(all(test, unix))]
+#[derive(Clone, Debug)]
+pub(crate) struct RegistrationProof {
+    key: String,
+    channel: Option<Arc<RegistrationSpawn>>,
+}
+#[cfg(all(test, unix))]
+impl std::ops::Deref for RegistrationProof {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.key
+    }
+}
+#[cfg(all(test, unix))]
+impl PartialEq for RegistrationProof {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+#[cfg(all(test, unix))]
+impl From<String> for RegistrationProof {
+    fn from(key: String) -> Self {
+        Self { key, channel: None }
+    }
+}
+#[cfg(all(test, unix))]
+impl From<&str> for RegistrationProof {
+    fn from(key: &str) -> Self {
+        key.to_owned().into()
+    }
+}
+#[cfg(all(test, unix))]
+impl RegistrationProof {
+    pub(crate) fn bind(&self, connection: ConnectionId) {
+        if let Some(channel) = &self.channel {
+            channel.bind(connection);
+        }
+    }
+    pub(crate) fn nonce(&self) -> Option<String> {
+        self.channel.is_none().then(|| self.key.clone())
+    }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.key
     }
 }
 
@@ -457,6 +600,10 @@ mod tests {
                 .ty,
             FrameType::HelloAck
         );
+        assert!(
+            registry.list_modules_with_nonce_verification().unwrap().1[0].1,
+            "the channel itself proves the spawn identity without a body nonce"
+        );
         let ping = Frame::build(
             FrameType::Ping,
             subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
@@ -484,7 +631,14 @@ mod tests {
             0,
             0,
             12,
-            serde_json::to_vec(&json!({"op":"catalog.update", "ready":true})).unwrap(),
+            serde_json::to_vec(
+                &subc_protocol::session::ModuleControlRequestFromModule::CatalogUpdate {
+                    provides: Vec::new(),
+                    capabilities: None,
+                    ready: Some(true),
+                },
+            )
+            .unwrap(),
         )
         .unwrap();
         subc_transport::write_frame(&mut child, &request)
@@ -508,7 +662,13 @@ mod tests {
         .unwrap()
         .unwrap()
         .is_none());
-        assert!(registry.get_module("channel-module").unwrap().is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while registry.get_module("channel-module").unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[cfg(unix)]
@@ -561,30 +721,37 @@ mod tests {
             router.install_registration_service(auth);
             let roster = ChildRoster::default();
             roster.set_privacy_trampoline(Ok(test_privacy_trampoline()));
+            let scratch = cortexkit_test_support::ScratchDir::new("channel-launch");
             let spec = ModuleSpec {
                 module_id: "channel-module".into(),
                 program: "/bin/sleep".into(),
                 args: vec!["60".into()],
-                env: Vec::new(),
+                env: [
+                    "HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_RUNTIME_DIR",
+                    "XDG_CONFIG_HOME",
+                ]
+                .into_iter()
+                .map(|key| (key.into(), scratch.display().to_string()))
+                .collect(),
                 reserved: false,
                 reserved_prefixes: Vec::new(),
                 protocol: ModuleProtocol::Subc,
                 overlap: Default::default(),
                 carry_containment: false,
             };
-            let ring = Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default())));
-            let mut child = spawn_child_in_slot(
-                &spec,
-                None,
-                None,
-                &ring,
-                None,
-                &roster,
-                None,
-                SpawnRole::Plain,
-                false,
-            )
-            .unwrap();
+            let mut spec = spec;
+            spec.protocol = ModuleProtocol::None;
+            let owner = super::super::suspended_spawn_tests::gated_owner(&scratch, &spec, true);
+            let mut runtime =
+                Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                    .with_config_runtime(owner)
+                    .runtime_config();
+            runtime.child_roster = roster;
+            let mut child = spawn_child_in_slot_async(&spec, &runtime, SpawnRole::Plain, false)
+                .await
+                .unwrap();
             let spawn = RegistrationSpawn::new(&handle, "channel-module", SpawnRole::Plain, None);
             child.registration_spawn = Some(spawn.clone());
             let (parent, peer) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -605,7 +772,7 @@ mod tests {
             })
             .await
             .unwrap();
-            // The ack is empty EOF and the PID has not changed. Neither fact
+            // The exec-acknowledgement reader returns EOF and the PID has not changed. Neither fact
             // authorizes HELLO before signature verification and resume.
             let reader = &child.privacy_exec.as_ref().unwrap().reader;
             let mut readiness = reader.readable().await.unwrap();

@@ -2097,7 +2097,12 @@ impl ControlHandler {
                             .and_then(|value| value.as_str()),
                         hello.get("launch_nonce").and_then(|value| value.as_str()),
                     ) {
-                        if !self.supervisor.wait_program_binding(module, nonce).await {
+                        if !self
+                            .config_runtime
+                            .as_ref()
+                            .is_some_and(|owner| owner.module_is_gated(module))
+                            && !self.supervisor.wait_program_binding(module, nonce).await
+                        {
                             self.forwarding.request_connection_close(
                                 ctx.connection_id,
                                 CloseReason::new(
@@ -3110,7 +3115,7 @@ impl ControlHandler {
         // registry or forwarding state behind.
         let hello_ack = self.build_hello_ack(&frame, negotiated_ver, &hello.manifest.module_id)?;
         if swap_candidate {
-            return self.register_swap_candidate(
+            let reply = self.register_swap_candidate(
                 connection_id,
                 sink,
                 &frame,
@@ -3120,7 +3125,12 @@ impl ControlHandler {
                 hello_ack,
                 #[cfg(windows)]
                 hello.launch_nonce.as_deref(),
-            );
+            )?;
+            #[cfg(windows)]
+            if let Some(spawn) = &channel_spawn {
+                spawn.hello_accepted();
+            }
+            return Ok(reply);
         }
         // Registered unpublished: the module id is claimed, so a duplicate HELLO
         // is refused, but `catalog.list` does not show the module and the
@@ -3269,6 +3279,10 @@ impl ControlHandler {
             "module registered"
         );
 
+        #[cfg(windows)]
+        if let Some(spawn) = &channel_spawn {
+            spawn.hello_accepted();
+        }
         #[cfg(windows)]
         if let Some(nonce) = hello.launch_nonce.as_deref() {
             self.supervisor

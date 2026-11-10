@@ -372,7 +372,7 @@ async fn config_phone_relay_approves_the_exact_plan_with_wire_correlation_and_re
     drop(held);
     assert!(matches!(
         apply.await.unwrap().unwrap(),
-        ConfigControlResponse::Applied { generation: 2 }
+        ConfigControlResponse::Applied { generation: 2, .. }
     ));
     let (history, _) = fixture.owner.history().unwrap();
     assert_eq!(
@@ -678,7 +678,7 @@ async fn config_phone_answer_publication_started_before_deadline_returns_its_com
     release.send(()).unwrap();
     assert!(matches!(
         apply.await.unwrap().unwrap(),
-        ConfigControlResponse::Applied { generation: 2 }
+        ConfigControlResponse::Applied { generation: 2, .. }
     ));
     assert_eq!(fixture.owner.history().unwrap().0.len(), 2);
     clock.abort();

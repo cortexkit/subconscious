@@ -87,7 +87,15 @@ until `ck module start` or `ck module restart`.
 
 ## 4. Change the configuration
 
-Edit `<config home>/cortexkit/subc.jsonc`, then:
+First check whether the daemon is stamped:
+
+```sh
+ck config status
+```
+
+An **unstamped** daemon keeps the existing file workflow, with a warning that
+configuration changes have not been gated. Edit
+`<config home>/cortexkit/subc.jsonc`, then:
 
 ```sh
 ck daemon lint                 # check the config and manifests offline
@@ -95,7 +103,7 @@ ck module rescan --dry-run     # show what would change
 ck module rescan               # apply it
 ```
 
-A rescan adds new modules, retires modules removed from the file (stopping
+An unstamped rescan adds new modules, retires modules removed from the file (stopping
 them), and applies changed launch settings at each module's next spawn and
 health settings at once. Some settings apply only when the daemon restarts,
 and rescan reports them as `restart_required`: `port`, `storage`,
@@ -105,14 +113,112 @@ and rescan reports them as `restart_required`: `port`, `storage`,
 edit to a running module's `restart` block or `drain_timeout_ms` also waits for
 the next daemon start.
 
-A module removed from the file keeps its reserved id, so no other process can
+### Stamp, plan and approve
+
+Stamping snapshots the daemon configuration, opted-in modules' declared layers
+and every module's covered program files. Review the complete stamp on the
+desktop approval surface, then approve its digest:
+
+```sh
+ck config stamp
+ck config apply <digest>
+```
+
+The terminal is not a trusted review surface: running `apply` requests approval;
+it does not supply it. Release builds currently have no enabled surface that
+can approve a stamp and return `approval_surface_unavailable`, remaining
+unstamped. Development builds with `dev-desktop-approval` can exercise desktop
+approval, still bound to the digest and an interactive OS prompt.
+
+After stamping, edits are proposals, not authority. The whole `subc.jsonc`
+document is covered, including ungated modules' entries and top-level policy.
+An ungated module still reads its own files unchecked; status lists that gap.
+For changes, use:
+
+```sh
+ck daemon lint
+ck config plan
+ck config apply <digest>
+ck config status
+```
+
+Plans bind the reviewed inputs and base generation. If an input in the plan's
+read set changes, approval fails with `plan_stale`; make a new plan and review
+it again. Status and file previews record a pending proposal, but do not
+approve it. A normal applying rescan, including checked apply, returns
+`config_gated` before the legacy operator prompt. A checked candidate preview
+only compares client text and records no proposal.
+
+Approval and activation are separate. Daemon-entry approval is not live
+reconfiguration: changes to module membership, enabled state, health or launch
+settings may remain inactive until the next deliberate daemon start. The
+`config.apply` reply always includes `restart_required`; true means that
+generation includes a daemon configuration change still waiting for that
+start. Status lists each known difference in `approved_but_inactive`, naming
+the module and entry and separating approved and in-force fingerprints without
+printing credential bytes. `supervisor.list` reports runtime `enabled`
+separately from approved `configured_enabled`.
+
+**Current startup limitation:** approved-snapshot bootstrap is not yet wired;
+startup still reads live `subc.jsonc`. Keep that file equal to the approved
+daemon configuration before restarting. A restart alone is not proof that
+an entry was approved. Check both in-force state and approval status afterward.
+
+A module retired from supervision keeps its reserved id, so no other process can
 register under it. Release it explicitly:
 
 ```sh
 ck module release old-module
 ```
 
+While stamped, release checks membership in the approved generation. A pending
+file edit that re-adds an approved-removed module does not block release.
+
+### Remove the stamp
+
+`ck config unstamp` builds a plan; `ck config apply <digest>` needs the same
+trusted desktop or phone review, not the OS prompt alone. Ordinary unstamp is
+never a small change; recovery unstamp has the fixed OS-prompt exception below.
+Missing or invalid `subc.jsonc` refuses the
+plan. Successful unstamp cancels the pending proposal and reconciles files at
+once as an applying rescan would, keeping the store and history. Opted-in
+modules whose view changes receive `config.changed` and can fetch their file
+layers without another edit or restart. Restart-required daemon settings still
+wait until the next daemon start.
+
+### Integrity and platform limits
+
+- Linux, Windows and ad-hoc or unsigned macOS use `digest_only` stores. A
+  change made while the daemon runs is detected at the next use, but edits,
+  replay, corruption and deletion while it is stopped are not protected.
+  Relocating the data home (`XDG_DATA_HOME` or `HOME`) can start a daemon with no
+  store and therefore no stamp. The Windows store uses a machine-local path,
+  not roaming `APPDATA`.
+- A team-signed macOS daemon can seal its store using a keychain anchor.
+  Deleting the keychain item and rewriting the store as `digest_only`, or
+  deleting both, bypasses that anchor. Real keychain access control, signed
+  upgrades, denial and deletion still need verification on a signed build.
+- A daemon binary predating the gate ignores the store and reads files
+  directly on every platform. Generation ids are not guaranteed to continue
+  after loss or replay of the store or recreation of the keychain item.
+- On Unix, an in-place covered-file write between hashing and exec that keeps
+  device and inode can run unhashed bytes for that spawn. On macOS, observing
+  the executable path rather than the running image leaves a swap-before-exec,
+  swap-back-before-observation gap. A later spawn rechecks identity.
+- Linux OS approval needs the per-user polkit action installed under
+  `/usr/share/polkit-1/actions` (installation requires root). Without it status
+  lists the OS prompt as a missing surface. A policy authorization that did not
+  ask a person does not approve a config change.
+
+In `store_missing` or `store_unverified`, supervised modules do not start.
+Recovery uses default listener and authorization settings. The phone surface
+is unavailable because its supervised relay cannot start; recover by an
+approved re-stamp through the desktop app, or an OS-approved unstamp described
+as “Config files become authoritative again”. Restore denied key access before
+either exit can write a sealed store.
+
 The keys and their limits are in [`daemon-config.md`](daemon-config.md).
+
 
 ## 5. Restart the daemon
 

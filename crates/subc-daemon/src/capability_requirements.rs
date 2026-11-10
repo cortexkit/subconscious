@@ -265,6 +265,14 @@ impl CapabilityRequirementEvaluator {
             .map(|module| module.enabled)
     }
 
+    pub(crate) fn reserved_capabilities(&self) -> BTreeMap<String, String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reserved_capabilities
+            .clone()
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(EvaluatorState::default()),

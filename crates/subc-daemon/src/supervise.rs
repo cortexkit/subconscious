@@ -2242,6 +2242,7 @@ impl SupervisorRuntimeConfig {
 struct SupervisedConfiguration {
     spec: ModuleSpec,
     health: HealthConfig,
+    register_timeout: Duration,
 }
 
 /// Shared daemon lookup table for supervised module handles.
@@ -4038,6 +4039,7 @@ impl Supervisor {
         let configuration = Arc::new(Mutex::new(SupervisedConfiguration {
             spec: spec.clone(),
             health: runtime.health.clone(),
+            register_timeout: runtime.register_timeout,
         }));
         let stderr_ring = Arc::clone(&runtime.stderr_ring);
         let terminal_ring = Arc::clone(&runtime.terminal_ring);
@@ -4819,6 +4821,16 @@ impl SupervisedModule {
                     module_id: Some(self.inner.module_id.clone()),
                 })?;
         Ok((configuration.spec.clone(), configuration.health.clone()))
+    }
+
+    pub(crate) fn configured_register_timeout(&self) -> Result<Duration, SuperviseError> {
+        self.inner
+            .configuration
+            .lock()
+            .map(|configuration| configuration.register_timeout)
+            .map_err(|_| SuperviseError::StatePoisoned {
+                module_id: Some(self.inner.module_id.clone()),
+            })
     }
 
     /// Replace this module's launch spec, keeping its health and drain policy,
@@ -14685,6 +14697,7 @@ mod terminal_history_tests {
                 configuration: Arc::new(Mutex::new(SupervisedConfiguration {
                     spec,
                     health: runtime.health,
+                    register_timeout: runtime.register_timeout,
                 })),
                 stderr_ring: runtime.stderr_ring,
                 terminal_ring: runtime.terminal_ring,

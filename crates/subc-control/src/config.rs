@@ -114,7 +114,11 @@ pub enum ConfigControlResponse {
     #[serde(rename = "config.rollback")]
     Rollback { view: ConfigPlanView },
     #[serde(rename = "config.apply")]
-    Applied { generation: u64 },
+    Applied {
+        generation: u64,
+        #[serde(default)]
+        restart_required: bool,
+    },
     #[serde(rename = "config.history")]
     History {
         generations: Vec<Generation>,
@@ -124,6 +128,37 @@ pub enum ConfigControlResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_wire_applied_reports_restart_required_and_defaults_absent_to_false() {
+        use super::*;
+        let response = ConfigControlResponse::Applied {
+            generation: 7,
+            restart_required: true,
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({"op":"config.apply", "generation":7, "restart_required":true})
+        );
+        assert_eq!(
+            serde_json::from_value::<ConfigControlResponse>(
+                serde_json::json!({"op":"config.apply", "generation":7})
+            )
+            .unwrap(),
+            ConfigControlResponse::Applied {
+                generation: 7,
+                restart_required: false,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(ConfigControlResponse::Applied {
+                generation: 7,
+                restart_required: false,
+            })
+            .unwrap()["restart_required"],
+            false
+        );
+    }
+
     #[test]
     fn config_wire_status_and_history_preserve_unverified_approval_channel() {
         use super::*;

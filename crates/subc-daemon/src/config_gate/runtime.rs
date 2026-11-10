@@ -531,6 +531,8 @@ pub(crate) use admission::SpawnAdmission;
 
 #[path = "approval_request.rs"]
 mod approval_request;
+#[path = "daemon_readers.rs"]
+mod daemon_readers;
 #[path = "phone.rs"]
 mod phone;
 pub(crate) use approval_request::{ApprovalRequest, ApprovalRequestGuard, CancelApprovalRequest};
@@ -1643,7 +1645,10 @@ impl RuntimeOwner {
         if verified
             && !state.recovery_exit_hold
             && !state.store.status().anchor_pending
-            && state.store.status().state == StoreState::Stamped
+            && matches!(
+                state.store.status().state,
+                StoreState::Stamped | StoreState::Unstamped
+            )
         {
             let captured = self.capture(&mut state)?;
             state.store.observe(captured.diagnostic.to_store()?)?;

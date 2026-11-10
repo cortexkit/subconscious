@@ -152,7 +152,7 @@ async fn config_connection_loop_duplicate_correlation_cannot_cancel_the_reserved
             .code,
         "config_busy"
     );
-    assert!(matches!(applied, Some(ConfigControlResponse::Applied { generation: 2 })),
+    assert!(matches!(applied, Some(ConfigControlResponse::Applied { generation: 2, .. })),
         "a duplicate Apply must not steal the first task's token or let its losing guard cancel the winner; winner_cancelled={winner_cancelled}, applied={applied:?}, history={history}");
     assert_eq!(history, 2);
 }

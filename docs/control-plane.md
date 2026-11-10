@@ -66,7 +66,7 @@ so over a second, client connection. Test:
 | `catalog.list` | Registered modules with their manifests' roles, capabilities, readiness and optional `rich_ui` descriptor. Optional `module_id` narrows the list. | An unregistered id gives an empty list, not an error. This is the wire registry, not the supervised roster. `rich_ui` is opaque and fixed for the registration's lifetime; `nonce_verified: true` appears only when HELLO passes the launch-nonce check required for a reserved module or swap candidate. Both fields are omitted when absent/unverified, preserving legacy entry bytes. |
 | `route.open` | Open a route to a target (section 2.1). | Reply: `route_channel`, `route_epoch`. |
 | `route.poll` | Read a bound route's last status (`kind: "status"`) or whether its module process is live (`kind: "liveness"`). | Answered from the daemon's own state; the module is never asked. |
-| `supervisor.list` | Supervised modules with state, health, restart counts and policy. | Each entry's optional `configured_enabled` is the `enabled` value in the daemon's loaded configuration. Compare it with runtime `enabled` to detect drift; it is not a stored flag. Optional [`subtree`](module-subtree-memory.md) reports memory including child processes beside the unchanged per-process `resources`, with an explicit source and process count or unavailability reason. |
+| `supervisor.list` | Supervised modules with state, health, restart counts and policy. | Each entry's optional `configured_enabled` is from the approved generation when stamped, otherwise the daemon's loaded configuration. Runtime `enabled`, health and launch observations remain in-force supervisor state, not an assertion that approval activated it. Optional [`subtree`](module-subtree-memory.md) reports memory including child processes beside the unchanged per-process `resources`, with an explicit source and process count or unavailability reason. |
 | `supervisor.health` | Cached health for every supervised module. | |
 | `supervisor.health_probe` | Send one fresh `health.check` to a module and return its answer. | Refused `health_not_advertised` when the module did not list `health.check` in its HELLO `control_ops`. |
 | `supervisor.routes` | Live routes served by one module or every module. | Answered from the forwarding table; safe during a drain. |
@@ -78,9 +78,10 @@ so over a second, client connection. Test:
 | `supervisor.restart` | Drain and restart a module. Optional `drain_timeout_ms` overrides the drain budget for this restart; `0` tears down without waiting. | Privileged. |
 | `supervisor.swap` | Blue/green restart: start a replacement beside the running process and cut over when it reports ready. Optional `ready_timeout_ms` (default 100 s). | Privileged. Refused unless the module is configured `overlap: "safe"`. Test: `swap_of_an_exclusive_module_is_refused_and_spawns_nothing` (`crates/subc-core/tests/forwarding.rs`). |
 | `supervisor.reload` | Drain a running module's routes, stop its process and spawn it again; routes close with reason `reload`. | Privileged. Refused for a disabled module. |
-| `supervisor.set_enabled` | Stop and disable, or enable and start, a module. Enabling a module that is down after its crash budget ran out starts it again. | Privileged. Held in the daemon's memory only: it is not written to `subc.jsonc`. A daemon restart or any rescan applies the configured `enabled` again for every module, including entries that did not change. |
-| `supervisor.rescan` | Re-read `subc.jsonc` and reconcile the supervised set. `preview: true` computes the change without applying it. | Privileged unless `preview` is true. |
-| `supervisor.release_reserved` | Forget the reserved id of a module removed from config, so another process may register it. | Privileged. |
+| `supervisor.set_enabled` | Stop and disable, or enable and start, a module. Enabling a module that is down after its crash budget ran out starts it again. | Privileged. Held in memory only, not written to `subc.jsonc`. Unstamped, an applying rescan restores configured enabled for every module. Stamped rescans cannot apply configuration. |
+| `supervisor.rescan` | Unstamped, re-read `subc.jsonc` and reconcile the supervised set. `preview: true` computes changes without applying them. | Privileged unless preview. Stamped apply returns `config_gated` before the legacy prompt and still observes files as a proposal; file preview compares against approved entries and records a proposal. |
+| `supervisor.rescan_checked` | Preview client-supplied candidate text, or apply a file whose hash and staged generation match a preview. | Candidate preview records nothing. Stamped checked apply returns `config_gated` before the legacy prompt, with the existing request shape unchanged. |
+| `supervisor.release_reserved` | Forget the retained reserved id of a retired module, so another process may register it. | Privileged. While stamped, membership comes from the approved generation, not a proposed file re-add. |
 | `activity.record`, `activity.query`, `activity.subscribe` | The activity ledger. | Accepted from client and module connections; who may call each is in [`activity-ledger.md`](activity-ledger.md). |
 
 A successful privileged operation that has no other result answers
@@ -88,11 +89,56 @@ A successful privileged operation that has no other result answers
 Lifecycle acknowledgements are unchanged; they do not carry configuration
 values. To compare a start or stop with the configuration, read the target's
 `supervisor.list` entry after the acknowledgement. Its optional
-`configured_enabled` is the module's `enabled` value in the configuration the
-daemon loaded, not a fresh disk read. The field is absent when there is no
+`configured_enabled` is the module's `enabled` value in the approved generation
+(or loaded configuration while unstamped), not a fresh disk read. The field is absent when there is no
 configured entry (for example, a daemon without a config file), and on older
 daemons. Absent values are omitted rather than serialized as `null`, preserving
 older list-entry bytes.
+
+### Configuration plans and approval
+
+The opt-in `config.gate` capability advertises standalone configuration bodies,
+not new variants of the legacy exhaustive client control enums:
+
+| Op | Result |
+| --- | --- |
+| `config.status` | Stamp state, integrity mode, proposals, missing approval surfaces, platform warnings and approved-but-inactive differences. |
+| `config.stamp`, `config.plan`, `config.unstamp`, `config.rollback` | A reviewable plan and digest; none commits configuration. |
+| `config.apply` | Requests approval of that digest, then reports `generation` and `restart_required` (always serialized; absent on older replies means false). |
+| `config.history` | Retained generations and summaries of pruned history. |
+
+`ck config plan` followed by `ck config apply <digest>` replaces edit-and-rescan
+on a stamped daemon. The terminal is not a trusted surface and a client's claim
+to have reviewed a diff grants no authority. Stamp approval is desktop-only.
+Other plans require a trusted desktop or phone review unless the entire change
+fits the OS prompt: the daemon-generated description must remain unaltered,
+with no sanitizer substitutions or target truncation, in the 200-character
+summary (target names are limited to 64 characters). Such a small change may
+use the interactive OS prompt alone. Stamp, ordinary unstamp, rollback,
+declaration changes and program changes are never small. Recovery unstamp is
+the exception, using the fixed sentence “Config files become authoritative again”. No legacy
+`privileged_operator_prompt: "log"` policy or operator-app shortcut approves a
+plan. Unavailable review returns `approval_surface_unavailable`; declined or
+unanswered approval returns `approval_declined`. Changed plan inputs return
+`plan_stale`, without supplying a new digest.
+
+Approval of daemon entries is not live reconciliation. The intended activation
+boundary is the next deliberate daemon start; status compares approved entries
+with the supervisor's in-force configuration and reports known differences by
+`module_id` and `entry` in `approved_but_inactive`. Sensitive values are
+fingerprinted, not printed. A `restart_required: true` apply reply means the
+applied generation includes such a deferred daemon configuration change.
+Startup still reads live `subc.jsonc` until approved-snapshot bootstrap is
+available, so a restart is not itself evidence of approved configuration.
+
+Unstamp validates the files before planning and, after approval, reconciles
+them immediately as an Execute rescan would. It cancels proposals, keeps store
+history and notifies opted-in modules whose served file view changed. See
+[`operating-the-daemon.md`](operating-the-daemon.md#integrity-and-platform-limits)
+for integrity modes, recovery and the stopped-daemon, data-home relocation,
+keychain deletion, old-binary and program-identity platform gaps. Release builds
+currently cannot approve a stamp; development approval does not enable release
+surfaces.
 
 ### `app.open` and `connection.describe`
 

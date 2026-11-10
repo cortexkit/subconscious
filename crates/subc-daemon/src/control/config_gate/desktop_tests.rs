@@ -618,7 +618,7 @@ async fn config_desktop_apply_prompts_before_waiting_for_the_cutover_gate_and_pu
     assert_eq!(response.len(), 1);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&response[0].body).unwrap(),
-        serde_json::json!({"op":"config.apply","generation":1})
+        serde_json::json!({"op":"config.apply","generation":1,"restart_required":false})
     );
     assert_eq!(
         owner.history().unwrap().0[0].approval_channel,

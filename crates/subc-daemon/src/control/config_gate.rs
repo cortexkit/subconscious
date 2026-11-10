@@ -2,6 +2,8 @@ use subc_control::config::{ConfigControlRequest, ConfigControlResponse};
 
 use super::*;
 mod admission;
+mod daemon_readers;
+pub(super) use daemon_readers::preview_approved_daemon;
 mod delivery_worker;
 mod phone;
 mod recovery;
@@ -585,7 +587,7 @@ impl ControlHandler {
     ) -> std::result::Result<ConfigControlResponse, GateError> {
         match request {
             ConfigControlRequest::Status {} => {
-                let mut status = config_work(runtime, |owner| owner.status()).await?;
+                let mut status = config_work(runtime.clone(), |owner| owner.status()).await?;
                 let facts = self.config_approval_facts(ctx).await;
                 status
                     .missing_approval_surfaces
@@ -596,6 +598,8 @@ impl ControlHandler {
                 if let Err(error) = self.config_desktop_identity(ctx.connection_id) {
                     status.missing_approval_surfaces.push(error.code);
                 }
+                self.report_daemon_configuration(&runtime, &mut status)
+                    .await?;
                 Ok(ConfigControlResponse::Status { status })
             }
             ConfigControlRequest::History {} => {
@@ -714,9 +718,15 @@ impl ControlHandler {
                 } else {
                     work.await?
                 };
-                self.reconcile_authority_exit(exit_runtime, generation)
+                self.reconcile_authority_exit(exit_runtime.clone(), generation)
                     .await?;
-                Ok(ConfigControlResponse::Applied { generation })
+                let restart_required = self
+                    .daemon_restart_required(&exit_runtime, generation)
+                    .await?;
+                Ok(ConfigControlResponse::Applied {
+                    generation,
+                    restart_required,
+                })
             }
             request => {
                 let kind = match request {
@@ -1062,7 +1072,7 @@ async fn config_work<T: Send + 'static>(
         .await
 }
 
-fn config_error_frame(frame: &Frame, error: GateError) -> Result<Frame, RouterError> {
+pub(super) fn config_error_frame(frame: &Frame, error: GateError) -> Result<Frame, RouterError> {
     control_error_body_frame(
         frame,
         ErrorBody {

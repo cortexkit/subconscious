@@ -6120,6 +6120,13 @@ impl ControlHandler {
     }
 
     async fn handle_supervisor_list(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
+        let approved = if let Some(owner) = &self.config_runtime {
+            owner
+                .on_blocking(|owner| owner.approved_daemon_configuration())
+                .await
+        } else {
+            Ok(None)
+        };
         let generation = self
             .registry
             .generation()
@@ -6166,9 +6173,17 @@ impl ControlHandler {
                 status.launch_spec_digest.as_ref(),
             ));
             let pending_reload = Some(verdict);
-            let configured_enabled = self
-                .capability_evaluator
-                .configured_enabled(&status.module_id);
+            let configured_enabled = match &approved {
+                Ok(Some(approved)) => approved
+                    .modules
+                    .iter()
+                    .find(|module| module.module_id == status.module_id)
+                    .map(|module| module.enabled),
+                Ok(None) => self
+                    .capability_evaluator
+                    .configured_enabled(&status.module_id),
+                Err(_) => None,
+            };
             // Keep the retired policy field on the wire for one release so
             // existing status consumers still receive the platform policy.
             modules.push(
@@ -6754,6 +6769,21 @@ impl ControlHandler {
         requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
         let preview = mode.previews();
+        let mut approved_preview = None;
+        if matches!(mode, RescanMode::Preview) {
+            if let Some(owner) = &self.config_runtime {
+                match owner
+                    .on_blocking(|owner| {
+                        owner.observe_file_proposal()?;
+                        owner.approved_daemon_configuration()
+                    })
+                    .await
+                {
+                    Ok(config) => approved_preview = config,
+                    Err(error) => return Ok(vec![config_gate::config_error_frame(&frame, error)?]),
+                }
+            }
+        }
         let Some(context) = self.rescan.clone() else {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -6897,8 +6927,12 @@ impl ControlHandler {
         } else {
             Vec::new()
         };
-        let reconciled = match &mode {
-            RescanMode::Candidate(candidate) => self
+        let reconciled = match (&mode, approved_preview.as_ref()) {
+            (RescanMode::Preview, Some(approved)) => Ok((
+                config_gate::preview_approved_daemon(approved, &modules),
+                Vec::new(),
+            )),
+            (RescanMode::Candidate(candidate), _) => self
                 .preview_candidate(&context, modules, candidate)
                 .map(|result| (result, Vec::new())),
             _ => {
@@ -6958,7 +6992,28 @@ impl ControlHandler {
         };
         let operation_lock = self.supervisor.operation_lock();
         let _operation_guard = operation_lock.lock().await;
-        let loaded = match crate::daemon_config::load(&context.config_path) {
+        let approved = if let Some(owner) = &self.config_runtime {
+            // Observe the file as a proposal, but decide membership solely from
+            // approved bytes. A proposed re-add must not retain a removed id.
+            match owner
+                .on_blocking(|owner| {
+                    owner.observe_file_proposal()?;
+                    owner.approved_daemon_configuration()
+                })
+                .await
+            {
+                Ok(config) => config,
+                Err(error) => return Ok(vec![config_gate::config_error_frame(&frame, error)?]),
+            }
+        } else {
+            None
+        };
+        let loaded = if let Some(approved) = approved {
+            Ok(Some(approved))
+        } else {
+            crate::daemon_config::load(&context.config_path)
+        };
+        let loaded = match loaded {
             Ok(Some(config)) => config,
             Ok(None) => {
                 return Ok(vec![control_error_frame(

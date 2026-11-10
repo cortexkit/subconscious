@@ -4,6 +4,9 @@ use crate::config_store::StoreRoot;
 use serde_json::json;
 use subc_protocol::config::ConfigGetRequest;
 
+#[path = "daemon_readers_tests.rs"]
+mod daemon_readers;
+
 struct Rig {
     path: std::path::PathBuf,
     declaration: ConfigDeclareRequest,

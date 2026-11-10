@@ -2,6 +2,13 @@
 
 ## 0.41.10
 
+- Record file-preview proposals without recording client candidate text, and
+  read approved daemon entries for reservation release and configured enabled
+  reporting. Report approved-but-inactive daemon settings separately from
+  supervisor state and include an explicit `restart_required` in config apply
+  replies. Document approval, unstamp and platform limitations, including the
+  remaining approved-entry reconciliation and bootstrap integration gaps.
+
 - Retire binding authority at direct macOS privacy-confirmation exit observations
   and on uncertain synchronous waits. Publish identity reservations atomically
   with their launch-nonce sample. Upgrade a carried retirement hook's live holder

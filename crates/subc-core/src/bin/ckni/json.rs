@@ -163,7 +163,28 @@ mod tests {
 
     #[test]
     fn every_builtin_variant_has_one_plain_and_one_documented_json_classification() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let apply = format!("config apply {digest}");
+        let place_program = format!("config place-program alpha /program {digest}");
         let cases = [
+            // Config replies retain the daemon's complete view instead of a
+            // ckni schema envelope, while plain output keeps piped ck's form.
+            ("config status", PlainOutput::PipedText, JsonForm::Exempt),
+            ("config plan", PlainOutput::PipedText, JsonForm::Exempt),
+            (apply.as_str(), PlainOutput::PipedText, JsonForm::Exempt),
+            ("config stamp", PlainOutput::PipedText, JsonForm::Exempt),
+            ("config unstamp", PlainOutput::PipedText, JsonForm::Exempt),
+            ("config history", PlainOutput::PipedText, JsonForm::Exempt),
+            (
+                "config rollback 4",
+                PlainOutput::PipedText,
+                JsonForm::Exempt,
+            ),
+            (
+                place_program.as_str(),
+                PlainOutput::PipedText,
+                JsonForm::Exempt,
+            ),
             (
                 "module resources",
                 PlainOutput::PipedText,
@@ -309,6 +330,7 @@ mod tests {
         let docs = include_str!("../../../../../docs/ck-json.md");
         let mut commands = HashSet::new();
         let mut modules = HashSet::new();
+        let mut configs = HashSet::new();
         let mut schemas = BTreeSet::new();
         let mut walk = |text: &str, plain, json| {
             let args = crate::parse_args(
@@ -323,6 +345,12 @@ mod tests {
                 assert!(
                     modules.insert(discriminant(module)),
                     "duplicate module variant: {text}"
+                );
+            }
+            if let Command::Config(config) = &args.command {
+                assert!(
+                    configs.insert(discriminant(config)),
+                    "duplicate config variant: {text}"
                 );
             }
             match json {
@@ -361,6 +389,14 @@ mod tests {
             modules.len(),
             variant_count(source, "ModuleCommand"),
             "unclassified ModuleCommand variant"
+        );
+        assert_eq!(
+            configs.len(),
+            variant_count(
+                include_str!("../../../../subc-control/src/config.rs"),
+                "ConfigControlRequest"
+            ),
+            "unclassified ConfigControlRequest variant"
         );
         let documented = docs
             .lines()

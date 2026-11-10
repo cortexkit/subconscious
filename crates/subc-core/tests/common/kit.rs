@@ -87,10 +87,10 @@ pub fn isolate_client_fully(command: &mut Command, root: &Path) {
 /// root (which carries a PID and a kernel start identity) is not. Created
 /// `0700`, because the daemon refuses a data home other users can reach, and
 /// removed when the kit drops.
-struct ShortRoot(PathBuf);
+pub(crate) struct ShortRoot(PathBuf);
 
 impl ShortRoot {
-    fn create_short_socket_root() -> Self {
+    pub(crate) fn create_short_socket_root() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let name = format!(
@@ -103,11 +103,11 @@ impl ShortRoot {
         Self(path)
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.0
     }
 
-    fn join(&self, part: impl AsRef<Path>) -> PathBuf {
+    pub(crate) fn join(&self, part: impl AsRef<Path>) -> PathBuf {
         self.0.join(part)
     }
 }

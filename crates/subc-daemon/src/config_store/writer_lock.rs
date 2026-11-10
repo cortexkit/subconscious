@@ -195,27 +195,16 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    struct Rig(PathBuf);
+    struct Rig(cortexkit_test_support::ScratchDir);
     impl Rig {
         fn new() -> Self {
-            let path =
-                std::env::temp_dir().join(format!("subc-store-lock-{}-{}", std::process::id(), {
-                    static NEXT: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
-                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                }));
-            fs::create_dir(&path).unwrap();
+            let path = cortexkit_test_support::ScratchDir::new("subc-store-lock");
             #[cfg(windows)]
-            subc_os::windows_acl::create_private_dir(&path).unwrap();
+            subc_os::windows_acl::create_private_dir(path.path()).unwrap();
             Self(path)
         }
         fn root(&self) -> PathBuf {
             self.0.join("authority")
-        }
-    }
-    impl Drop for Rig {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
         }
     }
     struct KillOnDrop(Child);
@@ -233,7 +222,7 @@ mod tests {
         let (canonical, first) = StoreWriterLock::acquire(&root).unwrap();
         assert_eq!(
             canonical.path(),
-            fs::canonicalize(&rig.0).unwrap().join("authority")
+            fs::canonicalize(rig.0.path()).unwrap().join("authority")
         );
         assert!(!root.exists());
         assert!(

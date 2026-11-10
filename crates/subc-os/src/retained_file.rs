@@ -145,15 +145,7 @@ mod tests {
 
     #[test]
     fn retained_file_identity_hard_links_share_identity_but_copies_do_not() {
-        let root = std::env::temp_dir().join(format!(
-            "subc-retained-file-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&root).unwrap();
+        let root = cortexkit_test_support::ScratchDir::new("subc-retained-file");
         let first = root.join("first");
         let link = root.join("link");
         let copy = root.join("copy");
@@ -163,6 +155,5 @@ mod tests {
         let id = |path| retained_file_identity(&File::open(path).unwrap()).unwrap();
         assert_eq!(id(&first), id(&link));
         assert_ne!(id(&first), id(&copy));
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

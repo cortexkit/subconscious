@@ -66,15 +66,8 @@ fn windows_replace(from: &Path, to: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::{fs, io::Write};
-    fn root() -> std::path::PathBuf {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "subc-durable-replace-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        path
+    fn root() -> cortexkit_test_support::ScratchDir {
+        cortexkit_test_support::ScratchDir::new("subc-durable-replace")
     }
     #[test]
     fn durable_replace_replaces_existing_file() {
@@ -89,7 +82,6 @@ mod tests {
         durable_replace(&from, &to).unwrap();
         assert_eq!(fs::read(&to).unwrap(), b"next");
         assert!(!from.exists());
-        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn durable_replace_missing_source_is_error() {
@@ -98,6 +90,5 @@ mod tests {
         fs::write(&to, b"previous").unwrap();
         assert!(durable_replace(&root.join("absent"), &to).is_err());
         assert_eq!(fs::read(&to).unwrap(), b"previous");
-        fs::remove_dir_all(root).unwrap();
     }
 }

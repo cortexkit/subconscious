@@ -1,5 +1,7 @@
 //! The service argument, never ambient home variables, selects config authority.
 
+mod common;
+
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -158,15 +160,10 @@ async fn status_on<S: AsyncRead + AsyncWrite + Unpin>(
     )
 }
 
-struct Temp(PathBuf);
+struct Temp(common::kit::ShortRoot);
 impl Temp {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "subc-store-start-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+        let path = common::kit::ShortRoot::create_short_socket_root();
         for name in ["data", "runtime", "config/cortexkit", "home"] {
             fs::create_dir_all(path.join(name)).unwrap();
         }
@@ -176,11 +173,6 @@ impl Temp {
         )
         .unwrap();
         Self(path)
-    }
-}
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -235,7 +227,7 @@ async fn config_store_startup_explicit_root_reads_only_its_unique_marker() {
     let temp = Temp::new();
     let root = temp.0.join("service-store");
     let bytes = marker(&root);
-    let mut daemon = Daemon::start(temp.0.clone(), Some(&root));
+    let mut daemon = Daemon::start(temp.0.path().to_path_buf(), Some(&root));
     daemon.ready().await;
     let (kind, body) = daemon.status().await;
     assert_eq!(kind, FrameType::Response, "{body}");
@@ -254,7 +246,7 @@ async fn config_store_startup_explicit_root_reads_only_its_unique_marker() {
     daemon.stop();
     assert_eq!(fs::read(root.join("approved.json")).unwrap(), bytes);
     let mut artifacts = Vec::new();
-    config_artifacts(&temp.0, &mut artifacts);
+    config_artifacts(temp.0.path(), &mut artifacts);
     artifacts.sort();
     let mut expected = vec![
         root.join("approved.json"),
@@ -282,7 +274,7 @@ async fn config_store_startup_without_argument_ignores_all_fallback_markers() {
             (root.join("approved.json"), bytes)
         })
         .collect();
-    let mut daemon = Daemon::start(temp.0.clone(), None);
+    let mut daemon = Daemon::start(temp.0.path().to_path_buf(), None);
     daemon.ready().await;
     let (kind, body) = daemon.status().await;
     assert_eq!(kind, FrameType::Error, "{body}");
@@ -296,7 +288,7 @@ async fn config_store_startup_without_argument_ignores_all_fallback_markers() {
         assert_eq!(fs::read(path).unwrap(), *bytes);
     }
     let mut artifacts = Vec::new();
-    config_artifacts(&temp.0, &mut artifacts);
+    config_artifacts(temp.0.path(), &mut artifacts);
     artifacts.sort();
     let mut expected: Vec<_> = markers.into_iter().map(|(path, _)| path).collect();
     expected.sort();

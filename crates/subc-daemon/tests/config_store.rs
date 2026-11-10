@@ -8,23 +8,18 @@ use std::{
 };
 use subc_daemon::config_store::{StoreRoot, STORE_FILE};
 
-struct Rig(PathBuf);
+struct Rig(cortexkit_test_support::ScratchDir);
 impl Rig {
     fn new() -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "config-store-child-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path)
+        Self(cortexkit_test_support::ScratchDir::new(
+            "config-store-child",
+        ))
     }
     fn command(&self, mode: &str, sealed: bool) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ckdev-config-store-fixture"));
         command
             .arg(mode)
-            .arg(&self.0)
+            .arg(self.0.path())
             .arg(if sealed { "sealed" } else { "digest" });
         // These decoys must not redirect any part of an explicitly isolated rig.
         for key in [
@@ -69,11 +64,6 @@ impl Rig {
         }
         child.kill().unwrap();
         child.wait().unwrap();
-    }
-}
-impl Drop for Rig {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
     }
 }
 
@@ -129,7 +119,7 @@ fn config_store_root_and_all_hooks_reject_non_ckdev_binary() {
     fs::copy(source, &destination).unwrap();
     let output = Command::new(destination)
         .arg("stamp")
-        .arg(&rig.0)
+        .arg(rig.0.path())
         .arg("digest")
         .output()
         .unwrap();

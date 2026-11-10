@@ -711,19 +711,15 @@ mod tests {
 
     struct Rig {
         root: PathBuf,
+        _scratch: cortexkit_test_support::ScratchDir,
         capturer: ConfigCapturer,
         declarations: BTreeMap<String, ConfigDeclareRequest>,
     }
     impl Rig {
         fn new() -> Self {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let root = std::env::temp_dir().join(format!(
-                "subc-gate-capture-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            ));
-            std::fs::create_dir_all(root.join("cortexkit")).unwrap();
-            let root = root.canonicalize().unwrap();
+            let scratch = cortexkit_test_support::ScratchDir::new("subc-gate-capture");
+            std::fs::create_dir_all(scratch.join("cortexkit")).unwrap();
+            let root = scratch.path().canonicalize().unwrap();
             let daemon_path = root.join("cortexkit/subc.jsonc");
             std::fs::write(&daemon_path, br#"{"version":1,"modules":{}}"#).unwrap();
             let schema = json!({
@@ -747,15 +743,11 @@ mod tests {
                 },
                 declarations: BTreeMap::from([("a".into(), declaration)]),
                 root,
+                _scratch: scratch,
             }
         }
         fn write(&self, bytes: &[u8]) {
             std::fs::write(self.root.join("cortexkit/a.jsonc"), bytes).unwrap();
-        }
-    }
-    impl Drop for Rig {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
         }
     }
 

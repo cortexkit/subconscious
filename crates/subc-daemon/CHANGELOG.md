@@ -2,6 +2,11 @@
 
 ## 0.41.10
 
+- Add the opt-in `dev-placement` feature and owner-only `config.place_program`.
+  Record program-only development generations without changing configuration
+  delivery pointers; release daemons refuse their identities until approval.
+  Report ungated modules, interpreter-only coverage and startup override names.
+
 - Keep approved daemon configuration in a separately published memory view, so
   polled supervisor lists do not wait for configuration publication, disk checks
   or the platform keychain. Invalidate the view when authority becomes unverified.

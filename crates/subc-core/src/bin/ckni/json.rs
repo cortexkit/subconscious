@@ -13,6 +13,7 @@ pub(crate) enum JsonForm {
 
 pub(crate) fn json_form(command: &Command) -> JsonForm {
     match command {
+        Command::Config(_) => JsonForm::Exempt,
         Command::Health => JsonForm::Schema("ck.health/v1"),
         Command::HealthDetail { .. } => JsonForm::Schema("ck.health.detail/v1"),
         Command::Activity(_) => JsonForm::Schema("ck.activity/v1"),

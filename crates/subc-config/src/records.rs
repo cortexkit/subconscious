@@ -247,6 +247,9 @@ pub enum ApprovalChannel {
     PhoneCard,
     AttestedDesktop,
     UnverifiedDevelopmentDesktop,
+    /// A development placement under the compiled switch committed without
+    /// any approval surface.
+    DevelopmentPlacement,
 }
 
 impl ApprovalChannel {
@@ -256,6 +259,7 @@ impl ApprovalChannel {
             Self::PhoneCard => "phone card",
             Self::AttestedDesktop => "attested desktop",
             Self::UnverifiedDevelopmentDesktop => "development desktop (unverified)",
+            Self::DevelopmentPlacement => "development placement (no approval)",
         }
     }
 }
@@ -304,6 +308,11 @@ mod approval_channel_tests {
     #[test]
     fn approval_channel_is_required_closed_and_preserves_unverified_wording() {
         for (channel, wire, words) in [
+            (
+                ApprovalChannel::DevelopmentPlacement,
+                "development_placement",
+                "development placement (no approval)",
+            ),
             (ApprovalChannel::OsPrompt, "os_prompt", "OS prompt"),
             (ApprovalChannel::PhoneCard, "phone_card", "phone card"),
             (

@@ -26,6 +26,12 @@ pub enum ConfigControlRequest {
     History {},
     #[serde(rename = "config.rollback")]
     Rollback { generation: u64 },
+    #[serde(rename = "config.place_program")]
+    PlaceProgram {
+        module_id: String,
+        path: String,
+        sha256: Digest,
+    },
 }
 
 impl ConfigControlRequest {
@@ -38,6 +44,7 @@ impl ConfigControlRequest {
             Self::Unstamp {} => "config.unstamp",
             Self::History {} => "config.history",
             Self::Rollback { .. } => "config.rollback",
+            Self::PlaceProgram { .. } => "config.place_program",
         }
     }
 }
@@ -124,10 +131,37 @@ pub enum ConfigControlResponse {
         generations: Vec<Generation>,
         pruned: Vec<serde_json::Value>,
     },
+    #[serde(rename = "config.place_program")]
+    ProgramPlaced {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<u64>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn config_wire_program_placement_names_and_optional_generation() {
+        use super::*;
+        let body = serde_json::json!({"op":"config.place_program","module_id":"demo","path":"/bin/demo","sha256":format!("sha256:{}", "a".repeat(64))});
+        let request: ConfigControlRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(request.op(), "config.place_program");
+        assert_eq!(serde_json::to_value(request).unwrap(), body);
+        assert!(matches!(
+            serde_json::from_value::<ConfigControlResponse>(
+                serde_json::json!({"op":"config.place_program"})
+            )
+            .unwrap(),
+            ConfigControlResponse::ProgramPlaced { generation: None }
+        ));
+        let response = ConfigControlResponse::ProgramPlaced {
+            generation: Some(3),
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({"op":"config.place_program","generation":3})
+        );
+    }
     #[test]
     fn config_wire_applied_reports_restart_required_and_defaults_absent_to_false() {
         use super::*;

@@ -109,6 +109,22 @@ impl StoreBody {
     /// active/recovery versions even when recent history must be discarded.
     pub(super) fn protected_generations(&self) -> BTreeSet<u64> {
         let mut keep = BTreeSet::new();
+        // Program-only placements have no configuration tuple pointer. Retain
+        // each module's newest placement until a person-approved generation
+        // supersedes the development overlay.
+        let mut placed_modules = BTreeSet::new();
+        for (&id, entry) in self
+            .generations
+            .iter()
+            .rev()
+            .take_while(|(_, entry)| entry.kind == CommitKind::Development)
+        {
+            for module in entry.generation.changeset.launch_manifests.keys() {
+                if placed_modules.insert(module) {
+                    keep.insert(id);
+                }
+            }
+        }
         for (_, versions) in &self.versions {
             keep.extend(
                 [versions.active, versions.recovery, versions.pending]

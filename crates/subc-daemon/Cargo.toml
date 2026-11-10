@@ -12,6 +12,7 @@ bench-harness = []
 loom = []
 test-support = ["subc-os/test-support"]
 dev-desktop-approval = []
+dev-placement = []
 
 [[bin]]
 name = "privacy-trampoline-fixture"

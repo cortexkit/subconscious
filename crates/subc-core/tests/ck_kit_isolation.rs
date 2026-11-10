@@ -46,6 +46,7 @@ fn ck_in_the_kit_reaches_only_the_kit_daemon() {
     // nothing there.
     let output = kit
         .ck_command()
+        .env_remove("SUBC_CONNECTION_FILE")
         .args(["--json", "module", "list"])
         .output()
         .unwrap();

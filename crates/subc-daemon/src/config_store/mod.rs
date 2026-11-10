@@ -941,6 +941,14 @@ impl ConfigStore {
     ) -> Result<u64, StoreError> {
         self.delivery_ready()?;
         let kind = entry.kind;
+        if entry.generation.approval_channel == subc_config::ApprovalChannel::DevelopmentPlacement
+            && kind != CommitKind::Development
+        {
+            return Err(StoreError::new(
+                StoreErrorCode::InvalidState,
+                "development placement is not an approval channel for this commit",
+            ));
+        }
         if self.state == StoreState::Unstamped && kind != CommitKind::Stamp {
             return Err(StoreError::new(
                 StoreErrorCode::InvalidState,

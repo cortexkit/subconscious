@@ -6,6 +6,8 @@ use subc_protocol::config::ConfigGetRequest;
 
 #[path = "daemon_readers_tests.rs"]
 mod daemon_readers;
+#[path = "status_placement_tests.rs"]
+mod status_placement;
 
 struct Rig {
     path: std::path::PathBuf,

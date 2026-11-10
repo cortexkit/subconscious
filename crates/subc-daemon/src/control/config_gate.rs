@@ -29,6 +29,7 @@ pub(super) fn is_config_op(op: &str) -> bool {
             | "config.unstamp"
             | "config.history"
             | "config.rollback"
+            | "config.place_program"
     )
 }
 
@@ -49,6 +50,7 @@ impl PrivilegedRequest for ConfigControlRequest {
             Self::Unstamp {} => None,
             Self::History {} => None,
             Self::Rollback { .. } => None,
+            Self::PlaceProgram { .. } => None,
             _ => None,
         }
     }
@@ -586,6 +588,19 @@ impl ControlHandler {
         request: ConfigControlRequest,
     ) -> std::result::Result<ConfigControlResponse, GateError> {
         match request {
+            ConfigControlRequest::PlaceProgram {
+                module_id,
+                path,
+                sha256,
+            } => {
+                let gate = runtime.module_gate(&module_id)?;
+                let _guard = gate.lock().await;
+                let generation = config_work(runtime, move |owner| {
+                    owner.place_program(&module_id, &path, &sha256)
+                })
+                .await?;
+                Ok(ConfigControlResponse::ProgramPlaced { generation })
+            }
             ConfigControlRequest::Status {} => {
                 let mut status = config_work(runtime.clone(), |owner| owner.status()).await?;
                 let facts = self.config_approval_facts(ctx).await;

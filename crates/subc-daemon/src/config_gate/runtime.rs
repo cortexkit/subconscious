@@ -36,6 +36,7 @@ pub struct RuntimeOwner {
     approved_daemon: std::sync::RwLock<ApprovedDaemonView>,
     inner: Mutex<OwnerState>,
     capturer: ConfigCapturer,
+    startup_overrides: Vec<String>,
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     delivery_changed: std::sync::Arc<tokio::sync::Notify>,
     route_policy_authority: std::sync::OnceLock<std::sync::Arc<dyn RoutePolicyAuthority>>,
@@ -563,6 +564,10 @@ mod daemon_readers;
 pub(crate) use daemon_readers::ApprovedDaemonView;
 #[path = "phone.rs"]
 mod phone;
+#[path = "placement.rs"]
+mod placement;
+#[path = "status_inputs.rs"]
+mod status_inputs;
 pub(crate) use approval_request::{ApprovalRequest, ApprovalRequestGuard, CancelApprovalRequest};
 
 impl RuntimeOwner {
@@ -698,6 +703,9 @@ impl RuntimeOwner {
                 after_approval_drain_hook: None,
             }),
             capturer,
+            startup_overrides: status_inputs::present_overrides(|name| {
+                std::env::var_os(name).is_some()
+            }),
             module_gates: Mutex::new(HashMap::new()),
             delivery_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
             route_policy_authority: std::sync::OnceLock::new(),
@@ -1691,6 +1699,7 @@ impl RuntimeOwner {
 
     pub fn status(&self) -> Result<subc_control::config::ConfigStatus> {
         let mut state = self.lock()?;
+        let mut current_snapshot = None;
         state.retry_anchor(true);
         let verified = state.store.check().is_ok();
         if verified
@@ -1702,6 +1711,7 @@ impl RuntimeOwner {
             )
         {
             let captured = self.capture(&mut state)?;
+            current_snapshot = Some(captured.diagnostic.clone());
             state.store.observe(captured.diagnostic.to_store()?)?;
         }
         let store_status = state.store.status();
@@ -1727,13 +1737,31 @@ impl RuntimeOwner {
         status.revision = store_status.revision;
         status.base_revision = store_status.base_revision;
         status.anchor_pending = store_status.anchor_pending;
+        status.ungated_inputs = self.startup_overrides.clone();
         status.warnings.extend(store_status.warnings);
         if cfg!(feature = "dev-desktop-approval") {
             status
                 .development_switches
                 .push("dev-desktop-approval".into());
         }
+        if cfg!(feature = "dev-placement") {
+            status.development_switches.push("dev-placement".into());
+        }
         if let Ok(body) = state.store.body() {
+            if body.stamped {
+                current_snapshot = super::GateSnapshot::from_store(&body.approved).ok();
+            }
+            for entry in body
+                .generations
+                .values()
+                .rev()
+                .take_while(|entry| entry.kind == crate::config_store::CommitKind::Development)
+            {
+                status.warnings.push(format!(
+                    "development generation {}: development placement (no approval)",
+                    entry.generation.id
+                ));
+            }
             if let Ok(snapshot) = super::GateSnapshot::from_store(&body.approved) {
                 for (key, input) in &snapshot.inputs {
                     if let (
@@ -1789,6 +1817,9 @@ impl RuntimeOwner {
                     }));
                 }
             }
+        }
+        if let Some(snapshot) = current_snapshot {
+            status_inputs::report_snapshot(&snapshot, &mut status);
         }
         status.gated_modules = admission::AdmissionCache::from_state(&state).held_modules();
         Ok(status)

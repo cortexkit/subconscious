@@ -2,6 +2,10 @@
 
 ## 0.20.164
 
+- Add `ck config` status, plan, apply-by-digest, stamp, unstamp, history,
+  rollback and development program placement. Preserve the complete daemon
+  view and report uncertain commit outcomes without retrying them.
+
 - Require subc-daemon 0.41.10 or newer for connection-bound configuration delivery
   and pending ACK visibility until the authority-store anchor commits.
 

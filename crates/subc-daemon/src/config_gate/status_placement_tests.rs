@@ -1,0 +1,383 @@
+use super::*;
+
+#[test]
+fn config_status_lists_ungated_modules() {
+    let rig = Rig::new();
+    let owner = rig.owner("ungated-status");
+    assert_eq!(owner.status().unwrap().ungated_modules, ["a"]);
+    std::fs::write(
+        rig.path.join("cortexkit/a.jsonc"),
+        br#"{"credential":{"vault_ref":"approved"}}"#,
+    )
+    .unwrap();
+    rig.declare(&owner, 10);
+    rig.stamp(&owner);
+    assert!(owner.status().unwrap().ungated_modules.is_empty());
+}
+
+#[cfg(unix)]
+fn program_rig() -> Rig {
+    let rig = Rig::new();
+    std::fs::copy("/bin/sleep", rig.path.join("program")).unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"), serde_json::to_vec(&json!({
+        "version":1,"modules":{"a":{"program":rig.path.join("program"),"args":["600"],"protocol":"none","env":{
+            "HOME":rig.path,"XDG_DATA_HOME":rig.path,"XDG_CONFIG_HOME":rig.path,"XDG_RUNTIME_DIR":rig.path,"SUBC_CONNECTION_FILE":rig.path.join("connection.json")
+        }}}
+    })).unwrap()).unwrap();
+    rig
+}
+
+#[cfg(all(unix, feature = "dev-placement"))]
+#[tokio::test]
+async fn config_placement_restarts_module_on_recorded_program_without_crash_budget() {
+    use crate::supervise::{RestartPolicy, Supervisor};
+    use std::{sync::Arc, time::Duration};
+    let rig = program_rig();
+    let owner = Arc::new(rig.owner("placement-restart"));
+    rig.stamp(&owner);
+    let supervisor = Supervisor::new_for_test(
+        Arc::new(crate::Registry::default()),
+        RestartPolicy::default(),
+    )
+    .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(module_spec(&rig)).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(pid) = module.status().unwrap().pid {
+                break pid;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let digest = replace_program(&rig);
+    owner
+        .place_program("a", rig.path.join("program").to_str().unwrap(), &digest)
+        .unwrap();
+    module.restart(None).await.unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = module.status().unwrap();
+            if status.pid.is_some_and(|pid| pid != first) {
+                break status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    module.stop().await.unwrap();
+    assert_eq!(status.restart_count, 0);
+    assert_eq!(status.spawn_generation, 2);
+}
+
+#[cfg(unix)]
+fn module_spec(rig: &Rig) -> crate::supervise::ModuleSpec {
+    crate::daemon_config::load(rig.path.join("subc.jsonc"))
+        .unwrap()
+        .unwrap()
+        .modules[0]
+        .module_spec()
+}
+
+#[cfg(unix)]
+fn replace_program(rig: &Rig) -> Digest {
+    let path = rig.path.join("program");
+    std::fs::copy(&path, rig.path.join("replacement")).unwrap();
+    std::fs::rename(rig.path.join("replacement"), &path).unwrap();
+    subc_config::raw_digest(&std::fs::read(path).unwrap())
+}
+
+#[cfg(all(unix, feature = "dev-placement"))]
+#[test]
+fn config_placement_preserves_active_pending_and_nack_restores_active() {
+    let rig = program_rig();
+    let bytes = br#"{"credential":{"vault_ref":"approved"},"limit":2}"#;
+    std::fs::write(rig.path.join("cortexkit/a.jsonc"), bytes).unwrap();
+    let owner = rig.owner("placed-vectors");
+    rig.declare(&owner, 10);
+    rig.stamp(&owner);
+    let tuple = crate::config_store::Tuple {
+        module: "a".into(),
+        project: None,
+    };
+    owner
+        .lock()
+        .unwrap()
+        .store
+        .record_delivery(&tuple, 1, true)
+        .unwrap();
+    std::fs::write(
+        rig.path.join("cortexkit/a.jsonc"),
+        br#"{"credential":{"vault_ref":"approved"},"limit":3}"#,
+    )
+    .unwrap();
+    rig.stamp(&owner);
+    let digest = replace_program(&rig);
+    assert_eq!(
+        owner
+            .place_program("a", rig.path.join("program").to_str().unwrap(), &digest)
+            .unwrap(),
+        Some(3)
+    );
+    assert!(owner.prepare_spawn(&module_spec(&rig)).is_ok());
+    let view = owner
+        .module_get(ConnectionId::new(10), "a", ConfigGetRequest::new())
+        .unwrap();
+    assert_eq!(view.active.unwrap().generation, 1);
+    assert_eq!(view.pending.unwrap().generation, 2);
+    {
+        let mut state = owner.lock().unwrap();
+        let body = state.store.body().unwrap();
+        assert_eq!(body.versions[0].1.active, Some(1));
+        assert_eq!(body.versions[0].1.pending, Some(2));
+        assert!(body.generations[&3].generation.development);
+        assert_eq!(
+            body.generations[&3].generation.approval_channel,
+            subc_config::ApprovalChannel::DevelopmentPlacement
+        );
+        state.store.record_delivery(&tuple, 2, false).unwrap();
+    }
+    let view = owner
+        .module_get(ConnectionId::new(10), "a", ConfigGetRequest::new())
+        .unwrap();
+    assert_eq!(view.active.unwrap().generation, 1);
+    assert!(view.pending.is_none());
+    drop(owner);
+    let restarted = rig.owner("placed-restarted");
+    assert!(restarted.prepare_spawn(&module_spec(&rig)).is_ok());
+    assert!(restarted
+        .status()
+        .unwrap()
+        .development_switches
+        .contains(&"dev-placement".into()));
+}
+
+#[cfg(all(unix, feature = "dev-placement"))]
+#[test]
+fn config_placement_verifies_module_path_digest_and_is_superseded_by_approval() {
+    let rig = program_rig();
+    let owner = rig.owner("placement-identity");
+    rig.stamp(&owner);
+    let digest = replace_program(&rig);
+    for (module, path, digest) in [
+        ("missing", rig.path.join("program"), digest.clone()),
+        ("a", rig.path.join("subc.jsonc"), digest.clone()),
+        (
+            "a",
+            rig.path.join("program"),
+            subc_config::raw_digest(b"wrong"),
+        ),
+    ] {
+        assert_eq!(
+            owner
+                .place_program(module, path.to_str().unwrap(), &digest)
+                .unwrap_err()
+                .code,
+            "program_refused"
+        );
+    }
+    assert_eq!(owner.history().unwrap().0.len(), 1);
+    owner
+        .place_program("a", rig.path.join("program").to_str().unwrap(), &digest)
+        .unwrap();
+    assert!(owner.prepare_spawn(&module_spec(&rig)).is_ok());
+    // The next approval is the program authority; an older placement must not
+    // override it after a subsequent replacement.
+    rig.stamp(&owner);
+    replace_program(&rig);
+    assert_eq!(
+        owner.prepare_spawn(&module_spec(&rig)).err().unwrap().code,
+        "program_refused"
+    );
+}
+
+#[cfg(all(unix, feature = "dev-placement"))]
+#[test]
+fn config_placement_keeps_each_modules_program_through_history_pruning() {
+    let rig = program_rig();
+    let b = rig.path.join("program-b");
+    std::fs::copy(rig.path.join("program"), &b).unwrap();
+    let path = rig.path.join("subc.jsonc");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["modules"]["b"] = json!({"program":b,"args":["600"],"protocol":"none"});
+    std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let owner = rig.owner("placement-retention");
+    rig.stamp(&owner);
+    let digest = replace_program(&rig);
+    owner
+        .place_program("a", rig.path.join("program").to_str().unwrap(), &digest)
+        .unwrap();
+    let digest = subc_config::raw_digest(&std::fs::read(&b).unwrap());
+    for _ in 0..25 {
+        owner
+            .place_program("b", b.to_str().unwrap(), &digest)
+            .unwrap();
+    }
+    assert!(owner
+        .lock()
+        .unwrap()
+        .store
+        .body()
+        .unwrap()
+        .generations
+        .contains_key(&2));
+    assert!(owner.prepare_spawn(&module_spec(&rig)).is_ok());
+}
+
+#[cfg(all(unix, not(feature = "dev-placement")))]
+#[test]
+fn config_placement_release_refuses_op_and_persisted_development_identity() {
+    use crate::config_gate::{GateSnapshot, InputKey};
+    let rig = program_rig();
+    let owner = rig.owner("release-placement");
+    rig.stamp(&owner);
+    let digest = replace_program(&rig);
+    assert_eq!(
+        owner
+            .place_program("a", rig.path.join("program").to_str().unwrap(), &digest)
+            .unwrap_err()
+            .code,
+        "program_refused"
+    );
+    // Reconstruct the durable record written by a development daemon, then open
+    // it with this release-feature owner.
+    {
+        let mut state = owner.lock().unwrap();
+        let body = state.store.body().unwrap();
+        let approved = body.approved.clone();
+        let mut entry = body.generations[&1].clone();
+        let mut snapshot = GateSnapshot::from_store(&approved).unwrap();
+        let key = InputKey::Program {
+            module: "a".into(),
+            path: rig.path.join("program").to_string_lossy().into_owned(),
+        };
+        let input = crate::config_gate::capture::capture_program(&rig.path.join("program"))
+            .unwrap()
+            .1;
+        snapshot.inputs.insert(key, input);
+        entry.configuration = snapshot.to_store().unwrap();
+        entry.kind = crate::config_store::CommitKind::Development;
+        entry.generation.development = true;
+        entry.generation.approval_channel = subc_config::ApprovalChannel::DevelopmentPlacement;
+        entry
+            .generation
+            .changeset
+            .launch_manifests
+            .insert("a".into(), json!({"program":"placed"}));
+        entry.tuples.clear();
+        state
+            .store
+            .commit_generation(entry, approved, snapshot.to_store().unwrap(), 0)
+            .unwrap();
+    }
+    drop(owner);
+    let restarted = rig.owner("release-restart");
+    assert_eq!(
+        restarted
+            .prepare_spawn(&module_spec(&rig))
+            .err()
+            .unwrap()
+            .code,
+        "program_refused"
+    );
+    assert_eq!(
+        restarted
+            .prepare_spawn(&module_spec(&rig))
+            .err()
+            .unwrap()
+            .code,
+        "config_gated"
+    );
+    assert_eq!(
+        restarted
+            .take_activities()
+            .iter()
+            .filter(|a| a.event == "config.refused")
+            .count(),
+        1
+    );
+    assert_eq!(restarted.status().unwrap().pending_proposals, 1);
+    rig.stamp(&restarted);
+    assert!(restarted.prepare_spawn(&module_spec(&rig)).is_ok());
+}
+
+#[test]
+fn config_placement_channel_is_refused_for_non_development_commits() {
+    let rig = Rig::new();
+    let owner = rig.owner("channel-kind");
+    rig.stamp(&owner);
+    let mut state = owner.lock().unwrap();
+    let body = state.store.body().unwrap();
+    let approved = body.approved.clone();
+    let mut entry = body.generations[&1].clone();
+    entry.generation.approval_channel = subc_config::ApprovalChannel::DevelopmentPlacement;
+    for kind in [
+        crate::config_store::CommitKind::Stamp,
+        crate::config_store::CommitKind::Approved,
+        crate::config_store::CommitKind::Unstamp,
+        crate::config_store::CommitKind::Rollback,
+    ] {
+        entry.kind = kind;
+        assert!(state
+            .store
+            .commit_generation(entry.clone(), approved.clone(), approved.clone(), 0)
+            .is_err());
+    }
+    assert_eq!(state.store.body().unwrap().last_generation, 1);
+}
+
+#[test]
+fn config_status_lists_interpreter_only_covered() {
+    let rig = Rig::new();
+    #[cfg(unix)]
+    let interpreter = "/bin/sh";
+    #[cfg(windows)]
+    let interpreter = "python.exe";
+    // Capture classifies the configured executable by name, without executing it.
+    let path = rig.path.join(interpreter.rsplit('/').next().unwrap());
+    std::fs::copy(rig.path.join("program"), &path).unwrap();
+    std::fs::write(
+        rig.path.join("subc.jsonc"),
+        serde_json::to_vec(&json!({
+            "version":1,"modules":{"a":{"program":path}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let owner = rig.owner("interpreter-status");
+    assert_eq!(owner.status().unwrap().interpreter_only_covered, ["a"]);
+}
+
+#[test]
+fn config_status_lists_startup_overrides_without_values() {
+    const NAME: &str = "config_gate::runtime::tests::status_placement::config_status_lists_startup_overrides_without_values";
+    if std::env::var("SUBC_PORT").ok().as_deref() != Some("19473") {
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env("SUBC_PORT", "19473")
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+    let rig = Rig::new();
+    let owner = rig.owner("environment-status");
+    // This branch runs alone in a child test process, so changing its environment
+    // cannot race another test. Status must retain the startup fact, not re-read it.
+    std::env::remove_var("SUBC_PORT");
+    let status = owner.status().unwrap();
+    assert!(
+        status.ungated_inputs.contains(&"SUBC_PORT".into()),
+        "{:?}",
+        status.ungated_inputs
+    );
+    assert!(!serde_json::to_string(&status).unwrap().contains("19473"));
+}

@@ -66,8 +66,12 @@ cat "$1"
 EOF
   cat >"$STUBS/ck" <<'EOF'
 #!/usr/bin/env bash
+if [ "$*" = '--json config status' ]; then
+  printf '{"status":{"state":"unstamped","development_switches":[]}}\n'
+  exit 0
+fi
 [ "${1:-}" = "--ck-cli-face-reserved-names" ] || exit 64
-printf '%s\n' activity catalog daemon health help machine module provenance quota routes setup upgrade
+printf '%s\n' activity catalog config daemon health help machine module provenance quota routes setup upgrade
 EOF
   chmod +x "$STUBS/file" "$STUBS/nm" "$STUBS/codesign" "$STUBS/strings" "$STUBS/ck"
 

@@ -66,10 +66,26 @@ EOF
   cat >"$STUBS/ck" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = "--ck-cli-face-reserved-names" ]; then
-  printf '%s\n' activity catalog daemon health help machine module provenance quota routes setup upgrade
+  printf '%s\n' activity catalog config daemon health help machine module provenance quota routes setup upgrade
   exit 0
 fi
 if [ "${1:-}" = module ] && [ "${2:-}" = status ]; then exit 0; fi
+if [ "$*" = '--json config status' ]; then
+  case "${CK_CONFIG_STATE:-unstamped}" in
+    older) printf 'unknown_control_op — config.status\n' >&2; exit 1 ;;
+    inactive) printf 'config_gate_inactive — no config store configured\n' >&2; exit 1 ;;
+    broken) printf 'daemon unreachable\n' >&2; exit 3 ;;
+    malformed) printf '{broken'; exit 0 ;;
+    *) printf '{"status":{"state":"%s","development_switches":%s}}\n' "${CK_CONFIG_STATE:-unstamped}" "${CK_CONFIG_SWITCHES:-[]}" ;;
+  esac
+  exit 0
+fi
+if [ "${1:-}" = config ] && [ "${2:-}" = place-program ]; then
+  printf 'place-program %s\n' "${3:-}" >>"$CK_CALLS"
+  [ "${CK_CONFIG_PLACE_REFUSE:-0}" = 0 ] || exit 1
+  [ "$(shasum -a 256 "$4" | cut -d' ' -f1)" = "$5" ] || exit 1
+  exit 0
+fi
 if [ "${1:-}" = module ] && { [ "${2:-}" = stop ] || [ "${2:-}" = start ] || [ "${2:-}" = restart ]; }; then
   printf '%s %s\n' "$2" "${3:-}" >>"$CK_CALLS"
   printf 'module %s %s\n' "$2" "${3:-}"
@@ -261,8 +277,88 @@ case_dry_run_changes_nothing() {
   printf 'PASS: %s\n' "$CASE_NAME"
 }
 
+case_config_gate_preflight() {
+  local state before output
+  for state in older inactive unstamped stamped broken malformed store_unverified; do
+    new_sandbox "config-gate-$state"
+    make_binary_rollback
+    before=$(shasum -a 256 "$DEST" | awk '{print $1}')
+    if output=$(CK_CONFIG_STATE="$state" invoke --place 2>&1); then
+      case "$state" in older|inactive|unstamped) ;; *) fail "$state unexpectedly placed" ;; esac
+      assert test "$(<"$CASE_DIR/ck-calls")" = 'restart demo'
+      assert test "$(shasum -a 256 "$DEST" | awk '{print $1}')" != "$before"
+      if [ "$state" = older ] || [ "$state" = inactive ]; then
+        assert_contains "$output" 'config gate inactive on this daemon; placing as before'
+      fi
+    else
+      case "$state" in stamped|broken|malformed|store_unverified) ;; *) fail "$state unexpectedly refused: $output" ;; esac
+      assert_contains "$output" 'REFUSED:'
+      assert test "$(shasum -a 256 "$DEST" | awk '{print $1}')" = "$before"
+      assert test "$(<"$CASE_DIR/ck-calls")" = ''
+    fi
+    printf 'PASS: %s\n' "$CASE_NAME"
+  done
+}
+
+case_config_gate_placement_order() {
+  local refused output
+  for refused in 0 1; do
+    new_sandbox "config-gate-placement-$refused"
+    make_binary_rollback
+    if output=$(CK_CONFIG_STATE=stamped CK_CONFIG_SWITCHES='["dev-placement"]' CK_CONFIG_PLACE_REFUSE="$refused" invoke --place 2>&1); then
+      [ "$refused" = 0 ] || fail 'refused placement restarted'
+      assert test "$(<"$CASE_DIR/ck-calls")" = $'place-program demo\nrestart demo'
+    else
+      [ "$refused" = 1 ] || fail "placement failed: $output"
+      assert test "$(<"$CASE_DIR/ck-calls")" = 'place-program demo'
+    fi
+    assert_contains "$output" 'equals rollback snapshot'
+    printf 'PASS: %s\n' "$CASE_NAME"
+  done
+}
+
+case_config_gate_forward_and_install() {
+  local install output
+  for install in 0 1; do
+    new_sandbox "config-gate-forward-install-$install"
+    write_image "$STAGING/staged" '{"cli_faces":[]}' STAGED_IMAGE_BYTES
+    # Execute the production placement tail with the already-passed arm inputs.
+    # Signing and currency arms have their own fixtures; no daemon is contacted.
+    python3 - "$PLACE_SCRIPT" "$CASE_DIR/tail.sh" <<'PY'
+import pathlib,sys
+source=pathlib.Path(sys.argv[1]).read_text()
+functions=[]
+for name in ("config_gate_preflight", "record_program_placement"):
+    body=source.split(name+"() {\n",1)[1].split("\n}\n",1)[0]
+    functions.append(name+"() {\n"+body+"\n}\n")
+tail=source.split('say "=== place"\ncp "$STAGED"',1)[1]
+tail='say "=== place"\ncp "$STAGED"'+tail.split('\nif [ "$RESTART" -eq 1 ]; then',1)[0]
+pathlib.Path(sys.argv[2]).write_text('set -euo pipefail\nsay() { printf "%s\\n" "$*"; }\nrefuse() { say "REFUSED: $*"; exit 2; }\nreconcile_cli_faces() { :; }\n'+''.join(functions)+'config_gate_preflight\n'+tail)
+PY
+    if [ "$install" -eq 1 ]; then rm "$DEST"; fi
+    output=$(CK_CONFIG_STATE=stamped CK_CONFIG_SWITCHES='["dev-placement"]' \
+      CK_CALLS="$CASE_DIR/ck-calls" PATH="$STUBS:$PATH" INSTALL="$install" \
+      MODULE=demo DEST="$DEST" STAGED="$STAGING/staged" STAGING="$STAGING" \
+      MIGRATES='' PATH_FACE='' bash "$CASE_DIR/tail.sh" 2>&1) \
+      || fail "forward placement failed: $output"
+    assert_contains "$output" 'equals staged'
+    if [ "$install" -eq 1 ]; then
+      assert_contains "$output" 'ck config plan'
+      assert_contains "$output" 'ck config apply <digest>'
+      assert test "$(<"$CASE_DIR/ck-calls")" = ''
+      if [[ "$output" == *'ck module rescan'* ]]; then fail 'stamped install named rescan'; fi
+    else
+      assert test "$(<"$CASE_DIR/ck-calls")" = 'place-program demo'
+    fi
+    printf 'PASS: %s\n' "$CASE_NAME"
+  done
+}
+
 run_case() {
   case "$1" in
+    config-gate-preflight) case_config_gate_preflight ;;
+    config-gate-placement-order) case_config_gate_placement_order ;;
+    config-gate-forward-and-install) case_config_gate_forward_and_install ;;
     rollback-restores-and-saves-current) case_rollback_restores_and_saves_current ;;
     corrupted-sidecar-refused) case_corrupted_sidecar_refused ;;
     missing-stamp-refused) case_missing_stamp_refused ;;
@@ -276,6 +372,9 @@ run_case() {
 
 if [ "$#" -eq 0 ] || [ "$1" = all ]; then
   for test_case in \
+    config-gate-preflight \
+    config-gate-placement-order \
+    config-gate-forward-and-install \
     rollback-restores-and-saves-current \
     corrupted-sidecar-refused \
     missing-stamp-refused \

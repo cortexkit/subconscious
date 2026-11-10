@@ -25,6 +25,7 @@ macro_rules! println {
 #[path = "activity/mod.rs"]
 mod activity;
 mod ckni;
+mod config_cli;
 mod inline_actions;
 mod inline_views;
 use ckni::JsonOutput;
@@ -95,6 +96,7 @@ const CK_HARNESS: &str = "ck";
 const BUILTIN_DOMAINS: &[&str] = &[
     "activity",
     "catalog",
+    "config",
     "daemon",
     "health",
     "help",
@@ -115,7 +117,7 @@ const CK_BUILD_SHAPE: &str = "test-support: off";
 // production baseline data; then calibrate whether every window minute is needed.
 const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
-const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, resources, profile, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)
+const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  config    status, plan, apply, stamp, unstamp, history, rollback, place-program\n  module    supervised modules: list, status, resources, profile, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)
   routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint
   machine   this machine's id: show it, or adopt a restored one
   activity  consequential agent and module events";
@@ -624,9 +626,13 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
 
     let resolved = discover_connection_file(args.subc.as_deref())
         .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))?;
-    let mut client = CkClient::connect(resolved)
-        .await
-        .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))?;
+    let connected = if matches!(args.command, Command::Config(_)) {
+        CkClient::connect_config_local(resolved).await
+    } else {
+        CkClient::connect(resolved).await
+    };
+    let mut client =
+        connected.map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))?;
 
     let inline = !ckni && !args.json && io::stdout().is_terminal();
     if !args.json && args.wait.unwrap_or(inline) {
@@ -670,6 +676,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     }
 
     let result = match args.command {
+        Command::Config(request) => config_cli::run(&mut client, request, json_output).await,
         Command::Dashboard => unreachable!("handled before connecting"),
         Command::Module(ModuleCommand::List) => {
             module_list(
@@ -1544,6 +1551,7 @@ enum Command {
         dry_run: bool,
     },
     Module(ModuleCommand),
+    Config(subc_control::config::ConfigControlRequest),
     Activity(activity::Options),
     Routes {
         module_id: Option<String>,
@@ -1657,10 +1665,13 @@ struct RouteHandle {
     epoch: u32,
 }
 
+trait ControlStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> ControlStream for T {}
+
 struct CkClient {
     path: PathBuf,
     info: ConnectionInfo,
-    stream: TcpStream,
+    stream: Box<dyn ControlStream>,
     next_corr: u64,
 }
 
@@ -1704,7 +1715,7 @@ impl CkClient {
         Ok(Self {
             path: resolved.path,
             info: resolved.info,
-            stream,
+            stream: Box::new(stream),
             next_corr: 1,
         })
     }
@@ -1714,9 +1725,9 @@ impl CkClient {
             .await
     }
 
-    async fn rpc_value_with_timeout(
+    async fn rpc_value_with_timeout<T: Serialize>(
         &mut self,
-        request: ClientControlRequest,
+        request: T,
         response_timeout: Duration,
     ) -> Result<Value, CkError> {
         let frame = self
@@ -1749,9 +1760,9 @@ impl CkClient {
         }
     }
 
-    async fn rpc_frame_with_timeout(
+    async fn rpc_frame_with_timeout<T: Serialize>(
         &mut self,
-        request: ClientControlRequest,
+        request: T,
         response_timeout: Duration,
     ) -> Result<Frame, CkError> {
         let corr = self.next_corr;
@@ -8380,6 +8391,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 Some("setup") => SETUP_HELP.into(),
                 Some("upgrade") => UPGRADE_HELP.into(),
                 Some("module") => MODULE_HELP.into(),
+                Some("config") => config_cli::HELP.into(),
                 Some("routes") => ROUTES_HELP.into(),
                 Some("catalog") => CATALOG_HELP.into(),
                 Some("provenance") => PROVENANCE_HELP.into(),
@@ -8392,6 +8404,7 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
             }))
         }
         "activity" => activity::parse(tail),
+        "config" => config_cli::parse(tail),
         "setup"
             if tail
                 .iter()

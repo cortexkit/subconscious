@@ -145,7 +145,7 @@ while (($# > 0)); do
     # binary must be hardened with no get-task-allow, its identifier must be the
     # destination's name, it must be ad-hoc or signed by the daemon's own team,
     # and the marker must read in it. It never restarts: the module starts when
-    # its subc.jsonc entry exists and a rescan or daemon cut picks it up.
+    # its subc.jsonc entry is approved (or an unstamped rescan picks it up).
     --install) INSTALL=1; RESTART=0; shift ;;
     # Agent hosts register each head's tool definitions (descriptions and argument
     # schemas) when the head starts, and core refuses a call whose provider's
@@ -282,6 +282,42 @@ fi
 
 say() { printf '%s\n' "$*"; }
 refuse() { printf 'REFUSED: %s\n' "$*" >&2; exit 2; }
+
+# A release daemon cannot admit replaced bytes through the development bypass.
+# Check before mutation, including --no-restart and rollback placements.
+config_gate_preflight() {
+  local status gate_flags
+  if ! status=$(ck --json config status 2>&1); then
+    case "$status" in
+      'unknown_control_op — '*|'unsupported_control_frame — '*|'unsupported_control_op — '*|'config_gate_inactive — '*)
+        CONFIG_GATE_STATE=inactive
+        say "config gate inactive on this daemon; placing as before"
+        return 0
+        ;;
+      *) refuse "cannot read config gate status; nothing placed: $status" ;;
+    esac
+  fi
+  gate_flags=$(printf '%s' "$status" | python3 -c '
+import json,sys
+s=json.load(sys.stdin)["status"]
+state=s["state"]
+if state not in ("stamped", "unstamped"): raise SystemExit("config gate is in recovery")
+print(state + " " + ("yes" if "dev-placement" in s["development_switches"] else "no"))
+') || refuse "cannot verify config gate placement authority; nothing placed"
+  CONFIG_GATE_STATE=${gate_flags% *}
+  if [ "$CONFIG_GATE_STATE" = stamped ] && [ "$INSTALL" -eq 0 ] && [ "${gate_flags##* }" != yes ]; then
+    refuse "stamped daemon has no dev-placement; replace programs through 'ck config plan' and 'ck config apply', not this placement"
+  fi
+}
+
+record_program_placement() {
+  [ "$CONFIG_GATE_STATE" = stamped ] && [ "$INSTALL" -eq 0 ] || return 0
+  local placement_out
+  if ! placement_out=$(ck config place-program "$MODULE" "$DEST" "$placed_digest" 2>&1); then
+    refuse "config.place_program refused after placement; the new bytes are on disk and no restart was requested: $placement_out"
+  fi
+  printf '%s\n' "$placement_out"
+}
 
 FACE_STATE="not_checked"
 FACE_NAMES=()
@@ -558,6 +594,7 @@ rollback_mode() {
     return 0
   fi
 
+  config_gate_preflight
   mkdir -p "$STAGING"
   current_backup="$STAGING/$(basename "$DEST").rollback-$(date -u +%Y%m%dT%H%M%SZ)"
   [ ! -e "$current_backup" ] || refuse "a rollback snapshot already exists for this UTC second: $current_backup"
@@ -634,6 +671,7 @@ rollback_mode() {
   [ -n "$placed_digest" ] && [ "$placed_digest" = "$rollback_digest" ] \
     || refuse "placed bytes differ from the verified rollback snapshot (snapshot $rollback_digest, placed $placed_digest)"
   say "placed sha ${placed_digest:0:8} (equals rollback snapshot)"
+  record_program_placement
   placed_version=$("$DEST" --version 2>&1 | head -1)
   say "warm-exec at destination: $placed_version"
   reconcile_cli_faces
@@ -1417,6 +1455,8 @@ if [ "$PLACE" != "1" ]; then
   exit 0
 fi
 
+config_gate_preflight
+
 if [ "$INSTALL" -eq 1 ]; then
   say "=== rollback"
   say "first install: no previous binary; rolling back means removing $DEST and the module's subc.jsonc entry"
@@ -1553,6 +1593,7 @@ staged_digest=$(shasum -a 256 "$STAGED" | awk '{print $1}')
 [ -n "$placed_digest" ] && [ "$placed_digest" = "$staged_digest" ] \
   || refuse "placed bytes differ from the staged bytes (staged $staged_digest, placed $placed_digest); the destination now holds an unverified binary"
 say "placed sha ${placed_digest%"${placed_digest#????????}"} (equals staged)"
+record_program_placement
 # Equal bytes mean equal signature, so the placed binary carries exactly the
 # flags and entitlements checked above: this placement never re-signs. A
 # placement path that runs `codesign --force` after staging would strip
@@ -1588,9 +1629,14 @@ fi
 if [ "$INSTALL" -eq 1 ]; then
   say "=== next: start it"
   say "  installed, not started. Add the module's entry to subc.jsonc (back the file up first),"
-  say "  then 'ck module rescan --dry-run' must list '$MODULE' as added and nothing else changed,"
-  say "  then 'ck module rescan' (or the next daemon cut) starts it. A helper binary the module"
-  say "  runs itself as a child needs no entry."
+  if [ "$CONFIG_GATE_STATE" = stamped ]; then
+    say "  then 'ck config plan' reviews the entry and its program identity;"
+    say "  'ck config apply <digest>' requests trusted approval and starts it. No rescan is needed."
+  else
+    say "  then 'ck module rescan --dry-run' must list '$MODULE' as added and nothing else changed,"
+    say "  then 'ck module rescan' (or the next daemon cut) starts it. A helper binary the module"
+    say "  runs itself as a child needs no entry."
+  fi
 fi
 
 if [ "$RESTART" -eq 1 ]; then

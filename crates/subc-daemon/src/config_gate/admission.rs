@@ -118,10 +118,13 @@ impl AdmissionCache {
             });
             let entry = body
                 .generations
-                .get(&generation.unwrap_or(body.last_generation));
-            let snapshot = entry
+                .get(&generation.unwrap_or_else(|| placement::last_approved_generation(body)));
+            let mut snapshot = entry
                 .and_then(|entry| GateSnapshot::from_store(&entry.configuration).ok())
                 .unwrap_or_else(|| approved.clone());
+            if cfg!(feature = "dev-placement") {
+                placement::overlay_programs(body, &module, &mut snapshot);
+            }
             let command = entry
                 .and_then(|entry| entry.delivery.as_ref())
                 .and_then(|delivery| delivery.daemon.as_ref())

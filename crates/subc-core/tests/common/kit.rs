@@ -159,6 +159,14 @@ impl Kit {
     /// that module's process stays running after the daemon lets it go until
     /// [`Kit::release_exit`].
     pub fn boot(name: &str, modules: &[(&str, Value)]) -> Kit {
+        Self::boot_selected(name, modules, false)
+    }
+
+    pub fn boot_with_config_gate(name: &str, modules: &[(&str, Value)]) -> Kit {
+        Self::boot_selected(name, modules, true)
+    }
+
+    fn boot_selected(name: &str, modules: &[(&str, Value)], config_gate: bool) -> Kit {
         let root = ScratchDir::new(name);
         let data_home = ShortRoot::create_short_socket_root();
         let daemon = root.join("daemon");
@@ -189,7 +197,16 @@ impl Kit {
         let log = fs::File::create(root.join("daemon.log")).unwrap();
         // The locations are set on the daemon's command only, so this test
         // process and every other test keep their own.
-        let child = dev_command(super::ckdev_subc())
+        let mut daemon_command = dev_command(super::ckdev_subc());
+        if config_gate {
+            daemon_command
+                .arg("--config-store-root")
+                .arg(daemon.join("store"));
+        }
+        let child = daemon_command
+            .env("HOME", daemon.join("home"))
+            .env("USERPROFILE", daemon.join("home"))
+            .env("APPDATA", daemon.join("config"))
             .env("XDG_DATA_HOME", data_home.path())
             .env("LOCALAPPDATA", data_home.path())
             .env("XDG_CONFIG_HOME", daemon.join("config"))
@@ -197,7 +214,12 @@ impl Kit {
             .env("SUBC_PORT", "0")
             .env("SUBC_CGROUP_PLACEMENT", "disabled")
             .env_remove("CK_LOG")
-            .env_remove("SUBC_CONNECTION_FILE")
+            .env(
+                "SUBC_CONNECTION_FILE",
+                daemon
+                    .join("runtime")
+                    .join(subc_transport::CONNECTION_FILE_NAME),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
@@ -255,10 +277,11 @@ impl Kit {
     }
 
     /// The shipped `ck`, isolated from every per-user location outside the
-    /// kit and given no connection file.
+    /// kit and pinned to its connection file, even with poisoned inherited discovery.
     pub fn ck_command(&self) -> Command {
         let mut command = dev_command(super::ckdev_ck());
         isolate_client_fully(&mut command, &self.client_root());
+        command.env("SUBC_CONNECTION_FILE", self.connection());
         command
     }
 

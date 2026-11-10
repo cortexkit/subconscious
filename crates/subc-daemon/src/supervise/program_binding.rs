@@ -483,8 +483,9 @@ impl SupervisorHandle {
         }
         .filter(|nonce| !nonce.is_empty());
         let (sender, receiver) = tokio::sync::watch::channel(None);
-        // A channel-only launch has no nonce-table entry. Its owned publication
-        // supplies a launch-verification signal without creating a bearer secret.
+        // Channel-only launches use an internal table locator, not a bearer
+        // nonce. The locator is never delivered to a child or accepted by an
+        // identity check; the owned publication signals launch verification.
         let nonce = nonce.unwrap_or_else(|| {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             format!(

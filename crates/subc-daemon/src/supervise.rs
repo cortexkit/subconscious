@@ -349,7 +349,7 @@ fn privacy_command(
 type SpawnRegistrationChannel = std::os::unix::net::UnixStream;
 #[cfg(windows)]
 type SpawnRegistrationChannel = subc_os::registration_channel::RegistrationPipe;
-#[cfg(all(test, any(unix, windows)))]
+#[cfg(all(test, unix))]
 type CapturedRegistrationChannels =
     Arc<Mutex<Option<Vec<(Arc<RegistrationSpawn>, SpawnRegistrationChannel)>>>>;
 
@@ -2357,7 +2357,7 @@ struct SupervisedConfiguration {
 /// launch nonces recorded at spawn are checked by the same daemon instance.
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
-    #[cfg(all(test, any(unix, windows)))]
+    #[cfg(all(test, unix))]
     registration_test_channels: CapturedRegistrationChannels,
     registration_service: Arc<Mutex<Option<registration::RegistrationService>>>,
     registration_connections: Arc<Mutex<HashMap<ConnectionId, Arc<RegistrationSpawn>>>>,

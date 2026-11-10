@@ -380,6 +380,8 @@ async fn config_phone_channel_surface_requires_current_live_binding() {
     assert!(fixture.handler.config_phone_surface().await.is_some());
     let previous = fixture.module.status().unwrap().spawn_generation;
     fixture.module.restart(None).await.unwrap();
+    // The dummy process has no reader to perform connection teardown on stop.
+    fixture.handler.cleanup_connection(PHONE).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while fixture.module.status().unwrap().spawn_generation <= previous
             || fixture.module.status().unwrap().pid.is_none()
@@ -414,6 +416,17 @@ async fn config_phone_channel_surface_requires_current_live_binding() {
         .handler
         .registry
         .publish_registration(PHONE)
+        .unwrap();
+    fixture
+        .handler
+        .forwarding
+        .register_module_connection(
+            PHONE,
+            "callosum".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            fixture.sink.clone(),
+        )
         .unwrap();
     old.bind(PHONE);
     assert!(

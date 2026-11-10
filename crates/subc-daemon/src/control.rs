@@ -2089,6 +2089,11 @@ impl ControlHandler {
             FrameType::Hello => {
                 if let Some(spawn) = self.supervisor.registration_spawn(ctx.connection_id) {
                     spawn.wait_launch().await;
+                    // Refused launches close the channel. Leave their pending
+                    // HELLO unanswered instead of racing a reply against shutdown.
+                    if !spawn.launch_ready() {
+                        return Ok(Vec::new());
+                    }
                 } else if let Ok(hello) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
                     if let (Some(module), Some(nonce)) = (
                         hello

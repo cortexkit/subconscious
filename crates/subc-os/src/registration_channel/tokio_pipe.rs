@@ -1,6 +1,25 @@
-use super::RegistrationChannel;
+use super::{RegistrationChannel, RegistrationPipe};
 use std::{io, os::windows::io::IntoRawHandle};
-use tokio::net::windows::named_pipe::NamedPipeClient;
+use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer};
+
+impl RegistrationPipe {
+    /// Accept the direct child and transfer the owned server to Tokio.
+    /// Call on a blocking worker inside a Tokio runtime with I/O enabled.
+    pub fn accept_tokio_pipe_server(
+        self,
+        pid: u32,
+        deadline: std::time::Instant,
+    ) -> io::Result<NamedPipeServer> {
+        let file = self.accept(pid, deadline)?;
+        // SAFETY: accept returns a valid, uniquely owned overlapped server
+        // handle after checking the child PID. into_raw_handle consumes the
+        // File without duplicating the handle; only Tokio owns it afterward.
+        #[allow(unsafe_code)]
+        unsafe {
+            NamedPipeServer::from_raw_handle(file.into_raw_handle())
+        }
+    }
+}
 
 impl RegistrationChannel {
     /// Transfer the validated duplex pipe into Tokio's overlapped transport.

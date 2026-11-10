@@ -80,6 +80,10 @@ impl RegistrationSpawn {
         }
     }
 
+    pub(crate) fn launch_ready(&self) -> bool {
+        *self.launch.borrow() == LaunchState::Ready
+    }
+
     pub(crate) async fn wait_closed(&self) {
         let mut state = self.launch.subscribe();
         loop {
@@ -160,12 +164,15 @@ impl SupervisorHandle {
 
     #[cfg(all(test, unix))]
     pub(crate) fn registration_proof_for_test(&self, module: &str) -> Option<RegistrationProof> {
-        if let Some(nonce) = self.spawn_nonce(module) {
-            return Some(nonce.into());
-        }
-        let channel = self.registration_for_test(module)?;
+        let Some(channel) = self.registration_for_test(module) else {
+            return self.spawn_nonce(module).map(Into::into);
+        };
         Some(RegistrationProof {
-            key: channel.binding.as_ref()?.key_for_test().into(),
+            key: channel
+                .binding
+                .as_ref()
+                .map(|binding| binding.key_for_test().to_owned())
+                .unwrap_or_else(|| format!("channel-fixture:{:p}", Arc::as_ptr(&channel))),
             channel: Some(channel),
         })
     }
@@ -266,7 +273,7 @@ impl SupervisorHandle {
         pid: u32,
         timeout: Duration,
     ) {
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         {
             let mut captured = self.registration_test_channels.lock().unwrap();
             if let Some(channels) = &mut *captured {
@@ -299,20 +306,11 @@ impl SupervisorHandle {
                 };
                 #[cfg(windows)]
                 let stream = {
-                    use std::os::windows::io::IntoRawHandle;
-                    let file = tokio::task::spawn_blocking(move || {
-                        channel.accept(pid, std::time::Instant::now() + timeout)
+                    tokio::task::spawn_blocking(move || {
+                        channel.accept_tokio_pipe_server(pid, std::time::Instant::now() + timeout)
                     })
                     .await
-                    .map_err(io::Error::other)??;
-                    // SAFETY: accept returns the uniquely owned, overlapped
-                    // server handle after verifying the child's process id.
-                    #[allow(unsafe_code)]
-                    unsafe {
-                        tokio::net::windows::named_pipe::NamedPipeServer::from_raw_handle(
-                            file.into_raw_handle(),
-                        )?
-                    }
+                    .map_err(io::Error::other)??
                 };
                 let _ = crate::server::handle_connection_with_origin(
                     stream,
@@ -373,6 +371,7 @@ impl RegistrationProof {
     pub(crate) fn nonce(&self) -> Option<String> {
         self.channel.is_none().then(|| self.key.clone())
     }
+    #[cfg(target_os = "linux")]
     pub(crate) fn as_str(&self) -> &str {
         &self.key
     }

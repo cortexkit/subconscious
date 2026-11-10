@@ -1,4 +1,90 @@
 use super::*;
+
+#[tokio::test]
+async fn windows_channel_tokio_server_accepts_and_exchanges_frame() {
+    use subc_os::registration_channel::{DAEMON_PID_ENV, REGISTRATION_PIPE_ENV};
+    const CHILD_MODE: &str = "SUBC_REGISTRATION_CONVERSION_TEST_CHILD";
+    const TEST: &str = "supervise::windows_channel_tests::windows_channel_tokio_server_accepts_and_exchanges_frame";
+    let frame = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Ping,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        42,
+        b"registration frame".to_vec(),
+    )
+    .unwrap();
+    if std::env::var_os(CHILD_MODE).is_some() {
+        let mut stream = subc_os::take_registration_channel()
+            .unwrap()
+            .unwrap()
+            .into_tokio_pipe_client()
+            .unwrap();
+        subc_transport::write_frame(&mut stream, &frame)
+            .await
+            .unwrap();
+        let echoed = tokio::time::timeout(
+            Duration::from_secs(5),
+            subc_transport::read_frame(&mut stream),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(echoed.header, frame.header);
+        assert_eq!(echoed.body, frame.body);
+        return;
+    }
+    let scratch = cortexkit_test_support::ScratchDir::new("registration-tokio-server");
+    let pipe = subc_os::registration_channel::RegistrationPipe::new().unwrap();
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([TEST, "--exact", "--nocapture"])
+        .env(CHILD_MODE, "1")
+        .env(REGISTRATION_PIPE_ENV, pipe.name())
+        .env(DAEMON_PID_ENV, std::process::id().to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    for key in [
+        "HOME",
+        "XDG_DATA_HOME",
+        "XDG_RUNTIME_DIR",
+        "XDG_CONFIG_HOME",
+    ] {
+        command.env(key, scratch.display().to_string());
+    }
+    let child = command.spawn().unwrap();
+    let pid = child.id().unwrap();
+    let mut server = tokio::task::spawn_blocking(move || {
+        pipe.accept_tokio_pipe_server(pid, std::time::Instant::now() + Duration::from_secs(5))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let received = tokio::time::timeout(
+        Duration::from_secs(5),
+        subc_transport::read_frame(&mut server),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(received.header, frame.header);
+    assert_eq!(received.body, frame.body);
+    subc_transport::write_frame(&mut server, &received)
+        .await
+        .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child pipe exchange failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 use crate::{
     caller_identity::CallerIdentity,
     config_gate::{

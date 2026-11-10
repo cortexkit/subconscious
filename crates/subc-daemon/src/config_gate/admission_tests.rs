@@ -2249,7 +2249,10 @@ async fn config_recovery_unstamped_respawn_admits_fresh_nonce_and_refuses_dead_n
     }
     let fresh_nonce = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(nonce) = handle.registration_proof_for_test("a") {
+            if let Some(nonce) = handle
+                .spawn_launch_nonce_for("a")
+                .map(crate::supervise::RegistrationProof::from)
+            {
                 if nonce != dead_nonce && module.status().unwrap().process_alive {
                     break nonce;
                 }
@@ -2453,7 +2456,7 @@ async fn config_admission_stopped_gated_identity_refuses_impostors_without_a_liv
     std::fs::write(rig.path.join("program"), changed).unwrap();
     assert_eq!(
         owner.prepare_spawn(&spec(&rig)).err().unwrap().code,
-        "registration_channel_closed"
+        "program_refused"
     );
     let held = handler
         .handle_control(
@@ -2514,7 +2517,7 @@ async fn config_admission_unstamp_restores_unreserved_hello_without_a_synthetic_
         .unwrap();
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&refused[0].body).unwrap()["code"],
-        "program_refused"
+        "registration_channel_closed"
     );
 }
 
@@ -2650,7 +2653,15 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
         .unwrap();
     let _ = registry.deregister_connection(reconnect);
     assert_eq!(reply[0].header.ty, subc_protocol::FrameType::Error);
+    let previous_generation = module.status().unwrap().spawn_generation;
     module.restart(None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while module.status().unwrap().spawn_generation <= previous_generation {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let fresh = handle.registration_proof_for_test("a").unwrap();
     assert_ne!(fresh, current);
     assert!(handle.wait_program_binding("a", &fresh).await);

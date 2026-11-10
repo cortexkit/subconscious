@@ -571,13 +571,7 @@ impl Tracker {
             }
         }
         for root in prepared.pending {
-            let result = module.pend(
-                generation,
-                root,
-                &prepared.scope_target,
-                &prepared.table,
-                now,
-            );
+            let result = module.pend(generation, root, &prepared.table, now);
             if result.log_rejected {
                 applied.rejected.push(root);
             }
@@ -1142,10 +1136,10 @@ impl Tracker {
                 changed_domain && (module.table_revision >= table.revision() || overlapping);
             if !stale_transition {
                 if let (Some(_), Some(counter)) = (&tree, counter) {
-                    module.bind_counter(generation, counter, owner, pid);
+                    module.bind_counter(generation, counter, owner.clone(), pid);
                 }
                 module.observation_before = before.get(&id).map_or(0, |(_, cpu)| *cpu);
-                module.validate_pending(&id, generation, &table, now);
+                module.validate_pending(&id, generation, owner.as_ref(), &table, now);
             }
             let result = if stale_transition || (tree.is_none() && !module.outside_only) {
                 None

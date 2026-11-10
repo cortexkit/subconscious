@@ -109,8 +109,13 @@ impl Fixture {
         &mut self,
         table: &ProcessTable,
     ) -> Option<(Option<TreeReading>, AgentCommandResources)> {
-        self.module
-            .validate_pending("test-module", 1, table, table.observed_at_ms());
+        self.module.validate_pending(
+            "test-module",
+            1,
+            Some(&self.target()),
+            table,
+            table.observed_at_ms(),
+        );
         // Windows normally obtains these paired counters in observe_windows_commands.
         // Feed the exact injected counters, rather than reading this test's real CPU.
         #[cfg(windows)]
@@ -255,10 +260,12 @@ fn pending_start_uses_root_capacity_until_validated() {
         .module
         .accept_checked(1, extra, Some(candidate), &table, 0);
     assert!(refused.full && refused.log_rejected);
-    let refused = fixture.module.pend(1, extra, &fixture.target(), &table, 0);
+    let refused = fixture.module.pend(1, extra, &table, 0);
     assert!(refused.full);
     assert_eq!(fixture.module.pending.len(), 1);
-    fixture.module.validate_pending("test-module", 1, &table, 0);
+    fixture
+        .module
+        .validate_pending("test-module", 1, Some(&fixture.target()), &table, 0);
     assert!(fixture.module.pending.is_empty());
     assert!(
         fixture.module.roots.contains_key(&fixture.root),
@@ -331,4 +338,30 @@ fn a_known_pending_start_is_retained_but_finish_or_omission_withdraws_it() {
         assert!(fixture.module.roots.is_empty());
         assert_eq!(fixture.module.cpu_model.rows().1, 0);
     }
+}
+
+#[test]
+fn pending_validation_uses_the_current_launch_membership_not_the_declaration_target() {
+    let mut fixture = Fixture::new();
+    let incomplete = fixture.table(1, Some(10), true);
+    fixture.declare(fixture.root, incomplete);
+    let complete = fixture.table(2, Some(100), false);
+    fixture.module.validate_pending(
+        "test-module",
+        1,
+        Some(&crate::subtree_resources::Target::Unavailable(
+            "read_failed",
+        )),
+        &complete,
+        0,
+    );
+    assert!(fixture.module.pending.contains_key(&fixture.root));
+    assert!(fixture.module.roots.is_empty());
+    fixture.tick(&fixture.table(3, Some(125), false)).unwrap();
+    assert!(fixture.module.pending.is_empty());
+    assert_eq!(
+        fixture.module.roots[&fixture.root].acceptance_cpu,
+        Some(125)
+    );
+    assert_eq!(fixture.module.cpu_model.rows(), (145, 0, 145));
 }

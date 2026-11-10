@@ -8,7 +8,6 @@ pub(super) const ROOT_LIMIT: usize = 1_024;
 pub(super) struct PendingRoot {
     generation: u128,
     module_pid: u32,
-    target: crate::subtree_resources::Target,
     queued_at: Duration,
     declared_at: Instant,
     sequence: u64,
@@ -31,7 +30,6 @@ impl Module {
         &mut self,
         generation: u128,
         root: AgentCommandRoot,
-        target: &crate::subtree_resources::Target,
         table: &ProcessTable,
         now: u64,
     ) -> Acceptance {
@@ -62,7 +60,6 @@ impl Module {
             PendingRoot {
                 generation,
                 module_pid: self.pid.expect("declaration module pid"),
-                target: target.clone(),
                 queued_at: self.clock.now(),
                 declared_at: Instant::now(),
                 sequence: table.revision(),
@@ -75,6 +72,7 @@ impl Module {
         &mut self,
         module_id: &str,
         generation: u128,
+        target: Option<&crate::subtree_resources::Target>,
         table: &ProcessTable,
         now: u64,
     ) {
@@ -90,6 +88,10 @@ impl Module {
                 );
                 continue;
             }
+            let Some(target) = target else {
+                self.pending.insert(root, pending);
+                continue;
+            };
             if table.revision() <= pending.sequence
                 || table.revision() <= self.table_revision
                 || table
@@ -112,8 +114,7 @@ impl Module {
                 );
                 continue;
             }
-            match validation::validate_root(pending.module_pid, &pending.target, root, table, None)
-            {
+            match validation::validate_root(pending.module_pid, target, root, table, None) {
                 validation::Validation::Incomplete => {
                     self.pending.insert(root, pending);
                 }

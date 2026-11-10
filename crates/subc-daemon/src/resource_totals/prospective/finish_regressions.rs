@@ -42,6 +42,7 @@ fn a_tolerated_start_time_alias_cannot_retire_a_successfully_resumed_root() {
             module_pid: 1,
             before_cpu: None,
             started: Vec::new(),
+            pending: Vec::new(),
             finished: Vec::new(),
             known: Some(vec![(alias, Some(verified))]),
             table: snapshot,

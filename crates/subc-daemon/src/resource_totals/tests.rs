@@ -618,7 +618,7 @@ async fn windows_declared_tree(contained: bool) {
     };
     let tracker = Arc::new(Tracker::default());
     let generation = launch.generation();
-    tracker.declare(
+    let committed = tracker.declare(
         "test-module",
         std::process::id(),
         generation,
@@ -628,6 +628,29 @@ async fn windows_declared_tree(contained: bool) {
             ..Declaration::default()
         },
     );
+    assert!(
+        committed.rejected.is_empty() && !committed.roots_full,
+        "start refused: rejected={:?}, roots_full={}",
+        committed.rejected,
+        committed.roots_full
+    );
+    // Acknowledged starts can be pending while the process walk is incomplete.
+    // Tick until validation accepts the root; never re-declare or move CPU early.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if tracker.state.lock().unwrap().modules["test-module"]
+            .roots
+            .contains_key(&identity)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "acknowledged root was not accepted: {identity:?}"
+        );
+        let _ = observe(&tracker, &launch, None).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let baseline_root = tracker.state.lock().unwrap().modules["test-module"].roots[&identity]
         .cpu_floor
         .own((identity.pid, subc_os::start_time(identity.pid).unwrap()))

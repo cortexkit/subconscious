@@ -202,6 +202,9 @@ impl ControlHandler {
                 return Ok(vec![control_error_frame(&frame, subc_protocol::error_codes::AGENT_ROOTS_FULL,
                     "live agent command root limit reached; retry unaccepted roots after capacity is available")?]);
             }
+            // A successful reply acknowledges valid starts or starts retained
+            // pending a complete ownership snapshot. Transient unreadability
+            // must not silently discard a declaration that callers won't retry.
             return Ok(vec![control_response_body_frame(
                 &frame,
                 &serde_json::json!({}),

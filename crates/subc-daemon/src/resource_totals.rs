@@ -8,6 +8,7 @@ pub(crate) mod declaration_loss;
 mod finish_cpu;
 mod funded_groups;
 mod overlap;
+mod pending;
 pub(crate) use commit_fence::CommitFence;
 #[cfg(test)]
 mod audit_tests;
@@ -117,6 +118,7 @@ struct Module {
     pid: Option<u32>,
     outside_only: bool,
     roots: BTreeMap<AgentCommandRoot, Command>,
+    pending: BTreeMap<AgentCommandRoot, pending::PendingRoot>,
     finished: BTreeMap<AgentCommandRoot, u64>,
     finished_live: BTreeMap<AgentCommandRoot, (u64, Instant)>,
     omitted: BTreeMap<AgentCommandRoot, OmittedRoot>,
@@ -556,6 +558,9 @@ impl Tracker {
         module.observation_before = prepared.before_cpu.map_or(0, |(_, cpu)| cpu);
         let mut applied = Application::default();
         for (root, verified) in prepared.started {
+            if let Some(key) = module.pending_key(root) {
+                module.pending.remove(&key);
+            }
             let result = module.accept_checked(generation, root, verified, &prepared.table, now);
             if result.log_rejected {
                 applied.rejected.push(root);
@@ -563,6 +568,30 @@ impl Tracker {
             if result.full {
                 applied.roots_full = true;
                 applied.lost.push(root);
+            }
+        }
+        for root in prepared.pending {
+            let result = module.pend(
+                generation,
+                root,
+                &prepared.scope_target,
+                &prepared.table,
+                now,
+            );
+            if result.log_rejected {
+                applied.rejected.push(root);
+            }
+            if result.full {
+                applied.roots_full = true;
+                applied.lost.push(root);
+            }
+        }
+        for finished in &prepared.finished {
+            if let Some(key) = module.pending_key(AgentCommandRoot {
+                pid: finished.pid,
+                start_time_ms: finished.start_time_ms,
+            }) {
+                module.pending.remove(&key);
             }
         }
         // Retained identity-specific process handles can read final CPU after exit.
@@ -650,6 +679,13 @@ impl Tracker {
             );
         }
         if let Some(known) = prepared.known {
+            module.pending.retain(|pending, _| {
+                known.iter().any(|(root, _)| {
+                    root.pid == pending.pid
+                        && root.start_time_ms.abs_diff(pending.start_time_ms)
+                            < subc_os::process_start_time_precision_ms()
+                })
+            });
             let mut required: BTreeSet<_> = module
                 .roots
                 .iter()
@@ -680,6 +716,9 @@ impl Tracker {
             // Check overlaps before replacing the accepted set: removing old
             // roots first would conceal an overlapping ancestor in the resync.
             for (root, verified) in known {
+                if module.pending_key(root).is_some() {
+                    continue;
+                }
                 let result =
                     module.accept_checked(generation, root, verified, &prepared.table, now);
                 if result.log_rejected {
@@ -802,7 +841,7 @@ impl Tracker {
         generation: u128,
         target: crate::subtree_resources::Target,
         batch: Declaration,
-    ) {
+    ) -> Committed {
         let prepared = self
             .prepare(
                 module_id,
@@ -814,7 +853,7 @@ impl Tracker {
             )
             .unwrap();
         self.commit_fenced(module_id, generation, prepared, &CommitFence::default())
-            .unwrap();
+            .unwrap()
     }
 
     pub(crate) async fn read(
@@ -1105,6 +1144,8 @@ impl Tracker {
                 if let (Some(_), Some(counter)) = (&tree, counter) {
                     module.bind_counter(generation, counter, owner, pid);
                 }
+                module.observation_before = before.get(&id).map_or(0, |(_, cpu)| *cpu);
+                module.validate_pending(&id, generation, &table, now);
             }
             let result = if stale_transition || (tree.is_none() && !module.outside_only) {
                 None
@@ -1487,11 +1528,11 @@ impl Module {
         {
             return Acceptance::default();
         }
-        let retained = self.roots.len() + self.finished_live.len();
+        let retained = self.roots.len() + self.finished_live.len() + self.pending.len();
         let resumed = usize::from(resume.is_some_and(|root| {
             self.finished_live.contains_key(&root) || self.roots.contains_key(&root)
         }));
-        let full = verified.is_some() && retained.saturating_sub(resumed) >= 1_024;
+        let full = verified.is_some() && retained.saturating_sub(resumed) >= pending::ROOT_LIMIT;
         let verified = verified.filter(|_| !full).filter(|candidate| {
             !self.roots.iter().any(|(root, command)| {
                 if resume == Some(*root) {
@@ -1894,7 +1935,7 @@ impl Tracker {
             .unwrap_or_else(|p| p.into_inner())
             .modules
             .values()
-            .any(|module| module.roots.values().any(|root| root.live))
+            .any(|module| !module.pending.is_empty() || module.roots.values().any(|root| root.live))
     }
 }
 

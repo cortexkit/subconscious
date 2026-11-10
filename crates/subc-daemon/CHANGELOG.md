@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.44.7
+
+- Retain agent-command starts whose ownership snapshots are incomplete, reserving root capacity for up to 60 seconds and revalidating on fresh observations. Begin prospective CPU attribution only after acceptance; drop exited or expired pending roots without moving earlier CPU. Keep declaration replies unchanged and wait for acceptance in the Windows finish-accounting fixture.
+
 ## 0.44.6
 
 - Wait for complete process-tree observations in Windows resource-accounting tests before checking CPU retention and stopped attribution. Production accounting and its unreadable-tree rules are unchanged.

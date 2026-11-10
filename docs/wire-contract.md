@@ -159,7 +159,10 @@ the module's complete live root set. Start times come from
 within that platform's kernel timestamp resolution. A started root must still
 be live with that identity and must be a direct child of the module at the
 check. Invalid roots are ignored independently and logged once per identity;
-they do not refuse the batch. `known` only re-confirms identities already
+they do not refuse the batch. Starts whose ownership snapshot is incomplete
+remain pending for up to 60 seconds, count toward root capacity, and begin
+prospective attribution only when validated by a later observation. `known` only
+re-confirms identities already
 accepted in this launch, or in a previous launch that retained the same Linux
 cgroup or Windows job object across the module's restart. It never accepts a new identity, the module itself or an ancestor.
 A live identity keeps its accounting baseline even after being finished, so

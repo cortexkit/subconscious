@@ -6,12 +6,12 @@ async fn windows_channel_tokio_server_accepts_and_exchanges_frame() {
     const CHILD_MODE: &str = "SUBC_REGISTRATION_CONVERSION_TEST_CHILD";
     const TEST: &str = "supervise::windows_channel_tests::windows_channel_tokio_server_accepts_and_exchanges_frame";
     let frame = subc_protocol::Frame::build(
-        subc_protocol::FrameType::Ping,
+        subc_protocol::FrameType::Request,
         subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
         0,
         0,
         42,
-        b"registration frame".to_vec(),
+        br#"{"op":"health.check"}"#.to_vec(),
     )
     .unwrap();
     if std::env::var_os(CHILD_MODE).is_some() {
@@ -68,8 +68,15 @@ async fn windows_channel_tokio_server_accepts_and_exchanges_frame() {
     )
     .await
     .unwrap()
-    .unwrap()
     .unwrap();
+    let Some(received) = received else {
+        let output = child.wait_with_output().await.unwrap();
+        panic!(
+            "pipe client closed before writing a frame: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
     assert_eq!(received.header, frame.header);
     assert_eq!(received.body, frame.body);
     subc_transport::write_frame(&mut server, &received)

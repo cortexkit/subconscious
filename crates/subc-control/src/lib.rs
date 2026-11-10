@@ -24,6 +24,10 @@ use subc_protocol::{
     BindIdentity, RouteTarget,
 };
 
+pub use subc_protocol::claim::{
+    Claim, ClaimMintReply, ClaimMintRequest, ClaimPresentReply, ClaimPresentRequest, ClaimPurpose,
+    ClaimRateLimitedDetail,
+};
 pub use subc_protocol::peer::CallerOrigin as CatalogOrigin;
 pub use subc_protocol::RouteCloseReason;
 use subc_protocol::{peer::MAX_ATTESTATION_INTEGER, provider_declarations::ProviderDeclarations};
@@ -990,6 +994,67 @@ pub struct SupervisorModuleProvenance {
     pub module_declared: ModuleDeclaredProvenance,
     pub daemon_observed: SupervisorObservedProcess,
 }
+
+/// Optional entry keys kept outside the exhaustive provenance struct so older
+/// construction sites and destructures remain source-compatible.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisorModuleProvenanceExt {
+    /// The running spawn's registration path. Absence makes no claim about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration: Option<RegistrationMethod>,
+}
+
+impl SupervisorModuleProvenanceExt {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_registration(mut self, registration: Option<RegistrationMethod>) -> Self {
+        self.registration = registration;
+        self
+    }
+
+    /// Read from a single module entry, not the enclosing provenance reply.
+    pub fn read_from(entry: &serde_json::Value) -> serde_json::Result<Self> {
+        if !entry.is_object() {
+            return Err(serde_json::Error::custom(
+                "expected a module provenance entry object",
+            ));
+        }
+        serde_json::from_value(entry.clone())
+    }
+
+    /// Replace the companion key in a single module entry. An absent method
+    /// removes a stale key rather than writing `null`.
+    pub fn write_to(&self, entry: &mut serde_json::Value) -> serde_json::Result<()> {
+        let object = entry.as_object_mut().ok_or_else(|| {
+            serde_json::Error::custom("expected a module provenance entry object")
+        })?;
+        object.remove("registration");
+        if let Some(method) = &self.registration {
+            object.insert("registration".into(), serde_json::to_value(method)?);
+        }
+        Ok(())
+    }
+}
+
+/// How a running supervised spawn registered. Unknown future methods confer
+/// neither channel registration nor nonce registration.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistrationMethod {
+    Channel,
+    Nonce,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Admission refused because a gated module lacks channel support. This reason
+/// spends no restart budget; restarting cannot repair a missing declaration.
+pub const REGISTRATION_CHANNEL_UNSUPPORTED: &str = "registration_channel_unsupported";
 
 /// A module's declared build metadata, if its HELLO manifest carried it.
 #[derive(Debug, Clone, PartialEq)]
@@ -2724,6 +2789,11 @@ pub struct SupervisorEntry {
     pub waiting_for_previous_pid: Option<u32>,
     pub module_id: String,
     pub state: String,
+    /// Why admission was refused. This is an open string: readers must not
+    /// match exhaustively. `registration_channel_unsupported` means the gated
+    /// module lacks its support declaration, not a crash to restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_refused: Option<String>,
     /// Estimated Unix milliseconds of the next retry after restart-budget
     /// exhaustion. Recomputed from the daemon's monotonic remaining delay on
     /// each read; on macOS the countdown pauses during sleep. Absent otherwise.
@@ -2886,6 +2956,7 @@ impl SupervisorEntry {
         Self {
             module_id: module_id.into(),
             state: state.into(),
+            admission_refused: None,
             next_retry_at_ms: None,
             waiting_for_previous_pid: None,
             enabled,
@@ -2912,6 +2983,13 @@ impl SupervisorEntry {
             resources: None,
             subtree: None,
         }
+    }
+
+    /// Set or clear the daemon's admission refusal reason.
+    #[must_use]
+    pub fn with_admission_refused(mut self, reason: Option<String>) -> Self {
+        self.admission_refused = reason;
+        self
     }
 
     /// Set the module's declared wire protocol.
@@ -4236,6 +4314,102 @@ mod reader_skew_tests {
                 Some("approved".into())
             )
             .is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod claim_wire_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn legacy_provenance() -> SupervisorModuleProvenance {
+        SupervisorModuleProvenance {
+            module_id: "worker".into(),
+            module_declared: ModuleDeclaredProvenance::Unverifiable,
+            daemon_observed: SupervisorObservedProcess {
+                launch_nonce_source: None,
+                pid: None,
+                spawned_at_ms: None,
+                spawned_from: None,
+                running_image: RunningImageAgreement::Unavailable {
+                    reason: RunningImageUnavailableReason::NotRunning,
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn provenance_registration_companion_round_trip_preserves_legacy_entry() {
+        let legacy = legacy_provenance();
+        let original = serde_json::to_value(&legacy).unwrap();
+        let absent = SupervisorModuleProvenanceExt::read_from(&original).unwrap();
+        assert_eq!(absent.registration, None);
+        let mut wire = original.clone();
+        absent.write_to(&mut wire).unwrap();
+        assert_eq!(wire, original);
+        for (method, spelling) in [
+            (RegistrationMethod::Channel, "channel"),
+            (RegistrationMethod::Nonce, "nonce"),
+        ] {
+            let ext = SupervisorModuleProvenanceExt::new().with_registration(Some(method.clone()));
+            ext.write_to(&mut wire).unwrap();
+            assert_eq!(wire["registration"], spelling);
+            assert_eq!(
+                SupervisorModuleProvenanceExt::read_from(&wire).unwrap(),
+                ext
+            );
+            let old_reader: SupervisorModuleProvenance =
+                serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(old_reader, legacy);
+            assert_eq!(serde_json::to_value(old_reader).unwrap(), original);
+        }
+        absent.write_to(&mut wire).unwrap();
+        assert_eq!(wire, original);
+        for mut invalid in [Value::Null, json!([]), json!("entry")] {
+            assert!(SupervisorModuleProvenanceExt::read_from(&invalid).is_err());
+            assert!(absent.write_to(&mut invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn provenance_unknown_registration_is_not_channel_or_nonce() {
+        let mut wire = serde_json::to_value(legacy_provenance()).unwrap();
+        wire["registration"] = json!("future_method");
+        let ext = SupervisorModuleProvenanceExt::read_from(&wire).unwrap();
+        assert_eq!(ext.registration, Some(RegistrationMethod::Unknown));
+        assert_ne!(ext.registration, Some(RegistrationMethod::Channel));
+        assert_ne!(ext.registration, Some(RegistrationMethod::Nonce));
+        wire["registration"] = json!(false);
+        assert!(SupervisorModuleProvenanceExt::read_from(&wire).is_err());
+    }
+
+    #[test]
+    fn admission_refusal_is_optional_and_open() {
+        let entry = SupervisorEntry::new(
+            "worker",
+            "stopped",
+            true,
+            false,
+            SupervisorHealthStatus::Unknown,
+        );
+        let original = serde_json::to_value(&entry).unwrap();
+        assert!(original.get("admission_refused").is_none());
+        let read: SupervisorEntry = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(read.admission_refused, None);
+        assert_eq!(serde_json::to_value(read).unwrap(), original);
+        assert_eq!(
+            REGISTRATION_CHANNEL_UNSUPPORTED,
+            "registration_channel_unsupported"
+        );
+        for reason in [REGISTRATION_CHANNEL_UNSUPPORTED, "future_reason"] {
+            let mut wire = original.clone();
+            wire["admission_refused"] = json!(reason);
+            let read: SupervisorEntry = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(read.admission_refused.as_deref(), Some(reason));
+            assert_eq!(serde_json::to_value(read).unwrap(), wire);
+            let built = entry.clone().with_admission_refused(Some(reason.into()));
+            assert_eq!(serde_json::to_value(built).unwrap(), wire);
         }
     }
 }

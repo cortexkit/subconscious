@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 pub use machine_id::{MachineId, MachineIdError};
 
 pub mod call_mode;
+pub mod claim;
 pub mod config;
 pub mod consent;
 pub mod frame;
@@ -88,6 +89,39 @@ pub mod error_codes {
     /// The connection is not the module's delivery target. This refusal never
     /// sets the module to gated and never changes its delivery state.
     pub const NOT_DELIVERY_TARGET: &str = "not_delivery_target";
+
+    /// Minting is allowed only on the spawn's live primary registration channel,
+    /// never on a claim-bound connection. TERMINAL.
+    pub const CLAIM_MINT_NOT_ALLOWED: &str = "claim_mint_not_allowed";
+    /// The spawn has 64 unredeemed claims after reclaiming expired claims.
+    /// RETRYABLE once claims are consumed or expire.
+    pub const CLAIM_UNREDEEMED_LIMIT: &str = "claim_unredeemed_limit";
+    /// The spawn has exhausted its claim-minting rate limit. RETRYABLE; `ErrorBody.detail`
+    /// carries `retry_after_ms`, the backoff in milliseconds.
+    pub const CLAIM_RATE_LIMITED: &str = "claim_rate_limited";
+    /// The spawn has 256 live claim-bound connections. RETRYABLE after closing
+    /// a connection; the refused presentation's connection is always closed.
+    pub const CLAIM_CONNECTION_LIMIT: &str = "claim_connection_limit";
+    /// An unknown, reused, expired or revoked claim. TERMINAL and deliberately
+    /// indistinguishable: the refusal never reveals which condition applied.
+    pub const CLAIM_INVALID: &str = "claim_invalid";
+    /// Presentation was not the connection's first frame after handshake.
+    /// TERMINAL; the refused connection is closed, never left direct.
+    pub const CLAIM_PRESENT_NOT_FIRST: &str = "claim_present_not_first";
+    /// A prefix claim's module id was refused, or the minting module does not
+    /// own its longest matching reserved prefix. TERMINAL.
+    pub const CLAIM_PREFIX_REFUSED: &str = "claim_prefix_refused";
+
+    /// Retry classification for `claim.mint` and `claim.present` refusals.
+    /// Unknown codes are terminal. Every refused presentation closes its
+    /// connection, including retryable refusals; retry on a new connection,
+    /// never by continuing as a direct caller.
+    pub fn is_retryable_claim(code: &str) -> bool {
+        matches!(
+            code,
+            CLAIM_UNREDEEMED_LIMIT | CLAIM_RATE_LIMITED | CLAIM_CONNECTION_LIMIT
+        )
+    }
 
     pub const UNKNOWN_CHANNEL: &str = "unknown_channel";
     pub const STALE_ROUTE_EPOCH: &str = "stale_route_epoch";

@@ -52,6 +52,11 @@ pub struct ModuleManifest {
     /// must still tolerate an `on_bind` while not ready.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<bool>,
+    /// Declares SDK support for the private registration connection inherited
+    /// from the supervising daemon at spawn. Absence is unknown support, not
+    /// permission to use a nonce when admission requires that private channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_channel: Option<bool>,
     /// Existing role declarations; capability grammar claims deliberately live in
     /// the separate [`CapabilityDeclarations`] block below.
     pub provides: Vec<ProviderRole>,
@@ -197,6 +202,7 @@ pub struct ModuleManifestBuilder {
     protocol_ver: u8,
     trust_tier: Option<TrustTier>,
     ready: Option<bool>,
+    registration_channel: Option<bool>,
     provides: Vec<ProviderRole>,
     consumes: Vec<ConsumerRole>,
     bindings: Option<Bindings>,
@@ -231,6 +237,7 @@ impl ModuleManifest {
             protocol_ver: PROTOCOL_VERSION,
             trust_tier: None,
             ready: None,
+            registration_channel: None,
             provides: Vec::new(),
             consumes: Vec::new(),
             bindings: None,
@@ -283,6 +290,12 @@ impl ModuleManifestBuilder {
     /// Declares whether the module is ready to receive new route binds.
     pub fn ready(mut self, ready: bool) -> Self {
         self.ready = Some(ready);
+        self
+    }
+
+    /// Declare whether the module supports the inherited registration channel.
+    pub fn registration_channel(mut self, supported: bool) -> Self {
+        self.registration_channel = Some(supported);
         self
     }
 
@@ -400,6 +413,7 @@ impl ModuleManifestBuilder {
             protocol_ver: self.protocol_ver,
             trust_tier: self.trust_tier,
             ready: self.ready,
+            registration_channel: self.registration_channel,
             provides: self.provides,
             consumes: self.consumes,
             bindings: self.bindings,
@@ -446,6 +460,8 @@ struct ModuleManifestWire {
     trust_tier: Option<TrustTier>,
     #[serde(default)]
     ready: Option<bool>,
+    #[serde(default)]
+    registration_channel: Option<bool>,
     provides: Vec<ProviderRole>,
     #[serde(default)]
     consumes: Vec<ConsumerRole>,
@@ -501,6 +517,9 @@ impl<'de> Deserialize<'de> for ModuleManifest {
             .trust_tier(wire.trust_tier);
         if let Some(ready) = wire.ready {
             builder = builder.ready(ready);
+        }
+        if let Some(supported) = wire.registration_channel {
+            builder = builder.registration_channel(supported);
         }
         let mut manifest = builder
             .provides(wire.provides)

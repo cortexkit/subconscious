@@ -1,4 +1,14 @@
 {
+  "claim_retryable": {
+    "claim_connection_limit": "retryable",
+    "claim_invalid": "terminal",
+    "claim_mint_not_allowed": "terminal",
+    "claim_prefix_refused": "terminal",
+    "claim_present_not_first": "terminal",
+    "claim_rate_limited": "retryable",
+    "claim_unredeemed_limit": "retryable",
+    "a_code_nobody_declared": "terminal"
+  },
   "route_open_retryable": {
     "admission_facts_not_permitted": "terminal",
     "admission_facts_target_not_allowed": "terminal",

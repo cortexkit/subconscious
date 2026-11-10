@@ -24,9 +24,9 @@ test.skipIf(!LIVE)("config SDK sample adopts within 60 lines and explicitly refr
     const configFile = join(root, "config/cortexkit/subc.jsonc");
     const modules: Record<string, object> = {};
     for (const [id, fixture, enabled] of [["sample", "config-sample.ts", true], ["legacy", "config-sample-legacy.ts", true]] as const) {
-      writeFileSync(join(root, `${id}.json`), '{"limit":10}');
+      writeFileSync(join(root, "config/cortexkit", `${id}.jsonc`), '{"limit":10}');
       modules[id] = { program: process.execPath, args: [join(import.meta.dir, "fixtures", fixture)], enabled, reserved: true,
-        env: { SAMPLE_FILE: join(root, `${id}.json`), SAMPLE_EVENTS: join(root, `${id}.jsonl`), SUBC_CONNECTION_FILE: connection } };
+        env: { SAMPLE_FILE: join(root, "config/cortexkit", `${id}.jsonc`), SAMPLE_EVENTS: join(root, `${id}.jsonl`), SUBC_CONNECTION_FILE: connection } };
     }
     writeFileSync(configFile, JSON.stringify({ version: 1, modules }));
     child = spawn(executable, ["--config-store-root", join(root, "store")], { cwd: root, env: {
@@ -59,7 +59,7 @@ test.skipIf(!LIVE)("config SDK sample adopts within 60 lines and explicitly refr
       ? readFileSync(join(root, `${id}.jsonl`), "utf8").trim().split("\n").map((line) => JSON.parse(line)) : [];
     const has = (id: string, state: string, limit?: number) => entries(id).some((e) => e.state?.state === state && (limit === undefined || e.current?.limit === limit));
     await waitFor(() => has("sample", "unstamped", 10) && entries("legacy").some((e) => e.started && e.current?.limit === 10), 10000, "opted and unchanged samples");
-    writeFileSync(join(root, "sample.json"), '{"limit":20}');
+    writeFileSync(join(root, "config/cortexkit/sample.jsonc"), '{"limit":20}');
     const status = await rpc({ op: "config.status" });
     expect(status.status.state).toBe("unstamped");
     client = await SubcClient.connect({ connectionFile: connection,

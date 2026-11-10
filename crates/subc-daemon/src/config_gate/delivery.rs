@@ -292,11 +292,9 @@ impl DeliveryState {
     }
 }
 
-pub(super) fn bind_get(
-    state: &mut OwnerState,
+pub(super) fn visible_reply(
+    state: &OwnerState,
     connection: ConnectionId,
-    module: &str,
-    request: &ConfigGetRequest,
     mut reply: ConfigGetReply,
     transition: Transition,
 ) -> Result<ConfigGetReply> {
@@ -313,6 +311,18 @@ pub(super) fn bind_get(
             "generation waits for its required supervision or daemon boundary",
         ));
     }
+    Ok(reply)
+}
+
+pub(super) fn bind_get(
+    state: &mut OwnerState,
+    connection: ConnectionId,
+    module: &str,
+    request: &ConfigGetRequest,
+    reply: ConfigGetReply,
+    transition: Transition,
+) -> Result<ConfigGetReply> {
+    let mut reply = visible_reply(state, connection, reply, transition)?;
     match (request.generation, request.attempt) {
         (None, None) => {}
         (Some(generation), Some(attempt))

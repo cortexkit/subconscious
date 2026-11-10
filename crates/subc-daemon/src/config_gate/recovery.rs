@@ -2,6 +2,18 @@
 
 use super::*;
 
+impl OwnerState {
+    pub(super) fn queue_anchor_hints(&mut self) {
+        self.anchor_hints.extend(self.anchor_waiters.drain());
+        if !self.anchor_hints.is_empty() {
+            // Wake only for recovered anchor hints, not whenever the configuration
+            // owner's mutex is released. Unrelated wakes can disrupt the supervisor's
+            // sequence of recording an exited child and allowing its replacement.
+            self.anchor_notify.notify_one();
+        }
+    }
+}
+
 impl ApprovedDaemonConfiguration {
     pub(crate) fn generation(&self) -> u64 {
         self.generation
@@ -178,6 +190,45 @@ impl RuntimeOwner {
         Ok(state.authority_exit.is_none()
             && state.store.loaded_admission_state().0 == StoreState::Unstamped
             && state.unstamp_hints.remove(&connection))
+    }
+
+    /// Remember only a refusal returned to an opted-in connection. Recovery may
+    /// race the reply, in which case the connection needs its wakeup immediately.
+    pub(crate) fn anchor_pending_served(&self, connection: ConnectionId) -> Result<()> {
+        let mut state = self.lock()?;
+        if state.declarations.contains_key(&connection) {
+            if state.store.status().anchor_pending {
+                state.anchor_waiters.insert(connection);
+            } else {
+                let inserted = state.anchor_hints.insert(connection);
+                drop(state);
+                if inserted {
+                    self.notify_delivery_changed();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_anchor_hint(&self, connection: ConnectionId) -> Result<Option<u64>> {
+        let mut state = self.lock()?;
+        if state.store.status().anchor_pending || !state.anchor_hints.remove(&connection) {
+            return Ok(None);
+        }
+        let Some((module, _)) = state.declarations.get(&connection) else {
+            return Ok(None);
+        };
+        let (store_state, body) = state.store.loaded_admission_state();
+        if store_state == crate::config_store::StoreState::Unstamped {
+            return Ok(Some(0));
+        }
+        Ok(Some(
+            body.versions
+                .iter()
+                .find(|(tuple, _)| &tuple.module == module && tuple.project.is_none())
+                .and_then(|(_, versions)| versions.active.or(versions.pending))
+                .unwrap_or(0),
+        ))
     }
 }
 

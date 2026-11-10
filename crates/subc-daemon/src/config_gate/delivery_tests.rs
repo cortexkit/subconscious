@@ -1151,6 +1151,39 @@ fn config_delivery_mixed_daemon_and_module_restart_waits_for_new_daemon_without_
     assert_active(&restarted, connection, 2);
 }
 
+#[test]
+fn config_status_pending_only_view_is_gated_until_supervision_boundary_opens() {
+    let (rig, owner) = rig();
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::NextSupervision]);
+    assert_eq!(
+        owner
+            .module_get(INCUMBENT, "a", ConfigGetRequest::new())
+            .unwrap_err()
+            .code,
+        "config_gated"
+    );
+    assert_eq!(owner.status().unwrap().gated_modules, ["a"]);
+    owner.disconnected(INCUMBENT);
+    let spawn = owner
+        .spawned(
+            "a",
+            tokio::time::Instant::now(),
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .unwrap();
+    let replacement = ConnectionId::new(30);
+    rig.declare(&owner, replacement.get());
+    owner.registered(replacement, &spawn).unwrap();
+    assert!(owner
+        .module_get(replacement, "a", ConfigGetRequest::new())
+        .unwrap()
+        .pending
+        .is_some());
+    assert!(owner.status().unwrap().gated_modules.is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn config_delivery_live_deadline_starts_at_write_and_enforces_both_edges() {
     let (_rig, owner) = rig();
@@ -1583,6 +1616,152 @@ async fn config_delivery_worker_isolates_stuck_flush_and_never_hints_undeclared_
         c.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn config_delivery_worker_anchor_recovery_hints_refused_connection_once() {
+    worker_anchor_recovery_hint(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn config_delivery_worker_operator_anchor_recovery_hints_refused_connection_once() {
+    worker_anchor_recovery_hint(true).await;
+}
+
+async fn worker_anchor_recovery_hint(operator_command: bool) {
+    let _clock = hold_test_clock();
+    let key = crate::config_store::TestStoreKey::default();
+    let (rig, owner, handler, mut receivers) = worker_fixture_with_key(Some(&key));
+    let _worker = WorkerGuard(handler.spawn_config_delivery_worker().unwrap());
+    let mut a = receivers.remove(0);
+    let mut b = receivers.remove(0);
+    let mut undeclared = receivers.remove(0);
+    for receiver in [&mut a, &mut b] {
+        receiver
+            .recv()
+            .await
+            .unwrap()
+            .flushed
+            .take()
+            .unwrap()
+            .send(())
+            .unwrap();
+    }
+    wait_for_blocking_delivery(|| {
+        owner
+            .delivery_window(INCUMBENT)
+            .unwrap()
+            .is_some_and(|w| w.delivered)
+            && owner
+                .delivery_window(ConnectionId::new(2))
+                .unwrap()
+                .is_some_and(|w| w.delivered)
+    })
+    .await;
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    let reply = owner
+        .module_get(ConnectionId::new(2), "b", ConfigGetRequest::new())
+        .unwrap();
+    owner
+        .module_view_delivered(
+            ConnectionId::new(2),
+            "b",
+            &reply,
+            tokio::time::Instant::now(),
+            true,
+        )
+        .unwrap();
+    let view = reply.pending.unwrap();
+    owner
+        .module_applied(
+            ConnectionId::new(2),
+            "b",
+            ConfigAppliedRequest::new(
+                view.generation,
+                view.attempt.unwrap(),
+                ConfigApplyResult::Ack,
+                vec![],
+            ),
+        )
+        .unwrap();
+    approve(&rig, &owner, 2);
+    owner.notify_delivery_changed();
+    wait_for_blocking_delivery(|| !a.is_empty()).await;
+    a.recv()
+        .await
+        .unwrap()
+        .flushed
+        .take()
+        .unwrap()
+        .send(())
+        .unwrap();
+    let view = pending(&owner, INCUMBENT);
+    key.fail_anchor(true);
+    assert_eq!(
+        applied(&owner, INCUMBENT, &view, true).unwrap_err().code,
+        "anchor_pending"
+    );
+    owner.anchor_pending_served(INCUMBENT).unwrap();
+    owner.anchor_pending_served(ConnectionId::new(3)).unwrap();
+    owner.anchor_pending_served(ConnectionId::new(2)).unwrap();
+    owner.disconnected(ConnectionId::new(2));
+    owner
+        .declare(
+            ConnectionId::new(44),
+            "b",
+            subc_protocol::config::ConfigDeclareRequest::new(
+                rig.declaration.schema.clone(),
+                rig.path.join("cortexkit/b.jsonc").to_string_lossy(),
+                vec![],
+            ),
+            true,
+        )
+        .unwrap();
+    owner.retry_anchor().unwrap();
+    key.fail_anchor(false);
+    if operator_command {
+        assert!(!owner.status().unwrap().anchor_pending);
+    } else {
+        owner.notify_delivery_changed();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        wait_for_blocking_delivery(|| !owner.lock().unwrap().store.status().anchor_pending).await;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while a.is_empty() && std::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !a.is_empty(),
+        "recovered anchor must hint the refused connection (operator command: {operator_command})"
+    );
+    let mut recovered = a.recv().await.unwrap();
+    assert_eq!(recovered.frame.header.ty, subc_protocol::FrameType::Push);
+    assert_eq!(
+        (
+            recovered.frame.header.channel,
+            recovered.frame.header.epoch,
+            recovered.frame.header.corr
+        ),
+        (0, 0, 0)
+    );
+    let hint: subc_protocol::config::ConfigChanged =
+        serde_json::from_slice(&recovered.frame.body).unwrap();
+    assert_eq!(hint.generation, 2);
+    assert!(hint.fields.is_empty());
+    recovered.flushed.take().unwrap().send(()).unwrap();
+    wait_for_blocking_delivery(|| !owner.lock().unwrap().store.status().anchor_pending).await;
+    assert!(owner.take_anchor_hint(INCUMBENT).unwrap().is_none());
+    assert!(owner
+        .take_anchor_hint(ConnectionId::new(2))
+        .unwrap()
+        .is_none());
+    assert!(owner
+        .take_anchor_hint(ConnectionId::new(44))
+        .unwrap()
+        .is_none());
+    assert!(a.try_recv().is_err());
+    assert!(b.try_recv().is_err());
+    assert!(undeclared.try_recv().is_err());
 }
 
 #[tokio::test(start_paused = true)]

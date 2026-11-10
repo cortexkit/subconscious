@@ -48,7 +48,7 @@ pub struct RuntimeOwner {
     disconnected_pending: Mutex<Vec<ConnectionId>>,
     abandoned_spawns: Mutex<Vec<(DeliverySpawn, bool)>>,
     phone_withdrawals: Mutex<phone::PhoneWithdrawals>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     os_prompt_policy: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     spawn_preflight_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -327,6 +327,9 @@ struct OwnerState {
     reconciled_entries: BTreeMap<String, crate::daemon_config::ConfiguredModule>,
     recovery_exit_hold: bool,
     unstamp_hints: std::collections::HashSet<ConnectionId>,
+    anchor_waiters: std::collections::HashSet<ConnectionId>,
+    anchor_hints: std::collections::HashSet<ConnectionId>,
+    anchor_notify: std::sync::Arc<tokio::sync::Notify>,
     installed_route_policies: BTreeMap<String, u64>,
     route_policy_receipts: BTreeMap<(String, u64), route_policy::PendingRoutePolicy>,
     #[cfg(test)]
@@ -362,7 +365,8 @@ impl OwnerState {
                     tracing::warn!(%reason, "configuration anchor retry failed")
                 }
                 super::anchor_retry::Event::Recovered => {
-                    tracing::info!("configuration anchor recovered")
+                    tracing::info!("configuration anchor recovered");
+                    self.queue_anchor_hints();
                 }
             }
         }
@@ -658,6 +662,7 @@ impl RuntimeOwner {
             _ => BTreeMap::new(),
         };
         let approved_daemon = std::sync::RwLock::new(approved_daemon);
+        let delivery_changed = std::sync::Arc::new(tokio::sync::Notify::new());
         Self {
             #[cfg(test)]
             warm_restart_pause: Mutex::new(None),
@@ -693,6 +698,9 @@ impl RuntimeOwner {
                 reconciled_entries,
                 recovery_exit_hold: false,
                 unstamp_hints: std::collections::HashSet::new(),
+                anchor_waiters: std::collections::HashSet::new(),
+                anchor_hints: std::collections::HashSet::new(),
+                anchor_notify: delivery_changed.clone(),
                 installed_route_policies: BTreeMap::new(),
                 route_policy_receipts: BTreeMap::new(),
                 #[cfg(test)]
@@ -707,7 +715,7 @@ impl RuntimeOwner {
                 std::env::var_os(name).is_some()
             }),
             module_gates: Mutex::new(HashMap::new()),
-            delivery_changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            delivery_changed,
             route_policy_authority: std::sync::OnceLock::new(),
             binding_retirements: Mutex::new(BTreeMap::new()),
             canceled_approvals: Mutex::new(Vec::new()),
@@ -715,7 +723,7 @@ impl RuntimeOwner {
             disconnected_pending: Mutex::new(Vec::new()),
             abandoned_spawns: Mutex::new(Vec::new()),
             phone_withdrawals: Mutex::new(phone::PhoneWithdrawals::default()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             os_prompt_policy: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             spawn_preflight_hook: Mutex::new(None),
@@ -790,6 +798,8 @@ impl RuntimeOwner {
                 }
                 GateError::new("config_unavailable", "configuration owner lock is poisoned")
             })?;
+        #[cfg(feature = "test-support")]
+        guard.store.refresh_test_anchor_failure();
         self.drain_canceled_approvals(&mut guard);
         self.drain_disconnections(&mut guard);
         self.drain_abandoned_spawns(&mut guard);
@@ -1043,7 +1053,12 @@ impl RuntimeOwner {
             ));
         }
         if !check_store {
-            return Ok(subc_protocol::config::ConfigGetReply::new(active, pending));
+            return delivery::visible_reply(
+                state,
+                connection,
+                subc_protocol::config::ConfigGetReply::new(active, pending),
+                transition,
+            );
         }
         delivery::bind_get(
             state,
@@ -1685,15 +1700,15 @@ impl RuntimeOwner {
         }
     }
 
-    // Flipping a flag is platform-neutral; the unix-only phone tests and the
-    // test-support daemon tests (on every platform) are its callers.
-    #[cfg(all(test, any(unix, feature = "test-support")))]
+    // Flipping a flag is platform-neutral. Its callers are the unix-only phone
+    // tests and, under test-support, the ckdev config test seam and its tests.
+    #[cfg(any(all(test, unix), feature = "test-support"))]
     pub(crate) fn set_os_prompt_policy_for_tests(&self) {
         self.os_prompt_policy
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn os_prompt_policy_for_tests(&self) -> bool {
         self.os_prompt_policy
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1740,6 +1755,12 @@ impl RuntimeOwner {
         status.base_revision = store_status.base_revision;
         status.anchor_pending = store_status.anchor_pending;
         status.ungated_inputs = self.startup_overrides.clone();
+        #[cfg(feature = "test-support")]
+        if state.store.uses_config_gate_test_seam() {
+            status
+                .development_switches
+                .push("SUBC_TEST_CONFIG_GATE".into());
+        }
         status.warnings.extend(store_status.warnings);
         if cfg!(feature = "dev-desktop-approval") {
             status
@@ -1824,6 +1845,31 @@ impl RuntimeOwner {
             status_inputs::report_snapshot(&snapshot, &mut status);
         }
         status.gated_modules = admission::AdmissionCache::from_state(&state).held_modules();
+        if state.store.loaded_admission_state().0 == StoreState::Stamped {
+            let declarations: Vec<_> = state
+                .declarations
+                .iter()
+                .map(|(connection, (module, _))| (*connection, module.clone()))
+                .collect();
+            for (connection, module) in declarations {
+                // Use get's approved-declaration/view checks without opening the
+                // store or binding a delivery attempt merely to display status.
+                if self
+                    .module_get_locked(
+                        &mut state,
+                        connection,
+                        &module,
+                        subc_protocol::config::ConfigGetRequest::new(),
+                        false,
+                    )
+                    .is_err_and(|error| error.code == "config_gated")
+                {
+                    status.gated_modules.push(module);
+                }
+            }
+            status.gated_modules.sort();
+            status.gated_modules.dedup();
+        }
         Ok(status)
     }
 

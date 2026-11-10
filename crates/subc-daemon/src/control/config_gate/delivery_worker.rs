@@ -360,12 +360,17 @@ async fn module_worker(
                 break;
             };
             let connection = registration.connection_id;
-            if owner
+            let anchor_hint = owner
+                .on_blocking(move |owner| owner.take_anchor_hint(connection))
+                .await
+                .unwrap_or(None);
+            let unstamp_hint = owner
                 .on_blocking(move |owner| owner.take_unstamp_hint(connection))
                 .await
-                .unwrap_or(false)
-            {
-                let hint = subc_protocol::config::ConfigChanged::new(0, vec![]);
+                .unwrap_or(false);
+            if anchor_hint.is_some() || unstamp_hint {
+                let hint =
+                    subc_protocol::config::ConfigChanged::new(anchor_hint.unwrap_or(0), vec![]);
                 if let Ok(frame) = serde_json::to_vec(&hint)
                     .ok()
                     .and_then(|body| {

@@ -11,6 +11,7 @@ pub struct TestSupport {
     key_file: Option<PathBuf>,
     pause_at: Option<(PausePoint, PathBuf)>,
     fail_anchor: bool,
+    anchor_failure_file: Option<PathBuf>,
     deny_key: bool,
 }
 impl TestSupport {
@@ -27,11 +28,20 @@ impl TestSupport {
             key_file,
             pause_at: None,
             fail_anchor: false,
+            anchor_failure_file: None,
             deny_key: false,
         })
     }
     pub fn with_anchor_failure(mut self, fail: bool) -> Self {
         self.fail_anchor = fail;
+        self
+    }
+    /// The isolated rig creates this marker to deny anchor writes and removes
+    /// it to let the daemon's ordinary retry worker recover.
+    #[cfg(not(test))]
+    pub(crate) fn with_anchor_failure_file(mut self, path: PathBuf) -> Self {
+        assert!(path.starts_with(&self.root));
+        self.anchor_failure_file = Some(path);
         self
     }
     pub fn with_key_denial(mut self, denied: bool) -> Self {
@@ -93,6 +103,22 @@ fn authorize(executable: &Path) -> io::Result<()> {
 }
 
 impl ConfigStore {
+    pub(crate) fn uses_config_gate_test_seam(&self) -> bool {
+        self.hooks
+            .as_ref()
+            .is_some_and(|hooks| hooks.anchor_failure_file.is_some())
+    }
+    pub(crate) fn refresh_test_anchor_failure(&mut self) {
+        if let Some(path) = self
+            .hooks
+            .as_ref()
+            .and_then(|hooks| hooks.anchor_failure_file.as_ref())
+        {
+            if let Backend::File(keys) = &mut self.backend {
+                keys.set_update_failure(path.exists());
+            }
+        }
+    }
     pub fn test_support(&self) -> Option<&TestSupport> {
         self.hooks.as_ref()
     }

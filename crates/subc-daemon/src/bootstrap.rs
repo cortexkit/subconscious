@@ -693,6 +693,41 @@ pub async fn run() -> Result<(), BootstrapError> {
     .await
 }
 
+#[cfg(feature = "test-support")]
+mod config_test_seam {
+    #[cfg(not(test))]
+    use super::BootstrapError;
+
+    pub(super) fn enabled() -> bool {
+        std::env::var_os("SUBC_TEST_CONFIG_GATE").as_deref() == Some(std::ffi::OsStr::new("1"))
+            && std::env::current_exe().ok().is_some_and(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("ckdev-"))
+            })
+    }
+
+    #[cfg(not(test))]
+    pub(super) fn open(
+        root: crate::config_store::StoreRoot,
+    ) -> Result<crate::config_store::ConfigStore, BootstrapError> {
+        if !enabled() {
+            return Ok(crate::config_store::ConfigStore::open(root));
+        }
+        // The service's isolated store root contains every seam artifact, so a
+        // test cannot accidentally open the operator's keychain or anchor.
+        crate::config_store::testing::TestSupport::new(
+            root.path().to_path_buf(),
+            Some(root.path().join("test-key")),
+        )
+        .and_then(|hooks| {
+            hooks
+                .with_anchor_failure_file(root.path().join("fail-anchor"))
+                .open()
+        })
+        .map_err(|error| BootstrapError::ConfigStore(error.to_string()))
+    }
+}
+
 /// Serve a daemon from an explicit config. This is the entry point the twelve
 /// sibling repos use to boot an in-process daemon in their integration tests.
 ///
@@ -736,7 +771,9 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
                 } else {
                     crate::config_store::ConfigStore::open(root)
                 };
-                #[cfg(not(all(test, feature = "test-support")))]
+                #[cfg(all(feature = "test-support", not(test)))]
+                let store = config_test_seam::open(root)?;
+                #[cfg(not(feature = "test-support"))]
                 let store = crate::config_store::ConfigStore::open(root);
                 Ok::<_, BootstrapError>((store, lock))
             })
@@ -1287,6 +1324,10 @@ async fn serve_bound_daemon(
     }
     if let Some(runtime) = config_runtime {
         control = control.with_explicit_config_store(runtime);
+    }
+    #[cfg(feature = "test-support")]
+    if config_test_seam::enabled() {
+        control = control.with_config_os_prompt_policy_for_tests();
     }
     if let Some(ms) = route_bind_relay_default_ms {
         // A daemon-wide config value overrides the built-in default; a

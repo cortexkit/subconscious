@@ -7,6 +7,9 @@ const STARTUP_BEHAVIOR_ENV: &[&str] = &[
     "SUBC_CGROUP_PLACEMENT",
     "INVOCATION_ID",
     "SUBC_TEST_OPERATOR_SCRIPT",
+    // The guarded config test switch has no reader in release builds.
+    #[cfg(feature = "test-support")]
+    "SUBC_TEST_CONFIG_GATE",
     "SUBC_TEST_OPERATOR_EVENTS",
     "SUBC_TEST_OPERATOR_QUEUE_WAIT_MS",
     "SUBC_TEST_OPERATOR_TIMEOUT_MS",
@@ -100,7 +103,9 @@ mod tests {
                             panic!("classify new startup environment expression: {arg}")
                         });
                     assert!(
-                        STARTUP_BEHAVIOR_ENV.contains(&name) || PATH_ENV.contains(&name),
+                        STARTUP_BEHAVIOR_ENV.contains(&name)
+                            || PATH_ENV.contains(&name)
+                            || (name == "SUBC_TEST_CONFIG_GATE" && !cfg!(feature = "test-support")),
                         "classify startup environment variable {name}"
                     );
                 }
@@ -158,7 +163,7 @@ mod tests {
         inventory(&root, &root, &mut found);
         let expected = BTreeMap::from([
             ("app_open.rs", 2),
-            ("bootstrap.rs", 9),
+            ("bootstrap.rs", 10),
             ("config_gate/program.rs", 1),
             ("config_gate/runtime.rs", 1),
             ("config_store/writer_lock.rs", 1),

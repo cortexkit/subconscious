@@ -2,6 +2,11 @@
 
 ## 0.41.10
 
+- Report live opted-in modules with no approved configuration as gated, and hint
+  connections whose configuration replies waited for a recovered anchor. Add an
+  explicit `test-support`/`ckdev-`-guarded file-key store and scripted OS-confirmation
+  approval for isolated daemon/CLI/SDK acceptance; default-feature binaries contain
+  no switch.
 - Add the opt-in `dev-placement` feature and owner-only `config.place_program`.
   Record program-only development generations without changing configuration
   delivery pointers; release daemons refuse their identities until approval.

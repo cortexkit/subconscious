@@ -57,12 +57,11 @@ impl PrivilegedRequest for ConfigControlRequest {
 }
 
 impl ControlHandler {
-    #[cfg(all(test, feature = "test-support"))]
+    #[cfg(feature = "test-support")]
     pub(crate) fn with_config_os_prompt_policy_for_tests(self) -> Self {
-        self.config_runtime
-            .as_ref()
-            .unwrap()
-            .set_os_prompt_policy_for_tests();
+        if let Some(owner) = self.config_runtime.as_ref() {
+            owner.set_os_prompt_policy_for_tests();
+        }
         self
     }
     fn config_delivery_target_current(
@@ -370,7 +369,15 @@ impl ControlHandler {
                     Ok(vec![response])
                 }
             }
-            Err(error) => Ok(vec![config_error_frame(&frame, error)?]),
+            Err(error) => {
+                if error.code == "anchor_pending" {
+                    let _ = config_work(runtime.clone(), move |owner| {
+                        owner.anchor_pending_served(connection)
+                    })
+                    .await;
+                }
+                Ok(vec![config_error_frame(&frame, error)?])
+            }
         }
     }
     pub fn with_config_runtime(
@@ -849,7 +856,7 @@ impl ControlHandler {
 
     async fn config_approval_facts(&self, ctx: &RouteCtx) -> ApprovalFacts {
         let os_policy = crate::config_gate::os_prompt_policy_present();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let os_policy = os_policy
             || self
                 .config_runtime

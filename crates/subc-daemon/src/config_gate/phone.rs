@@ -28,6 +28,8 @@ impl OwnerState {
         self.approval_requests
             .retain(|(caller, _), _| *caller != connection);
         self.declarations.remove(&connection);
+        self.anchor_waiters.remove(&connection);
+        self.anchor_hints.remove(&connection);
         self.active_declarations
             .retain(|_, current| *current != connection);
     }

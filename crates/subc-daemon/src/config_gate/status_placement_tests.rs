@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn config_status_tracks_live_declarations_without_approved_config() {
+    let rig = Rig::new();
+    let owner = rig.owner("gated-status");
+    rig.stamp(&owner);
+    std::fs::write(
+        rig.path.join("cortexkit/a.jsonc"),
+        br#"{"credential":{"vault_ref":"approved"}}"#,
+    )
+    .unwrap();
+    rig.declare(&owner, 10);
+    assert_eq!(
+        owner
+            .module_get(ConnectionId::new(10), "a", ConfigGetRequest::new())
+            .unwrap_err()
+            .code,
+        "config_gated"
+    );
+    assert_eq!(owner.status().unwrap().gated_modules, ["a"]);
+    owner.disconnected(ConnectionId::new(10));
+    assert!(owner.status().unwrap().gated_modules.is_empty());
+    rig.declare(&owner, 11);
+    assert_eq!(owner.status().unwrap().gated_modules, ["a"]);
+    let generation = rig.stamp(&owner);
+    owner
+        .lock()
+        .unwrap()
+        .store
+        .record_delivery(
+            &crate::config_store::Tuple {
+                module: "a".into(),
+                project: None,
+            },
+            generation,
+            true,
+        )
+        .unwrap();
+    assert!(owner
+        .module_get(ConnectionId::new(11), "a", ConfigGetRequest::new())
+        .unwrap()
+        .active
+        .is_some());
+    assert!(owner.status().unwrap().gated_modules.is_empty());
+    owner.disconnected(ConnectionId::new(11));
+    rig.declare(&owner, 12);
+    assert!(owner.status().unwrap().gated_modules.is_empty());
+}
+
+#[test]
 fn config_status_lists_ungated_modules() {
     let rig = Rig::new();
     let owner = rig.owner("ungated-status");

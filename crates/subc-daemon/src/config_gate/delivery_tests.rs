@@ -1463,7 +1463,7 @@ async fn config_spawn_async_io_checks_keychain_and_store_hash_off_the_runtime_th
     let owner = Arc::new(sealed_owner(&rig, &key, "async-spawn-io"));
     rig.declare(&owner, INCUMBENT.get());
     rig.stamp(&owner);
-    let supervisor = crate::supervise::Supervisor::new(
+    let supervisor = crate::supervise::Supervisor::new_for_test(
         Arc::new(crate::Registry::default()),
         crate::supervise::RestartPolicy::new(3, Duration::ZERO),
     )
@@ -1992,7 +1992,7 @@ fn supervised_fixture_with_program(
     }
     let registry = Arc::new(crate::Registry::default());
     let handle = crate::supervise::SupervisorHandle::new();
-    let supervisor = crate::supervise::Supervisor::new(
+    let supervisor = crate::supervise::Supervisor::new_for_test(
         registry.clone(),
         crate::supervise::RestartPolicy {
             max_restarts: 3,
@@ -2108,7 +2108,7 @@ async fn config_delivery_supervisor_pre_hello_crash_defers_respawn_without_spend
         1,
         "the real crash spends one entry, waiting on its fence spends none"
     );
-    let probe = crate::supervise::Supervisor::new(
+    let probe = crate::supervise::Supervisor::new_for_test(
         std::sync::Arc::new(crate::Registry::default()),
         crate::supervise::RestartPolicy::default(),
     )
@@ -2292,7 +2292,7 @@ async fn exit_after_unavailable_image(unavailable_stage: &'static str, child_exi
         1,
         "the exit fence must prevent a second exec"
     );
-    let probe = crate::supervise::Supervisor::new(
+    let probe = crate::supervise::Supervisor::new_for_test(
         std::sync::Arc::new(crate::Registry::default()),
         crate::supervise::RestartPolicy::default(),
     )
@@ -3130,11 +3130,12 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
     let registry = Arc::new(crate::Registry::default());
     let forwarding = Arc::new(crate::ForwardingTable::default());
     let handle = SupervisorHandle::new();
-    let supervisor = Supervisor::new(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
-        .with_handle(handle.clone())
-        .with_forwarding(forwarding.clone())
-        .with_config_runtime(owner.clone())
-        .with_drain_timeout(Duration::from_millis(20));
+    let supervisor =
+        Supervisor::new_for_test(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
+            .with_handle(handle.clone())
+            .with_forwarding(forwarding.clone())
+            .with_config_runtime(owner.clone())
+            .with_drain_timeout(Duration::from_millis(20));
     let handler = Arc::new(
         crate::ControlHandler::with_forwarding(registry.clone(), forwarding.clone())
             .with_supervisor(handle)
@@ -3451,12 +3452,13 @@ async fn config_delivery_route_worker_requests_immediate_health_and_uses_deliver
             cadence: Duration::from_secs(3600),
             ..HealthConfig::default()
         };
-        let supervisor = Supervisor::new(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
-            .with_handle(handle.clone())
-            .with_forwarding(forwarding.clone())
-            .with_health_config(health)
-            .with_config_runtime(owner.clone())
-            .with_drain_timeout(Duration::ZERO);
+        let supervisor =
+            Supervisor::new_for_test(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
+                .with_handle(handle.clone())
+                .with_forwarding(forwarding.clone())
+                .with_health_config(health)
+                .with_config_runtime(owner.clone())
+                .with_drain_timeout(Duration::ZERO);
         let mut spec = supervised_spec(&rig, "a");
         spec.protocol = subc_control::ModuleProtocol::Subc;
         let module = supervisor.spawn(spec).unwrap();
@@ -3642,11 +3644,12 @@ async fn restart_after_busy_swap_warmup(candidate_exits_first: bool) {
     let registry = Arc::new(crate::Registry::default());
     let forwarding = Arc::new(crate::ForwardingTable::default());
     let handle = SupervisorHandle::new();
-    let supervisor = Supervisor::new(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
-        .with_handle(handle.clone())
-        .with_forwarding(forwarding.clone())
-        .with_config_runtime(owner.clone())
-        .with_drain_timeout(Duration::from_millis(20));
+    let supervisor =
+        Supervisor::new_for_test(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
+            .with_handle(handle.clone())
+            .with_forwarding(forwarding.clone())
+            .with_config_runtime(owner.clone())
+            .with_drain_timeout(Duration::from_millis(20));
     let handler = Arc::new(
         crate::ControlHandler::with_forwarding(registry.clone(), forwarding.clone())
             .with_supervisor(handle)

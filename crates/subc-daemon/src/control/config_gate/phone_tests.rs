@@ -78,10 +78,10 @@ impl Fixture {
         std::fs::create_dir_all(path.join("store")).unwrap();
         std::fs::create_dir_all(path.join("cortexkit")).unwrap();
         std::fs::copy("/bin/sh", path.join("program")).unwrap();
-        // macOS rejects the copied platform shell at exec. Keep its signed
-        // system path so the phone fixture actually starts.
+        // macOS needs the signed system image. Run the dummy holder directly:
+        // a shell may exec sleep before its own image can be confirmed.
         let phone_program = if cfg!(target_os = "macos") {
-            std::path::PathBuf::from("/bin/sh")
+            std::path::PathBuf::from("/bin/sleep")
         } else {
             path.join("program")
         };
@@ -89,7 +89,7 @@ impl Fixture {
             path.join("subc.jsonc"),
             serde_json::to_vec(&json!({"version":1,"modules":{
                 "a":{"program":path.join("program")},
-                "callosum":{"program":phone_program,"args":["-c","sleep 600"],"reserved":true,
+                "callosum":{"program":phone_program,"args":if cfg!(target_os = "macos") { json!(["600"]) } else { json!(["-c","sleep 600"]) },"reserved":true,
                     "overlap": if lifecycle { "safe" } else { "exclusive" }}
             }}))
             .unwrap(),

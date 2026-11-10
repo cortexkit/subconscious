@@ -1937,11 +1937,32 @@ async fn config_admission_hello_rechecks_script_and_declared_file_content() {
 async fn config_admission_hello_rejects_a_wrapper_that_execs_after_the_spawn_sample() {
     let rig = rig();
     let marker = rig.path.join("release-wrapper");
+    #[cfg(target_os = "linux")]
     std::fs::write(
         rig.path.join("program"),
         "#!/bin/sh\nwhile [ ! -f \"$1\" ]; do /bin/sleep 0.01; done\nexec /bin/sleep 600\n",
     )
     .unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        // Approved macOS programs must be signed images. A native wrapper
+        // keeps the late exec under test without requiring script admission.
+        let source = rig.path.join("late-exec.c");
+        std::fs::write(&source, include_str!("../../tests/fixtures/late-exec.c")).unwrap();
+        assert!(std::process::Command::new("/usr/bin/cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(rig.path.join("program"))
+            .status()
+            .unwrap()
+            .success());
+        assert!(std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(rig.path.join("program"))
+            .status()
+            .unwrap()
+            .success());
+    }
     wire_fixture_document(&rig, json!([marker]));
     let owner = Arc::new(rig.owner("late-exec"));
     rig.stamp(&owner);
@@ -1951,15 +1972,28 @@ async fn config_admission_hello_rejects_a_wrapper_that_execs_after_the_spawn_sam
         .with_handle(handle.clone())
         .with_config_runtime(owner.clone());
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
-    assert!(
-        handle
-            .wait_program_binding("a", &handle.spawn_launch_nonce_for("a").unwrap())
-            .await
-    );
+    let nonce = handle.spawn_launch_nonce_for("a").unwrap_or_else(|| {
+        panic!(
+            "wrapper did not spawn: {:?}; {:?}",
+            module.status(),
+            owner.take_activities()
+        )
+    });
+    assert!(handle.wait_program_binding("a", &nonce).await);
+    // Binding publication can precede suspended exec confirmation on macOS.
+    // Wait for a reportable child before releasing its late-exec barrier.
+    let pid = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(pid) = module.status().unwrap().pid {
+                break pid;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("wrapper must complete exec admission");
+    let process = subc_os::Process::open(pid).unwrap().unwrap();
     std::fs::write(marker, "").unwrap();
-    let process = subc_os::Process::open(module.status().unwrap().pid.unwrap())
-        .unwrap()
-        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while process.observe().and_then(|image| image.executable)
             != subc_os::file_identity(std::path::Path::new("/bin/sleep"))

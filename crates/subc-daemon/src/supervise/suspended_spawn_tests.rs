@@ -1,5 +1,5 @@
 use super::*;
-use std::{io::Write, path::Path};
+use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct Probe {
@@ -70,6 +70,116 @@ fn runtime() -> SupervisorRuntimeConfig {
         .runtime_config()
 }
 
+pub(super) fn gated_owner(
+    root: &Path,
+    spec: &ModuleSpec,
+    stamped: bool,
+) -> Arc<crate::config_gate::runtime::RuntimeOwner> {
+    use crate::config_gate::{
+        capture::ConfigCapturer, runtime::RuntimeOwner, ApprovalFacts, ApprovalReply, PlanKind,
+        PresenceDecision,
+    };
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let root = root.join(format!(
+        "gate-{}",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(root.join("store")).unwrap();
+    let daemon_path = root.join("subc.jsonc");
+    std::fs::write(&daemon_path, serde_json::to_vec(&serde_json::json!({
+        "version":1, "modules":{spec.module_id.clone():{
+            "program":spec.program, "args":spec.args, "env":spec.env.iter().cloned().collect::<std::collections::BTreeMap<_,_>>(),
+            "protocol":"none", "carry_containment":spec.carry_containment
+        }}
+    })).unwrap()).unwrap();
+    let owner = Arc::new(RuntimeOwner::new(
+        "suspended-test".into(),
+        crate::config_store::ConfigStore::open_digest_only_for_tests(
+            crate::config_store::StoreRoot::from_service_definition(root.join("store")).unwrap(),
+        ),
+        ConfigCapturer {
+            daemon_path,
+            config_home: root,
+            projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+        },
+    ));
+    if stamped {
+        let prepared = owner.prepare(PlanKind::Stamp).unwrap();
+        let plan = owner
+            .finish_plan(prepared, crate::config_gate::runtime::daemon_review)
+            .unwrap();
+        let facts = ApprovalFacts {
+            connection: 7,
+            owner_uid: true,
+            desktop_app: true,
+            attested_operator_app: true,
+            os_prompt_available: true,
+            phone: None,
+            caller: crate::caller_identity::CallerIdentity::default(),
+        };
+        owner
+            .desktop_view_delivered(crate::ConnectionId::new(7), &plan)
+            .unwrap();
+        let challenge = owner.begin_approval(&plan.digest, &facts).unwrap();
+        owner
+            .finish_approval(
+                challenge.attempt(),
+                &facts,
+                ApprovalReply::Presence(PresenceDecision::InteractiveApproval),
+                1,
+            )
+            .unwrap();
+    }
+    // Suspended verification applies only to gated launches. These tests need
+    // real approved program authority, not just a configured trampoline.
+    owner
+}
+
+fn gated_runtime(probe: &Probe, spec: &ModuleSpec, stamped: bool) -> SupervisorRuntimeConfig {
+    Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+        .with_config_runtime(gated_owner(&probe.root, spec, stamped))
+        .runtime_config()
+}
+
+#[tokio::test]
+async fn macos_ungated_script_starts_without_a_code_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = Probe::new();
+    let marker = probe.root.join("ungated-script-marker");
+    let script = probe.root.join("ungated-script");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf started > '{}'\nexec /bin/sleep 30\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut spec = probe.spec(&marker);
+    spec.program = script;
+    spec.args.clear();
+    for runtime in [runtime(), gated_runtime(&probe, &spec, false)] {
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
+        child.confirm_privacy_exec().await;
+        assert_eq!(child.spawn_failure, None);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while std::fs::read(&marker).ok().as_deref() != Some(b"started") {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"started");
+        assert!(child.report_ready.get().is_some());
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+        child.release_roster();
+        std::fs::remove_file(&marker).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn macos_suspended_refusal_never_runs_marker_target() {
     let probe = Probe::new();
@@ -80,7 +190,7 @@ async fn macos_suspended_refusal_never_runs_marker_target() {
         "SUBC_TEST_BEFORE_EXEC_CONFIRM".into(),
         listener.local_addr().unwrap().to_string(),
     ));
-    let runtime = runtime();
+    let runtime = gated_runtime(&probe, &spec, true);
     let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
     let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
     let task = tokio::spawn(async move {
@@ -113,59 +223,66 @@ async fn macos_suspended_refusal_never_runs_marker_target() {
 }
 
 #[tokio::test]
-async fn macos_suspended_shebang_has_no_wildcard_admission() {
+async fn macos_gated_script_approval_does_not_admit_changed_content_or_another_script() {
     let probe = Probe::new();
-    let marker = probe.root.join("script-marker");
-    let script = probe.root.join("script");
-    let mut file = std::fs::File::create(&script).unwrap();
-    writeln!(
-        file,
-        "#!/bin/sh\nprintf started > '{}'\nexec /bin/sleep 30",
-        marker.display()
-    )
-    .unwrap();
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let mut spec = probe.spec(&marker);
-    spec.program = script;
-    spec.args.clear();
-    let runtime = runtime();
-    let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-    let refused = match spawn_and_mark_running(&spec, &runtime, &snapshot) {
-        Err(error) => error
-            .to_string()
-            .contains("scripts are not executable images"),
-        Ok(mut child) => {
-            child.confirm_privacy_exec().await;
-            let refused = child.spawn_failure.is_some();
-            let _ = child.start_kill();
-            child.wait().await.unwrap();
-            child.release_roster();
-            refused
+    for replace_path in [false, true] {
+        let marker = probe.root.join(format!("script-marker-{replace_path}"));
+        let script = probe.root.join(format!("approved-script-{replace_path}"));
+        let other = probe.root.join(format!("unapproved-script-{replace_path}"));
+        std::fs::write(&script, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut spec = probe.spec(&marker);
+        spec.program = script.clone();
+        spec.args.clear();
+        let runtime = gated_runtime(&probe, &spec, true);
+        let unapproved = format!(
+            "#!/bin/sh\nprintf started > '{}'\nexec /bin/sleep 30\n",
+            marker.display()
+        );
+        if replace_path {
+            // Both scripts use the approved interpreter. Substituting B at A's
+            // launch path must not inherit A's approval through that image.
+            std::fs::write(&other, unapproved).unwrap();
+            std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_file(&script).unwrap();
+            std::os::unix::fs::symlink(&other, &script).unwrap();
+        } else {
+            std::fs::write(&script, unapproved).unwrap();
         }
-    };
-    assert!(
-        refused,
-        "a shebang script was admitted through the interpreter wildcard"
-    );
-    assert!(!marker.exists());
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let refused = match spawn_and_mark_running(&spec, &runtime, &snapshot) {
+            Err(SuperviseError::ConfigHeld { code, .. }) => code == "program_refused",
+            Err(error) => panic!("unexpected script refusal: {error:?}"),
+            Ok(mut child) => {
+                child.confirm_privacy_exec().await;
+                let refused = child.spawn_failure.is_some();
+                let _ = child.start_kill();
+                child.wait().await.unwrap();
+                child.release_roster();
+                refused
+            }
+        };
+        assert!(refused, "unapproved script content was admitted through an interpreter wildcard; replace_path={replace_path}");
+        assert!(!marker.exists());
+    }
 }
 
 #[tokio::test]
 async fn macos_suspended_cdhash_mismatch_never_runs_marker_target() {
     let probe = Probe::new();
     let marker = probe.root.join("hash-refused-marker");
-    let runtime = runtime();
+    let runtime = gated_runtime(&probe, &probe.spec(&marker), true);
     let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
     let mut child = spawn_and_mark_running(&probe.spec(&marker), &runtime, &snapshot).unwrap();
     let other = Path::new("/bin/sleep");
-    child.privacy_exec.as_mut().unwrap().signature = Arc::new(
+    child.privacy_exec.as_mut().unwrap().signature = Some(Arc::new(
         subc_os::privacy_identity::SuspendedSignature::capture(
             &std::fs::File::open(other).unwrap(),
             other,
         )
         .unwrap(),
-    );
+    ));
     child.confirm_privacy_exec().await;
     assert!(
         child
@@ -184,9 +301,7 @@ async fn macos_suspended_cdhash_mismatch_never_runs_marker_target() {
 #[tokio::test]
 async fn macos_suspended_plain_restart_and_candidate_resume_only_after_verification() {
     let probe = Probe::new();
-    let runtime = runtime();
-    // The second plain launch exercises the same slot after a reaped leader;
-    // both swap slots and the async preparation entry use the same admission.
+    // Both swap slots and the async preparation entry use approved admission.
     for (index, role, alternate, carry) in [
         (0, SpawnRole::Plain, false, false),
         (1, SpawnRole::Plain, false, false),
@@ -197,6 +312,7 @@ async fn macos_suspended_plain_restart_and_candidate_resume_only_after_verificat
         let marker = probe.root.join(format!("accepted-{index}"));
         let mut spec = probe.spec(&marker);
         spec.carry_containment = carry;
+        let runtime = gated_runtime(&probe, &spec, true);
         let mut child = spawn_child_in_slot_async(&spec, &runtime, role, alternate)
             .await
             .unwrap();
@@ -206,7 +322,7 @@ async fn macos_suspended_plain_restart_and_candidate_resume_only_after_verificat
         assert_eq!(child.spawn_failure, None);
         assert!(child.report_ready.get().is_some());
         tokio::time::timeout(Duration::from_secs(5), async {
-            while !marker.exists() {
+            while std::fs::read(&marker).ok().as_deref() != Some(b"started") {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })

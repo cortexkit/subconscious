@@ -136,6 +136,8 @@ pub struct BootstrapConfig {
         Option<fn(crate::config_store::StoreRoot) -> crate::config_store::ConfigStore>,
     #[cfg(all(test, feature = "test-support"))]
     test_control: Option<fn(ControlHandler) -> ControlHandler>,
+    #[cfg(all(test, feature = "test-support"))]
+    test_listener_bind: Option<fn(&mut BootstrapConfig)>,
     configured_port: Option<u16>,
     /// Daemon-wide route.bind relay budget in milliseconds (the fallback for
     /// any module without a per-module override). `None` = built-in default
@@ -236,6 +238,8 @@ impl BootstrapConfig {
             test_store_factory: None,
             #[cfg(all(test, feature = "test-support"))]
             test_control: None,
+            #[cfg(all(test, feature = "test-support"))]
+            test_listener_bind: None,
             configured_port: None,
             route_bind_relay_default_ms: None,
             reserved_capabilities: BTreeMap::new(),
@@ -797,6 +801,16 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
             .transpose()?;
         let config =
             load_bootstrap_authority(config, opened_store.as_mut().map(|(store, _)| store))?;
+        #[cfg(all(test, feature = "test-support"))]
+        let config = {
+            let mut config = config;
+            if let Some(bind) = config.test_listener_bind {
+                // Tests observe authority's port selection but change only the
+                // bind, so they never take a running daemon's production port.
+                bind(&mut config);
+            }
+            config
+        };
         Ok::<_, BootstrapError>((config, opened_store, start_lock))
     })
     .await
@@ -958,6 +972,8 @@ fn load_bootstrap_authority(
         test_store_factory: config.test_store_factory,
         #[cfg(all(test, feature = "test-support"))]
         test_control: config.test_control,
+        #[cfg(all(test, feature = "test-support"))]
+        test_listener_bind: config.test_listener_bind,
         ..authority
     })
 }

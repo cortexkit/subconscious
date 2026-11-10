@@ -680,8 +680,10 @@ async fn privacy_trampoline_behind_the_admission_gate_preserves_the_carried_pgid
     let supervisor = new_supervisor(&dir);
     let mut module_spec = spec(&dir, "privacy");
     let holder_file = dir.join("privacy-holder.pid");
+    // Keep the configured shell image alive through exec confirmation; the
+    // carried-group assertions do not require a second image replacement.
     module_spec.args = vec!["-c".into(),
-        "if [ ! -s \"$1\" ]; then /bin/sleep 60 </dev/null >/dev/null 2>&1 & echo $! >\"$1\"; fi; exec /bin/sleep 60".into(),
+        "if [ ! -s \"$1\" ]; then /bin/sleep 60 </dev/null >/dev/null 2>&1 & echo $! >\"$1\"; fi; while :; do /bin/sleep 60; done".into(),
         "privacy-holder".into(), holder_file.display().to_string()];
     let module = supervisor.spawn(module_spec).unwrap();
     until("the first privacy image must finish exec", || {

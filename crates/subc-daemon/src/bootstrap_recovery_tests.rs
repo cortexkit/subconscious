@@ -35,10 +35,19 @@ struct Rig {
     dir: ScratchDir,
     exe: PathBuf,
     sealed: bool,
+    socket_dir: PathBuf,
 }
 impl Rig {
     fn new(sealed: bool) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = ScratchDir::new("recovery");
+        // The harness's scratch prefix can exceed macOS's Unix socket path limit.
+        // Only the owned socket directory needs a short system-temp name.
+        let socket_dir = std::env::temp_dir().join(format!(
+            "subc-r{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let exe = dir.join("ckdev-recovery");
         std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
         for name in [
@@ -59,13 +68,19 @@ impl Rig {
         })).unwrap()).unwrap();
         std::fs::write(dir.join("config/cortexkit/a.jsonc"), b"{}").unwrap();
         std::fs::write(dir.join("operator"), "approve\napprove\napprove\napprove\n").unwrap();
-        Self { dir, exe, sealed }
+        Self {
+            dir,
+            exe,
+            sealed,
+            socket_dir,
+        }
     }
     fn command(&self, role: &str) -> Command {
         let mut cmd = Command::new(&self.exe);
         cmd.args(["--ignored", "--exact", FIXTURE, "--nocapture"])
             .env("RECOVERY_ROLE", role)
             .env("RECOVERY_ROOT", self.dir.path())
+            .env("RECOVERY_SOCKET_DIR", &self.socket_dir)
             .env("RECOVERY_SEALED", if self.sealed { "1" } else { "0" })
             .env("HOME", self.dir.join("home"))
             .env("XDG_DATA_HOME", self.dir.join("data"))
@@ -80,6 +95,11 @@ impl Rig {
             .stderr(Stdio::from(
                 std::fs::File::create(self.dir.join(format!("{role}.err"))).unwrap(),
             ));
+        #[cfg(target_os = "macos")]
+        cmd.env(
+            "RECOVERY_TRAMPOLINE",
+            crate::supervise::test_privacy_trampoline(),
+        );
         cmd
     }
     fn seed(&self) {
@@ -147,6 +167,12 @@ impl Rig {
     }
     fn retained(&self) -> Option<Vec<u8>> {
         std::fs::read(self.store()).ok()
+    }
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.socket_dir);
     }
 }
 
@@ -338,7 +364,40 @@ async fn config_approved_removal_retires_module() {
 #[tokio::test]
 async fn config_approved_launch_change_applies_at_next_spawn() {
     let _serial = DAEMONS.lock().await;
+    #[cfg(target_os = "linux")]
     let rig = approved_rig();
+    #[cfg(target_os = "macos")]
+    let rig = {
+        let rig = Rig::new(true);
+        let source = rig.dir.join("record-arguments.c");
+        let program = rig.dir.join("record-arguments");
+        std::fs::write(
+            &source,
+            include_str!("../tests/fixtures/record-arguments.c"),
+        )
+        .unwrap();
+        assert!(Command::new("/usr/bin/cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&program)
+            .status()
+            .unwrap()
+            .success());
+        edit_approved_file(&rig, |doc| {
+            doc["port"] = json!(0);
+            doc["modules"]["held-fixture"]["program"] = json!(program);
+            doc["modules"]["held-fixture"]["env"] =
+                json!({"RECOVERY_ARGUMENT_FILE":rig.dir.join("arguments")});
+        });
+        rig.seed();
+        rig
+    };
     let _daemon = rig.start().await;
     let mut stream = rig.local().await;
     let before = wait_approved_running(&mut stream).await;
@@ -393,10 +452,17 @@ async fn config_approved_launch_change_applies_at_next_spawn() {
         .iter()
         .find(|child| child["module_id"] == "held-fixture")
         .unwrap();
-    let cmdline_path = format!("/proc/{}/cmdline", child["pid"].as_u64().unwrap());
+    let pid = child["pid"].as_u64().unwrap();
+    #[cfg(target_os = "macos")]
+    let _ = pid;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let cmdline = std::fs::read(&cmdline_path).unwrap();
+            #[cfg(target_os = "linux")]
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+            #[cfg(target_os = "macos")]
+            // macOS has no /proc, and its sandbox may prohibit ps. The native
+            // fixture records the actual argv it received, not the config.
+            let cmdline = std::fs::read(rig.dir.join("arguments")).unwrap_or_default();
             if cmdline.split(|b| *b == 0).any(|arg| arg == b"3500") {
                 break;
             }
@@ -768,11 +834,28 @@ fn config_recovery_fixture() {
                 let mut config = initial
                     .with_config_store_root(root.join("store"))
                     .unwrap()
-                    .with_local_listener_socket_dir(root.join("socket"));
+                    .with_local_listener_socket_dir(PathBuf::from(
+                        std::env::var_os("RECOVERY_SOCKET_DIR").unwrap(),
+                    ));
+                #[cfg(target_os = "macos")]
+                {
+                    config = config.with_privacy_trampoline(PathBuf::from(
+                        std::env::var_os("RECOVERY_TRAMPOLINE").unwrap(),
+                    ));
+                }
                 config.connection_file_path = root.join("connection.json");
                 config.defer_file_load = !eager;
                 config.test_store_factory = Some(open_store);
                 config.test_control = Some(adapt_control);
+                config.test_listener_bind = Some(|config| {
+                    let root = PathBuf::from(std::env::var_os("RECOVERY_ROOT").unwrap());
+                    std::fs::write(root.join("selected-port"), config.port.to_string()).unwrap();
+                    // Small sentinel ports distinguish live/approved files in
+                    // these rigs; they must not require privileged binds.
+                    if config.port == DEFAULT_SUBC_PORT || config.port < 1024 {
+                        config.port = 0;
+                    }
+                });
                 config.operator_script = Some(root.join("operator"));
                 config.operator_events = Some(root.join("operator-events"));
                 run_with_config(config).await.unwrap();
@@ -895,10 +978,11 @@ async fn config_recovery_spawned_defaults_and_os_unstamp_write_a_fresh_store() {
         let daemon = rig.start().await;
         let prompt_before = std::fs::read(rig.dir.join("operator-events")).ok();
         let info = subc_transport::connection_file::read(rig.dir.join("connection.json")).unwrap();
-        assert!(info
-            .endpoints
-            .iter()
-            .all(|endpoint| endpoint.port == DEFAULT_SUBC_PORT));
+        assert_eq!(
+            std::fs::read_to_string(rig.dir.join("selected-port")).unwrap(),
+            DEFAULT_SUBC_PORT.to_string()
+        );
+        assert!(info.endpoints.iter().all(|endpoint| endpoint.port != 0));
         let mut client = rig.local().await;
         let status = rpc(&mut client, json!({"op":"config.status"})).await;
         assert_eq!(

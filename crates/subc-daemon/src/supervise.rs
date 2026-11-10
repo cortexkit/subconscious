@@ -178,7 +178,8 @@ struct PrivacyExec {
     deadline: tokio::time::Instant,
     expected: Option<subc_os::FileIdentity>,
     trampoline: Option<subc_os::FileIdentity>,
-    signature: Arc<subc_os::privacy_identity::SuspendedSignature>,
+    signature: Option<Arc<subc_os::privacy_identity::SuspendedSignature>>,
+    script: bool,
     module_id: String,
     #[cfg(test)]
     confirmation_pause: Option<(String, Option<tokio::net::TcpStream>)>,
@@ -266,6 +267,7 @@ fn privacy_command(
     spec: &ModuleSpec,
     binding: &SpawnProgramBinding,
     roster: &ChildRoster,
+    gated: bool,
 ) -> Result<
     (
         Command,
@@ -285,9 +287,18 @@ fn privacy_command(
     let trampoline = roster.privacy_trampoline().map_err(failure)?;
     let expected = Some(binding.identity);
     let trampoline_image = subc_os::file_identity(&trampoline);
-    let signature =
-        subc_os::privacy_identity::SuspendedSignature::capture(&binding._file, &binding.path)
-            .map_err(|error| failure(error.to_string()))?;
+    let signature = gated
+        .then(|| {
+            subc_os::privacy_identity::SuspendedSignature::capture(&binding._file, &binding.path)
+                .map(Arc::new)
+        })
+        .transpose()
+        .map_err(|error| failure(error.to_string()))?;
+    let script = !gated && {
+        use std::io::Read;
+        let mut prefix = [0; 2];
+        (&binding._file).read_exact(&mut prefix).is_ok() && &prefix == b"#!"
+    };
     if expected == trampoline_image {
         return Err(failure(
             "privacy identity module executable is missing or is the trampoline itself".to_string(),
@@ -299,20 +310,25 @@ fn privacy_command(
         tokio::io::unix::AsyncFd::new(reader).map_err(|error| failure(error.to_string()))?;
     let mut command = Command::new(&trampoline);
     command
-        .arg("__disclaim-exec-suspended")
+        .arg(if gated {
+            "__disclaim-exec-suspended"
+        } else {
+            "__disclaim-exec"
+        })
         .arg(ack.fd().to_string())
         .arg(&binding.path);
     Ok((
         command,
         Some(PrivacyExec {
-            gated: false,
+            gated,
             admission_binding: None,
             content_check: None,
             reader,
             deadline: tokio::time::Instant::now() + Duration::from_secs(5),
             expected,
             trampoline: trampoline_image,
-            signature: Arc::new(signature),
+            signature,
+            script,
             module_id: spec.module_id.clone(),
             #[cfg(test)]
             confirmation_pause: spec
@@ -579,6 +595,13 @@ impl SupervisedChild {
         };
         // Keep the reader in self across await: select cancellation must not
         // discard the handshake or reset its original five-second deadline.
+        // Use try_wait so a child reaped during confirmation has its program
+        // binding retired before another command can use its nonce.
+        let waited = if matches!(&result, Ok(Ok(record)) if record.is_empty()) {
+            Some(self.try_wait())
+        } else {
+            None
+        };
         let pending = self.privacy_exec.as_ref().expect("pending exec");
         let cause = match result {
             Err(_) => Some("privacy identity trampoline did not exec within 5s".to_string()),
@@ -597,19 +620,55 @@ impl SupervisedChild {
                     .unwrap_or("invalid privacy exec refusal record")
                     .to_string(),
             ),
-            Ok(Ok(_)) => match self.child.try_wait() {
-                Ok(Some(_)) => {
-                    if let Some(binding) = &self._program_binding {
-                        binding.retire();
+            Ok(Ok(_)) if !pending.gated => match waited.expect("exec EOF checked child") {
+                Ok(Some(_)) => None,
+                Err(error) => Some(format!("privacy identity trampoline wait failed: {error}")),
+                Ok(None) => {
+                    let image = observe_spawned_image(self.pid);
+                    if let Some(image) = image.filter(|image| {
+                        image.executable.is_some()
+                            && image.executable != pending.trampoline
+                            && (image.executable == pending.expected || pending.script)
+                    }) {
+                        match self
+                            .roster_guard
+                            .as_ref()
+                            .map(|guard| guard.confirm_executable(image))
+                            .transpose()
+                        {
+                            Err(error) => Some(format!(
+                                "could not durably record confirmed module image: {error}"
+                            )),
+                            Ok(_) => {
+                                let _ = self.report_ready.set(());
+                                None
+                            }
+                        }
+                    } else if image.is_none()
+                        || image.is_some_and(|image| image.executable.is_none())
+                    {
+                        // Empty EOF acknowledged exec. An image disappearing
+                        // during observation is an ordinary module exit.
+                        match tokio::time::timeout_at(pending.deadline, self.child.wait()).await {
+                            Ok(result) => {
+                                self.registration_channel.take();
+                                if let Some(binding) = &self._program_binding {
+                                    binding.retire();
+                                }
+                                result.err().map(|error| format!("privacy identity trampoline wait failed: {error}"))
+                            }
+                            Err(_) => Some("privacy identity module executable remained unreadable until the 5s exec deadline".to_string()),
+                        }
+                    } else {
+                        Some("privacy identity trampoline executable mismatch: expected the module program, not ck-subc".to_string())
                     }
+                }
+            },
+            Ok(Ok(_)) => match waited.expect("exec EOF checked child") {
+                Ok(Some(_)) => {
                     Some("privacy identity target exited before suspended admission".to_string())
                 }
-                Err(error) => {
-                    if let Some(binding) = &self._program_binding {
-                        binding.retire();
-                    }
-                    Some(format!("privacy identity trampoline wait failed: {error}"))
-                }
+                Err(error) => Some(format!("privacy identity trampoline wait failed: {error}")),
                 Ok(None) => {
                     // CLOEXEC closes the ack just before the kernel reports the
                     // suspended target. EOF alone must never admit a running image.
@@ -651,10 +710,10 @@ impl SupervisedChild {
         if let Some(binding) = &self._program_binding {
             binding.pause_after_wait_for_test().await;
         }
-        if cause.is_none() {
+        if cause.is_none() && pending.gated {
             let publication = pending.admission_binding.clone();
             let live = self.live_program_binding.clone();
-            let signature = Arc::clone(&pending.signature);
+            let signature = Arc::clone(pending.signature.as_ref().expect("gated signature"));
             let pid = self.pid;
             let gated = pending.gated;
             self.privacy_exec
@@ -705,7 +764,7 @@ impl SupervisedChild {
     #[cfg(target_os = "macos")]
     fn finish_privacy_exec(&mut self, mut cause: Option<String>) {
         let mut pending = self.privacy_exec.take().expect("pending exec");
-        if cause.is_none() {
+        if cause.is_none() && pending.gated {
             let admission = (|| -> io::Result<()> {
                 let image = observe_spawned_image(self.pid)
                     .filter(|image| image.executable == pending.expected)
@@ -713,7 +772,11 @@ impl SupervisedChild {
                 if let Some(guard) = &self.roster_guard {
                     guard.confirm_executable(image)?;
                 }
-                pending.signature.resume(self.pid)?;
+                pending
+                    .signature
+                    .as_ref()
+                    .expect("gated signature")
+                    .resume(self.pid)?;
                 let _ = self.report_ready.set(());
                 info!(module_id = %pending.module_id, pid = self.pid,
                     "verified suspended module resumed with own privacy identity");
@@ -10717,6 +10780,31 @@ async fn spawn_child_in_slot_async(
     result
 }
 
+fn validate_spawn_program(
+    spec: &ModuleSpec,
+    admission: Option<&crate::config_gate::runtime::SpawnAdmission>,
+    delivery: Option<config_delivery::SpawnDelivery<'_>>,
+) -> Result<(), SuperviseError> {
+    if let Some(admission) = admission {
+        if let Some(program) = &admission.launch {
+            if let Err(error) = program.validate_for_spawn() {
+                // A captured unsigned image is a definite refusal. Uncertain
+                // reads are deferred by validate_for_spawn, not attributed to
+                // the operator as a changed or unapprovable program.
+                if let (Some(context), Some(base)) = (delivery, admission.approved_base()) {
+                    if error.code == "program_refused"
+                        && !context.record_refusal(spec, base, &error.detail)
+                    {
+                        return Err(spawn_plan_stale(spec));
+                    }
+                }
+                return Err(config_delivery::gate_hold_error(spec, error));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_child_in_slot(
     spec: &ModuleSpec,
@@ -10734,6 +10822,10 @@ fn prepare_child_in_slot(
     let spawn_admission = config_delivery
         .map(|delivery| delivery.prepare(spec))
         .transpose()?;
+    #[cfg(target_os = "macos")]
+    let gated = spawn_admission
+        .as_ref()
+        .is_some_and(|admission| admission.approved_base().is_some());
     let launch_spec = spawn_admission
         .as_ref()
         .and_then(|admission| admission.launch.as_ref())
@@ -10840,12 +10932,18 @@ fn prepare_child_in_slot(
         .then(|| SpawnProgramBinding::capture(spec))
         .transpose()?;
     #[cfg(target_os = "macos")]
+    validate_spawn_program(spec, spawn_admission.as_ref(), config_delivery)?;
+    #[cfg(target_os = "macos")]
     let (mut command, privacy_exec, exec_ack) = privacy_command(
         spec,
         program_binding
             .as_ref()
             .expect("macOS captures every launch"),
         roster,
+        // Ungated launches retain legacy unsuspended exec, including scripts. Suspended
+        // verification admits approved programs only. prepare() above fails
+        // closed if the gate cannot decide; an image sample is not authority.
+        gated,
     )?;
     #[cfg(windows)]
     let mut command = Command::new(image_capture.path());
@@ -11097,20 +11195,7 @@ fn prepare_child_in_slot(
             context.pause_preflight_for_test();
         }
     }
-    if let Some(admission) = &spawn_admission {
-        if let Some(program) = &admission.launch {
-            if let Err(error) = program.validate_for_spawn() {
-                if let (Some(context), Some(base)) = (delivery_context, admission.approved_base()) {
-                    if error.code == "program_refused"
-                        && !context.record_refusal(spec, base, &error.detail)
-                    {
-                        return Err(spawn_plan_stale(spec));
-                    }
-                }
-                return Err(config_delivery::gate_hold_error(spec, error));
-            }
-        }
-    }
+    validate_spawn_program(spec, spawn_admission.as_ref(), delivery_context)?;
     Ok(PreparedChild {
         #[cfg(any(unix, windows))]
         registration_channel,
@@ -11210,7 +11295,6 @@ fn launch_child_in_slot(
     if let Some(pending) = &mut privacy_exec {
         pending.admission_binding = binding_publication.clone();
         if expected_image.is_some() {
-            pending.gated = true;
             pending.expected = expected_image;
         }
     }
@@ -20279,10 +20363,12 @@ mod privacy_exec_boundary_tests {
         {
             let registry = Arc::new(Registry::default());
             let policy = RestartPolicy::new(0, Duration::ZERO);
-            let supervisor = Supervisor::new_for_test(Arc::clone(&registry), policy);
+            let spec = spec("/bin/sh", &["-c", "exit 121"]);
+            let scratch = cortexkit_test_support::ScratchDir::new("resumed-exit");
+            let supervisor = Supervisor::new_for_test(Arc::clone(&registry), policy)
+                .with_config_runtime(suspended_spawn_tests::gated_owner(&scratch, &spec, true));
             let runtime = supervisor.runtime_config();
             let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-            let spec = spec("/bin/sh", &["-c", "exit 121"]);
             // A module cannot exit before suspended admission. After resume,
             // retain the real exit status even when it resembles a refusal.
             let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();

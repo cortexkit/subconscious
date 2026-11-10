@@ -45,8 +45,11 @@ impl Rig {
     fn new(config: &Path, incarnation: &str) -> Self {
         let registry = Arc::new(Registry::default());
         let handle = SupervisorHandle::new();
-        // Native macOS tests need the launch helper that execs the child with
-        // the daemon's privacy identity, even for a child with no control protocol.
+        // On macOS every child, even one with no control protocol, is started
+        // through the privacy trampoline (the helper that execs it as its own
+        // responsible process, so it never borrows the daemon's privacy grants).
+        // `new_for_test` configures that test helper; a bare
+        // `Supervisor::new` refuses to spawn without it.
         let supervisor =
             Supervisor::new_for_test(registry.clone(), RestartPolicy::new(0, Duration::ZERO))
                 .with_handle(handle.clone())

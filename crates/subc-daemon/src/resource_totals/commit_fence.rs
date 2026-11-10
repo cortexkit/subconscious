@@ -26,7 +26,8 @@ impl CommitFence {
     }
 
     /// Only the winner of a new timeout may replace validation with retention.
-    /// An earlier explicit cancellation must not acquire a new mutation fence.
+    /// If the caller already cancelled explicitly, this returns false, so a
+    /// cancelled declaration is never retained as pending afterwards.
     pub(crate) fn cancel_for_retention(&self) -> bool {
         self.0
             .compare_exchange(OPEN, CANCELLED, Ordering::AcqRel, Ordering::Acquire)

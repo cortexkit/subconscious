@@ -168,6 +168,79 @@ fn caller() -> Value {
 }
 
 #[test]
+fn reader_skew_caller_constructor_round_trips_through_peer() {
+    let caller = CallerAttestation::new(
+        "daemon",
+        1,
+        2,
+        CallerClaim::Own,
+        true,
+        CallerOrigin::Release,
+        "approved",
+    )
+    .unwrap();
+    assert!(caller.declaration.is_none());
+    assert!(caller.declaration_digest.is_none());
+    let without_entry = RouteBindPeer::new().with_caller(Some(caller.clone()));
+    let encoded = serde_json::to_value(&without_entry).unwrap();
+    assert!(encoded["caller"].get("declaration").is_none());
+    assert!(encoded["caller"].get("declaration_digest").is_none());
+    assert_eq!(
+        serde_json::from_value::<RouteBindPeer>(encoded).unwrap(),
+        without_entry
+    );
+
+    let declaration = json!({"future": {"surfaces": ["search"]}})
+        .as_object()
+        .unwrap()
+        .clone();
+    let with_entry = RouteBindPeer::new().with_caller(Some(
+        caller.with_declaration(declaration.clone(), "entry-digest"),
+    ));
+    let encoded = serde_json::to_value(&with_entry).unwrap();
+    assert_eq!(encoded["caller"]["declaration"], Value::Object(declaration));
+    assert_eq!(encoded["caller"]["declaration_digest"], "entry-digest");
+    assert_eq!(
+        serde_json::from_value::<RouteBindPeer>(encoded).unwrap(),
+        with_entry
+    );
+}
+
+#[test]
+fn reader_skew_caller_constructor_refuses_unsafe_integers() {
+    let max = 9_007_199_254_740_991_u64;
+    CallerAttestation::new(
+        "daemon",
+        max,
+        max,
+        CallerClaim::Legacy,
+        false,
+        CallerOrigin::Other,
+        "approved",
+    )
+    .unwrap();
+    for (spawn, epoch, field) in [
+        (max + 1, 1, "spawn"),
+        (1, max + 1, "authority_epoch"),
+        (u64::MAX, 1, "spawn"),
+        (1, u64::MAX, "authority_epoch"),
+    ] {
+        let error = CallerAttestation::new(
+            "daemon",
+            spawn,
+            epoch,
+            CallerClaim::Brokered,
+            false,
+            CallerOrigin::Development,
+            "approved",
+        )
+        .unwrap_err();
+        assert_eq!(error.field(), field);
+        assert_eq!(error.to_string(), format!("caller {field} exceeds 2^53-1"));
+    }
+}
+
+#[test]
 fn reader_skew_caller_absent_or_missing_any_required_field_is_unmarked() {
     for raw in [json!({}), json!({"caller": null})] {
         let decoded: RouteBindPeer = serde_json::from_value(raw).unwrap();

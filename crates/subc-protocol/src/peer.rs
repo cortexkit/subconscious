@@ -76,6 +76,86 @@ pub struct CallerAttestation {
     pub declaration_digest: Option<String>,
 }
 
+/// A caller identity that cannot round-trip exactly through every wire reader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallerAttestationError {
+    field: &'static str,
+}
+
+impl CallerAttestationError {
+    /// The unsafe identity field: `spawn` or `authority_epoch`.
+    pub fn field(&self) -> &'static str {
+        self.field
+    }
+}
+
+impl std::fmt::Display for CallerAttestationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "caller {} exceeds 2^53-1", self.field)
+    }
+}
+
+impl std::error::Error for CallerAttestationError {}
+
+impl CallerAttestation {
+    /// Constructs an attestation without a provider declaration. Both integer
+    /// identities must be representable exactly by JavaScript and Swift readers.
+    ///
+    /// External emitters can construct the non-exhaustive type and its enums:
+    ///
+    /// ```
+    /// use subc_protocol::peer::{CallerAttestation, CallerClaim, CallerOrigin, RouteBindPeer};
+    ///
+    /// let caller = CallerAttestation::new(
+    ///     "daemon", 1, 2, CallerClaim::Own, true, CallerOrigin::Release, "approved",
+    /// )?.with_declaration(serde_json::Map::new(), "entry-digest");
+    /// let peer = RouteBindPeer::new().with_caller(Some(caller));
+    /// let bytes = serde_json::to_vec(&peer)?;
+    /// let decoded: RouteBindPeer = serde_json::from_slice(&bytes)?;
+    /// assert_eq!(decoded, peer);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn new(
+        incarnation: impl Into<String>,
+        spawn: u64,
+        authority_epoch: u64,
+        claim: CallerClaim,
+        first_party: bool,
+        origin: CallerOrigin,
+        approved_declarations_digest: impl Into<String>,
+    ) -> Result<Self, CallerAttestationError> {
+        for (field, value) in [("spawn", spawn), ("authority_epoch", authority_epoch)] {
+            if value > MAX_ATTESTATION_INTEGER {
+                return Err(CallerAttestationError { field });
+            }
+        }
+        Ok(Self {
+            incarnation: incarnation.into(),
+            spawn,
+            authority_epoch,
+            claim,
+            first_party,
+            origin,
+            declaration: None,
+            approved_declarations_digest: approved_declarations_digest.into(),
+            declaration_digest: None,
+        })
+    }
+
+    /// Adds the provider's approved entry and its digest together. The constructor
+    /// leaves both absent, so builders never fabricate one without the other.
+    #[must_use]
+    pub fn with_declaration(
+        mut self,
+        declaration: serde_json::Map<String, serde_json::Value>,
+        digest: impl Into<String>,
+    ) -> Self {
+        self.declaration = Some(declaration);
+        self.declaration_digest = Some(digest.into());
+        self
+    }
+}
+
 fn deserialize_attestation_integer<'de, D: Deserializer<'de>>(decoder: D) -> Result<u64, D::Error> {
     let value = u64::deserialize(decoder)?;
     if value > MAX_ATTESTATION_INTEGER {

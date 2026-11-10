@@ -559,12 +559,23 @@ async fn windows_declared_tree(contained: bool) {
         tracker: &Arc<Tracker>,
         launch: &crate::supervise::ResourceLaunch,
     ) -> AgentCommandResources {
-        observe(tracker, launch, None)
-            .await
-            .agent_commands
-            .expect("a fresh complete walk reports agent commands")
-            .pop()
-            .unwrap()
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            // A fresh snapshot can still contain unreadable descendants while
+            // processes exit. Retry the walk, not the accounting assertions.
+            let readings = observe(tracker, launch, None).await;
+            if let Some(mut agents) = readings.agent_commands {
+                return agents
+                    .pop()
+                    .expect("a complete walk reports agent commands");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a complete resource walk: {:?}",
+                readings.reasons
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     let earlier_table = ProcessTable::read().unwrap();
     let mut command = ProcessCommand::new(std::env::current_exe().unwrap());

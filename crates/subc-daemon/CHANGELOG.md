@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.44.6
+
+- Wait for complete process-tree observations in Windows resource-accounting tests before checking CPU retention and stopped attribution. Production accounting and its unreadable-tree rules are unchanged.
+
 ## 0.44.5
 
 - Add owner-restricted route.authorize over shared pure route admission, with exact claim matching and restart-stable content versions. Ordinary opens keep their existing refusal precedence; authorization does not promise transient availability.

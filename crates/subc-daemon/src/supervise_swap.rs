@@ -28,6 +28,11 @@
 use super::*;
 use crate::registry::RegistrationSlot;
 
+// Gate publication can spend several seconds in disk-bound work under fsync load.
+// Allow that work the same 30 s as a live config ACK, but do not retain a warmed
+// candidate indefinitely if cutover still cannot acquire the gate.
+const SWAP_CUTOVER_DEADLINE: Duration = Duration::from_secs(30);
+
 /// The cgroup directory name for one process of `module_id`.
 ///
 /// A swap overlaps two processes of one module and they must not share a
@@ -177,7 +182,7 @@ async fn run_swap_inner(
         {
             Ok(candidate) => break candidate,
             Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
-                if wait_for_config_gate(runtime, module_id, commands, end).await {
+                if wait_for_config_gate(runtime, module_id, commands, end, None).await {
                     continue;
                 }
                 handle.close_swap(module_id);
@@ -353,25 +358,33 @@ async fn run_swap_inner(
                 .iter()
                 .any(|op| op == "config.review")
         });
+    let mut cutover_deadline = None;
     let (forwarding_cutover, promoted) = loop {
-        match try_config_cutover(
-            module_id,
-            config_owner.as_ref(),
-            config_gate.as_ref(),
-            config_opted_in,
-            candidate.config_delivery.as_ref(),
-            candidate_connection,
-            registry,
-            &forwarding,
-        ) {
+        let attempt = if cutover_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            Err(CutoverDeferred::DeadlineExceeded)
+        } else {
+            try_config_cutover(
+                module_id,
+                config_owner.as_ref(),
+                config_gate.as_ref(),
+                config_opted_in,
+                candidate.config_delivery.as_ref(),
+                candidate_connection,
+                registry,
+                &forwarding,
+            )
+        };
+        match attempt {
             Ok(cutover) => break cutover,
             Err(CutoverDeferred::Busy) => {
+                let deadline =
+                    *cutover_deadline.get_or_insert_with(|| Instant::now() + SWAP_CUTOVER_DEADLINE);
                 let retry = tokio::select! {
-                    ready=wait_for_config_gate(runtime,module_id,commands,end)=>ready,
+                    ready=wait_for_config_gate(runtime,module_id,commands,end,Some(deadline))=>ready,
                     _=candidate.wait()=>false,
                     _=async {match child.as_mut() {Some(incumbent)=>{let _=incumbent.wait().await;},None=>std::future::pending::<()>().await}}=>false,
                 };
-                if retry {
+                if retry || Instant::now() >= deadline {
                     continue;
                 }
                 abandon_candidate(module_id, registry, &forwarding, &handle, candidate, None).await;
@@ -405,6 +418,9 @@ async fn run_swap_inner(
                         SwapFailureArm::CutoverLost
                     },
                     detail: match failed {
+                        CutoverDeferred::DeadlineExceeded => {
+                            "configuration cutover deadline expired while the gate was busy".into()
+                        }
                         CutoverDeferred::Refused(error) => format!("config_gated: {error}"),
                         CutoverDeferred::RegistryLost => {
                             "the candidate registration closed during cutover; restarting plainly"
@@ -540,6 +556,7 @@ async fn dispatch_retirement(
 
 enum CutoverDeferred {
     Busy,
+    DeadlineExceeded,
     NewGeneration(u64),
     Refused(crate::config_gate::GateError),
     ForwardingLost,
@@ -637,11 +654,20 @@ async fn wait_for_config_gate(
     module: &str,
     commands: &mut mpsc::Receiver<SupervisorCommand>,
     end: &mut SwapEnd,
+    deadline: Option<Instant>,
 ) -> bool {
+    let expired = async {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(expired);
     let backoff = tokio::time::sleep(CONFIG_ADMISSION_RETRY_DELAY);
     tokio::pin!(backoff);
     loop {
         tokio::select! {
+            _=&mut expired=>return false,
             _=&mut backoff=>break,
             command=commands.recv()=>{
                 let Some(command)=command else {return false;};
@@ -657,6 +683,7 @@ async fn wait_for_config_gate(
     };
     loop {
         tokio::select! {
+            _=&mut expired=>return false,
             guard = gate.lock() => { drop(guard); return true; }
             command = commands.recv() => {
                 let Some(command) = command else { return false; };
@@ -1356,6 +1383,7 @@ mod tests {
         let forwarding = Arc::new(ForwardingTable::default());
         let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
             .with_config_runtime(owner)
+            .with_live_children_record(dir.join("children.json"))
             .with_forwarding(forwarding.clone());
         let mut runtime = supervisor.runtime_config();
         runtime.register_timeout = Duration::from_secs(5);
@@ -1428,6 +1456,7 @@ mod tests {
             "timed",
             &mut commands,
             &mut end,
+            None,
         ));
         for advance in [Duration::ZERO, Duration::from_millis(99)] {
             tokio::time::advance(advance).await;
@@ -1443,6 +1472,309 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         assert!(wait.await);
         finish_timing_child(fixture.child).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn config_admission_swap_busy_gate_wait_uses_absolute_deadline() {
+        let fixture = config_timing_fixture();
+        let gate = fixture
+            .runtime
+            .config_delivery
+            .as_ref()
+            .unwrap()
+            .0
+            .module_gate("timed")
+            .unwrap();
+        let _guard = gate.lock().await;
+        let (_sender, mut commands) = mpsc::channel(8);
+        let mut end = SwapEnd::default();
+        let deadline = Instant::now() + SWAP_CUTOVER_DEADLINE;
+        let mut wait = Box::pin(wait_for_config_gate(
+            &fixture.runtime,
+            "timed",
+            &mut commands,
+            &mut end,
+            Some(deadline),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(wait.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(SWAP_CUTOVER_DEADLINE - Duration::from_nanos(1)).await;
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(wait.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        let expired = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(matches!(
+                std::future::Future::poll(wait.as_mut(), cx),
+                std::task::Poll::Ready(false)
+            ))
+        })
+        .await;
+        drop(wait);
+        finish_timing_child(fixture.child).await;
+        assert!(expired, "the config gate lock await must end at the cutover deadline, even while the mutex stays held");
+    }
+
+    #[cfg(unix)]
+    async fn busy_cutover_failure(
+        hold_module_gate: bool,
+    ) -> (
+        Vec<subc_config::Generation>,
+        SupervisorSnapshot,
+        SupervisorSnapshot,
+    ) {
+        let mut fixture = config_timing_fixture();
+        approve_timing_restart(&fixture);
+        let owner = fixture.runtime.config_delivery.as_ref().unwrap().0.clone();
+        fixture.runtime.supervisor_handle = Some(SupervisorHandle::new());
+        let mut manifest = fixture
+            .registry
+            .get_candidate("timed")
+            .unwrap()
+            .unwrap()
+            .manifest;
+        fixture
+            .registry
+            .deregister_connection(ConnectionId::new(2))
+            .unwrap();
+        fixture
+            .registry
+            .register_with_control_ops(
+                manifest.clone(),
+                subc_protocol::PROTOCOL_VERSION,
+                ConnectionId::new(1),
+                vec![],
+            )
+            .unwrap();
+        manifest.ready = Some(true);
+        fixture
+            .registry
+            .register_candidate_with_control_ops(
+                manifest,
+                subc_protocol::PROTOCOL_VERSION,
+                ConnectionId::new(2),
+                vec![
+                    "config.review".into(),
+                    MODULE_CONTROL_OP_HEALTH_CHECK.into(),
+                ],
+            )
+            .unwrap();
+        let (incumbent_sender, _incumbent_receiver) = mpsc::channel(8);
+        fixture
+            .forwarding
+            .register_module_connection(
+                ConnectionId::new(1),
+                "timed".into(),
+                subc_protocol::PROTOCOL_VERSION,
+                subc_protocol::manifest::Concurrency::ModuleManaged,
+                FrameSink::new(incumbent_sender),
+            )
+            .unwrap();
+        let spec = ModuleSpec {
+            module_id: "timed".into(),
+            program: PathBuf::from("/bin/sleep"),
+            args: vec!["600".into()],
+            env: vec![],
+            reserved: false,
+            reserved_prefixes: vec![],
+            protocol: ModuleProtocol::Subc,
+            overlap: ModuleOverlap::Safe,
+            carry_containment: false,
+        };
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        set_running(
+            &snapshot,
+            &fixture.child,
+            "timed",
+            &fixture.runtime.spawn_events,
+        )
+        .unwrap();
+        snapshot
+            .lock()
+            .unwrap()
+            .record_crash_restart(&RestartPolicy::default(), Instant::now());
+        let before = snapshot.lock().unwrap().clone();
+        let mut child = Some(fixture.child);
+        let incumbent_pid = child.as_ref().unwrap().pid;
+        let (_sender, mut commands) = mpsc::channel(8);
+        let (reply, mut answer) = oneshot::channel();
+        let liveness = SupervisorProcessLiveness::default();
+        let mut swap = Box::pin(run_swap(
+            &spec,
+            &fixture.runtime,
+            &fixture.registry,
+            &liveness,
+            &snapshot,
+            &mut child,
+            &mut commands,
+            Duration::from_secs(5),
+            reply,
+        ));
+        let probe = tokio::select! {
+            frame = fixture.receiver.recv() => frame.unwrap(),
+            _ = &mut swap => panic!("swap ended before probing the candidate"),
+        };
+        assert_eq!(fixture.runtime.child_roster.live_count_for_test(), 2);
+        let candidate_pid = crate::live_children::read_record(&fixture.dir.join("children.json"))
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.pid != incumbent_pid)
+            .unwrap()
+            .pid;
+        let gate = owner.module_gate("timed").unwrap();
+        let _gate_guard = if hold_module_gate {
+            Some(gate.lock().await)
+        } else {
+            None
+        };
+        let owner_guard = if hold_module_gate {
+            None
+        } else {
+            Some(owner.try_swap_configuration().unwrap())
+        };
+        fixture
+            .forwarding
+            .complete_module_control_rpc(
+                ConnectionId::new(2),
+                probe.header.corr,
+                Some(MODULE_CONTROL_OP_HEALTH_CHECK),
+                ModuleControlRpcOutcome::Response(
+                    subc_protocol::session::ModuleControlResponse::HealthCheck {
+                        status: HealthStatus::Ok,
+                        detail: None,
+                        metrics: None,
+                    },
+                ),
+            )
+            .unwrap();
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(swap.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // Exercise multiple retries when only the owner's state is busy, as well
+        // as the single parked lock await when the module gate is held.
+        for advance in [
+            SWAP_CUTOVER_DEADLINE / 2,
+            SWAP_CUTOVER_DEADLINE / 2 - Duration::from_nanos(1),
+        ] {
+            tokio::time::advance(advance).await;
+            std::future::poll_fn(|cx| {
+                assert!(std::future::Future::poll(swap.as_mut(), cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(
+                matches!(answer.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+                "a busy cutover must retain its candidate until the deadline"
+            );
+        }
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        // The fake registration has no socket to observe EOF and deregister it.
+        fixture
+            .registry
+            .deregister_connection(ConnectionId::new(2))
+            .unwrap();
+        tokio::time::resume();
+        let end = timeout(Duration::from_secs(2), &mut swap)
+            .await
+            .expect("cutover expiry must clean up while the config lock remains held");
+        drop(swap);
+        assert!(matches!(
+            answer.try_recv().unwrap(),
+            Err(SuperviseError::SwapFailed {
+                arm: SwapFailureArm::CutoverLost,
+                ..
+            })
+        ));
+        assert!(end.requeue.is_empty());
+        assert_eq!(
+            fixture.runtime.child_roster.live_count_for_test(),
+            1,
+            "candidate must be reaped and released from the roster"
+        );
+        assert_eq!(
+            subc_os::child_exit::observe(candidate_pid)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(rustix::io::Errno::CHILD.raw_os_error()),
+            "candidate must be killed and reaped, not just removed from the roster"
+        );
+        assert_eq!(child.as_ref().unwrap().pid, incumbent_pid);
+        assert!(
+            child.as_mut().unwrap().child.try_wait().unwrap().is_none(),
+            "incumbent process must keep serving"
+        );
+        assert_eq!(
+            fixture
+                .registry
+                .get_module("timed")
+                .unwrap()
+                .unwrap()
+                .connection_id,
+            ConnectionId::new(1)
+        );
+        let (client_sender, _client_receiver) = mpsc::channel(8);
+        let route = fixture
+            .forwarding
+            .begin_route_bind_relay_for_test(
+                ConnectionId::new(3),
+                FrameSink::new(client_sender),
+                1,
+                "timed",
+            )
+            .unwrap();
+        assert_eq!(
+            route.endpoint.connection_id,
+            ConnectionId::new(1),
+            "new requests must still reach the incumbent"
+        );
+        assert!(!fixture
+            .runtime
+            .supervisor_handle
+            .as_ref()
+            .unwrap()
+            .swap_open("timed"));
+        let after = snapshot.lock().unwrap().clone();
+        drop(owner_guard);
+        let generations = owner.history().unwrap().0;
+        finish_timing_child(child.take().unwrap()).await;
+        (generations, before, after)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn config_admission_swap_busy_cutover_keeps_generation_deliverable() {
+        let (generations, _, _) = busy_cutover_failure(true).await;
+        assert_eq!(generations.len(), 2);
+        assert!(
+            generations.iter().all(|generation| !generation
+                .never_redeliver
+                .iter()
+                .any(|module| module == "timed")),
+            "gate contention must not poison any approved generation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn config_admission_swap_busy_cutover_preserves_restart_budget() {
+        let (_, before, after) = busy_cutover_failure(true).await;
+        assert_eq!(after.crash_restarts, before.crash_restarts);
+        assert_eq!(after.lifetime_restarts, before.lifetime_restarts);
+        assert_eq!(after.spawn_generation, before.spawn_generation);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn config_admission_swap_busy_cutover_retries_share_one_deadline() {
+        busy_cutover_failure(false).await;
     }
 
     #[cfg(unix)]

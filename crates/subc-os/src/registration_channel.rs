@@ -21,6 +21,9 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+#[cfg(all(windows, feature = "tokio"))]
+mod tokio_pipe;
+
 pub const REGISTRATION_FD_ENV: &str = "SUBC_REGISTRATION_FD";
 pub const REGISTRATION_PIPE_ENV: &str = "SUBC_REGISTRATION_PIPE";
 pub const DAEMON_PID_ENV: &str = "SUBC_DAEMON_PID";

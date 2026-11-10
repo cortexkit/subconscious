@@ -57,11 +57,13 @@ pub use async_trait::async_trait;
 pub use subc_control::{CatalogEntry, ConsumerIdentity};
 mod scope_served_by;
 pub use scope_served_by::{ScopeServedByAnswer, ScopeServedByReply};
+mod registration;
 mod route_authorize;
 pub use route_authorize::{
     RouteAuthorizeExpected, RouteAuthorizeOutcome, RouteAuthorizeResponse, RouteAuthorizeScope,
 };
 mod request_pools;
+pub use registration::ClaimError;
 use request_pools::{wait_for_permit, DispatchPools, PermitWaitOutcome, WaitingRequest};
 pub use request_pools::{RequestClass, RequestPool, RequestPoolSnapshot, RequestPools};
 /// The one launch-nonce reader for a module process: `launch_nonce()` reads
@@ -488,6 +490,7 @@ pub struct ModuleHandle {
 }
 
 struct ModuleHandleShared {
+    registration: registration::Session,
     negotiated_ver: u8,
     daemon_capabilities: Vec<String>,
     supports_catalog_update: bool,
@@ -514,6 +517,7 @@ struct ModuleHandleShared {
 }
 
 struct ModuleHandleState {
+    pending_claim_calls: HashMap<u64, oneshot::Sender<Frame>>,
     writer: Option<mpsc::Sender<Frame>>,
     next_corr: Option<u64>,
     pending_catalog_updates: HashMap<u64, CatalogUpdateReply>,
@@ -560,6 +564,7 @@ impl ModuleHandle {
     ) -> Self {
         Self {
             shared: Arc::new(ModuleHandleShared {
+                registration: registration::Session::default(),
                 negotiated_ver: ack.negotiated_ver,
                 daemon_capabilities: ack.subc_capabilities.clone(),
                 supports_catalog_update: ack
@@ -598,6 +603,7 @@ impl ModuleHandle {
                 catalog_send: tokio::sync::Mutex::new(()),
                 config: config::Session::default(),
                 inner: Mutex::new(ModuleHandleState {
+                    pending_claim_calls: HashMap::new(),
                     writer: Some(writer),
                     next_corr: Some(HELLO_CORR + 1),
                     pending_catalog_updates: HashMap::new(),
@@ -1353,6 +1359,15 @@ impl ModuleHandle {
     }
 
     fn handle_control_reply(&self, frame: Frame) -> bool {
+        let claim_reply = self
+            .shared
+            .lock_inner()
+            .pending_claim_calls
+            .remove(&frame.header.corr);
+        if let Some(reply) = claim_reply {
+            let _ = reply.send(frame);
+            return true;
+        }
         let config_reply = self
             .shared
             .lock_inner()
@@ -1545,6 +1560,7 @@ impl ModuleHandleShared {
             inner.pending_scope_served_by.clear();
             inner.pending_config_calls.clear();
             inner.pending_agent_commands.clear();
+            inner.pending_claim_calls.clear();
             inner
                 .pending_catalog_updates
                 .drain()
@@ -2433,6 +2449,9 @@ enum BindDecisionKind {
 /// authenticates, sends HELLO, waits for HELLO_ACK, then serves frames until
 /// GOODBYE, clean EOF or a socket disconnect. How it ended is passed to
 /// [`ModuleHandler::on_connection_end`].
+/// A validated inherited registration channel replaces TCP when available.
+/// It is never reconnected; its end exits the process after the lifecycle hook
+/// and teardown, so the supervisor can restart the module with a new channel.
 pub async fn serve<H>(manifest: ModuleManifest, handler: H) -> Result<(), SubcModuleError>
 where
     H: ModuleHandler,
@@ -2465,6 +2484,7 @@ impl ModuleStopHandle {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct ServeOptions {
+    registration_channel: bool,
     writer_drain_timeout: Duration,
     stop_handle: ModuleStopHandle,
 }
@@ -2473,6 +2493,7 @@ impl Default for ServeOptions {
     fn default() -> Self {
         Self {
             writer_drain_timeout: DEFAULT_WRITER_DRAIN_TIMEOUT,
+            registration_channel: false,
             stop_handle: ModuleStopHandle::new(),
         }
     }
@@ -2591,8 +2612,9 @@ async fn prepare_connection<H: ModuleHandler>(
     connection_file: &Path,
     manifest: ModuleManifest,
     handler: H,
-    options: ServeOptions,
+    mut options: ServeOptions,
 ) -> Result<Option<(ModuleHandle, ModuleServeFuture)>, SubcModuleError> {
+    options.registration_channel = registration::supervised();
     let stream = tokio::select! {
         biased;
         () = options.stop_handle.token.cancelled() => return Ok(None),
@@ -2699,6 +2721,9 @@ where
         connection_runtime,
     );
     handle.shared.lock_inner().current_provides = Some(provides);
+    if options.registration_channel {
+        registration::install_owner(&handle)?;
+    }
     if let Some(declaration) = declaration {
         let _ = handle.shared.config.declaration.set(declaration);
     }
@@ -2855,6 +2880,11 @@ where
                 undelivered_replies,
                 "daemon EOF: replies could not be delivered during drain"
             );
+        }
+        if options.registration_channel {
+            // An inherited registration cannot be recreated. Finish the hook
+            // and teardown before letting the supervisor restart the process.
+            std::process::exit(if loop_result.is_ok() { 0 } else { 1 });
         }
         match (loop_result, writer_result) {
             (Err(SubcModuleError::WriterClosed), Err(writer_error)) => Err(writer_error),
@@ -3561,13 +3591,19 @@ async fn send_hello(
     mut manifest: ModuleManifest,
     config_gate: bool,
 ) -> Result<(), SubcModuleError> {
-    let launch_nonce = match retained_launch_nonce() {
-        Some(retained) => Some(retained),
-        None => launch_nonce()
-            .map_err(SubcModuleError::LaunchNonce)?
-            .map(|nonce| nonce.value().to_string()),
+    let launch_nonce = if registration::supervised() {
+        None
+    } else {
+        match retained_launch_nonce() {
+            Some(retained) => Some(retained),
+            None => launch_nonce()
+                .map_err(SubcModuleError::LaunchNonce)?
+                .map(|nonce| nonce.value().to_string()),
+        }
     };
-    stamp_launch_nonce_source(&mut manifest, launch_nonce.as_deref());
+    if !registration::supervised() {
+        stamp_launch_nonce_source(&mut manifest, launch_nonce.as_deref());
+    }
     let mut control_ops = vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()];
     if config_gate {
         control_ops.push(config::CONFIG_REVIEW_OP.to_owned());
@@ -3602,13 +3638,28 @@ where
     }
 }
 
-async fn connect_to_subc(connection_file_path: &Path) -> Result<TcpStream, SubcModuleError> {
+trait ModuleStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ModuleStream for T {}
+
+async fn connect_to_subc(
+    connection_file_path: &Path,
+) -> Result<Box<dyn ModuleStream>, SubcModuleError> {
     let conn = connection_file::read_for_client(connection_file_path).map_err(|source| {
         SubcModuleError::ConnectionFile {
             path: connection_file_path.to_path_buf(),
             source,
         }
     })?;
+    if let Some(mut stream) = registration::take_stream()? {
+        authenticate_client(&mut stream, &conn, AUTH_DEADLINE)
+            .await
+            .map_err(|source| SubcModuleError::Auth {
+                path: connection_file_path.to_path_buf(),
+                endpoint: "registration channel".into(),
+                source,
+            })?;
+        return Ok(stream);
+    }
     let endpoint = conn
         .endpoints
         .first()
@@ -3640,7 +3691,7 @@ async fn connect_to_subc(connection_file_path: &Path) -> Result<TcpStream, SubcM
             endpoint: endpoint_label,
             source,
         })?;
-    Ok(stream)
+    Ok(Box::new(stream))
 }
 
 async fn connect_endpoint(host: &str, port: u16) -> io::Result<TcpStream> {
@@ -3868,6 +3919,7 @@ fn data_flags() -> Flags {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum SubcModuleError {
+    RegistrationChannel(io::Error),
     MissingSubcArg,
     MissingSubcValue,
     EmptyModuleIdEnv,
@@ -3916,6 +3968,7 @@ pub enum SubcModuleError {
 impl fmt::Display for SubcModuleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RegistrationChannel(error) => write!(f, "registration channel: {error}"),
             Self::MissingSubcArg => write!(f, "missing required --subc <connection-file> argument"),
             Self::MissingSubcValue => write!(f, "--subc requires a connection-file path value"),
             Self::EmptyModuleIdEnv => write!(f, "{SUBC_MODULE_ID_ENV} must not be empty when set"),
@@ -3976,6 +4029,7 @@ impl fmt::Display for SubcModuleError {
 impl Error for SubcModuleError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::RegistrationChannel(error) => Some(error),
             Self::ConnectionFile { source, .. } => Some(source),
             Self::Connect { source, .. } => Some(source),
             Self::Auth { source, .. } => Some(source),

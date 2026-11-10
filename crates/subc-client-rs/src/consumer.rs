@@ -512,6 +512,8 @@ pub struct CloseRouteOptions {
     /// Override for the consumer identity used to locate the route being closed;
     /// when absent, the supervised launch identity identifies the route, except
     /// on connections created by [`SubcConsumer::connect_operator_app`].
+    /// On claim-bound connections, a legacy nonce identity conflicts with the
+    /// binding; `close_route` refuses it by doing nothing.
     pub consumer_identity: Option<ConsumerIdentity>,
     /// Reverse-request handlers plus extra capability strings added through
     /// [`Self::with_consumer_capability`]. Together, they identify the route being closed.
@@ -588,6 +590,8 @@ pub struct CallOptions {
     /// Explicit consumer identity for route.open; when absent, the supervised
     /// launch identity is used, except on [`SubcConsumer::connect_operator_app`]
     /// connections, which omit implicit identity.
+    /// A claim-bound connection rejects legacy nonce identity overrides as not
+    /// sent, rather than changing the connection's authority.
     pub consumer_identity: Option<ConsumerIdentity>,
     /// Reverse-request handlers plus extra capability strings added with
     /// [`Self::with_consumer_capability`]. For example, `tool-result/v1` declares
@@ -691,6 +695,7 @@ pub struct SubscribeOptions {
     /// Explicit consumer identity for route.open; when absent, the supervised
     /// launch identity is used, except on [`SubcConsumer::connect_operator_app`]
     /// connections, which omit implicit identity.
+    /// Claim-bound connections reject legacy nonce identity overrides as not sent.
     pub consumer_identity: Option<ConsumerIdentity>,
     /// Reverse-request handlers plus extra capability strings added with
     /// [`Self::with_consumer_capability`]. For example, `tool-result/v1` declares
@@ -1300,6 +1305,11 @@ impl SubscriptionCancel {
 impl SubcConsumer {
     /// Connect through an explicit connection-file path. The initial connection
     /// generation uses epoch 1; each reconnect advances it.
+    /// In a supervised process, the module's primary registration connection
+    /// mints a fresh self claim for
+    /// every connection, including reconnects. Mint/presentation failure is an
+    /// error, never a direct connection: dropping the binding would change the
+    /// caller's authority. Unsupervised processes retain the legacy behavior.
     pub async fn connect(
         connection_file: &Path,
         opts: ConsumerOptions,
@@ -1442,7 +1452,7 @@ impl SubcConsumer {
     ) -> Result<RouteHandle, CallError> {
         opts.reject_scope()?;
         let deadline = Instant::now() + opts.timeout;
-        let consumer_identity = self.shared.route_open_consumer_identity(&opts);
+        let consumer_identity = self.shared.route_open_consumer_identity(&opts)?;
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
         let role_versions = route_open_role_versions(opts.role_versions.as_ref());
         let key = RouteKey::new(
@@ -1520,7 +1530,7 @@ impl SubcConsumer {
             ));
         }
         let deadline = Instant::now() + opts.timeout;
-        let consumer_identity = self.shared.route_open_consumer_identity(&opts);
+        let consumer_identity = self.shared.route_open_consumer_identity(&opts)?;
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
         let role_versions = route_open_role_versions(opts.role_versions.as_ref());
         let key = RouteKey::new(
@@ -1630,7 +1640,7 @@ impl SubcConsumer {
             busy_refusals: Some(true),
             target,
             identity,
-            consumer_identity: self.shared.route_open_consumer_identity(opts),
+            consumer_identity: self.shared.route_open_consumer_identity(opts)?,
             consumer_capabilities,
             role_versions: route_open_role_versions(opts.role_versions.as_ref()),
             admission_facts: Some(facts),
@@ -2574,7 +2584,7 @@ impl SubcConsumer {
         // Preserve the single resend policy even for older daemons whose
         // unmarked refusals cannot prove that the module never saw the request.
         let mut resent_after_unsent_refusal = false;
-        let consumer_identity = self.shared.route_open_consumer_identity(&opts);
+        let consumer_identity = self.shared.route_open_consumer_identity(&opts)?;
         let consumer_capabilities = route_open_consumer_capabilities(&opts);
         let role_versions = route_open_role_versions(opts.role_versions.as_ref());
         let route_key = RouteKey::new(
@@ -2783,7 +2793,7 @@ impl SubcConsumer {
             reverse_requests: opts.reverse_requests.clone(),
             role_versions: opts.role_versions.clone(),
         };
-        let consumer_identity = self.shared.route_open_consumer_identity(&route_opts);
+        let consumer_identity = self.shared.route_open_consumer_identity(&route_opts)?;
         let consumer_capabilities = route_open_consumer_capabilities(&route_opts);
         let role_versions = route_open_role_versions(route_opts.role_versions.as_ref());
         let route_key = RouteKey::new(
@@ -2885,7 +2895,9 @@ impl SubcConsumer {
         identity: BindIdentity,
         opts: CloseRouteOptions,
     ) {
-        let consumer_identity = self.shared.close_route_consumer_identity(&opts);
+        let Ok(consumer_identity) = self.shared.close_route_consumer_identity(&opts) else {
+            return;
+        };
         let consumer_capabilities = close_route_consumer_capabilities(&opts);
         let key = RouteKey::new(
             &target,
@@ -2922,6 +2934,10 @@ impl SubcConsumer {
     /// Current transport epoch: 1 on initial connect, then +1 per successful reconnect.
     pub fn current_epoch(&self) -> u64 {
         self.shared.lock_inner().epoch
+    }
+
+    pub(crate) fn pool_reusable(&self) -> bool {
+        !self.shared.close_token.is_cancelled()
     }
 
     /// Register a connection-state callback. Callbacks are best-effort observability hooks.
@@ -2971,6 +2987,16 @@ pub enum ConsumerError {
         source: AuthError,
     },
     Closed,
+}
+
+impl ConsumerError {
+    pub(crate) fn claim(error: crate::ClaimError) -> Self {
+        Self::Connect {
+            path: PathBuf::new(),
+            endpoint: "claim binding".into(),
+            source: io::Error::other(error),
+        }
+    }
 }
 
 impl fmt::Display for ConsumerError {
@@ -3532,6 +3558,7 @@ struct Opening {
 }
 
 struct Shared {
+    claim_bound: bool,
     connection_file: PathBuf,
     operator_app_candidates: Option<Vec<PathBuf>>,
     opts: ConsumerOptions,
@@ -3852,6 +3879,7 @@ impl Shared {
         transport: ConsumerTransport,
     ) -> Self {
         Self {
+            claim_bound: crate::registration::bound(),
             connection_file,
             operator_app_candidates: None,
             opts,
@@ -6836,6 +6864,9 @@ async fn open_connection(
                 endpoint: label,
                 source,
             })?;
+        crate::registration::bind_consumer(&mut stream, deadline)
+            .await
+            .map_err(ConsumerError::claim)?;
         return Ok(OpenedConnection {
             stream,
             daemon_origin_trusted: trusts_daemon_origin(&read.info.daemon_ver),
@@ -6903,6 +6934,9 @@ async fn open_connection_with_info(
             endpoint: endpoint_label,
             source,
         })?;
+    crate::registration::bind_consumer(&mut stream, deadline)
+        .await
+        .map_err(ConsumerError::claim)?;
     Ok(OpenedConnection {
         stream: Box::new(stream),
         daemon_origin_trusted: trusts_daemon_origin(&conn.daemon_ver),
@@ -7400,7 +7434,7 @@ impl Shared {
     fn implicit_consumer_identity(&self) -> Option<ConsumerIdentity> {
         // Operator-app connections must not even consult the launch environment:
         // the nonce accessor can consume an inherited credential descriptor.
-        if self.identity_from_environment {
+        if self.identity_from_environment && !self.claim_bound {
             consumer_identity_from_env()
         } else {
             None
@@ -7422,16 +7456,35 @@ impl Shared {
         .map_err(|err| CallError::not_sent(format!("failed to encode activity read: {err}")))
     }
 
-    fn route_open_consumer_identity(&self, opts: &CallOptions) -> Option<ConsumerIdentity> {
-        opts.consumer_identity
+    fn route_open_consumer_identity(
+        &self,
+        opts: &CallOptions,
+    ) -> Result<Option<ConsumerIdentity>, CallError> {
+        if self.claim_bound && opts.consumer_identity.is_some() {
+            // Legacy nonce identities cannot describe a claim-bound connection.
+            return Err(CallError::not_sent(
+                "consumer identity conflicts with connection binding",
+            ));
+        }
+        Ok(opts
+            .consumer_identity
             .clone()
-            .or_else(|| self.implicit_consumer_identity())
+            .or_else(|| self.implicit_consumer_identity()))
     }
 
-    fn close_route_consumer_identity(&self, opts: &CloseRouteOptions) -> Option<ConsumerIdentity> {
-        opts.consumer_identity
+    fn close_route_consumer_identity(
+        &self,
+        opts: &CloseRouteOptions,
+    ) -> Result<Option<ConsumerIdentity>, CallError> {
+        if self.claim_bound && opts.consumer_identity.is_some() {
+            return Err(CallError::not_sent(
+                "consumer identity conflicts with connection binding",
+            ));
+        }
+        Ok(opts
+            .consumer_identity
             .clone()
-            .or_else(|| self.implicit_consumer_identity())
+            .or_else(|| self.implicit_consumer_identity()))
     }
 }
 
@@ -7769,6 +7822,14 @@ fn is_retryable_catalog_transport_error(err: &CallError) -> bool {
 }
 
 fn is_reconnect_transient(err: &ConsumerError) -> bool {
+    if let ConsumerError::Connect { source, .. } = err {
+        if let Some(claim) = source
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<crate::ClaimError>())
+        {
+            return matches!(claim, crate::ClaimError::Refused { code } if error_codes::is_retryable_claim(code));
+        }
+    }
     match err {
         ConsumerError::Connect { source, .. } => matches!(
             source.kind(),

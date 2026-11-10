@@ -772,6 +772,13 @@ impl Router {
         }
     }
 
+    /// Install only the inherited-channel service; the supervisor must not own
+    /// this router or retain it after the listeners have stopped serving.
+    pub(crate) fn install_registration_service(self: &Arc<Self>, auth: crate::server::ServerAuth) {
+        self.control
+            .install_registration_service(Arc::downgrade(self), auth);
+    }
+
     pub fn with_default_self_handler() -> Self {
         Self::with_control_handler(Arc::new(ControlHandler::default()))
     }

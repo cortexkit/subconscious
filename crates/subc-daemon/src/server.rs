@@ -603,13 +603,13 @@ where
     result
 }
 
-/// Where a connection came in. The local endpoint serves clients only, because
-/// a module registers over TCP, where the daemon can tell a launched process
-/// apart by the launch nonce in its HELLO.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where a connection came in. Only a spawn's inherited channel carries its
+/// launch context; local client sockets never acquire module authority.
+#[derive(Debug, Clone)]
 pub(crate) enum LocalOrigin {
     Tcp,
     Local,
+    RegistrationChannel(Arc<crate::supervise::RegistrationSpawn>),
 }
 
 /// Serve all already-bound loopback TCP listeners until one accept loop fails.
@@ -621,6 +621,7 @@ pub async fn serve_listeners(
     if listeners.is_empty() {
         return Err(ServerError::NoListeners);
     }
+    router.install_registration_service(auth.clone());
 
     let (tx, mut rx) = mpsc::channel(listeners.len());
     let mut accept_tasks = AbortTasksOnDrop::default();
@@ -743,19 +744,34 @@ where
             }
         };
 
-    let authenticated = authenticate_server(
+    let channel_spawn = match &origin {
+        LocalOrigin::RegistrationChannel(spawn) => Some(spawn.clone()),
+        _ => None,
+    };
+    let channel_closed = async {
+        match &channel_spawn {
+            Some(spawn) => spawn.wait_closed().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(channel_closed);
+    let authenticated = tokio::select! {
+        _ = &mut channel_closed => { let _ = stream.shutdown().await; return Ok(()); },
+        result = authenticate_server(
         &mut stream,
         auth.key.as_ref(),
         &auth.daemon_id,
         auth.daemon_ver.as_ref(),
         auth.deadline,
-    )
-    .await
-    .map_err(ConnectionError::Auth)?;
+        ) => result.map_err(ConnectionError::Auth)?,
+    };
     drop(permit);
 
     let mut connection = router.begin_connection();
     let connection_id = connection.id();
+    if let LocalOrigin::RegistrationChannel(spawn) = &origin {
+        spawn.bind(connection_id);
+    }
     router.record_caller_endpoints(connection_id, endpoints);
     if matches!(origin, LocalOrigin::Local) {
         router.record_local_connection(connection_id);
@@ -801,7 +817,9 @@ where
 
     let mut route_open_tasks = JoinSet::new();
     let mut privileged_tasks = JoinSet::new();
-    let loop_result = connection_loop(
+    let loop_result = tokio::select! {
+        _ = &mut channel_closed => Ok(ConnectionLoopExit::CloseRequested(CloseReason::new("registration_channel_closed", "the supervised launch ended"))),
+        result = connection_loop(
         &mut read_half,
         Arc::clone(&router),
         ctx.clone(),
@@ -809,8 +827,8 @@ where
         &mut route_open_tasks,
         &mut privileged_tasks,
         origin,
-    )
-    .await;
+        ) => result,
+    };
 
     drop(delivery_guard);
     // Every in-flight route.open must have FINISHED before `connection` drops,
@@ -1043,7 +1061,9 @@ where
             }
         };
 
-        if origin == LocalOrigin::Local && frame.header.ty == subc_protocol::FrameType::Hello {
+        if matches!(origin, LocalOrigin::Local)
+            && frame.header.ty == subc_protocol::FrameType::Hello
+        {
             // A module registers over TCP only. Refusing here, before the router
             // sees the frame, is what guarantees the local endpoint leaves no
             // registration, catalog entry or route behind, whatever the HELLO

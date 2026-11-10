@@ -61,13 +61,12 @@ fn roster() -> ChildRoster {
 async fn probe() {
     let scratch = ScratchDir::new("unix-channel-placement");
     let spec = spec(&scratch);
-    let handle = SupervisorHandle::new();
     let ring = Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default())));
     let roster = roster();
     let mut child = spawn_child_in_slot(
         &spec,
         None,
-        Some(&handle),
+        None,
         &ring,
         None,
         &roster,
@@ -93,10 +92,7 @@ async fn probe() {
     }
     let value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(scratch.join("result.json")).unwrap()).unwrap();
-    assert_eq!(
-        value["nonce"].as_str(),
-        handle.spawn_nonce(&spec.module_id).as_deref()
-    );
+    assert_eq!(value["nonce"].as_str().unwrap().len(), 64);
     assert_eq!(
         value["environment"]["SUBC_DAEMON_PID"],
         std::process::id().to_string()
@@ -189,7 +185,7 @@ fn unix_channel_nonce_policy_preserves_ungated_and_none() {
     }
 }
 
-pub(crate) fn assert_legacy_nonce_admission(
+pub(crate) fn assert_channel_only_admission(
     spec: &ModuleSpec,
     admission: &crate::config_gate::runtime::SpawnAdmission,
 ) {
@@ -210,36 +206,25 @@ pub(crate) fn assert_legacy_nonce_admission(
             Some(admission),
         )
         .unwrap();
-        let handoff = handoff.expect("gated children still need the legacy nonce pipe");
-        let metadata = handoff.fd_env_value();
-        assert!(command.as_std().get_envs().any(|(key, value)| {
-            key == subc_os::LAUNCH_NONCE_FD_ENV && value == Some(std::ffi::OsStr::new(&metadata))
-        }));
+        assert!(handoff.is_none(), "gated children receive no nonce pipe");
+        assert!(command
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == subc_os::LAUNCH_NONCE_FD_ENV && value.is_none()));
         assert!(command
             .as_std()
             .get_envs()
             .any(|(key, value)| { key == SUBC_LAUNCH_NONCE_ENV && value.is_none() }));
-        let mut delivered = String::new();
-        std::fs::File::from(handoff.into_descriptor())
-            .read_to_string(&mut delivered)
-            .unwrap();
-        assert_eq!(delivered.len(), 64);
         match role {
             SpawnRole::Plain => {
-                assert_eq!(
-                    handle.spawn_nonce(&spec.module_id).as_deref(),
-                    Some(delivered.as_str())
-                );
-                assert_eq!(
-                    handle.reserved_launch_nonce_for(&spec.module_id).as_deref(),
-                    Some(delivered.as_str())
-                );
+                assert!(handle.spawn_nonce(&spec.module_id).is_none());
+                assert!(handle.reserved_launch_nonce_for(&spec.module_id).is_none());
             }
             SpawnRole::SwapCandidate => {
                 assert_eq!(handle.spawn_nonce(&spec.module_id), incumbent);
                 let swaps = handle.swaps.lock().unwrap();
                 let swap = swaps.get(&spec.module_id).expect("candidate nonce record");
-                assert_eq!(swap.candidate_nonce, delivered);
+                assert!(swap.candidate_nonce.is_empty());
                 assert_eq!(swap.incumbent_nonce, incumbent);
             }
         }

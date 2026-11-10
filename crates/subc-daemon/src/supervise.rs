@@ -73,6 +73,8 @@ mod carried_job_tests;
 mod config_delivery;
 mod content_binding;
 mod program_binding;
+mod registration;
+pub(crate) use registration::RegistrationSpawn;
 #[cfg(all(test, unix))]
 pub(crate) mod unix_channel_placement_tests;
 use program_binding::ProgramBindingPublication;
@@ -347,6 +349,7 @@ type SpawnRegistrationChannel = std::os::unix::net::UnixStream;
 type SpawnRegistrationChannel = subc_os::registration_channel::RegistrationPipe;
 
 struct SupervisedChild {
+    registration_spawn: Option<Arc<RegistrationSpawn>>,
     /// Owned daemon endpoint, retained for the per-spawn registration service.
     #[cfg(any(unix, windows))]
     registration_channel: Option<SpawnRegistrationChannel>,
@@ -455,6 +458,9 @@ impl SupervisedChild {
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         let result = self.child.try_wait();
         if !matches!(result, Ok(None)) {
+            if let Some(spawn) = &self.registration_spawn {
+                spawn.retire();
+            }
             #[cfg(any(unix, windows))]
             self.registration_channel.take();
             if let Some(binding) = &self._program_binding {
@@ -475,6 +481,9 @@ impl SupervisedChild {
         // caller releases it after recording the exit (`release_roster`), and
         // dropping the handle releases it too.
         let result = self.child.wait().await;
+        if let Some(spawn) = &self.registration_spawn {
+            spawn.retire();
+        }
         #[cfg(any(unix, windows))]
         self.registration_channel.take();
         // All plain and swap waits pass here. Revoke the reaped child's nonce
@@ -787,9 +796,14 @@ impl SupervisedChild {
             }
         }
         if cause.is_some() {
+            if let Some(spawn) = &self.registration_spawn {
+                spawn.refuse();
+            }
             if let Some(binding) = &mut pending.admission_binding {
                 binding.reject();
             }
+        } else if let Some(spawn) = &self.registration_spawn {
+            spawn.ready();
         }
         // Exec confirmation describes launch success, not roster retirement.
         // Keep even a reaped child recorded until its terminal history exists.
@@ -2338,6 +2352,8 @@ struct SupervisedConfiguration {
 /// launch nonces recorded at spawn are checked by the same daemon instance.
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
+    registration_service: Arc<Mutex<Option<registration::RegistrationService>>>,
+    registration_connections: Arc<Mutex<HashMap<ConnectionId, Arc<RegistrationSpawn>>>>,
     program_bindings: program_binding::ProgramBindings,
     #[cfg(test)]
     identity_sample_pause: Arc<Mutex<Option<IdentitySamplePause>>>,
@@ -2905,7 +2921,7 @@ impl SupervisorHandle {
         let Some(swap) = swaps.get(module_id) else {
             return SwapHelloAdmission::NotSwapping;
         };
-        let Some(presented) = presented else {
+        let Some(presented) = presented.filter(|nonce| !nonce.is_empty()) else {
             return SwapHelloAdmission::Refused;
         };
         if constant_time_eq(swap.candidate_nonce.as_bytes(), presented.as_bytes()) {
@@ -10110,7 +10126,7 @@ fn apply_wire_spawn_args_for_admission(
     connection_file_path: Option<&std::path::Path>,
     handle: Option<&SupervisorHandle>,
     role: SpawnRole,
-    _admission: Option<&crate::config_gate::runtime::SpawnAdmission>,
+    admission: Option<&crate::config_gate::runtime::SpawnAdmission>,
 ) -> Result<Option<NonceHandoff>, SuperviseError> {
     command.env(SUBC_MODULE_ID_ENV, &spec.module_id);
     // SUBC_LAUNCH_NONCE_FD is removed for every child, `protocol: "none"`
@@ -10135,8 +10151,30 @@ fn apply_wire_spawn_args_for_admission(
         command.arg(SUBC_ARG).arg(connection_file_path);
     }
 
-    // An inherited socket alone cannot register a module. Until the daemon
-    // services HELLO on that socket, approved admissions need the nonce path too.
+    if admission.is_some_and(|admission| admission.launch.is_some()) {
+        if let Some(handle) = handle {
+            match role {
+                SpawnRole::Plain => {
+                    handle
+                        .spawn_nonces
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&spec.module_id);
+                    if spec.reserved {
+                        handle
+                            .reserved_nonces
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(spec.module_id.clone(), None);
+                    }
+                }
+                // Swaps still need their lifecycle record, but the empty value
+                // is not a bearer token and is never accepted by nonce HELLO.
+                SpawnRole::SwapCandidate => handle.open_swap(&spec.module_id, String::new()),
+            }
+        }
+        return Ok(None);
+    }
     // Every subc-wire spawn receives a fresh one-time launch nonce for consumer
     // route.open attestation. Reserved modules additionally use the same nonce
     // for HELLO id-squatting protection. A respawn rotates both records.
@@ -10465,6 +10503,8 @@ impl Drop for AsyncInitialIdentity<'_> {
 /// this value returns, the async caller validates its launch witness and creates
 /// and publishes the child without another await.
 struct PreparedChild {
+    registration_spawn: Option<Arc<RegistrationSpawn>>,
+    registration_handle: Option<SupervisorHandle>,
     #[cfg(any(unix, windows))]
     registration_channel: Option<SpawnRegistrationChannel>,
     config_context: Option<config_delivery::ConfigDelivery>,
@@ -11030,6 +11070,13 @@ fn prepare_child_in_slot(
     } else {
         None
     };
+    let registration_spawn = (spec.protocol == ModuleProtocol::Subc)
+        .then(|| {
+            handle.map(|handle| {
+                RegistrationSpawn::new(handle, &spec.module_id, role, binding_publication.clone())
+            })
+        })
+        .flatten();
 
     #[cfg(target_os = "linux")]
     let cgroup_path = cgroup_placement
@@ -11197,6 +11244,8 @@ fn prepare_child_in_slot(
     }
     validate_spawn_program(spec, spawn_admission.as_ref(), delivery_context)?;
     Ok(PreparedChild {
+        registration_spawn,
+        registration_handle: handle.cloned(),
         #[cfg(any(unix, windows))]
         registration_channel,
         config_context: delivery_context.map(|delivery| delivery.runtime()),
@@ -11300,6 +11349,8 @@ fn launch_child_in_slot(
     }
     #[cfg(any(unix, windows))]
     let registration_channel = prepared.registration_channel;
+    let registration_spawn = prepared.registration_spawn;
+    let registration_handle = prepared.registration_handle;
     #[cfg(windows)]
     let image_capture = prepared.image_capture;
     #[cfg(windows)]
@@ -11701,6 +11752,7 @@ fn launch_child_in_slot(
     #[cfg(not(any(target_os = "linux", windows)))]
     let subtree_target = crate::subtree_resources::Target::Unavailable("unsupported_platform");
     let mut supervised = SupervisedChild {
+        registration_spawn,
         #[cfg(any(unix, windows))]
         registration_channel,
         live_program_binding: None,
@@ -11844,6 +11896,19 @@ fn launch_child_in_slot(
     }
     if let Some(registration) = delivery_registration {
         registration.commit();
+    }
+    if let Some(spawn) = &supervised.registration_spawn {
+        if supervised.spawn_failure.is_some() {
+            spawn.refuse();
+        } else if binding_ready {
+            spawn.ready();
+        }
+        #[cfg(any(unix, windows))]
+        if let (Some(handle), Some(channel)) =
+            (registration_handle, supervised.registration_channel.take())
+        {
+            handle.serve_registration(channel, spawn.clone(), pid, DEFAULT_REGISTER_TIMEOUT);
+        }
     }
     Ok(supervised)
 }
@@ -19316,6 +19381,7 @@ mod cgroup_placement_tests {
         let pid = child.id().expect("spawned child has pid");
         let mut child = SupervisedChild {
             registration_channel: None,
+            registration_spawn: None,
             live_program_binding: None,
             registered_config_connection: None,
             admission_base: None,

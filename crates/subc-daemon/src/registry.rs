@@ -870,7 +870,10 @@ pub enum RegistryError {
 impl fmt::Display for RegistryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::FederatedCapabilityChanged => write!(f, "scope-federated/v1 is fixed at HELLO; re-register on a new connection to change it"),
+            Self::FederatedCapabilityChanged => write!(
+                f,
+                "scope-federated/v1 is fixed at HELLO; restart the module to change it"
+            ),
             Self::DuplicateModuleId { module_id } => {
                 write!(f, "module_id '{module_id}' is already registered")
             }
@@ -898,7 +901,7 @@ impl Error for RegistryError {}
 /// and a colon cannot traverse. Windows path legality is the store library's
 /// concern, not an identity rule.
 pub fn module_id_path_hazard(module_id: &str) -> Result<(), String> {
-    subc_protocol::manifest::validate_module_id(module_id)
+    subc_protocol::module_id::module_id_path_hazard(module_id)
 }
 
 #[cfg(test)]

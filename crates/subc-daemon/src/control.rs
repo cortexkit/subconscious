@@ -1017,6 +1017,13 @@ impl RouteBindBreakers {
 }
 
 impl ControlHandler {
+    pub(crate) fn install_registration_service(
+        &self,
+        router: std::sync::Weak<crate::Router>,
+        auth: crate::server::ServerAuth,
+    ) {
+        self.supervisor.install_registration_service(router, auth);
+    }
     pub fn new(registry: Arc<Registry>) -> Self {
         Self::with_forwarding(registry, Arc::new(ForwardingTable::default()))
     }
@@ -2080,7 +2087,9 @@ impl ControlHandler {
         match frame.header.ty {
             FrameType::Ping => Ok(vec![pong(&frame)?]),
             FrameType::Hello => {
-                if let Ok(hello) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
+                if let Some(spawn) = self.supervisor.registration_spawn(ctx.connection_id) {
+                    spawn.wait_launch().await;
+                } else if let Ok(hello) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
                     if let (Some(module), Some(nonce)) = (
                         hello
                             .get("manifest")
@@ -2384,6 +2393,11 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        if let Some(spawn) = self.supervisor.registration_spawn(connection_id) {
+            spawn.retire();
+        }
+        self.supervisor
+            .forget_registration_connection(connection_id);
         self.local_connections
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2643,6 +2657,21 @@ impl ControlHandler {
         frame: Frame,
         wait_for_gate: bool,
     ) -> Result<Vec<Frame>, RouterError> {
+        let channel_spawn = self.supervisor.registration_spawn(connection_id);
+        if let Some(spawn) = &channel_spawn {
+            let value = serde_json::from_slice::<serde_json::Value>(&frame.body).ok();
+            if let Err(code) = spawn.admit_hello(
+                value
+                    .as_ref()
+                    .and_then(|value| value["manifest"]["module_id"].as_str()),
+            ) {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    code,
+                    "registration channel HELLO refused",
+                )?]);
+            }
+        }
         debug!(
             connection_id = connection_id.get(),
             corr = frame.header.corr,
@@ -2683,6 +2712,9 @@ impl ControlHandler {
                 .as_ref()
                 .is_some_and(|owner| owner.check_recovery().unwrap_or(true));
             if recovering
+                && channel_spawn
+                    .as_ref()
+                    .is_none_or(|spawn| spawn.check().is_err())
                 && !hello_value
                     .get("launch_nonce")
                     .and_then(|value| value.as_str())
@@ -2702,18 +2734,11 @@ impl ControlHandler {
             if self
                 .config_runtime
                 .as_ref()
-                .is_some_and(|owner| !recovering && owner.module_is_gated(module))
-                && (self
-                    .config_runtime
-                    .as_ref()
-                    .is_some_and(|owner| owner.check_module_hold(module).is_err())
-                    || !hello_value
-                        .get("launch_nonce")
-                        .and_then(|value| value.as_str())
-                        .is_some_and(|nonce| {
-                            self.supervisor.spawned_consumer_authorized(module, nonce)
-                                && self.supervisor.has_program_binding_record(module, nonce)
-                        }))
+                .is_some_and(|owner| owner.module_is_gated(module))
+                && (channel_spawn.is_none()
+                    || self.config_runtime.as_ref().is_some_and(|owner| {
+                        !recovering && owner.check_module_hold(module).is_err()
+                    }))
             {
                 return Ok(vec![control_error_frame(
                     &frame,
@@ -2722,38 +2747,40 @@ impl ControlHandler {
                 )?]);
             }
         }
-        if let (Some(module), Some(nonce)) = (
-            hello_value
-                .get("manifest")
-                .and_then(|value| value.get("module_id"))
-                .and_then(|value| value.as_str()),
-            hello_value
-                .get("launch_nonce")
-                .and_then(|value| value.as_str()),
-        ) {
-            let binding = self.supervisor.has_program_binding_record(module, nonce);
-            let required = self
-                .config_runtime
-                .as_ref()
-                .is_some_and(|owner| owner.module_is_gated(module));
-            if let Some(error) = (binding || required)
-                .then(|| {
-                    self.supervisor
-                        .check_current_program_binding(module, nonce)
-                        .err()
-                })
-                .flatten()
-            {
-                let code = if error.code == "program_refused" {
-                    "program_refused"
-                } else {
-                    "config_delivery_deferred"
-                };
-                self.forwarding.request_connection_close(
-                    connection_id,
-                    CloseReason::new(code, error.detail.clone()),
-                );
-                return Ok(vec![control_error_frame(&frame, code, error.detail)?]);
+        if channel_spawn.is_none() {
+            if let (Some(module), Some(nonce)) = (
+                hello_value
+                    .get("manifest")
+                    .and_then(|value| value.get("module_id"))
+                    .and_then(|value| value.as_str()),
+                hello_value
+                    .get("launch_nonce")
+                    .and_then(|value| value.as_str()),
+            ) {
+                let binding = self.supervisor.has_program_binding_record(module, nonce);
+                let required = self
+                    .config_runtime
+                    .as_ref()
+                    .is_some_and(|owner| owner.module_is_gated(module));
+                if let Some(error) = (binding || required)
+                    .then(|| {
+                        self.supervisor
+                            .check_current_program_binding(module, nonce)
+                            .err()
+                    })
+                    .flatten()
+                {
+                    let code = if error.code == "program_refused" {
+                        "program_refused"
+                    } else {
+                        "config_delivery_deferred"
+                    };
+                    self.forwarding.request_connection_close(
+                        connection_id,
+                        CloseReason::new(code, error.detail.clone()),
+                    );
+                    return Ok(vec![control_error_frame(&frame, code, error.detail)?]);
+                }
             }
         }
         if let Err(err) = validate_hello_display_name(&hello_value) {
@@ -2916,6 +2943,9 @@ impl ControlHandler {
         // precedes parsing and this publication-gate check; this cached read
         // also observes any recovery transition published during that work.
         if recovering
+            && channel_spawn
+                .as_ref()
+                .is_none_or(|spawn| spawn.check().is_err())
             && !hello.launch_nonce.as_deref().is_some_and(|nonce| {
                 self.supervisor.spawned_consumer_authorized(module, nonce)
                     && self
@@ -2930,23 +2960,27 @@ impl ControlHandler {
             )?]);
         }
         if required
-            && !recovering
-            && (self
-                .config_runtime
-                .as_ref()
-                .is_some_and(|owner| owner.check_module_hold(module).is_err())
-                || !hello.launch_nonce.as_deref().is_some_and(|nonce| {
-                    self.supervisor.spawned_consumer_authorized(module, nonce)
-                        && self.supervisor.has_program_binding_record(module, nonce)
-                }))
+            && (channel_spawn.is_none()
+                || self
+                    .config_runtime
+                    .as_ref()
+                    .is_some_and(|owner| !recovering && owner.check_module_hold(module).is_err()))
         {
             return Ok(vec![control_error_frame(
                 &frame,
                 "reserved_module",
-                "gated admission requires an unheld module and the current supervised child's nonce and verified image binding",
+                "gated admission requires the current supervised child's registration channel and verified image binding",
             )?]);
         }
-        if let Some(nonce) = hello.launch_nonce.as_deref() {
+        if let Some(spawn) = &channel_spawn {
+            if let Err(code) = spawn.check() {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    code,
+                    "registration launch is no longer live",
+                )?]);
+            }
+        } else if let Some(nonce) = hello.launch_nonce.as_deref() {
             if required || self.supervisor.has_program_binding_record(module, nonce) {
                 if let Err(error) = self.supervisor.check_current_program_binding(module, nonce) {
                     let code = if error.code == "program_refused" {
@@ -2970,9 +3004,13 @@ impl ControlHandler {
         // duplicate. Run after the reserved gate, a reserved module's candidate
         // would be refused `reserved_module` for presenting a nonce that gate
         // does not know. See `SupervisorHandle::swap_hello_admission`.
-        let swap_admission = self
-            .supervisor
-            .swap_hello_admission(&hello.manifest.module_id, hello.launch_nonce.as_deref());
+        let swap_admission = match &channel_spawn {
+            Some(spawn) if spawn.is_candidate() => SwapHelloAdmission::Candidate,
+            Some(_) => SwapHelloAdmission::NotSwapping,
+            None => self
+                .supervisor
+                .swap_hello_admission(&hello.manifest.module_id, hello.launch_nonce.as_deref()),
+        };
         if swap_admission == SwapHelloAdmission::Refused {
             warn!(
                 module_id = %hello.manifest.module_id,
@@ -2994,7 +3032,7 @@ impl ControlHandler {
         // Other registrations receive this catalog fact only when reserved-module
         // policy required and accepted a nonce; unreserved registrations require
         // no nonce check.
-        let verification = if swap_candidate {
+        let verification = if swap_candidate || channel_spawn.is_some() {
             ReservedHelloVerification {
                 nonce_verified: true,
                 prefix_owner: None,
@@ -4417,12 +4455,22 @@ impl ControlHandler {
             )?]);
         }
 
-        let updated = match self.registry.replace_catalog_for_connection(connection_id, provides, capabilities, ready) {
-            Err(crate::registry::RegistryError::FederatedCapabilityChanged) => return Ok(vec![control_error_frame(
-                &frame, error_codes::CATALOG_UPDATE_FROZEN_CAPABILITY,
-                "scope-federated/v1 is fixed at HELLO; re-register on a new connection to change it",
-            )?]),
-            result => result.map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?,
+        let updated = match self.registry.replace_catalog_for_connection(
+            connection_id,
+            provides,
+            capabilities,
+            ready,
+        ) {
+            Err(crate::registry::RegistryError::FederatedCapabilityChanged) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    error_codes::CATALOG_UPDATE_FROZEN_CAPABILITY,
+                    "scope-federated/v1 is fixed at HELLO; restart the module to change it",
+                )?])
+            }
+            result => {
+                result.map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+            }
         };
         if updated.is_none() {
             return Ok(vec![control_error_frame(

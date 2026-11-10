@@ -20,7 +20,7 @@ fn env(command: &Command, key: &str) -> Option<std::ffi::OsString> {
 }
 
 #[tokio::test]
-async fn windows_channel_gated_spawn_keeps_nonce_until_channel_hello_service() {
+async fn windows_channel_gated_spawn_withholds_nonce() {
     let scratch = ScratchDir::new("windows-channel-admission");
     let path = std::fs::canonicalize(&*scratch).unwrap();
     std::fs::create_dir(path.join("store")).unwrap();
@@ -95,8 +95,7 @@ fn check_environment(
             role,
             admission,
         )
-        .unwrap()
-        .expect("channel HELLO service is not active; preserve nonce registration");
+        .unwrap();
         let pipe = prepare_windows_registration_pipe(&mut command, spec)
             .unwrap()
             .expect("wire children receive a reserved registration instance");
@@ -111,6 +110,19 @@ fn check_environment(
             env(&command, subc_os::registration_channel::DAEMON_PID_ENV),
             Some(std::process::id().to_string().into())
         );
+        if admission.is_some() {
+            assert!(nonce.is_none());
+            for key in [
+                subc_os::LAUNCH_NONCE_PIPE_ENV,
+                SUBC_LAUNCH_NONCE_ENV,
+                subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV,
+            ] {
+                assert!(env(&command, key).is_none());
+            }
+            assert!(handle.spawn_nonce(&spec.module_id).is_none());
+            continue;
+        }
+        let nonce = nonce.expect("ungated children retain legacy nonce registration");
         assert_eq!(
             env(&command, subc_os::LAUNCH_NONCE_PIPE_ENV),
             Some(nonce.name().into())

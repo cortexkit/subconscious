@@ -80,6 +80,34 @@ impl ProgramBindingRetirement {
 }
 
 impl ProgramBindingPublication {
+    pub(super) fn check(&self) -> Result<(), crate::config_gate::GateError> {
+        if *self.signal.borrow() != Some(true)
+            || self.retired.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(crate::config_gate::GateError::new(
+                "program_refused",
+                "launch has not been verified",
+            ));
+        }
+        self.live
+            .lock()
+            .ok()
+            .and_then(|live| live.upgrade())
+            .ok_or_else(|| {
+                crate::config_gate::GateError::new(
+                    "program_refused",
+                    "live launch witness is unavailable",
+                )
+            })?
+            .check()
+    }
+
+    #[cfg(windows)]
+    pub(super) fn hello_accepted(&self) {
+        if let Some(live) = self.live.lock().ok().and_then(|live| live.upgrade()) {
+            live.hello_accepted();
+        }
+    }
     #[cfg(unix)]
     pub(super) fn retirement_hook(&self) -> ProgramBindingRetirement {
         ProgramBindingRetirement {
@@ -438,8 +466,20 @@ impl SupervisorHandle {
                 .ok()?
                 .get(module)
                 .map(|swap| swap.candidate_nonce.clone()),
-        }?;
+        }
+        .filter(|nonce| !nonce.is_empty());
         let (sender, receiver) = tokio::sync::watch::channel(None);
+        // A channel-only launch has no nonce-table entry. Its owned publication
+        // supplies a launch-verification signal without creating a bearer secret.
+        let Some(nonce) = nonce else {
+            return Some(ProgramBindingPublication {
+                signal: Arc::new(sender),
+                live: Arc::new(Mutex::new(std::sync::Weak::new())),
+                bindings: std::sync::Weak::new(),
+                key: (module.to_owned(), String::new()),
+                retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+        };
         let mut bindings = self.program_bindings.lock().ok()?;
         bindings.configured.insert(module.to_owned());
         if role == SpawnRole::Plain {

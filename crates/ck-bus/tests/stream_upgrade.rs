@@ -571,6 +571,10 @@ async fn a_five_stream_plane_upgrades_in_place_to_nine_streams_and_the_module_du
                     "ck.{}.event.basal.flow_instance_expired.v1",
                     names.account()
                 ),
+                format!(
+                    "ck.{}.event.basal.flow_instance_rescheduled.v1",
+                    names.account()
+                ),
             ],
         ),
         (
@@ -924,6 +928,10 @@ async fn bootstrap_creates_every_table_event_durable_with_its_filter_and_setting
                 ),
                 format!(
                     "ck.{}.event.basal.flow_instance_expired.v1",
+                    plane.names.account()
+                ),
+                format!(
+                    "ck.{}.event.basal.flow_instance_rescheduled.v1",
                     plane.names.account()
                 ),
             ],

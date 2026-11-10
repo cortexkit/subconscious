@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.3
+
+- `m_prefrontal-core` also reads Basal's fifth flow-instance lifecycle event, `event.basal.flow_instance_rescheduled.v1` (cortexkit-bus-naming 0.3.3). Bootstrap adds the subject to the existing durable's filter in place and keeps its position in the stream. Basal already publishes under `event.basal.>`; core's delivery-authority grant gains the matching content-free hint subject, `live.basal.flow_instance_rescheduled.v1`, as for the other four.
+
 ## 0.6.2
 
 - Require subc-client-rs 0.38.0 for scoped managed calls and watches. This dependency-only patch keeps wire behavior unchanged.

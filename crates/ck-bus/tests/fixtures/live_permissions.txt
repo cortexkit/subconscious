@@ -4,6 +4,7 @@ allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_instance
 allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_instance_ended.v1
 allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_instance_expired.v1
 allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_instance_extended.v1
+allow delivery-authority subscribe ck.box_goldenfixture.live.basal.flow_instance_rescheduled.v1
 allow delivery-authority subscribe ck.box_goldenfixture.live.broca.>
 allow flow-engine publish ck.box_goldenfixture.live.basal.>
 allow flow-engine subscribe ck.box_goldenfixture.live.>

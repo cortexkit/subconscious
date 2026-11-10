@@ -301,21 +301,31 @@ async fn macos_suspended_cdhash_mismatch_never_runs_marker_target() {
 #[tokio::test]
 async fn macos_suspended_plain_restart_and_candidate_resume_only_after_verification() {
     let probe = Probe::new();
-    // Both swap slots and the async preparation entry use approved admission.
-    for (index, role, alternate, carry) in [
-        (0, SpawnRole::Plain, false, false),
-        (1, SpawnRole::Plain, false, false),
-        (2, SpawnRole::SwapCandidate, true, false),
-        (3, SpawnRole::SwapCandidate, false, false),
-        (4, SpawnRole::Plain, false, true),
+    let marker = probe.root.join("accepted");
+    let runtime = gated_runtime(&probe, &probe.spec(&marker), true);
+    // Reuse the plain slot after reaping, then both swap slots. A carried
+    // launch needs its own approval because containment is part of the spec.
+    for (role, alternate, carry) in [
+        (SpawnRole::Plain, false, false),
+        (SpawnRole::Plain, false, false),
+        (SpawnRole::SwapCandidate, true, false),
+        (SpawnRole::SwapCandidate, false, false),
+        (SpawnRole::Plain, false, true),
     ] {
-        let marker = probe.root.join(format!("accepted-{index}"));
         let mut spec = probe.spec(&marker);
         spec.carry_containment = carry;
-        let runtime = gated_runtime(&probe, &spec, true);
-        let mut child = spawn_child_in_slot_async(&spec, &runtime, role, alternate)
+        let carried_runtime = carry.then(|| gated_runtime(&probe, &spec, true));
+        let runtime = carried_runtime.as_ref().unwrap_or(&runtime);
+        let mut child = spawn_child_in_slot_async(&spec, runtime, role, alternate)
             .await
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !subc_os::privacy_identity::SuspendedSignature::is_suspended(child.pid).unwrap() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("approved target must be stopped before verification");
         assert!(!marker.exists());
         assert!(child.report_ready.get().is_none());
         child.confirm_privacy_exec().await;
@@ -332,5 +342,6 @@ async fn macos_suspended_plain_restart_and_candidate_resume_only_after_verificat
         child.start_kill().unwrap();
         child.wait().await.unwrap();
         child.release_roster();
+        std::fs::remove_file(&marker).unwrap();
     }
 }

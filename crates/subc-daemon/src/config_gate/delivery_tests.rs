@@ -3059,6 +3059,13 @@ async fn config_delivery_approved_restart_preserves_the_crash_ring_and_its_warmu
     })
     .await;
     assert_eq!(module.status().unwrap().restart_count, 1);
+    // A generation is published before the resumed shell records its start.
+    // Let generation two begin warmup before approval replaces that child.
+    wait_for_supervised_stage(&module, "second script starts before approval", || {
+        std::fs::read_to_string(rig.path.join("a.launches"))
+            .is_ok_and(|text| text.lines().count() == 2)
+    })
+    .await;
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::ModuleRestart]);
     owner.notify_delivery_changed();
     wait_for_supervised_stage(&module, "approved restart spawns generation three", || {
@@ -3237,7 +3244,9 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
     registry.deregister_connection(INCUMBENT).unwrap();
     drop(guard);
     wait_for_supervised_stage(&module, "approved current command starts", || {
-        rig.path.join("a.next-command.launches").exists()
+        // Shell redirection creates the file before echo writes its record.
+        std::fs::read_to_string(rig.path.join("a.next-command.launches"))
+            .is_ok_and(|text| !text.is_empty())
     })
     .await;
     assert_eq!(

@@ -3168,7 +3168,7 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
         let module = module.clone();
         tokio::spawn(async move { module.swap(Some(Duration::from_secs(30))).await })
     };
-    wait_for_delivery_condition(|| {
+    wait_for_supervised_stage(&module, "incumbent and candidate scripts start", || {
         std::fs::read_to_string(rig.path.join("a.launches"))
             .is_ok_and(|text| text.lines().count() == 2)
     })
@@ -3235,7 +3235,10 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
     assert_eq!(module.status().unwrap().restart_count, 0);
     registry.deregister_connection(INCUMBENT).unwrap();
     drop(guard);
-    wait_for_delivery_condition(|| rig.path.join("a.next-command.launches").exists()).await;
+    wait_for_supervised_stage(&module, "approved current command starts", || {
+        rig.path.join("a.next-command.launches").exists()
+    })
+    .await;
     assert_eq!(
         std::fs::read_to_string(rig.path.join("a.next-command.launches"))
             .unwrap()
@@ -3272,7 +3275,10 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
         )
         .unwrap();
     rig.declare(&owner, 30);
-    wait_for_delivery_condition(|| owner.health_probe(replacement, "a").unwrap().is_some()).await;
+    wait_for_supervised_stage(&module, "replacement has a config health probe", || {
+        owner.health_probe(replacement, "a").unwrap().is_some()
+    })
+    .await;
     assert_eq!(pending(&owner, replacement).generation, 2);
     registry.deregister_connection(replacement).unwrap();
     module.stop().await.unwrap();

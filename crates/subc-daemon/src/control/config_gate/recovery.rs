@@ -72,10 +72,11 @@ impl ControlHandler {
         generation: u64,
     ) -> std::result::Result<(), GateError> {
         let _operation = self.supervisor.operation_lock().lock_owned().await;
-        let Some((config, activity, stamped, approved)) =
-            config_work(owner.clone(), move |owner| {
-                owner.authority_exit_configuration(generation)
-            })
+        // This snapshot read must not notify the delivery worker. A failed
+        // reconciliation would consume its own wakeup and retry without backoff,
+        // contending with module spawns for the configuration owner lock.
+        let Some((config, activity, stamped, approved)) = owner
+            .on_blocking(move |owner| owner.authority_exit_configuration(generation))
             .await?
         else {
             return Ok(());

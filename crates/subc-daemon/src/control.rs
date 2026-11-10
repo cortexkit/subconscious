@@ -466,6 +466,9 @@ pub struct ControlHandler {
     recovery_exit_test_quiet_retry: bool,
     #[cfg(test)]
     recovery_exit_test_retry_pause: Option<fn(u64) -> Option<PathBuf>>,
+    #[cfg(test)]
+    config_delivery_test_wakes:
+        Option<tokio::sync::mpsc::UnboundedSender<(&'static str, tokio::time::Instant)>>,
     /// Test-only Windows signature and flash hooks. Production builds carry
     /// neither: with the publisher unset, the production table never reaches
     /// verification, and the default attention hook only logs.
@@ -1100,6 +1103,8 @@ impl ControlHandler {
             recovery_exit_test_quiet_retry: false,
             #[cfg(test)]
             recovery_exit_test_retry_pause: None,
+            #[cfg(test)]
+            config_delivery_test_wakes: None,
             #[cfg(windows)]
             windows_verify: None,
             #[cfg(windows)]

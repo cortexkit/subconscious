@@ -281,12 +281,74 @@ impl ControlHandler {
                     (next, listen_for_changes)
                 };
                 tokio::select! {
-                    _ = changed.notified(), if listen_for_changes => {},
-                    _ = async { match next_anchor { Some(at) => sleep_until(at).await, None => std::future::pending().await } } => {},
+                    _ = changed.notified(), if listen_for_changes => {
+                        #[cfg(test)]
+                        report_delivery_wake(&handler, "notification");
+                    },
+                    _ = async { match next_anchor { Some(at) => sleep_until(at).await, None => std::future::pending().await } } => {
+                        #[cfg(test)]
+                        report_delivery_wake(&handler, "timer");
+                    },
                 }
             }
         }))
     }
+}
+
+#[cfg(test)]
+fn report_delivery_wake(handler: &std::sync::Weak<ControlHandler>, cause: &'static str) {
+    if let Some(control) = handler.upgrade() {
+        if let Some(wakes) = &control.config_delivery_test_wakes {
+            let _ = wakes.send((cause, Instant::now()));
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+#[tokio::test(start_paused = true)]
+async fn config_recovery_exit_failed_snapshot_read_wakes_only_for_timers_and_state_changes() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let (_rig, owner, _supervisor, handler, _spec) =
+        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+    assert_eq!(owner.pending_authority_exit().unwrap(), Some(1));
+    assert!(handler.rescan.is_none());
+    let error = handler
+        .reconcile_authority_exit(owner.clone(), 1)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "supervisor_reconcile_unavailable");
+
+    // Discard setup notifications so every observed wake belongs to the worker.
+    let changed = owner.delivery_notifications();
+    {
+        let mut notification = std::pin::pin!(changed.notified());
+        let _ = std::future::poll_fn(|cx| Poll::Ready(notification.as_mut().poll(cx))).await;
+    }
+    let (sender, mut wakes) = tokio::sync::mpsc::unbounded_channel();
+    let mut handler = (*handler).clone();
+    handler.config_delivery_test_wakes = Some(sender);
+    let handler = Arc::new(handler);
+    let worker = handler.spawn_config_delivery_worker().unwrap();
+    let start = Instant::now();
+
+    let first = wakes.recv().await.unwrap();
+    assert_eq!(first.0, "timer");
+    assert!(first.1 >= start + Duration::from_secs(1));
+    owner.notify_delivery_changed();
+    let second = wakes.recv().await.unwrap();
+    assert_eq!(second, ("notification", first.1));
+    let third = wakes.recv().await.unwrap();
+    assert_eq!(third.0, "timer");
+    assert!(third.1 >= first.1 + Duration::from_secs(2));
+    assert!(
+        wakes.try_recv().is_err(),
+        "exactly three wakes were requested"
+    );
+    assert_eq!(owner.pending_authority_exit().unwrap(), Some(1));
+    worker.abort();
+    let _ = worker.await;
 }
 
 #[cfg(test)]

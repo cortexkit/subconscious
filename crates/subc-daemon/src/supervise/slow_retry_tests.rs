@@ -244,7 +244,14 @@ async fn running_window_deadline(module: &SupervisedModule) -> Instant {
     })
     .await;
     let state = lock_snapshot(&module.inner.snapshot).unwrap();
-    state.failed_retry.running_since.unwrap() + module.inner.restart_policy.window
+    state.failed_retry.running_since.unwrap()
+        + module
+            .inner
+            .configuration
+            .lock()
+            .unwrap()
+            .restart_policy
+            .window
 }
 
 async fn advance_to(deadline: Instant) {
@@ -256,7 +263,7 @@ fn clock_sample(module: &SupervisedModule, step: &str) {
         let state = lock_snapshot(&module.inner.snapshot).unwrap();
         eprintln!("CLOCK step={step} now={:?} spawned_at_ms={:?} running_since={:?} deadline={:?} attempt={} actor_select={:?}",
             Instant::now(), state.spawned_at_ms, state.failed_retry.running_since,
-            state.failed_retry.running_since.map(|since| since + module.inner.restart_policy.window),
+            state.failed_retry.running_since.map(|since| since + module.inner.configuration.lock().unwrap().restart_policy.window),
             state.failed_retry.attempt, state.actor_select);
     }
 }

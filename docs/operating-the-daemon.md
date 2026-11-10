@@ -130,6 +130,7 @@ can approve a stamp and return `approval_surface_unavailable`, remaining
 unstamped. Development builds with `dev-desktop-approval` can exercise desktop
 approval, still bound to the digest and an interactive OS prompt.
 
+An approved stamp switches authority from live files to the approved store.
 After stamping, edits are proposals, not authority. The whole `subc.jsonc`
 document is covered, including ungated modules' entries and top-level policy.
 An ungated module still reads its own files unchecked; status lists that gap.
@@ -149,20 +150,31 @@ approve it. A normal applying rescan, including checked apply, returns
 `config_gated` before the legacy operator prompt. A checked candidate preview
 only compares client text and records no proposal.
 
-Approval and activation are separate. Daemon-entry approval is not live
-reconfiguration: changes to module membership, enabled state, health or launch
-settings may remain inactive until the next deliberate daemon start. The
-`config.apply` reply always includes `restart_required`; true means that
-generation includes a daemon configuration change still waiting for that
-start. Status lists each known difference in `approved_but_inactive`, naming
-the module and entry and separating approved and in-force fingerprints without
-printing credential bytes. `supervisor.list` reports runtime `enabled`
+Approval and activation are separate. After `config.apply` commits a change,
+rollback or initial stamp, the supervisor reconciles module additions, removals,
+enabled state, health,
+drain budgets, restart policy and registration timeouts from the approved
+generation. Launch changes are staged for the next spawn; approval does not
+restart an already-running module just to change its launch settings. A runtime
+stop or start override lasts until an approved generation changes that module's
+entry. An unrelated approval does not undo it. Module-layer delivery retains its
+own activation and failure state.
+
+Listeners and other daemon-restart settings remain approved but inactive until
+the next deliberate daemon start. The `config.apply` reply always includes
+`restart_required`; true means that generation includes a daemon setting still
+waiting for that start, not a launch change merely waiting for `next_spawn`.
+Status lists known differences in `approved_but_inactive`, naming the module,
+entry and activation boundary and separating approved and in-force fingerprints
+without printing credential bytes. `supervisor.list` reports runtime `enabled`
 separately from approved `configured_enabled`.
 
-**Current startup limitation:** approved-snapshot bootstrap is not yet wired;
-startup still reads live `subc.jsonc`. Keep that file equal to the approved
-daemon configuration before restarting. A restart alone is not proof that
-an entry was approved. Check both in-force state and approval status afterward.
+With `--config-store-root`, a daemon verifies the store before startup. If the
+store is stamped, it starts from the newest approved generation's daemon
+snapshot, including its module set and listeners. A changed or deleted live
+`subc.jsonc` is only a pending proposal; it
+cannot change startup authority. An unverifiable store follows the recovery
+rules below rather than falling back to live files.
 
 A module retired from supervision keeps its reserved id, so no other process can
 register under it. Release it explicitly:

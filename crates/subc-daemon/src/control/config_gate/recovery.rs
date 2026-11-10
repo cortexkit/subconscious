@@ -72,10 +72,11 @@ impl ControlHandler {
         generation: u64,
     ) -> std::result::Result<(), GateError> {
         let _operation = self.supervisor.operation_lock().lock_owned().await;
-        let Some((config, activity, stamped)) = config_work(owner.clone(), move |owner| {
-            owner.authority_exit_configuration(generation)
-        })
-        .await?
+        let Some((config, activity, stamped, approved)) =
+            config_work(owner.clone(), move |owner| {
+                owner.authority_exit_configuration(generation)
+            })
+            .await?
         else {
             return Ok(());
         };
@@ -102,17 +103,45 @@ impl ControlHandler {
             .await
             .map_err(|error| GateError::new("activity_config_failed", error))?;
         if stamped {
-            // Existing module processes receive approved configuration changes
-            // through the configuration-delivery worker, not file rescans.
-            // Listener changes remain inactive until the next daemon start.
+            // Daemon entries and module-layer activation have separate state.
+            // Only the former is reconciled here; listeners wait for startup.
+            for module in self.supervisor.list() {
+                if config
+                    .modules
+                    .iter()
+                    .any(|next| next.module_id == module.module_id())
+                {
+                    continue;
+                }
+                let id = module.module_id().to_owned();
+                module
+                    .retire_requested(Some(Principal::Direct))
+                    .await
+                    .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
+                self.supervisor.record_rescan_removal(&id);
+                self.supervisor.retire(&id);
+                self.route_outages.forget(&id);
+                let witness = approved.clone();
+                config_work(owner.clone(), move |owner| {
+                    owner.daemon_entry_reconciled(&witness, &id)
+                })
+                .await?;
+            }
             for (index, module) in config.modules.into_iter().enumerate() {
-                if self.supervisor.get(&module.module_id).is_none() {
+                if let Some(existing) = self.supervisor.get(&module.module_id) {
+                    if approved.changes_entry(&module.module_id) {
+                        existing
+                            .reconcile_approved_configuration(approved.clone())
+                            .await
+                            .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
+                    }
+                } else {
                     context
                         .supervisor
                         .supervise_configured_requested_async(
                             module.module_spec(),
                             module.enabled,
-                            module.health,
+                            module.health.clone(),
                             module.drain_timeout_ms,
                             module.restart,
                             module.register_timeout,
@@ -121,6 +150,11 @@ impl ControlHandler {
                         .await
                         .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
                 }
+                let witness = approved.clone();
+                config_work(owner.clone(), move |owner| {
+                    owner.daemon_entry_reconciled(&witness, &module.module_id)
+                })
+                .await?;
                 #[cfg(test)]
                 if let Some(hook) = self.recovery_exit_test_after_step {
                     hook(index + 1)?;

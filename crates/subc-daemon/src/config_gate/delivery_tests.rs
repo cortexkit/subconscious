@@ -205,6 +205,60 @@ fn config_delivery_nack_restores_active_and_durable_mark_refuses_failed_and_edit
     );
 }
 
+#[test]
+fn config_delivery_daemon_approval_preserves_failed_and_active_module_state() {
+    let (rig, owner) = rig();
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    approve(&rig, &owner, 2);
+    let failed = pending(&owner, INCUMBENT);
+    applied(&owner, INCUMBENT, &failed, false).unwrap();
+    owner.take_admission_transitions().unwrap();
+    let path = rig.path.join("subc.jsonc");
+    let mut daemon: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    daemon["port"] = json!(4321);
+    std::fs::write(path, serde_json::to_vec(&daemon).unwrap()).unwrap();
+    let view = owner
+        .finish_plan(owner.prepare(PlanKind::Change).unwrap(), daemon_review)
+        .unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &view)
+        .unwrap();
+    let approval = owner.begin_approval(&view.digest, &Rig::facts()).unwrap();
+    let generation = owner
+        .finish_approval(
+            approval.attempt(),
+            &Rig::facts(),
+            ApprovalReply::Presence(super::super::super::PresenceDecision::InteractiveApproval),
+            3,
+        )
+        .unwrap();
+    assert_eq!(generation, 3);
+    assert!(owner
+        .authority_exit_configuration(generation)
+        .unwrap()
+        .is_some());
+    owner.complete_authority_exit(generation).unwrap();
+    let reply = owner
+        .module_get(INCUMBENT, "a", ConfigGetRequest::new())
+        .unwrap();
+    assert!(
+        reply.pending.is_none(),
+        "a daemon-only approval must not redeliver failed module bytes"
+    );
+    assert_eq!(reply.active.unwrap().generation, 1);
+    assert_eq!(
+        owner.lock().unwrap().store.body().unwrap().generations[&2]
+            .generation
+            .never_redeliver,
+        ["a"]
+    );
+    assert!(
+        owner.lock().unwrap().admission_releases.is_empty(),
+        "normal reconciliation must not revive unrelated module actors"
+    );
+}
+
 fn active_catchup() -> (Rig, RuntimeOwner) {
     let (rig, owner) = rig();
     applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();

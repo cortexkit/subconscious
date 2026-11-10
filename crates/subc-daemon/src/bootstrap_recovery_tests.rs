@@ -71,6 +71,7 @@ impl Rig {
             .env("XDG_DATA_HOME", self.dir.join("data"))
             .env("XDG_RUNTIME_DIR", self.dir.join("runtime"))
             .env("XDG_CONFIG_HOME", self.dir.join("config"))
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
             .env("SUBC_CONNECTION_FILE", self.dir.join("connection.json"))
             .env("SUBC_PORT", "0")
             .stdout(Stdio::from(
@@ -108,7 +109,10 @@ impl Rig {
         }
     }
     async fn start(&self) -> Process {
-        let mut process = Process(self.command("daemon").spawn().unwrap());
+        self.start_role("daemon").await
+    }
+    async fn start_role(&self, role: &str) -> Process {
+        let mut process = Process(self.command(role).spawn().unwrap());
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 assert!(
@@ -126,7 +130,13 @@ impl Rig {
             }
         })
         .await
-        .unwrap();
+        .unwrap_or_else(|_| {
+            panic!(
+                "daemon did not publish connection: {} {}",
+                std::fs::read_to_string(self.dir.join(format!("{role}.log"))).unwrap(),
+                std::fs::read_to_string(self.dir.join(format!("{role}.err"))).unwrap()
+            )
+        });
         process
     }
     async fn local(&self) -> tokio::net::UnixStream {
@@ -138,6 +148,401 @@ impl Rig {
     fn retained(&self) -> Option<Vec<u8>> {
         std::fs::read(self.store()).ok()
     }
+}
+
+fn approved_rig() -> Rig {
+    let rig = Rig::new(true);
+    let mut doc: Value =
+        serde_json::from_slice(&std::fs::read(rig.dir.join("subc.jsonc")).unwrap()).unwrap();
+    doc["port"] = json!(0);
+    std::fs::write(
+        rig.dir.join("subc.jsonc"),
+        serde_json::to_vec(&doc).unwrap(),
+    )
+    .unwrap();
+    rig.seed();
+    rig
+}
+
+fn edit_approved_file(rig: &Rig, edit: impl FnOnce(&mut Value)) {
+    let path = rig.dir.join("subc.jsonc");
+    let mut doc = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    edit(&mut doc);
+    std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
+}
+
+async fn approved_modules(stream: &mut tokio::net::UnixStream) -> Value {
+    rpc(stream, json!({"op":"supervisor.list"})).await["modules"].clone()
+}
+
+async fn wait_approved_running(stream: &mut tokio::net::UnixStream) -> Value {
+    let mut last = Value::Null;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let modules = approved_modules(stream).await;
+            if let Some(module) = modules
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["module_id"] == "held-fixture" && m["live"] == true)
+            {
+                return module.clone();
+            }
+            last = modules;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("approved module must run: {last}"))
+}
+
+#[tokio::test]
+async fn config_approved_boot_ignores_changed_live_file() {
+    let _serial = DAEMONS.lock().await;
+    let rig = approved_rig();
+    edit_approved_file(&rig, |doc| {
+        doc["modules"] = json!({});
+        doc["port"] = json!(1);
+    });
+    let _daemon = rig.start().await;
+    let mut stream = rig.local().await;
+    let modules = approved_modules(&mut stream).await;
+    assert_eq!(
+        modules.as_array().unwrap().len(),
+        2,
+        "boot must use approved roster: {modules}"
+    );
+    wait_approved_running(&mut stream).await;
+    let status = rpc(&mut stream, json!({"op":"config.status"})).await;
+    assert_eq!(status["status"]["pending_proposals"], 1, "{status}");
+    assert!(
+        !status["status"]["approved_but_inactive"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row.get("entry").is_some()),
+        "{status}"
+    );
+}
+
+#[tokio::test]
+async fn config_approved_boot_ignores_deleted_live_file() {
+    let _serial = DAEMONS.lock().await;
+    let rig = approved_rig();
+    std::fs::remove_file(rig.dir.join("subc.jsonc")).unwrap();
+    let _daemon = rig.start().await;
+    let mut stream = rig.local().await;
+    let modules = approved_modules(&mut stream).await;
+    assert_eq!(
+        modules.as_array().unwrap().len(),
+        2,
+        "deleted proposal cannot erase approved roster: {modules}"
+    );
+    wait_approved_running(&mut stream).await;
+    let status = rpc(&mut stream, json!({"op":"config.status"})).await;
+    assert_eq!(status["status"]["pending_proposals"], 1, "{status}");
+}
+
+#[tokio::test]
+async fn config_approved_boot_replaces_eager_provisional_configuration() {
+    let _serial = DAEMONS.lock().await;
+    let rig = approved_rig();
+    edit_approved_file(&rig, |doc| {
+        doc["port"] = json!(12345);
+        doc["modules"] = json!({});
+        doc["scope_authority_owners"] = json!(["provisional-owner"]);
+    });
+    let _daemon = rig.start_role("daemon-eager").await;
+    let mut stream = rig.local().await;
+    let modules = approved_modules(&mut stream).await;
+    assert_eq!(modules.as_array().unwrap().len(), 2, "{modules}");
+    wait_approved_running(&mut stream).await;
+    let status = rpc(&mut stream, json!({"op":"config.status"})).await;
+    assert!(
+        !status["status"]["approved_but_inactive"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row.get("entry").is_some()),
+        "all provisional fields must be replaced: {status}"
+    );
+    let info = subc_transport::connection_file::read(rig.dir.join("connection.json")).unwrap();
+    assert!(info.endpoints.iter().all(|endpoint| endpoint.port != 12345));
+}
+
+#[tokio::test]
+async fn config_approved_disable_stops_module() {
+    let _serial = DAEMONS.lock().await;
+    let rig = approved_rig();
+    let _daemon = rig.start().await;
+    let mut stream = rig.local().await;
+    wait_approved_running(&mut stream).await;
+    edit_approved_file(&rig, |doc| {
+        doc["modules"]["held-fixture"]["enabled"] = json!(false)
+    });
+    let reply = apply(&mut stream, "config.plan").await;
+    assert_eq!(reply["generation"], 2, "{reply}");
+    let modules = approved_modules(&mut stream).await;
+    let module = modules
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["module_id"] == "held-fixture")
+        .unwrap();
+    assert_eq!(
+        module["enabled"], false,
+        "approved disable must stop supervision: {modules}"
+    );
+    assert_eq!(module["live"], false, "{modules}");
+    assert_eq!(reply["restart_required"], false, "{reply}");
+}
+
+#[tokio::test]
+async fn config_approved_removal_retires_module() {
+    let _serial = DAEMONS.lock().await;
+    let rig = approved_rig();
+    let _daemon = rig.start().await;
+    let mut stream = rig.local().await;
+    wait_approved_running(&mut stream).await;
+    edit_approved_file(&rig, |doc| {
+        doc["modules"]
+            .as_object_mut()
+            .unwrap()
+            .remove("held-fixture");
+    });
+    let reply = apply(&mut stream, "config.plan").await;
+    assert_eq!(reply["generation"], 2, "{reply}");
+    let modules = approved_modules(&mut stream).await;
+    assert!(
+        !modules
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["module_id"] == "held-fixture"),
+        "approved removal must retire actor: {modules}"
+    );
+    assert_eq!(reply["restart_required"], false, "{reply}");
+    let view = rpc(&mut stream, json!({"op":"config.rollback","generation":1})).await;
+    assert!(view.get("view").is_some(), "{view}");
+    let reply = rpc(
+        &mut stream,
+        json!({"op":"config.apply","digest":view["view"]["digest"]}),
+    )
+    .await;
+    assert_eq!(reply["generation"], 3, "{reply}");
+    wait_approved_running(&mut stream).await;
+    assert_eq!(approved_modules(&mut stream).await.as_array().unwrap().len(), 2,
+        "rollback must add and start the approved removed entry, without importing the still-removed live file");
+}
+
+#[tokio::test]
+async fn config_approved_launch_change_applies_at_next_spawn() {
+    let _serial = DAEMONS.lock().await;
+    let rig = approved_rig();
+    let _daemon = rig.start().await;
+    let mut stream = rig.local().await;
+    let before = wait_approved_running(&mut stream).await;
+    edit_approved_file(&rig, |doc| {
+        doc["modules"]["held-fixture"]["args"] = json!(["3500"])
+    });
+    let reply = apply(&mut stream, "config.plan").await;
+    assert_eq!(reply["generation"], 2, "{reply}");
+    assert_eq!(
+        reply["restart_required"], false,
+        "next-spawn launch changes do not require a daemon restart: {reply}"
+    );
+    let status = rpc(&mut stream, json!({"op":"config.status"})).await;
+    assert!(
+        status["status"]["approved_but_inactive"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["entry"] == "launch_spec" && r["waiting_for"] == "next_spawn"),
+        "launch must be staged without restarting: {status}"
+    );
+    assert_eq!(
+        wait_approved_running(&mut stream).await["spawn_generation"],
+        before["spawn_generation"]
+    );
+    edit_approved_file(&rig, |doc| {
+        doc["modules"]["held-fixture"]["args"] = json!(["3400"])
+    });
+    let reply = rpc(
+        &mut stream,
+        json!({"op":"supervisor.set_enabled","module_id":"held-fixture","enabled":false}),
+    )
+    .await;
+    assert!(reply.get("code").is_none(), "{reply}");
+    rpc(
+        &mut stream,
+        json!({"op":"supervisor.set_enabled","module_id":"held-fixture","enabled":true}),
+    )
+    .await;
+    let after = wait_approved_running(&mut stream).await;
+    assert!(
+        after["spawn_generation"].as_u64().unwrap() > before["spawn_generation"].as_u64().unwrap()
+    );
+    assert_eq!(
+        after["pending_reload"]["spec"]["status"], "match",
+        "next spawn must use staged approved launch: {after}"
+    );
+    let snapshot = rpc(&mut stream, json!({"op":"supervisor.spawn_snapshot"})).await;
+    let child = snapshot["live"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|child| child["module_id"] == "held-fixture")
+        .unwrap();
+    let cmdline_path = format!("/proc/{}/cmdline", child["pid"].as_u64().unwrap());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let cmdline = std::fs::read(&cmdline_path).unwrap();
+            if cmdline.split(|b| *b == 0).any(|arg| arg == b"3500") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("kernel command line must contain approved next-spawn argument");
+    let status = rpc(&mut stream, json!({"op":"config.status"})).await;
+    assert!(
+        !status["status"]["approved_but_inactive"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row.get("entry").is_some()),
+        "{status}"
+    );
+}
+
+#[tokio::test]
+async fn config_approved_unrelated_approval_keeps_runtime_override() {
+    let _serial = DAEMONS.lock().await;
+    let rig = approved_rig();
+    std::fs::write(rig.dir.join("operator"), "approve\n".repeat(6)).unwrap();
+    let _daemon = rig.start().await;
+    let mut stream = rig.local().await;
+    wait_approved_running(&mut stream).await;
+    let stopped = rpc(
+        &mut stream,
+        json!({"op":"supervisor.set_enabled","module_id":"held-fixture","enabled":false}),
+    )
+    .await;
+    assert!(stopped.get("code").is_none(), "{stopped}");
+    edit_approved_file(&rig, |doc| {
+        doc["modules"]["reserved-fixture"]["register_timeout_s"] = json!(27)
+    });
+    let reply = apply(&mut stream, "config.plan").await;
+    assert_eq!(reply["generation"], 2, "{reply}");
+    let modules = approved_modules(&mut stream).await;
+    assert_eq!(
+        modules
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["module_id"] == "held-fixture")
+            .unwrap()["enabled"],
+        false,
+        "unrelated approval must preserve operator stop: {modules}"
+    );
+    let status = rpc(&mut stream, json!({"op":"config.status"})).await;
+    assert!(
+        !status["status"]["approved_but_inactive"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["entry"] == "register_timeout_s"),
+        "unrelated module policy must reconcile: {status}"
+    );
+    edit_approved_file(&rig, |doc| {
+        doc["modules"]["held-fixture"]["restart"]["max_restarts"] = json!(9)
+    });
+    let reply = apply(&mut stream, "config.plan").await;
+    assert_eq!(reply["generation"], 3, "{reply}");
+    wait_approved_running(&mut stream).await;
+    edit_approved_file(&rig, |doc| {
+        doc["modules"]["held-fixture"]["enabled"] = json!(false)
+    });
+    let reply = apply(&mut stream, "config.plan").await;
+    assert_eq!(reply["generation"], 4, "{reply}");
+    let started_reply = rpc(
+        &mut stream,
+        json!({"op":"supervisor.set_enabled","module_id":"held-fixture","enabled":true}),
+    )
+    .await;
+    assert!(started_reply.get("code").is_none(), "{started_reply}");
+    let started = wait_approved_running(&mut stream).await;
+    edit_approved_file(&rig, |doc| {
+        doc["modules"]["reserved-fixture"]["register_timeout_s"] = json!(28)
+    });
+    let reply = apply(&mut stream, "config.plan").await;
+    assert_eq!(reply["generation"], 5, "{reply}");
+    let still_started = wait_approved_running(&mut stream).await;
+    assert_eq!(still_started["configured_enabled"], false);
+    assert_eq!(
+        still_started["spawn_generation"], started["spawn_generation"],
+        "unrelated approval must also preserve operator start"
+    );
+}
+
+#[tokio::test]
+async fn config_approved_daemon_restart_setting_stays_inactive() {
+    let _serial = DAEMONS.lock().await;
+    let rig = approved_rig();
+    let daemon = rig.start().await;
+    let mut stream = rig.local().await;
+    wait_approved_running(&mut stream).await;
+    let port_reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = port_reservation.local_addr().unwrap().port();
+    edit_approved_file(&rig, |doc| {
+        doc["port"] = json!(port);
+        doc["modules"]["held-fixture"]["restart"]["max_restarts"] = json!(9);
+    });
+    let reply = apply(&mut stream, "config.plan").await;
+    assert_eq!(reply["restart_required"], true, "{reply}");
+    let status = rpc(&mut stream, json!({"op":"config.status"})).await;
+    let inactive = status["status"]["approved_but_inactive"]
+        .as_array()
+        .unwrap();
+    assert!(
+        inactive
+            .iter()
+            .any(|r| r["entry"] == "port" && r["waiting_for"] == "daemon_restart"),
+        "{status}"
+    );
+    assert!(
+        !inactive.iter().any(|r| r["entry"] == "restart"),
+        "live restart policy must not remain inactive: {status}"
+    );
+    drop(stream);
+    drop(daemon);
+    drop(port_reservation);
+    edit_approved_file(&rig, |doc| {
+        doc["modules"] = json!({});
+        doc["port"] = json!(1);
+    });
+    let _restarted = rig.start().await;
+    let mut stream = rig.local().await;
+    let module = wait_approved_running(&mut stream).await;
+    assert_eq!(
+        module["max_restarts"], 9,
+        "boot must select the newest approval, not the initial stamp"
+    );
+    let info = subc_transport::connection_file::read(rig.dir.join("connection.json")).unwrap();
+    assert!(
+        info.endpoints.iter().all(|endpoint| endpoint.port == port),
+        "approved listener must activate only at the deliberate restart"
+    );
+    let status = rpc(&mut stream, json!({"op":"config.status"})).await;
+    assert!(
+        !status["status"]["approved_but_inactive"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row.get("entry").is_some()),
+        "{status}"
+    );
 }
 
 async fn local(root: &Path) -> tokio::net::UnixStream {
@@ -351,13 +756,21 @@ fn config_recovery_fixture() {
                     )
                     .unwrap();
             }
-            "daemon" => {
-                let mut config = BootstrapConfig::new(root.join("connection.json"), 0)
-                    .with_daemon_config_source(root.join("subc.jsonc"), None)
+            "daemon" | "daemon-eager" => {
+                let eager = std::env::var("RECOVERY_ROLE").unwrap() == "daemon-eager";
+                let initial = if eager {
+                    BootstrapConfig::from_env_with_daemon_config_path(root.join("subc.jsonc"))
+                        .unwrap()
+                } else {
+                    BootstrapConfig::new(root.join("connection.json"), 0)
+                        .with_daemon_config_source(root.join("subc.jsonc"), None)
+                };
+                let mut config = initial
                     .with_config_store_root(root.join("store"))
                     .unwrap()
                     .with_local_listener_socket_dir(root.join("socket"));
-                config.defer_file_load = true;
+                config.connection_file_path = root.join("connection.json");
+                config.defer_file_load = !eager;
                 config.test_store_factory = Some(open_store);
                 config.test_control = Some(adapt_control);
                 config.operator_script = Some(root.join("operator"));

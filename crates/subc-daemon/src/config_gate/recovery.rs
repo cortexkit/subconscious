@@ -2,6 +2,41 @@
 
 use super::*;
 
+impl ApprovedDaemonConfiguration {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn configuration(
+        &self,
+    ) -> Result<(
+        crate::daemon_config::DaemonConfig,
+        crate::daemon_config::ActivityConfig,
+    )> {
+        let bytes = self.daemon.bytes.as_deref().ok_or_else(GateError::stale)?;
+        let doc = std::str::from_utf8(bytes).map_err(|_| GateError::stale())?;
+        let path = self.daemon.path.as_deref().ok_or_else(GateError::stale)?;
+        crate::daemon_config::parse_with_activity(doc, std::path::Path::new(path))
+            .map_err(|error| GateError::new("invalid_daemon_config", error.to_string()))
+    }
+
+    pub(crate) fn module_entry(
+        &self,
+        module: &str,
+    ) -> Result<crate::daemon_config::ConfiguredModule> {
+        self.configuration()?
+            .0
+            .modules
+            .into_iter()
+            .find(|entry| entry.module_id == module)
+            .ok_or_else(GateError::stale)
+    }
+
+    pub(crate) fn changes_entry(&self, module: &str) -> bool {
+        self.changed_entries.contains(module)
+    }
+}
+
 impl RuntimeOwner {
     pub(crate) fn authority_exit_retry_generation(&self) -> Result<Option<u64>> {
         Ok(self.lock()?.authority_exit)
@@ -41,12 +76,14 @@ impl RuntimeOwner {
             crate::daemon_config::DaemonConfig,
             crate::daemon_config::ActivityConfig,
             bool,
+            ApprovedDaemonConfiguration,
         )>,
     > {
         let mut state = self.lock()?;
         if state.authority_exit != Some(generation) {
             return Ok(None);
         }
+        state.store.delivery_ready()?;
         let body = state.store.body()?;
         let layer = body
             .generations
@@ -56,12 +93,45 @@ impl RuntimeOwner {
             .ok_or_else(|| {
                 GateError::new("config_unavailable", "approved exit has no daemon snapshot")
             })?;
-        let bytes = layer.bytes.as_deref().ok_or_else(GateError::stale)?;
-        let doc = std::str::from_utf8(bytes).map_err(|_| GateError::stale())?;
-        let path = layer.path.as_deref().ok_or_else(GateError::stale)?;
-        crate::daemon_config::parse_with_activity(doc, std::path::Path::new(path))
-            .map(|(config, activity)| Some((config, activity, body.stamped)))
-            .map_err(|error| GateError::new("invalid_daemon_config", error.to_string()))
+        let stamped = body.stamped;
+        let mut approved = ApprovedDaemonConfiguration {
+            generation,
+            daemon: std::sync::Arc::new(layer.clone()),
+            changed_entries: BTreeSet::new(),
+        };
+        let (config, activity) = approved.configuration()?;
+        approved.changed_entries = config
+            .modules
+            .iter()
+            .filter(|module| state.reconciled_entries.get(&module.module_id) != Some(module))
+            .map(|module| module.module_id.clone())
+            .collect();
+        Ok(Some((config, activity, stamped, approved)))
+    }
+
+    /// Record each completed entry before waiting on the next module. A retry
+    /// must not undo a runtime override made after an earlier successful step.
+    pub(crate) fn daemon_entry_reconciled(
+        &self,
+        approved: &ApprovedDaemonConfiguration,
+        module: &str,
+    ) -> Result<()> {
+        let mut state = self.lock()?;
+        if state.authority_exit != Some(approved.generation) {
+            return Err(GateError::stale());
+        }
+        if let Some(entry) = approved
+            .configuration()?
+            .0
+            .modules
+            .into_iter()
+            .find(|entry| entry.module_id == module)
+        {
+            state.reconciled_entries.insert(module.to_owned(), entry);
+        } else {
+            state.reconciled_entries.remove(module);
+        }
+        Ok(())
     }
 
     /// Release admission only after all committed-exit reconciliation succeeds.
@@ -70,14 +140,18 @@ impl RuntimeOwner {
         if state.authority_exit != Some(generation) {
             return Err(GateError::stale());
         }
-        // Actors created under the recovery hold may not have been observed by
-        // the coordinator yet. Queue their ordinary admission release here.
-        let modules =
-            crate::config_gate::GateSnapshot::from_store(&state.store.body()?.approved)?.modules();
-        state.admission_releases.extend(modules);
+        // Actors created under an exit hold may not have been observed by the
+        // coordinator yet. Normal approvals must not revive unrelated stopped
+        // or failed actors whose daemon entries did not change.
+        let unstamped = state.store.loaded_admission_state().0 == StoreState::Unstamped;
+        if state.recovery_exit_hold || unstamped {
+            let modules =
+                crate::config_gate::GateSnapshot::from_store(&state.store.body()?.approved)?
+                    .modules();
+            state.admission_releases.extend(modules);
+        }
         state.authority_exit = None;
         state.recovery_exit_hold = false;
-        let unstamped = state.store.loaded_admission_state().0 == StoreState::Unstamped;
         drop(state);
         if unstamped {
             self.retire_unstamped_bindings();

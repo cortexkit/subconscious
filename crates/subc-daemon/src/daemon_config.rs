@@ -312,7 +312,8 @@ pub struct ConfiguredModule {
     /// Read when a module STARTS being supervised (daemon start, or a rescan
     /// that adds the module). Like `drain_timeout_ms`, an edit to this block for
     /// an already-running module is not part of the rescan diff, so it takes
-    /// effect on the next daemon start rather than immediately.
+    /// effect on the next daemon start rather than immediately. With approved-
+    /// store authority, approved generations reconcile it live on a separate path.
     pub restart: RestartPolicy,
 }
 

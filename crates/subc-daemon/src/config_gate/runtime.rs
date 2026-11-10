@@ -322,6 +322,8 @@ struct OwnerState {
     admission_holds: Vec<String>,
     admission_releases: Vec<String>,
     authority_exit: Option<u64>,
+    // Last reconciled daemon entries, independent of module-layer activation.
+    reconciled_entries: BTreeMap<String, crate::daemon_config::ConfiguredModule>,
     recovery_exit_hold: bool,
     unstamp_hints: std::collections::HashSet<ConnectionId>,
     installed_route_policies: BTreeMap<String, u64>,
@@ -524,6 +526,16 @@ pub struct ApprovedRollbackCommands {
     pub programs: BTreeMap<String, ApprovedRollbackProgram>,
 }
 
+/// A supervisor reconciliation witness minted only from a verified committed
+/// generation. Keeping the raw layer prevents a caller from substituting a
+/// freshly parsed live file for the approved command inputs.
+#[derive(Clone, Debug)]
+pub(crate) struct ApprovedDaemonConfiguration {
+    generation: u64,
+    daemon: std::sync::Arc<ConfigLayerSnapshot>,
+    changed_entries: BTreeSet<String>,
+}
+
 pub struct ApprovedRollbackProgram {
     pub path: String,
     pub identity: super::CapturedInput,
@@ -630,11 +642,17 @@ impl RuntimeOwner {
     pub fn new(incarnation: String, mut store: ConfigStore, capturer: ConfigCapturer) -> Self {
         let initial_generation = store.body().map(|body| body.last_generation).unwrap_or(0);
         let admission = std::sync::RwLock::new(admission::AdmissionCache::from_store(&store));
-        let approved_daemon = std::sync::RwLock::new(ApprovedDaemonView::from_store(
-            &store,
-            false,
-            &ApprovedDaemonView::Unavailable,
-        ));
+        let approved_daemon =
+            ApprovedDaemonView::from_store(&store, false, &ApprovedDaemonView::Unavailable);
+        let reconciled_entries = match &approved_daemon {
+            ApprovedDaemonView::Approved { config, .. } => config
+                .modules
+                .iter()
+                .map(|module| (module.module_id.clone(), module.clone()))
+                .collect(),
+            _ => BTreeMap::new(),
+        };
+        let approved_daemon = std::sync::RwLock::new(approved_daemon);
         Self {
             #[cfg(test)]
             warm_restart_pause: Mutex::new(None),
@@ -667,6 +685,7 @@ impl RuntimeOwner {
                 admission_holds: Vec::new(),
                 admission_releases: Vec::new(),
                 authority_exit: None,
+                reconciled_entries,
                 recovery_exit_hold: false,
                 unstamp_hints: std::collections::HashSet::new(),
                 installed_route_policies: BTreeMap::new(),
@@ -1568,7 +1587,9 @@ impl RuntimeOwner {
             .next_back()
             .filter(|(_, entry)| {
                 entry.generation.plan_digest == digest
-                    && (was_recovery || entry.kind == crate::config_store::CommitKind::Unstamp)
+                    && (was_recovery
+                        || state.store.loaded_admission_state().1.stamped
+                        || entry.kind == crate::config_store::CommitKind::Unstamp)
             })
             .map(|(generation, entry)| {
                 (
@@ -1579,10 +1600,13 @@ impl RuntimeOwner {
         if let Some((generation, unstamp)) = committed_exit {
             state.authority_exit = Some(generation);
             state.recovery_exit_hold = was_recovery;
-            state
-                .delivery
-                .reset_for_authority_exit(if unstamp { generation } else { 0 });
+            if was_recovery || unstamp {
+                state
+                    .delivery
+                    .reset_for_authority_exit(if unstamp { generation } else { 0 });
+            }
             if unstamp {
+                state.reconciled_entries.clear();
                 state.unstamp_hints.extend(unstamp_hints);
             }
         } else if result.is_ok() {

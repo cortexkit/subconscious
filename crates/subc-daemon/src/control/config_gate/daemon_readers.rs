@@ -226,7 +226,10 @@ impl ControlHandler {
                 rows.push(serde_json::json!({"module_id":id,"entry":"launch_spec","waiting_for":"next_spawn",
                     "in_force":"previous_spawn","approved":"supervisor_configuration"}));
             }
-            difference(&mut rows, id, "enabled", &status.enabled, &next.enabled);
+            let configured_enabled = module
+                .configured_enabled()
+                .map_err(|e| GateError::new("config_unavailable", e.to_string()))?;
+            difference(&mut rows, id, "enabled", &configured_enabled, &next.enabled);
             difference(&mut rows, id, "health", &health, &next.health);
             let register_timeout = module
                 .configured_register_timeout()
@@ -317,7 +320,9 @@ impl ControlHandler {
         let inactive = self.inactive_daemon_configuration(&approved)?;
         Ok(changed.iter().any(|change| {
             inactive.iter().any(|row| {
-                row["module_id"] == change["module_id"] && row["entry"] == change["entry"]
+                row["waiting_for"] == "daemon_restart"
+                    && row["module_id"] == change["module_id"]
+                    && row["entry"] == change["entry"]
             })
         }))
     }

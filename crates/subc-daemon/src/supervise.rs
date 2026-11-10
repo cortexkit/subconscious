@@ -2241,8 +2241,10 @@ impl SupervisorRuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SupervisedConfiguration {
     spec: ModuleSpec,
+    enabled: bool,
     health: HealthConfig,
     register_timeout: Duration,
+    restart_policy: RestartPolicy,
 }
 
 /// Shared daemon lookup table for supervised module handles.
@@ -4038,15 +4040,13 @@ impl Supervisor {
     ) -> (SupervisedModule, mpsc::Receiver<SupervisorCommand>) {
         let configuration = Arc::new(Mutex::new(SupervisedConfiguration {
             spec: spec.clone(),
+            enabled: snapshot.lock().unwrap_or_else(|p| p.into_inner()).enabled,
             health: runtime.health.clone(),
             register_timeout: runtime.register_timeout,
+            restart_policy: runtime.restart_policy,
         }));
         let stderr_ring = Arc::clone(&runtime.stderr_ring);
         let terminal_ring = Arc::clone(&runtime.terminal_ring);
-        // The module's OWN policy, which may be its per-module config rather than
-        // the supervisor-wide one; status must report the budget the supervise
-        // loop actually enforces.
-        let restart_policy = runtime.restart_policy;
         let effective_drain_timeout = Arc::clone(&runtime.effective_drain_timeout);
         let (tx, rx) = mpsc::channel(4);
         let module_id = spec.module_id.clone();
@@ -4060,7 +4060,6 @@ impl Supervisor {
                 terminal_ring,
                 commands: tx,
                 monitor: Mutex::new(None),
-                restart_policy,
                 effective_drain_timeout,
                 provenance_probe: self.provenance_probe.clone(),
                 retained: runtime.child_roster.retained_view(),
@@ -4121,10 +4120,6 @@ struct SupervisedModuleInner {
     terminal_ring: Arc<Mutex<TerminalRing>>,
     commands: mpsc::Sender<SupervisorCommand>,
     monitor: Mutex<Option<JoinHandle<()>>>,
-    /// Copied from the supervisor's runtime config at spawn so `status()` can
-    /// report the restart budget without reaching back into the supervisor. The
-    /// policy is fixed for the process's lifetime, so a copy cannot drift.
-    restart_policy: RestartPolicy,
     effective_drain_timeout: Arc<Mutex<Duration>>,
     provenance_probe: ExecutableIdentityProbe,
 }
@@ -4340,14 +4335,21 @@ impl SupervisedModule {
         snapshot: &SharedSnapshot,
         caller: Option<&'static str>,
     ) -> Result<(ModuleStatus, Option<SpawnedFileIdentity>), SuperviseError> {
+        let restart_policy = self
+            .inner
+            .configuration
+            .lock()
+            .map_err(|_| SuperviseError::StatePoisoned {
+                module_id: Some(self.inner.module_id.clone()),
+            })?
+            .restart_policy;
         let mut guard = match caller {
             Some(caller) => lock_snapshot_for_control(snapshot, &self.inner.module_id, caller)?,
             None => lock_snapshot(snapshot)?,
         };
         // Read the budget through the pruning path so a reader sees the same
         // in-window count the restart decision would use, not a stale total.
-        let restart_count =
-            guard.crash_restarts_in_window(self.inner.restart_policy.window, Instant::now());
+        let restart_count = guard.crash_restarts_in_window(restart_policy.window, Instant::now());
         let snapshot = guard.clone();
         drop(guard);
         let drain_timeout = *self.inner.effective_drain_timeout.lock().map_err(|_| {
@@ -4431,11 +4433,11 @@ impl SupervisedModule {
                 lifetime_restarts: snapshot.lifetime_restarts,
                 spawn_generation: snapshot.spawn_generation,
                 swap_outcome: snapshot.swap_outcome,
-                max_restarts: self.inner.restart_policy.max_restarts,
-                restart_window: self.inner.restart_policy.window,
+                max_restarts: restart_policy.max_restarts,
+                restart_window: restart_policy.window,
                 drain_timeout,
-                restart_backoff: self.inner.restart_policy.backoff,
-                restart_max_backoff: self.inner.restart_policy.max_backoff,
+                restart_backoff: restart_policy.backoff,
+                restart_max_backoff: restart_policy.max_backoff,
                 pid,
                 spawned_at_ms: snapshot.spawned_at_ms,
                 spawned_from: snapshot.spawned_from,
@@ -4561,7 +4563,18 @@ impl SupervisedModule {
             ModuleState::Restarting => true,
             ModuleState::Failed | ModuleState::Disabled => false,
             _ if snapshot.enabled && snapshot.respawn_pending => true,
-            _ => daemon_will_restart(&mut snapshot, &self.inner.restart_policy, Instant::now()),
+            _ => daemon_will_restart(
+                &mut snapshot,
+                &self
+                    .inner
+                    .configuration
+                    .lock()
+                    .map_err(|_| SuperviseError::StatePoisoned {
+                        module_id: Some(self.inner.module_id.clone()),
+                    })?
+                    .restart_policy,
+                Instant::now(),
+            ),
         })
     }
 
@@ -4833,6 +4846,16 @@ impl SupervisedModule {
             })
     }
 
+    pub(crate) fn configured_enabled(&self) -> Result<bool, SuperviseError> {
+        self.inner
+            .configuration
+            .lock()
+            .map(|configuration| configuration.enabled)
+            .map_err(|_| SuperviseError::StatePoisoned {
+                module_id: Some(self.inner.module_id.clone()),
+            })
+    }
+
     /// Replace this module's launch spec, keeping its health and drain policy,
     /// the way a rescan does for a changed config entry. The running process is
     /// untouched; the next spawn (a restart, or a swap's candidate) uses it.
@@ -4849,6 +4872,42 @@ impl SupervisedModule {
         .ok();
         self.update_configuration(spec, health, drain_timeout_ms)
             .await
+    }
+
+    pub(crate) async fn reconcile_approved_configuration(
+        &self,
+        approved: crate::config_gate::runtime::ApprovedDaemonConfiguration,
+    ) -> Result<(), SuperviseError> {
+        let entry = approved
+            .module_entry(&self.inner.module_id)
+            .map_err(|error| SuperviseError::InvalidSpec {
+                reason: error.to_string(),
+            })?;
+        validate_spec(&entry.module_spec())?;
+        let (reply, received) = oneshot::channel();
+        self.inner
+            .commands
+            .send(SupervisorCommand::ApprovedConfiguration { approved, reply })
+            .await
+            .map_err(|_| SuperviseError::CommandClosed {
+                module_id: self.inner.module_id.clone(),
+            })?;
+        received.await.map_err(|_| SuperviseError::CommandClosed {
+            module_id: self.inner.module_id.clone(),
+        })??;
+        let mut configuration =
+            self.inner
+                .configuration
+                .lock()
+                .map_err(|_| SuperviseError::StatePoisoned {
+                    module_id: Some(self.inner.module_id.clone()),
+                })?;
+        configuration.spec = entry.module_spec();
+        configuration.enabled = entry.enabled;
+        configuration.health = entry.health;
+        configuration.register_timeout = entry.register_timeout;
+        configuration.restart_policy = entry.restart;
+        Ok(())
     }
 
     pub(crate) async fn update_configuration(
@@ -4910,6 +4969,10 @@ impl Drop for SupervisedModuleInner {
 
 #[derive(Debug)]
 enum SupervisorCommand {
+    ApprovedConfiguration {
+        approved: crate::config_gate::runtime::ApprovedDaemonConfiguration,
+        reply: oneshot::Sender<Result<(), SuperviseError>>,
+    },
     ConfigPolicyProbe {
         connection: crate::ConnectionId,
         generation: u64,
@@ -8333,7 +8396,9 @@ async fn handle_supervisor_command(
 ) -> bool {
     if !matches!(
         command,
-        SupervisorCommand::UpdateConfiguration { .. } | SupervisorCommand::ConfigPolicyProbe { .. }
+        SupervisorCommand::UpdateConfiguration { .. }
+            | SupervisorCommand::ApprovedConfiguration { .. }
+            | SupervisorCommand::ConfigPolicyProbe { .. }
     ) {
         runtime.recovery_is_daemon = false;
     }
@@ -8410,6 +8475,47 @@ async fn handle_supervisor_command(
         command
     };
     match command {
+        SupervisorCommand::ApprovedConfiguration { approved, reply } => {
+            let result = async {
+                let next = approved.module_entry(&spec.module_id).map_err(|error| {
+                    SuperviseError::InvalidSpec { reason: error.to_string() }
+                })?;
+                stage_supervisor_configuration(
+                    spec, runtime, snapshot, next.module_spec(), next.health,
+                    next.drain_timeout_ms,
+                );
+                runtime.restart_policy = next.restart;
+                runtime.register_timeout = next.register_timeout;
+                if let Some(active) = child.as_mut()
+                    .filter(|child| child.registration_deadline.is_some())
+                {
+                    active.registration_deadline = Some(active.spawned_at + next.register_timeout);
+                }
+                let enabled = lock_snapshot(snapshot)?.enabled;
+                if enabled != next.enabled {
+                    let held = next.enabled && runtime.config_delivery.as_ref()
+                        .is_some_and(|delivery| delivery.0.check_module_hold(&spec.module_id).is_err());
+                    if held {
+                        // Preserve module-delivery failure/recovery holds. The
+                        // admission release starts the actor when its own hold ends.
+                        update_snapshot(snapshot, Some(&spec.module_id), |state| state.enabled = true)?;
+                    } else {
+                        set_child_enabled(
+                            spec, runtime, registry, process_liveness, snapshot, child,
+                            next.enabled, &runtime.failure_context(false),
+                        ).await?;
+                        if !next.enabled {
+                            containment::terminate(&runtime.child_roster.containment).await;
+                        }
+                    }
+                }
+                info!(module_id=%spec.module_id, config_generation=approved.generation(), "approved daemon entry reconciled");
+                Ok(())
+            }
+            .await;
+            let _ = reply.send(result);
+            true
+        }
         SupervisorCommand::ConfigPolicyProbe {
             connection,
             generation,
@@ -8860,29 +8966,17 @@ async fn handle_supervisor_command(
                 }));
                 return true;
             }
-            if let Some(handle) = &runtime.supervisor_handle {
-                handle.apply_identity_configuration(&next_spec);
-            }
-            *spec = next_spec;
+            stage_supervisor_configuration(
+                spec,
+                runtime,
+                snapshot,
+                next_spec,
+                health,
+                drain_timeout_ms,
+            );
             let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 state.configuration_updated_since_spawn = true;
             });
-            let health_changed = runtime.health != health;
-            runtime.health = health;
-            // Reset the cadence and old endpoint's failure streak on a live
-            // health-policy change rather than waiting for its old deadline.
-            if health_changed {
-                let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                    state.health = ModuleHealthStatus::default();
-                });
-            }
-            runtime.drain_timeout = drain_timeout_ms
-                .map(Duration::from_millis)
-                .unwrap_or(runtime.default_drain_timeout);
-            *runtime
-                .effective_drain_timeout
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime.drain_timeout;
             let _ = reply.send(Ok(()));
             true
         }
@@ -8927,6 +9021,41 @@ async fn handle_supervisor_command(
             true
         }
     }
+}
+
+fn stage_supervisor_configuration(
+    spec: &mut ModuleSpec,
+    runtime: &mut SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    next_spec: ModuleSpec,
+    health: HealthConfig,
+    drain_timeout_ms: Option<u64>,
+) {
+    if let Some(handle) = &runtime.supervisor_handle {
+        handle.apply_identity_configuration(&next_spec);
+    }
+    let launch_changed = *spec != next_spec;
+    *spec = next_spec;
+    if launch_changed {
+        let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+            state.configuration_updated_since_spawn = true
+        });
+    }
+    let health_changed = runtime.health != health;
+    runtime.health = health;
+    // Reset the old endpoint's failure streak when its live policy changes.
+    if health_changed {
+        let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+            state.health = ModuleHealthStatus::default()
+        });
+    }
+    runtime.drain_timeout = drain_timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(runtime.default_drain_timeout);
+    *runtime
+        .effective_drain_timeout
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = runtime.drain_timeout;
 }
 
 async fn restart_child(
@@ -14689,6 +14818,7 @@ mod terminal_history_tests {
         // These tests read synthetic snapshots. A real child and monitor would
         // race those reads by replacing the requested state during startup.
         let (commands, _rx) = mpsc::channel(4);
+        let configured_enabled = snapshot.enabled;
         SupervisedModule {
             inner: Arc::new(SupervisedModuleInner {
                 module_id: spec.module_id.clone(),
@@ -14696,14 +14826,15 @@ mod terminal_history_tests {
                 snapshot: Arc::new(Mutex::new(snapshot)),
                 configuration: Arc::new(Mutex::new(SupervisedConfiguration {
                     spec,
+                    enabled: configured_enabled,
                     health: runtime.health,
                     register_timeout: runtime.register_timeout,
+                    restart_policy: runtime.restart_policy,
                 })),
                 stderr_ring: runtime.stderr_ring,
                 terminal_ring: runtime.terminal_ring,
                 commands,
                 monitor: Mutex::new(None),
-                restart_policy: runtime.restart_policy,
                 effective_drain_timeout: runtime.effective_drain_timeout,
                 provenance_probe: supervisor.provenance_probe.clone(),
                 retained: runtime.child_roster.retained_view(),

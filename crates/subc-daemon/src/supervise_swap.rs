@@ -689,6 +689,7 @@ fn serve_command_while_warming(
         }
         SupervisorCommand::ConfigApplyRestart { .. } => Some(command),
         SupervisorCommand::Drain { .. }
+        | SupervisorCommand::ApprovedConfiguration { .. }
         | SupervisorCommand::ConfigExitHold { .. }
         | SupervisorCommand::ConfigDeliveryFailed { .. }
         | SupervisorCommand::Retire { .. }

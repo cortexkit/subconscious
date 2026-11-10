@@ -369,6 +369,10 @@ impl BootstrapConfig {
         Ok(config)
     }
 
+    /// Load live-file values for an unstamped embedder. If a store root is
+    /// attached later, these values are provisional and replaced at run time.
+    /// An invalid live file can still fail this eager constructor; the binary
+    /// defers loading until store authority has been selected instead.
     pub fn from_env_with_daemon_config_path(
         daemon_config_path: impl AsRef<Path>,
     ) -> Result<Self, BootstrapError> {
@@ -447,17 +451,35 @@ impl BootstrapConfig {
         Ok(config)
     }
 
+    /// Load live-file values unless a store root is already attached. Attaching
+    /// a root later makes eager values provisional: run time replaces them with
+    /// approved authority. An invalid live file can fail the eager constructor;
+    /// the binary's deferred path does not parse it before selecting authority.
     pub fn with_daemon_config_path(
-        self,
+        mut self,
         daemon_config_path: impl AsRef<Path>,
     ) -> Result<Self, BootstrapError> {
         let daemon_config_path = daemon_config_path.as_ref().to_path_buf();
+        if self.config_store_root.is_some() {
+            self.defer_file_load = true;
+            return Ok(self.with_daemon_config_source(daemon_config_path, None));
+        }
         let (daemon_config, activity_config) =
             daemon_config::load_with_activity(&daemon_config_path)
                 .map_err(BootstrapError::DaemonConfig)?
                 .map(|(config, activity)| (Some(config), activity))
                 .unwrap_or_default();
         let configured_port = daemon_config.as_ref().and_then(|config| config.port);
+        Ok(self
+            .with_parsed_daemon_config(daemon_config, activity_config)
+            .with_daemon_config_source(daemon_config_path, configured_port))
+    }
+
+    fn with_parsed_daemon_config(
+        self,
+        daemon_config: Option<daemon_config::DaemonConfig>,
+        activity_config: daemon_config::ActivityConfig,
+    ) -> Self {
         let storage_config = daemon_config
             .as_ref()
             .and_then(|config| config.storage.clone());
@@ -485,8 +507,7 @@ impl BootstrapConfig {
         let configured_modules = daemon_config
             .map(|config| config.modules)
             .unwrap_or_default();
-        Ok(self
-            .with_configured_modules(configured_modules)
+        self.with_configured_modules(configured_modules)
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_scope_authority_owners(scope_authority_owners)
@@ -494,7 +515,6 @@ impl BootstrapConfig {
             .with_activity_config(activity_config)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
             .with_reserved_capabilities(reserved_capabilities)
-            .with_daemon_config_source(daemon_config_path, configured_port))
     }
 
     pub fn with_configured_modules(
@@ -794,17 +814,52 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
 // authorization. Recovery must remain reachable even with invalid live files.
 fn load_bootstrap_authority(
     config: BootstrapConfig,
-    store: Option<&mut crate::config_store::ConfigStore>,
+    mut store: Option<&mut crate::config_store::ConfigStore>,
 ) -> Result<BootstrapConfig, BootstrapError> {
-    let recovery = store.is_some_and(|store| {
-        matches!(
-            store.status().state,
+    let store_state = store.as_mut().map(|store| store.status().state);
+    let recovery = matches!(
+        store_state,
+        Some(
             crate::config_store::StoreState::StoreUnverified
                 | crate::config_store::StoreState::StoreMissing
         )
-    });
+    );
     let authority = if recovery {
         BootstrapConfig::new(&config.connection_file_path, DEFAULT_SUBC_PORT)
+    } else if store_state == Some(crate::config_store::StoreState::Stamped) {
+        let store = store.expect("stamped store was just checked");
+        store
+            .delivery_ready()
+            .map_err(|error| BootstrapError::ConfigStore(error.to_string()))?;
+        let body = store
+            .body()
+            .map_err(|error| BootstrapError::ConfigStore(error.to_string()))?;
+        let layer = body
+            .generations
+            .get(&body.last_generation)
+            .and_then(|entry| entry.delivery.as_ref())
+            .and_then(|delivery| delivery.daemon.as_ref())
+            .ok_or_else(|| {
+                BootstrapError::ConfigStore("approved daemon snapshot is absent".into())
+            })?;
+        let bytes = layer.bytes.as_deref().ok_or_else(|| {
+            BootstrapError::ConfigStore("approved daemon bytes are absent".into())
+        })?;
+        let path = layer
+            .path
+            .as_deref()
+            .ok_or_else(|| BootstrapError::ConfigStore("approved daemon path is absent".into()))?;
+        let doc = std::str::from_utf8(bytes)
+            .map_err(|error| BootstrapError::ConfigStore(error.to_string()))?;
+        let (daemon, activity) = daemon_config::parse_with_activity(doc, Path::new(path))
+            .map_err(BootstrapError::DaemonConfig)?;
+        let port = daemon.port;
+        BootstrapConfig::new(
+            &config.connection_file_path,
+            port.unwrap_or(DEFAULT_SUBC_PORT),
+        )
+        .with_parsed_daemon_config(Some(daemon), activity)
+        .with_daemon_config_source(PathBuf::from(path), port)
     } else if config.defer_file_load {
         BootstrapConfig::from_env_with_daemon_config_path(
             config

@@ -245,11 +245,11 @@ async fn config_readers_apply_reports_approved_entries_separately_from_in_force_
         Arc::new(Presence),
         crate::operator_confirm::OperatorLimits::default(),
     );
-    let initial = module.configuration().unwrap();
     std::fs::write(
         rig.path.join("subc.jsonc"),
         json!({"version":1,"port":4321,
-        "modules":{"a":{"program":rig.path.join("program"),"args":["new-argument"],"enabled":true,
+        "modules":{"a":{"program":rig.path.join("program"),"args":["new-argument"],"enabled":false,
+            "health":{"cadence_ms":100,"deadline_ms":20},
             "restart":{"max_restarts":9},"drain_timeout_ms":17,"register_timeout_s":25}}})
         .to_string(),
     )
@@ -265,25 +265,32 @@ async fn config_readers_apply_reports_approved_entries_separately_from_in_force_
     assert_eq!(reply["restart_required"], true, "{reply}");
     let reply = request(&handler, json!({"op":"config.status"})).await;
     let inactive = reply["status"]["approved_but_inactive"].as_array().unwrap();
-    for entry in [
-        "port",
-        "args",
-        "enabled",
-        "restart",
-        "drain_timeout_ms",
-        "register_timeout_s",
-    ] {
-        let row = inactive
+    let row = inactive
+        .iter()
+        .find(|row| row["entry"] == "port")
+        .unwrap_or_else(|| panic!("missing port: {reply}"));
+    assert_eq!(row["waiting_for"], "daemon_restart");
+    assert_ne!(row["in_force"], row["approved"]);
+    assert!(
+        !inactive
             .iter()
-            .find(|row| row["entry"] == entry)
-            .unwrap_or_else(|| panic!("missing {entry}: {reply}"));
-        assert_eq!(row["waiting_for"], "daemon_restart");
-        if entry != "port" {
-            assert_eq!(row["module_id"], "a");
-        }
-        assert_ne!(row["in_force"], row["approved"]);
-    }
-    assert_eq!(module.configuration().unwrap(), initial);
+            .any(|row| row.get("module_id").is_some_and(|id| id == "a")
+                && row.get("entry").is_some()),
+        "{reply}"
+    );
+    assert_eq!(module.configuration().unwrap().0.args, ["new-argument"]);
+    let health = module.configuration().unwrap().1;
+    assert_eq!(health.cadence, std::time::Duration::from_millis(100));
+    assert_eq!(health.deadline, std::time::Duration::from_millis(20));
+    assert_eq!(module.status().unwrap().max_restarts, 9);
+    assert_eq!(
+        module.status().unwrap().drain_timeout,
+        std::time::Duration::from_millis(17)
+    );
+    assert_eq!(
+        module.configured_register_timeout().unwrap(),
+        std::time::Duration::from_secs(25)
+    );
     assert!(!module.status().unwrap().enabled);
     let preview = request(&handler, json!({"op":"supervisor.rescan","preview":true})).await;
     assert_eq!(
@@ -297,7 +304,7 @@ async fn config_readers_apply_reports_approved_entries_separately_from_in_force_
     )
     .unwrap();
     let reply = request(&handler, json!({"op":"supervisor.list"})).await;
-    assert_eq!(reply["modules"][0]["configured_enabled"], true, "{reply}");
+    assert_eq!(reply["modules"][0]["configured_enabled"], false, "{reply}");
     assert_eq!(reply["modules"][0]["enabled"], false, "{reply}");
     module.stop().await.unwrap();
 }

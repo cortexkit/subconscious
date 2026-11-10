@@ -28,6 +28,16 @@ public struct CatalogEntry {
     /// Raw per-role JSON declarations; each role owns its entry's schema.
     public let roleDeclarations: Any?
     public let nonceVerified: Bool?
+    /// Active-spawn discovery metadata, never evidence for authorization.
+    public let incarnation: String?
+    public let spawn: UInt64?
+    public let firstParty: Bool?
+    public let origin: CatalogOrigin?
+    public let requestedDeclarationsDigest: String?
+    public let approvedDeclarationsDigest: String?
+    /// Provider-owned JSON entries returned by a filtered catalog read.
+    public let approvedDeclarations: [String: Any]?
+    public let requestedDeclarations: [String: Any]?
 }
 
 /// One decoded subscribe-stream control event (the chat-renderable unit).
@@ -47,9 +57,20 @@ public struct SessionEvent {
 /// A durable resubscribe position: replay strictly AFTER this (wal_seq, sub_index).
 public typealias SubscribeCursor = (walSeq: UInt64, subIndex: UInt32)
 
+/// Only the optional connect-time capability exchange uses this I/O budget.
+public let CAPABILITY_PROBE_TIMEOUT: TimeInterval = 2
+
 public struct SubcError: Error {
     public let message: String
-    public init(message: String) { self.message = message }
+    public let code: String?
+    public let closeReason: RouteCloseReason?
+    public var routeOpenMayRetry: Bool { isRouteOpenRetryable(code) }
+    public init(message: String) { self.init(message: message, code: nil) }
+    public init(message: String, code: String?, closeReason: RouteCloseReason? = nil) {
+        self.message = message
+        self.code = code
+        self.closeReason = closeReason
+    }
 }
 
 public enum ClientLocalError: Error, Equatable, CustomStringConvertible {
@@ -80,12 +101,14 @@ final class ConnectionToken: @unchecked Sendable {}
 public struct RouteHandle: Hashable, Sendable {
     public let channel: UInt16
     public let epoch: UInt32
+    public let target: RouteOpenTarget?
     fileprivate let connectionToken: ConnectionToken
 
-    init(channel: UInt16, epoch: UInt32, connectionToken: ConnectionToken) {
+    init(channel: UInt16, epoch: UInt32, connectionToken: ConnectionToken, target: RouteOpenTarget? = nil) {
         self.channel = channel
         self.epoch = epoch
         self.connectionToken = connectionToken
+        self.target = target
     }
 
     public static func == (lhs: RouteHandle, rhs: RouteHandle) -> Bool {
@@ -118,6 +141,8 @@ public final class SubcClient {
     private var inFlight: Set<InFlightKey> = []
     private var abandonedRouteOpens: Set<UInt64> = []
     private var busyRoutes: Set<UInt16> = []
+    private var serverCapabilities: Set<String> = []
+    private var routeEndReasons: [UInt16: (epoch: UInt32, reason: RouteCloseReason)] = [:]
     private let busyNow: () -> TimeInterval
     private let busySleep: (TimeInterval) throws -> Void
     private let busyRandom: () -> Double
@@ -145,28 +170,105 @@ public final class SubcClient {
         }
         let transport = try POSIXTransport(host: endpoint.host, port: endpoint.port)
         try authenticateClient(transport, conn)
-        return SubcClient(transport: transport)
+        return connected(transport: transport)
+    }
+
+    // Capability discovery is advisory: a refused or unreadable describe reply
+    // must not prevent a connection to an older daemon.
+    static func connected(transport: Transport) -> SubcClient {
+        let client = SubcClient(transport: transport)
+        let probeTransport = transport as? CapabilityProbeTransport
+        probeTransport?.capabilityProbeDeadline = ProcessInfo.processInfo.systemUptime + CAPABILITY_PROBE_TIMEOUT
+        defer { probeTransport?.capabilityProbeDeadline = nil }
+        if let body = try? JSONSerialization.data(withJSONObject: ["op": "server.describe"]),
+           let reply = try? client.controlRequest(body: body, admissionClass: .normal),
+           let object = (try? JSONSerialization.jsonObject(with: reply)) as? [String: Any],
+           let capabilities = object["capabilities"] as? [String] {
+            client.serverCapabilities = Set(capabilities)
+        }
+        return client
     }
 
     /// List modules subc knows about (channel-0 catalog.list).
     public func catalogList(admissionClass: AdmissionClass = .normal) throws -> [CatalogEntry] {
-        let body = try JSONSerialization.data(withJSONObject: ["op": "catalog.list"])
+        try catalogList(moduleId: nil, admissionClass: admissionClass)
+    }
+
+    /// Narrow discovery to one module, including its provider declarations.
+    public func catalogList(moduleId: String?, admissionClass: AdmissionClass = .normal) throws -> [CatalogEntry] {
+        var payload: [String: Any] = ["op": "catalog.list"]
+        if let moduleId { payload["module_id"] = moduleId }
+        let body = try JSONSerialization.data(withJSONObject: payload)
         let reply = try controlRequest(body: body, admissionClass: admissionClass)
         guard let obj = try JSONSerialization.jsonObject(with: reply) as? [String: Any] else {
             throw SubcError(message: "catalog.list reply was not a JSON object")
         }
         let modules = obj["modules"] as? [[String: Any]] ?? []
-        return modules.map { module in
-            CatalogEntry(
+        return try modules.map { module in
+            try CatalogEntry(
                 moduleId: module["module_id"] as? String ?? "?",
                 roles: rolesOf(module["roles"]),
                 controlOps: module["control_ops"] as? [String] ?? [],
                 events: eventsOf(module["events"]),
                 richUi: richUiOf(module["rich_ui"]),
                 roleDeclarations: module["role_declarations"],
-                nonceVerified: module["nonce_verified"] as? Bool
+                nonceVerified: module["nonce_verified"] as? Bool,
+                incarnation: module["incarnation"] as? String,
+                spawn: authorityInteger(module["spawn"], field: "catalog.spawn"),
+                firstParty: wireBoolean(module["first_party"]),
+                origin: (module["origin"] as? String).map(CatalogOrigin.init(rawValue:)),
+                requestedDeclarationsDigest: module["requested_declarations_digest"] as? String,
+                approvedDeclarationsDigest: module["approved_declarations_digest"] as? String,
+                approvedDeclarations: module["approved_declarations"] as? [String: Any],
+                requestedDeclarations: module["requested_declarations"] as? [String: Any]
             )
         }
+    }
+
+    /// Read the initial catalog generation and later coalesced advances. Return
+    /// false from the callback to cancel. Like other calls, this owns the reader
+    /// until it returns; the callback must not issue requests on this client.
+    public func catalogWatch(
+        admissionClass: AdmissionClass = .normal,
+        onGeneration: (UInt64) -> Bool
+    ) throws {
+        try validateRequestAdmission(admissionClass)
+        let corr = try allocateCorr()
+        let key = InFlightKey(channel: 0, epoch: 0, corr: corr)
+        inFlight.insert(key)
+        defer { inFlight.remove(key) }
+        let body = try JSONSerialization.data(withJSONObject: ["op": "catalog.watch"])
+        try writeControlRequest(corr: corr, body: body, admissionClass: admissionClass)
+        var ended = false
+        defer {
+            if !ended {
+                try? transport.writeAll(encodeFrame(ty: .cancel, flags: 0, channel: 0, epoch: 0,
+                                                  corr: corr, body: Data()))
+            }
+        }
+        while true {
+            let frame = try nextIngressFrame()
+            guard frame.header.channel == 0, frame.header.epoch == 0, frame.header.corr == corr else { continue }
+            switch frame.header.ty {
+            case .response, .push, .streamData:
+                if !onGeneration(try CatalogWatchEvent(body: frame.body).generation) { return }
+            case .streamEnd:
+                ended = true
+                return
+            case .error:
+                ended = true
+                throw remoteError(prefix: "catalog.watch rejected", body: frame.body)
+            default:
+                continue
+            }
+        }
+    }
+
+    /// A lifecycle reason observed for this exact connection and route epoch.
+    public func routeCloseReason(for route: RouteHandle) -> RouteCloseReason? {
+        guard route.connectionToken === connectionToken,
+              let end = routeEndReasons[route.channel], end.epoch == route.epoch else { return nil }
+        return end.reason
     }
 
     /// Fetch a tool provider's definitions in broca's `session.send` shape.
@@ -214,6 +316,9 @@ public final class SubcClient {
         ]
         if let consumerCapabilities {
             payload["consumer_capabilities"] = consumerCapabilities
+        }
+        if serverCapabilities.contains(ROUTE_CLOSE_REASONS_CAPABILITY) {
+            payload["accepts_close_reasons"] = ACCEPTED_ROUTE_CLOSE_REASONS
         }
         let body = try JSONSerialization.data(withJSONObject: payload)
         let corr = try allocateCorr()
@@ -422,7 +527,8 @@ public final class SubcClient {
                 || frameHandle == (commandRoute.channel, commandRoute.epoch)
             {
                 throw SubcError(message:
-                    "route closed by daemon mid-turn (module restarted or drained) — resend to reopen")
+                    "route closed by daemon mid-turn", code: nil,
+                    closeReason: routeCloseReason(for: frame.header.channel == subscribeRoute.channel ? subscribeRoute : commandRoute))
             }
 
             let key = InFlightKey(
@@ -480,6 +586,7 @@ public final class SubcClient {
     public func close() {
         liveEpochs.removeAll()
         busyRoutes.removeAll()
+        routeEndReasons.removeAll()
         transport.close()
     }
 
@@ -535,7 +642,8 @@ public final class SubcClient {
                frame.header.channel == route.channel,
                frame.header.epoch == route.epoch
             {
-                throw SubcError(message: "route closed while request was in flight")
+                throw SubcError(message: "route closed while request was in flight", code: nil,
+                                closeReason: routeCloseReason(for: route))
             }
             guard frameKey == key else { continue }
             switch frame.header.ty {
@@ -611,6 +719,13 @@ public final class SubcClient {
             let frame = try readFrame(from: transport)
             if frame.header.channel == 0 {
                 if try consumeLateRouteOpen(frame) { continue }
+                if frame.header.ty == .push, let push = RouteControlPush(body: frame.body) {
+                    for channel in push.channels {
+                        if let epoch = liveEpochs[channel] {
+                            routeEndReasons[channel] = (epoch, push.reason)
+                        }
+                    }
+                }
                 return frame
             }
             guard liveEpochs[frame.header.channel] == frame.header.epoch else {
@@ -663,9 +778,11 @@ public final class SubcClient {
         let route = RouteHandle(
             channel: UInt16(channel),
             epoch: UInt32(epoch),
-            connectionToken: connectionToken
+            connectionToken: connectionToken,
+            target: try RouteOpenTarget.read(object["target"])
         )
         liveEpochs[route.channel] = route.epoch
+        routeEndReasons.removeValue(forKey: route.channel)
         busyRoutes.remove(route.channel)
         if object["request_window"] != nil { busyRoutes.insert(route.channel) }
         return route
@@ -770,7 +887,8 @@ public final class SubcClient {
 
     private func remoteError(prefix: String, body: Data) -> SubcError {
         let message = String(data: body, encoding: .utf8) ?? "<binary>"
-        return SubcError(message: "\(prefix): \(message)")
+        let object = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+        return SubcError(message: "\(prefix): \(message)", code: object?["code"] as? String)
     }
 }
 

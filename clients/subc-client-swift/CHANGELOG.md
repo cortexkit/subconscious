@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Read optional catalog authority metadata and provider declarations, expose
+  `catalogWatch` generation updates, and retain `route.open` target metadata on
+  `RouteHandle`. Missing or incomplete targets are unmarked; unknown origins
+  become `other`, and unknown target kinds cannot retain spawn authority.
+  Authority integers above 2^53−1 are malformed. Discovery metadata is never
+  authorization evidence. Swift remains a consumer client, with no API for
+  accepting requests on behalf of a supervised module.
+- Decode `authority_changed` as reopenable and expose refusal codes, including
+  retryable `stale_authority_epoch`, without automatically retrying route opens.
+  On connection, best-effort `server.describe` caches capability support with a
+  two-second I/O budget, after which ordinary reads remain blocking as before.
+  Swift has no route deadline to intersect with this connect-time budget.
+  `accepts_close_reasons` is sent on every open only when `route-close-reasons/v1`
+  is present. Describe refusal or failure keeps the connection usable without
+  the field. Existing public enum case lists and public initializer signatures
+  are unchanged.
+
 - Tag session subscriptions only when the route negotiated credit windows;
   older daemons keep the original subscription frame flags.
 - Opt in to route credit refusals. Only trusted

@@ -96,7 +96,7 @@ final class ContractTablesTests: XCTestCase {
         )
     }
 
-    func testDecisionTablesPinBusyAndLeaveRouteOpenAndCloseUnmanaged() throws {
+    func testDecisionTablesMatchReaderClassifiersAndBusyRefusals() throws {
         let url = loadGoldenURL(name: "decision_tables")
         let data = try Data(contentsOf: url)
         let decoder = JSONDecoder()
@@ -130,13 +130,24 @@ final class ContractTablesTests: XCTestCase {
             "route_close_disposition decision table must not be empty"
         )
 
-        // The Swift SubcClient does not carry route.open retry classifiers or
-        // route close disposition mappings (route opens fail immediately to caller;
-        // routes do not automatically reopen on close). Assert absence explicitly.
-        let swiftClientCarriesDecisionTables = false
-        XCTAssertFalse(
-            swiftClientCarriesDecisionTables,
-            "Swift SubcClient does not carry route_open_retryable or route_close_disposition classifiers"
-        )
+        // Classification is exposed to callers; the synchronous client does not
+        // automatically reopen routes or retry failed opens.
+        for (code, disposition) in tables.routeOpenRetryable {
+            XCTAssertEqual(SubcError(message: "refused", code: code).routeOpenMayRetry,
+                           disposition == "retryable", code)
+        }
+        for (reason, disposition) in tables.routeCloseDisposition {
+            XCTAssertEqual(RouteCloseReason(rawValue: reason).mayReopen, disposition == "may_reopen", reason)
+        }
+    }
+
+    func testReaderSkewCloseReasonListCoversEveryMappedReason() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let tables = try decoder.decode(DecisionTables.self, from: Data(contentsOf: loadGoldenURL(name: "decision_tables")))
+        XCTAssertEqual(Set(ACCEPTED_ROUTE_CLOSE_REASONS), Set(tables.routeCloseDisposition.keys))
+        XCTAssertEqual(ACCEPTED_ROUTE_CLOSE_REASONS.count, Set(ACCEPTED_ROUTE_CLOSE_REASONS).count)
+        XCTAssertEqual(tables.routeCloseDisposition["authority_changed"], "may_reopen")
+        XCTAssertEqual(tables.routeOpenRetryable["stale_authority_epoch"], "retryable")
     }
 }

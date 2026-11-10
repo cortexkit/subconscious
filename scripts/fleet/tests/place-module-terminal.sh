@@ -63,6 +63,7 @@ set -euo pipefail
 case "$*" in
   '--ck-cli-face-reserved-names') echo module; exit 0 ;;
   'module status demo') exit 0 ;;
+  '--json config status') echo '{"status":{"state":"unstamped","development_switches":[]}}' ;;
   '--json provenance demo')
     echo provenance >>"$CK_TEST_CASE/events"
     echo '{"modules":[{"daemon_observed":{"pid":4242}}]}' ;;

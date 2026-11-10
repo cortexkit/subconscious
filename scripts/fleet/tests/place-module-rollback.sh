@@ -73,6 +73,7 @@ if [ "${1:-}" = module ] && [ "${2:-}" = status ]; then exit 0; fi
 if [ "$*" = '--json config status' ]; then
   case "${CK_CONFIG_STATE:-unstamped}" in
     older) printf 'unknown_control_op — config.status\n' >&2; exit 1 ;;
+    oldck) printf "unknown command 'config'. No ck-config in the CortexKit bin folder (~/.local/share/cortexkit/bin, from HOME) or on PATH. Run ck --help.\n" >&2; exit 1 ;;
     inactive) printf 'config_gate_inactive — no config store configured\n' >&2; exit 1 ;;
     broken) printf 'daemon unreachable\n' >&2; exit 3 ;;
     malformed) printf '{broken'; exit 0 ;;
@@ -279,16 +280,19 @@ case_dry_run_changes_nothing() {
 
 case_config_gate_preflight() {
   local state before output
-  for state in older inactive unstamped stamped broken malformed store_unverified; do
+  for state in older oldck inactive unstamped stamped broken malformed store_unverified; do
     new_sandbox "config-gate-$state"
     make_binary_rollback
     before=$(shasum -a 256 "$DEST" | awk '{print $1}')
     if output=$(CK_CONFIG_STATE="$state" invoke --place 2>&1); then
-      case "$state" in older|inactive|unstamped) ;; *) fail "$state unexpectedly placed" ;; esac
+      case "$state" in older|oldck|inactive|unstamped) ;; *) fail "$state unexpectedly placed" ;; esac
       assert test "$(<"$CASE_DIR/ck-calls")" = 'restart demo'
       assert test "$(shasum -a 256 "$DEST" | awk '{print $1}')" != "$before"
       if [ "$state" = older ] || [ "$state" = inactive ]; then
         assert_contains "$output" 'config gate inactive on this daemon; placing as before'
+      fi
+      if [ "$state" = oldck ]; then
+        assert_contains "$output" 'this ck has no config command'
       fi
     else
       case "$state" in stamped|broken|malformed|store_unverified) ;; *) fail "$state unexpectedly refused: $output" ;; esac

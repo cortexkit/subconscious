@@ -313,6 +313,14 @@ config_gate_preflight() {
         say "config gate inactive on this daemon; placing as before"
         return 0
         ;;
+      # A ck from before the gate has no config command. It ships with a daemon
+      # from before the gate, so there is no gate to bypass; and if the daemon
+      # is newer, its own admission check still refuses unapproved programs.
+      "unknown command 'config'"*)
+        CONFIG_GATE_STATE=inactive
+        say "this ck has no config command (it predates the config gate); placing as before"
+        return 0
+        ;;
       *) refuse "cannot read config gate status; nothing placed: $status" ;;
     esac
   fi

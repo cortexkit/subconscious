@@ -226,6 +226,20 @@ impl crate::config_gate::ReviewAdmission for Admitted {
 
 fn adapt_control(mut handler: ControlHandler) -> ControlHandler {
     handler = handler.with_config_os_prompt_policy_for_tests();
+    handler = handler.with_recovery_exit_retry_pause_for_test(|generation| {
+        let root = PathBuf::from(std::env::var_os("RECOVERY_ROOT").unwrap());
+        let pause = root.join("pause-exit-retry");
+        if pause.exists() {
+            std::fs::write(
+                root.join("exit-retry-paused-generation"),
+                generation.to_string(),
+            )
+            .unwrap();
+            Some(pause)
+        } else {
+            None
+        }
+    });
     handler = handler.with_recovery_exit_test_hook(
         |step| {
             let root = PathBuf::from(std::env::var_os("RECOVERY_ROOT").unwrap());
@@ -952,5 +966,51 @@ async fn config_recovery_spawned_unstamp_hints_changed_opted_in_module_without_r
         "the opted-in connection must survive unstamp"
     );
     drop(module);
+    drop(daemon);
+}
+
+#[cfg(feature = "dev-desktop-approval")]
+#[tokio::test]
+async fn config_recovery_superseding_failed_exit_keeps_its_own_timer() {
+    let _serial = DAEMONS.lock().await;
+    let rig = Rig::new(true);
+    rig.seed();
+    rig.reject_store(false);
+    for name in ["fail-exit-step", "quiet-exit-retry", "pause-exit-retry"] {
+        std::fs::write(rig.dir.join(name), b"1").unwrap();
+    }
+    let daemon = rig.start().await;
+    let mut client = rig.local().await;
+    let first = apply(&mut client, "config.stamp").await;
+    assert_eq!(first["code"], "rescan_failed", "{first}");
+    wait_path(&rig.dir, "exit-retry-paused-generation").await;
+    assert_eq!(
+        std::fs::read_to_string(rig.dir.join("exit-retry-paused-generation")).unwrap(),
+        "1"
+    );
+    let second = apply(&mut client, "config.stamp").await;
+    assert_eq!(second["code"], "rescan_failed", "{second}");
+    let status = rpc(&mut client, json!({"op":"config.status"})).await;
+    assert_eq!(
+        status["status"]["approved_but_inactive"][0]["generation"], 2,
+        "{status}"
+    );
+    assert_eq!(status["status"]["state"], "store_unverified", "{status}");
+    // Only the coordinator's timer may wake after its stale generation returns.
+    // The second commit really ran inline reconciliation and hit the same fault.
+    std::fs::remove_file(rig.dir.join("fail-exit-step")).unwrap();
+    std::fs::remove_file(rig.dir.join("pause-exit-retry")).unwrap();
+    wait_path(&rig.dir, "exit-definitions-reconciled").await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status = rpc(&mut client, json!({"op":"config.status"})).await;
+            if status["status"]["state"] == "stamped" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("superseding exit must retry without another state notification");
     drop(daemon);
 }

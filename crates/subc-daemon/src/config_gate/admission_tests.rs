@@ -2130,6 +2130,11 @@ async fn config_recovery_reaped_child_refuses_hello_before_exit_cleanup() {
 async fn config_recovery_unstamped_respawn_admits_fresh_nonce_and_refuses_dead_nonce() {
     let rig = rig();
     wire_fixture_document(&rig, json!(["600"]));
+    let path = rig.path.join("subc.jsonc");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    doc["modules"]["a"]["reserved"] = json!(true);
+    std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
     let owner = Arc::new(rig.owner("unstamped-respawn"));
     rig.stamp(&owner);
     let registry = Arc::new(crate::Registry::default());
@@ -2142,11 +2147,34 @@ async fn config_recovery_unstamped_respawn_admits_fresh_nonce_and_refuses_dead_n
     let dead_nonce = handle.spawn_launch_nonce_for("a").unwrap();
     assert!(handle.wait_program_binding("a", &dead_nonce).await);
     approve(&rig, &owner, PlanKind::Unstamp);
+    #[cfg(target_os = "linux")]
+    let (reaped, release) = handle.pause_program_binding_exit_for_test("a", &dead_nonce);
     subc_os::Process::open(pid)
         .unwrap()
         .unwrap()
         .signal(subc_os::Signal::Kill)
         .unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        tokio::time::timeout(Duration::from_secs(5), reaped)
+            .await
+            .unwrap()
+            .unwrap();
+        let handler = crate::ControlHandler::new(registry.clone())
+            .with_supervisor(handle.clone())
+            .with_config_runtime(owner.clone());
+        let dead = handler
+            .handle_control(
+                ConnectionId::new(784),
+                module_hello(Some(dead_nonce.clone())),
+            )
+            .unwrap();
+        let _ = release.send(());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&dead[0].body).unwrap()["code"],
+            "program_refused"
+        );
+    }
     let fresh_nonce = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Some(nonce) = handle.spawn_launch_nonce_for("a") {
@@ -2178,9 +2206,11 @@ async fn config_recovery_unstamped_respawn_admits_fresh_nonce_and_refuses_dead_n
         subc_protocol::FrameType::HelloAck,
         "fresh unstamped respawn must register: {fresh:?}"
     );
+    assert_eq!(dead[0].header.ty, subc_protocol::FrameType::Error);
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&dead[0].body).unwrap()["code"],
-        "program_refused"
+        "reserved_module",
+        "rotation prunes the dead nonce's content record, but reserved identity still refuses it"
     );
 }
 
@@ -2593,4 +2623,273 @@ async fn config_admission_hold_after_final_hello_check_preserves_admission_but_r
     assert_eq!(status.pid, pid);
     assert_eq!(status.spawn_generation, generation);
     assert_eq!(status.restart_count, 0);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn config_recovery_late_swap_incumbent_cannot_erase_promoted_nonce_refusal() {
+    for respawn in [false, true] {
+        let rig = rig();
+        wire_fixture_document(&rig, json!(["600"]));
+        let path = rig.path.join("subc.jsonc");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        doc["modules"]["a"]["reserved"] = json!(true);
+        doc["modules"]["a"]["overlap"] = json!("safe");
+        std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        let owner = Arc::new(rig.owner("late-incumbent"));
+        rig.stamp(&owner);
+        let registry = Arc::new(crate::Registry::default());
+        let forwarding = Arc::new(crate::ForwardingTable::default());
+        let handle = SupervisorHandle::new();
+        let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone())
+            .with_forwarding(forwarding.clone())
+            .with_config_runtime(owner.clone())
+            .with_drain_timeout(Duration::from_secs(30));
+        let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+        let incumbent_pid = reported_pid(&module).await;
+        let incumbent_nonce = handle.spawn_launch_nonce_for("a").unwrap();
+        assert!(handle.wait_program_binding("a", &incumbent_nonce).await);
+        let mut manifest = subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build();
+        manifest.ready = Some(true);
+        let incumbent = ConnectionId::new(790);
+        let candidate = ConnectionId::new(791);
+        registry
+            .register_with_control_ops(
+                manifest.clone(),
+                subc_protocol::PROTOCOL_VERSION,
+                incumbent,
+                vec![],
+            )
+            .unwrap();
+        let (tx, _incumbent_frames) = tokio::sync::mpsc::channel(32);
+        forwarding
+            .register_module_connection(
+                incumbent,
+                "a".into(),
+                subc_protocol::PROTOCOL_VERSION,
+                subc_protocol::manifest::Concurrency::ModuleManaged,
+                crate::FrameSink::new(tx),
+            )
+            .unwrap();
+        let swapping = tokio::spawn({
+            let module = module.clone();
+            async move { module.swap(Some(Duration::from_secs(5))).await }
+        });
+        let candidate_nonce = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(nonce) = handle.candidate_launch_nonce_for_test("a") {
+                    if handle.has_live_verified_program_binding("a", &nonce) {
+                        break nonce;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        approve(&rig, &owner, PlanKind::Unstamp);
+        registry
+            .register_candidate_with_control_ops(
+                manifest,
+                subc_protocol::PROTOCOL_VERSION,
+                candidate,
+                vec![],
+            )
+            .unwrap();
+        let (tx, _candidate_frames) = tokio::sync::mpsc::channel(32);
+        forwarding
+            .register_candidate_module_connection(
+                candidate,
+                "a".into(),
+                subc_protocol::PROTOCOL_VERSION,
+                subc_protocol::manifest::Concurrency::ModuleManaged,
+                crate::FrameSink::new(tx),
+            )
+            .unwrap();
+        assert!(swapping.await.unwrap().is_ok());
+        assert_eq!(
+            handle.spawn_launch_nonce_for("a").as_deref(),
+            Some(candidate_nonce.as_str())
+        );
+        registry.deregister_connection(candidate).unwrap();
+        let fresh_nonce = if respawn {
+            subc_os::Process::open(reported_pid(&module).await)
+                .unwrap()
+                .unwrap()
+                .signal(subc_os::Signal::Kill)
+                .unwrap();
+            Some(
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if let Some(nonce) = handle.spawn_launch_nonce_for("a") {
+                            if nonce != candidate_nonce && module.status().unwrap().process_alive {
+                                break nonce;
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("fresh plain respawn must run while the old incumbent drains"),
+            )
+        } else {
+            module.stop().await.unwrap();
+            None
+        };
+        assert!(handle.has_program_binding_record("a", &candidate_nonce));
+        let handler = crate::ControlHandler::with_forwarding(registry.clone(), forwarding)
+            .with_supervisor(handle.clone())
+            .with_config_runtime(owner);
+        if let Some(fresh) = &fresh_nonce {
+            assert!(handle.spawned_consumer_authorized("a", &incumbent_nonce));
+            assert!(handle.spawned_consumer_authorized("a", &candidate_nonce));
+            assert!(handle.spawned_consumer_authorized("a", fresh));
+            let dead = handler
+                .handle_control(
+                    ConnectionId::new(792),
+                    module_hello(Some(candidate_nonce.clone())),
+                )
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&dead[0].body).unwrap()["code"],
+                "program_refused"
+            );
+            let fresh_reply = handler
+                .handle_control(ConnectionId::new(793), module_hello(Some(fresh.clone())))
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&fresh_reply[0].body).unwrap()["code"],
+                "swap_token_invalid",
+                "the existing swap gate refuses fresh plain spawns until the old drain closes"
+            );
+        }
+        // The old process drains in a detached task. Reap it only after the promoted
+        // process has died, so its later retirement must not replace that refusal.
+        registry.deregister_connection(incumbent).unwrap();
+        subc_os::Process::open(incumbent_pid)
+            .unwrap()
+            .unwrap()
+            .signal(subc_os::Signal::Kill)
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.swap_open("a") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if let Some(fresh) = fresh_nonce {
+            assert!(!handle.has_program_binding_record("a", &candidate_nonce));
+            assert!(!handle.has_program_binding_record("a", &incumbent_nonce));
+            let reply = handler
+                .handle_control(ConnectionId::new(793), module_hello(Some(fresh)))
+                .unwrap();
+            handler.cleanup_connection(ConnectionId::new(793)).unwrap();
+            module.stop().await.unwrap();
+            assert_eq!(
+                reply[0].header.ty,
+                subc_protocol::FrameType::HelloAck,
+                "fresh spawn registers once the old drain closes: {reply:?}"
+            );
+        } else {
+            assert!(handle.reserved_hello_authorized("a", Some(&candidate_nonce)));
+            assert!(handle.spawned_consumer_authorized("a", &candidate_nonce));
+            let reply = handler
+                .handle_control(ConnectionId::new(792), module_hello(Some(candidate_nonce)))
+                .unwrap();
+            handler.cleanup_connection(ConnectionId::new(792)).unwrap();
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&reply[0].body).unwrap()["code"], "program_refused", "late incumbent retirement must preserve the still-current promoted nonce's refusal: {reply:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn config_recovery_stamped_unapproved_actor_enable_is_refused() {
+    let rig = rig();
+    let owner = Arc::new(rig.owner("unapproved-enable"));
+    rig.stamp(&owner);
+    let mut unapproved = spec(&rig);
+    unapproved.module_id = "not-approved".into();
+    let supervisor = Supervisor::new_for_test(
+        Arc::new(crate::Registry::default()),
+        RestartPolicy::default(),
+    )
+    .with_config_runtime(owner);
+    let module = supervisor
+        .supervise_configured_requested_async(
+            unapproved,
+            false,
+            crate::HealthConfig::default(),
+            None,
+            RestartPolicy::default(),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .unwrap();
+    let result = module.set_enabled(true).await;
+    let state = module.status().unwrap();
+    module.stop().await.unwrap();
+    assert!(
+        matches!(result, Err(crate::SuperviseError::ConfigHeld { ref code, .. }) if code == "config_gated"),
+        "stamped-unapproved enable must refuse, not stage: {result:?}"
+    );
+    assert!(!state.enabled);
+    assert!(!state.process_alive);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn config_recovery_carried_command_close_reap_retires_before_group_cleanup() {
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let path = rig.path.join("subc.jsonc");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    doc["modules"]["a"]["reserved"] = json!(true);
+    doc["modules"]["a"]["carry_containment"] = json!(true);
+    doc["modules"]["a"]["overlap"] = json!("exclusive");
+    std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let owner = Arc::new(rig.owner("carried-command-close"));
+    rig.stamp(&owner);
+    let registry = Arc::new(crate::Registry::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let mut module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    reported_pid(&module).await;
+    let nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    assert!(handle.wait_program_binding("a", &nonce).await);
+    let (reaped, release) = handle.pause_program_binding_exit_for_test("a", &nonce);
+    approve(&rig, &owner, PlanKind::Unstamp);
+    let closing = tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            handle.close_actor_commands_for_test(&mut module).await;
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), reaped)
+        .await
+        .unwrap()
+        .unwrap();
+    let handler = crate::ControlHandler::new(registry)
+        .with_supervisor(handle)
+        .with_config_runtime(owner);
+    let reply = handler
+        .handle_control(ConnectionId::new(794), module_hello(Some(nonce)))
+        .unwrap();
+    handler.cleanup_connection(ConnectionId::new(794)).unwrap();
+    let _ = release.send(());
+    tokio::time::timeout(Duration::from_secs(5), closing)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&reply[0].body).unwrap()["code"],
+        "program_refused",
+        "carried pin reap must retire before the paused recover_group await: {reply:?}"
+    );
 }

@@ -10,6 +10,8 @@ pub(crate) type Slot = Arc<Mutex<Option<Arc<CarriedContainment>>>>;
 #[derive(Debug)]
 pub(crate) struct CarriedContainment {
     #[cfg(unix)]
+    binding_retirement: Mutex<Option<super::program_binding::ProgramBindingRetirement>>,
+    #[cfg(unix)]
     module_id: String,
     #[cfg(unix)]
     counters: crate::observability::DaemonCounters,
@@ -425,7 +427,24 @@ impl CarriedContainment {
                     // while the child's original I/O reactor is blocked.
                     loop {
                         match child.try_wait() {
-                            Ok(Some(_)) => break,
+                            Ok(Some(_)) => {
+                                let binding = self
+                                    .binding_retirement
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .as_ref()
+                                    .and_then(|hook| hook.upgrade());
+                                // The command arm can reap this pin independently
+                                // of SupervisedChild::wait. Revoke before cleanup awaits.
+                                if let Some(binding) = &binding {
+                                    binding.retire();
+                                }
+                                #[cfg(all(test, target_os = "linux"))]
+                                if let Some(binding) = &binding {
+                                    binding.pause_after_wait_for_test().await;
+                                }
+                                break;
+                            }
                             Ok(None) => sleep(Duration::from_millis(1)).await,
                             Err(error) => {
                                 warn!(module_id = %self.module_id, %error, "carried process-group pin reap failed");
@@ -730,6 +749,13 @@ pub(super) fn adopt(
         }
     }
     child.child.container = Arc::downgrade(&container);
+    #[cfg(unix)]
+    if let Some(binding) = &child._program_binding {
+        *container
+            .binding_retirement
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(binding.retirement_hook());
+    }
     child.child.slot = Arc::downgrade(&roster.containment);
     #[cfg(windows)]
     {
@@ -770,6 +796,7 @@ pub(super) fn prepare_before_exec(
     #[cfg(not(target_os = "linux"))]
     let resource = group();
     let owned = Arc::new(CarriedContainment {
+        binding_retirement: Mutex::new(None),
         module_id: spec.module_id.clone(),
         counters: roster.counters.clone(),
         cleanup_block: Mutex::new(None),
@@ -1008,6 +1035,7 @@ mod anchor_tests {
             .start_time;
         let group_signals = Arc::new(Mutex::new(Vec::new()));
         let container = CarriedContainment {
+            binding_retirement: Mutex::new(None),
             module_id: "mismatched-pin-birth".into(),
             counters: crate::observability::DaemonCounters::default(),
             cleanup_block: Mutex::new(None),
@@ -1046,6 +1074,7 @@ mod anchor_tests {
         // No process owns this fixture: a missing creation identity and no
         // child handle must remain unverifiable without sending any signal.
         let container = Arc::new(CarriedContainment {
+            binding_retirement: Mutex::new(None),
             module_id: "unverifiable-admission".into(),
             counters: crate::observability::DaemonCounters::default(),
             cleanup_block: Mutex::new(None),
@@ -1113,6 +1142,7 @@ mod anchor_tests {
         // live when the destructor must decide whether to retain ownership.
         let group_signals = Arc::new(Mutex::new(Vec::new()));
         let container = Arc::new(CarriedContainment {
+            binding_retirement: Mutex::new(None),
             module_id: "drop-retention".into(),
             counters: crate::observability::DaemonCounters::default(),
             cleanup_block: Mutex::new(None),
@@ -1198,6 +1228,7 @@ mod anchor_tests {
         let group_signals = Arc::new(Mutex::new(Vec::new()));
         let counters = crate::observability::DaemonCounters::default();
         let container = Arc::new(CarriedContainment {
+            binding_retirement: Mutex::new(None),
             module_id: "lost-anchor-fixture".into(),
             counters: counters.clone(),
             cleanup_block: Mutex::new(None),
@@ -1334,6 +1365,7 @@ mod cgroup_policy_tests {
         let mut leader = leader.spawn().unwrap();
         let signals = Arc::new(Mutex::new(Vec::new()));
         let container = Arc::new(CarriedContainment {
+            binding_retirement: Mutex::new(None),
             module_id: "carried-cgroup-policy".into(),
             resource: Resource::Cgroup {
                 identity: LaunchIdentity::capture().unwrap(),

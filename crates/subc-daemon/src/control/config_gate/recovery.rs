@@ -2,6 +2,14 @@ use super::*;
 
 impl ControlHandler {
     #[cfg(all(test, feature = "test-support", unix))]
+    pub(crate) fn with_recovery_exit_retry_pause_for_test(
+        mut self,
+        pause: fn(u64) -> Option<std::path::PathBuf>,
+    ) -> Self {
+        self.recovery_exit_test_retry_pause = Some(pause);
+        self
+    }
+    #[cfg(all(test, feature = "test-support", unix))]
     pub(crate) fn with_recovery_exit_test_hook(
         mut self,
         hook: fn(usize) -> std::result::Result<(), GateError>,

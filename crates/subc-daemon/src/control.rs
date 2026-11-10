@@ -455,6 +455,8 @@ pub struct ControlHandler {
     recovery_exit_test_after_step: Option<fn(usize) -> Result<(), crate::config_gate::GateError>>,
     #[cfg(test)]
     recovery_exit_test_quiet_retry: bool,
+    #[cfg(test)]
+    recovery_exit_test_retry_pause: Option<fn(u64) -> Option<PathBuf>>,
     /// Test-only Windows signature and flash hooks. Production builds carry
     /// neither: with the publisher unset, the production table never reaches
     /// verification, and the default attention hook only logs.
@@ -1080,6 +1082,8 @@ impl ControlHandler {
             recovery_exit_test_after_step: None,
             #[cfg(test)]
             recovery_exit_test_quiet_retry: false,
+            #[cfg(test)]
+            recovery_exit_test_retry_pause: None,
             #[cfg(windows)]
             windows_verify: None,
             #[cfg(windows)]

@@ -8,6 +8,7 @@ use crate::supervise::ModuleSpec;
 pub(super) struct AdmissionCache {
     state: StoreState,
     file_authoritative: bool,
+    unstamp_exit_pending: bool,
     modules: BTreeMap<String, ModuleAdmission>,
     fenced: BTreeSet<String>,
 }
@@ -78,6 +79,7 @@ impl AdmissionCache {
         let mut cache = Self {
             state,
             file_authoritative: state == StoreState::Unstamped,
+            unstamp_exit_pending: false,
             modules: BTreeMap::new(),
             fenced: BTreeSet::new(),
         };
@@ -167,6 +169,7 @@ impl AdmissionCache {
 
     pub(super) fn from_state(state: &OwnerState) -> Self {
         let mut cache = Self::from_store_at(&state.store, state.delivery.started_at_generation());
+        cache.unstamp_exit_pending = cache.file_authoritative && state.authority_exit.is_some();
         if state.recovery_exit_hold {
             cache.state = StoreState::StoreUnverified;
         }
@@ -230,6 +233,13 @@ impl SpawnAdmission {
 }
 
 impl RuntimeOwner {
+    /// Only a committed, still-pending unstamp may stage enabled state while held.
+    pub(crate) fn can_stage_unstamp_enable(&self) -> bool {
+        self.admission
+            .read()
+            .map(|cache| cache.unstamp_exit_pending)
+            .unwrap_or(false)
+    }
     /// A committed unstamp permits its definition reconciliation while the
     /// separate recovery admission hold still prevents every child spawn.
     pub(crate) fn file_configuration_is_gated(&self, module: &str) -> bool {

@@ -2,6 +2,12 @@
 
 ## 0.41.10
 
+- Retain a separate dead-binding refusal for every nonce still recognized by
+  current, reserved or draining-swap admission; prune only after rotation or swap
+  closure removes its last acceptance surface. Retire registration-timeout reaps
+  before health probing, keep a superseding recovery exit's retry timer armed,
+  and limit held enable staging to a committed unstamp that is still pending.
+
 - Refuse retired launch nonces without blocking fresh unstamped respawns, and
   retire binding authority immediately when plain or swap child waits return.
   Recheck retired bindings before publishing unstamped HELLO registrations.

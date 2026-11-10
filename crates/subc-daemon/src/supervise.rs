@@ -425,6 +425,16 @@ impl SupervisedChild {
         self.process_identity
     }
 
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let result = self.child.try_wait();
+        if matches!(result, Ok(Some(_))) {
+            if let Some(binding) = &self._program_binding {
+                binding.retire();
+            }
+        }
+        result
+    }
+
     async fn wait(&mut self) -> io::Result<ExitStatus> {
         #[cfg(target_os = "macos")]
         self.confirm_privacy_exec().await;
@@ -2473,6 +2483,7 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(module_id.to_string(), nonce);
+        self.refresh_program_binding_nonces(module_id);
     }
 
     /// Record the launch nonce expected from the next HELLO for a reserved module,
@@ -2482,6 +2493,7 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(module_id.to_string(), Some(nonce));
+        self.refresh_program_binding_nonces(module_id);
     }
 
     /// Record namespace prefixes owned by a supervised module.
@@ -2525,6 +2537,7 @@ impl SupervisorHandle {
             reserved_nonces.insert(spec.module_id.clone(), spawn_nonce);
         }
         drop(reserved_nonces);
+        self.refresh_program_binding_nonces(&spec.module_id);
         // A later unreserved declaration must not silently unreserve an id that
         // was retained after its reserved configuration was removed. The explicit
         // release ceremony is the only operation that retires that gate.
@@ -2662,6 +2675,7 @@ impl SupervisorHandle {
                     candidate_admitted: false,
                 },
             );
+        self.refresh_program_binding_nonces(module_id);
     }
 
     /// Close the swap for `module_id`, releasing whichever nonce is no longer
@@ -2671,6 +2685,7 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(module_id);
+        self.refresh_program_binding_nonces(module_id);
     }
 
     /// Install the observer told about swap promotions, replacing any earlier
@@ -7974,7 +7989,7 @@ async fn supervise_loop(
                         active_child.registration_deadline = None;
                         if !runtime.child_roster.is_closed()
                             && !active_child.registered_since_spawn()
-                            && active_child.child.try_wait().is_ok_and(|status| status.is_none())
+                            && registration_child_is_running(active_child)
                         {
                             warn!(module_id = %spec.module_id, pid = active_child.pid,
                                 wait_secs = runtime.register_timeout.as_secs(),
@@ -8319,12 +8334,14 @@ async fn handle_supervisor_command(
                 reply,
             } => {
                 if matches!(error, SuperviseError::ConfigHeld { .. })
-                    && runtime.config_delivery.as_ref().is_some_and(|delivery| {
-                        !delivery.0.file_configuration_is_gated(&spec.module_id)
-                    })
+                    && runtime
+                        .config_delivery
+                        .as_ref()
+                        .is_some_and(|delivery| delivery.0.can_stage_unstamp_enable())
                 {
-                    // The same committed-unstamp exception as UpdateConfiguration
-                    // stages desired state only. Admission release starts it later.
+                    // Stage only the pending unstamp's desired state. A stamped
+                    // unapproved actor stays refused; admission release starts
+                    // an unstamped actor only after reconciliation completes.
                     let mut changed = false;
                     let result = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                         changed = !state.enabled;
@@ -11420,9 +11437,7 @@ fn launch_child_in_slot(
             }
             // Reap through the normal child-reaping path, retaining the real exit record and
             // its roster ownership. A refusal must also end any helpers.
-            if error.code == "program_refused"
-                || supervised.child.try_wait().ok().flatten().is_none()
-            {
+            if error.code == "program_refused" || supervised.try_wait().ok().flatten().is_none() {
                 supervised.spawn_failure = Some(format!("{}: {}", error.code, error.detail));
                 #[cfg(all(test, target_os = "linux"))]
                 assert!(roster.admission_event_for_test(
@@ -20582,4 +20597,8 @@ mod retained_status_tests {
             assert!(!status.process_alive);
         }
     }
+}
+
+fn registration_child_is_running(child: &mut SupervisedChild) -> bool {
+    child.try_wait().is_ok_and(|status| status.is_none())
 }

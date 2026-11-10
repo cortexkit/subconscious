@@ -57,6 +57,8 @@ impl ControlHandler {
             let mut restarting = HashSet::<(String, u64)>::new();
             let mut recovery_holds = HashSet::<String>::new();
             let mut exit_retry = AuthorityExitRetry::default();
+            #[cfg(test)]
+            let mut quiet_after_retry_pause = false;
             loop {
                 let (next_anchor, listen_for_changes) = {
                     let Some(control) = handler.upgrade() else {
@@ -107,14 +109,28 @@ impl ControlHandler {
                         .await
                         .unwrap_or((None, exit_retry.generation));
                     if let Some(generation) = ready_exit {
+                        #[cfg(test)]
+                        if let Some(path) = control
+                            .recovery_exit_test_retry_pause
+                            .and_then(|pause| pause(generation))
+                        {
+                            quiet_after_retry_pause = true;
+                            while path.exists() {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
                         if let Err(error) = control
                             .reconcile_authority_exit(owner.clone(), generation)
                             .await
                         {
                             warn!(%error, "approved configuration exit could not be reconciled");
-                        } else {
-                            retained_exit = None;
                         }
+                        // A stale generation reconciles as a no-op. Only the
+                        // current marker, not that return value, can disarm retries.
+                        retained_exit = owner
+                            .on_blocking(|owner| owner.authority_exit_retry_generation())
+                            .await
+                            .unwrap_or(retained_exit);
                     }
                     exit_retry.observe_pending(retained_exit, Instant::now());
                     if owner.is_recovering() {
@@ -256,8 +272,9 @@ impl ControlHandler {
                         }
                     }
                     #[cfg(test)]
-                    let listen_for_changes =
-                        !(retained_exit.is_some() && control.recovery_exit_test_quiet_retry);
+                    let listen_for_changes = !((retained_exit.is_some()
+                        || quiet_after_retry_pause)
+                        && control.recovery_exit_test_quiet_retry);
                     #[cfg(not(test))]
                     let listen_for_changes = true;
                     let next = next.into_iter().chain(exit_retry.next).min();

@@ -30,6 +30,12 @@
   only with `test-support` and a development executable name. Keys and encoded
   copies use zeroizing storage and debug output redacts the key.
 
+## 0.1.33
+
+- Keep a registration pipe's first instance reserved after a foreign connector
+  disconnects, including before acceptance begins. Foreign disconnect errors
+  cannot cancel the child's registration opportunity before its deadline.
+
 ## 0.1.32
 
 - Enumerate Windows process creation identities with their parent and program names, and compare them against retained process handles instead of the adjustable wall clock. Clock rollback can no longer silently drop live processes; PID reuse remains explicit uncertainty.

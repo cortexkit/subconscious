@@ -297,9 +297,24 @@ impl LaunchNoncePipeHandoff {
                     Some(code) if code == ERROR_PIPE_CONNECTED as i32 => {}
                     Some(code) if code == ERROR_IO_PENDING as i32 => {
                         operation.pending = true;
-                        operation.wait(deadline, Some(&process), None)?;
+                        if operation.wait(deadline, Some(&process), None).is_err() {
+                            // A peer may disappear before the overlapped connect
+                            // completes. Keep the first instance and its name;
+                            // only the child exit or deadline ends acceptance.
+                            drop(operation);
+                            unsafe { DisconnectNamedPipe(handle) };
+                            std::thread::sleep(POLL);
+                            continue;
+                        }
                     }
-                    _ => return Err(error),
+                    _ => {
+                        // ERROR_NO_DATA means a peer connected and closed before
+                        // ConnectNamedPipe. Reset this instance, never its name.
+                        drop(operation);
+                        unsafe { DisconnectNamedPipe(handle) };
+                        std::thread::sleep(POLL);
+                        continue;
+                    }
                 }
             }
             drop(operation);
@@ -311,9 +326,10 @@ impl LaunchNoncePipeHandoff {
                 return Ok(std::fs::File::from(self.pipe));
             }
             // SAFETY: disconnect only our client; keep the original first-instance handle.
-            if unsafe { DisconnectNamedPipe(handle) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
+            // An already-disconnected foreign peer can make this fail. Neither
+            // the failure nor that peer may release the reserved server name.
+            unsafe { DisconnectNamedPipe(handle) };
+            std::thread::sleep(POLL);
         }
     }
 }

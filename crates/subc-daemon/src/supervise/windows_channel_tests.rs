@@ -1,6 +1,112 @@
 use super::*;
 
 #[tokio::test]
+async fn windows_channel_foreign_connect_close_does_not_prevent_child_hello() {
+    use std::io::{Read, Write};
+    use std::os::windows::fs::OpenOptionsExt;
+    use subc_os::registration_channel::{DAEMON_PID_ENV, REGISTRATION_PIPE_ENV};
+    const MODE: &str = "SUBC_FOREIGN_CHANNEL_CLOSE_CHILD";
+    const TEST: &str = "supervise::windows_channel_tests::windows_channel_foreign_connect_close_does_not_prevent_child_hello";
+    let info = subc_transport::ConnectionInfo {
+        schema: subc_transport::SCHEMA_VERSION,
+        wire_version: None,
+        endpoints: Vec::new(),
+        key: vec![0x42; 32],
+        daemon_id: [0x24; 16],
+        pid: std::process::id(),
+        daemon_ver: "test".into(),
+    };
+    if std::env::var_os(MODE).is_some() {
+        std::io::stdin().read_exact(&mut [0]).unwrap();
+        let mut channel = subc_os::take_registration_channel()
+            .unwrap()
+            .unwrap()
+            .into_tokio_pipe_client()
+            .unwrap();
+        subc_transport::authenticate_client(&mut channel, &info, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let hello = subc_protocol::ModuleHelloBody {
+            manifest: subc_protocol::manifest::ModuleManifest::builder(
+                "channel-foreign-close",
+                "1.0.0",
+            )
+            .build(),
+            protocol_ver: subc_protocol::PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: None,
+        };
+        let hello = subc_protocol::Frame::build(
+            subc_protocol::FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            1,
+            serde_json::to_vec(&hello).unwrap(),
+        )
+        .unwrap();
+        subc_transport::write_frame(&mut channel, &hello)
+            .await
+            .unwrap();
+        let ack = subc_transport::read_frame(&mut channel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ack.header.ty, subc_protocol::FrameType::HelloAck);
+        return;
+    }
+    let scratch = ScratchDir::new("foreign-channel-close");
+    let pipe = subc_os::registration_channel::RegistrationPipe::new().unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([TEST, "--exact", "--nocapture"])
+        .env(MODE, "1")
+        .env(REGISTRATION_PIPE_ENV, pipe.name())
+        .env(DAEMON_PID_ENV, std::process::id().to_string())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for key in [
+        "HOME",
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_RUNTIME_DIR",
+    ] {
+        command.env(key, scratch.display().to_string());
+    }
+    let mut child = command.spawn().unwrap();
+    // The foreign peer closes before the server calls ConnectNamedPipe, which
+    // produces ERROR_NO_DATA rather than the connected foreign-PID case.
+    let foreign = std::fs::OpenOptions::new()
+        .access_mode(0x8000_0002)
+        .open(pipe.name())
+        .unwrap();
+    drop(foreign);
+    let handle = SupervisorHandle::new();
+    let registry = Arc::new(Registry::default());
+    let control = crate::ControlHandler::new(registry).with_supervisor(handle.clone());
+    let router = Arc::new(crate::Router::with_control_handler(Arc::new(control)));
+    router.install_registration_service(crate::server::ServerAuth::new(
+        info.key,
+        info.daemon_id,
+        "test",
+    ));
+    let spawn = RegistrationSpawn::new(&handle, "channel-foreign-close", SpawnRole::Plain, None);
+    spawn.ready();
+    handle.serve_registration(pipe, spawn, child.id(), Duration::from_secs(5));
+    child.stdin.take().unwrap().write_all(b"x").unwrap();
+    let output = tokio::task::spawn_blocking(move || child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child HELLO failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 async fn windows_channel_tokio_server_accepts_and_exchanges_frame() {
     use subc_os::registration_channel::{DAEMON_PID_ENV, REGISTRATION_PIPE_ENV};
     const CHILD_MODE: &str = "SUBC_REGISTRATION_CONVERSION_TEST_CHILD";

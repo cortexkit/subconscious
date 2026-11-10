@@ -2572,14 +2572,19 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
         let module = module.clone();
         tokio::spawn(async move { module.swap(Some(Duration::from_secs(5))).await })
     };
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !handle.swap_open("a") {
+    // The swap is marked open before its replacement process has a registration
+    // channel. Wait for that channel to exist before attempting candidate HELLO.
+    let candidate_proof = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(proof) = handle.candidate_registration_proof_for_test("a") {
+                break proof;
+            }
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    let candidate_proof = handle.candidate_registration_proof_for_test("a").unwrap();
+    assert!(handle.swap_open("a"));
     assert!(handle.wait_program_binding("a", &candidate_proof).await);
     candidate_proof.bind(candidate);
     let registering = crate::ControlHandler::new(registry.clone())

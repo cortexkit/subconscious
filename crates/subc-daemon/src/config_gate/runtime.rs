@@ -1685,7 +1685,9 @@ impl RuntimeOwner {
         }
     }
 
-    #[cfg(all(test, unix))]
+    // Flipping a flag is platform-neutral; the unix-only phone tests and the
+    // test-support daemon tests (on every platform) are its callers.
+    #[cfg(all(test, any(unix, feature = "test-support")))]
     pub(crate) fn set_os_prompt_policy_for_tests(&self) {
         self.os_prompt_policy
             .store(true, std::sync::atomic::Ordering::Relaxed);

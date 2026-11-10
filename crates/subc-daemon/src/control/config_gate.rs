@@ -57,7 +57,7 @@ impl PrivilegedRequest for ConfigControlRequest {
 }
 
 impl ControlHandler {
-    #[cfg(all(test, feature = "test-support", unix))]
+    #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn with_config_os_prompt_policy_for_tests(self) -> Self {
         self.config_runtime
             .as_ref()

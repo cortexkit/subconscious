@@ -1,6 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { throwerOf } from "./settle.js";
 import { ModuleConfig, configLayerBytes, type ConfigView, type ModuleConfigOptions, type ModuleConfigState } from "../src/index.js";
 
 const sessions: ModuleConfig[] = [];
@@ -121,8 +122,8 @@ test("a pending view without an assigned attempt cannot be applied", async () =>
 test("review refuses unknown layers rather than passing them to a merger", async () => {
   let reviews = 0;
   const r = rig({ review: () => { reviews++; return { op: "config.review", fields: [], refusals: [] }; } });
-  await expect(r.config.review({ op: "config.review", base_generation: 0, base: null,
-    layers: [{ module_id: "sample", layer: "future_layer", path: "/isolated/config.json" }] })).rejects.toThrow("unknown");
+  expect(await throwerOf(r.config.review({ op: "config.review", base_generation: 0, base: null,
+    layers: [{ module_id: "sample", layer: "future_layer", path: "/isolated/config.json" }] }))).toThrow("unknown");
   expect(reviews).toBe(0);
   expect(r.config.state).toEqual({ state: "unknown", rawState: "future_layer", view: undefined });
 });

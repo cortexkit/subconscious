@@ -71,7 +71,7 @@ fn owned(handle: HANDLE) -> io::Result<OwnedHandle> {
 pub struct LaunchNoncePipeHandoff {
     pipe: OwnedHandle,
     name: String,
-    nonce: Vec<u8>,
+    nonce: zeroize::Zeroizing<Vec<u8>>,
 }
 
 impl LaunchNoncePipeHandoff {
@@ -86,6 +86,16 @@ impl LaunchNoncePipeHandoff {
                 "invalid launch nonce length",
             ));
         }
+        let mut pipe = Self::reserve_with_names(&mut next)?;
+        pipe.nonce = zeroize::Zeroizing::new(nonce.as_bytes().to_vec());
+        Ok(pipe)
+    }
+
+    pub(crate) fn reserve() -> io::Result<Self> {
+        Self::reserve_with_names(random_name)
+    }
+
+    fn reserve_with_names(mut next: impl FnMut() -> io::Result<String>) -> io::Result<Self> {
         let security = user_security_descriptor()?;
         let attrs = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -115,7 +125,7 @@ impl LaunchNoncePipeHandoff {
                     return Ok(Self {
                         pipe,
                         name,
-                        nonce: nonce.as_bytes().to_vec(),
+                        nonce: zeroize::Zeroizing::new(Vec::new()),
                     })
                 }
                 Err(error) if matches!(error.raw_os_error(), Some(code) if code == ERROR_ACCESS_DENIED as i32 || code == ERROR_PIPE_BUSY as i32) => {
@@ -254,7 +264,10 @@ pub const HELPER_CLAIM_CONNECT_WINDOW: Duration = Duration::from_secs(5);
 /// A one-use helper pipe. Neither its Debug output nor its environment metadata
 /// includes the claim. Unlike the daemon's legacy nonce server, a foreign client
 /// ends this handoff instead of retrying with the real helper.
-pub struct HelperClaimHandoff(LaunchNoncePipeHandoff);
+pub struct HelperClaimHandoff(
+    crate::registration_channel::PreparedHelperClaimHandoff,
+    zeroize::Zeroizing<String>,
+);
 impl std::fmt::Debug for HelperClaimHandoff {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("HelperClaimHandoff(<redacted>)")
@@ -264,23 +277,30 @@ impl std::fmt::Debug for HelperClaimHandoff {
 impl HelperClaimHandoff {
     pub fn new(claim: &str) -> io::Result<Self> {
         crate::registration_channel::check_claim(claim)?;
-        Ok(Self(LaunchNoncePipeHandoff::new(claim)?))
+        Ok(Self(
+            crate::registration_channel::PreparedHelperClaimHandoff::new(3)?,
+            zeroize::Zeroizing::new(claim.to_owned()),
+        ))
     }
 
     /// Set only public metadata before spawn. The helper's stdin is untouched.
     pub fn configure(&self, command: &mut std::process::Command) {
-        use crate::registration_channel::{HELPER_CLAIM_PIPE_ENV, HELPER_PARENT_PID_ENV};
-        command
-            .env(HELPER_CLAIM_PIPE_ENV, self.0.name())
-            .env(HELPER_PARENT_PID_ENV, std::process::id().to_string());
+        command.envs(self.0.environment());
     }
 
     /// Call after spawn with the live helper's PID. The caller retains its
     /// child until this bounded delivery returns, preventing PID reuse.
     pub fn serve(self, pid: u32) -> io::Result<()> {
+        self.0.complete(pid, &self.1)
+    }
+}
+
+impl LaunchNoncePipeHandoff {
+    pub(crate) fn deliver_helper(mut self, pid: u32, claim: &str) -> io::Result<()> {
+        self.nonce = zeroize::Zeroizing::new(claim.as_bytes().to_vec());
         // SAFETY: a fresh, non-inheritable process handle pins the live child.
         let process = owned(unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) })?;
-        self.0.deliver_with_policy(
+        self.deliver_with_policy(
             pid,
             &process,
             Instant::now() + HELPER_CLAIM_CONNECT_WINDOW,

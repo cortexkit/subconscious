@@ -14,6 +14,11 @@
 //! named pipe and checks both process IDs; it does not commandeer stdin, which
 //! helpers may need for stdio protocols. Only pipe metadata enters the child's
 //! environment. The daemon's nonce handoff to ungated spawns is unchanged.
+//! [`PreparedHelperClaimHandoff`] separates preparation from delivery for runtimes
+//! that own their child process: put its child descriptor in the chosen stdio
+//! slot, spawn, then complete with the live child's PID and a freshly minted claim.
+//! Drop it on a spawn error. [`HelperClaimHandoff`] is the convenience wrapper
+//! for Rust callers using `std::process::Command` with a claim already minted.
 
 use std::{
     ffi::OsString,
@@ -465,7 +470,7 @@ fn read_helper_claim(mut lookup: impl FnMut(&str) -> Option<OsString>) -> Helper
         let Some(value) = lookup(HELPER_CLAIM_FD_ENV) else {
             return Ok(None);
         };
-        crate::launch_nonce::read_helper_descriptor(&value)
+        helper_unix::read(&value)
     };
     #[cfg(windows)]
     let read = {
@@ -504,24 +509,69 @@ pub(crate) fn check_claim(claim: &str) -> std::io::Result<()> {
 
 #[cfg(unix)]
 #[derive(Debug)]
-pub struct HelperClaimHandoff(crate::launch_nonce::LaunchNonceHandoff);
+pub struct HelperClaimHandoff(PreparedHelperClaimHandoff);
 #[cfg(unix)]
 impl HelperClaimHandoff {
     pub fn new(claim: &str) -> std::io::Result<Self> {
         check_claim(claim)?;
-        Ok(Self(crate::launch_nonce::LaunchNonceHandoff::new(claim)?))
+        let mut prepared = PreparedHelperClaimHandoff::new(3)?;
+        prepared.write_claim(claim)?;
+        Ok(Self(prepared))
     }
 
     /// Install last, after all other pre-exec hooks. Only descriptor metadata
     /// is placed in the environment; stdin and the other stdio are untouched.
     pub fn install_last(self, command: &mut std::process::Command) {
-        command.env(HELPER_CLAIM_FD_ENV, self.0.fd_env_value());
         self.0.install_last(command);
     }
 }
 
 #[cfg(windows)]
 pub use crate::launch_nonce::{HelperClaimHandoff, HELPER_CLAIM_CONNECT_WINDOW};
+
+#[cfg(unix)]
+mod helper_unix;
+#[cfg(unix)]
+pub use helper_unix::PreparedHelperClaimHandoff;
+
+/// Reserved single-instance helper pipe. Preparation contains no claim bytes;
+/// completion checks the live child's PID before delivering exactly one claim.
+#[cfg(windows)]
+pub struct PreparedHelperClaimHandoff(crate::launch_nonce::PreparedHelperPipe);
+#[cfg(windows)]
+impl fmt::Debug for PreparedHelperClaimHandoff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PreparedHelperClaimHandoff(<redacted>)")
+    }
+}
+#[cfg(windows)]
+impl PreparedHelperClaimHandoff {
+    #[cfg(test)]
+    pub(crate) fn name(&self) -> &str {
+        self.0.name()
+    }
+    pub fn new(_child_fd: i32) -> std::io::Result<Self> {
+        Ok(Self(crate::launch_nonce::PreparedHelperPipe::reserve()?))
+    }
+    pub fn environment(&self) -> Vec<(OsString, OsString)> {
+        vec![
+            (HELPER_CLAIM_PIPE_ENV.into(), self.0.name().into()),
+            (
+                HELPER_PARENT_PID_ENV.into(),
+                std::process::id().to_string().into(),
+            ),
+        ]
+    }
+    pub fn child_fd(&self) -> Option<i32> {
+        None
+    }
+    /// Retain the child until completion returns to prevent PID reuse.
+    pub fn complete(self, child_pid: u32, claim: &str) -> std::io::Result<()> {
+        check_claim(claim)?;
+        self.0.deliver_helper(child_pid, claim)
+    }
+    pub fn abort(self) {}
+}
 
 #[cfg(all(test, unix))]
 #[allow(unsafe_code)]
@@ -842,5 +892,74 @@ mod tests {
         success(process.wait_with_output().unwrap());
         assert!(HelperClaimHandoff::new("").is_err());
         assert!(HelperClaimHandoff::new(&"x".repeat(513)).is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(unsafe_code)]
+mod prepared_helper_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    const MODE: &str = "SUBC_PREPARED_HELPER_TEST";
+    #[test]
+    fn prepared_helper_split_delivery_and_abort() {
+        if let Ok(mode) = std::env::var(MODE) {
+            let value = helper_claim();
+            if mode == "read" {
+                assert!(value.unwrap().unwrap().value() == "test-single-use-claim");
+            } else {
+                assert!(value.is_err(), "aborted handoff must deliver no bytes");
+            }
+            return;
+        }
+        #[cfg(unix)]
+        let modes = ["read", "abort"].as_slice();
+        #[cfg(windows)]
+        let modes = ["read", "abort", "refuse"].as_slice();
+        for mode in modes.iter().copied() {
+            let prepared = PreparedHelperClaimHandoff::new(3).unwrap();
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "registration_channel::prepared_helper_tests::prepared_helper_split_delivery_and_abort", "--nocapture"])
+                .env(MODE, mode).envs(prepared.environment()).stdout(Stdio::piped()).stderr(Stdio::piped());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let fd = prepared.child_fd().unwrap();
+                assert_ne!(
+                    unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                    0
+                );
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::dup2(fd, 3) == -1 || libc::fcntl(3, libc::F_SETFD, 0) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+            }
+            let child = command.spawn().unwrap();
+            if mode == "read" {
+                prepared
+                    .complete(child.id(), "test-single-use-claim")
+                    .unwrap();
+            } else if mode == "refuse" {
+                assert!(
+                    prepared
+                        .complete(std::process::id(), "test-single-use-claim")
+                        .is_err(),
+                    "foreign helper must receive no bytes"
+                );
+            } else {
+                prepared.abort();
+            }
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

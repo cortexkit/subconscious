@@ -307,18 +307,13 @@ fn pipe_or_permitted_env(pipe: Cached, fallback: Option<LaunchNonce>) -> Cached 
 #[cfg(unix)]
 pub use unix::LaunchNonceHandoff;
 
-#[cfg(unix)]
-pub(crate) fn read_helper_descriptor(
-    value: &std::ffi::OsStr,
-) -> Result<Option<String>, LaunchNonceError> {
-    unix::read_descriptor(value, &AtomicUsize::new(0)).map(|nonce| nonce.map(|nonce| nonce.value))
-}
-
 #[cfg(windows)]
 pub use windows::{LaunchNoncePipeDelivery, LaunchNoncePipeHandoff};
 
 #[cfg(windows)]
 pub(crate) use windows::read_helper_pipe;
+#[cfg(windows)]
+pub(crate) use windows::LaunchNoncePipeHandoff as PreparedHelperPipe;
 #[cfg(windows)]
 pub use windows::{HelperClaimHandoff, HELPER_CLAIM_CONNECT_WINDOW};
 

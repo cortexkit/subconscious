@@ -262,8 +262,12 @@ The command surface is:
   refusals do not ask. `--yes` (`-y`) skips this question, not safety checks or
   the separate `--confirm` required for conversion. If either stream is not a
   terminal, setup proceeds without a question for scripted callers. The shell
-  and PowerShell bootstrap installers only print `Next: ck setup`; they do not
-  invoke it.
+  and PowerShell bootstrap installers print `Next: ck setup`; they do not
+  invoke it. The shell installer cannot change the PATH of the shell that ran
+  it, so when its inherited PATH lacks the command directory it first names the
+  profile it changed and prints the `source` command that loads it in the
+  current terminal. The PowerShell installer updates the current session's
+  PATH itself.
 - `ck setup aft --convert` and `ck setup mc --convert` are explicit conversion
   paths and require confirmation before any mutation.
 - `ck setup --uninstall` prints a removal plan, deregisters only manifest-owned

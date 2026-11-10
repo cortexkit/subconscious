@@ -432,6 +432,9 @@ async fn config_recovery_r5_direct_privacy_confirmation_retires_before_return() 
     child._program_binding = handle.begin_program_binding("privacy-reap", SpawnRole::Plain);
     // Reproduce unstamp's witness release while keeping the current reserved nonce.
     handle.program_bindings.lock().unwrap().active.clear();
+    // Suspended admission prevents an ordinary exit before confirmation. An
+    // external kill still exercises direct confirmation's first-exit retirement.
+    child.kill_leader().unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while subc_os::child_exit::observe(child.pid).unwrap().is_none() {
             tokio::task::yield_now().await;

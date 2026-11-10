@@ -1,8 +1,12 @@
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     #[cfg(target_os = "macos")]
-    if args.first().is_some_and(|arg| arg == "__disclaim-exec")
-        && !args.iter().any(|arg| arg == "--probe")
+    if args
+        .first()
+        .is_some_and(|arg| arg == "__disclaim-exec" || arg == "__disclaim-exec-suspended")
+        && !args
+            .iter()
+            .any(|arg| arg == "--probe" || arg == "--probe-suspended")
     {
         if let Some(path) = std::env::var_os("SUBC_TEST_PRIVACY_EXEC_BARRIER") {
             use std::io::{Read, Write};

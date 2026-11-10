@@ -46,6 +46,10 @@ pub fn observe(pid: u32) -> io::Result<Option<ExitStatus>> {
                 libc::CLD_EXITED => status << 8,
                 libc::CLD_KILLED => status,
                 libc::CLD_DUMPED => status | 0x80,
+                // The macOS kernel can report START_SUSPENDED stops despite WEXITED. Keep
+                // those non-exit events unconsumed so the owned pin stays live.
+                #[cfg(target_os = "macos")]
+                libc::CLD_STOPPED | libc::CLD_CONTINUED => return Ok(None),
                 _ => return Err(io::Error::other("unexpected child exit observation")),
             };
             return Ok(Some(ExitStatus::from_raw(raw)));
@@ -114,5 +118,32 @@ mod tests {
         assert_eq!(killed.0.wait().unwrap(), status);
         assert!(observe(0).is_err());
         assert!(observe(u32::MAX).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn suspended_child_is_not_an_exit_and_keeps_its_owned_wait_status() {
+        let mut child = OwnedChild(
+            Command::new("/bin/sh")
+                .args(["-c", "kill -STOP $$; exit 23"])
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !crate::privacy_identity::SuspendedSignature::is_suspended(pid).unwrap() {
+            assert!(Instant::now() < deadline, "child did not stop");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(observe(pid).unwrap(), None);
+        assert_eq!(observe(pid).unwrap(), None);
+        // SAFETY: OwnedChild retains this stopped, unreaped child until wait.
+        #[allow(unsafe_code)]
+        let resumed = unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+        assert_eq!(resumed, 0);
+        let status = observed_exit(&child);
+        assert_eq!(status.code(), Some(23));
+        assert_eq!(observe(pid).unwrap(), Some(status));
+        assert_eq!(child.0.wait().unwrap(), status);
     }
 }

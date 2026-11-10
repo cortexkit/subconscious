@@ -8,7 +8,7 @@
 //! [`ModuleControlRequest`] and once as [`RouteBindPeer`].
 //!
 //! Each key is sent only to a target declaring its capability in
-//! `capabilities.provides`, and a target declaring neither receives exactly
+//! `capabilities.provides`, and a target declaring none receives exactly
 //! the bytes it received before these keys existed.
 
 use serde::{ser::Error as _, Deserialize, Deserializer, Serialize, Serializer};
@@ -23,6 +23,101 @@ pub const OBSERVED_PEER_CAPABILITY: &str = "observed-peer/v1";
 /// [`RouteBindPeer::operator_app`] on a `route.bind` whose route was opened by
 /// a recognised operator app.
 pub const OPERATOR_APP_CAPABILITY: &str = "operator-app/v1";
+
+/// A target declares this to receive [`RouteBindPeer::caller`] on `route.bind`.
+pub const CALLER_ATTESTATION_CAPABILITY: &str = "caller-attestation/v1";
+
+/// Largest spawn or authority epoch exactly representable by all wire readers.
+pub const MAX_ATTESTATION_INTEGER: u64 = (1_u64 << 53) - 1;
+
+/// The purpose of the connection attested by the daemon. Only `Own` can grant
+/// automatic first-party access; unknown purposes must never be treated as own.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CallerClaim {
+    Own,
+    Brokered,
+    Relay,
+    Legacy,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Evidence-backed program origin. Unknown strings establish no recognized origin.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CallerOrigin {
+    Release,
+    Development,
+    #[serde(other)]
+    Other,
+}
+
+/// Daemon-attested caller authority, captured once for this bind. Providers must
+/// require both `claim: own` and `first_party: true` before automatic grants.
+/// `declaration` is the approved entry for the receiving provider, not a request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CallerAttestation {
+    pub incarnation: String,
+    #[serde(deserialize_with = "deserialize_attestation_integer")]
+    pub spawn: u64,
+    #[serde(deserialize_with = "deserialize_attestation_integer")]
+    pub authority_epoch: u64,
+    pub claim: CallerClaim,
+    pub first_party: bool,
+    pub origin: CallerOrigin,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<serde_json::Map<String, serde_json::Value>>,
+    pub approved_declarations_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_digest: Option<String>,
+}
+
+fn deserialize_attestation_integer<'de, D: Deserializer<'de>>(decoder: D) -> Result<u64, D::Error> {
+    let value = u64::deserialize(decoder)?;
+    if value > MAX_ATTESTATION_INTEGER {
+        return Err(serde::de::Error::custom(
+            "attestation integer exceeds 2^53-1",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_caller<'de, D: Deserializer<'de>>(
+    decoder: D,
+) -> Result<Option<CallerAttestation>, D::Error> {
+    let Some(value) = Option::<serde_json::Value>::deserialize(decoder)? else {
+        return Ok(None);
+    };
+    // Check numeric bounds even on an incomplete object: rounding a future
+    // spawn or epoch must never turn it into a different authority identity.
+    for field in ["spawn", "authority_epoch"] {
+        if let Some(integer) = value.get(field) {
+            deserialize_attestation_integer(integer).map_err(serde::de::Error::custom)?;
+        }
+    }
+    if value.is_object()
+        && [
+            "incarnation",
+            "spawn",
+            "authority_epoch",
+            "claim",
+            "first_party",
+            "origin",
+            "approved_declarations_digest",
+        ]
+        .iter()
+        .any(|field| value.get(field).is_none())
+    {
+        return Ok(None);
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
 
 /// Whether the daemon could read the peer's identity from the kernel when it
 /// accepted the connection.
@@ -159,7 +254,7 @@ impl OperatorApp {
 
 /// The `route.bind` keys carried beside [`ModuleControlRequest::RouteBind`].
 ///
-/// Both are absent unless the target declared the matching capability, and an
+/// Keys are absent unless the target declared the matching capability, and an
 /// absent key is omitted, never `null`. Decoding ignores every other key, so a
 /// module reads this from the same body it decodes as the bind.
 #[non_exhaustive]
@@ -172,6 +267,14 @@ pub struct RouteBindPeer {
     /// when the daemon recognised the opening connection as an operator app.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator_app: Option<OperatorApp>,
+    /// Sent only to targets declaring [`CALLER_ATTESTATION_CAPABILITY`]. An absent
+    /// or incomplete caller is treated as absent; unsafe integers are malformed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_caller"
+    )]
+    pub caller: Option<CallerAttestation>,
 }
 
 impl RouteBindPeer {
@@ -194,9 +297,16 @@ impl RouteBindPeer {
         self
     }
 
-    /// Whether neither key is present.
+    /// Set or clear the caller for a target declaring `caller-attestation/v1`.
+    #[must_use]
+    pub fn with_caller(mut self, caller: Option<CallerAttestation>) -> Self {
+        self.caller = caller;
+        self
+    }
+
+    /// Whether no peer key is present.
     pub fn is_empty(&self) -> bool {
-        self.observed_peer.is_none() && self.operator_app.is_none()
+        self.observed_peer.is_none() && self.operator_app.is_none() && self.caller.is_none()
     }
 }
 

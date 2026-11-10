@@ -27,6 +27,7 @@
     "scope_not_live": "terminal",
     "scope_not_synced": "retryable",
     "session_address_unavailable": "retryable",
+    "stale_authority_epoch": "retryable",
     "target_agent_run_unsupported": "terminal",
     "target_flow_unsupported": "terminal",
     "target_unavailable": "retryable",
@@ -57,6 +58,7 @@
     ]
   },
   "route_close_disposition": {
+    "authority_changed": "may_reopen",
     "capability_denied": "must_not_reopen",
     "crash": "must_not_reopen",
     "disable": "must_not_reopen",

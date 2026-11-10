@@ -14,7 +14,12 @@ use std::{
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+use crate::provider_declarations::{deserialize_provider_declarations, ProviderDeclarations};
 use crate::PROTOCOL_VERSION;
+
+pub use crate::provider_declarations::{
+    validate_hello_provider_declarations, ProviderDeclarationsError,
+};
 
 /// Maximum compact JSON size of the complete per-role declaration map.
 pub const MAX_ROLE_DECLARATIONS_BYTES: usize = 16_384;
@@ -178,6 +183,10 @@ pub struct ModuleManifest {
     /// entries before every daemon understands this slot.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_declarations: BTreeMap<String, serde_json::Map<String, Value>>,
+    /// Requested provider-owned entries, immutable for the spawn. Absence grants
+    /// nothing. Invalid shapes and sizes refuse HELLO rather than being dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_declarations: Option<ProviderDeclarations>,
 }
 
 /// Incrementally constructs a [`ModuleManifest`] without fabricating absent facts.
@@ -201,6 +210,7 @@ pub struct ModuleManifestBuilder {
     confirm_operations: Option<Vec<String>>,
     rich_ui: Option<RichUiDescriptor>,
     role_declarations: BTreeMap<String, serde_json::Map<String, Value>>,
+    provider_declarations: Option<ProviderDeclarations>,
 }
 
 impl ModuleManifest {
@@ -234,6 +244,7 @@ impl ModuleManifest {
             confirm_operations: None,
             rich_ui: None,
             role_declarations: BTreeMap::new(),
+            provider_declarations: None,
         }
     }
 
@@ -374,6 +385,13 @@ impl ModuleManifestBuilder {
         self
     }
 
+    /// Sets requested provider entries. HELLO validates their bounds before
+    /// registration; the provider, not the daemon, owns each entry's schema.
+    pub fn provider_declarations(mut self, declarations: Option<ProviderDeclarations>) -> Self {
+        self.provider_declarations = declarations;
+        self
+    }
+
     /// Finishes the manifest.
     pub fn build(self) -> ModuleManifest {
         ModuleManifest {
@@ -395,6 +413,7 @@ impl ModuleManifestBuilder {
             confirm_operations: self.confirm_operations,
             rich_ui: self.rich_ui,
             role_declarations: self.role_declarations,
+            provider_declarations: self.provider_declarations,
         }
     }
 }
@@ -459,6 +478,8 @@ struct ModuleManifestWire {
     runtime_computed: Option<Value>,
     #[serde(default)]
     role_declarations: Option<Value>,
+    #[serde(default, deserialize_with = "deserialize_provider_declarations")]
+    provider_declarations: Option<ProviderDeclarations>,
 }
 
 impl<'de> Deserialize<'de> for ModuleManifest {
@@ -502,6 +523,7 @@ impl<'de> Deserialize<'de> for ModuleManifest {
                     .unwrap_or_default(),
             )
             .operation_payload(wire.operation_payload)
+            .provider_declarations(wire.provider_declarations)
             .build();
         manifest
             .validate_operation_payload()

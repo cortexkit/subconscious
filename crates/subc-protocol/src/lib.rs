@@ -46,10 +46,15 @@ pub mod frame;
 pub mod framed_body;
 pub mod machine_id;
 pub mod manifest;
+pub mod module_id;
 pub mod peer;
+pub mod provider_declarations;
 pub mod scope;
 pub mod session;
 pub mod tool_call;
+
+#[cfg(test)]
+mod reader_skew;
 
 /// Canonical error codes emitted by subc.
 ///
@@ -86,6 +91,14 @@ pub mod error_codes {
 
     pub const UNKNOWN_CHANNEL: &str = "unknown_channel";
     pub const STALE_ROUTE_EPOCH: &str = "stale_route_epoch";
+    /// A caller or target authority epoch changed before the bind committed.
+    /// Retry the open to capture current authority. This refusal never
+    /// closes the shared module connection and does not prove non-delivery.
+    pub const STALE_AUTHORITY_EPOCH: &str = "stale_authority_epoch";
+    /// HELLO carried malformed or oversized provider declarations.
+    pub const INVALID_PROVIDER_DECLARATIONS: &str = "invalid_provider_declarations";
+    /// A catalog update tried to change declarations fixed for the spawn.
+    pub const CATALOG_UPDATE_FROZEN_DECLARATIONS: &str = "catalog_update_frozen_declarations";
     /// An opted-in established route has no free request or watch credit.
     /// The daemon did not forward this request; retry on the same route, never
     /// by treating the route as dead or reopening it.
@@ -321,6 +334,7 @@ pub mod error_codes {
                 | SCOPE_CHANGED
                 | SESSION_ADDRESS_UNAVAILABLE
                 | BIND_BUSY
+                | STALE_AUTHORITY_EPOCH
         )
     }
 
@@ -359,6 +373,8 @@ pub use frame::{Frame, FrameBuildError};
 pub enum RouteCloseReason {
     Reload,
     Restart,
+    /// Authority changed; reopening immediately obtains the current attestation.
+    AuthorityChanged,
     Disable,
     Crash,
     /// A live route became forbidden because newly attested capability metadata
@@ -376,6 +392,17 @@ pub enum RouteCloseReason {
     /// The scope's parent ended, so its stamp no longer names a live parent.
     ScopeParentEnded,
 }
+
+impl RouteCloseReason {
+    /// Whether an opener may immediately reopen after this close.
+    pub fn may_reopen(self) -> bool {
+        matches!(self, Self::Reload | Self::Restart | Self::AuthorityChanged)
+    }
+}
+
+/// `server.describe` capability permitting `accepts_close_reasons` on route opens.
+/// Readers define the name before any daemon advertises support for it.
+pub const ROUTE_CLOSE_REASONS_CAPABILITY: &str = "route-close-reasons/v1";
 
 /// Per-route bind identity shared by client-facing and module-facing control.
 ///

@@ -10040,7 +10040,7 @@ fn apply_wire_spawn_args_for_admission(
     connection_file_path: Option<&std::path::Path>,
     handle: Option<&SupervisorHandle>,
     role: SpawnRole,
-    admission: Option<&crate::config_gate::runtime::SpawnAdmission>,
+    _admission: Option<&crate::config_gate::runtime::SpawnAdmission>,
 ) -> Result<Option<NonceHandoff>, SuperviseError> {
     command.env(SUBC_MODULE_ID_ENV, &spec.module_id);
     // SUBC_LAUNCH_NONCE_FD is removed for every child, `protocol: "none"`
@@ -10065,33 +10065,8 @@ fn apply_wire_spawn_args_for_admission(
         command.arg(SUBC_ARG).arg(connection_file_path);
     }
 
-    if admission.is_some_and(|admission| admission.approved_base().is_some()) {
-        // An approved admission record requires registration over the inherited
-        // channel, with no launch nonce. Remove prior nonce records before the
-        // replacement exists; a module config flag cannot select this policy.
-        if let Some(handle) = handle {
-            handle
-                .spawn_nonces
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&spec.module_id);
-            handle
-                .reserved_nonces
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&spec.module_id);
-            if role == SpawnRole::SwapCandidate {
-                handle
-                    .swaps
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .remove(&spec.module_id);
-            }
-            handle.refresh_program_binding_nonces(&spec.module_id);
-        }
-        return Ok(None);
-    }
-
+    // An inherited socket alone cannot register a module. Until the daemon
+    // services HELLO on that socket, approved admissions need the nonce path too.
     // Every subc-wire spawn receives a fresh one-time launch nonce for consumer
     // route.open attestation. Reserved modules additionally use the same nonce
     // for HELLO id-squatting protection. A respawn rotates both records.

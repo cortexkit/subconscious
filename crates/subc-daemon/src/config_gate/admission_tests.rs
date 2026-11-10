@@ -76,13 +76,13 @@ fn approve(_rig: &Rig, owner: &RuntimeOwner, kind: PlanKind) -> u64 {
 }
 
 #[test]
-fn unix_channel_gated_admission_records_withhold_nonce() {
+fn unix_channel_gated_admission_keeps_legacy_nonce_until_channel_hello_is_served() {
     let rig = rig();
-    let owner = rig.owner("channel-only");
+    let owner = rig.owner("channel-with-legacy-nonce");
     rig.stamp(&owner);
     let spec = spec(&rig);
     let admission = owner.prepare_spawn(&spec).unwrap();
-    crate::supervise::unix_channel_placement_tests::assert_channel_only_admission(
+    crate::supervise::unix_channel_placement_tests::assert_legacy_nonce_admission(
         &spec, &admission,
     );
 }

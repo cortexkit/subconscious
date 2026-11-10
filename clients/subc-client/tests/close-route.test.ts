@@ -572,6 +572,11 @@ async function handleConnection(socket: Socket, state: FakeState): Promise<void>
 
     if (frame.header.channel === 0) {
       const request = parseJson(frame.body) as { op?: string };
+      const describe = serverDescribeReply(frame);
+      if (describe) {
+        await writeFrame(socket, describe, deadline);
+        continue;
+      }
       if (request.op === "route.open") {
         state.routeOpens += 1;
         const channel = state.nextChannel!++;
@@ -769,3 +774,4 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
   }
   throw new Error(`timed out waiting for ${label}`);
 }
+import { serverDescribeReply } from "./control-fixture.js";

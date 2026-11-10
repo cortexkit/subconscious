@@ -1,3 +1,5 @@
+import type { RouteOpenTarget } from "./attestation.js";
+
 const connectionToken = new WeakMap<RouteHandle, object>();
 const reverseRequests = new WeakMap<RouteHandle, ReverseRequestRegistry>();
 
@@ -64,8 +66,9 @@ export class ReverseRequestRegistry {
 export class RouteHandle {
   readonly channel: number;
   readonly epoch: number;
+  readonly target?: RouteOpenTarget;
 
-  private constructor(channel: number, epoch: number, token: object, registry: ReverseRequestRegistry) {
+  private constructor(channel: number, epoch: number, token: object, registry: ReverseRequestRegistry, target?: RouteOpenTarget) {
     if (!Number.isInteger(channel) || channel <= 0 || channel > 0xffff) {
       throw new RangeError(`route channel must be an integer in 1..65535, got ${channel}`);
     }
@@ -74,6 +77,7 @@ export class RouteHandle {
     }
     this.channel = channel;
     this.epoch = epoch;
+    this.target = target === undefined ? undefined : Object.freeze(target);
     registry.seal();
     connectionToken.set(this, token);
     reverseRequests.set(this, registry);
@@ -90,8 +94,9 @@ export class RouteHandle {
     epoch: number,
     token: object,
     registry: ReverseRequestRegistry,
+    target?: RouteOpenTarget,
   ): RouteHandle {
-    return new RouteHandle(channel, epoch, token, registry);
+    return new RouteHandle(channel, epoch, token, registry, target);
   }
 }
 
@@ -101,11 +106,12 @@ export function createRouteHandle(
   epoch: number,
   token: object,
   registry = new ReverseRequestRegistry(),
+  target?: RouteOpenTarget,
 ): RouteHandle {
   const factory = RouteHandle as unknown as {
-    create(channel: number, epoch: number, token: object, registry: ReverseRequestRegistry): RouteHandle;
+    create(channel: number, epoch: number, token: object, registry: ReverseRequestRegistry, target?: RouteOpenTarget): RouteHandle;
   };
-  return factory.create(channel, epoch, token, registry);
+  return factory.create(channel, epoch, token, registry, target);
 }
 
 /** @internal */

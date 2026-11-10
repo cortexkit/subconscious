@@ -14,6 +14,7 @@ import {
   type SubcCallErrorKind,
 } from "./client.js";
 import { ConnectionFileError, readConnectionFile, type ConnectionInfo } from "./connection-file.js";
+import { readCaller, type CallerAttestation } from "./attestation.js";
 import {
   scopeEndWire, scopeInteger, scopeRecordWire,
   type ScopeApplyReply, type ScopeEnd, type ScopeEndResult, type ScopeRecord, type ScopeSyncReply,
@@ -277,6 +278,8 @@ export interface RouteBindRequest {
   target: RouteTarget;
   identity: BindIdentity;
   principal?: Principal;
+  /** Absent on older daemons and for incomplete attestations; never infer caller.first_party from principal. */
+  caller?: CallerAttestation;
   /** Consumer-declared reverse-request capabilities for this bind. This is a declaration, not a verified privilege; providers must treat an omitted field as no reverse-request capability. Known MCP method-family values today are "elicitation", "sampling", and "roots". */
   consumer_capabilities?: string[];
 }
@@ -1061,6 +1064,7 @@ export class SubcProvider {
       target?: unknown;
       identity?: unknown;
       principal?: unknown;
+      caller?: unknown;
       consumer_capabilities?: unknown;
     };
     if (request.op === HEALTH_CHECK_OP) {
@@ -1115,6 +1119,7 @@ export class SubcProvider {
       target: request.target as RouteTarget,
       identity: request.identity as BindIdentity,
       principal: request.principal as Principal | undefined,
+      caller: readCaller(request.caller),
       consumer_capabilities: request.consumer_capabilities as string[] | undefined,
     };
 

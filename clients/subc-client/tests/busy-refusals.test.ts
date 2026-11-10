@@ -22,6 +22,11 @@ function harness(requestWindow?: number, watchWindow?: number) {
     writeTracked(data: Uint8Array) {
       if (!this.queueWrites) return { queued: false, completed: Promise.reject(new Error("not queued")) };
       const frame = { header: decodeHeader(data.subarray(0, HEADER_LEN)), body: data.subarray(HEADER_LEN) };
+      const describe = serverDescribeReply(frame);
+      if (describe) {
+        queueMicrotask(() => internals.dispatch(describe));
+        return { queued: true, completed: Promise.resolve() };
+      }
       writes.push(frame);
       queueMicrotask(() => this.onWrite?.(frame));
       return { queued: true, completed: this.failWrites ? Promise.reject(new Error("completion failed")) : Promise.resolve() };
@@ -420,3 +425,4 @@ describe("negotiated route busy admission", () => {
     expect(h.requests()).toHaveLength(2);
   });
 });
+import { serverDescribeReply } from "./control-fixture.js";

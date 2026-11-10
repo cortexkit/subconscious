@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 import { debuglog } from "node:util";
 
 import { AuthError, authenticateClient } from "./auth.js";
+import { attestationInteger, callerOrigin, readRouteOpenTarget, type CallerOrigin, type ProviderDeclarations, type RouteOpenTarget } from "./attestation.js";
 import { ConnectionFileError, readConnectionFile, readConnectionFileWithLocalEndpoint, type ConnectionInfo, type ConnectionInfoWithLocalEndpoint } from "./connection-file.js";
 import {
   AdmissionClass,
@@ -54,6 +55,8 @@ const debug = debuglog("subc-client");
 
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+/** Optional capability discovery must not spend a route's normal request budget. */
+export const CAPABILITY_PROBE_TIMEOUT = 2_000;
 // Socket timers use milliseconds; never dispatch with less than one left.
 const MIN_REQUEST_BUDGET_MS = 1;
 // When a request-timeout timer fires, its reply may already be sitting in the
@@ -198,6 +201,15 @@ export interface CatalogRichUiDescriptor {
 
 export interface CatalogEntry {
   module_id: string;
+  /** Discovery metadata only; authorize against the route's attestation instead. */
+  incarnation?: string;
+  spawn?: number;
+  first_party?: boolean;
+  origin?: CallerOrigin;
+  requested_declarations_digest?: string;
+  approved_declarations_digest?: string;
+  requested_declarations?: ProviderDeclarations;
+  approved_declarations?: ProviderDeclarations;
   /** Build provenance from the registered manifest; absent when undeclared or on older daemons. */
   provenance?: ManifestProvenance;
   roles: unknown[];
@@ -514,17 +526,14 @@ export interface ControlPush {
   body: Record<string, unknown>;
 }
 
+/** Every close reason this client can interpret, declared per route to capable daemons. */
+export const ACCEPTS_CLOSE_REASONS = Object.freeze([
+  "reload", "restart", "disable", "crash", "capability_denied", "scope_ended",
+  "scope_carrier_removed", "scope_delegation_changed", "scope_parent_ended", "authority_changed",
+] as const);
+
 /** A known route-close reason, excluding forward-compatible unknown values. */
-export type KnownRouteCloseReason =
-  | "reload"
-  | "restart"
-  | "disable"
-  | "crash"
-  | "capability_denied"
-  | "scope_ended"
-  | "scope_carrier_removed"
-  | "scope_delegation_changed"
-  | "scope_parent_ended";
+export type KnownRouteCloseReason = typeof ACCEPTS_CLOSE_REASONS[number];
 
 /** A route-close reason decoded from a daemon control push. */
 export type RouteCloseReason = KnownRouteCloseReason | "unknown";
@@ -559,6 +568,7 @@ export function parseRouteCloseReason(reason: unknown): RouteCloseReason {
     case "scope_carrier_removed":
     case "scope_delegation_changed":
     case "scope_parent_ended":
+    case "authority_changed":
       return reason;
     default:
       return "unknown";
@@ -570,6 +580,7 @@ export function classifyRouteCloseReason(reason: unknown): RouteCloseDisposition
   switch (parseRouteCloseReason(reason)) {
     case "reload":
     case "restart":
+    case "authority_changed":
       return "may_reopen";
     case "disable":
     case "crash":
@@ -711,6 +722,7 @@ interface CachedRoute {
 }
 
 export class SubcClient {
+  private closeReasonSupport?: { promise: Promise<boolean>; finish: (supported: boolean) => void };
   private nextCorr = 1n;
   private readonly pending = new Map<string, Pending>();
   private readonly lateResponses = new Map<string, (frame: Frame) => void>();
@@ -776,7 +788,53 @@ export class SubcClient {
     );
     const reply = await this.controlRpc(body);
     const parsed = this.parseJson(reply) as { op: string; modules?: CatalogEntry[] };
-    return parsed.modules ?? [];
+    return (parsed.modules ?? []).map((entry) => {
+      attestationInteger(entry.spawn, "spawn");
+      return { ...entry, ...(entry.origin !== undefined ? { origin: callerOrigin(entry.origin) } : {}) };
+    });
+  }
+
+  /**
+   * Watch coalesced catalog generations on channel zero; unsubscribe sends CANCEL.
+   * Uses activity.subscribe framing: STREAM_DATA events, STREAM_END or ERROR at
+   * termination (crates/subc-daemon/src/control.rs, handle_activity_read and
+   * cancel_activity_subscription). The Rust SDK's generic subscription reader
+   * also accepts a terminal RESPONSE (crates/subc-client-rs/src/consumer.rs).
+   */
+  catalogWatch(onEvent: (event: { op: "catalog.watch"; generation: number }) => void): Subscription {
+    return this.subscribeOnRoute(null, { op: "catalog.watch" }, (bytes) => {
+      const event = JSON.parse(new TextDecoder().decode(bytes)) as { op?: unknown; generation?: unknown };
+      if (event.op !== "catalog.watch" || typeof event.generation !== "number" ||
+          !Number.isInteger(event.generation) || event.generation < 0) return;
+      onEvent({ op: "catalog.watch", generation: event.generation });
+    });
+  }
+
+  private async supportsCloseReasons(remainingMs: number): Promise<boolean> {
+    // Cache failures as well as successes: an older daemon must never lose a route
+    // merely because it cannot describe this optional wire extension.
+    let probe = this.closeReasonSupport;
+    const budget = Math.min(CAPABILITY_PROBE_TIMEOUT, remainingMs);
+    if (!probe) {
+      let resolve!: (supported: boolean) => void;
+      let settled = false;
+      const promise = new Promise<boolean>((done) => { resolve = done; });
+      probe = this.closeReasonSupport = {
+        promise,
+        finish: (supported) => { if (!settled) { settled = true; resolve(supported); } },
+      };
+      const current = probe;
+      void this.controlRpc(this.encode({ op: "server.describe" }), undefined, undefined, budget)
+        .then((frame) => {
+          const body = this.parseJson(frame) as { capabilities?: unknown };
+          current.finish(Array.isArray(body?.capabilities) && body.capabilities.includes("route-close-reasons/v1"));
+        }).catch(() => current.finish(false));
+    }
+    // A concurrent opener with less time left can end the shared probe early.
+    // Late successful discovery cannot undo a cached timeout on this connection.
+    const current = probe;
+    const timer = setTimeout(() => current.finish(false), budget);
+    try { return await current.promise; } finally { clearTimeout(timer); }
   }
 
   /**
@@ -836,17 +894,26 @@ export class SubcClient {
     target: RouteTarget,
     identity: BindIdentity,
     opts: RouteOpenOptions = {},
+    deadline = (this.opts?.now?.() ?? Date.now()) + DEFAULT_REQUEST_TIMEOUT_MS,
   ): Promise<RouteHandle> {
     const scope = validatedRouteScope(opts.scope);
     const consumerIdentity = await routeOpenConsumerIdentity(opts);
     const reverseRequests = opts.reverseRequests ?? new ReverseRequestRegistry();
     reverseRequests.seal();
     const consumerCapabilities = reverseRequests.capabilities();
+    const remaining = (): number => Math.max(0, deadline - (this.opts?.now?.() ?? Date.now()));
+    let connection: object;
+    let acceptsCloseReasons: boolean;
+    do {
+      connection = this.connectionToken;
+      acceptsCloseReasons = await this.supportsCloseReasons(remaining());
+    } while (connection !== this.connectionToken);
     const body = this.encode({
       op: "route.open",
       busy_refusals: true,
       target,
       identity,
+      ...(acceptsCloseReasons ? { accepts_close_reasons: ACCEPTS_CLOSE_REASONS } : {}),
       ...(consumerIdentity ? { consumer_identity: consumerIdentity } : {}),
       ...(consumerCapabilities.length > 0 ? { consumer_capabilities: consumerCapabilities } : {}),
       ...(scope ? { scope: { owner: scope.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch,
@@ -857,11 +924,11 @@ export class SubcClient {
     let installed: RouteHandle | null = null;
     const install = (frame: Frame): boolean => {
       if (frame.header.ty !== FrameType.Response) return true;
-      const parsed = this.parseJson(frame) as { route_channel?: number; route_epoch?: number; request_window?: number; watch_window?: number };
+      const parsed = this.parseJson(frame) as { route_channel?: number; route_epoch?: number; request_window?: number; watch_window?: number; target?: unknown };
       if (typeof parsed.route_channel !== "number" || typeof parsed.route_epoch !== "number") {
         throw new SubcError(`route.open returned no route handle: ${JSON.stringify(parsed)}`);
       }
-      installed = this.installRoute(parsed.route_channel, parsed.route_epoch, reverseRequests);
+      installed = this.installRoute(parsed.route_channel, parsed.route_epoch, reverseRequests, readRouteOpenTarget(parsed.target));
       if (parsed.request_window !== undefined) this.gates.set(installed, new RequestGate(parsed.request_window, parsed.watch_window));
       this.routeModules.set(parsed.route_channel, target.module_id);
       return true;
@@ -880,7 +947,7 @@ export class SubcClient {
       }
     };
 
-    await this.controlRpc(body, install, closeLateRoute);
+    await this.controlRpc(body, install, closeLateRoute, remaining());
     if (!installed) throw new SubcError("route.open response was not installed");
     return installed;
   }
@@ -1046,6 +1113,16 @@ export class SubcClient {
   ): Subscription {
     this.assertLiveHandle(handle);
     if (this.gates.has(handle)) return this.subscribeGated(handle, body, onEvent, opts);
+    return this.subscribeOnRoute(handle, body, onEvent, opts);
+  }
+
+  private subscribeOnRoute(
+    handle: RouteHandle | null,
+    body: unknown,
+    onEvent: (event: Uint8Array) => void,
+    opts: SubscribeOptions = {},
+  ): Subscription {
+    const connection = this.connectionToken;
     const bytes = body instanceof Uint8Array ? body : this.encode(body);
     const priority = opts.priority ?? Priority.Interactive;
     const admission = opts.admissionClass ?? AdmissionClass.Normal;
@@ -1094,8 +1171,8 @@ export class SubcClient {
       const frame = buildFrame(
         FrameType.Request,
         buildFlags(false, priority, false, admission) | SUBSCRIPTION_FLAG,
-        handle.channel,
-        handle.epoch,
+        handle?.channel ?? 0,
+        handle?.epoch ?? 0,
         corr,
         bytes,
       );
@@ -1113,7 +1190,11 @@ export class SubcClient {
         resolveEnded({ kind: "cancelled" });
         resolveClosed?.();
       });
-      if (this.isLiveHandle(handle)) this.cancel(handle, corr, priority);
+      if (handle && this.isLiveHandle(handle)) this.cancel(handle, corr, priority);
+      else if (!handle && !this.closedErr && this.connectionToken === connection) {
+        const frame = buildFrame(FrameType.Cancel, buildFlags(false, priority, false), 0, 0, corr, EMPTY_BODY);
+        writeBorrowed(this.sock, encodeFrame(frame), Date.now() + DEFAULT_REQUEST_TIMEOUT_MS).catch(() => undefined);
+      }
     };
     return { unsubscribe, closed, ended };
   }
@@ -1311,8 +1392,9 @@ export class SubcClient {
     body: Uint8Array,
     acceptFrame?: (frame: Frame) => boolean,
     onLateResponse?: (frame: Frame) => void,
+    timeoutMs?: number,
   ): Promise<Frame> {
-    return this.send(null, body, Priority.Interactive, AdmissionClass.Normal, undefined, undefined, acceptFrame, onLateResponse);
+    return this.send(null, body, Priority.Interactive, AdmissionClass.Normal, timeoutMs, undefined, acceptFrame, onLateResponse);
   }
 
   private send(
@@ -1725,6 +1807,9 @@ export class SubcClient {
         throw this.notSentRecoveryError("route.open could not run because reconnect failed", error);
       }
       if (cached.handle && this.isLiveHandle(cached.handle)) return cached.handle;
+      // Do not start a zero-budget control call after the last retry sleep: its
+      // local timeout would hide the daemon refusal that exhausted the deadline.
+      if (this.opts.now() >= deadline) throw this.routeOpenRetryExhausted(cached.moduleId, routeRetryAttempt, refusals);
 
       // Waiting for a free slot spends the same deadline as retrying refusals.
       const release = await this.routeOpenGate.acquire(Math.max(0, deadline - this.opts.now()));
@@ -1736,7 +1821,7 @@ export class SubcClient {
             scope: cached.scope,
             consumerIdentity: cached.consumerIdentity ?? null,
             reverseRequests: cached.reverseRequests,
-          }),
+          }, deadline),
         };
       } catch (error) {
         outcome = { error };
@@ -1985,6 +2070,7 @@ export class SubcClient {
     this.liveRoutes.clear();
     this.lateResponses.clear();
     this.nextCorr = 1n;
+    this.closeReasonSupport = undefined;
     void this.readLoop(opened.sock, this.generation);
   }
 
@@ -2462,10 +2548,11 @@ export class SubcClient {
     channel: number,
     epoch: number,
     reverseRequests = new ReverseRequestRegistry(),
+    target?: RouteOpenTarget,
   ): RouteHandle {
     const previous = this.liveRoutes.get(channel);
     if (previous && this.gates.has(previous)) this.failHandle(previous, new SubcError("route replaced", "route_closed", undefined, "closed_by_caller"));
-    const handle = createRouteHandle(channel, epoch, this.connectionToken, reverseRequests);
+    const handle = createRouteHandle(channel, epoch, this.connectionToken, reverseRequests, target);
     this.routeEndReasons.delete(channel);
     this.legacyChannelReasons.delete(channel);
     this.routeModules.delete(channel);
@@ -2585,6 +2672,7 @@ export function isRetryableRouteOpenCode(code: string | undefined): boolean {
     // re-open can succeed.
     code === "scope_not_synced" ||
     code === "scope_changed" ||
+    code === "stale_authority_epoch" ||
     // A target module that can't yet resolve where the session's state lives
     // refuses the bind; nothing was sent, so a re-open can succeed.
     code === "session_address_unavailable" ||

@@ -1001,7 +1001,7 @@ describe("SubcClient managed call", () => {
       });
       // The third data attempt begins a new managed call. It must open a route
       // before sending data, rather than reuse the retry's dead channel.
-      expect(stats.requestFrames[4]).toEqual({ channel: 0, controlOp: "route.open" });
+      expect(stats.requestFrames[5]).toEqual({ channel: 0, controlOp: "route.open" });
     } finally {
       client.close();
     }
@@ -1903,6 +1903,11 @@ async function handleFakeConnection(socket: Socket, options: FakeDaemonOptions):
     if (frame.header.channel === 0) {
       const request = parseJson(frame.body) as { op?: string; target?: { module_id?: string } };
       requestFrame.controlOp = request.op;
+      const describe = serverDescribeReply(frame);
+      if (describe) {
+        await writeFrame(socket, describe, deadline);
+        continue;
+      }
       if (request.op === "catalog.list") {
         if (options.holdCatalogList) {
           continue; // parked forever: the pending stays in flight client-side
@@ -2327,3 +2332,4 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 function clientClosedErr(client: SubcClient): Error | null {
   return (client as unknown as { closedErr: Error | null }).closedErr;
 }
+import { serverDescribeReply } from "./control-fixture.js";

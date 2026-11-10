@@ -165,3 +165,5 @@ export {
   type TrustTier,
   type VaultGrantInput,
 } from "./provider.js";
+export type { CallerAttestation, CallerClaim, CallerOrigin, ProviderDeclarations, RouteOpenTarget } from "./attestation.js";
+export { ACCEPTS_CLOSE_REASONS, CAPABILITY_PROBE_TIMEOUT } from "./client.js";

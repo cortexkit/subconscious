@@ -526,6 +526,8 @@ pub struct ControlHandler {
     hello_before_publication_hold: Option<Arc<std::sync::Barrier>>,
     #[cfg(test)]
     hello_after_launch_check_hold: Option<Arc<std::sync::Barrier>>,
+    #[cfg(test)]
+    hello_inside_publication_hold: Option<Arc<std::sync::Barrier>>,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -1144,6 +1146,8 @@ impl ControlHandler {
             hello_before_publication_hold: None,
             #[cfg(test)]
             hello_after_launch_check_hold: None,
+            #[cfg(test)]
+            hello_inside_publication_hold: None,
         }
     }
 
@@ -1321,6 +1325,15 @@ impl ControlHandler {
         hold: Arc<std::sync::Barrier>,
     ) -> Self {
         self.hello_after_launch_check_hold = Some(hold);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_hello_inside_publication_hold(
+        mut self,
+        hold: Arc<std::sync::Barrier>,
+    ) -> Self {
+        self.hello_inside_publication_hold = Some(hold);
         self
     }
 
@@ -3375,6 +3388,12 @@ impl ControlHandler {
         if let Some(nonce) = hello.launch_nonce.as_deref() {
             self.supervisor
                 .program_hello_accepted(&registration.manifest.module_id, nonce);
+        }
+
+        #[cfg(test)]
+        if let Some(hold) = &self.hello_inside_publication_hold {
+            hold.wait();
+            hold.wait();
         }
 
         Ok(reply)

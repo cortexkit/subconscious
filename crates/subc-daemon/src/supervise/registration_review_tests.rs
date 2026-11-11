@@ -118,6 +118,66 @@ async fn registration_channel_retirement_wins_during_hello_publication() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registration_channel_publication_lock_excludes_retirement_until_cleanup() {
+    let handle = SupervisorHandle::new();
+    let registry = Arc::new(Registry::default());
+    let hold = Arc::new(std::sync::Barrier::new(2));
+    let control = crate::ControlHandler::new(registry.clone())
+        .with_supervisor(handle.clone())
+        .with_hello_inside_publication_hold(hold.clone());
+    let spawn = RegistrationSpawn::new(&handle, "channel-module", SpawnRole::Plain, None);
+    spawn.ready();
+    let (auth, info) = auth();
+    let (_router, mut child, _copy) = serve_control(&handle, spawn.clone(), auth, control);
+    subc_transport::authenticate_client(&mut child, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    subc_transport::write_frame(&mut child, &hello("channel-module"))
+        .await
+        .unwrap();
+    let barrier = hold.clone();
+    tokio::task::spawn_blocking(move || {
+        barrier.wait();
+    })
+    .await
+    .unwrap();
+    assert_eq!(registry.active_registration_count().unwrap(), 1);
+    let (started, entered) = tokio::sync::oneshot::channel();
+    let mut retirement = tokio::task::spawn_blocking(move || {
+        started.send(()).unwrap();
+        spawn.retire();
+    });
+    entered.await.unwrap();
+    let completed_early = tokio::time::timeout(Duration::from_millis(100), &mut retirement)
+        .await
+        .is_ok();
+    let barrier = hold.clone();
+    tokio::task::spawn_blocking(move || {
+        barrier.wait();
+    })
+    .await
+    .unwrap();
+    if !completed_early {
+        retirement.await.unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while registry.active_registration_count().unwrap() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retirement must withdraw the published registration");
+    assert!(
+        !completed_early,
+        "retirement must wait while publication owns the transition lock"
+    );
+    assert!(
+        registry.generation().unwrap() >= 2,
+        "the test must cover publication and its removal"
+    );
+}
+
 #[tokio::test]
 async fn registration_channel_binding_retirement_shuts_down_retained_endpoint() {
     let handle = SupervisorHandle::new();

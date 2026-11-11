@@ -2269,7 +2269,7 @@ impl ControlHandler {
                     return Ok(vec![refusal]);
                 }
                 if op.as_ref().is_some_and(|probe| probe.op == "claim.mint") {
-                    return self.handle_claim_mint(ctx.connection_id, &frame);
+                    return self.handle_claim_mint(ctx.connection_id, &frame).await;
                 }
                 if let Some(probe) = op
                     .as_ref()

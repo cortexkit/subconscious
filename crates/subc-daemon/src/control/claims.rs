@@ -6,6 +6,11 @@
 //! GOODBYE prevents the primary from issuing new connection claims and voids
 //! pending tokens only. Already-bound consumers belong to the launch, so they
 //! remain connected until retirement (observed exit or permanent program refusal).
+//!
+//! Quota and single-use reservations cover the unlocked content-verification
+//! interval. Concurrent attempts cannot overbook a limit or hash the same token
+//! twice. The blocking worker retains them through hashing even after caller
+//! cancellation; refusal or cancellation then returns them without a binding.
 
 use super::*;
 use crate::supervise::RegistrationSpawn;
@@ -53,6 +58,7 @@ impl fmt::Debug for ClaimBinding {
 struct Pending {
     purpose: ClaimPurpose,
     expires: tokio::time::Instant,
+    redeeming: Option<Arc<()>>,
 }
 
 struct Bucket {
@@ -86,10 +92,81 @@ struct LaunchState {
     pending: HashMap<[u8; 16], Pending>,
     connections: HashMap<ConnectionId, crate::FrameSink>,
     bucket: Bucket,
+    mint_reservations: usize,
+    present_reservations: usize,
     #[cfg(test)]
     pending_visits: u64,
     #[cfg(test)]
     index_operations: u64,
+}
+
+struct MintPermit {
+    launch: Arc<LaunchClaims>,
+    reserved: bool,
+}
+
+impl MintPermit {
+    fn finish(&mut self, state: &mut LaunchState) {
+        state.mint_reservations -= 1;
+        self.reserved = false;
+    }
+}
+
+impl Drop for MintPermit {
+    fn drop(&mut self) {
+        if self.reserved {
+            self.launch
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .mint_reservations -= 1;
+        }
+    }
+}
+
+struct PresentPermit {
+    launch: Arc<LaunchClaims>,
+    registration: Arc<RegistrationSpawn>,
+    token: [u8; 16],
+    marker: Arc<()>,
+    reserved: bool,
+}
+
+impl PresentPermit {
+    fn finish(&mut self, state: &mut LaunchState) {
+        state.present_reservations -= 1;
+        self.reserved = false;
+    }
+}
+
+impl Drop for PresentPermit {
+    fn drop(&mut self) {
+        if !self.reserved {
+            return;
+        }
+        let mut state = self.launch.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.present_reservations -= 1;
+        if let Some(pending) = state.pending.get_mut(&self.token) {
+            if pending
+                .redeeming
+                .as_ref()
+                .is_some_and(|marker| Arc::ptr_eq(marker, &self.marker))
+            {
+                pending.redeeming = None;
+                if pending.expires <= tokio::time::Instant::now() {
+                    state.pending.remove(&self.token);
+                    if let Some(table) = self.launch.table.upgrade() {
+                        table
+                            .0
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .pending
+                            .remove(&self.token);
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(crate) struct LaunchClaims {
@@ -110,6 +187,10 @@ impl fmt::Debug for LaunchClaims {
 }
 
 impl LaunchClaims {
+    #[cfg(all(test, unix))]
+    pub(crate) fn pending_count_for_test(&self) -> usize {
+        self.state.lock().unwrap().pending.len()
+    }
     pub(crate) fn end_primary_registration(&self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.primary_live = false;
@@ -200,12 +281,83 @@ impl Claims {
 }
 
 impl ControlHandler {
-    fn claim_primary_authorized(
+    #[cfg(all(test, unix))]
+    pub(crate) fn expire_claim_for_test(&self, claim: &Claim) {
+        let token: [u8; 16] = URL_SAFE_NO_PAD
+            .decode(claim.expose_secret())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let launch = self
+            .claims
+            .0
+            .lock()
+            .unwrap()
+            .pending
+            .get(&token)
+            .unwrap()
+            .upgrade()
+            .unwrap();
+        launch
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .get_mut(&token)
+            .unwrap()
+            .expires = tokio::time::Instant::now() - Duration::from_secs(1);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn claim_pending_for_test(&self, claim: &Claim) -> bool {
+        let token: [u8; 16] = URL_SAFE_NO_PAD
+            .decode(claim.expose_secret())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        self.claims.0.lock().unwrap().pending.contains_key(&token)
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn claim_reserved_for_test(&self, claim: &Claim) -> bool {
+        let token: [u8; 16] = URL_SAFE_NO_PAD
+            .decode(claim.expose_secret())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let launch = self
+            .claims
+            .0
+            .lock()
+            .unwrap()
+            .pending
+            .get(&token)
+            .and_then(std::sync::Weak::upgrade);
+        launch.is_some_and(|launch| {
+            launch
+                .state
+                .lock()
+                .unwrap()
+                .pending
+                .get(&token)
+                .is_some_and(|pending| pending.redeeming.is_some())
+        })
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn exhaust_claim_rate_for_test(&self, connection: ConnectionId) {
+        let spawn = self.supervisor.registration_spawn(connection).unwrap();
+        let mut state = spawn.claims.get().unwrap().state.lock().unwrap();
+        state.bucket.tokens = 0;
+        state.bucket.updated = tokio::time::Instant::now() + Duration::from_secs(60);
+    }
+    fn claim_primary_registered(
         &self,
         connection: ConnectionId,
         spawn: &RegistrationSpawn,
     ) -> bool {
         spawn.registered()
+            && spawn.launch_ready()
             && self
                 .forwarding
                 .module_id_for_connection(connection)
@@ -213,9 +365,31 @@ impl ControlHandler {
                 .flatten()
                 .as_deref()
                 == Some(spawn.module_id.as_str())
-            && spawn.check().is_ok()
     }
-    pub(super) fn handle_claim_mint(
+
+    async fn check_claim_program<T: Send + 'static>(
+        &self,
+        spawn: Arc<RegistrationSpawn>,
+        permit: T,
+    ) -> Result<(T, bool), tokio::task::JoinError> {
+        // Without a program binding, check() only reads launch state and cannot
+        // hash executable content.
+        if !spawn.has_program_binding() {
+            return Ok((permit, spawn.check().is_ok()));
+        }
+        let dispatcher = tracing::dispatcher::get_default(Clone::clone);
+        let span = tracing::Span::current();
+        // The worker owns the reservation until hashing ends, even if its caller
+        // disconnects and drops the JoinHandle before receiving the result.
+        tokio::task::spawn_blocking(move || {
+            let allowed = tracing::dispatcher::with_default(&dispatcher, || {
+                span.in_scope(|| spawn.check().is_ok())
+            });
+            (permit, allowed)
+        })
+        .await
+    }
+    pub(super) async fn handle_claim_mint(
         &self,
         connection: ConnectionId,
         frame: &Frame,
@@ -233,90 +407,112 @@ impl ControlHandler {
         let Some(spawn) = self.supervisor.registration_spawn(connection) else {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
         };
-        if !self.claim_primary_authorized(connection, &spawn) {
+        if !self.claim_primary_registered(connection, &spawn) {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
         }
-        // Prefix claims authorize a child's HELLO under its owner's configured
-        // module-id prefix. Consumer-purpose minting cannot grant that permission
-        // without checking ownership of the child's exact requested module id.
+        // Prefix claims register a child module, rather than opening a consumer.
         if !matches!(
             request.purpose,
             ClaimPurpose::SelfConnection | ClaimPurpose::Helper | ClaimPurpose::Relay
         ) {
             return self.claim_refusal(frame, error_codes::CLAIM_PREFIX_REFUSED);
         }
+        let permit = {
+            let Ok(_alive) = spawn.begin_publication() else {
+                return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
+            };
+            let now = tokio::time::Instant::now();
+            let launch = spawn
+                .claims
+                .get_or_init(|| {
+                    Arc::new(LaunchClaims {
+                        primary: connection,
+                        incarnation: spawn.incarnation.clone(),
+                        registration: Arc::downgrade(&spawn),
+                        table: Arc::downgrade(&self.claims),
+                        forwarding: self.forwarding.clone(),
+                        state: Mutex::new(LaunchState {
+                            active: true,
+                            primary_live: true,
+                            pending: HashMap::new(),
+                            connections: HashMap::new(),
+                            bucket: Bucket {
+                                tokens: CLAIM_MINT_BURST * TOKEN,
+                                updated: now,
+                            },
+                            mint_reservations: 0,
+                            present_reservations: 0,
+                            #[cfg(test)]
+                            pending_visits: 0,
+                            #[cfg(test)]
+                            index_operations: 0,
+                        }),
+                    })
+                })
+                .clone();
+            let mut state = launch.state.lock().unwrap_or_else(|p| p.into_inner());
+            if !state.active || !state.primary_live {
+                return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
+            }
+            if let Err(retry_after_ms) = state.bucket.take(now) {
+                let error = ErrorBody {
+                    code: error_codes::CLAIM_RATE_LIMITED.into(),
+                    message: "claim mint rate exceeded".into(),
+                    detail: Some(
+                        serde_json::to_value(ClaimRateLimitedDetail::new(retry_after_ms))
+                            .expect("claim rate detail serializes"),
+                    ),
+                };
+                return Ok(vec![control_error_body_frame(frame, error)?]);
+            }
+            if state.pending.len() + state.mint_reservations >= MAX_UNREDEEMED_CLAIMS_PER_SPAWN {
+                #[cfg(test)]
+                {
+                    state.pending_visits += state.pending.len() as u64;
+                }
+                let expired = state
+                    .pending
+                    .iter()
+                    .filter(|(_, pending)| pending.expires <= now)
+                    .map(|(token, _)| *token)
+                    .collect::<Vec<_>>();
+                if !expired.is_empty() {
+                    let mut index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
+                    for token in expired {
+                        state.pending.remove(&token);
+                        index.pending.remove(&token);
+                        #[cfg(test)]
+                        {
+                            state.index_operations += 1;
+                        }
+                    }
+                }
+                if state.pending.len() + state.mint_reservations >= MAX_UNREDEEMED_CLAIMS_PER_SPAWN
+                {
+                    return self.claim_refusal(frame, error_codes::CLAIM_UNREDEEMED_LIMIT);
+                }
+            }
+            state.mint_reservations += 1;
+            drop(state);
+            MintPermit {
+                launch,
+                reserved: true,
+            }
+        };
+        let (mut permit, verified) = match self.check_claim_program(spawn.clone(), permit).await {
+            Ok(result) => result,
+            Err(_) => return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED),
+        };
+        if !verified || !self.claim_primary_registered(connection, &spawn) {
+            return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
+        }
         let Ok(_alive) = spawn.begin_publication() else {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
         };
-        let now = tokio::time::Instant::now();
-        let launch = spawn
-            .claims
-            .get_or_init(|| {
-                Arc::new(LaunchClaims {
-                    primary: connection,
-                    incarnation: spawn.incarnation.clone(),
-                    registration: Arc::downgrade(&spawn),
-                    table: Arc::downgrade(&self.claims),
-                    forwarding: self.forwarding.clone(),
-                    state: Mutex::new(LaunchState {
-                        active: true,
-                        primary_live: true,
-                        pending: HashMap::new(),
-                        connections: HashMap::new(),
-                        bucket: Bucket {
-                            tokens: CLAIM_MINT_BURST * TOKEN,
-                            updated: now,
-                        },
-                        #[cfg(test)]
-                        pending_visits: 0,
-                        #[cfg(test)]
-                        index_operations: 0,
-                    }),
-                })
-            })
-            .clone();
+        let launch = permit.launch.clone();
         let mut state = launch.state.lock().unwrap_or_else(|p| p.into_inner());
-        if !state.primary_live {
+        if !state.active || !state.primary_live {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
-        }
-        if let Err(retry_after_ms) = state.bucket.take(now) {
-            let error = subc_protocol::ErrorBody {
-                code: error_codes::CLAIM_RATE_LIMITED.into(),
-                message: "claim mint rate exceeded".into(),
-                detail: Some(
-                    serde_json::to_value(ClaimRateLimitedDetail::new(retry_after_ms))
-                        .expect("claim rate detail serializes"),
-                ),
-            };
-            return Ok(vec![control_error_body_frame(frame, error)?]);
-        }
-        // A count below the cap needs no sweep. At the cap, inspect only this
-        // launch's bounded pending set, after the cheap rate admission succeeds.
-        if state.pending.len() >= MAX_UNREDEEMED_CLAIMS_PER_SPAWN {
-            #[cfg(test)]
-            {
-                state.pending_visits += state.pending.len() as u64;
-            }
-            let expired = state
-                .pending
-                .iter()
-                .filter(|(_, pending)| pending.expires <= now)
-                .map(|(token, _)| *token)
-                .collect::<Vec<_>>();
-            if !expired.is_empty() {
-                let mut index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
-                for token in expired {
-                    state.pending.remove(&token);
-                    index.pending.remove(&token);
-                    #[cfg(test)]
-                    {
-                        state.index_operations += 1;
-                    }
-                }
-            }
-            if state.pending.len() >= MAX_UNREDEEMED_CLAIMS_PER_SPAWN {
-                return self.claim_refusal(frame, error_codes::CLAIM_UNREDEEMED_LIMIT);
-            }
         }
         let mut index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
         let mut token = [0; 16];
@@ -336,7 +532,8 @@ impl ControlHandler {
             token,
             Pending {
                 purpose: request.purpose,
-                expires: now + CLAIM_LIFETIME,
+                expires: tokio::time::Instant::now() + CLAIM_LIFETIME,
+                redeeming: None,
             },
         );
         index.pending.insert(token, Arc::downgrade(&launch));
@@ -344,6 +541,7 @@ impl ControlHandler {
         {
             state.index_operations += 1;
         }
+        permit.finish(&mut state);
         let expires_at_ms =
             crate::clock::wall_now_ms().saturating_add(CLAIM_LIFETIME.as_millis() as u64);
         Ok(vec![control_response_body_frame(
@@ -400,6 +598,25 @@ impl ControlHandler {
         Ok(Vec::new())
     }
 
+    fn reclaim_expired_claim(&self, launch: &LaunchClaims, token: &[u8; 16]) -> bool {
+        let mut state = launch.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state
+            .pending
+            .get(token)
+            .is_some_and(|pending| pending.expires <= tokio::time::Instant::now())
+        {
+            state.pending.remove(token);
+            self.claims
+                .0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pending
+                .remove(token);
+            return true;
+        }
+        false
+    }
+
     async fn consume_claim(&self, ctx: &RouteCtx, frame: &Frame) -> Result<(), &'static str> {
         let connection = ctx.connection_id;
         let request = serde_json::from_slice::<ClaimPresentRequest>(&frame.body)
@@ -410,12 +627,11 @@ impl ControlHandler {
             return Err(error_codes::CLAIM_INVALID);
         }
         let launch = {
-            let state = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
-            state
+            let index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
+            index
                 .pending
                 .get(&token)
-                .ok_or(error_codes::CLAIM_INVALID)?
-                .upgrade()
+                .and_then(std::sync::Weak::upgrade)
                 .ok_or(error_codes::CLAIM_INVALID)?
         };
         #[cfg(test)]
@@ -425,11 +641,73 @@ impl ControlHandler {
                 barrier.wait().await;
             }
         }
+        if self.reclaim_expired_claim(&launch, &token) {
+            return Err(error_codes::CLAIM_INVALID);
+        }
         let registration = launch
             .registration
             .upgrade()
             .ok_or(error_codes::CLAIM_INVALID)?;
-        if !self.claim_primary_authorized(launch.primary, &registration) {
+        if !self.claim_primary_registered(launch.primary, &registration) {
+            return Err(error_codes::CLAIM_INVALID);
+        }
+        let permit = {
+            let _alive = registration
+                .begin_publication()
+                .map_err(|_| error_codes::CLAIM_INVALID)?;
+            let mut state = launch.state.lock().unwrap_or_else(|p| p.into_inner());
+            let pending = state
+                .pending
+                .get(&token)
+                .ok_or(error_codes::CLAIM_INVALID)?;
+            if pending.expires <= tokio::time::Instant::now() {
+                state.pending.remove(&token);
+                self.claims
+                    .0
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .pending
+                    .remove(&token);
+                return Err(error_codes::CLAIM_INVALID);
+            }
+            if !state.active || !state.primary_live || pending.redeeming.is_some() {
+                return Err(error_codes::CLAIM_INVALID);
+            }
+            if state.connections.len() + state.present_reservations
+                >= MAX_LIVE_CLAIM_CONNECTIONS_PER_SPAWN
+            {
+                return Err(error_codes::CLAIM_CONNECTION_LIMIT);
+            }
+            if self
+                .claims
+                .0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .bindings
+                .contains_key(&connection)
+            {
+                return Err(error_codes::CLAIM_INVALID);
+            }
+            let marker = Arc::new(());
+            state
+                .pending
+                .get_mut(&token)
+                .expect("pending claim checked under the launch lock")
+                .redeeming = Some(marker.clone());
+            state.present_reservations += 1;
+            PresentPermit {
+                launch: launch.clone(),
+                registration: registration.clone(),
+                token,
+                marker,
+                reserved: true,
+            }
+        };
+        let (mut permit, verified) = self
+            .check_claim_program(registration.clone(), permit)
+            .await
+            .map_err(|_| error_codes::CLAIM_INVALID)?;
+        if !verified || !self.claim_primary_registered(launch.primary, &registration) {
             return Err(error_codes::CLAIM_INVALID);
         }
         let _alive = registration
@@ -440,11 +718,15 @@ impl ControlHandler {
             .pending
             .get(&token)
             .ok_or(error_codes::CLAIM_INVALID)?;
-        if pending.expires <= tokio::time::Instant::now() || !state.active || !state.primary_live {
+        if pending.expires <= tokio::time::Instant::now()
+            || !state.active
+            || !state.primary_live
+            || !pending
+                .redeeming
+                .as_ref()
+                .is_some_and(|marker| Arc::ptr_eq(marker, &permit.marker))
+        {
             return Err(error_codes::CLAIM_INVALID);
-        }
-        if state.connections.len() >= MAX_LIVE_CLAIM_CONNECTIONS_PER_SPAWN {
-            return Err(error_codes::CLAIM_CONNECTION_LIMIT);
         }
         let mut index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
         if index.bindings.contains_key(&connection) {
@@ -453,7 +735,7 @@ impl ControlHandler {
         let pending = state
             .pending
             .remove(&token)
-            .expect("pending claim checked under the launch lock");
+            .expect("reserved claim checked under the launch lock");
         index.pending.remove(&token);
         state.connections.insert(connection, ctx.egress.clone());
         index.bindings.insert(
@@ -463,9 +745,10 @@ impl ControlHandler {
                 incarnation: launch.incarnation.clone(),
                 spawn: launch.primary,
                 purpose: pending.purpose,
-                registration: registration.clone(),
+                registration: permit.registration.clone(),
             },
         );
+        permit.finish(&mut state);
         #[cfg(test)]
         if let Some(hold) = self.claims.3.lock().unwrap().take() {
             hold.reached.notify_one();
@@ -506,6 +789,11 @@ pub(crate) mod tests {
     }
 
     impl Net {
+        pub(crate) async fn send(&mut self, frame: Frame) {
+            subc_transport::write_frame(&mut self.client, &frame)
+                .await
+                .unwrap();
+        }
         pub(crate) async fn new(router: Arc<Router>) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();

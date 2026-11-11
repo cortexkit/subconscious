@@ -16,6 +16,7 @@ struct GatedClaimFixture {
     module: crate::supervise::SupervisedModule,
     spawn: Arc<crate::supervise::RegistrationSpawn>,
     router: Arc<crate::Router>,
+    handler: Arc<crate::ControlHandler>,
     primary: crate::control::claims::tests::Net,
 }
 
@@ -37,10 +38,12 @@ async fn gated_claim_fixture() -> GatedClaimFixture {
     assert!(handle.wait_program_binding("a", &proof).await);
     let spawn = handle.registration_for_test("a").unwrap();
     spawn.wait_launch().await;
-    let control = crate::ControlHandler::with_forwarding(registry, forwarding)
-        .with_supervisor(handle.clone())
-        .with_config_runtime(owner.clone());
-    let router = Arc::new(crate::Router::with_control_handler(Arc::new(control)));
+    let control = Arc::new(
+        crate::ControlHandler::with_forwarding(registry, forwarding)
+            .with_supervisor(handle.clone())
+            .with_config_runtime(owner.clone()),
+    );
+    let router = Arc::new(crate::Router::with_control_handler(control.clone()));
     let mut primary = Net::new(router.clone()).await;
     let ack = primary
         .call(module_hello(Some(proof), ConnectionId::new(1)))
@@ -59,6 +62,7 @@ async fn gated_claim_fixture() -> GatedClaimFixture {
         module,
         spawn,
         router,
+        handler: control,
         primary,
     }
 }
@@ -143,6 +147,201 @@ async fn gated_claim_mint(primary: &mut crate::control::claims::tests::Net) -> s
     serde_json::from_slice::<subc_control::ClaimMintReply>(&reply.body)
         .unwrap()
         .claim
+}
+
+#[tokio::test]
+async fn claims_expired_representations_are_removed_without_content_checks() {
+    use crate::control::claims::tests::{error, request, Net};
+    let mut fixture = gated_claim_fixture().await;
+    let token = gated_claim_mint(&mut fixture.primary).await;
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = checks.clone();
+    fixture.spawn.set_content_probe_for_test(Arc::new(move || {
+        observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }));
+    // Move only the stored monotonic expiry; the production lifetime and the
+    // informational wall-clock timestamp remain unchanged.
+    fixture.handler.expire_claim_for_test(&token);
+    for _ in 0..2 {
+        let mut consumer = Net::new(fixture.router.clone()).await;
+        error(
+            &consumer
+                .call(request(subc_control::ClaimPresentRequest::new(
+                    token.clone(),
+                )))
+                .await,
+            "claim_invalid",
+        );
+        assert!(consumer.recv().await.is_none());
+    }
+    assert_eq!(
+        checks.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "expired tokens must be rejected before executable hashing"
+    );
+    assert!(
+        !fixture.handler.claim_pending_for_test(&token),
+        "expired token must leave the global index"
+    );
+    assert_eq!(
+        fixture.spawn.claims.get().unwrap().pending_count_for_test(),
+        0
+    );
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn claims_rate_refusal_precedes_content_checks() {
+    use crate::control::claims::tests::{error, request};
+    let mut fixture = gated_claim_fixture().await;
+    gated_claim_mint(&mut fixture.primary).await;
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = checks.clone();
+    fixture.spawn.set_content_probe_for_test(Arc::new(move || {
+        observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }));
+    fixture
+        .handler
+        .exhaust_claim_rate_for_test(ConnectionId::new(1));
+    error(
+        &fixture
+            .primary
+            .call(request(subc_control::ClaimMintRequest::new(
+                subc_control::ClaimPurpose::SelfConnection,
+            )))
+            .await,
+        "claim_rate_limited",
+    );
+    assert_eq!(
+        checks.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "rate-limited mint must not hash the executable"
+    );
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn claims_mint_and_present_content_checks_use_blocking_workers() {
+    use crate::control::claims::tests::{request, Net};
+    let mut fixture = gated_claim_fixture().await;
+    let threads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = threads.clone();
+    // The current-thread runtime runs the test driver and socket readers on
+    // one thread, so a different ID identifies an actual blocking worker.
+    let reader = std::thread::current().id();
+    fixture.spawn.set_content_probe_for_test(Arc::new(move || {
+        observed.lock().unwrap().push(std::thread::current().id());
+        Ok(())
+    }));
+    let token = gated_claim_mint(&mut fixture.primary).await;
+    let mut consumer = Net::new(fixture.router.clone()).await;
+    assert_eq!(
+        consumer
+            .call(request(subc_control::ClaimPresentRequest::new(token)))
+            .await
+            .header
+            .ty,
+        subc_protocol::FrameType::Response
+    );
+    let checked = threads.lock().unwrap().clone();
+    assert!(
+        checked.len() >= 2,
+        "both mint and present must verify live content"
+    );
+    assert!(
+        checked.iter().all(|thread| *thread != reader),
+        "content verification must run off the async reader"
+    );
+    drop(consumer);
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn claims_cancelled_presentation_keeps_reservation_until_content_worker_finishes() {
+    use crate::control::claims::tests::{error, request, Net};
+    type Gate = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+    struct Release(Gate);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+        }
+    }
+    let mut fixture = gated_claim_fixture().await;
+    let token = gated_claim_mint(&mut fixture.primary).await;
+    let gate: Gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Release(gate.clone());
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let observed = reached.clone();
+    let hold = gate.clone();
+    fixture.spawn.set_content_probe_for_test(Arc::new(move || {
+        observed.notify_one();
+        let _ = hold
+            .1
+            .wait_timeout_while(
+                hold.0.lock().unwrap(),
+                Duration::from_secs(10),
+                |released| !*released,
+            )
+            .unwrap();
+        Ok(())
+    }));
+    let mut first = Net::new(fixture.router.clone()).await;
+    first
+        .send(request(subc_control::ClaimPresentRequest::new(
+            token.clone(),
+        )))
+        .await;
+    tokio::time::timeout(Duration::from_secs(2), reached.notified())
+        .await
+        .expect("content worker must reach the held check");
+    fixture.handler.forwarding().request_connection_close(
+        ConnectionId::new(2),
+        crate::forwarding::CloseReason::new("test_cancel", "cancel pending claim check"),
+    );
+    assert!(first.recv().await.is_none());
+    assert!(
+        fixture.handler.claim_reserved_for_test(&token),
+        "disconnect must not release a running content worker's reservation"
+    );
+    let mut duplicate = Net::new(fixture.router.clone()).await;
+    error(
+        &duplicate
+            .call(request(subc_control::ClaimPresentRequest::new(
+                token.clone(),
+            )))
+            .await,
+        "claim_invalid",
+    );
+    assert!(duplicate.recv().await.is_none());
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.handler.claim_reserved_for_test(&token) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("finished worker must release its reservation");
+    fixture
+        .spawn
+        .set_content_probe_for_test(Arc::new(|| Ok(())));
+    let mut retry = Net::new(fixture.router.clone()).await;
+    assert_eq!(
+        retry
+            .call(request(subc_control::ClaimPresentRequest::new(token)))
+            .await
+            .header
+            .ty,
+        subc_protocol::FrameType::Response
+    );
+    drop(retry);
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

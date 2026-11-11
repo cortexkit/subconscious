@@ -75,6 +75,7 @@ async fn probe() {
         None,
         SpawnRole::Plain,
         false,
+        DEFAULT_REGISTER_TIMEOUT,
     )
     .unwrap();
     #[cfg(target_os = "macos")]

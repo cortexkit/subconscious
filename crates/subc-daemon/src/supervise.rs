@@ -3802,6 +3802,7 @@ impl Supervisor {
             runtime.spawn_delivery(),
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
+            runtime.register_timeout,
         );
         #[cfg(test)]
         self.test_after_first_spawn.run(&spec.module_id);
@@ -4099,6 +4100,7 @@ impl Supervisor {
                 runtime.spawn_delivery(),
                 #[cfg(target_os = "linux")]
                 runtime.cgroup_placement.as_ref(),
+                runtime.register_timeout,
             );
             #[cfg(test)]
             self.test_after_first_spawn.run(&spec.module_id);
@@ -10542,6 +10544,7 @@ fn spawn_child(
     roster: &ChildRoster,
     config_delivery: Option<config_delivery::SpawnDelivery<'_>>,
     #[cfg(target_os = "linux")] cgroup_placement: Option<&subc_cgroup::Placement>,
+    register_timeout: Duration,
 ) -> Result<SupervisedChild, SuperviseError> {
     #[cfg(all(test, unix))]
     if let Some(source) = containment_tests::join_failure(spec, roster) {
@@ -10564,6 +10567,7 @@ fn spawn_child(
         cgroup_placement,
         SpawnRole::Plain,
         false,
+        register_timeout,
     );
     if result.is_err() {
         if roster.admission_pending(&spec.module_id) {
@@ -10599,6 +10603,7 @@ fn spawn_child_in_slot(
     #[cfg(target_os = "linux")] cgroup_placement: Option<&subc_cgroup::Placement>,
     role: SpawnRole,
     alternate_slot: bool,
+    register_timeout: Duration,
 ) -> Result<SupervisedChild, SuperviseError> {
     let prepared = prepare_child_in_slot(
         spec,
@@ -10633,10 +10638,6 @@ fn spawn_child_in_slot(
         .as_ref()
         .and_then(|admission| admission.approved_base())
         .cloned();
-    let register_timeout = handle
-        .and_then(|handle| handle.get(&spec.module_id))
-        .and_then(|module| module.configured_register_timeout().ok())
-        .unwrap_or(DEFAULT_REGISTER_TIMEOUT);
     let mut result = launch_child_in_slot(spec, ring, roster, prepared, register_timeout);
     drop(_gate);
     if let (Some(delivery), Err(SuperviseError::ConfigHeld { code, detail, .. })) =
@@ -12950,6 +12951,7 @@ fn spawn_and_mark_running(
             runtime.spawn_delivery(),
             #[cfg(target_os = "linux")]
             runtime.cgroup_placement.as_ref(),
+            runtime.register_timeout,
         )
     };
     let result = spawn();
@@ -19466,6 +19468,7 @@ mod cgroup_placement_tests {
                 &runtime.child_roster,
                 runtime.spawn_delivery(),
                 Some(&placement),
+                runtime.register_timeout,
             )
             .unwrap()
         };
@@ -19509,6 +19512,7 @@ mod cgroup_placement_tests {
             &fresh_roster,
             None,
             Some(&placement),
+            runtime.register_timeout,
         )
         .unwrap();
         short.wait().await.unwrap();
@@ -19523,6 +19527,7 @@ mod cgroup_placement_tests {
             &fresh_roster,
             None,
             Some(&placement),
+            runtime.register_timeout,
         )
         .unwrap();
         long_id.wait().await.unwrap();
@@ -20756,6 +20761,7 @@ mod launch_nonce_descriptor_tests {
             None,
             role,
             matches!(role, super::SpawnRole::SwapCandidate),
+            super::DEFAULT_REGISTER_TIMEOUT,
         )
         .expect("spawn probe");
         let deadline = Instant::now() + Duration::from_secs(10);

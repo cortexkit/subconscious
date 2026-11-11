@@ -1434,6 +1434,7 @@ mod tests {
             runtime.spawn_delivery(),
             #[cfg(target_os = "linux")]
             None,
+            runtime.register_timeout,
         )
         .unwrap();
         let mut manifest =
@@ -2159,6 +2160,7 @@ mod tests {
             runtime.spawn_delivery(),
             #[cfg(target_os = "linux")]
             None,
+            runtime.register_timeout,
         )
         .unwrap();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));

@@ -3,6 +3,68 @@ use subc_protocol::{Frame, FrameType};
 
 include!("registration_drain_tests.rs");
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registration_channel_sync_spawn_budget_ignores_previous_same_id_configuration() {
+    let scratch = cortexkit_test_support::ScratchDir::new("sync-channel-budget");
+    let registry = Arc::new(Registry::default());
+    let handle = SupervisorHandle::new();
+    handle.capture_registration_channels_for_test();
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone());
+    let spec = ModuleSpec {
+        module_id: "channel-module".into(),
+        program: "/bin/sleep".into(),
+        args: vec!["60".into()],
+        env: [
+            "HOME",
+            "XDG_DATA_HOME",
+            "XDG_RUNTIME_DIR",
+            "XDG_CONFIG_HOME",
+        ]
+        .into_iter()
+        .map(|key| (key.into(), scratch.display().to_string()))
+        .collect(),
+        reserved: false,
+        reserved_prefixes: vec![],
+        protocol: ModuleProtocol::Subc,
+        overlap: Default::default(),
+        carry_containment: false,
+    };
+    let _prior = supervisor
+        .register_configured_with_health(
+            spec.clone(),
+            false,
+            HealthConfig::default(),
+            None,
+            RestartPolicy::default(),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+    let module = supervisor.spawn(spec).unwrap();
+    let spawn = handle.registration_for_test("channel-module").unwrap();
+    handle.registration_test_channels.lock().unwrap().take();
+    let (auth, info) = auth();
+    let control = crate::ControlHandler::new(registry).with_supervisor(handle.clone());
+    let (_router, mut peer, _copy) = serve_control(&handle, spawn, auth, control);
+    subc_transport::authenticate_client(&mut peer, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let wrote = subc_transport::write_frame(&mut peer, &hello("channel-module")).await;
+    let reply = if wrote.is_ok() {
+        subc_transport::read_frame(&mut peer).await.unwrap()
+    } else {
+        None
+    };
+    drop(peer);
+    module.stop().await.unwrap();
+    assert_eq!(
+        reply.map(|reply| reply.header.ty),
+        Some(FrameType::HelloAck),
+        "the synchronous spawn's default budget must not inherit an older same-id module's timeout"
+    );
+}
+
 fn hello(module: &str) -> Frame {
     let hello = subc_protocol::ModuleHelloBody {
         manifest: subc_protocol::manifest::ModuleManifest::builder(module, "1.0.0").build(),

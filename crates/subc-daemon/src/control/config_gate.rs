@@ -609,7 +609,7 @@ impl ControlHandler {
                 Ok(ConfigControlResponse::ProgramPlaced { generation })
             }
             ConfigControlRequest::Status {} => {
-                let mut status = config_work(runtime.clone(), |owner| owner.status()).await?;
+                let mut status = runtime.on_blocking(|owner| owner.status()).await?;
                 let facts = self.config_approval_facts(ctx).await;
                 status
                     .missing_approval_surfaces
@@ -968,11 +968,10 @@ impl ControlHandler {
             return None;
         }
         let connection = registration.connection_id;
-        let approved = config_work(runtime.clone(), move |owner| {
-            owner.approved_phone_entry(connection)
-        })
-        .await
-        .ok()??;
+        let approved = runtime
+            .on_blocking(move |owner| owner.approved_phone_entry(connection))
+            .await
+            .ok()??;
         if !approved.enabled || approved.module_spec() != spec {
             return None;
         }
@@ -980,16 +979,17 @@ impl ControlHandler {
             let supervisor = self.supervisor.clone();
             let registry = self.registry.clone();
             let nonce = nonce.clone();
-            if !config_work(runtime.clone(), move |_| {
-                Ok(supervisor.registration_is_current_live(
-                    &registry,
-                    "callosum",
-                    connection,
-                    nonce.as_deref(),
-                ))
-            })
-            .await
-            .ok()?
+            if !runtime
+                .on_blocking(move |_| {
+                    Ok(supervisor.registration_is_current_live(
+                        &registry,
+                        "callosum",
+                        connection,
+                        nonce.as_deref(),
+                    ))
+                })
+                .await
+                .ok()?
             {
                 return None;
             }

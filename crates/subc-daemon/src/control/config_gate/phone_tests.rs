@@ -58,6 +58,10 @@ struct Fixture {
 }
 
 async fn status_over_real_server(fixture: &Fixture) {
+    status_polls_over_real_server(fixture, 1, false).await;
+}
+
+async fn status_polls_over_real_server(fixture: &Fixture, polls: usize, require_no_wakes: bool) {
     let router = Arc::new(crate::Router::with_control_handler(fixture.handler.clone()));
     let info = subc_transport::ConnectionInfo {
         schema: subc_transport::SCHEMA_VERSION,
@@ -99,6 +103,13 @@ async fn status_over_real_server(fixture: &Fixture) {
     subc_transport::authenticate_client(&mut client, &info, std::time::Duration::from_secs(2))
         .await
         .unwrap();
+    let notifications = fixture.owner.delivery_notifications();
+    if require_no_wakes {
+        while tokio::time::timeout(Duration::from_millis(10), notifications.notified())
+            .await
+            .is_ok()
+        {}
+    }
     let status = Frame::build(
         FrameType::Request,
         control_flags(),
@@ -108,24 +119,41 @@ async fn status_over_real_server(fixture: &Fixture) {
         serde_json::to_vec(&ConfigControlRequest::Status {}).unwrap(),
     )
     .unwrap();
-    subc_transport::write_frame(&mut client, &status)
+    for _ in 0..polls {
+        subc_transport::write_frame(&mut client, &status)
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            subc_transport::read_frame(&mut client),
+        )
         .await
+        .unwrap()
+        .unwrap()
         .unwrap();
-    let reply = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        subc_transport::read_frame(&mut client),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .unwrap();
-    assert_eq!(
-        reply.header.ty,
-        FrameType::Response,
-        "{}",
-        String::from_utf8_lossy(&reply.body)
-    );
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        if require_no_wakes {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), notifications.notified())
+                    .await
+                    .is_err(),
+                "a read-only status poll must not wake the delivery worker"
+            );
+        }
+    }
     server.abort();
+}
+
+#[tokio::test]
+async fn config_phone_status_polls_never_wake_delivery_without_a_change() {
+    let fixture = Fixture::build(true).await;
+    status_polls_over_real_server(&fixture, 4, true).await;
+    fixture.stop().await;
 }
 
 #[tokio::test]

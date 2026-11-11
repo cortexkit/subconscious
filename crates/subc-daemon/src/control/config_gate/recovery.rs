@@ -33,7 +33,8 @@ impl ControlHandler {
         let Some(owner) = self.config_runtime.clone() else {
             return Ok(None);
         };
-        let recovering = config_work(owner, |owner| owner.check_recovery())
+        let recovering = owner
+            .on_blocking(|owner| owner.check_recovery())
             .await
             .unwrap_or(true);
         if !recovering {

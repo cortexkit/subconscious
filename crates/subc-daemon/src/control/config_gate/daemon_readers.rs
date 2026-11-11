@@ -289,8 +289,9 @@ impl ControlHandler {
         if status.state != "stamped" || status.anchor_pending {
             return Ok(());
         }
-        if let Some(approved) =
-            config_work(owner.clone(), |owner| owner.approved_daemon_configuration()).await?
+        if let Some(approved) = owner
+            .on_blocking(|owner| owner.approved_daemon_configuration())
+            .await?
         {
             let mut rows = self.inactive_daemon_configuration(&approved)?;
             for row in &mut rows {

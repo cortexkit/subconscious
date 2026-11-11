@@ -2170,12 +2170,10 @@ mod tests {
     }
 
     /// During a swap two processes of the module are alive, and consumers
-    /// started by either one attest with that process's launch nonce. Both are
-    /// accepted while the swap is open, including after cutover has made the
-    /// candidate's nonce the recorded one; once the swap closes, only the
-    /// recorded nonce is.
+    /// started by either one attest before cutover. Promotion ends the
+    /// incumbent's authority even while its process is still draining.
     #[test]
-    fn consumer_attestation_accepts_both_nonces_only_while_the_swap_is_open() {
+    fn consumer_attestation_revokes_incumbent_nonce_at_promotion() {
         let handle = SupervisorHandle::new();
         handle.set_spawn_nonce("aft", "incumbent".to_string());
         assert!(!handle.spawned_consumer_authorized("aft", "candidate"));
@@ -2187,8 +2185,8 @@ mod tests {
 
         handle.promote_swap_nonce("aft", false);
         assert!(
-            handle.spawned_consumer_authorized("aft", "incumbent"),
-            "the draining incumbent's consumers must keep attesting after cutover"
+            !handle.spawned_consumer_authorized("aft", "incumbent"),
+            "promotion retires the incumbent's nonce before its drain ends"
         );
         assert!(handle.spawned_consumer_authorized("aft", "candidate"));
 

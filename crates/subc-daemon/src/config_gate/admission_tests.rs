@@ -50,6 +50,109 @@ fn spec(rig: &Rig) -> ModuleSpec {
         .module_spec()
 }
 
+#[tokio::test]
+async fn gated_nonce_policy_refuses_stopped_uncached_identity_over_real_server() {
+    let rig = rig();
+    let owner = Arc::new(rig.owner("nonce-policy"));
+    rig.stamp(&owner);
+    let registry = Arc::new(crate::Registry::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let mut missing = spec(&rig);
+    missing.module_id = "callosum".into();
+    missing.protocol = subc_control::ModuleProtocol::Subc;
+    missing.reserved = true;
+    let _configured = supervisor
+        .register_configured_with_health(
+            missing,
+            false,
+            crate::supervise::HealthConfig::default(),
+            None,
+            RestartPolicy::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    handle.set_spawn_nonce("callosum", "stale-before-stamp".into());
+    handle.set_reserved_nonce("callosum", "stale-before-stamp".into());
+    let control = crate::ControlHandler::new(registry)
+        .with_supervisor(handle.clone())
+        .with_config_runtime(owner.clone())
+        .with_activity_ledger(&rig.path, "nonce-policy".into());
+    let router = Arc::new(crate::Router::with_control_handler(Arc::new(control)));
+    let info = subc_transport::ConnectionInfo {
+        schema: subc_transport::SCHEMA_VERSION,
+        wire_version: None,
+        endpoints: vec![],
+        key: vec![0x42; 32],
+        daemon_id: [0x24; 16],
+        pid: std::process::id(),
+        daemon_ver: "test".into(),
+    };
+    let auth = crate::server::ServerAuth::new(info.key.clone(), info.daemon_id, "test");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(crate::server::serve_listener(listener, router, auth));
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    subc_transport::authenticate_client(&mut client, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let query = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Request,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&json!({"op":"activity.query", "limit":1,
+            "consumer_identity":{"module_id":"callosum", "launch_nonce":"stale-before-stamp"}}))
+        .unwrap(),
+    )
+    .unwrap();
+    subc_transport::write_frame(&mut client, &query)
+        .await
+        .unwrap();
+    let response = subc_transport::read_frame(&mut client)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.header.ty, subc_protocol::FrameType::Error,
+        "a stopped configured id missing from approval cache cannot redeem its old nonce for activity");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["code"],
+        "activity_read_forbidden"
+    );
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder("callosum", "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: Some("stale-before-stamp".into()),
+    };
+    let hello = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+        0,
+        0,
+        2,
+        serde_json::to_vec(&hello).unwrap(),
+    )
+    .unwrap();
+    subc_transport::write_frame(&mut client, &hello)
+        .await
+        .unwrap();
+    assert_eq!(
+        subc_transport::read_frame(&mut client)
+            .await
+            .unwrap()
+            .unwrap()
+            .header
+            .ty,
+        subc_protocol::FrameType::Error,
+        "uncached gated ids also refuse nonce HELLO"
+    );
+    server.abort();
+}
+
 async fn reported_pid(module: &crate::supervise::SupervisedModule) -> u32 {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

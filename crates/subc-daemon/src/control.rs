@@ -1334,6 +1334,9 @@ impl ControlHandler {
 
     pub fn with_supervisor(mut self, supervisor: SupervisorHandle) -> Self {
         self.supervisor = supervisor;
+        if let Some(owner) = &self.config_runtime {
+            self.supervisor.install_binding_retirement(owner);
+        }
         self.supervisor.set_activity(self.activity.clone());
         self
     }

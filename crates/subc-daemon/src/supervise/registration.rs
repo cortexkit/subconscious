@@ -373,6 +373,9 @@ impl SupervisorHandle {
                     launch.pid == Some(identity.pid) && launch.start == Some(identity.start_time)
                 });
         }
+        if self.module_is_gated(module) {
+            return false;
+        }
         nonce.is_some_and(|presented| {
             self.spawn_nonce(module).is_some_and(|current| {
                 !presented.is_empty() && constant_time_eq(current.as_bytes(), presented.as_bytes())

@@ -2378,6 +2378,7 @@ pub struct SupervisorHandle {
     registration_service: Arc<Mutex<Option<registration::RegistrationService>>>,
     registration_connections: Arc<Mutex<HashMap<ConnectionId, Arc<RegistrationSpawn>>>>,
     registration_launches: Arc<Mutex<Vec<std::sync::Weak<RegistrationSpawn>>>>,
+    gate_runtime: Arc<Mutex<Option<std::sync::Weak<crate::config_gate::runtime::RuntimeOwner>>>>,
     program_bindings: program_binding::ProgramBindings,
     #[cfg(test)]
     identity_sample_pause: Arc<Mutex<Option<IdentitySamplePause>>>,
@@ -2475,13 +2476,11 @@ impl fmt::Debug for PromotionObserverSlot {
 /// The nonces of one open swap.
 #[derive(Debug, Clone)]
 struct OpenSwap {
-    /// The launch nonce minted for the candidate process. It is the swap
-    /// token: the only thing that admits a HELLO into the candidate slot.
+    /// Legacy candidate token. A gated candidate has an empty lifecycle
+    /// placeholder instead; only its own channel admits its HELLO.
     candidate_nonce: String,
-    /// The incumbent's launch nonce, captured when the swap opened. It is kept
-    /// here because cutover moves the module's recorded spawn nonce to the
-    /// candidate while the incumbent is still draining and its consumers are
-    /// still attesting with this one.
+    /// Incumbent token accepted before cutover, then cleared by promotion even
+    /// while the incumbent's process is still draining.
     incumbent_nonce: Option<String>,
     /// Set once a HELLO has been admitted with the swap token, so the token
     /// admits one registration and cannot be replayed after cutover empties
@@ -2537,6 +2536,19 @@ impl Default for DaemonRestartIntent {
 }
 
 impl SupervisorHandle {
+    pub(crate) fn module_is_gated(&self, module: &str) -> bool {
+        let runtime = {
+            let Ok(runtime) = self.gate_runtime.lock() else {
+                return true;
+            };
+            runtime.clone()
+        };
+        runtime.is_some_and(|runtime| {
+            runtime
+                .upgrade()
+                .is_none_or(|owner| owner.module_is_gated(module))
+        })
+    }
     pub(crate) fn announce_daemon_restart(&self) -> u64 {
         let mut intent = self
             .restart_intent
@@ -2674,6 +2686,9 @@ impl SupervisorHandle {
 
     /// The launch nonce most recently minted for a module's spawn, if any.
     pub(crate) fn spawn_nonce(&self, module_id: &str) -> Option<String> {
+        if self.module_is_gated(module_id) {
+            return None;
+        }
         self.spawn_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2732,6 +2747,11 @@ impl SupervisorHandle {
         module_id: &str,
         presented: Option<&str>,
     ) -> Result<ReservedHelloVerification, ReservedHelloRejection> {
+        if self.module_is_gated(module_id) {
+            return Err(ReservedHelloRejection::Exact {
+                module_id: module_id.into(),
+            });
+        }
         self.hello_verification(module_id, presented, false)
     }
 
@@ -2758,6 +2778,7 @@ impl SupervisorHandle {
         presented: Option<&str>,
         channel: bool,
     ) -> Result<ReservedHelloVerification, ReservedHelloRejection> {
+        let presented = presented.filter(|nonce| !nonce.is_empty());
         let nonces = self
             .reserved_nonces
             .lock()
@@ -2796,6 +2817,13 @@ impl SupervisorHandle {
             return Ok(ReservedHelloVerification::default());
         };
 
+        if !channel && self.module_is_gated(&owner_module_id) {
+            return Err(ReservedHelloRejection::Prefix {
+                prefix,
+                owner_module_id,
+            });
+        }
+
         let authorized = if channel {
             owner_module_id == module_id
         } else {
@@ -2828,7 +2856,7 @@ impl SupervisorHandle {
     /// Absence of an expected spawn nonce is a hard failure: consumer_identity is
     /// accepted only for module ids the supervisor has spawned.
     pub fn spawned_consumer_authorized(&self, module_id: &str, presented: &str) -> bool {
-        if presented.is_empty() {
+        if self.module_is_gated(module_id) || presented.is_empty() {
             return false;
         }
         let nonces = self
@@ -2839,15 +2867,16 @@ impl SupervisorHandle {
             .get(module_id)
             .is_some_and(|expected| constant_time_eq(expected.as_bytes(), presented.as_bytes()));
         drop(nonces);
-        // During a swap two processes of the module are alive, and a consumer
-        // started by either one presents that process's nonce. Accepting only
-        // the recorded one would fail the incumbent's consumers for the whole
-        // overlap once cutover moves the record to the candidate.
+        // Before cutover both launches may attest. Promotion removes the
+        // incumbent's token even if its process still needs time to drain.
         current || self.swap_nonce_matches(module_id, presented)
     }
 
     /// Whether `presented` is either nonce of an open swap for `module_id`.
     fn swap_nonce_matches(&self, module_id: &str, presented: &str) -> bool {
+        if self.module_is_gated(module_id) || presented.is_empty() {
+            return false;
+        }
         let swaps = self
             .swaps
             .lock()
@@ -2931,15 +2960,34 @@ impl SupervisorHandle {
 
     /// Make the candidate's nonce the module's recorded spawn nonce, as a plain
     /// respawn would, once cutover has made the candidate the module's process.
-    /// The swap stays open so the incumbent's nonce keeps attesting until the
-    /// incumbent has drained and exited.
+    /// Promotion revokes the incumbent's tokens; the swap record stays open
+    /// only for lifecycle cleanup while the old process drains.
     fn promote_swap_nonce(&self, module_id: &str, reserved: bool) {
         let candidate_nonce = self
             .swaps
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(module_id)
-            .map(|swap| swap.candidate_nonce.clone());
+            .get_mut(module_id)
+            .map(|swap| {
+                swap.incumbent_nonce = None;
+                swap.candidate_nonce.clone()
+            });
+        self.spawn_nonces
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(module_id);
+        {
+            let mut nonces = self
+                .reserved_nonces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if reserved || nonces.contains_key(module_id) {
+                nonces.insert(module_id.into(), None);
+            }
+        }
+        if self.module_is_gated(module_id) {
+            return;
+        }
         let Some(nonce) = candidate_nonce.filter(|nonce| !nonce.is_empty()) else {
             return;
         };
@@ -2968,6 +3016,9 @@ impl SupervisorHandle {
         module_id: &str,
         presented: Option<&str>,
     ) -> SwapHelloAdmission {
+        if self.module_is_gated(module_id) {
+            return SwapHelloAdmission::Refused;
+        }
         let swaps = self
             .swaps
             .lock()
@@ -3010,15 +3061,14 @@ impl SupervisorHandle {
 
     /// Test/support lookup for the current launch nonce of a supervised spawn.
     pub fn spawn_launch_nonce_for(&self, module_id: &str) -> Option<String> {
-        self.spawn_nonces
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(module_id)
-            .cloned()
+        self.spawn_nonce(module_id)
     }
 
     /// Test/support lookup for the HELLO-gating nonce of a reserved module.
     pub fn reserved_launch_nonce_for(&self, module_id: &str) -> Option<String> {
+        if self.module_is_gated(module_id) {
+            return None;
+        }
         self.reserved_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

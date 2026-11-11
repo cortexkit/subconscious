@@ -257,14 +257,11 @@ impl RuntimeOwner {
             })
             .unwrap_or(true)
     }
-    pub(crate) fn module_is_gated(&self, module: &str) -> bool {
+    pub(crate) fn module_is_gated(&self, _module: &str) -> bool {
         self.admission
             .read()
-            .map(|cache| match cache.state {
-                StoreState::Unstamped => false,
-                StoreState::Stamped => cache.modules.contains_key(module),
-                _ => true,
-            })
+            // Missing approval is a hold, not permission to redeem a nonce.
+            .map(|cache| !matches!(cache.state, StoreState::Unstamped))
             .unwrap_or(true)
     }
     pub(crate) fn checked_admission_hold(&self, module: Option<&str>) -> Result<()> {

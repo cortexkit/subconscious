@@ -397,3 +397,66 @@ async fn registration_channel_second_hello_finds_closed_endpoint() {
     );
     assert!(!spawn.launch_ready());
 }
+
+async fn nonce_hello_over_tcp(handle: SupervisorHandle, module: &str, nonce: &str) -> Frame {
+    let control = crate::ControlHandler::new(Arc::new(Registry::default())).with_supervisor(handle);
+    let router = Arc::new(crate::Router::with_control_handler(Arc::new(control)));
+    let (auth, info) = auth();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(crate::server::serve_listener(listener, router, auth));
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    subc_transport::authenticate_client(&mut client, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let mut body: subc_protocol::ModuleHelloBody =
+        serde_json::from_slice(&hello(module).body).unwrap();
+    body.launch_nonce = Some(nonce.into());
+    let frame = Frame::build(
+        FrameType::Hello,
+        super::super::control_flags(),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
+    subc_transport::write_frame(&mut client, &frame)
+        .await
+        .unwrap();
+    let reply = subc_transport::read_frame(&mut client)
+        .await
+        .unwrap()
+        .unwrap();
+    server.abort();
+    reply
+}
+
+#[tokio::test]
+async fn registration_nonce_policy_empty_swap_token_never_authorizes_prefix() {
+    let handle = SupervisorHandle::new();
+    handle.set_reserved_prefixes("prefix-owner", &["prefix:".into()]);
+    handle.open_swap("prefix-owner", String::new());
+    let reply = nonce_hello_over_tcp(handle, "prefix:child", "").await;
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Error,
+        "an empty candidate token is not a prefix credential"
+    );
+}
+
+#[tokio::test]
+async fn registration_nonce_policy_empty_promotion_clears_incumbent_authority() {
+    let handle = SupervisorHandle::new();
+    handle.set_spawn_nonce("channel-module", "old-incumbent".into());
+    handle.set_reserved_nonce("channel-module", "old-incumbent".into());
+    handle.open_swap("channel-module", String::new());
+    handle.promote_swap_nonce("channel-module", true);
+    handle.close_swap("channel-module");
+    let reply = nonce_hello_over_tcp(handle, "channel-module", "old-incumbent").await;
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Error,
+        "gated promotion must not retain an incumbent nonce"
+    );
+}

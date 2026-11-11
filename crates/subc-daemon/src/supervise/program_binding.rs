@@ -313,8 +313,9 @@ impl SupervisorHandle {
     }
     pub(crate) fn install_binding_retirement(
         &self,
-        owner: &crate::config_gate::runtime::RuntimeOwner,
+        owner: &Arc<crate::config_gate::runtime::RuntimeOwner>,
     ) {
+        *self.gate_runtime.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::downgrade(owner));
         let key = Arc::as_ptr(&self.program_bindings) as usize;
         let bindings = Arc::downgrade(&self.program_bindings);
         owner.install_binding_retirement(key, move || {

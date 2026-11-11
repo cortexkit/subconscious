@@ -1808,6 +1808,20 @@ impl ControlHandler {
         )
     }
 
+    fn request_refusal_close(
+        &self,
+        connection: ConnectionId,
+        sink: Option<&crate::FrameSink>,
+        reason: CloseReason,
+    ) {
+        if let Some(sink) = sink {
+            sink.terminate_ingress();
+        }
+        if self.claims.close_notifications_enabled() {
+            self.forwarding.request_connection_close(connection, reason);
+        }
+    }
+
     pub(crate) fn route_open_target(&self, frame: &Frame) -> Option<String> {
         if frame.header.channel != 0 || frame.header.ty != FrameType::Request {
             return None;
@@ -2167,6 +2181,7 @@ impl ControlHandler {
                     // Refused launches close the channel. Leave their pending
                     // HELLO unanswered instead of racing a reply against shutdown.
                     if !spawn.launch_ready() {
+                        ctx.egress.terminate_ingress();
                         return Ok(Vec::new());
                     }
                 } else if let Ok(hello) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
@@ -2183,8 +2198,9 @@ impl ControlHandler {
                             .is_some_and(|owner| owner.module_is_gated(module))
                             && !self.supervisor.wait_program_binding(module, nonce).await
                         {
-                            self.forwarding.request_connection_close(
+                            self.request_refusal_close(
                                 ctx.connection_id,
+                                Some(&ctx.egress),
                                 CloseReason::new(
                                     "program_refused",
                                     "the spawned program binding failed",
@@ -2757,17 +2773,26 @@ impl ControlHandler {
         wait_for_gate: bool,
     ) -> Result<Vec<Frame>, RouterError> {
         let channel_spawn = self.supervisor.registration_spawn(connection_id);
-        struct RefuseUnregisteredChannel(Option<Arc<crate::supervise::RegistrationSpawn>>);
+        struct RefuseUnregisteredChannel {
+            spawn: Option<Arc<crate::supervise::RegistrationSpawn>>,
+            sink: Option<crate::FrameSink>,
+        }
         impl Drop for RefuseUnregisteredChannel {
             fn drop(&mut self) {
-                if let Some(spawn) = &self.0 {
+                if let Some(spawn) = &self.spawn {
                     if !spawn.registered() {
+                        if let Some(sink) = &self.sink {
+                            sink.terminate_ingress();
+                        }
                         spawn.retire();
                     }
                 }
             }
         }
-        let _channel_attempt = RefuseUnregisteredChannel(channel_spawn.clone());
+        let _channel_attempt = RefuseUnregisteredChannel {
+            spawn: channel_spawn.clone(),
+            sink: sink.clone(),
+        };
         if let Some(spawn) = &channel_spawn {
             let value = serde_json::from_slice::<serde_json::Value>(&frame.body).ok();
             if let Err(code) = spawn.admit_hello(
@@ -2887,8 +2912,9 @@ impl ControlHandler {
                     } else {
                         "config_delivery_deferred"
                     };
-                    self.forwarding.request_connection_close(
+                    self.request_refusal_close(
                         connection_id,
+                        sink.as_ref(),
                         CloseReason::new(code, error.detail.clone()),
                     );
                     return Ok(vec![control_error_frame(&frame, code, error.detail)?]);
@@ -3102,8 +3128,9 @@ impl ControlHandler {
                     } else {
                         "config_delivery_deferred"
                     };
-                    self.forwarding.request_connection_close(
+                    self.request_refusal_close(
                         connection_id,
+                        sink.as_ref(),
                         CloseReason::new(code, error.detail.clone()),
                     );
                     return Ok(vec![control_error_frame(&frame, code, error.detail)?]);

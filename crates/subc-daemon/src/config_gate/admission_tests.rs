@@ -67,6 +67,132 @@ async fn gated_claim_fixture() -> GatedClaimFixture {
     }
 }
 
+async fn refused_nonce_hello_pipeline(
+    handler: Arc<crate::ControlHandler>,
+    router: Arc<crate::Router>,
+    nonce: String,
+) {
+    use crate::control::claims::tests::{error, request, Net};
+    handler.defer_refusal_notifications_for_test();
+    let mut peer = Net::new(router).await;
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: Some(nonce),
+    };
+    let hello = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        81,
+        serde_json::to_vec(&hello).unwrap(),
+    )
+    .unwrap();
+    let mut next = request(json!({"op":"server.describe"}));
+    next.header.corr = 82;
+    peer.pipeline(&[hello, next]).await;
+    error(&peer.recv().await.unwrap(), "program_refused");
+    while let Some(frame) = peer.recv().await {
+        assert_ne!(
+            frame.header.corr, 82,
+            "nonce HELLO refusal must fence pipelined requests"
+        );
+    }
+    assert!(!handler.was_dispatched_for_test(82));
+}
+
+#[tokio::test]
+async fn claims_nonce_hello_early_content_refusal_is_terminal() {
+    let fixture = gated_claim_fixture().await;
+    let key = fixture
+        .handle
+        .registration_proof_for_test("a")
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = checks.clone();
+    fixture.spawn.set_content_probe_for_test(Arc::new(move || {
+        observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(GateError::new(
+            "program_refused",
+            "nonce content witness changed",
+        ))
+    }));
+    let handler = Arc::new(
+        crate::ControlHandler::new(Arc::new(crate::Registry::default()))
+            .with_supervisor(fixture.handle.clone()),
+    );
+    let router = Arc::new(crate::Router::with_control_handler(handler.clone()));
+    let reserved = router.begin_connection();
+    refused_nonce_hello_pipeline(handler, router, key).await;
+    assert_eq!(checks.load(std::sync::atomic::Ordering::Relaxed), 1);
+    drop(reserved);
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn claims_nonce_hello_wait_refusal_is_terminal() {
+    let fixture = gated_claim_fixture().await;
+    let key = fixture
+        .handle
+        .registration_proof_for_test("a")
+        .unwrap()
+        .as_str()
+        .to_owned();
+    fixture.spawn.retire();
+    assert!(!fixture.handle.wait_program_binding("a", &key).await);
+    let handler = Arc::new(
+        crate::ControlHandler::new(Arc::new(crate::Registry::default()))
+            .with_supervisor(fixture.handle.clone()),
+    );
+    let router = Arc::new(crate::Router::with_control_handler(handler.clone()));
+    // The existing primary is connection 1 on the shared supervisor. Reserve
+    // that id without routing frames so the new test listener starts at 2.
+    let reserved = router.begin_connection();
+    refused_nonce_hello_pipeline(handler, router, key).await;
+    drop(reserved);
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn claims_nonce_hello_late_content_refusal_is_terminal() {
+    let fixture = gated_claim_fixture().await;
+    let key = fixture
+        .handle
+        .registration_proof_for_test("a")
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = checks.clone();
+    fixture.spawn.set_content_probe_for_test(Arc::new(move || {
+        if observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            Ok(())
+        } else {
+            Err(GateError::new(
+                "program_refused",
+                "content changed between nonce HELLO checks",
+            ))
+        }
+    }));
+    let handler = Arc::new(
+        crate::ControlHandler::new(Arc::new(crate::Registry::default()))
+            .with_supervisor(fixture.handle.clone()),
+    );
+    let router = Arc::new(crate::Router::with_control_handler(handler.clone()));
+    let reserved = router.begin_connection();
+    refused_nonce_hello_pipeline(handler, router, key).await;
+    assert_eq!(checks.load(std::sync::atomic::Ordering::Relaxed), 2);
+    drop(reserved);
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn claims_mint_obeys_recovery_and_resumes_after_approved_exit() {
     use crate::control::claims::tests::{error, request, Net};

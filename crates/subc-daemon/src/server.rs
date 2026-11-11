@@ -1102,6 +1102,7 @@ where
         if let LocalOrigin::RegistrationChannel(spawn) = &origin {
             let hello = frame.header.ty == subc_protocol::FrameType::Hello;
             if (!spawn.registered() && !hello) || (spawn.registered() && hello) {
+                ctx.egress.terminate_ingress();
                 spawn.retire();
                 return Ok(ConnectionLoopExit::PeerClosed);
             }
@@ -1114,6 +1115,7 @@ where
             // sees the frame, is what guarantees the local endpoint leaves no
             // registration, catalog entry or route behind, whatever the HELLO
             // carries.
+            ctx.egress.terminate_ingress();
             let refusal = crate::control::control_error_frame(
                 &frame,
                 crate::local_listener::LOCAL_ENDPOINT_CLIENTS_ONLY,

@@ -248,6 +248,16 @@ struct AttachHold {
 }
 
 impl Claims {
+    pub(super) fn close_notifications_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            !self.1.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
     #[cfg(test)]
     pub(super) fn record_dispatch(&self, corr: u64) {
         self.2.lock().unwrap().push(corr);
@@ -281,6 +291,17 @@ impl Claims {
 }
 
 impl ControlHandler {
+    #[cfg(all(test, unix))]
+    pub(crate) fn defer_refusal_notifications_for_test(&self) {
+        self.claims
+            .1
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn was_dispatched_for_test(&self, corr: u64) -> bool {
+        self.claims.2.lock().unwrap().contains(&corr)
+    }
     #[cfg(all(test, unix))]
     pub(crate) fn expire_claim_for_test(&self, claim: &Claim) {
         let token: [u8; 16] = URL_SAFE_NO_PAD
@@ -592,16 +613,11 @@ impl ControlHandler {
         ctx.egress.terminate_ingress();
         let refusal = control_error_frame(frame, code, "claim connection refused")?;
         let sent = ctx.egress.send_flushed(refusal).await;
-        #[cfg(test)]
-        let notify = !self.claims.1.load(std::sync::atomic::Ordering::Relaxed);
-        #[cfg(not(test))]
-        let notify = true;
-        if notify {
-            self.forwarding.request_connection_close(
-                connection,
-                CloseReason::new(code, "claim connection refused"),
-            );
-        }
+        self.request_refusal_close(
+            connection,
+            Some(&ctx.egress),
+            CloseReason::new(code, "claim connection refused"),
+        );
         sent?;
         Ok(Vec::new())
     }
@@ -885,7 +901,7 @@ pub(crate) mod tests {
             self.recv().await.expect("server reply")
         }
 
-        async fn pipeline(&mut self, frames: &[Frame]) {
+        pub(crate) async fn pipeline(&mut self, frames: &[Frame]) {
             use tokio::io::AsyncWriteExt;
             let mut bytes = Vec::new();
             for frame in frames {

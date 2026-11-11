@@ -149,6 +149,16 @@ impl RegistrationSpawn {
         self.registered.load(Ordering::Acquire)
     }
 
+    /// Serialize the registry/forwarding publication with synchronous retirement.
+    /// Image verification happens before this lock; only snapshot writes follow it.
+    pub(crate) fn begin_publication(&self) -> Result<std::sync::MutexGuard<'_, ()>, &'static str> {
+        let guard = self.transition.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.launch_ready() {
+            return Err("registration_channel_closed");
+        }
+        Ok(guard)
+    }
+
     pub(crate) async fn registration_expired(&self) {
         tokio::time::sleep_until(self.deadline()).await;
         if self.registered.load(Ordering::Acquire) {

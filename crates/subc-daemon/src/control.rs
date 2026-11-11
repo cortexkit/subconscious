@@ -524,6 +524,8 @@ pub struct ControlHandler {
     hello_registry_to_forwarding_hold: Option<Arc<std::sync::Barrier>>,
     #[cfg(test)]
     hello_before_publication_hold: Option<Arc<std::sync::Barrier>>,
+    #[cfg(test)]
+    hello_after_launch_check_hold: Option<Arc<std::sync::Barrier>>,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -1140,6 +1142,8 @@ impl ControlHandler {
             hello_registry_to_forwarding_hold: None,
             #[cfg(test)]
             hello_before_publication_hold: None,
+            #[cfg(test)]
+            hello_after_launch_check_hold: None,
         }
     }
 
@@ -1308,6 +1312,15 @@ impl ControlHandler {
         hold: Arc<std::sync::Barrier>,
     ) -> Self {
         self.hello_before_publication_hold = Some(hold);
+        self
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_hello_after_launch_check_hold(
+        mut self,
+        hold: Arc<std::sync::Barrier>,
+    ) -> Self {
+        self.hello_after_launch_check_hold = Some(hold);
         self
     }
 
@@ -3140,6 +3153,33 @@ impl ControlHandler {
         // Built before anything is registered so an encoding failure leaves no
         // registry or forwarding state behind.
         let hello_ack = self.build_hello_ack(&frame, negotiated_ver, &hello.manifest.module_id)?;
+        #[cfg(test)]
+        struct PublicationFinished(Arc<std::sync::Barrier>);
+        #[cfg(test)]
+        impl Drop for PublicationFinished {
+            fn drop(&mut self) {
+                self.0.wait();
+            }
+        }
+        #[cfg(test)]
+        let _publication_finished = self.hello_after_launch_check_hold.as_ref().map(|hold| {
+            hold.wait();
+            hold.wait();
+            PublicationFinished(hold.clone())
+        });
+        let _registration_publication = match &channel_spawn {
+            Some(spawn) => Some(match spawn.begin_publication() {
+                Ok(guard) => guard,
+                Err(code) => {
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        code,
+                        "registration ended before HELLO publication",
+                    )?])
+                }
+            }),
+            None => None,
+        };
         if swap_candidate {
             let reply = self.register_swap_candidate(
                 connection_id,

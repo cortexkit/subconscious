@@ -46,6 +46,19 @@ fn serve(
 ) {
     let control =
         crate::ControlHandler::new(Arc::new(Registry::default())).with_supervisor(handle.clone());
+    serve_control(handle, spawn, auth, control)
+}
+
+fn serve_control(
+    handle: &SupervisorHandle,
+    spawn: Arc<RegistrationSpawn>,
+    auth: crate::server::ServerAuth,
+    control: crate::ControlHandler,
+) -> (
+    Arc<crate::Router>,
+    tokio::net::UnixStream,
+    std::os::unix::net::UnixStream,
+) {
     let router = Arc::new(crate::Router::with_control_handler(Arc::new(control)));
     router.install_registration_service(auth);
     let (parent, child) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -59,6 +72,50 @@ fn serve(
         Instant::now() + Duration::from_secs(5),
     );
     (router, child, retained)
+}
+
+#[tokio::test]
+async fn registration_channel_retirement_wins_during_hello_publication() {
+    let handle = SupervisorHandle::new();
+    let registry = Arc::new(Registry::default());
+    let hold = Arc::new(std::sync::Barrier::new(2));
+    let control = crate::ControlHandler::new(registry.clone())
+        .with_supervisor(handle.clone())
+        .with_hello_after_launch_check_hold(hold.clone());
+    let spawn = RegistrationSpawn::new(&handle, "channel-module", SpawnRole::Plain, None);
+    spawn.ready();
+    let (auth, info) = auth();
+    let (_router, mut child, _copy) = serve_control(&handle, spawn.clone(), auth, control);
+    subc_transport::authenticate_client(&mut child, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    subc_transport::write_frame(&mut child, &hello("channel-module"))
+        .await
+        .unwrap();
+    let barrier = hold.clone();
+    tokio::task::spawn_blocking(move || {
+        barrier.wait();
+    })
+    .await
+    .unwrap();
+    spawn.retire();
+    let barrier = hold.clone();
+    tokio::task::spawn_blocking(move || {
+        barrier.wait();
+        barrier.wait();
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        registry.active_registration_count().unwrap(),
+        0,
+        "HELLO cannot publish after retirement won the launch transition"
+    );
+    assert_eq!(
+        registry.generation().unwrap(),
+        0,
+        "a retired launch cannot briefly publish and then clean up"
+    );
 }
 
 #[tokio::test]

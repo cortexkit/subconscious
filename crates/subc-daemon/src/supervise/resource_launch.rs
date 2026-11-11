@@ -1,5 +1,11 @@
 use super::{SupervisedModule, SupervisorHandle, SupervisorSnapshot};
 
+#[cfg(test)]
+pub(super) type ResourceCommitPause = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResourceCommitError {
     Busy,
@@ -55,8 +61,16 @@ impl SupervisedModule {
 
 impl SupervisorHandle {
     #[cfg(all(test, unix))]
-    pub(crate) fn pause_resource_commit_for_test(&self, pause: std::sync::Arc<std::sync::Barrier>) {
-        *self.resource_commit_pause.lock().unwrap() = Some(pause);
+    pub(crate) fn pause_resource_commit_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (reached, reached_rx) = tokio::sync::oneshot::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        *self.resource_commit_pause.lock().unwrap() = Some((reached, resume_rx));
+        (reached_rx, resume)
     }
     /// Keep launch replacement and nonce rotation excluded only for the short,
     /// syscall-free accounting commit, never while validating processes.
@@ -68,9 +82,9 @@ impl SupervisorHandle {
         commit: impl FnOnce() -> T,
     ) -> Result<T, ResourceCommitError> {
         #[cfg(test)]
-        if let Some(pause) = self.resource_commit_pause.lock().unwrap().take() {
-            pause.wait();
-            pause.wait();
+        if let Some((reached, resume)) = self.resource_commit_pause.lock().unwrap().take() {
+            let _ = reached.send(());
+            let _ = resume.recv_timeout(std::time::Duration::from_secs(2));
         }
         let runtime = self
             .gate_runtime

@@ -2381,7 +2381,7 @@ struct SupervisedConfiguration {
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
     #[cfg(test)]
-    resource_commit_pause: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
+    resource_commit_pause: Arc<Mutex<Option<resource_launch::ResourceCommitPause>>>,
     #[cfg(all(test, unix))]
     registration_test_channels: CapturedRegistrationChannels,
     registration_service: Arc<Mutex<Option<registration::RegistrationService>>>,

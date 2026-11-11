@@ -125,8 +125,17 @@ async fn gated_nonce_policy_stamp_between_agent_validation_and_commit_refuses_wi
             .ty,
         subc_protocol::FrameType::HelloAck
     );
-    let pause = Arc::new(std::sync::Barrier::new(2));
-    handle.pause_resource_commit_for_test(pause.clone());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !module
+            .resource_launch()
+            .is_some_and(|launch| launch.alive && launch.enabled && launch.pid.is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("module must publish its confirmed live launch before declaring commands");
+    let (reached, resume) = handle.pause_resource_commit_for_test();
     subc_transport::write_frame(
         &mut peer,
         &frame(
@@ -140,18 +149,12 @@ async fn gated_nonce_policy_stamp_between_agent_validation_and_commit_refuses_wi
     )
     .await
     .unwrap();
-    let reached = pause.clone();
-    tokio::task::spawn_blocking(move || {
-        reached.wait();
-    })
-    .await
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), reached)
+        .await
+        .expect("declaration must reach the commit fence")
+        .unwrap();
     rig.stamp(&owner);
-    tokio::task::spawn_blocking(move || {
-        pause.wait();
-    })
-    .await
-    .unwrap();
+    resume.send(()).unwrap();
     let reply = tokio::time::timeout(
         Duration::from_secs(2),
         subc_transport::read_frame(&mut peer),

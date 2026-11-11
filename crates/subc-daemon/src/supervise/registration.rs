@@ -1,6 +1,9 @@
 //! Per-launch registration, tracked separately from nonce checks keyed by module ID.
 //! Locks only protect snapshots; neither service nor launch waits hold them.
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "retirement_tests.rs"]
+mod retirement_tests;
 #[cfg(all(test, unix))]
 #[path = "registration_review_tests.rs"]
 mod review_tests;
@@ -18,6 +21,13 @@ enum LaunchState {
     Dead,
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct RetirementPause {
+    reached: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 #[derive(Debug)]
 pub(crate) struct RegistrationSpawn {
     pub(crate) incarnation: String,
@@ -30,6 +40,8 @@ pub(crate) struct RegistrationSpawn {
     deadline: std::sync::OnceLock<Instant>,
     launch: tokio::sync::watch::Sender<LaunchState>,
     transition: Mutex<()>,
+    #[cfg(test)]
+    retirement_pause: Mutex<Option<RetirementPause>>,
     #[cfg(unix)]
     endpoint: Mutex<Option<std::os::unix::net::UnixStream>>,
     #[cfg(windows)]
@@ -90,6 +102,8 @@ impl RegistrationSpawn {
             deadline: std::sync::OnceLock::new(),
             launch,
             transition: Mutex::new(()),
+            #[cfg(test)]
+            retirement_pause: Mutex::new(None),
             #[cfg(any(unix, windows))]
             endpoint: Mutex::new(None),
             binding,
@@ -171,6 +185,11 @@ impl RegistrationSpawn {
         }
         let revoked = self.claims.get().map(|claims| claims.revoke());
         drop(transition);
+        #[cfg(test)]
+        if let Some(pause) = self.retirement_pause.lock().unwrap().take() {
+            let _ = pause.reached.send(());
+            let _ = pause.release.recv_timeout(Duration::from_secs(5));
+        }
         if let (Some(claims), Some(revoked)) = (self.claims.get(), revoked) {
             claims.close_revoked(revoked);
         }
@@ -544,7 +563,10 @@ impl SupervisorHandle {
                     .map_err(io::Error::other)??
                 };
                 let _ = crate::server::handle_connection_with_origin(
-                    stream,
+                    RegistrationStream {
+                        stream,
+                        spawn: spawn.clone(),
+                    },
                     router,
                     auth,
                     crate::server::LocalOrigin::RegistrationChannel(spawn.clone()),
@@ -555,6 +577,54 @@ impl SupervisorHandle {
             let _ = serve.await;
             spawn.retire();
         });
+    }
+}
+
+// Retire at the transport's first EOF, including during authentication or frame
+// decoding, rather than waiting for the connection loop to finish unwinding.
+struct RegistrationStream<S> {
+    stream: S,
+    spawn: Arc<RegistrationSpawn>,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RegistrationStream<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let can_read = buf.remaining() != 0;
+        let result = std::pin::Pin::new(&mut this.stream).poll_read(cx, buf);
+        if can_read && result.is_ready() && buf.filled().len() == before {
+            this.spawn.retire();
+        }
+        result
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for RegistrationStream<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
     }
 }
 

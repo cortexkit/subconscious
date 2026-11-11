@@ -3511,6 +3511,11 @@ impl ControlHandler {
         } else {
             (None, None)
         };
+        if let Some(spawn) = publication_spawn {
+            self.forwarding
+                .bind_spawn(connection_id, spawn)
+                .map_err(RouterError::Forwarding)?;
+        }
         #[cfg(test)]
         if prefix_binding.is_some() {
             self.claims.pause_prefix_hello_for_test(8);

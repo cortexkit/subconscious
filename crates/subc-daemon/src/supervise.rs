@@ -451,6 +451,10 @@ struct SupervisedChild {
 
 impl SupervisedChild {
     fn retire_registration(&self) {
+        // All exit observers enter here before cleanup can await. The retired
+        // program-binding flag and the registration's Dead state make repeated
+        // observations harmless, even when another task observes the group
+        // leader retained unreaped to reserve its process-group id.
         if let Some(spawn) = &self.registration_spawn {
             spawn.retire();
         } else if let Some(binding) = &self._program_binding {
@@ -13072,8 +13076,25 @@ async fn stop_unregistered_child(child: &mut SupervisedChild) -> io::Result<()> 
         // Process-group safety rule: only signal a group while its leader is
         // our unreaped child. Even a zombie leader reserves its pid/group id;
         // reaping it before KILL would let that id name an unrelated group.
-        // Sleep without waiting so TERM-ignoring helpers get the full grace.
-        sleep(crate::child_roster::TERM_TO_KILL).await;
+        // Observe without reaping so helpers still get the full TERM grace and
+        // the leader continues to reserve the group id until the final KILL.
+        let grace = sleep(crate::child_roster::TERM_TO_KILL);
+        tokio::pin!(grace);
+        tokio::select! {
+            biased;
+            _ = async {
+                loop {
+                    match subc_os::child_exit::observe(child.pid) {
+                        Ok(None) => sleep(Duration::from_millis(1)).await,
+                        _ => {
+                            child.retire_registration();
+                            break;
+                        }
+                    }
+                }
+            } => grace.await,
+            _ = &mut grace => {},
+        }
         let group = unreaped_registration_group(child)?;
         let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
     }

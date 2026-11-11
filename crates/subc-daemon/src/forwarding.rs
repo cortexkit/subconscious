@@ -1,3 +1,8 @@
+//! Forwarding snapshots and route publication. Spawn/claim publication takes
+//! the spawn transition, claim state/index, then forwarding, in that order.
+//! Bind commits read only the launch watch, never the spawn transition lock.
+//! No forwarding guard is held while awaiting a module.
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     error::Error,
@@ -566,6 +571,8 @@ struct ForwardingInner {
     /// still answers every admission-gate check.
     draining_endpoints: HashMap<ModuleEndpointId, RouteCloseReason>,
     closing_connections: HashSet<ConnectionId>,
+    /// Pending binds check spawn liveness without keeping the spawn alive.
+    spawn_connections: HashMap<ConnectionId, std::sync::Weak<crate::supervise::RegistrationSpawn>>,
     next_generation: u64,
     reserved_client: HashMap<ClientRouteKey, ModuleRouteKey>,
     reserved_module: HashMap<ModuleRouteKey, ClientRouteKey>,
@@ -652,6 +659,16 @@ struct FrameDropWarning {
 type ChannelDropWarnings = HashMap<(u16, &'static str), FrameDropWarning>;
 
 impl ForwardingTable {
+    pub(crate) fn bind_spawn(
+        &self,
+        connection: ConnectionId,
+        spawn: &Arc<crate::supervise::RegistrationSpawn>,
+    ) -> Result<(), ForwardingError> {
+        self.write_inner()?
+            .spawn_connections
+            .insert(connection, Arc::downgrade(spawn));
+        Ok(())
+    }
     pub(crate) fn active_module_endpoint(
         &self,
         module_id: &str,
@@ -1894,10 +1911,11 @@ impl ForwardingTable {
         }
 
         match outcome {
-            // Two shapes of "the client is not there to receive this route" that
+            // Three shapes of "the client is not there to receive this route" that
             // must resolve identically: its egress is already closed, or it is
             // marked closing (its connection loop has been asked to end, but has
-            // not drained yet, so the sink is still open).
+            // not drained yet, so the sink is still open), or its spawn is dead
+            // before connection-close notifications have reached that loop.
             //
             // Only the first used to be caught here. The second fell through to
             // `commit_route_locked`, which refuses a closing client with
@@ -1914,6 +1932,10 @@ impl ForwardingTable {
             // created. Nothing here touches the module connection.
             RouteBindRelayOutcome::Accepted
                 if pending.client_sink.is_closed()
+                    || spawn_connection_dead(
+                        &inner,
+                        pending.reservation.client_key.connection_id,
+                    )
                     || inner
                         .closing_connections
                         .contains(&pending.reservation.client_key.connection_id) =>
@@ -1964,6 +1986,7 @@ impl ForwardingTable {
             // `StaleModuleEndpoint` exactly as before swaps existed.
             RouteBindRelayOutcome::Accepted
                 if inner.superseded_endpoints.contains_key(&endpoint)
+                    || spawn_connection_dead(&inner, connection_id)
                     || inner.draining_endpoints.contains_key(&endpoint) =>
             {
                 release_reserved_route_locked(
@@ -2949,6 +2972,7 @@ impl ForwardingTable {
             .remove(&connection_id);
         let mut inner = self.write_inner()?;
         inner.closing_connections.insert(connection_id);
+        inner.spawn_connections.remove(&connection_id);
         let cleanup = if let Some(endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
             remove_module_connection_locked(&mut inner, endpoint)
         } else {
@@ -3675,6 +3699,13 @@ fn commit_route_locked(
     }
     let _ = pending.sender.send(RouteBindRelayOutcome::Accepted);
     Ok(None)
+}
+
+fn spawn_connection_dead(inner: &ForwardingInner, connection: ConnectionId) -> bool {
+    inner
+        .spawn_connections
+        .get(&connection)
+        .is_some_and(|spawn| spawn.upgrade().is_none_or(|spawn| !spawn.launch_ready()))
 }
 
 /// The live module connection registered under exactly `endpoint`, whichever

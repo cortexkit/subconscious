@@ -2,6 +2,8 @@
 //! lock, then launch-local claims, then the token/connection index. Index lookups
 //! release their lock before acquiring a spawn lock. No lock crosses an await;
 //! forwarding closes run after retirement releases the transition lock.
+//! Claim publication records its spawn in forwarding after taking the claim
+//! index; forwarding bind commits read launch state without taking these locks.
 //! Prefix HELLO publication then takes the reservation map, registry and
 //! forwarding locks, in that order. Its launch/index guards keep primary GOODBYE
 //! and binding removal from overtaking the registration commit. These guards
@@ -946,6 +948,9 @@ impl ControlHandler {
         if index.bindings.contains_key(&connection) {
             return Err(error_codes::CLAIM_INVALID);
         }
+        self.forwarding
+            .bind_spawn(connection, &registration)
+            .map_err(|_| error_codes::CLAIM_INVALID)?;
         let pending = state
             .pending
             .remove(&token)
@@ -1260,14 +1265,14 @@ pub(crate) mod tests {
         assert!(!rig.spawn.launch_ready());
     }
 
-    struct Wire {
-        connection: RouterConnection,
-        ctx: RouteCtx,
+    pub(crate) struct Wire {
+        pub(crate) connection: RouterConnection,
+        pub(crate) ctx: RouteCtx,
         replies: mpsc::Receiver<OutboundFrame>,
     }
 
     impl Wire {
-        fn new(router: &Router) -> Self {
+        pub(crate) fn new(router: &Router) -> Self {
             let connection = router.begin_connection();
             let (tx, replies) = mpsc::channel(32);
             let ctx = RouteCtx {
@@ -1281,7 +1286,7 @@ pub(crate) mod tests {
             }
         }
 
-        async fn call(&mut self, router: &Arc<Router>, frame: Frame) -> Frame {
+        pub(crate) async fn call(&mut self, router: &Arc<Router>, frame: Frame) -> Frame {
             let router = router.clone();
             let ctx = self.ctx.clone();
             let task = tokio::spawn(async move { router.route_for_connection(&ctx, frame).await });
@@ -1302,15 +1307,15 @@ pub(crate) mod tests {
         }
     }
 
-    struct Rig {
-        handler: Arc<ControlHandler>,
-        router: Arc<Router>,
-        primary: Wire,
-        spawn: Arc<RegistrationSpawn>,
+    pub(crate) struct Rig {
+        pub(crate) handler: Arc<ControlHandler>,
+        pub(crate) router: Arc<Router>,
+        pub(crate) primary: Wire,
+        pub(crate) spawn: Arc<RegistrationSpawn>,
         _module: SupervisedModule,
     }
 
-    async fn rig() -> Rig {
+    pub(crate) async fn rig() -> Rig {
         rig_with_activity(None).await
     }
 
@@ -1845,7 +1850,7 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    async fn mint(rig: &mut Rig, purpose: ClaimPurpose) -> ClaimMintReply {
+    pub(crate) async fn mint(rig: &mut Rig, purpose: ClaimPurpose) -> ClaimMintReply {
         let reply = rig
             .primary
             .call(&rig.router, request(ClaimMintRequest::new(purpose)))

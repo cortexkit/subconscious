@@ -1151,6 +1151,7 @@ async fn abandon_candidate(
     mut candidate: SupervisedChild,
     failure: Option<&CandidateFailure>,
 ) {
+    candidate.retire_registration();
     if let Some(failure) = failure {
         warn!(module_id, arm=failure.arm.as_str(), detail=%failure.detail, candidate_pid=candidate.pid,
             "swap failed; killing the candidate and leaving the incumbent serving");

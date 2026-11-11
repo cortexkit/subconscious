@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.44.12
+
+- Hold silence-based health restarts while the host is overloaded, using distinct late modules and a daemon scheduler-lag tick over a 60-second window. Held probes report degraded health with `host overloaded`; lane loss, process exits, and restart budgets keep their existing behavior. Resume counting new failures when the hold clears, and log hold transitions.
+
 ## 0.44.11
 
 - Test-only: the resource fixture's CPU-burning child no longer waits forever for the test's next marker. It gives up after a minute, or as soon as the test's scratch directory is gone, so a failed or cancelled test run no longer leaves it running. No daemon runtime changes.

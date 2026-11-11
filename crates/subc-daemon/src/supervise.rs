@@ -72,6 +72,8 @@ pub(crate) mod containment;
 mod containment_tests;
 mod slow_retry;
 use slow_retry::{FailedRetry, FailureContext};
+mod host_health;
+use host_health::HostHealth;
 
 #[cfg(all(test, unix))]
 mod slow_retry_tests;
@@ -1343,6 +1345,7 @@ struct SupervisorSnapshot {
     /// Diagnostic attached to the next drain's terminal record, if any.
     drain_disposition_detail: Option<String>,
     health: ModuleHealthStatus,
+    last_probe_evidence: Option<HealthProbeEvidence>,
     /// Whether the current process was started as a swap candidate and so
     /// lives in the module's alternate cgroup. The next swap's candidate takes
     /// the other one, so the two processes of a swap never share a cgroup. A
@@ -1478,6 +1481,7 @@ impl SupervisorSnapshot {
             last_exit: None,
             drain_disposition_detail: None,
             health: ModuleHealthStatus::default(),
+            last_probe_evidence: None,
             in_alternate_slot: false,
             draining_to_replace: false,
             configuration_updated_since_spawn: false,
@@ -2014,6 +2018,7 @@ struct SupervisorRuntimeConfig {
     /// REMOVES the per-module override can re-resolve to it.
     default_drain_timeout: Duration,
     health: HealthConfig,
+    host_health: HostHealth,
     connection_file_path: Option<PathBuf>,
     capture_logs_dir: Option<PathBuf>,
     forwarding: Option<Arc<ForwardingTable>>,
@@ -2060,6 +2065,7 @@ struct SupervisedConfiguration {
 /// launch nonces recorded at spawn are checked by the same daemon instance.
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
+    host_health: HostHealth,
     restart_intent: Arc<Mutex<DaemonRestartIntent>>,
     activity: Arc<Mutex<Option<crate::activity::ActivityLedger>>>,
     activity_images: Arc<Mutex<HashMap<String, activity::ActivityImage>>>,
@@ -2696,6 +2702,7 @@ impl SupervisorHandle {
         let Some(module) = self.get(module_id) else {
             return Ok(false);
         };
+        self.host_health.record_late_module(module_id);
         update_snapshot(&module.inner.snapshot, Some(module_id), |state| {
             state.health.late_answer_count = state.health.late_answer_count.saturating_add(1);
             state.health.last_late_answer_latency_ms = Some(latency_ms);
@@ -2709,6 +2716,10 @@ impl SupervisorHandle {
             state.health.consecutive_failures = 0;
         })?;
         Ok(true)
+    }
+
+    pub(crate) fn spawn_host_health_monitor(&self) -> JoinHandle<()> {
+        self.host_health.spawn_monitor()
     }
 
     /// Arm the one-shot marker for the module process that this caller
@@ -2829,6 +2840,7 @@ pub struct Supervisor {
     process_liveness: Arc<SupervisorProcessLiveness>,
     supervisor_handle: Option<SupervisorHandle>,
     health: HealthConfig,
+    host_health: HostHealth,
     daemon_start_clock: crate::clock::StartClock,
     terminal_journal: Option<Arc<crate::terminal_journal::TerminalJournal>>,
     spawn_events: SpawnEventFeed,
@@ -3168,6 +3180,7 @@ impl Supervisor {
             process_liveness: Arc::new(SupervisorProcessLiveness::default()),
             supervisor_handle: None,
             health: HealthConfig::default(),
+            host_health: HostHealth::default(),
             daemon_start_clock: crate::clock::StartClock::capture(),
             terminal_journal: None,
             spawn_events: SpawnEventFeed::default(),
@@ -3237,6 +3250,7 @@ impl Supervisor {
     }
 
     pub fn with_handle(mut self, supervisor_handle: SupervisorHandle) -> Self {
+        self.host_health = supervisor_handle.host_health.clone();
         self.spawn_events = supervisor_handle.spawn_events.clone();
         self.supervisor_handle = Some(supervisor_handle);
         self
@@ -3578,6 +3592,7 @@ impl Supervisor {
             effective_drain_timeout,
             default_drain_timeout: self.drain_timeout,
             health: self.health.clone(),
+            host_health: self.host_health.clone(),
             connection_file_path: self.connection_file_path.clone(),
             capture_logs_dir: self.capture_logs_dir.clone(),
             forwarding: self.forwarding.clone(),
@@ -3620,6 +3635,7 @@ impl Supervisor {
         runtime: &SupervisorRuntimeConfig,
         snapshot: SharedSnapshot,
     ) -> (SupervisedModule, mpsc::Receiver<SupervisorCommand>) {
+        runtime.host_health.track(spec, &snapshot);
         let configuration = Arc::new(Mutex::new(SupervisedConfiguration {
             spec: spec.clone(),
             health: runtime.health.clone(),
@@ -4823,6 +4839,7 @@ impl HealthProbeRuntime {
                     let unknown = ModuleHealthStatus::default();
                     if state.health != unknown {
                         state.health = unknown;
+                        state.last_probe_evidence = None;
                     }
                 });
             } else if self.next_probe_at.is_none() {
@@ -4867,6 +4884,7 @@ impl HealthProbeRuntime {
                     || state.health.metrics.is_some()
                 {
                     state.health.status = SupervisorHealthStatus::Unknown;
+                    state.last_probe_evidence = None;
                     state.health.consecutive_failures = 0;
                     state.health.last_probe_ms = None;
                     state.health.detail = None;
@@ -4886,6 +4904,7 @@ impl HealthProbeRuntime {
             );
             let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 state.health.status = SupervisorHealthStatus::Unknown;
+                state.last_probe_evidence = None;
                 state.health.consecutive_failures = 0;
                 state.health.detail = None;
                 state.health.metrics = None;
@@ -4915,41 +4934,10 @@ impl HealthProbeRuntime {
     }
 }
 
-/// What a failed health probe actually OBSERVED, kept apart from how it reads.
-///
-/// This was a struct with a single `message: String`, and every one of the
-/// fifteen construction sites collapsed into it. Each site knows exactly what it
-/// saw -- the lane is gone, the module did not answer in time, the module
-/// answered with the wrong thing -- and `handle_health_probe_failure` then
-/// treated all of them identically: increment a counter, compare to a threshold,
-/// restart the module. THE DISTINCTION EXISTED AT EVERY CALL SITE AND WAS
-/// DESTROYED BEFORE THE DECISION THAT NEEDED IT.
-///
-/// The distinction that matters is not severity, it is EVIDENTIAL WEIGHT:
-///
-/// * `LaneDead` is PROOF. The module's control connection is gone; nothing will
-///   answer on it again.
-/// * `NoAnswer` is ABSENCE OF EVIDENCE. It is consistent with a wedged module
-///   AND with a perfectly healthy one that lost a CPU race -- which is what
-///   happens under machine load, and is how this supervisor killed a healthy
-///   module three times in one day.
-/// * `BadAnswer` proves the module is ALIVE. It replied; the reply was wrong.
-///   Restarting on it is defensible, but it is not the silence case and should
-///   never be counted as one.
-/// * `Misconfigured` is a daemon-side fault. The module has not been asked
-///   anything, so it cannot be evidence about the module at all.
-///
-/// The asymmetry is the whole point: under saturation the WEAKEST signal is the
-/// one that fires most often, and while every variant collapsed into one string
-/// it carried the same weight as the strongest.
-///
-/// LIVE BEHAVIOUR TODAY, stated here because this doc block describes the
-/// DESIGN and a reader stopping at it gets the build backwards: the restart
-/// decision does NOT yet consult this classification -- consecutive `NoAnswer`
-/// probes still increment the failure streak and drive escalation at the
-/// threshold (see `is_proof_of_death` below for why that is deliberate and
-/// what gates the change). Absence of evidence restarts modules today.
-#[derive(Debug)]
+/// Evidence is separate from diagnostic prose so host starvation can hold only
+/// silence-based restarts. A missing lane is still actionable during overload;
+/// a timeout can instead mean the host has not scheduled a healthy module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HealthProbeEvidence {
     /// The module's control lane is gone. Proof of death.
     LaneDead,
@@ -4997,13 +4985,8 @@ impl HealthProbeError {
     /// variant that fires under CPU starvation, and treating it as proof is the
     /// defect this enum exists to make impossible to reintroduce silently.
     ///
-    /// NOT YET CONSULTED BY THE RESTART DECISION, deliberately. Requiring proof
-    /// to restart also needs a bound for the case it excludes -- a genuinely
-    /// wedged module, alive but never answering -- and that bound must come from
-    /// the distribution of real late-answer latencies, which nothing measures
-    /// yet. Landing the classification first makes the later change a one-line
-    /// decision against evidence that already exists, rather than two unproven
-    /// changes at once.
+    /// Outside a host-overload hold, silence still reaches the normal failure
+    /// threshold so an isolated, genuinely wedged module can recover.
     #[allow(dead_code)]
     fn is_proof_of_death(&self) -> bool {
         matches!(self.evidence, HealthProbeEvidence::LaneDead)
@@ -5467,6 +5450,7 @@ async fn handle_health_report(
     let metrics = truncate_health_metrics(report.metrics);
     let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
         state.health.status = status;
+        state.last_probe_evidence = None;
         state.health.last_probe_ms = Some(now_ms);
         state.health.detail = detail.clone();
         state.health.metrics = metrics.clone();
@@ -5509,29 +5493,47 @@ async fn handle_health_probe_failure(
     now_ms: u64,
 ) {
     let threshold = runtime.health.failure_threshold.max(1);
+    let held = if err.evidence == HealthProbeEvidence::NoAnswer {
+        runtime.host_health.record_late_module(&spec.module_id)
+    } else {
+        false
+    };
     let mut failures = 0;
     // Carry the evidence class into the operator-visible detail. Without it,
     // "module did not answer within 5s" and "the control lane is gone" are two
     // prose strings in the same field, and the reader has to know the codebase to
     // tell which one is proof of anything.
-    let detail = format!("[{}] {err}", err.label());
+    let detail = if held {
+        format!("[{}] {err}; host overloaded", err.label())
+    } else {
+        format!("[{}] {err}", err.label())
+    };
     let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.last_probe_evidence = Some(err.evidence);
         state
             .failed_retry
             .observe_health(false, runtime.restart_policy.window);
         // A failed wire probe invalidates the last report, even before the
         // restart threshold. HTTP probes already mark failures as Failing.
-        if state.spawned_protocol.unwrap_or(spec.protocol) == ModuleProtocol::Subc {
+        if held {
+            state.health.status = SupervisorHealthStatus::Degraded;
+        } else if state.spawned_protocol.unwrap_or(spec.protocol) == ModuleProtocol::Subc {
             state.health.status = SupervisorHealthStatus::Unknown;
         }
         state.health.last_probe_ms = Some(now_ms);
-        state.health.consecutive_failures = state.health.consecutive_failures.saturating_add(1);
+        // Held silence breaks the streak: after the host recovers, only new
+        // failures count. Replaying pre-overload misses would restart immediately.
+        state.health.consecutive_failures = if held {
+            0
+        } else {
+            state.health.consecutive_failures.saturating_add(1)
+        };
         state.health.detail = Some(detail.clone());
         state.health.metrics = None;
         failures = state.health.consecutive_failures;
     });
 
-    if failures < threshold {
+    if held || failures < threshold {
         warn!(
             module_id = %spec.module_id,
             consecutive_failures = failures,
@@ -7872,6 +7874,7 @@ async fn handle_supervisor_command(
             if health_changed {
                 let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                     state.health = ModuleHealthStatus::default();
+                    state.last_probe_evidence = None;
                 });
             }
             runtime.drain_timeout = drain_timeout_ms
@@ -12436,6 +12439,7 @@ fn set_running(
     // Probe samples belong to one process. Keep module-level escalation and
     // late-answer history, but never charge a new child for its predecessor's misses.
     state.health.status = SupervisorHealthStatus::Unknown;
+    state.last_probe_evidence = None;
     state.health.consecutive_failures = 0;
     state.health.detail = None;
     state.health.metrics = None;

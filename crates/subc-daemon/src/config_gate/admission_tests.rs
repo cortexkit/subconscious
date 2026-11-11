@@ -106,12 +106,7 @@ async fn refused_nonce_hello_pipeline(
 #[tokio::test]
 async fn claims_nonce_hello_early_content_refusal_is_terminal() {
     let fixture = gated_claim_fixture().await;
-    let key = fixture
-        .handle
-        .registration_proof_for_test("a")
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let key = String::from(&*fixture.handle.registration_proof_for_test("a").unwrap());
     let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = checks.clone();
     fixture.spawn.set_content_probe_for_test(Arc::new(move || {
@@ -137,12 +132,7 @@ async fn claims_nonce_hello_early_content_refusal_is_terminal() {
 #[tokio::test]
 async fn claims_nonce_hello_wait_refusal_is_terminal() {
     let fixture = gated_claim_fixture().await;
-    let key = fixture
-        .handle
-        .registration_proof_for_test("a")
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let key = String::from(&*fixture.handle.registration_proof_for_test("a").unwrap());
     fixture.spawn.retire();
     assert!(!fixture.handle.wait_program_binding("a", &key).await);
     let handler = Arc::new(
@@ -162,12 +152,7 @@ async fn claims_nonce_hello_wait_refusal_is_terminal() {
 #[tokio::test]
 async fn claims_nonce_hello_late_content_refusal_is_terminal() {
     let fixture = gated_claim_fixture().await;
-    let key = fixture
-        .handle
-        .registration_proof_for_test("a")
-        .unwrap()
-        .as_str()
-        .to_owned();
+    let key = String::from(&*fixture.handle.registration_proof_for_test("a").unwrap());
     let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = checks.clone();
     fixture.spawn.set_content_probe_for_test(Arc::new(move || {

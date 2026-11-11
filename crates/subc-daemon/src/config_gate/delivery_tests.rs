@@ -1992,6 +1992,9 @@ fn supervised_fixture_with_program(
     }
     let registry = Arc::new(crate::Registry::default());
     let handle = crate::supervise::SupervisorHandle::new();
+    // Keep the channel available during manual delivery and warmup. A missing
+    // registration service would be a separate launch failure, not warmup.
+    handle.capture_registration_channels_for_test();
     let supervisor = crate::supervise::Supervisor::new_for_test(
         registry.clone(),
         crate::supervise::RestartPolicy {

@@ -517,3 +517,68 @@ async fn registration_channel_failed_ungated_service_keeps_nonce_launch_alive() 
         "the older SDK still registers over its nonce"
     );
 }
+
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registration_channel_macos_direct_exec_reap_never_becomes_ready() {
+    let handle = SupervisorHandle::new();
+    let (auth, info) = auth();
+    let scratch = cortexkit_test_support::ScratchDir::new("direct-exec-reap");
+    let spec = ModuleSpec {
+        module_id: "channel-module".into(),
+        program: "/bin/sleep".into(),
+        args: vec!["2".into()],
+        env: [
+            "HOME",
+            "XDG_DATA_HOME",
+            "XDG_RUNTIME_DIR",
+            "XDG_CONFIG_HOME",
+        ]
+        .into_iter()
+        .map(|key| (key.into(), scratch.display().to_string()))
+        .collect(),
+        reserved: false,
+        reserved_prefixes: vec![],
+        protocol: ModuleProtocol::None,
+        overlap: Default::default(),
+        carry_containment: false,
+    };
+    let runtime = Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+        .runtime_config();
+    runtime
+        .child_roster
+        .set_privacy_trampoline(Ok(test_privacy_trampoline()));
+    let mut child = spawn_child_in_slot_async(&spec, &runtime, SpawnRole::Plain, false)
+        .await
+        .unwrap();
+    child.privacy_exec.as_mut().unwrap().image_probe = Some(|pid| {
+        assert!(
+            observe_spawned_image(pid).is_some(),
+            "probe must run before the child exits"
+        );
+        None
+    });
+    let spawn = RegistrationSpawn::new(&handle, "channel-module", SpawnRole::Plain, None);
+    child.registration_spawn = Some(spawn.clone());
+    let (_router, mut channel, _copy) = serve(&handle, spawn.clone(), auth);
+    subc_transport::authenticate_client(&mut channel, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    subc_transport::write_frame(&mut channel, &hello("channel-module"))
+        .await
+        .unwrap();
+    child.confirm_privacy_exec().await;
+    assert!(
+        !spawn.launch_ready(),
+        "observed reap must be terminal before launch confirmation finishes"
+    );
+    assert!(tokio::time::timeout(
+        Duration::from_secs(1),
+        subc_transport::read_frame(&mut channel)
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .is_none());
+    child.finish_exit(false).await.unwrap();
+}

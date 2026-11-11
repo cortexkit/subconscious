@@ -187,6 +187,8 @@ struct PrivacyExec {
     module_id: String,
     #[cfg(test)]
     confirmation_pause: Option<(String, Option<tokio::net::TcpStream>)>,
+    #[cfg(test)]
+    image_probe: Option<fn(u32) -> Option<subc_os::Observation>>,
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -334,6 +336,8 @@ fn privacy_command(
             signature,
             script,
             module_id: spec.module_id.clone(),
+            #[cfg(test)]
+            image_probe: None,
             #[cfg(test)]
             confirmation_pause: spec
                 .env
@@ -653,6 +657,8 @@ impl SupervisedChild {
                 Err(error) => Some(format!("privacy identity trampoline wait failed: {error}")),
                 Ok(None) => {
                     let image = observe_spawned_image(self.pid);
+                    #[cfg(test)]
+                    let image = pending.image_probe.map_or(image, |probe| probe(self.pid));
                     if let Some(image) = image.filter(|image| {
                         image.executable.is_some()
                             && image.executable != pending.trampoline
@@ -679,6 +685,7 @@ impl SupervisedChild {
                         // during observation is an ordinary module exit.
                         match tokio::time::timeout_at(pending.deadline, self.child.wait()).await {
                             Ok(result) => {
+                                self.retire_registration();
                                 self.registration_channel.take();
                                 if let Some(binding) = &self._program_binding {
                                     binding.retire();

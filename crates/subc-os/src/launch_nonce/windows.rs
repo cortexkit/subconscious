@@ -278,13 +278,15 @@ impl LaunchNoncePipeHandoff {
         self,
         pid: u32,
         deadline: Instant,
+        cancelled: &AtomicBool,
     ) -> io::Result<std::fs::File> {
         // SAFETY: a fresh, non-inheritable process handle pins the child's PID.
         let process = owned(unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) })?;
         let handle = self.pipe.as_raw_handle();
         loop {
             // SAFETY: the pinned process handle is open for synchronization.
-            if Instant::now() >= deadline
+            if cancelled.load(Ordering::Acquire)
+                || Instant::now() >= deadline
                 || unsafe { WaitForSingleObject(process.as_raw_handle(), 0) } == WAIT_OBJECT_0
             {
                 return Err(timeout());
@@ -297,7 +299,10 @@ impl LaunchNoncePipeHandoff {
                     Some(code) if code == ERROR_PIPE_CONNECTED as i32 => {}
                     Some(code) if code == ERROR_IO_PENDING as i32 => {
                         operation.pending = true;
-                        if operation.wait(deadline, Some(&process), None).is_err() {
+                        if operation
+                            .wait(deadline, Some(&process), Some(cancelled))
+                            .is_err()
+                        {
                             // A peer may disappear before the overlapped connect
                             // completes. Keep the first instance and its name;
                             // only the child exit or deadline ends acceptance.
@@ -331,6 +336,10 @@ impl LaunchNoncePipeHandoff {
             unsafe { DisconnectNamedPipe(handle) };
             std::thread::sleep(POLL);
         }
+    }
+
+    pub(crate) fn registration_shutdown_handle(&self) -> io::Result<std::fs::File> {
+        self.pipe.try_clone().map(std::fs::File::from)
     }
 }
 

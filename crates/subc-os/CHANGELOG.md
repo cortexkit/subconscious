@@ -32,6 +32,8 @@
 
 ## 0.1.33
 
+- Expose a safe owned registration-pipe shutdown handle. Retirement disconnects
+  the instance synchronously and cancels a pending child-accept wait.
 - Keep a registration pipe's first instance reserved after a foreign connector
   disconnects, including before acceptance begins. Foreign disconnect errors
   cannot cancel the child's registration opportunity before its deadline.

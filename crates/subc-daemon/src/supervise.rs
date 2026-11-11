@@ -446,6 +446,23 @@ struct SupervisedChild {
 }
 
 impl SupervisedChild {
+    fn retire_registration(&self) {
+        if let Some(spawn) = &self.registration_spawn {
+            spawn.retire();
+        } else if let Some(binding) = &self._program_binding {
+            binding.retire();
+        }
+        #[cfg(unix)]
+        if let Some(channel) = &self.registration_channel {
+            let _ = channel.shutdown(std::net::Shutdown::Both);
+        }
+        #[cfg(windows)]
+        if let Some(channel) = &self.registration_channel {
+            if let Ok(shutdown) = channel.shutdown_handle() {
+                shutdown.shutdown();
+            }
+        }
+    }
     fn registered_since_spawn(&self) -> bool {
         self.registration_watch
             .as_ref()
@@ -463,9 +480,7 @@ impl SupervisedChild {
     fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         let result = self.child.try_wait();
         if !matches!(result, Ok(None)) {
-            if let Some(spawn) = &self.registration_spawn {
-                spawn.retire();
-            }
+            self.retire_registration();
             #[cfg(any(unix, windows))]
             self.registration_channel.take();
             if let Some(binding) = &self._program_binding {
@@ -486,9 +501,7 @@ impl SupervisedChild {
         // caller releases it after recording the exit (`release_roster`), and
         // dropping the handle releases it too.
         let result = self.child.wait().await;
-        if let Some(spawn) = &self.registration_spawn {
-            spawn.retire();
-        }
+        self.retire_registration();
         #[cfg(any(unix, windows))]
         self.registration_channel.take();
         // All plain and swap waits pass here. Revoke the reaped child's nonce
@@ -514,6 +527,7 @@ impl SupervisedChild {
     }
 
     async fn finish_exit(&mut self, carry: bool) -> io::Result<()> {
+        self.retire_registration();
         // Idempotent fallback for cleanup paths that did not call wait.
         if let Some(binding) = self._program_binding.take() {
             binding.retire();
@@ -857,6 +871,7 @@ impl SupervisedChild {
     /// direct-child kill still decides the outcome, so containment can never
     /// change whether a module is reported as stopped.
     fn start_kill(&mut self) -> io::Result<()> {
+        self.retire_registration();
         if let Some(container) = self.child.container() {
             container.hard_kill();
             return self.kill_leader();
@@ -876,6 +891,7 @@ impl SupervisedChild {
     }
 
     fn kill_leader(&mut self) -> io::Result<()> {
+        self.retire_registration();
         self.child.start_kill()
     }
 
@@ -12840,6 +12856,7 @@ fn arm_registration_deadline(
 }
 
 async fn stop_unregistered_child(child: &mut SupervisedChild) -> io::Result<()> {
+    child.retire_registration();
     if let Some(container) = child.child.container() {
         container.stop_members().await;
         child.kill_leader()?;
@@ -14071,6 +14088,7 @@ async fn drain_child_to_state(
     failure: &FailureContext,
 ) -> Result<(), SuperviseError> {
     let protocol = child.protocol;
+    child.retire_registration();
     update_snapshot(snapshot, Some(module_id), |state| {
         state.state = ModuleState::Draining;
         state.draining_to_replace = final_state == ModuleState::Restarting;

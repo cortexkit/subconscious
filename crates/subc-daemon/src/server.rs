@@ -709,6 +709,26 @@ async fn handle_connection_with_peer<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let channel_spawn = match &origin {
+        LocalOrigin::RegistrationChannel(spawn) => Some(spawn.clone()),
+        _ => None,
+    };
+    struct RetireRegistration(Option<Arc<crate::supervise::RegistrationSpawn>>);
+    impl Drop for RetireRegistration {
+        fn drop(&mut self) {
+            if let Some(spawn) = &self.0 {
+                spawn.retire();
+            }
+        }
+    }
+    let _registration_lifetime = RetireRegistration(channel_spawn.clone());
+    let channel_closed = async {
+        match &channel_spawn {
+            Some(spawn) => spawn.wait_closed().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(channel_closed);
     // Capture only socket facts here. Process-table lookup happens lazily on a
     // blocking thread when privileged dispatch needs a caller description.
     let endpoints = (&stream as &dyn Any)
@@ -733,28 +753,16 @@ where
     // auth-failure -> restart-budget-burn path this queue exists to prevent.
     // On a loopback-only, key-authenticated listener the doubled bound is a
     // per-connection occupancy cost, not a meaningful DoS surface.
-    let permit =
-        match tokio::time::timeout(auth.deadline, auth.unauthenticated.clone().acquire_owned())
-            .await
-        {
+    let permit = tokio::select! {
+        _ = &mut channel_closed => return Ok(()),
+        result = tokio::time::timeout(auth.deadline, auth.unauthenticated.clone().acquire_owned()) => match result {
             Ok(Ok(permit)) => permit,
             Ok(Err(_)) | Err(_) => {
                 let _ = stream.shutdown().await;
                 return Err(ConnectionError::UnauthenticatedCapacity);
             }
-        };
-
-    let channel_spawn = match &origin {
-        LocalOrigin::RegistrationChannel(spawn) => Some(spawn.clone()),
-        _ => None,
-    };
-    let channel_closed = async {
-        match &channel_spawn {
-            Some(spawn) => spawn.wait_closed().await,
-            None => std::future::pending().await,
         }
     };
-    tokio::pin!(channel_closed);
     let authenticated = tokio::select! {
         _ = &mut channel_closed => { let _ = stream.shutdown().await; return Ok(()); },
         result = authenticate_server(
@@ -830,6 +838,12 @@ where
         ) => result,
     };
 
+    // EOF and errors revoke the launch before task withdrawal or writer drain
+    // can await. Socket shutdown invalidates copies of the daemon's endpoint
+    // retained by a child that forked before closing inherited descriptors.
+    if let Some(spawn) = &channel_spawn {
+        spawn.retire();
+    }
     drop(delivery_guard);
     // Every in-flight route.open must have FINISHED before `connection` drops,
     // because that drop runs the forwarding cleanup for this id, and cleanup is

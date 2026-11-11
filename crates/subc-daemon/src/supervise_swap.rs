@@ -1227,6 +1227,9 @@ async fn retire_incumbent(
     incumbent_generation: u64,
 ) {
     let module_id = spec.module_id.as_str();
+    if let Some(incumbent) = &incumbent {
+        incumbent.retire_registration();
+    }
     if let Some(endpoint) = incumbent_endpoint {
         if let Err(err) = begin_forwarding_drain_with(
             forwarding,

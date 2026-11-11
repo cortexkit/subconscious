@@ -1,6 +1,10 @@
 //! Per-launch registration, tracked separately from nonce checks keyed by module ID.
 //! Locks only protect snapshots; neither service nor launch waits hold them.
 
+#[cfg(all(test, unix))]
+#[path = "registration_review_tests.rs"]
+mod review_tests;
+
 use super::*;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -11,7 +15,6 @@ use std::sync::{
 enum LaunchState {
     Pending,
     Ready,
-    Refused,
     Dead,
 }
 
@@ -21,6 +24,11 @@ pub(crate) struct RegistrationSpawn {
     pub(super) role: SpawnRole,
     hello_seen: AtomicBool,
     launch: tokio::sync::watch::Sender<LaunchState>,
+    transition: Mutex<()>,
+    #[cfg(unix)]
+    endpoint: Mutex<Option<std::os::unix::net::UnixStream>>,
+    #[cfg(windows)]
+    endpoint: Mutex<Option<subc_os::registration_channel::RegistrationPipeShutdown>>,
     binding: Option<ProgramBindingPublication>,
     pub(super) identity: std::sync::OnceLock<ProcessIdentity>,
     connections: Weak<Mutex<HashMap<ConnectionId, Arc<RegistrationSpawn>>>>,
@@ -34,15 +42,22 @@ impl RegistrationSpawn {
         binding: Option<ProgramBindingPublication>,
     ) -> Arc<Self> {
         let (launch, _) = tokio::sync::watch::channel(LaunchState::Pending);
-        Arc::new(Self {
+        let spawn = Arc::new(Self {
             module_id: module.into(),
             role,
             hello_seen: AtomicBool::new(false),
             launch,
+            transition: Mutex::new(()),
+            #[cfg(any(unix, windows))]
+            endpoint: Mutex::new(None),
             binding,
             identity: std::sync::OnceLock::new(),
             connections: Arc::downgrade(&handle.registration_connections),
-        })
+        });
+        if let Some(binding) = &spawn.binding {
+            binding.attach_registration(&spawn);
+        }
+        spawn
     }
 
     pub(crate) fn bind(self: &Arc<Self>, connection: ConnectionId) {
@@ -65,10 +80,31 @@ impl RegistrationSpawn {
         });
     }
     pub(super) fn refuse(&self) {
-        self.launch.send_replace(LaunchState::Refused);
+        self.retire();
     }
     pub(crate) fn retire(&self) {
-        self.launch.send_replace(LaunchState::Dead);
+        {
+            let _transition = self.transition.lock().unwrap_or_else(|p| p.into_inner());
+            if *self.launch.borrow() == LaunchState::Dead {
+                return;
+            }
+            self.launch.send_replace(LaunchState::Dead);
+            #[cfg(any(unix, windows))]
+            if let Some(endpoint) = self
+                .endpoint
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                #[cfg(unix)]
+                let _ = endpoint.shutdown(std::net::Shutdown::Both);
+                #[cfg(windows)]
+                endpoint.shutdown();
+            }
+        }
+        if let Some(binding) = &self.binding {
+            binding.retire();
+        }
     }
 
     pub(crate) async fn wait_launch(&self) {
@@ -87,10 +123,7 @@ impl RegistrationSpawn {
     pub(crate) async fn wait_closed(&self) {
         let mut state = self.launch.subscribe();
         loop {
-            if matches!(
-                *state.borrow_and_update(),
-                LaunchState::Dead | LaunchState::Refused
-            ) {
+            if matches!(*state.borrow_and_update(), LaunchState::Dead) {
                 return;
             }
             if state.changed().await.is_err() {
@@ -112,7 +145,6 @@ impl RegistrationSpawn {
     pub(crate) fn check(&self) -> Result<(), &'static str> {
         match *self.launch.borrow() {
             LaunchState::Dead => return Err("registration_channel_closed"),
-            LaunchState::Refused => return Err("program_refused"),
             LaunchState::Pending => return Err("config_delivery_deferred"),
             LaunchState::Ready => {}
         }
@@ -273,6 +305,27 @@ impl SupervisorHandle {
         pid: u32,
         timeout: Duration,
     ) {
+        #[cfg(unix)]
+        let endpoint = channel.try_clone();
+        #[cfg(windows)]
+        let endpoint = channel.shutdown_handle();
+        match endpoint {
+            Ok(endpoint) => {
+                let _transition = spawn.transition.lock().unwrap_or_else(|p| p.into_inner());
+                if *spawn.launch.borrow() == LaunchState::Dead {
+                    #[cfg(unix)]
+                    let _ = endpoint.shutdown(std::net::Shutdown::Both);
+                    #[cfg(windows)]
+                    endpoint.shutdown();
+                    return;
+                }
+                *spawn.endpoint.lock().unwrap_or_else(|p| p.into_inner()) = Some(endpoint);
+            }
+            Err(_) => {
+                spawn.refuse();
+                return;
+            }
+        }
         #[cfg(all(test, unix))]
         {
             let mut captured = self.registration_test_channels.lock().unwrap();
@@ -783,7 +836,7 @@ mod tests {
             handle.serve_registration(parent, spawn.clone(), 1, Duration::from_secs(1));
             use tokio::io::AsyncReadExt;
             assert_eq!(child.read(&mut [0]).await.unwrap(), 0);
-            assert_eq!(spawn.check(), Err("program_refused"));
+            assert_eq!(spawn.check(), Err("registration_channel_closed"));
             assert!(handle.spawn_nonce("channel-module").is_none());
         }
     }

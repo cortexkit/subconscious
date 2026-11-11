@@ -40,6 +40,7 @@ pub(super) struct ProgramBindingPublication {
     bindings: std::sync::Weak<ProgramBindingTable>,
     key: (String, String),
     retired: Arc<std::sync::atomic::AtomicBool>,
+    registration: Arc<Mutex<std::sync::Weak<RegistrationSpawn>>>,
 }
 
 // A carried pin can reap independently of the actor. Its hook shares retirement
@@ -52,6 +53,7 @@ pub(super) struct ProgramBindingRetirement {
     bindings: std::sync::Weak<ProgramBindingTable>,
     key: (String, String),
     retired: Arc<std::sync::atomic::AtomicBool>,
+    registration: Arc<Mutex<std::sync::Weak<RegistrationSpawn>>>,
     #[cfg(test)]
     upgrade_pause: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
 }
@@ -75,11 +77,15 @@ impl ProgramBindingRetirement {
             bindings: self.bindings.clone(),
             key: self.key.clone(),
             retired: self.retired.clone(),
+            registration: self.registration.clone(),
         })
     }
 }
 
 impl ProgramBindingPublication {
+    pub(super) fn attach_registration(&self, spawn: &Arc<RegistrationSpawn>) {
+        *self.registration.lock().unwrap_or_else(|p| p.into_inner()) = Arc::downgrade(spawn);
+    }
     #[cfg(all(test, unix))]
     pub(super) fn key_for_test(&self) -> &str {
         &self.key.1
@@ -120,6 +126,7 @@ impl ProgramBindingPublication {
             bindings: self.bindings.clone(),
             key: self.key.clone(),
             retired: self.retired.clone(),
+            registration: self.registration.clone(),
             #[cfg(test)]
             upgrade_pause: None,
         }
@@ -144,6 +151,14 @@ impl ProgramBindingPublication {
         }
     }
     pub(super) fn retire(&self) {
+        let registration = self
+            .registration
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .upgrade();
+        if let Some(registration) = registration {
+            registration.retire();
+        }
         if self.retired.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
         }
@@ -519,6 +534,7 @@ impl SupervisorHandle {
             bindings: Arc::downgrade(&self.program_bindings),
             key,
             retired: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            registration: Arc::new(Mutex::new(std::sync::Weak::new())),
         })
     }
 

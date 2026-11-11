@@ -40,16 +40,55 @@ pub const HELPER_PARENT_PID_ENV: &str = "SUBC_HELPER_PARENT_PID";
 /// Retaining this value keeps the name reserved even after a foreign client is
 /// disconnected. No stream is exposed until the direct child's PID is checked.
 #[cfg(windows)]
-pub struct RegistrationPipe(crate::LaunchNoncePipeHandoff);
+pub struct RegistrationPipe(
+    crate::LaunchNoncePipeHandoff,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+);
+
+/// Cancellation for an owned registration instance, before or after acceptance.
+/// Disconnect is synchronous; closing this duplicate never releases another owner's handle.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct RegistrationPipeShutdown {
+    pipe: std::fs::File,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(windows)]
+impl RegistrationPipeShutdown {
+    pub fn shutdown(self) {
+        use std::os::windows::io::AsRawHandle;
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        // SAFETY: this owned duplicate keeps the original server instance alive
+        // throughout disconnect. An already-disconnected instance is harmless.
+        #[allow(unsafe_code)]
+        unsafe {
+            windows_sys::Win32::System::Pipes::DisconnectNamedPipe(self.pipe.as_raw_handle())
+        };
+    }
+}
 
 #[cfg(windows)]
 impl RegistrationPipe {
     pub fn new() -> std::io::Result<Self> {
-        crate::LaunchNoncePipeHandoff::registration().map(Self)
+        crate::LaunchNoncePipeHandoff::registration().map(|pipe| {
+            Self(
+                pipe,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )
+        })
     }
 
     pub fn name(&self) -> &str {
         self.0.name()
+    }
+
+    pub fn shutdown_handle(&self) -> std::io::Result<RegistrationPipeShutdown> {
+        Ok(RegistrationPipeShutdown {
+            pipe: self.0.registration_shutdown_handle()?,
+            cancelled: self.1.clone(),
+        })
     }
 
     /// Accept only the owned child's connection, without reading any bytes.
@@ -57,7 +96,7 @@ impl RegistrationPipe {
     /// Use the spawn's registration deadline, not the legacy nonce serve window.
     /// The returned file owns an overlapped handle, not a synchronous stream.
     pub fn accept(self, pid: u32, deadline: std::time::Instant) -> std::io::Result<std::fs::File> {
-        self.0.accept_registration(pid, deadline)
+        self.0.accept_registration(pid, deadline, &self.1)
     }
 }
 

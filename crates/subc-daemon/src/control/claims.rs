@@ -354,36 +354,45 @@ impl ControlHandler {
         frame: &Frame,
         first: bool,
     ) -> Result<Vec<Frame>, RouterError> {
-        let connection = ctx.connection_id;
         let refusal = if !first {
             Some(error_codes::CLAIM_PRESENT_NOT_FIRST)
         } else {
             self.consume_claim(ctx, frame).err()
         };
         if let Some(code) = refusal {
-            // Close even on retryable refusal: no failed bearer presentation may
-            // leave an authenticated but unbound direct connection behind.
-            ctx.egress.terminate_ingress();
-            let refusal = control_error_frame(frame, code, "claim presentation refused")?;
-            let sent = ctx.egress.send_flushed(refusal).await;
-            #[cfg(test)]
-            let notify = !self.claims.1.load(std::sync::atomic::Ordering::Relaxed);
-            #[cfg(not(test))]
-            let notify = true;
-            if notify {
-                self.forwarding.request_connection_close(
-                    connection,
-                    CloseReason::new(code, "claim presentation refused"),
-                );
-            }
-            sent?;
-            return Ok(Vec::new());
+            return self.refuse_claim_connection(ctx, frame, code).await;
         }
         Ok(vec![control_response_body_frame(
             frame,
             &ClaimPresentReply::new(),
             "claim.present",
         )?])
+    }
+
+    pub(super) async fn refuse_claim_connection(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+        code: &'static str,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let connection = ctx.connection_id;
+        // End ingress before I/O, even for a retryable refusal, so buffered
+        // requests cannot run after a rejected claim operation.
+        ctx.egress.terminate_ingress();
+        let refusal = control_error_frame(frame, code, "claim connection refused")?;
+        let sent = ctx.egress.send_flushed(refusal).await;
+        #[cfg(test)]
+        let notify = !self.claims.1.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(test))]
+        let notify = true;
+        if notify {
+            self.forwarding.request_connection_close(
+                connection,
+                CloseReason::new(code, "claim connection refused"),
+            );
+        }
+        sent?;
+        Ok(Vec::new())
     }
 
     fn consume_claim(&self, ctx: &RouteCtx, frame: &Frame) -> Result<(), &'static str> {
@@ -918,6 +927,53 @@ mod tests {
             FrameType::Response,
             "retryable connection-cap refusal must not consume the bearer"
         );
+    }
+
+    #[tokio::test]
+    async fn claims_bound_connections_cannot_hello_register_as_modules() {
+        let mut rig = rig().await;
+        for (index, purpose) in [
+            ClaimPurpose::SelfConnection,
+            ClaimPurpose::Helper,
+            ClaimPurpose::Relay,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let token = mint(&mut rig, purpose).await.claim;
+            let mut consumer = Net::new(rig.router.clone()).await;
+            assert_eq!(
+                consumer
+                    .call(request(ClaimPresentRequest::new(token)))
+                    .await
+                    .header
+                    .ty,
+                FrameType::Response
+            );
+            let module = format!("claimed-{index}");
+            let hello = subc_protocol::ModuleHelloBody {
+                manifest: ModuleManifest::builder(&module, "1.0.0").build(),
+                protocol_ver: PROTOCOL_VERSION,
+                control_ops: None,
+                launch_nonce: None,
+            };
+            let reply = consumer
+                .call(
+                    Frame::build(
+                        FrameType::Hello,
+                        control_flags(),
+                        0,
+                        0,
+                        8,
+                        serde_json::to_vec(&hello).unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .await;
+            error(&reply, "claim_hello_not_allowed");
+            assert!(rig.handler.registry.get_module(&module).unwrap().is_none());
+            assert!(consumer.recv().await.is_none());
+        }
     }
 
     #[tokio::test]

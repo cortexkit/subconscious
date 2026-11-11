@@ -2143,6 +2143,11 @@ impl ControlHandler {
         match frame.header.ty {
             FrameType::Ping => Ok(vec![pong(&frame)?]),
             FrameType::Hello => {
+                if self.claims.binding(ctx.connection_id).is_some() {
+                    return self
+                        .refuse_claim_connection(ctx, &frame, "claim_hello_not_allowed")
+                        .await;
+                }
                 if let Some(spawn) = self.supervisor.registration_spawn(ctx.connection_id) {
                     spawn.wait_launch().await;
                     // Refused launches close the channel. Leave their pending

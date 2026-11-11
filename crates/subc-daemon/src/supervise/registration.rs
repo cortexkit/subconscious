@@ -20,6 +20,7 @@ enum LaunchState {
 
 #[derive(Debug)]
 pub(crate) struct RegistrationSpawn {
+    pub(crate) incarnation: String,
     pub(crate) claims: std::sync::OnceLock<Arc<crate::control::claims::LaunchClaims>>,
     pub(crate) module_id: String,
     pub(super) role: SpawnRole,
@@ -69,6 +70,13 @@ impl RegistrationSpawn {
     ) -> Arc<Self> {
         let (launch, _) = tokio::sync::watch::channel(LaunchState::Pending);
         let spawn = Arc::new(Self {
+            incarnation: handle
+                .spawn_events
+                .0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .daemon_incarnation
+                .clone(),
             claims: std::sync::OnceLock::new(),
             module_id: module.into(),
             role,

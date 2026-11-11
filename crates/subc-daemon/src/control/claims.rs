@@ -82,6 +82,10 @@ struct LaunchState {
     pending: HashMap<[u8; 16], Pending>,
     connections: HashMap<ConnectionId, crate::FrameSink>,
     bucket: Bucket,
+    #[cfg(test)]
+    pending_visits: u64,
+    #[cfg(test)]
+    index_operations: u64,
 }
 
 pub(crate) struct LaunchClaims {
@@ -236,7 +240,6 @@ impl ControlHandler {
         ) {
             return self.claim_refusal(frame, error_codes::CLAIM_PREFIX_REFUSED);
         }
-        let incarnation = self.supervisor.spawn_snapshot().cursor.daemon_incarnation;
         let Ok(_alive) = spawn.begin_publication() else {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
         };
@@ -246,7 +249,7 @@ impl ControlHandler {
             .get_or_init(|| {
                 Arc::new(LaunchClaims {
                     primary: connection,
-                    incarnation,
+                    incarnation: spawn.incarnation.clone(),
                     registration: Arc::downgrade(&spawn),
                     table: Arc::downgrade(&self.claims),
                     forwarding: self.forwarding.clone(),
@@ -259,6 +262,10 @@ impl ControlHandler {
                             tokens: CLAIM_MINT_BURST * TOKEN,
                             updated: now,
                         },
+                        #[cfg(test)]
+                        pending_visits: 0,
+                        #[cfg(test)]
+                        index_operations: 0,
                     }),
                 })
             })
@@ -266,22 +273,6 @@ impl ControlHandler {
         let mut state = launch.state.lock().unwrap_or_else(|p| p.into_inner());
         if !state.primary_live {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
-        }
-        let expired = state
-            .pending
-            .iter()
-            .filter(|(_, pending)| pending.expires <= now)
-            .map(|(token, _)| *token)
-            .collect::<Vec<_>>();
-        if !expired.is_empty() {
-            let mut index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
-            for token in expired {
-                state.pending.remove(&token);
-                index.pending.remove(&token);
-            }
-        }
-        if state.pending.len() >= MAX_UNREDEEMED_CLAIMS_PER_SPAWN {
-            return self.claim_refusal(frame, error_codes::CLAIM_UNREDEEMED_LIMIT);
         }
         if let Err(retry_after_ms) = state.bucket.take(now) {
             let error = subc_protocol::ErrorBody {
@@ -294,12 +285,44 @@ impl ControlHandler {
             };
             return Ok(vec![control_error_body_frame(frame, error)?]);
         }
+        // A count below the cap needs no sweep. At the cap, inspect only this
+        // launch's bounded pending set, after the cheap rate admission succeeds.
+        if state.pending.len() >= MAX_UNREDEEMED_CLAIMS_PER_SPAWN {
+            #[cfg(test)]
+            {
+                state.pending_visits += state.pending.len() as u64;
+            }
+            let expired = state
+                .pending
+                .iter()
+                .filter(|(_, pending)| pending.expires <= now)
+                .map(|(token, _)| *token)
+                .collect::<Vec<_>>();
+            if !expired.is_empty() {
+                let mut index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
+                for token in expired {
+                    state.pending.remove(&token);
+                    index.pending.remove(&token);
+                    #[cfg(test)]
+                    {
+                        state.index_operations += 1;
+                    }
+                }
+            }
+            if state.pending.len() >= MAX_UNREDEEMED_CLAIMS_PER_SPAWN {
+                return self.claim_refusal(frame, error_codes::CLAIM_UNREDEEMED_LIMIT);
+            }
+        }
         let mut index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
         let mut token = [0; 16];
         loop {
             getrandom::getrandom(&mut token).map_err(|_| {
                 RouterError::backend(0, frame.header.corr, "claim entropy unavailable")
             })?;
+            #[cfg(test)]
+            {
+                state.index_operations += 1;
+            }
             if !index.pending.contains_key(&token) {
                 break;
             }
@@ -312,6 +335,10 @@ impl ControlHandler {
             },
         );
         index.pending.insert(token, Arc::downgrade(&launch));
+        #[cfg(test)]
+        {
+            state.index_operations += 1;
+        }
         let expires_at_ms =
             crate::clock::wall_now_ms().saturating_add(CLAIM_LIFETIME.as_millis() as u64);
         Ok(vec![control_response_body_frame(
@@ -811,6 +838,85 @@ mod tests {
             String::from_utf8_lossy(&reply.body)
         );
         serde_json::from_slice(&reply.body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn claims_resource_work_is_launch_local_and_rate_admission_is_first() {
+        let rig = rig().await;
+        let (mut busy, busy_spawn, _busy_module, _) = network_primary(&rig, "claims-busy").await;
+        let (mut other, other_spawn, _other_module, _) =
+            network_primary(&rig, "claims-other").await;
+        net_mint(&mut other, ClaimPurpose::SelfConnection).await;
+        let baseline = {
+            let state = other_spawn.claims.get().unwrap().state.lock().unwrap();
+            (state.pending_visits, state.index_operations)
+        };
+        assert_eq!(baseline, (0, 2));
+        let mut consumers = Vec::new();
+        for index in 0..256 {
+            if index % 32 == 0 && busy_spawn.claims.get().is_some() {
+                busy_spawn
+                    .claims
+                    .get()
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .bucket
+                    .tokens = CLAIM_MINT_BURST * TOKEN;
+            }
+            let token = net_mint(&mut busy, ClaimPurpose::SelfConnection)
+                .await
+                .claim;
+            let mut net = Net::new(rig.router.clone()).await;
+            assert_eq!(
+                net.call(request(ClaimPresentRequest::new(token)))
+                    .await
+                    .header
+                    .ty,
+                FrameType::Response
+            );
+            consumers.push(net);
+        }
+        busy_spawn
+            .claims
+            .get()
+            .unwrap()
+            .state
+            .lock()
+            .unwrap()
+            .bucket
+            .tokens = CLAIM_MINT_BURST * TOKEN;
+        for _ in 0..64 {
+            net_mint(&mut busy, ClaimPurpose::Helper).await;
+        }
+        {
+            let mut state = busy_spawn.claims.get().unwrap().state.lock().unwrap();
+            assert_eq!((state.pending.len(), state.connections.len()), (64, 256));
+            state.bucket.tokens = 0;
+            state.bucket.updated = tokio::time::Instant::now() + Duration::from_secs(60);
+            state.pending_visits = 0;
+            state.index_operations = 0;
+        }
+        let refusal = busy
+            .call(request(ClaimMintRequest::new(ClaimPurpose::SelfConnection)))
+            .await;
+        {
+            let state = busy_spawn.claims.get().unwrap().state.lock().unwrap();
+            assert_eq!(
+                (state.pending_visits, state.index_operations),
+                (0, 0),
+                "rate refusal must precede claim scans and global index work"
+            );
+        }
+        error(&refusal, error_codes::CLAIM_RATE_LIMITED);
+        net_mint(&mut other, ClaimPurpose::Relay).await;
+        let state = other_spawn.claims.get().unwrap().state.lock().unwrap();
+        assert_eq!(
+            (state.pending_visits, state.index_operations),
+            (baseline.0, baseline.1 + 2),
+            "a foreign launch at both caps must add no mint work"
+        );
     }
 
     #[tokio::test]

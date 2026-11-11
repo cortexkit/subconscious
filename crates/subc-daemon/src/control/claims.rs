@@ -2,6 +2,10 @@
 //! lock, then launch-local claims, then the token/connection index. Index lookups
 //! release their lock before acquiring a spawn lock. No lock crosses an await;
 //! forwarding closes run after retirement releases the transition lock.
+//!
+//! GOODBYE prevents the primary from issuing new connection claims and voids
+//! pending tokens only. Already-bound consumers belong to the launch, so they
+//! remain connected until retirement (observed exit or permanent program refusal).
 
 use super::*;
 use crate::supervise::RegistrationSpawn;
@@ -1118,6 +1122,80 @@ pub(crate) mod tests {
             error_codes::CLAIM_INVALID,
         );
         assert!(consumer.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn claims_goodbye_voids_pending_but_bound_helpers_live_until_retirement() {
+        let rig = rig().await;
+        let (mut primary, spawn, _module, _) = network_primary(&rig, "claims-goodbye-helper").await;
+        let helper = net_mint(&mut primary, ClaimPurpose::Helper).await.claim;
+        let pending = net_mint(&mut primary, ClaimPurpose::SelfConnection)
+            .await
+            .claim;
+        let mut consumer = Net::new(rig.router.clone()).await;
+        assert_eq!(
+            consumer
+                .call(request(ClaimPresentRequest::new(helper)))
+                .await
+                .header
+                .ty,
+            FrameType::Response
+        );
+        subc_transport::write_frame(
+            &mut primary.client,
+            &Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 4, Vec::new()).unwrap(),
+        )
+        .await
+        .unwrap();
+        let ping = || Frame::build(FrameType::Ping, control_flags(), 0, 0, 5, Vec::new()).unwrap();
+        assert_eq!(primary.call(ping()).await.header.ty, FrameType::Pong);
+        assert!(spawn.launch_ready());
+        assert!(
+            !spawn
+                .claims
+                .get()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .primary_live
+        );
+        let mut rejected = Net::new(rig.router.clone()).await;
+        error(
+            &rejected
+                .call(request(ClaimPresentRequest::new(pending)))
+                .await,
+            error_codes::CLAIM_INVALID,
+        );
+        assert!(rejected.recv().await.is_none());
+        let written = subc_transport::write_frame(&mut consumer.client, &ping()).await;
+        let pong = if written.is_ok() {
+            consumer.recv().await
+        } else {
+            None
+        };
+        assert!(
+            matches!(pong, Some(reply) if reply.header.ty == FrameType::Pong),
+            "GOODBYE must retain the helper's launch-bound connection"
+        );
+        let binding = rig
+            .handler
+            .claims
+            .0
+            .lock()
+            .unwrap()
+            .bindings
+            .values()
+            .find(|binding| binding.spawn != rig.primary.connection.id())
+            .cloned()
+            .unwrap();
+        assert_eq!(binding.purpose, ClaimPurpose::Helper);
+        assert!(Arc::ptr_eq(&binding.registration, &spawn));
+        spawn.retire();
+        assert!(
+            consumer.recv().await.is_none(),
+            "launch retirement must end the helper connection"
+        );
     }
 
     #[tokio::test]

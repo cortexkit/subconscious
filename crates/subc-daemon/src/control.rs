@@ -3131,9 +3131,16 @@ impl ControlHandler {
                 #[cfg(windows)]
                 hello.launch_nonce.as_deref(),
             )?;
-            #[cfg(windows)]
             if let Some(spawn) = &channel_spawn {
-                spawn.hello_accepted();
+                if self
+                    .registry
+                    .get_module_by_connection(connection_id)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    spawn.hello_accepted();
+                }
             }
             return Ok(reply);
         }
@@ -3284,7 +3291,6 @@ impl ControlHandler {
             "module registered"
         );
 
-        #[cfg(windows)]
         if let Some(spawn) = &channel_spawn {
             spawn.hello_accepted();
         }

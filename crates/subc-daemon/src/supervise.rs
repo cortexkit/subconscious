@@ -10495,7 +10495,11 @@ fn spawn_child_in_slot(
         .as_ref()
         .and_then(|admission| admission.approved_base())
         .cloned();
-    let mut result = launch_child_in_slot(spec, ring, roster, prepared);
+    let register_timeout = handle
+        .and_then(|handle| handle.get(&spec.module_id))
+        .and_then(|module| module.configured_register_timeout().ok())
+        .unwrap_or(DEFAULT_REGISTER_TIMEOUT);
+    let mut result = launch_child_in_slot(spec, ring, roster, prepared, register_timeout);
     drop(_gate);
     if let (Some(delivery), Err(SuperviseError::ConfigHeld { code, detail, .. })) =
         (config_delivery, &result)
@@ -10822,8 +10826,13 @@ async fn spawn_child_in_slot_async(
         .as_ref()
         .and_then(|admission| admission.approved_base())
         .cloned();
-    let mut result =
-        launch_child_in_slot(spec, &runtime.stderr_ring, &runtime.child_roster, prepared);
+    let mut result = launch_child_in_slot(
+        spec,
+        &runtime.stderr_ring,
+        &runtime.child_roster,
+        prepared,
+        runtime.register_timeout,
+    );
     drop(_gate);
     if let (Some(delivery), Err(SuperviseError::ConfigHeld { code, detail, .. })) =
         (runtime.config_delivery.as_ref(), &result)
@@ -11310,6 +11319,7 @@ fn launch_child_in_slot(
     ring: &Arc<Mutex<StderrRing>>,
     roster: &ChildRoster,
     prepared: PreparedChild,
+    register_timeout: Duration,
 ) -> Result<SupervisedChild, SuperviseError> {
     let launch_spec = prepared.launch_spec.clone();
     let admission_base = prepared
@@ -11933,7 +11943,7 @@ fn launch_child_in_slot(
         if let (Some(handle), Some(channel)) =
             (registration_handle, supervised.registration_channel.take())
         {
-            handle.serve_registration(channel, spawn.clone(), pid, DEFAULT_REGISTER_TIMEOUT);
+            handle.serve_registration(channel, spawn.clone(), pid, spawned_at + register_timeout);
         }
     }
     Ok(supervised)

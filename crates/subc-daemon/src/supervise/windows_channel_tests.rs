@@ -93,7 +93,12 @@ async fn windows_channel_foreign_connect_close_does_not_prevent_child_hello() {
     ));
     let spawn = RegistrationSpawn::new(&handle, "channel-foreign-close", SpawnRole::Plain, None);
     spawn.ready();
-    handle.serve_registration(pipe, spawn, child.id(), Duration::from_secs(5));
+    handle.serve_registration(
+        pipe,
+        spawn,
+        child.id(),
+        Instant::now() + Duration::from_secs(5),
+    );
     child.stdin.take().unwrap().write_all(b"x").unwrap();
     let output = tokio::task::spawn_blocking(move || child.wait_with_output())
         .await

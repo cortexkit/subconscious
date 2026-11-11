@@ -753,16 +753,27 @@ where
     // auth-failure -> restart-budget-burn path this queue exists to prevent.
     // On a loopback-only, key-authenticated listener the doubled bound is a
     // per-connection occupancy cost, not a meaningful DoS surface.
-    let permit = tokio::select! {
-        _ = &mut channel_closed => return Ok(()),
-        result = tokio::time::timeout(auth.deadline, auth.unauthenticated.clone().acquire_owned()) => match result {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) | Err(_) => {
-                let _ = stream.shutdown().await;
-                return Err(ConnectionError::UnauthenticatedCapacity);
+    // Each supervised child receives exactly one registration channel. It does
+    // not compete with unauthenticated TCP callers for a pre-auth pool slot.
+    let permit = if channel_spawn.is_some() {
+        None
+    } else {
+        Some(tokio::select! {
+            _ = &mut channel_closed => return Ok(()),
+            result = tokio::time::timeout(auth.deadline, auth.unauthenticated.clone().acquire_owned()) => match result {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) | Err(_) => {
+                    let _ = stream.shutdown().await;
+                    return Err(ConnectionError::UnauthenticatedCapacity);
+                }
             }
-        }
+        })
     };
+    let handshake_budget = channel_spawn.as_ref().map_or(auth.deadline, |spawn| {
+        spawn
+            .deadline()
+            .saturating_duration_since(tokio::time::Instant::now())
+    });
     let authenticated = tokio::select! {
         _ = &mut channel_closed => { let _ = stream.shutdown().await; return Ok(()); },
         result = authenticate_server(
@@ -770,7 +781,7 @@ where
         auth.key.as_ref(),
         &auth.daemon_id,
         auth.daemon_ver.as_ref(),
-        auth.deadline,
+        handshake_budget,
         ) => result.map_err(ConnectionError::Auth)?,
     };
     drop(permit);
@@ -825,7 +836,14 @@ where
 
     let mut route_open_tasks = JoinSet::new();
     let mut privileged_tasks = JoinSet::new();
+    let registration_expired = async {
+        match &channel_spawn {
+            Some(spawn) => spawn.registration_expired().await,
+            None => std::future::pending().await,
+        }
+    };
     let loop_result = tokio::select! {
+        _ = registration_expired => Ok(ConnectionLoopExit::CloseRequested(CloseReason::new("registration_timeout", "module did not complete HELLO before its spawn deadline"))),
         _ = &mut channel_closed => Ok(ConnectionLoopExit::CloseRequested(CloseReason::new("registration_channel_closed", "the supervised launch ended"))),
         result = connection_loop(
         &mut read_half,

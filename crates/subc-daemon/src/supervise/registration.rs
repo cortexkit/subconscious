@@ -23,6 +23,8 @@ pub(crate) struct RegistrationSpawn {
     pub(crate) module_id: String,
     pub(super) role: SpawnRole,
     hello_seen: AtomicBool,
+    registered: AtomicBool,
+    deadline: std::sync::OnceLock<Instant>,
     launch: tokio::sync::watch::Sender<LaunchState>,
     transition: Mutex<()>,
     #[cfg(unix)]
@@ -46,6 +48,8 @@ impl RegistrationSpawn {
             module_id: module.into(),
             role,
             hello_seen: AtomicBool::new(false),
+            registered: AtomicBool::new(false),
+            deadline: std::sync::OnceLock::new(),
             launch,
             transition: Mutex::new(()),
             #[cfg(any(unix, windows))]
@@ -120,6 +124,20 @@ impl RegistrationSpawn {
         *self.launch.borrow() == LaunchState::Ready
     }
 
+    pub(crate) fn deadline(&self) -> Instant {
+        *self
+            .deadline
+            .get()
+            .expect("served registration has a spawn deadline")
+    }
+
+    pub(crate) async fn registration_expired(&self) {
+        tokio::time::sleep_until(self.deadline()).await;
+        if self.registered.load(Ordering::Acquire) {
+            std::future::pending::<()>().await;
+        }
+    }
+
     pub(crate) async fn wait_closed(&self) {
         let mut state = self.launch.subscribe();
         loop {
@@ -162,8 +180,9 @@ impl RegistrationSpawn {
         self.role == SpawnRole::SwapCandidate
     }
 
-    #[cfg(windows)]
     pub(crate) fn hello_accepted(&self) {
+        self.registered.store(true, Ordering::Release);
+        #[cfg(windows)]
         if let Some(binding) = &self.binding {
             binding.hello_accepted();
         }
@@ -303,8 +322,9 @@ impl SupervisorHandle {
         channel: SpawnRegistrationChannel,
         spawn: Arc<RegistrationSpawn>,
         pid: u32,
-        timeout: Duration,
+        deadline: Instant,
     ) {
+        let _ = spawn.deadline.set(deadline);
         #[cfg(unix)]
         let endpoint = channel.try_clone();
         #[cfg(windows)]
@@ -353,14 +373,14 @@ impl SupervisorHandle {
             let serve = async {
                 #[cfg(unix)]
                 let stream = {
-                    let _ = (pid, timeout);
+                    let _ = pid;
                     channel.set_nonblocking(true)?;
                     tokio::net::UnixStream::from_std(channel)?
                 };
                 #[cfg(windows)]
                 let stream = {
                     tokio::task::spawn_blocking(move || {
-                        channel.accept_tokio_pipe_server(pid, std::time::Instant::now() + timeout)
+                        channel.accept_tokio_pipe_server(pid, deadline.into_std())
                     })
                     .await
                     .map_err(io::Error::other)??
@@ -638,7 +658,7 @@ mod tests {
             parent,
             spawn.clone(),
             std::process::id(),
-            Duration::from_secs(2),
+            Instant::now() + Duration::from_secs(2),
         );
         subc_transport::authenticate_client(&mut child, &info, Duration::from_secs(2))
             .await
@@ -833,7 +853,12 @@ mod tests {
             let (parent, child) = std::os::unix::net::UnixStream::pair().unwrap();
             child.set_nonblocking(true).unwrap();
             let mut child = tokio::net::UnixStream::from_std(child).unwrap();
-            handle.serve_registration(parent, spawn.clone(), 1, Duration::from_secs(1));
+            handle.serve_registration(
+                parent,
+                spawn.clone(),
+                1,
+                Instant::now() + Duration::from_secs(1),
+            );
             use tokio::io::AsyncReadExt;
             assert_eq!(child.read(&mut [0]).await.unwrap(), 0);
             assert_eq!(spawn.check(), Err("registration_channel_closed"));
@@ -903,7 +928,12 @@ mod tests {
             let (parent, peer) = std::os::unix::net::UnixStream::pair().unwrap();
             peer.set_nonblocking(true).unwrap();
             let mut peer = tokio::net::UnixStream::from_std(peer).unwrap();
-            handle.serve_registration(parent, spawn, child.pid, Duration::from_secs(2));
+            handle.serve_registration(
+                parent,
+                spawn,
+                child.pid,
+                Instant::now() + Duration::from_secs(2),
+            );
             subc_transport::authenticate_client(&mut peer, &info, Duration::from_secs(2))
                 .await
                 .unwrap();

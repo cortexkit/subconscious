@@ -2170,7 +2170,9 @@ fn setup_rerun_applies_the_missing_core_gateway_entry() {
     assert_eq!(
         written["modules"]["subc-mcp"],
         json!({
-            "program": fixture.data_home.join("cortexkit/bin").join(platform_binary("ck-subc-mcp")),
+            // Join each component separately: setup writes native separators,
+            // and a "cortexkit/bin" literal would keep a forward slash on Windows.
+            "program": fixture.data_home.join("cortexkit").join("bin").join(platform_binary("ck-subc-mcp")),
             "args": ["module"],
             "reserved": true,
         })

@@ -221,6 +221,12 @@ impl RegistrationSpawn {
     }
 
     pub(crate) async fn wait_registration_failure(&self) {
+        // A launch without a required program binding can still register by
+        // nonce through an older SDK. Closing its unused channel is not a
+        // registration failure.
+        if !self.requires_binding {
+            std::future::pending::<()>().await;
+        }
         self.wait_closed().await;
         if self.registered() || self.nonce_registered.load(Ordering::Acquire) {
             std::future::pending::<()>().await;

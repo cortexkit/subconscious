@@ -460,3 +460,49 @@ async fn registration_nonce_policy_empty_promotion_clears_incumbent_authority() 
         "gated promotion must not retain an incumbent nonce"
     );
 }
+
+#[tokio::test]
+async fn registration_channel_failed_ungated_service_keeps_nonce_launch_alive() {
+    let handle = SupervisorHandle::new();
+    let registry = Arc::new(Registry::default());
+    let supervisor = Supervisor::new_for_test(registry, RestartPolicy::new(0, Duration::ZERO))
+        .with_handle(handle.clone());
+    let module = supervisor
+        .spawn(ModuleSpec {
+            module_id: "legacy-channel-failure".into(),
+            program: "/bin/sleep".into(),
+            args: vec!["600".into()],
+            env: vec![],
+            reserved: true,
+            reserved_prefixes: vec![],
+            protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
+            carry_containment: false,
+        })
+        .unwrap();
+    let nonce = handle.spawn_launch_nonce_for(module.module_id()).unwrap();
+    let spawn = handle
+        .registration_launches
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .upgrade()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), spawn.wait_closed())
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let alive = module.status().unwrap().process_alive;
+    let reply = nonce_hello_over_tcp(handle, module.module_id(), &nonce).await;
+    module.stop().await.unwrap();
+    assert!(
+        alive,
+        "an ungated child must survive failure of its unused channel service"
+    );
+    assert_eq!(
+        reply.header.ty,
+        FrameType::HelloAck,
+        "the older SDK still registers over its nonce"
+    );
+}

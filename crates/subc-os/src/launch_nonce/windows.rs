@@ -291,7 +291,9 @@ impl LaunchNoncePipeHandoff {
             {
                 return Err(timeout());
             }
-            let mut operation = Operation::new(handle)?;
+            // Explicit retry cleanup must not move a pending OVERLAPPED: the
+            // kernel and CancelIoEx identify it by its original address.
+            let mut operation = Box::new(Operation::new(handle)?);
             // SAFETY: the OVERLAPPED and event stay live until cancellation or completion.
             if unsafe { ConnectNamedPipe(handle, &mut operation.overlapped) } == 0 {
                 let error = io::Error::last_os_error();

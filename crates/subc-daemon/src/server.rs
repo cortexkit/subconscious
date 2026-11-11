@@ -1093,6 +1093,7 @@ where
             }
         };
 
+        let first = ctx.egress.first_ingress_frame();
         if let LocalOrigin::RegistrationChannel(spawn) = &origin {
             let hello = frame.header.ty == subc_protocol::FrameType::Hello;
             if (!spawn.registered() && !hello) || (spawn.registered() && hello) {
@@ -1162,7 +1163,7 @@ where
                 let task_router = Arc::clone(&router);
                 let task_ctx = ctx.clone();
                 activity_tasks.spawn(async move {
-                    route_open_tail(task_router, task_ctx, frame, Instant::now()).await
+                    route_open_tail(task_router, task_ctx, frame, Instant::now(), first).await
                 });
             }
             continue;
@@ -1204,7 +1205,7 @@ where
             // full scheduler and handler lifetime, as inline timing did.
             let dispatch_started_at = Instant::now();
             route_open_tasks.spawn(async move {
-                route_open_tail(task_router, task_ctx, frame, dispatch_started_at).await
+                route_open_tail(task_router, task_ctx, frame, dispatch_started_at, first).await
             });
             continue;
         }
@@ -1239,7 +1240,7 @@ where
                 // The future owns cleanup even if it is dropped before its
                 // first poll or authorization refuses before approval begins.
                 let _reservation = reservation;
-                route_open_tail(task_router, task_ctx, frame, started).await
+                route_open_tail(task_router, task_ctx, frame, started, first).await
             });
             continue;
         }
@@ -1250,7 +1251,7 @@ where
             close = &mut close_receiver => {
                 return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
             }
-            result = router.route_for_connection(&ctx, frame) => result,
+            result = router.route_for_connection_ingress(&ctx, frame, None, first) => result,
         };
 
         if let Err(err) = route_result {
@@ -1297,9 +1298,10 @@ async fn route_open_tail(
     ctx: RouteCtx,
     frame: crate::Frame,
     dispatch_started_at: Instant,
+    first: bool,
 ) -> Result<(), RouterError> {
     match router
-        .route_for_connection_started(&ctx, frame, Some(dispatch_started_at))
+        .route_for_connection_ingress(&ctx, frame, Some(dispatch_started_at), first)
         .await
     {
         Ok(()) => Ok(()),

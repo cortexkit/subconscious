@@ -81,6 +81,9 @@ pub(crate) struct EgressBacklog {
 /// to a client, so it takes no lock per frame.
 #[derive(Debug)]
 struct EgressAccounting {
+    // Shared by the connection's sink clones so even an invalid data frame
+    // spends the one opportunity to present a claim after authentication.
+    ingress_seen: AtomicBool,
     byte_budget: usize,
     queued_bytes: AtomicUsize,
     queued_frames: AtomicUsize,
@@ -102,6 +105,7 @@ struct EgressAccounting {
 impl EgressAccounting {
     fn new(byte_budget: usize) -> Self {
         Self {
+            ingress_seen: AtomicBool::new(false),
             byte_budget,
             queued_bytes: AtomicUsize::new(0),
             queued_frames: AtomicUsize::new(0),
@@ -361,6 +365,9 @@ pub struct FrameSink {
 }
 
 impl FrameSink {
+    pub(crate) fn first_ingress_frame(&self) -> bool {
+        !self.accounting.ingress_seen.swap(true, Ordering::Relaxed)
+    }
     /// A sink with the standard per-connection byte budget
     /// ([`crate::server::CONNECTION_EGRESS_BYTE_BUDGET`]); the frame-count bound
     /// is whatever capacity `tx`'s channel was created with.
@@ -1009,6 +1016,19 @@ impl Router {
         frame: Frame,
         dispatch_started_at: Option<Instant>,
     ) -> Result<(), RouterError> {
+        // Embedded callers have no socket reader; mark at their ingress instead.
+        let first = ctx.egress.first_ingress_frame();
+        self.route_for_connection_ingress(ctx, frame, dispatch_started_at, first)
+            .await
+    }
+
+    pub(crate) async fn route_for_connection_ingress(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+        dispatch_started_at: Option<Instant>,
+        first: bool,
+    ) -> Result<(), RouterError> {
         let channel = frame.header.channel;
         let epoch = frame.header.epoch;
         let corr = frame.header.corr;
@@ -1029,7 +1049,7 @@ impl Router {
                 .then(|| dispatch_started_at.unwrap_or_else(Instant::now));
             let responses = self
                 .control
-                .handle_control_frame_timed(ctx, frame, dispatch_started_at)
+                .handle_control_frame_ingress(ctx, frame, dispatch_started_at, first)
                 .await?;
             for response in responses {
                 if let Some(view) = self

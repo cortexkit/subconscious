@@ -97,6 +97,8 @@ const CAP_SESSION_ATTACH: &str = "session_attach_v1";
 const CAP_ADMISSION_FACTS_RELAY: &str = "admission_facts_relay_v1";
 
 const SUBC_CONTROL_OPS: &[&str] = &[
+    "claim.mint",
+    "claim.present",
     ops::DAEMON_SHUTDOWN_INTENT,
     ops::ACTIVITY_RECORD,
     ops::ACTIVITY_QUERY,
@@ -141,6 +143,7 @@ const SUBC_UNADVERTISED_CONTROL_OPS: &[&str] = &[
     "config.rollback",
 ];
 
+mod claims;
 #[cfg(test)]
 #[path = "control/config_advertisement_tests.rs"]
 mod config_advertisement_tests;
@@ -152,6 +155,8 @@ mod rescan_checked;
 use rescan_checked::{RescanMode, RescanPlan};
 
 const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
+    "claim.mint",
+    "claim.present",
     MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     "supervisor.live_roots",
     "supervisor.agent_commands",
@@ -372,6 +377,7 @@ const ROUTE_OPEN_NOT_SERVING_REASONS: &[&str] = &[
 /// Real channel-0 control handler for subc itself.
 #[derive(Clone)]
 pub struct ControlHandler {
+    claims: Arc<claims::Claims>,
     registry: Arc<Registry>,
     config_runtime: Option<Arc<crate::config_gate::runtime::RuntimeOwner>>,
     config_review_admission: Arc<dyn crate::config_gate::ReviewAdmission>,
@@ -1042,6 +1048,7 @@ impl ControlHandler {
         let route_outages = forwarding.route_outages();
         Self {
             registry,
+            claims: Arc::new(claims::Claims::default()),
             config_runtime: None,
             config_review_admission: Arc::new(crate::config_gate::MissingReviewAdmission),
             config_review_admission_is_default: true,
@@ -2113,6 +2120,18 @@ impl ControlHandler {
         frame: Frame,
         dispatch_started_at: Option<StdInstant>,
     ) -> Result<Vec<Frame>, RouterError> {
+        let first = ctx.egress.first_ingress_frame();
+        self.handle_control_frame_ingress(ctx, frame, dispatch_started_at, first)
+            .await
+    }
+
+    pub(crate) async fn handle_control_frame_ingress(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+        dispatch_started_at: Option<StdInstant>,
+        first: bool,
+    ) -> Result<Vec<Frame>, RouterError> {
         match frame.header.ty {
             FrameType::Ping => Ok(vec![pong(&frame)?]),
             FrameType::Hello => {
@@ -2209,6 +2228,12 @@ impl ControlHandler {
                 // This additive operation is not part of the existing exhaustive
                 // module-control enum. Probe the op before decoding that enum.
                 let op = serde_json::from_slice::<ControlOpProbe>(&frame.body).ok();
+                if op.as_ref().is_some_and(|probe| probe.op == "claim.present") {
+                    return self.handle_claim_present(ctx, &frame, first).await;
+                }
+                if op.as_ref().is_some_and(|probe| probe.op == "claim.mint") {
+                    return self.handle_claim_mint(ctx.connection_id, &frame);
+                }
                 if let Some(refusal) = self
                     .recovery_request_refusal(
                         ctx,
@@ -2432,6 +2457,7 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        self.claims.connection_closed(connection_id);
         if let Some(spawn) = self.supervisor.registration_spawn(connection_id) {
             spawn.retire();
         }

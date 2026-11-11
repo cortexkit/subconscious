@@ -415,22 +415,25 @@ impl ControlHandler {
             .begin_publication()
             .map_err(|_| error_codes::CLAIM_INVALID)?;
         let mut state = launch.state.lock().unwrap_or_else(|p| p.into_inner());
-        let mut index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
         let pending = state
             .pending
-            .remove(&token)
+            .get(&token)
             .ok_or(error_codes::CLAIM_INVALID)?;
-        index.pending.remove(&token);
-        if pending.expires <= tokio::time::Instant::now()
-            || !state.active
-            || !state.primary_live
-            || index.bindings.contains_key(&connection)
-        {
+        if pending.expires <= tokio::time::Instant::now() || !state.active || !state.primary_live {
             return Err(error_codes::CLAIM_INVALID);
         }
         if state.connections.len() >= MAX_LIVE_CLAIM_CONNECTIONS_PER_SPAWN {
             return Err(error_codes::CLAIM_CONNECTION_LIMIT);
         }
+        let mut index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
+        if index.bindings.contains_key(&connection) {
+            return Err(error_codes::CLAIM_INVALID);
+        }
+        let pending = state
+            .pending
+            .remove(&token)
+            .expect("pending claim checked under the launch lock");
+        index.pending.remove(&token);
         state.connections.insert(connection, ctx.egress.clone());
         index.bindings.insert(
             connection,
@@ -838,6 +841,83 @@ mod tests {
             String::from_utf8_lossy(&reply.body)
         );
         serde_json::from_slice(&reply.body).unwrap()
+    }
+
+    async fn fill_live_connections(
+        rig: &Rig,
+        primary: &mut Net,
+        spawn: &RegistrationSpawn,
+    ) -> Vec<Net> {
+        let mut consumers = Vec::new();
+        for index in 0..256 {
+            if index % 32 == 0 && spawn.claims.get().is_some() {
+                spawn
+                    .claims
+                    .get()
+                    .unwrap()
+                    .state
+                    .lock()
+                    .unwrap()
+                    .bucket
+                    .tokens = CLAIM_MINT_BURST * TOKEN;
+            }
+            let token = net_mint(primary, ClaimPurpose::SelfConnection).await.claim;
+            let mut net = Net::new(rig.router.clone()).await;
+            assert_eq!(
+                net.call(request(ClaimPresentRequest::new(token)))
+                    .await
+                    .header
+                    .ty,
+                FrameType::Response
+            );
+            consumers.push(net);
+        }
+        consumers
+    }
+
+    #[tokio::test]
+    async fn claims_connection_limit_preserves_bearer_for_retry_on_a_new_connection() {
+        let rig = rig().await;
+        let (mut primary, spawn, _module, _) = network_primary(&rig, "claims-retry").await;
+        let mut consumers = fill_live_connections(&rig, &mut primary, &spawn).await;
+        let token = net_mint(&mut primary, ClaimPurpose::Helper).await.claim;
+        let mut refused = Net::new(rig.router.clone()).await;
+        let body = error(
+            &refused
+                .call(request(ClaimPresentRequest::new(token.clone())))
+                .await,
+            error_codes::CLAIM_CONNECTION_LIMIT,
+        );
+        assert!(error_codes::is_retryable_claim(&body.code));
+        assert!(refused.recv().await.is_none());
+        drop(consumers.pop());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while spawn
+                .claims
+                .get()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .connections
+                .len()
+                != 255
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("closed consumer must release its live-connection slot");
+        let mut retry = Net::new(rig.router.clone()).await;
+        assert_eq!(
+            retry
+                .call(request(ClaimPresentRequest::new(token)))
+                .await
+                .header
+                .ty,
+            FrameType::Response,
+            "retryable connection-cap refusal must not consume the bearer"
+        );
     }
 
     #[tokio::test]

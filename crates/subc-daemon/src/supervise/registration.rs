@@ -20,6 +20,7 @@ enum LaunchState {
 
 #[derive(Debug)]
 pub(crate) struct RegistrationSpawn {
+    pub(crate) claims: std::sync::OnceLock<Arc<crate::control::claims::LaunchClaims>>,
     pub(crate) module_id: String,
     pub(super) role: SpawnRole,
     hello_seen: AtomicBool,
@@ -68,6 +69,7 @@ impl RegistrationSpawn {
     ) -> Arc<Self> {
         let (launch, _) = tokio::sync::watch::channel(LaunchState::Pending);
         let spawn = Arc::new(Self {
+            claims: std::sync::OnceLock::new(),
             module_id: module.into(),
             role,
             hello_seen: AtomicBool::new(false),
@@ -148,7 +150,11 @@ impl RegistrationSpawn {
                 endpoint.shutdown();
             }
         }
+        let revoked = self.claims.get().map(|claims| claims.revoke());
         drop(transition);
+        if let (Some(claims), Some(revoked)) = (self.claims.get(), revoked) {
+            claims.close_revoked(revoked);
+        }
         if let Some(binding) = &self.binding {
             binding.retire();
         }

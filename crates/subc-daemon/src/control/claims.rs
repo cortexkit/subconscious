@@ -1,6 +1,7 @@
 //! Single-use connection claims. Lock order is the spawn's publication/retirement
-//! lock, then the claims table. Table lookups release their lock before acquiring
-//! a spawn lock; neither lock is held across an await or forwarding operation.
+//! lock, then launch-local claims, then the token/connection index. Index lookups
+//! release their lock before acquiring a spawn lock. No lock crosses an await;
+//! forwarding closes run after retirement releases the transition lock.
 
 use super::*;
 use crate::supervise::RegistrationSpawn;
@@ -25,6 +26,7 @@ const TOKEN: u128 = 1_000_000_000;
 
 #[derive(Clone)]
 pub(crate) struct ClaimBinding {
+    launch: Arc<LaunchClaims>,
     pub(crate) incarnation: String,
     // The primary channel's connection id is unique within this incarnation and
     // remains the spawn key even when a candidate is promoted or begins draining.
@@ -45,7 +47,7 @@ impl fmt::Debug for ClaimBinding {
 }
 
 struct Pending {
-    binding: ClaimBinding,
+    purpose: ClaimPurpose,
     expires: tokio::time::Instant,
 }
 
@@ -70,9 +72,63 @@ impl Bucket {
 
 #[derive(Default)]
 struct State {
-    pending: HashMap<[u8; 16], Pending>,
-    buckets: HashMap<ConnectionId, Bucket>,
+    pending: HashMap<[u8; 16], std::sync::Weak<LaunchClaims>>,
     bindings: HashMap<ConnectionId, ClaimBinding>,
+}
+
+struct LaunchState {
+    active: bool,
+    pending: HashMap<[u8; 16], Pending>,
+    connections: HashMap<ConnectionId, crate::FrameSink>,
+    bucket: Bucket,
+}
+
+pub(crate) struct LaunchClaims {
+    primary: ConnectionId,
+    incarnation: String,
+    registration: std::sync::Weak<RegistrationSpawn>,
+    table: std::sync::Weak<Claims>,
+    forwarding: Arc<ForwardingTable>,
+    state: Mutex<LaunchState>,
+}
+
+impl fmt::Debug for LaunchClaims {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LaunchClaims")
+            .field("primary", &self.primary)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LaunchClaims {
+    // Called under the spawn transition lock. Fence ingress before releasing the
+    // lock, then deliver close notifications after releasing the transition,
+    // launch-local claims, and token/connection index locks.
+    pub(crate) fn revoke(&self) -> Vec<ConnectionId> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.active = false;
+        if let Some(table) = self.table.upgrade() {
+            let mut index = table.0.lock().unwrap_or_else(|p| p.into_inner());
+            for token in state.pending.keys() {
+                index.pending.remove(token);
+            }
+        }
+        state.pending.clear();
+        let connections = std::mem::take(&mut state.connections);
+        for sink in connections.values() {
+            sink.terminate_ingress();
+        }
+        connections.into_keys().collect()
+    }
+
+    pub(crate) fn close_revoked(&self, connections: Vec<ConnectionId>) {
+        for connection in connections {
+            self.forwarding.request_connection_close(
+                connection,
+                CloseReason::new("claim_revoked", "the supervised launch ended"),
+            );
+        }
+    }
 }
 
 #[derive(Default)]
@@ -80,7 +136,14 @@ pub(super) struct Claims(
     Mutex<State>,
     #[cfg(test)] std::sync::atomic::AtomicBool,
     #[cfg(test)] Mutex<Vec<u64>>,
+    #[cfg(test)] Mutex<Option<Arc<AttachHold>>>,
 );
+
+#[cfg(test)]
+struct AttachHold {
+    reached: tokio::sync::Notify,
+    release: std::sync::Barrier,
+}
 
 impl Claims {
     #[cfg(test)]
@@ -97,12 +160,21 @@ impl Claims {
     }
 
     pub(super) fn connection_closed(&self, connection: ConnectionId) {
-        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        state.bindings.remove(&connection);
-        state
-            .pending
-            .retain(|_, claim| claim.binding.spawn != connection);
-        state.buckets.remove(&connection);
+        let binding = self
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .bindings
+            .remove(&connection);
+        if let Some(binding) = binding {
+            binding
+                .launch
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .connections
+                .remove(&connection);
+        }
     }
 }
 
@@ -154,22 +226,45 @@ impl ControlHandler {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
         };
         let now = tokio::time::Instant::now();
-        let mut state = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
-        state.pending.retain(|_, pending| pending.expires > now);
-        if state
+        let launch = spawn
+            .claims
+            .get_or_init(|| {
+                Arc::new(LaunchClaims {
+                    primary: connection,
+                    incarnation,
+                    registration: Arc::downgrade(&spawn),
+                    table: Arc::downgrade(&self.claims),
+                    forwarding: self.forwarding.clone(),
+                    state: Mutex::new(LaunchState {
+                        active: true,
+                        pending: HashMap::new(),
+                        connections: HashMap::new(),
+                        bucket: Bucket {
+                            tokens: CLAIM_MINT_BURST * TOKEN,
+                            updated: now,
+                        },
+                    }),
+                })
+            })
+            .clone();
+        let mut state = launch.state.lock().unwrap_or_else(|p| p.into_inner());
+        let expired = state
             .pending
-            .values()
-            .filter(|p| p.binding.spawn == connection)
-            .count()
-            >= MAX_UNREDEEMED_CLAIMS_PER_SPAWN
-        {
+            .iter()
+            .filter(|(_, pending)| pending.expires <= now)
+            .map(|(token, _)| *token)
+            .collect::<Vec<_>>();
+        if !expired.is_empty() {
+            let mut index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
+            for token in expired {
+                state.pending.remove(&token);
+                index.pending.remove(&token);
+            }
+        }
+        if state.pending.len() >= MAX_UNREDEEMED_CLAIMS_PER_SPAWN {
             return self.claim_refusal(frame, error_codes::CLAIM_UNREDEEMED_LIMIT);
         }
-        let bucket = state.buckets.entry(connection).or_insert(Bucket {
-            tokens: CLAIM_MINT_BURST * TOKEN,
-            updated: now,
-        });
-        if let Err(retry_after_ms) = bucket.take(now) {
+        if let Err(retry_after_ms) = state.bucket.take(now) {
             let error = subc_protocol::ErrorBody {
                 code: error_codes::CLAIM_RATE_LIMITED.into(),
                 message: "claim mint rate exceeded".into(),
@@ -180,27 +275,24 @@ impl ControlHandler {
             };
             return Ok(vec![control_error_body_frame(frame, error)?]);
         }
+        let mut index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
         let mut token = [0; 16];
         loop {
             getrandom::getrandom(&mut token).map_err(|_| {
                 RouterError::backend(0, frame.header.corr, "claim entropy unavailable")
             })?;
-            if !state.pending.contains_key(&token) {
+            if !index.pending.contains_key(&token) {
                 break;
             }
         }
         state.pending.insert(
             token,
             Pending {
-                binding: ClaimBinding {
-                    incarnation,
-                    spawn: connection,
-                    purpose: request.purpose,
-                    registration: spawn.clone(),
-                },
+                purpose: request.purpose,
                 expires: now + CLAIM_LIFETIME,
             },
         );
+        index.pending.insert(token, Arc::downgrade(&launch));
         let expires_at_ms =
             crate::clock::wall_now_ms().saturating_add(CLAIM_LIFETIME.as_millis() as u64);
         Ok(vec![control_response_body_frame(
@@ -220,7 +312,7 @@ impl ControlHandler {
         let refusal = if !first {
             Some(error_codes::CLAIM_PRESENT_NOT_FIRST)
         } else {
-            self.consume_claim(connection, frame).err()
+            self.consume_claim(ctx, frame).err()
         };
         if let Some(code) = refusal {
             // Close even on retryable refusal: no failed bearer presentation may
@@ -248,7 +340,8 @@ impl ControlHandler {
         )?])
     }
 
-    fn consume_claim(&self, connection: ConnectionId, frame: &Frame) -> Result<(), &'static str> {
+    fn consume_claim(&self, ctx: &RouteCtx, frame: &Frame) -> Result<(), &'static str> {
+        let connection = ctx.connection_id;
         let request = serde_json::from_slice::<ClaimPresentRequest>(&frame.body)
             .map_err(|_| error_codes::CLAIM_INVALID)?;
         let secret = request.claim.expose_secret();
@@ -256,39 +349,54 @@ impl ControlHandler {
         if secret.len() != 22 || URL_SAFE_NO_PAD.decode_slice(secret, &mut token) != Ok(16) {
             return Err(error_codes::CLAIM_INVALID);
         }
-        let registration = {
+        let launch = {
             let state = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
             state
                 .pending
                 .get(&token)
                 .ok_or(error_codes::CLAIM_INVALID)?
-                .binding
-                .registration
-                .clone()
+                .upgrade()
+                .ok_or(error_codes::CLAIM_INVALID)?
         };
+        let registration = launch
+            .registration
+            .upgrade()
+            .ok_or(error_codes::CLAIM_INVALID)?;
         let _alive = registration
             .begin_publication()
             .map_err(|_| error_codes::CLAIM_INVALID)?;
-        let mut state = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = launch.state.lock().unwrap_or_else(|p| p.into_inner());
+        let mut index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
         let pending = state
             .pending
             .remove(&token)
             .ok_or(error_codes::CLAIM_INVALID)?;
+        index.pending.remove(&token);
         if pending.expires <= tokio::time::Instant::now()
-            || state.bindings.contains_key(&connection)
+            || !state.active
+            || index.bindings.contains_key(&connection)
         {
             return Err(error_codes::CLAIM_INVALID);
         }
-        if state
-            .bindings
-            .values()
-            .filter(|b| b.spawn == pending.binding.spawn)
-            .count()
-            >= MAX_LIVE_CLAIM_CONNECTIONS_PER_SPAWN
-        {
+        if state.connections.len() >= MAX_LIVE_CLAIM_CONNECTIONS_PER_SPAWN {
             return Err(error_codes::CLAIM_CONNECTION_LIMIT);
         }
-        state.bindings.insert(connection, pending.binding);
+        state.connections.insert(connection, ctx.egress.clone());
+        index.bindings.insert(
+            connection,
+            ClaimBinding {
+                launch: launch.clone(),
+                incarnation: launch.incarnation.clone(),
+                spawn: launch.primary,
+                purpose: pending.purpose,
+                registration: registration.clone(),
+            },
+        );
+        #[cfg(test)]
+        if let Some(hold) = self.claims.3.lock().unwrap().take() {
+            hold.reached.notify_one();
+            hold.release.wait();
+        }
         Ok(())
     }
 
@@ -422,6 +530,70 @@ mod tests {
                 "pipelined request reached control dispatch"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn claims_bound_connections_close_and_pending_claims_void_on_retirement() {
+        let mut rig = rig().await;
+        let token = mint(&mut rig, ClaimPurpose::SelfConnection).await.claim;
+        let pending = mint(&mut rig, ClaimPurpose::Helper).await.claim;
+        let mut net = Net::new(rig.router.clone()).await;
+        assert_eq!(
+            net.call(request(ClaimPresentRequest::new(token)))
+                .await
+                .header
+                .ty,
+            FrameType::Response
+        );
+        rig.spawn.retire();
+        assert!(
+            net.recv().await.is_none(),
+            "retirement must close the bound server connection"
+        );
+        assert!(
+            rig.handler.claims.0.lock().unwrap().pending.is_empty(),
+            "retirement must void pending claims immediately"
+        );
+        let mut refused = Net::new(rig.router.clone()).await;
+        error(
+            &refused
+                .call(request(ClaimPresentRequest::new(pending)))
+                .await,
+            error_codes::CLAIM_INVALID,
+        );
+        assert!(refused.recv().await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn claims_redemption_racing_retirement_is_never_bound_and_alive() {
+        let mut rig = rig().await;
+        let token = mint(&mut rig, ClaimPurpose::SelfConnection).await.claim;
+        let hold = Arc::new(AttachHold {
+            reached: tokio::sync::Notify::new(),
+            release: std::sync::Barrier::new(2),
+        });
+        *rig.handler.claims.3.lock().unwrap() = Some(hold.clone());
+        let mut net = Net::new(rig.router.clone()).await;
+        subc_transport::write_frame(&mut net.client, &request(ClaimPresentRequest::new(token)))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), hold.reached.notified())
+            .await
+            .expect("redemption attached while holding the transition lock");
+        let spawn = rig.spawn.clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = started.clone();
+        let retire = tokio::task::spawn_blocking(move || {
+            notify.notify_one();
+            spawn.retire();
+        });
+        started.notified().await;
+        hold.release.wait();
+        retire.await.unwrap();
+        while let Some(reply) = net.recv().await {
+            assert_eq!(reply.header.ty, FrameType::Response);
+        }
+        assert!(!rig.spawn.launch_ready());
     }
 
     struct Wire {

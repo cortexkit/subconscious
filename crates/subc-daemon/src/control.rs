@@ -143,7 +143,7 @@ const SUBC_UNADVERTISED_CONTROL_OPS: &[&str] = &[
     "config.rollback",
 ];
 
-mod claims;
+pub(crate) mod claims;
 #[cfg(test)]
 #[path = "control/config_advertisement_tests.rs"]
 mod config_advertisement_tests;

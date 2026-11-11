@@ -2244,9 +2244,6 @@ impl ControlHandler {
                 if op.as_ref().is_some_and(|probe| probe.op == "claim.present") {
                     return self.handle_claim_present(ctx, &frame, first).await;
                 }
-                if op.as_ref().is_some_and(|probe| probe.op == "claim.mint") {
-                    return self.handle_claim_mint(ctx.connection_id, &frame);
-                }
                 if let Some(refusal) = self
                     .recovery_request_refusal(
                         ctx,
@@ -2256,6 +2253,9 @@ impl ControlHandler {
                     .await?
                 {
                     return Ok(vec![refusal]);
+                }
+                if op.as_ref().is_some_and(|probe| probe.op == "claim.mint") {
+                    return self.handle_claim_mint(ctx.connection_id, &frame);
                 }
                 if let Some(probe) = op
                     .as_ref()

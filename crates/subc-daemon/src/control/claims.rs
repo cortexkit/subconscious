@@ -480,7 +480,7 @@ impl ControlHandler {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::supervise::{
         ModuleOverlap, ModuleSpec, RestartPolicy, SupervisedModule, Supervisor,
@@ -490,7 +490,7 @@ mod tests {
     use subc_protocol::manifest::ModuleManifest;
     use tokio::sync::mpsc;
 
-    struct Net {
+    pub(crate) struct Net {
         client: tokio::net::TcpStream,
         server: tokio::task::JoinHandle<()>,
     }
@@ -502,7 +502,7 @@ mod tests {
     }
 
     impl Net {
-        async fn new(router: Arc<Router>) -> Self {
+        pub(crate) async fn new(router: Arc<Router>) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let info = subc_transport::ConnectionInfo {
@@ -527,7 +527,7 @@ mod tests {
             Self { client, server }
         }
 
-        async fn recv(&mut self) -> Option<Frame> {
+        pub(crate) async fn recv(&mut self) -> Option<Frame> {
             tokio::time::timeout(
                 Duration::from_secs(2),
                 subc_transport::read_frame(&mut self.client),
@@ -537,7 +537,7 @@ mod tests {
             .unwrap()
         }
 
-        async fn call(&mut self, frame: Frame) -> Frame {
+        pub(crate) async fn call(&mut self, frame: Frame) -> Frame {
             subc_transport::write_frame(&mut self.client, &frame)
                 .await
                 .unwrap();
@@ -1153,7 +1153,7 @@ mod tests {
         assert!(consumer.recv().await.is_none());
     }
 
-    fn request(body: impl Serialize) -> Frame {
+    pub(crate) fn request(body: impl Serialize) -> Frame {
         Frame::build(
             FrameType::Request,
             control_flags(),
@@ -1184,7 +1184,7 @@ mod tests {
             .await
     }
 
-    fn error(reply: &Frame, code: &str) -> ErrorBody {
+    pub(crate) fn error(reply: &Frame, code: &str) -> ErrorBody {
         assert_eq!(reply.header.ty, FrameType::Error);
         let body: ErrorBody = serde_json::from_slice(&reply.body).unwrap();
         assert_eq!(body.code, code);

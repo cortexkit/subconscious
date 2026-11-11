@@ -8,6 +8,130 @@ fn channel_handle() -> SupervisorHandle {
     handle
 }
 
+struct GatedClaimFixture {
+    rig: Rig,
+    owner: Arc<RuntimeOwner>,
+    supervisor: Supervisor,
+    handle: SupervisorHandle,
+    module: crate::supervise::SupervisedModule,
+    spawn: Arc<crate::supervise::RegistrationSpawn>,
+    router: Arc<crate::Router>,
+    primary: crate::control::claims::tests::Net,
+}
+
+async fn gated_claim_fixture() -> GatedClaimFixture {
+    use crate::control::claims::tests::Net;
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = Arc::new(rig.owner("claims-recovery"));
+    rig.stamp(&owner);
+    let handle = channel_handle();
+    let registry = Arc::new(crate::Registry::default());
+    let forwarding = Arc::new(crate::ForwardingTable::default());
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_forwarding(forwarding.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    let proof = handle.registration_proof_for_test("a").unwrap();
+    assert!(handle.wait_program_binding("a", &proof).await);
+    let spawn = handle.registration_for_test("a").unwrap();
+    spawn.wait_launch().await;
+    let control = crate::ControlHandler::with_forwarding(registry, forwarding)
+        .with_supervisor(handle.clone())
+        .with_config_runtime(owner.clone());
+    let router = Arc::new(crate::Router::with_control_handler(Arc::new(control)));
+    let mut primary = Net::new(router.clone()).await;
+    let ack = primary
+        .call(module_hello(Some(proof), ConnectionId::new(1)))
+        .await;
+    assert_eq!(
+        ack.header.ty,
+        subc_protocol::FrameType::HelloAck,
+        "{}",
+        String::from_utf8_lossy(&ack.body)
+    );
+    GatedClaimFixture {
+        rig,
+        owner,
+        supervisor,
+        handle,
+        module,
+        spawn,
+        router,
+        primary,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claims_mint_obeys_recovery_and_resumes_after_approved_exit() {
+    use crate::control::claims::tests::{error, request, Net};
+    use subc_control::{ClaimMintRequest, ClaimPurpose};
+    let mut fixture = gated_claim_fixture().await;
+    assert_eq!(
+        fixture
+            .primary
+            .call(request(ClaimMintRequest::new(ClaimPurpose::SelfConnection)))
+            .await
+            .header
+            .ty,
+        subc_protocol::FrameType::Response
+    );
+    std::fs::write(
+        fixture
+            .rig
+            .path
+            .join("store")
+            .join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(fixture.owner.check_recovery().unwrap());
+    error(
+        &fixture
+            .primary
+            .call(request(ClaimMintRequest::new(ClaimPurpose::SelfConnection)))
+            .await,
+        "config_gated",
+    );
+    let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Unstamp);
+    fixture.owner.complete_authority_exit(generation).unwrap();
+    assert!(!fixture.owner.check_recovery().unwrap());
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+    let replacement = fixture
+        .supervisor
+        .spawn_async(spec(&fixture.rig))
+        .await
+        .unwrap();
+    let proof = fixture.handle.registration_proof_for_test("a").unwrap();
+    fixture
+        .handle
+        .registration_for_test("a")
+        .unwrap()
+        .wait_launch()
+        .await;
+    let mut primary = Net::new(fixture.router.clone()).await;
+    assert_eq!(
+        primary
+            .call(module_hello(Some(proof), ConnectionId::new(2)))
+            .await
+            .header
+            .ty,
+        subc_protocol::FrameType::HelloAck
+    );
+    assert_eq!(
+        primary
+            .call(request(ClaimMintRequest::new(ClaimPurpose::Relay)))
+            .await
+            .header
+            .ty,
+        subc_protocol::FrameType::Response
+    );
+    drop(primary);
+    replacement.stop().await.unwrap();
+}
+
 fn rig() -> Rig {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

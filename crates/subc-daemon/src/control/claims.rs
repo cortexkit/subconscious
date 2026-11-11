@@ -43,6 +43,24 @@ pub(crate) struct ClaimBinding {
     pub(crate) spawn: ConnectionId,
     pub(crate) purpose: ClaimPurpose,
     pub(crate) registration: Arc<RegistrationSpawn>,
+    hello_attempted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ClaimBinding {
+    pub(super) fn prefix_module_id(&self) -> Option<&str> {
+        match &self.purpose {
+            ClaimPurpose::Prefix { module_id } => Some(module_id),
+            _ => None,
+        }
+    }
+
+    pub(super) fn admit_prefix_hello(&self, module_id: Option<&str>) -> bool {
+        self.prefix_module_id()
+            .is_some_and(|expected| Some(expected) == module_id)
+            && !self
+                .hello_attempted
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+    }
 }
 
 impl fmt::Debug for ClaimBinding {
@@ -433,12 +451,13 @@ impl ControlHandler {
         if !self.claim_primary_registered(connection, &spawn) {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
         }
-        // Prefix claims register a child module, rather than opening a consumer.
-        if !matches!(
-            request.purpose,
-            ClaimPurpose::SelfConnection | ClaimPurpose::Helper | ClaimPurpose::Relay
-        ) {
-            return self.claim_refusal(frame, error_codes::CLAIM_PREFIX_REFUSED);
+        if let ClaimPurpose::Prefix { module_id } = &request.purpose {
+            if !self
+                .supervisor
+                .prefix_claim_authorized(&spawn.module_id, module_id)
+            {
+                return self.claim_refusal(frame, error_codes::CLAIM_PREFIX_REFUSED);
+            }
         }
         let permit = {
             let Ok(_alive) = spawn.begin_publication() else {
@@ -528,6 +547,15 @@ impl ControlHandler {
         };
         if !verified || !self.claim_primary_registered(connection, &spawn) {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
+        }
+        // Ownership may have changed while executable verification was unlocked.
+        if let ClaimPurpose::Prefix { module_id } = &request.purpose {
+            if !self
+                .supervisor
+                .prefix_claim_authorized(&spawn.module_id, module_id)
+            {
+                return self.claim_refusal(frame, error_codes::CLAIM_PREFIX_REFUSED);
+            }
         }
         if self
             .recovery_request_refusal(ctx, frame, Some("claim.mint"))
@@ -801,6 +829,7 @@ impl ControlHandler {
                 spawn: launch.primary,
                 purpose: pending.purpose,
                 registration: permit.registration.clone(),
+                hello_attempted: Arc::default(),
             },
         );
         permit.finish(&mut state);
@@ -1151,6 +1180,10 @@ pub(crate) mod tests {
     }
 
     async fn rig() -> Rig {
+        rig_with_activity(None).await
+    }
+
+    async fn rig_with_activity(activity_root: Option<&std::path::Path>) -> Rig {
         let registry = Arc::new(Registry::default());
         let forwarding = Arc::new(ForwardingTable::default());
         let handle = SupervisorHandle::new();
@@ -1180,8 +1213,12 @@ pub(crate) mod tests {
             "claim fixture launch failed: {:?}",
             module.status()
         );
-        let handler =
-            Arc::new(ControlHandler::with_forwarding(registry, forwarding).with_supervisor(handle));
+        let mut handler =
+            ControlHandler::with_forwarding(registry, forwarding).with_supervisor(handle);
+        if let Some(root) = activity_root {
+            handler = handler.with_activity_ledger(root, "prefix-test".into());
+        }
+        let handler = Arc::new(handler);
         let router = Arc::new(Router::with_control_handler(handler.clone()));
         let mut primary = Wire::new(&router);
         spawn.bind(primary.connection.id());
@@ -1868,6 +1905,384 @@ pub(crate) mod tests {
                 .await,
             error_codes::CLAIM_MINT_NOT_ALLOWED,
         );
+    }
+
+    fn prefix_hello(module_id: &str) -> Frame {
+        Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            8,
+            serde_json::to_vec(&subc_protocol::ModuleHelloBody {
+                manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
+                protocol_ver: PROTOCOL_VERSION,
+                control_ops: None,
+                launch_nonce: None,
+            })
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn prefix_connection(rig: &mut Rig, module_id: &str) -> Net {
+        rig.handler
+            .supervisor
+            .set_reserved_prefixes("claims-module", &["claims:".into()]);
+        let token = mint(
+            rig,
+            ClaimPurpose::Prefix {
+                module_id: module_id.into(),
+            },
+        )
+        .await
+        .claim;
+        let mut child = Net::new(rig.router.clone()).await;
+        assert_eq!(
+            child
+                .call(request(ClaimPresentRequest::new(token)))
+                .await
+                .header
+                .ty,
+            FrameType::Response
+        );
+        child
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_mint_uses_longest_owner_and_excludes_exact_reservations() {
+        let mut rig = rig().await;
+        let _allowed = prefix_connection(&mut rig, "claims:allowed").await;
+        rig.handler
+            .supervisor
+            .set_reserved_prefixes("other-owner", &["claims:nested:".into()]);
+        rig.handler
+            .supervisor
+            .set_reserved_nonce("claims:exact", "unused".into());
+        rig.handler
+            .supervisor
+            .apply_identity_configuration(&ModuleSpec {
+                module_id: "claims:no-holder".into(),
+                program: "/bin/false".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+                reserved: true,
+                reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::Subc,
+                overlap: ModuleOverlap::Exclusive,
+                carry_containment: false,
+            });
+        for module_id in [
+            "claims:exact",
+            "claims:no-holder",
+            "claims:nested:child",
+            "unowned:child",
+            "claims:bad/id",
+        ] {
+            error(
+                &rig.primary
+                    .call(
+                        &rig.router,
+                        request(ClaimMintRequest::new(ClaimPurpose::Prefix {
+                            module_id: module_id.into(),
+                        })),
+                    )
+                    .await,
+                error_codes::CLAIM_PREFIX_REFUSED,
+            );
+        }
+        error(
+            &rig.primary
+                .call(
+                    &rig.router,
+                    request(serde_json::json!({"op":"claim.mint", "purpose":"prefix"})),
+                )
+                .await,
+            "invalid_control_body",
+        );
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_mint_refuses_gated_id() {
+        use crate::config_gate::{
+            capture::{ConfigCapturer, UnavailableProjectRegistry},
+            runtime::RuntimeOwner,
+            ApprovalFacts, ApprovalReply, PlanKind, PresenceDecision,
+        };
+        let mut rig = rig().await;
+        let _allowed = prefix_connection(&mut rig, "claims:allowed").await;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/scratch")
+            .join(format!("prefix-gate-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("store")).unwrap();
+        let daemon_path = root.join("subc.jsonc");
+        std::fs::write(&daemon_path, br#"{"version":1,"modules":{"claims:gated":{"program":"/bin/false","protocol":"none"}}}"#).unwrap();
+        let owner = Arc::new(RuntimeOwner::new(
+            "prefix-gate".into(),
+            crate::config_store::ConfigStore::open_digest_only_for_tests(
+                crate::config_store::StoreRoot::from_service_definition(root.join("store"))
+                    .unwrap(),
+            ),
+            ConfigCapturer {
+                daemon_path,
+                config_home: root.clone(),
+                projects: Arc::new(UnavailableProjectRegistry),
+            },
+        ));
+        let plan = owner
+            .finish_plan(
+                owner.prepare(PlanKind::Stamp).unwrap(),
+                crate::config_gate::runtime::daemon_review,
+            )
+            .unwrap();
+        let facts = ApprovalFacts {
+            connection: 7,
+            owner_uid: true,
+            desktop_app: true,
+            attested_operator_app: true,
+            os_prompt_available: true,
+            phone: None,
+            caller: crate::caller_identity::CallerIdentity::default(),
+        };
+        owner
+            .desktop_view_delivered(ConnectionId::new(7), &plan)
+            .unwrap();
+        let challenge = owner.begin_approval(&plan.digest, &facts).unwrap();
+        owner
+            .finish_approval(
+                challenge.attempt(),
+                &facts,
+                ApprovalReply::Presence(PresenceDecision::InteractiveApproval),
+                1,
+            )
+            .unwrap();
+        let _supervisor =
+            Supervisor::new_for_test(rig.handler.registry.clone(), RestartPolicy::default())
+                .with_handle(rig.handler.supervisor.clone())
+                .with_config_runtime(owner.clone());
+        assert!(owner.module_is_gated("claims:gated"));
+        error(
+            &rig.primary
+                .call(
+                    &rig.router,
+                    request(ClaimMintRequest::new(ClaimPurpose::Prefix {
+                        module_id: "claims:gated".into(),
+                    })),
+                )
+                .await,
+            error_codes::CLAIM_PREFIX_REFUSED,
+        );
+        drop(_supervisor);
+        drop(owner);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_hello_names_exact_child_once_and_rechecks_ownership() {
+        let mut rig = rig().await;
+        let mut child = prefix_connection(&mut rig, "claims:child").await;
+        assert_eq!(
+            child.call(prefix_hello("claims:child")).await.header.ty,
+            FrameType::HelloAck
+        );
+        assert!(rig
+            .handler
+            .registry
+            .list_modules_with_nonce_verification()
+            .unwrap()
+            .1
+            .iter()
+            .any(
+                |(registration, verified)| registration.manifest.module_id == "claims:child"
+                    && *verified
+            ));
+        let binding = rig
+            .handler
+            .claims
+            .binding(child.connection_id(&rig.handler))
+            .unwrap();
+        assert_eq!(
+            binding.purpose,
+            ClaimPurpose::Prefix {
+                module_id: "claims:child".into()
+            }
+        );
+        assert_eq!(binding.registration.module_id, "claims-module");
+        error(
+            &child.call(prefix_hello("claims:child")).await,
+            error_codes::CLAIM_PREFIX_REFUSED,
+        );
+
+        let mut wrong = prefix_connection(&mut rig, "claims:named").await;
+        error(
+            &wrong.call(prefix_hello("claims:substitute")).await,
+            error_codes::CLAIM_PREFIX_REFUSED,
+        );
+        assert!(wrong.recv().await.is_none());
+        assert!(rig
+            .handler
+            .registry
+            .get_module("claims:substitute")
+            .unwrap()
+            .is_none());
+
+        let mut changed = prefix_connection(&mut rig, "claims:changed").await;
+        rig.handler
+            .supervisor
+            .set_reserved_prefixes("other-owner", &["claims:changed".into()]);
+        error(
+            &changed.call(prefix_hello("claims:changed")).await,
+            error_codes::CLAIM_PREFIX_REFUSED,
+        );
+        assert!(changed.recv().await.is_none());
+        assert!(rig
+            .handler
+            .registry
+            .get_module("claims:changed")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_requires_hello_before_other_operations() {
+        let mut rig = rig().await;
+        let mut frames = [
+            "server.describe",
+            "catalog.list",
+            "route.open",
+            "claim.mint",
+            "claim.present",
+            "activity.query",
+            "activity.record",
+            "scope.describe",
+            "config.get",
+            "operator.confirm",
+        ]
+        .into_iter()
+        .map(|op| request(serde_json::json!({"op":op})))
+        .collect::<Vec<_>>();
+        for ty in [
+            FrameType::Ping,
+            FrameType::Goodbye,
+            FrameType::Cancel,
+            FrameType::Push,
+            FrameType::Response,
+        ] {
+            frames.push(Frame::build(ty, control_flags(), 0, 0, 8, Vec::new()).unwrap());
+        }
+        for (index, frame) in frames.into_iter().enumerate() {
+            let mut child = prefix_connection(&mut rig, &format!("claims:prehello-{index}")).await;
+            error(&child.call(frame).await, "claim_hello_required");
+            assert!(child.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_registration_keeps_only_brokered_operations() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/scratch")
+            .join(format!("prefix-activity-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut rig = rig_with_activity(Some(&root)).await;
+        let mut child = prefix_connection(&mut rig, "claims:brokered").await;
+        assert_eq!(
+            child.call(prefix_hello("claims:brokered")).await.header.ty,
+            FrameType::HelloAck
+        );
+        for body in [
+            serde_json::json!({"op":"catalog.update","provides":[],"ready":false}),
+            serde_json::json!({"op":"supervisor.live_roots"}),
+            serde_json::json!({"op":"activity.record","kind":"claims:brokered.settled","summary":"Worker settled"}),
+            serde_json::json!({"op":"scope.describe","owner":{"kind":"reserved","module_id":"claims-module"},"ref":"missing"}),
+        ] {
+            let reply = child.call(request(body)).await;
+            assert_eq!(
+                reply.header.ty,
+                FrameType::Response,
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
+        }
+        assert!(
+            !rig.handler
+                .registry
+                .get_module("claims:brokered")
+                .unwrap()
+                .unwrap()
+                .ready
+        );
+        for op in [
+            "scope.sync",
+            "scope.apply",
+            "operator.confirm",
+            "claim.mint",
+            "route.authorize",
+            "supervisor.agent_commands",
+            "scope.served_by",
+            "route.open",
+            "activity.query",
+            "config.declare",
+            "config.review",
+            "config.get",
+            "config.applied",
+            "config.status",
+            "config.plan",
+            "config.stamp",
+            "config.unstamp",
+            "config.apply",
+        ] {
+            error(
+                &child.call(request(serde_json::json!({"op":op}))).await,
+                "claim_operation_not_allowed",
+            );
+        }
+        drop(child);
+        drop(rig);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_consumers_use_owner_minted_helper() {
+        let mut rig = rig().await;
+        let mut child = prefix_connection(&mut rig, "claims:helper-child").await;
+        assert_eq!(
+            child
+                .call(prefix_hello("claims:helper-child"))
+                .await
+                .header
+                .ty,
+            FrameType::HelloAck
+        );
+        error(
+            &child
+                .call(request(ClaimMintRequest::new(ClaimPurpose::SelfConnection)))
+                .await,
+            "claim_operation_not_allowed",
+        );
+        let helper = mint(&mut rig, ClaimPurpose::Helper).await.claim;
+        let mut consumer = Net::new(rig.router.clone()).await;
+        assert_eq!(
+            consumer
+                .call(request(ClaimPresentRequest::new(helper)))
+                .await
+                .header
+                .ty,
+            FrameType::Response
+        );
+        let binding = rig
+            .handler
+            .claims
+            .binding(consumer.connection_id(&rig.handler))
+            .unwrap();
+        assert_eq!(binding.purpose, ClaimPurpose::Helper);
+        assert!(Arc::ptr_eq(&binding.registration, &rig.spawn));
+        error(
+            &consumer.call(prefix_hello("claims:helper-child")).await,
+            "claim_hello_not_allowed",
+        );
+        assert!(consumer.recv().await.is_none());
+        rig.spawn.retire();
+        assert!(child.recv().await.is_none());
     }
 
     #[tokio::test]

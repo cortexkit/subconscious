@@ -2781,6 +2781,26 @@ impl SupervisorHandle {
         Ok(verification)
     }
 
+    pub(crate) fn prefix_claim_authorized(&self, owner: &str, module_id: &str) -> bool {
+        if subc_protocol::manifest::validate_module_id(module_id).is_err()
+            || self.module_is_gated(module_id)
+            || self
+                .reserved_nonces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .contains_key(module_id)
+        {
+            return false;
+        }
+        self.reserved_prefix_owners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|(prefix, _)| module_id.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
+            .is_some_and(|(_, holder)| holder == owner)
+    }
+
     fn hello_verification(
         &self,
         module_id: &str,

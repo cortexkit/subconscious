@@ -2198,10 +2198,49 @@ impl ControlHandler {
         }
         #[cfg(test)]
         self.claims.record_dispatch(frame.header.corr);
+        if self
+            .claims
+            .binding(ctx.connection_id)
+            .is_some_and(|binding| binding.prefix_module_id().is_some())
+        {
+            let registered = self
+                .forwarding
+                .module_endpoint_for_connection(ctx.connection_id)
+                .map_err(RouterError::Forwarding)?
+                .is_some();
+            if !registered && frame.header.ty != FrameType::Hello {
+                return self
+                    .refuse_claim_connection(ctx, &frame, "claim_hello_required")
+                    .await;
+            }
+            if registered && frame.header.ty == FrameType::Request {
+                let allowed =
+                    serde_json::from_slice::<ControlOpProbe>(&frame.body).is_ok_and(|probe| {
+                        matches!(
+                            probe.op.as_str(),
+                            "catalog.update"
+                                | "scope.describe"
+                                | "supervisor.live_roots"
+                                | "activity.record"
+                        )
+                    });
+                if !allowed {
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        "claim_operation_not_allowed",
+                        "prefix registrations have only brokered module operations",
+                    )?]);
+                }
+            }
+        }
         match frame.header.ty {
             FrameType::Ping => Ok(vec![pong(&frame)?]),
             FrameType::Hello => {
-                if self.claims.binding(ctx.connection_id).is_some() {
+                let claim_binding = self.claims.binding(ctx.connection_id);
+                if claim_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.prefix_module_id().is_none())
+                {
                     return self
                         .refuse_claim_connection(ctx, &frame, "claim_hello_not_allowed")
                         .await;
@@ -2214,41 +2253,43 @@ impl ControlHandler {
                         ctx.egress.terminate_ingress();
                         return Ok(Vec::new());
                     }
-                } else if let Ok(hello) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
-                    if let (Some(module), Some(nonce)) = (
-                        hello
-                            .get("manifest")
-                            .and_then(|value| value.get("module_id"))
-                            .and_then(|value| value.as_str()),
-                        hello.get("launch_nonce").and_then(|value| value.as_str()),
-                    ) {
-                        if !self
-                            .config_runtime
-                            .as_ref()
-                            .is_some_and(|owner| owner.module_is_gated(module))
-                            && !self.supervisor.wait_program_binding(module, nonce).await
-                        {
-                            self.request_refusal_close(
-                                ctx.connection_id,
-                                Some(&ctx.egress),
-                                CloseReason::new(
-                                    "program_refused",
+                } else if claim_binding.is_none() {
+                    if let Ok(hello) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
+                        if let (Some(module), Some(nonce)) = (
+                            hello
+                                .get("manifest")
+                                .and_then(|value| value.get("module_id"))
+                                .and_then(|value| value.as_str()),
+                            hello.get("launch_nonce").and_then(|value| value.as_str()),
+                        ) {
+                            if !self
+                                .config_runtime
+                                .as_ref()
+                                .is_some_and(|owner| owner.module_is_gated(module))
+                                && !self.supervisor.wait_program_binding(module, nonce).await
+                            {
+                                self.request_refusal_close(
+                                    ctx.connection_id,
+                                    Some(&ctx.egress),
+                                    CloseReason::new(
+                                        "program_refused",
+                                        "the spawned program binding failed",
+                                    ),
+                                );
+                                return Ok(vec![control_error_frame(
+                                    &frame,
+                                    if self
+                                        .config_runtime
+                                        .as_ref()
+                                        .is_some_and(|owner| owner.is_recovering())
+                                    {
+                                        "config_gated"
+                                    } else {
+                                        "program_refused"
+                                    },
                                     "the spawned program binding failed",
-                                ),
-                            );
-                            return Ok(vec![control_error_frame(
-                                &frame,
-                                if self
-                                    .config_runtime
-                                    .as_ref()
-                                    .is_some_and(|owner| owner.is_recovering())
-                                {
-                                    "config_gated"
-                                } else {
-                                    "program_refused"
-                                },
-                                "the spawned program binding failed",
-                            )?]);
+                                )?]);
+                            }
                         }
                     }
                 }
@@ -2258,7 +2299,7 @@ impl ControlHandler {
                 let correlation = frame.header.corr;
                 let dispatcher = tracing::dispatcher::get_default(|dispatcher| dispatcher.clone());
                 let span = tracing::Span::current();
-                tokio::task::spawn_blocking(move || {
+                let replies = tokio::task::spawn_blocking(move || {
                     tracing::dispatcher::with_default(&dispatcher, || {
                         span.in_scope(|| {
                             handler.handle_hello_checked(connection, Some(egress), frame, true)
@@ -2266,7 +2307,26 @@ impl ControlHandler {
                     })
                 })
                 .await
-                .map_err(|error| RouterError::backend(0, correlation, error.to_string()))?
+                .map_err(|error| RouterError::backend(0, correlation, error.to_string()))??;
+                if claim_binding.is_some()
+                    && self
+                        .registry
+                        .get_module_by_connection(ctx.connection_id)
+                        .map_err(|err| RouterError::backend(0, correlation, err.to_string()))?
+                        .is_none()
+                {
+                    ctx.egress.terminate_ingress();
+                    for reply in replies {
+                        ctx.egress.send_flushed(reply).await?;
+                    }
+                    self.request_refusal_close(
+                        ctx.connection_id,
+                        Some(&ctx.egress),
+                        CloseReason::new("claim_prefix_refused", "prefix HELLO refused"),
+                    );
+                    return Ok(Vec::new());
+                }
+                Ok(replies)
             }
             FrameType::Goodbye => self.handle_goodbye(ctx.connection_id),
             FrameType::Cancel => {
@@ -2815,6 +2875,26 @@ impl ControlHandler {
         wait_for_gate: bool,
     ) -> Result<Vec<Frame>, RouterError> {
         let channel_spawn = self.supervisor.registration_spawn(connection_id);
+        let prefix_binding = self.claims.binding(connection_id);
+        if let Some(binding) = &prefix_binding {
+            let value = serde_json::from_slice::<serde_json::Value>(&frame.body).ok();
+            let module = value
+                .as_ref()
+                .and_then(|value| value["manifest"]["module_id"].as_str());
+            if !binding.admit_prefix_hello(module)
+                || !module.is_some_and(|module| {
+                    self.supervisor
+                        .prefix_claim_authorized(&binding.registration.module_id, module)
+                })
+                || binding.registration.check().is_err()
+            {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "claim_prefix_refused",
+                    "HELLO must name the prefix claim's exact module id once",
+                )?]);
+            }
+        }
         struct RefuseUnregisteredChannel {
             spawn: Option<Arc<crate::supervise::RegistrationSpawn>>,
             sink: Option<crate::FrameSink>,
@@ -3190,6 +3270,7 @@ impl ControlHandler {
         let swap_admission = match &channel_spawn {
             Some(spawn) if spawn.is_candidate() => SwapHelloAdmission::Candidate,
             Some(_) => SwapHelloAdmission::NotSwapping,
+            None if prefix_binding.is_some() => SwapHelloAdmission::NotSwapping,
             None => self
                 .supervisor
                 .swap_hello_admission(&hello.manifest.module_id, hello.launch_nonce.as_deref()),
@@ -3221,7 +3302,22 @@ impl ControlHandler {
                 prefix_owner: None,
             }
         } else {
-            let verification = if channel_spawn.is_some() {
+            let verification = if let Some(binding) = &prefix_binding {
+                if !self.supervisor.prefix_claim_authorized(
+                    &binding.registration.module_id,
+                    &hello.manifest.module_id,
+                ) {
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        "claim_prefix_refused",
+                        "prefix ownership changed",
+                    )?]);
+                }
+                Ok(ReservedHelloVerification {
+                    nonce_verified: true,
+                    prefix_owner: Some(binding.registration.module_id.clone()),
+                })
+            } else if channel_spawn.is_some() {
                 self.supervisor
                     .channel_hello_verification(&hello.manifest.module_id)
             } else {
@@ -3312,7 +3408,10 @@ impl ControlHandler {
             hold.wait();
             PublicationFinished(hold.clone())
         });
-        let _registration_publication = match &channel_spawn {
+        let publication_spawn = channel_spawn
+            .as_ref()
+            .or_else(|| prefix_binding.as_ref().map(|binding| &binding.registration));
+        let _registration_publication = match publication_spawn {
             Some(spawn) => Some(match spawn.begin_publication() {
                 Ok(guard) => guard,
                 Err(code) => {

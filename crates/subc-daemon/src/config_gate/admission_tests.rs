@@ -1788,6 +1788,13 @@ async fn config_admission_hello_accepts_only_the_approved_current_native_image()
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
     let nonce = handle.registration_proof_for_test("a").unwrap();
     assert!(handle.wait_program_binding("a", &nonce).await);
+    // The channel service waits for launch confirmation before dispatching
+    // HELLO. A direct-handler fixture must wait for the same transition.
+    handle
+        .registration_for_test("a")
+        .unwrap()
+        .wait_launch()
+        .await;
     assert!(
         !module.configuration().unwrap().0.reserved,
         "the launch-local nonce gate must not rewrite approved role policy"
@@ -2064,14 +2071,14 @@ async fn config_admission_hello_cannot_publish_after_post_exec_same_inode_refusa
         .with_handle(handle.clone())
         .with_config_runtime(owner.clone());
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
-    let nonce = handle.registration_proof_for_test("a").unwrap();
+    let proof = handle.registration_proof_for_test("a");
     let handler = crate::ControlHandler::new(registry.clone())
         .with_supervisor(handle)
         .with_config_runtime(owner);
     let reply = handler
         .handle_control(
             ConnectionId::new(730),
-            module_hello(Some(nonce), ConnectionId::new(730)),
+            module_hello(proof, ConnectionId::new(730)),
         )
         .unwrap();
     module.stop().await.unwrap();
@@ -3271,7 +3278,7 @@ async fn config_recovery_carried_command_close_reap_retires_before_group_cleanup
         .unwrap();
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&reply[0].body).unwrap()["code"],
-        "program_refused",
+        "registration_channel_closed",
         "carried pin reap must retire before the paused recover_group await: {reply:?}"
     );
 }

@@ -13667,11 +13667,26 @@ async fn send_module_goodbyes_for_daemon_shutdown(
     while sends.join_next().await.is_some() {}
 }
 
-fn send_module_goodbye(module_id: &str, forwarding: &ForwardingTable, target: &ModuleDrainTarget) {
+async fn send_module_goodbye(
+    module_id: &str,
+    forwarding: &ForwardingTable,
+    target: &ModuleDrainTarget,
+    wait_for_flush: bool,
+) {
     let Some(frame) = module_goodbye_frame(module_id, target.negotiated_ver) else {
         return;
     };
-    if let Err(err) = target.sink.try_send(frame) {
+    // A channel is shut down synchronously after its drain. Its final frame
+    // must reach the socket writer first; queue admission alone can lose it.
+    let sent = if wait_for_flush {
+        timeout(Duration::from_millis(500), target.sink.send_flushed(frame))
+            .await
+            .map_err(|_| "module GOODBYE flush exceeded 500ms".to_owned())
+            .and_then(|result| result.map_err(|err| err.to_string()))
+    } else {
+        target.sink.try_send(frame).map_err(|err| err.to_string())
+    };
+    if let Err(err) = sent {
         warn!(
             module_id,
             target_connection_id = target.endpoint.connection_id.get(),
@@ -13877,6 +13892,11 @@ async fn begin_forwarding_drain_with(
         // was asked to stop.
         return Ok(StopNotice::NoConnection);
     };
+    let flush_goodbye = runtime.supervisor_handle.as_ref().is_some_and(|handle| {
+        handle
+            .registration_spawn(target.endpoint.connection_id)
+            .is_some()
+    });
     {
         send_module_draining(&spec.module_id, reason, deadline_ms, target, false).await;
         #[cfg(feature = "test-support")]
@@ -13963,13 +13983,13 @@ async fn begin_forwarding_drain_with(
                     error = %err,
                     "failed to release module endpoint routes after route.closed; module GOODBYE will still be sent"
                 );
-                send_module_goodbye(&spec.module_id, forwarding, target);
+                send_module_goodbye(&spec.module_id, forwarding, target, flush_goodbye).await;
                 return Err(SuperviseError::Forwarding(err));
             }
         };
         let route_goodbye_count = released_routes.len();
         send_route_goodbyes(forwarding, released_routes);
-        send_module_goodbye(&spec.module_id, forwarding, target);
+        send_module_goodbye(&spec.module_id, forwarding, target, flush_goodbye).await;
 
         // The drain's happy path was previously silent: every emission above is
         // best-effort with only its failure arm logged, so "were consumers told"

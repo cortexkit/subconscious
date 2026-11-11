@@ -1,6 +1,8 @@
 use super::*;
 use subc_protocol::{Frame, FrameType};
 
+include!("registration_drain_tests.rs");
+
 fn hello(module: &str) -> Frame {
     let hello = subc_protocol::ModuleHelloBody {
         manifest: subc_protocol::manifest::ModuleManifest::builder(module, "1.0.0").build(),

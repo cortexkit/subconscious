@@ -139,29 +139,34 @@ async fn first_observation(mode: &'static str, caller: bool) {
         tokio::task::yield_now().await;
     }
     let spawn = rig.spawn.clone();
-    let observer = tokio::spawn(async move {
-        match mode {
-            "wait" => {
-                child.wait().await.unwrap();
+    // Retirement's test hook blocks synchronously. Keep it off the I/O workers
+    // so a wake parked in a worker's local queue cannot delay the assertion task.
+    let executor = tokio::runtime::Handle::current();
+    let observer = tokio::task::spawn_blocking(move || {
+        executor.block_on(async move {
+            match mode {
+                "wait" => {
+                    child.wait().await.unwrap();
+                }
+                "try_wait" => {
+                    assert!(child.try_wait().unwrap().is_some());
+                }
+                "finish_exit" => {
+                    child.finish_exit(true).await.unwrap();
+                }
+                "hook" => {
+                    binding.retirement_hook().upgrade().unwrap().retire();
+                }
+                "eof" => {
+                    stream.set_nonblocking(true).unwrap();
+                    let stream = tokio::net::UnixStream::from_std(stream).unwrap();
+                    let mut stream = RegistrationStream { stream, spawn };
+                    assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
+                }
+                _ => unreachable!(),
             }
-            "try_wait" => {
-                assert!(child.try_wait().unwrap().is_some());
-            }
-            "finish_exit" => {
-                child.finish_exit(true).await.unwrap();
-            }
-            "hook" => {
-                binding.retirement_hook().upgrade().unwrap().retire();
-            }
-            "eof" => {
-                stream.set_nonblocking(true).unwrap();
-                let stream = tokio::net::UnixStream::from_std(stream).unwrap();
-                let mut stream = RegistrationStream { stream, spawn };
-                assert_eq!(stream.read(&mut [0]).await.unwrap(), 0);
-            }
-            _ => unreachable!(),
-        }
-        child
+            child
+        })
     });
     if mode == "eof" {
         peer.shutdown().await.unwrap();

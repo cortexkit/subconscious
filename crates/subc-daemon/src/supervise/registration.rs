@@ -165,11 +165,13 @@ impl RegistrationSpawn {
     }
 
     fn retire_transition(&self, transition: std::sync::MutexGuard<'_, ()>) {
+        let revoked;
         {
             if *self.launch.borrow() == LaunchState::Dead {
                 return;
             }
             self.launch.send_replace(LaunchState::Dead);
+            revoked = self.claims.get().map(|claims| claims.revoke());
             #[cfg(any(unix, windows))]
             if let Some(endpoint) = self
                 .endpoint
@@ -183,7 +185,6 @@ impl RegistrationSpawn {
                 endpoint.shutdown();
             }
         }
-        let revoked = self.claims.get().map(|claims| claims.revoke());
         drop(transition);
         #[cfg(test)]
         if let Some(pause) = self.retirement_pause.lock().unwrap().take() {

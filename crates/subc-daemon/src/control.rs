@@ -1780,8 +1780,8 @@ impl ControlHandler {
     /// registration-release watch. The signal is what the supervisor waits on
     /// before spawning a replacement, so it must only fire once forwarding
     /// teardown is also done (see [`Self::cleanup_connection`] /
-    /// [`Self::handle_goodbye`]). Used directly only where a registry entry was
-    /// admitted but its forwarding endpoint could not be installed.
+    /// [`Self::handle_goodbye`]). Unpublished HELLO rollback uses the separate
+    /// registry-only path below because publication already owns the spawn lock.
     fn deregister_connection(
         &self,
         connection_id: ConnectionId,
@@ -1792,6 +1792,20 @@ impl ControlHandler {
         }
         self.registry
             .deregister_connection_with_reason(connection_id, reason)
+    }
+
+    // HELLO publication owns the spawn transition guard. claim.mint is allowed
+    // only after HELLO acceptance, so a failed first HELLO has no bearer tokens
+    // or claim-bound consumers to revoke. Remove only its unpublished registry
+    // entry without re-entering primary-registration teardown.
+    fn rollback_unpublished_hello(
+        &self,
+        connection: ConnectionId,
+    ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        self.registry.deregister_connection_with_reason(
+            connection,
+            RegistrationEndReason::RegistrationFailed,
+        )
     }
 
     pub(crate) fn route_open_target(&self, frame: &Frame) -> Option<String> {
@@ -3346,10 +3360,7 @@ impl ControlHandler {
                 // published and so never listed or counted in the catalog
                 // generation, and signal the release watch directly.
                 if matches!(
-                    self.deregister_connection(
-                        connection_id,
-                        RegistrationEndReason::RegistrationFailed,
-                    ),
+                    self.rollback_unpublished_hello(connection_id),
                     Ok(r) if !r.is_empty()
                 ) {
                     crate::supervise::notify_registration_release();
@@ -3559,10 +3570,7 @@ impl ControlHandler {
                 hello_ack,
             ) {
                 if matches!(
-                    self.deregister_connection(
-                        connection_id,
-                        RegistrationEndReason::RegistrationFailed,
-                    ),
+                    self.rollback_unpublished_hello(connection_id),
                     Ok(r) if !r.is_empty()
                 ) {
                     crate::supervise::notify_registration_release();

@@ -655,6 +655,124 @@ mod tests {
         spawn
     }
 
+    #[cfg(unix)]
+    async fn hello_rollback_case(candidate: bool) {
+        let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "supervise::registration::tests::hello_forwarding_rollback_worker",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(
+                "SUBC_TEST_HELLO_ROLLBACK",
+                if candidate { "candidate" } else { "ordinary" },
+            )
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        if result.is_err() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+        assert!(matches!(result, Ok(Ok(status)) if status.success()),
+            "channel HELLO rollback must finish and allow later retirement within the subprocess deadline");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_channel_hello_rollback_does_not_reenter_transition() {
+        hello_rollback_case(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn candidate_channel_hello_rollback_does_not_reenter_transition() {
+        hello_rollback_case(true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "subprocess fixture; invoked only by the bounded rollback tests"]
+    async fn hello_forwarding_rollback_worker() {
+        let candidate = std::env::var("SUBC_TEST_HELLO_ROLLBACK").unwrap() == "candidate";
+        let (handle, registry, control) = setup();
+        if candidate {
+            assert_eq!(
+                control
+                    .handle_control(ConnectionId::new(90), hello("channel-module"))
+                    .unwrap()[0]
+                    .header
+                    .ty,
+                FrameType::HelloAck
+            );
+            handle.open_swap("channel-module", "candidate".into());
+        }
+        let forwarding = control.forwarding();
+        forwarding.begin_daemon_drain().unwrap();
+        let role = if candidate {
+            SpawnRole::SwapCandidate
+        } else {
+            SpawnRole::Plain
+        };
+        let spawn = RegistrationSpawn::new(&handle, "channel-module", role, None);
+        spawn.ready();
+        let router = Arc::new(crate::Router::with_control_handler(Arc::new(control)));
+        let info = subc_transport::ConnectionInfo {
+            schema: subc_transport::SCHEMA_VERSION,
+            wire_version: None,
+            endpoints: Vec::new(),
+            key: vec![0x42; 32],
+            daemon_id: [0x24; 16],
+            pid: std::process::id(),
+            daemon_ver: "test".into(),
+        };
+        router.install_registration_service(crate::server::ServerAuth::new(
+            info.key.clone(),
+            info.daemon_id,
+            "test",
+        ));
+        let (parent, child) = std::os::unix::net::UnixStream::pair().unwrap();
+        child.set_nonblocking(true).unwrap();
+        let mut child = tokio::net::UnixStream::from_std(child).unwrap();
+        handle.serve_registration(
+            parent,
+            spawn.clone(),
+            std::process::id(),
+            Instant::now() + Duration::from_secs(5),
+        );
+        subc_transport::authenticate_client(&mut child, &info, Duration::from_secs(1))
+            .await
+            .unwrap();
+        subc_transport::write_frame(&mut child, &hello("channel-module"))
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(1),
+            subc_transport::read_frame(&mut child),
+        )
+        .await
+        .expect("forwarding refusal must settle the channel HELLO")
+        .unwrap();
+        if let Some(reply) = reply {
+            assert_eq!(reply.header.ty, FrameType::Error);
+        }
+        assert!(!spawn.registered());
+        if candidate {
+            assert!(registry.get_candidate("channel-module").unwrap().is_none());
+        } else {
+            assert!(registry.get_module("channel-module").unwrap().is_none());
+        }
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::task::spawn_blocking(move || spawn.retire()),
+        )
+        .await
+        .expect("retirement after HELLO rollback must return")
+        .unwrap();
+    }
+
     #[test]
     fn registration_channel_wrong_id_consumes_hello() {
         let (handle, registry, control) = setup();

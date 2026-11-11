@@ -1787,6 +1787,9 @@ impl ControlHandler {
         connection_id: ConnectionId,
         reason: RegistrationEndReason,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        if let Some(spawn) = self.supervisor.registration_spawn(connection_id) {
+            spawn.end_primary_registration();
+        }
         self.registry
             .deregister_connection_with_reason(connection_id, reason)
     }

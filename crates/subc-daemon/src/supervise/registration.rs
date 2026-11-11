@@ -123,6 +123,13 @@ impl RegistrationSpawn {
         self.retire_transition(self.transition.lock().unwrap_or_else(|p| p.into_inner()));
     }
 
+    pub(crate) fn end_primary_registration(&self) {
+        let _transition = self.transition.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(claims) = self.claims.get() {
+            claims.end_primary_registration();
+        }
+    }
+
     fn retire_unused(&self) {
         let transition = self.transition.lock().unwrap_or_else(|p| p.into_inner());
         if !self.registered() {

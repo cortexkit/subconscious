@@ -78,6 +78,7 @@ struct State {
 
 struct LaunchState {
     active: bool,
+    primary_live: bool,
     pending: HashMap<[u8; 16], Pending>,
     connections: HashMap<ConnectionId, crate::FrameSink>,
     bucket: Bucket,
@@ -101,6 +102,17 @@ impl fmt::Debug for LaunchClaims {
 }
 
 impl LaunchClaims {
+    pub(crate) fn end_primary_registration(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.primary_live = false;
+        if let Some(table) = self.table.upgrade() {
+            let mut index = table.0.lock().unwrap_or_else(|p| p.into_inner());
+            for token in state.pending.keys() {
+                index.pending.remove(token);
+            }
+        }
+        state.pending.clear();
+    }
     // Called under the spawn transition lock. Fence ingress before releasing the
     // lock, then deliver close notifications after releasing the transition,
     // launch-local claims, and token/connection index locks.
@@ -179,6 +191,21 @@ impl Claims {
 }
 
 impl ControlHandler {
+    fn claim_primary_authorized(
+        &self,
+        connection: ConnectionId,
+        spawn: &RegistrationSpawn,
+    ) -> bool {
+        spawn.registered()
+            && self
+                .forwarding
+                .module_id_for_connection(connection)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(spawn.module_id.as_str())
+            && spawn.check().is_ok()
+    }
     pub(super) fn handle_claim_mint(
         &self,
         connection: ConnectionId,
@@ -200,16 +227,7 @@ impl ControlHandler {
         let Some(spawn) = self.supervisor.registration_spawn(connection) else {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
         };
-        if !spawn.registered()
-            || self
-                .forwarding
-                .module_id_for_connection(connection)
-                .ok()
-                .flatten()
-                .as_deref()
-                != Some(spawn.module_id.as_str())
-            || spawn.check().is_err()
-        {
+        if !self.claim_primary_authorized(connection, &spawn) {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
         }
         // Prefix claims authorize a child's HELLO under its owner's configured
@@ -237,6 +255,7 @@ impl ControlHandler {
                     forwarding: self.forwarding.clone(),
                     state: Mutex::new(LaunchState {
                         active: true,
+                        primary_live: true,
                         pending: HashMap::new(),
                         connections: HashMap::new(),
                         bucket: Bucket {
@@ -248,6 +267,9 @@ impl ControlHandler {
             })
             .clone();
         let mut state = launch.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.primary_live {
+            return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
+        }
         let expired = state
             .pending
             .iter()
@@ -362,6 +384,9 @@ impl ControlHandler {
             .registration
             .upgrade()
             .ok_or(error_codes::CLAIM_INVALID)?;
+        if !self.claim_primary_authorized(launch.primary, &registration) {
+            return Err(error_codes::CLAIM_INVALID);
+        }
         let _alive = registration
             .begin_publication()
             .map_err(|_| error_codes::CLAIM_INVALID)?;
@@ -374,6 +399,7 @@ impl ControlHandler {
         index.pending.remove(&token);
         if pending.expires <= tokio::time::Instant::now()
             || !state.active
+            || !state.primary_live
             || index.bindings.contains_key(&connection)
         {
             return Err(error_codes::CLAIM_INVALID);
@@ -710,6 +736,164 @@ mod tests {
             spawn,
             _module: module,
         }
+    }
+
+    async fn network_primary(
+        rig: &Rig,
+        module_id: &str,
+    ) -> (Net, Arc<RegistrationSpawn>, SupervisedModule, ConnectionId) {
+        let handle = rig.handler.supervisor.clone();
+        let supervisor =
+            Supervisor::new_for_test(rig.handler.registry.clone(), RestartPolicy::default())
+                .with_handle(handle.clone())
+                .with_forwarding(rig.handler.forwarding.clone());
+        let module = supervisor
+            .spawn_async(ModuleSpec {
+                module_id: module_id.into(),
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "exec sleep 300".into()],
+                env: Vec::new(),
+                reserved: false,
+                reserved_prefixes: Vec::new(),
+                protocol: ModuleProtocol::Subc,
+                overlap: ModuleOverlap::Safe,
+                carry_containment: false,
+            })
+            .await
+            .unwrap();
+        let spawn = handle.registration_for_test(module_id).unwrap();
+        spawn.wait_launch().await;
+        let mut net = Net::new(rig.router.clone()).await;
+        let ping = Frame::build(FrameType::Ping, control_flags(), 0, 0, 2, Vec::new()).unwrap();
+        assert_eq!(net.call(ping).await.header.ty, FrameType::Pong);
+        let peer = net.client.local_addr().unwrap();
+        let connection = *rig
+            .handler
+            .caller_endpoints
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, (_, remote))| *remote == peer)
+            .unwrap()
+            .0;
+        spawn.bind(connection);
+        let hello = subc_protocol::ModuleHelloBody {
+            manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
+            protocol_ver: PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: None,
+        };
+        let reply = net
+            .call(
+                Frame::build(
+                    FrameType::Hello,
+                    control_flags(),
+                    0,
+                    0,
+                    3,
+                    serde_json::to_vec(&hello).unwrap(),
+                )
+                .unwrap(),
+            )
+            .await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::HelloAck,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        (net, spawn, module, connection)
+    }
+
+    async fn net_mint(net: &mut Net, purpose: ClaimPurpose) -> ClaimMintReply {
+        let reply = net.call(request(ClaimMintRequest::new(purpose))).await;
+        assert_eq!(
+            reply.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&reply.body)
+        );
+        serde_json::from_slice(&reply.body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn claims_primary_goodbye_voids_pending_before_presentation() {
+        let rig = rig().await;
+        let (mut primary, spawn, _module, _) = network_primary(&rig, "claims-goodbye").await;
+        let token = net_mint(&mut primary, ClaimPurpose::SelfConnection)
+            .await
+            .claim;
+        subc_transport::write_frame(
+            &mut primary.client,
+            &Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 4, Vec::new()).unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            primary
+                .call(Frame::build(FrameType::Ping, control_flags(), 0, 0, 5, Vec::new()).unwrap())
+                .await
+                .header
+                .ty,
+            FrameType::Pong
+        );
+        assert!(
+            spawn
+                .claims
+                .get()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .pending
+                .is_empty(),
+            "primary deregistration must void pending claims"
+        );
+        let mut consumer = Net::new(rig.router.clone()).await;
+        error(
+            &consumer
+                .call(request(ClaimPresentRequest::new(token)))
+                .await,
+            error_codes::CLAIM_INVALID,
+        );
+        assert!(consumer.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn claims_present_rechecks_primary_endpoint_even_with_pending_token() {
+        let rig = rig().await;
+        let (mut primary, spawn, _module, connection) =
+            network_primary(&rig, "claims-endpoint").await;
+        let token = net_mint(&mut primary, ClaimPurpose::SelfConnection)
+            .await
+            .claim;
+        // Model a stale primary endpoint without using the pending-token cleanup
+        // path, so this exercises redemption's independent authority recheck.
+        rig.handler
+            .forwarding
+            .cleanup_connection(connection)
+            .unwrap();
+        assert!(spawn.launch_ready());
+        assert_eq!(
+            spawn
+                .claims
+                .get()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .pending
+                .len(),
+            1
+        );
+        let mut consumer = Net::new(rig.router.clone()).await;
+        error(
+            &consumer
+                .call(request(ClaimPresentRequest::new(token)))
+                .await,
+            error_codes::CLAIM_INVALID,
+        );
+        assert!(consumer.recv().await.is_none());
     }
 
     fn request(body: impl Serialize) -> Frame {

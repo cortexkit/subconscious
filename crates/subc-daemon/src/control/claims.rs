@@ -741,7 +741,11 @@ pub(crate) mod tests {
             .unwrap();
         let spawn = handle.registration_for_test("claims-module").unwrap();
         spawn.wait_launch().await;
-        assert!(spawn.launch_ready());
+        assert!(
+            spawn.launch_ready(),
+            "claim fixture launch failed: {:?}",
+            module.status()
+        );
         let handler =
             Arc::new(ControlHandler::with_forwarding(registry, forwarding).with_supervisor(handle));
         let router = Arc::new(Router::with_control_handler(handler.clone()));

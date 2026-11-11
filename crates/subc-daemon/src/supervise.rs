@@ -11157,7 +11157,15 @@ fn prepare_child_in_slot(
     let registration_spawn = (spec.protocol == ModuleProtocol::Subc)
         .then(|| {
             handle.map(|handle| {
-                RegistrationSpawn::new(handle, &spec.module_id, role, binding_publication.clone())
+                RegistrationSpawn::new_with_binding_requirement(
+                    handle,
+                    &spec.module_id,
+                    role,
+                    binding_publication.clone(),
+                    spawn_admission
+                        .as_ref()
+                        .is_some_and(|admission| admission.launch.is_some()),
+                )
             })
         })
         .flatten();

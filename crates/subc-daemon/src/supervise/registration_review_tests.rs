@@ -207,3 +207,36 @@ async fn registration_channel_own_id_still_obeys_reserved_prefix_owner() {
     );
     assert!(!spawn.launch_ready());
 }
+
+#[tokio::test]
+async fn registration_channel_gated_without_binding_never_admits_hello() {
+    let handle = SupervisorHandle::new();
+    let spawn = RegistrationSpawn::new_with_binding_requirement(
+        &handle,
+        "channel-module",
+        SpawnRole::Plain,
+        None,
+        true,
+    );
+    spawn.ready();
+    let (auth, info) = auth();
+    let (_router, mut child, _copy) = serve(&handle, spawn.clone(), auth);
+    subc_transport::authenticate_client(&mut child, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    subc_transport::write_frame(&mut child, &hello("channel-module"))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            subc_transport::read_frame(&mut child)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .is_none(),
+        "launch readiness alone cannot replace a gated program binding"
+    );
+    assert!(!spawn.launch_ready());
+}

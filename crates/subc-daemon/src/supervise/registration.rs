@@ -32,16 +32,29 @@ pub(crate) struct RegistrationSpawn {
     #[cfg(windows)]
     endpoint: Mutex<Option<subc_os::registration_channel::RegistrationPipeShutdown>>,
     binding: Option<ProgramBindingPublication>,
+    requires_binding: bool,
     pub(super) identity: std::sync::OnceLock<ProcessIdentity>,
     connections: Weak<Mutex<HashMap<ConnectionId, Arc<RegistrationSpawn>>>>,
 }
 
 impl RegistrationSpawn {
+    #[cfg(test)]
     pub(super) fn new(
         handle: &SupervisorHandle,
         module: &str,
         role: SpawnRole,
         binding: Option<ProgramBindingPublication>,
+    ) -> Arc<Self> {
+        let required = binding.is_some();
+        Self::new_with_binding_requirement(handle, module, role, binding, required)
+    }
+
+    pub(super) fn new_with_binding_requirement(
+        handle: &SupervisorHandle,
+        module: &str,
+        role: SpawnRole,
+        binding: Option<ProgramBindingPublication>,
+        requires_binding: bool,
     ) -> Arc<Self> {
         let (launch, _) = tokio::sync::watch::channel(LaunchState::Pending);
         let spawn = Arc::new(Self {
@@ -55,6 +68,7 @@ impl RegistrationSpawn {
             #[cfg(any(unix, windows))]
             endpoint: Mutex::new(None),
             binding,
+            requires_binding,
             identity: std::sync::OnceLock::new(),
             connections: Arc::downgrade(&handle.registration_connections),
         });
@@ -170,6 +184,9 @@ impl RegistrationSpawn {
             LaunchState::Pending => return Err("config_delivery_deferred"),
             LaunchState::Ready => {}
         }
+        if self.requires_binding && self.binding.is_none() {
+            return Err("program_refused");
+        }
         if self
             .binding
             .as_ref()
@@ -178,6 +195,10 @@ impl RegistrationSpawn {
             return Err("program_refused");
         }
         Ok(())
+    }
+
+    pub(crate) fn has_program_binding(&self) -> bool {
+        self.binding.is_some()
     }
 
     pub(crate) fn is_candidate(&self) -> bool {

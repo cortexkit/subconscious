@@ -2735,7 +2735,7 @@ impl ControlHandler {
             if recovering
                 && channel_spawn
                     .as_ref()
-                    .is_none_or(|spawn| spawn.check().is_err())
+                    .is_none_or(|spawn| !spawn.has_program_binding() || spawn.check().is_err())
                 && !hello_value
                     .get("launch_nonce")
                     .and_then(|value| value.as_str())
@@ -2756,7 +2756,9 @@ impl ControlHandler {
                 .config_runtime
                 .as_ref()
                 .is_some_and(|owner| owner.module_is_gated(module))
-                && (channel_spawn.is_none()
+                && (channel_spawn
+                    .as_ref()
+                    .is_none_or(|spawn| !spawn.has_program_binding())
                     || self.config_runtime.as_ref().is_some_and(|owner| {
                         !recovering && owner.check_module_hold(module).is_err()
                     }))
@@ -2966,7 +2968,7 @@ impl ControlHandler {
         if recovering
             && channel_spawn
                 .as_ref()
-                .is_none_or(|spawn| spawn.check().is_err())
+                .is_none_or(|spawn| !spawn.has_program_binding() || spawn.check().is_err())
             && !hello.launch_nonce.as_deref().is_some_and(|nonce| {
                 self.supervisor.spawned_consumer_authorized(module, nonce)
                     && self
@@ -2981,7 +2983,9 @@ impl ControlHandler {
             )?]);
         }
         if required
-            && (channel_spawn.is_none()
+            && (channel_spawn
+                .as_ref()
+                .is_none_or(|spawn| !spawn.has_program_binding())
                 || self
                     .config_runtime
                     .as_ref()

@@ -2255,9 +2255,7 @@ impl ControlHandler {
                 // This additive operation is not part of the existing exhaustive
                 // module-control enum. Probe the op before decoding that enum.
                 let op = serde_json::from_slice::<ControlOpProbe>(&frame.body).ok();
-                if op.as_ref().is_some_and(|probe| probe.op == "claim.present") {
-                    return self.handle_claim_present(ctx, &frame, first).await;
-                }
+                let claim_present = op.as_ref().is_some_and(|probe| probe.op == "claim.present");
                 if let Some(refusal) = self
                     .recovery_request_refusal(
                         ctx,
@@ -2266,10 +2264,19 @@ impl ControlHandler {
                     )
                     .await?
                 {
+                    if claim_present {
+                        self.reclaim_presented_expiry(&frame);
+                        return self
+                            .refuse_claim_connection(ctx, &frame, "config_gated")
+                            .await;
+                    }
                     return Ok(vec![refusal]);
                 }
+                if claim_present {
+                    return self.handle_claim_present(ctx, &frame, first).await;
+                }
                 if op.as_ref().is_some_and(|probe| probe.op == "claim.mint") {
-                    return self.handle_claim_mint(ctx.connection_id, &frame).await;
+                    return self.handle_claim_mint(ctx, &frame).await;
                 }
                 if let Some(probe) = op
                     .as_ref()

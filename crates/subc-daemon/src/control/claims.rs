@@ -391,9 +391,10 @@ impl ControlHandler {
     }
     pub(super) async fn handle_claim_mint(
         &self,
-        connection: ConnectionId,
+        ctx: &RouteCtx,
         frame: &Frame,
     ) -> Result<Vec<Frame>, RouterError> {
+        let connection = ctx.connection_id;
         let request = match serde_json::from_slice::<ClaimMintRequest>(&frame.body) {
             Ok(request) => request,
             Err(_) => {
@@ -506,6 +507,13 @@ impl ControlHandler {
         if !verified || !self.claim_primary_registered(connection, &spawn) {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
         }
+        if self
+            .recovery_request_refusal(ctx, frame, Some("claim.mint"))
+            .await?
+            .is_some()
+        {
+            return self.claim_refusal(frame, "config_gated");
+        }
         let Ok(_alive) = spawn.begin_publication() else {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
         };
@@ -617,6 +625,28 @@ impl ControlHandler {
         false
     }
 
+    pub(super) fn reclaim_presented_expiry(&self, frame: &Frame) {
+        let Ok(request) = serde_json::from_slice::<ClaimPresentRequest>(&frame.body) else {
+            return;
+        };
+        let secret = request.claim.expose_secret();
+        let mut token = [0; 16];
+        if secret.len() != 22 || URL_SAFE_NO_PAD.decode_slice(secret, &mut token) != Ok(16) {
+            return;
+        }
+        let launch = self
+            .claims
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending
+            .get(&token)
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(launch) = launch {
+            self.reclaim_expired_claim(&launch, &token);
+        }
+    }
+
     async fn consume_claim(&self, ctx: &RouteCtx, frame: &Frame) -> Result<(), &'static str> {
         let connection = ctx.connection_id;
         let request = serde_json::from_slice::<ClaimPresentRequest>(&frame.body)
@@ -710,6 +740,14 @@ impl ControlHandler {
         if !verified || !self.claim_primary_registered(launch.primary, &registration) {
             return Err(error_codes::CLAIM_INVALID);
         }
+        if self
+            .recovery_request_refusal(ctx, frame, Some("claim.present"))
+            .await
+            .map_err(|_| "config_gated")?
+            .is_some()
+        {
+            return Err("config_gated");
+        }
         let _alive = registration
             .begin_publication()
             .map_err(|_| error_codes::CLAIM_INVALID)?;
@@ -789,6 +827,17 @@ pub(crate) mod tests {
     }
 
     impl Net {
+        pub(crate) fn connection_id(&self, handler: &ControlHandler) -> ConnectionId {
+            let peer = self.client.local_addr().unwrap();
+            *handler
+                .caller_endpoints
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(_, (_, remote))| *remote == peer)
+                .unwrap()
+                .0
+        }
         pub(crate) async fn send(&mut self, frame: Frame) {
             subc_transport::write_frame(&mut self.client, &frame)
                 .await

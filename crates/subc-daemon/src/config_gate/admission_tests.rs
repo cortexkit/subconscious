@@ -72,15 +72,7 @@ async fn claims_mint_obeys_recovery_and_resumes_after_approved_exit() {
     use crate::control::claims::tests::{error, request, Net};
     use subc_control::{ClaimMintRequest, ClaimPurpose};
     let mut fixture = gated_claim_fixture().await;
-    assert_eq!(
-        fixture
-            .primary
-            .call(request(ClaimMintRequest::new(ClaimPurpose::SelfConnection)))
-            .await
-            .header
-            .ty,
-        subc_protocol::FrameType::Response
-    );
+    let token = gated_claim_mint(&mut fixture.primary).await;
     std::fs::write(
         fixture
             .rig
@@ -98,6 +90,53 @@ async fn claims_mint_obeys_recovery_and_resumes_after_approved_exit() {
             .await,
         "config_gated",
     );
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = checks.clone();
+    fixture.spawn.set_content_probe_for_test(Arc::new(move || {
+        observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }));
+    for _ in 0..2 {
+        let mut consumer = Net::new(fixture.router.clone()).await;
+        error(
+            &consumer
+                .call(request(subc_control::ClaimPresentRequest::new(
+                    token.clone(),
+                )))
+                .await,
+            "config_gated",
+        );
+        assert!(consumer.recv().await.is_none());
+        assert!(
+            fixture.handler.claim_pending_for_test(&token),
+            "recovery refusal must preserve an unexpired bearer"
+        );
+        assert!(!fixture.handler.claim_reserved_for_test(&token));
+    }
+    assert_eq!(
+        checks.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "recovery refusals must not verify executable content"
+    );
+    fixture.handler.expire_claim_for_test(&token);
+    let mut expired = Net::new(fixture.router.clone()).await;
+    error(
+        &expired
+            .call(request(subc_control::ClaimPresentRequest::new(
+                token.clone(),
+            )))
+            .await,
+        "config_gated",
+    );
+    assert!(expired.recv().await.is_none());
+    assert!(
+        !fixture.handler.claim_pending_for_test(&token),
+        "recovery refusal must reclaim expired tokens"
+    );
+    assert_eq!(checks.load(std::sync::atomic::Ordering::Relaxed), 0);
+    fixture
+        .spawn
+        .set_content_probe_for_test(Arc::new(|| Ok(())));
     let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Unstamp);
     fixture.owner.complete_authority_exit(generation).unwrap();
     assert!(!fixture.owner.check_recovery().unwrap());
@@ -116,9 +155,23 @@ async fn claims_mint_obeys_recovery_and_resumes_after_approved_exit() {
         .wait_launch()
         .await;
     let mut primary = Net::new(fixture.router.clone()).await;
+    let ping = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Ping,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        2,
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        primary.call(ping).await.header.ty,
+        subc_protocol::FrameType::Pong
+    );
+    let connection = primary.connection_id(&fixture.handler);
     assert_eq!(
         primary
-            .call(module_hello(Some(proof), ConnectionId::new(2)))
+            .call(module_hello(Some(proof), connection))
             .await
             .header
             .ty,
@@ -134,6 +187,95 @@ async fn claims_mint_obeys_recovery_and_resumes_after_approved_exit() {
     );
     drop(primary);
     replacement.stop().await.unwrap();
+}
+
+async fn recovery_during_claim_verification(present: bool) {
+    use crate::control::claims::tests::{error, request, Net};
+    type Gate = Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+    struct Release(Gate);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0 .0.lock().unwrap() = true;
+            self.0 .1.notify_all();
+        }
+    }
+    let mut fixture = gated_claim_fixture().await;
+    let token = if present {
+        Some(gated_claim_mint(&mut fixture.primary).await)
+    } else {
+        None
+    };
+    let gate: Gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let release = Release(gate.clone());
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let observed = reached.clone();
+    fixture.spawn.set_content_probe_for_test(Arc::new(move || {
+        observed.notify_one();
+        let _ = gate
+            .1
+            .wait_timeout_while(
+                gate.0.lock().unwrap(),
+                Duration::from_secs(10),
+                |released| !*released,
+            )
+            .unwrap();
+        Ok(())
+    }));
+    let mut primary = Some(fixture.primary);
+    let mut peer = if present {
+        Net::new(fixture.router.clone()).await
+    } else {
+        primary.take().unwrap()
+    };
+    let frame = if let Some(token) = &token {
+        request(subc_control::ClaimPresentRequest::new(token.clone()))
+    } else {
+        request(subc_control::ClaimMintRequest::new(
+            subc_control::ClaimPurpose::SelfConnection,
+        ))
+    };
+    peer.send(frame).await;
+    tokio::time::timeout(Duration::from_secs(2), reached.notified())
+        .await
+        .expect("claim must reach its held verification after initial admission");
+    std::fs::write(
+        fixture
+            .rig
+            .path
+            .join("store")
+            .join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(fixture.owner.check_recovery().unwrap());
+    drop(release);
+    error(&peer.recv().await.unwrap(), "config_gated");
+    if let Some(token) = token {
+        assert!(peer.recv().await.is_none());
+        assert!(
+            fixture.handler.claim_pending_for_test(&token),
+            "recovery after verification must not consume the bearer"
+        );
+        assert!(!fixture.handler.claim_reserved_for_test(&token));
+    } else {
+        assert_eq!(
+            fixture.spawn.claims.get().unwrap().pending_count_for_test(),
+            0
+        );
+    }
+    drop(peer);
+    drop(primary);
+    fixture.module.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn claims_present_rechecks_recovery_after_content_verification() {
+    recovery_during_claim_verification(true).await;
+}
+
+#[tokio::test]
+async fn claims_mint_rechecks_recovery_after_content_verification() {
+    recovery_during_claim_verification(false).await;
 }
 
 async fn gated_claim_mint(primary: &mut crate::control::claims::tests::Net) -> subc_control::Claim {

@@ -3181,6 +3181,7 @@ impl ControlHandler {
             None => None,
         };
         if swap_candidate {
+            let module_id = hello.manifest.module_id.clone();
             let reply = self.register_swap_candidate(
                 connection_id,
                 sink,
@@ -3202,6 +3203,15 @@ impl ControlHandler {
                 {
                     spawn.hello_accepted();
                 }
+            } else if self
+                .registry
+                .get_module_by_connection(connection_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                self.supervisor
+                    .retire_unused_registration_channel(&module_id, hello.launch_nonce.as_deref());
             }
             return Ok(reply);
         }
@@ -3354,6 +3364,11 @@ impl ControlHandler {
 
         if let Some(spawn) = &channel_spawn {
             spawn.hello_accepted();
+        } else {
+            self.supervisor.retire_unused_registration_channel(
+                &registration.manifest.module_id,
+                hello.launch_nonce.as_deref(),
+            );
         }
         #[cfg(windows)]
         if let Some(nonce) = hello.launch_nonce.as_deref() {

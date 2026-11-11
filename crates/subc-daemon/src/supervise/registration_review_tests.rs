@@ -297,3 +297,103 @@ async fn registration_channel_gated_without_binding_never_admits_hello() {
     );
     assert!(!spawn.launch_ready());
 }
+
+#[tokio::test]
+async fn registration_channel_nonce_registration_retires_unused_endpoint() {
+    let handle = SupervisorHandle::new();
+    handle.set_spawn_nonce("channel-module", "legacy-test-nonce".into());
+    handle.set_reserved_nonce("channel-module", "legacy-test-nonce".into());
+    let spawn = RegistrationSpawn::new(&handle, "channel-module", SpawnRole::Plain, None);
+    spawn.ready();
+    let (auth, info) = auth();
+    let (router, mut channel, _copy) = serve(&handle, spawn.clone(), auth.clone());
+    subc_transport::authenticate_client(&mut channel, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(crate::server::serve_listener(listener, router, auth));
+    let mut nonce_connection = tokio::net::TcpStream::connect(address).await.unwrap();
+    subc_transport::authenticate_client(&mut nonce_connection, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let mut nonce_hello = hello("channel-module");
+    let mut body: subc_protocol::ModuleHelloBody =
+        serde_json::from_slice(&nonce_hello.body).unwrap();
+    body.launch_nonce = Some("legacy-test-nonce".into());
+    nonce_hello = Frame::build(
+        FrameType::Hello,
+        super::super::control_flags(),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
+    subc_transport::write_frame(&mut nonce_connection, &nonce_hello)
+        .await
+        .unwrap();
+    assert_eq!(
+        subc_transport::read_frame(&mut nonce_connection)
+            .await
+            .unwrap()
+            .unwrap()
+            .header
+            .ty,
+        FrameType::HelloAck
+    );
+    assert!(tokio::time::timeout(
+        Duration::from_secs(1),
+        subc_transport::read_frame(&mut channel)
+    )
+    .await
+    .expect("nonce registration must close its unused channel immediately")
+    .unwrap()
+    .is_none());
+    let _ = subc_transport::write_frame(&mut channel, &hello("channel-module")).await;
+    assert!(subc_transport::read_frame(&mut channel)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(!spawn.launch_ready());
+    server.abort();
+}
+
+#[tokio::test]
+async fn registration_channel_second_hello_finds_closed_endpoint() {
+    let handle = SupervisorHandle::new();
+    let spawn = RegistrationSpawn::new(&handle, "channel-module", SpawnRole::Plain, None);
+    spawn.ready();
+    let (auth, info) = auth();
+    let (_router, mut channel, _copy) = serve(&handle, spawn.clone(), auth);
+    subc_transport::authenticate_client(&mut channel, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    subc_transport::write_frame(&mut channel, &hello("channel-module"))
+        .await
+        .unwrap();
+    assert_eq!(
+        subc_transport::read_frame(&mut channel)
+            .await
+            .unwrap()
+            .unwrap()
+            .header
+            .ty,
+        FrameType::HelloAck
+    );
+    subc_transport::write_frame(&mut channel, &hello("channel-module"))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            subc_transport::read_frame(&mut channel)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .is_none(),
+        "a second HELLO cannot leave an accepted channel usable"
+    );
+    assert!(!spawn.launch_ready());
+}

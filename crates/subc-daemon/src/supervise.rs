@@ -2377,6 +2377,7 @@ pub struct SupervisorHandle {
     registration_test_channels: CapturedRegistrationChannels,
     registration_service: Arc<Mutex<Option<registration::RegistrationService>>>,
     registration_connections: Arc<Mutex<HashMap<ConnectionId, Arc<RegistrationSpawn>>>>,
+    registration_launches: Arc<Mutex<Vec<std::sync::Weak<RegistrationSpawn>>>>,
     program_bindings: program_binding::ProgramBindings,
     #[cfg(test)]
     identity_sample_pause: Arc<Mutex<Option<IdentitySamplePause>>>,
@@ -8078,7 +8079,7 @@ async fn supervise_loop(
                 .flatten();
             let registration_failed = async {
                 match &registration {
-                    Some(spawn) => spawn.wait_closed().await,
+                    Some(spawn) => spawn.wait_registration_failure().await,
                     None => std::future::pending().await,
                 }
             };

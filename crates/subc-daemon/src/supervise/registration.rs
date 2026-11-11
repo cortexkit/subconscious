@@ -24,6 +24,7 @@ pub(crate) struct RegistrationSpawn {
     pub(super) role: SpawnRole,
     hello_seen: AtomicBool,
     registered: AtomicBool,
+    nonce_registered: AtomicBool,
     deadline: std::sync::OnceLock<Instant>,
     launch: tokio::sync::watch::Sender<LaunchState>,
     transition: Mutex<()>,
@@ -33,6 +34,7 @@ pub(crate) struct RegistrationSpawn {
     endpoint: Mutex<Option<subc_os::registration_channel::RegistrationPipeShutdown>>,
     binding: Option<ProgramBindingPublication>,
     requires_binding: bool,
+    legacy_nonce_digest: Option<[u8; 32]>,
     pub(super) identity: std::sync::OnceLock<ProcessIdentity>,
     connections: Weak<Mutex<HashMap<ConnectionId, Arc<RegistrationSpawn>>>>,
 }
@@ -57,11 +59,21 @@ impl RegistrationSpawn {
         requires_binding: bool,
     ) -> Arc<Self> {
         let (launch, _) = tokio::sync::watch::channel(LaunchState::Pending);
+        let nonce = match role {
+            SpawnRole::Plain => handle.spawn_nonce(module),
+            SpawnRole::SwapCandidate => handle
+                .swaps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(module)
+                .map(|swap| swap.candidate_nonce.clone()),
+        };
         let spawn = Arc::new(Self {
             module_id: module.into(),
             role,
             hello_seen: AtomicBool::new(false),
             registered: AtomicBool::new(false),
+            nonce_registered: AtomicBool::new(false),
             deadline: std::sync::OnceLock::new(),
             launch,
             transition: Mutex::new(()),
@@ -69,12 +81,21 @@ impl RegistrationSpawn {
             endpoint: Mutex::new(None),
             binding,
             requires_binding,
+            legacy_nonce_digest: nonce
+                .filter(|nonce| !nonce.is_empty())
+                .map(|nonce| Sha256::digest(nonce.as_bytes()).into()),
             identity: std::sync::OnceLock::new(),
             connections: Arc::downgrade(&handle.registration_connections),
         });
         if let Some(binding) = &spawn.binding {
             binding.attach_registration(&spawn);
         }
+        let mut launches = handle
+            .registration_launches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        launches.retain(|launch| launch.strong_count() != 0);
+        launches.push(Arc::downgrade(&spawn));
         spawn
     }
 
@@ -101,8 +122,19 @@ impl RegistrationSpawn {
         self.retire();
     }
     pub(crate) fn retire(&self) {
+        self.retire_transition(self.transition.lock().unwrap_or_else(|p| p.into_inner()));
+    }
+
+    fn retire_unused(&self) {
+        let transition = self.transition.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.registered() {
+            self.nonce_registered.store(true, Ordering::Release);
+            self.retire_transition(transition);
+        }
+    }
+
+    fn retire_transition(&self, transition: std::sync::MutexGuard<'_, ()>) {
         {
-            let _transition = self.transition.lock().unwrap_or_else(|p| p.into_inner());
             if *self.launch.borrow() == LaunchState::Dead {
                 return;
             }
@@ -120,6 +152,7 @@ impl RegistrationSpawn {
                 endpoint.shutdown();
             }
         }
+        drop(transition);
         if let Some(binding) = &self.binding {
             binding.retire();
         }
@@ -178,6 +211,13 @@ impl RegistrationSpawn {
         }
     }
 
+    pub(crate) async fn wait_registration_failure(&self) {
+        self.wait_closed().await;
+        if self.registered() || self.nonce_registered.load(Ordering::Acquire) {
+            std::future::pending::<()>().await;
+        }
+    }
+
     pub(crate) fn admit_hello(&self, module: Option<&str>) -> Result<(), &'static str> {
         if self.hello_seen.swap(true, Ordering::AcqRel) {
             return Err("registration_channel_hello_repeated");
@@ -231,6 +271,28 @@ pub(crate) struct RegistrationService {
 }
 
 impl SupervisorHandle {
+    pub(crate) fn retire_unused_registration_channel(&self, module: &str, nonce: Option<&str>) {
+        let Some(nonce) = nonce.filter(|nonce| !nonce.is_empty()) else {
+            return;
+        };
+        let digest: [u8; 32] = Sha256::digest(nonce.as_bytes()).into();
+        let launches: Vec<_> = self
+            .registration_launches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|spawn| {
+                spawn.module_id == module
+                    && spawn
+                        .legacy_nonce_digest
+                        .is_some_and(|expected| constant_time_eq(&expected, &digest))
+            })
+            .collect();
+        for launch in launches {
+            launch.retire_unused();
+        }
+    }
     #[cfg(all(test, unix))]
     pub(crate) fn capture_registration_channels_for_test(&self) {
         *self.registration_test_channels.lock().unwrap() = Some(Vec::new());

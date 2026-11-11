@@ -5,7 +5,8 @@
 //!
 //! GOODBYE prevents the primary from issuing new connection claims and voids
 //! pending tokens only. Already-bound consumers belong to the launch, so they
-//! remain connected until retirement (observed exit or permanent program refusal).
+//! remain connected until retirement: the launch's process is seen to exit, or the
+//! daemon permanently refuses the module's program because its content check failed.
 //!
 //! Quota and single-use reservations cover the unlocked content-verification
 //! interval. Concurrent attempts cannot overbook a limit or hash the same token

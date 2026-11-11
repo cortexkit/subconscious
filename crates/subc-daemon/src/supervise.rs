@@ -3053,17 +3053,19 @@ impl SupervisorHandle {
         SwapHelloAdmission::Refused
     }
 
-    /// Record that the swap token has registered a candidate, so it admits no
-    /// second HELLO.
-    pub(crate) fn mark_swap_candidate_admitted(&self, module_id: &str) {
-        if let Some(swap) = self
-            .swaps
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Exclude swap closure through the short, synchronous candidate publication.
+    pub(crate) fn with_swap_candidate_admission<T>(
+        &self,
+        module_id: &str,
+        publish: impl FnOnce() -> (T, bool),
+    ) -> Option<T> {
+        let mut swaps = self.swaps.lock().unwrap_or_else(|p| p.into_inner());
+        let swap = swaps
             .get_mut(module_id)
-        {
-            swap.candidate_admitted = true;
-        }
+            .filter(|swap| !swap.candidate_admitted)?;
+        let (result, admitted) = publish();
+        swap.candidate_admitted = admitted;
+        Some(result)
     }
 
     /// Test/support lookup for the current launch nonce of a supervised spawn.

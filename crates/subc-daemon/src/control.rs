@@ -3428,6 +3428,51 @@ impl ControlHandler {
         #[cfg(windows)] launch_nonce: Option<&str>,
     ) -> Result<Vec<Frame>, RouterError> {
         let module_id = manifest.module_id.clone();
+        // Closing a swap and publishing its candidate must be ordered. The
+        // spawn role proves which slot is intended, not that the slot is open.
+        self.supervisor
+            .with_swap_candidate_admission(&module_id, || {
+                let reply = self.publish_swap_candidate(
+                    connection_id,
+                    sink,
+                    frame,
+                    manifest,
+                    negotiated_ver,
+                    control_ops,
+                    hello_ack,
+                    #[cfg(windows)]
+                    launch_nonce,
+                );
+                let admitted = self
+                    .registry
+                    .get_candidate(&module_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|candidate| candidate.connection_id == connection_id);
+                (reply, admitted)
+            })
+            .unwrap_or_else(|| {
+                Ok(vec![control_error_frame(
+                    frame,
+                    "swap_token_invalid",
+                    "swap ended before candidate HELLO publication",
+                )?])
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_swap_candidate(
+        &self,
+        connection_id: ConnectionId,
+        sink: Option<crate::FrameSink>,
+        frame: &Frame,
+        manifest: ModuleManifest,
+        negotiated_ver: u8,
+        control_ops: Vec<String>,
+        hello_ack: Frame,
+        #[cfg(windows)] launch_nonce: Option<&str>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let module_id = manifest.module_id.clone();
         let registration = match self.registry.register_unpublished_verified_candidate_with_control_ops(
             manifest,
             negotiated_ver,
@@ -3505,7 +3550,6 @@ impl ControlHandler {
             );
             return Ok(reply);
         }
-        self.supervisor.mark_swap_candidate_admitted(&module_id);
         info!(
             module_id = %module_id,
             module_version = %registration.manifest.module_version,

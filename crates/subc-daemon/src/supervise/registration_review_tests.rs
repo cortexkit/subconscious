@@ -326,6 +326,37 @@ async fn registration_channel_own_id_still_obeys_reserved_prefix_owner() {
 }
 
 #[tokio::test]
+async fn registration_channel_candidate_cannot_register_after_swap_closes() {
+    let handle = SupervisorHandle::new();
+    handle.open_swap("channel-module", "candidate".into());
+    let registry = Arc::new(Registry::default());
+    let control = crate::ControlHandler::new(registry.clone()).with_supervisor(handle.clone());
+    let spawn = RegistrationSpawn::new(&handle, "channel-module", SpawnRole::SwapCandidate, None);
+    spawn.ready();
+    let (auth, info) = auth();
+    let (_router, mut child, _copy) = serve_control(&handle, spawn, auth, control);
+    subc_transport::authenticate_client(&mut child, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    handle.close_swap("channel-module");
+    subc_transport::write_frame(&mut child, &hello("channel-module"))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            subc_transport::read_frame(&mut child)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .is_none(),
+        "a closed swap cannot admit a late candidate HELLO"
+    );
+    assert!(registry.get_candidate("channel-module").unwrap().is_none());
+}
+
+#[tokio::test]
 async fn registration_channel_gated_without_binding_never_admits_hello() {
     let handle = SupervisorHandle::new();
     let spawn = RegistrationSpawn::new_with_binding_requirement(

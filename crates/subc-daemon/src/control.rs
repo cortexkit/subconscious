@@ -1328,7 +1328,7 @@ impl ControlHandler {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_hello_inside_publication_hold(
         mut self,
         hold: Arc<std::sync::Barrier>,

@@ -34,7 +34,6 @@ pub(crate) struct RegistrationSpawn {
     endpoint: Mutex<Option<subc_os::registration_channel::RegistrationPipeShutdown>>,
     binding: Option<ProgramBindingPublication>,
     requires_binding: bool,
-    legacy_nonce_digest: Option<[u8; 32]>,
     pub(super) identity: std::sync::OnceLock<ProcessIdentity>,
     connections: Weak<Mutex<HashMap<ConnectionId, Arc<RegistrationSpawn>>>>,
 }
@@ -68,15 +67,6 @@ impl RegistrationSpawn {
         requires_binding: bool,
     ) -> Arc<Self> {
         let (launch, _) = tokio::sync::watch::channel(LaunchState::Pending);
-        let nonce = match role {
-            SpawnRole::Plain => handle.spawn_nonce(module),
-            SpawnRole::SwapCandidate => handle
-                .swaps
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(module)
-                .map(|swap| swap.candidate_nonce.clone()),
-        };
         let spawn = Arc::new(Self {
             module_id: module.into(),
             role,
@@ -90,9 +80,6 @@ impl RegistrationSpawn {
             endpoint: Mutex::new(None),
             binding,
             requires_binding,
-            legacy_nonce_digest: nonce
-                .filter(|nonce| !nonce.is_empty())
-                .map(|nonce| Sha256::digest(nonce.as_bytes()).into()),
             identity: std::sync::OnceLock::new(),
             connections: Arc::downgrade(&handle.registration_connections),
         });
@@ -303,25 +290,19 @@ pub(crate) struct RegistrationService {
 }
 
 impl SupervisorHandle {
-    pub(crate) fn retire_unused_registration_channel(&self, module: &str, nonce: Option<&str>) {
-        let Some(nonce) = nonce.filter(|nonce| !nonce.is_empty()) else {
-            return;
-        };
-        let digest: [u8; 32] = Sha256::digest(nonce.as_bytes()).into();
-        let launches: Vec<_> = self
+    pub(crate) fn retire_unused_registration_channel(&self, module: &str, candidate: bool) {
+        // Successful registration claims the id even when legacy policy did
+        // not require a nonce. Resolve its unused endpoint from our launch
+        // history, not a credential supplied by that registration.
+        let launch = self
             .registration_launches
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .iter()
+            .rev()
             .filter_map(Weak::upgrade)
-            .filter(|spawn| {
-                spawn.module_id == module
-                    && spawn
-                        .legacy_nonce_digest
-                        .is_some_and(|expected| constant_time_eq(&expected, &digest))
-            })
-            .collect();
-        for launch in launches {
+            .find(|spawn| spawn.module_id == module && spawn.is_candidate() == candidate);
+        if let Some(launch) = launch {
             launch.retire_unused();
         }
     }

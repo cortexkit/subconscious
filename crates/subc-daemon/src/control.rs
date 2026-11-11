@@ -3214,7 +3214,7 @@ impl ControlHandler {
                 .is_some()
             {
                 self.supervisor
-                    .retire_unused_registration_channel(&module_id, hello.launch_nonce.as_deref());
+                    .retire_unused_registration_channel(&module_id, true);
             }
             return Ok(reply);
         }
@@ -3368,10 +3368,8 @@ impl ControlHandler {
         if let Some(spawn) = &channel_spawn {
             spawn.hello_accepted();
         } else {
-            self.supervisor.retire_unused_registration_channel(
-                &registration.manifest.module_id,
-                hello.launch_nonce.as_deref(),
-            );
+            self.supervisor
+                .retire_unused_registration_channel(&registration.manifest.module_id, false);
         }
         #[cfg(windows)]
         if let Some(nonce) = hello.launch_nonce.as_deref() {

@@ -300,9 +300,20 @@ async fn registration_channel_gated_without_binding_never_admits_hello() {
 
 #[tokio::test]
 async fn registration_channel_nonce_registration_retires_unused_endpoint() {
+    tcp_registration_retires_unused_endpoint(true).await;
+}
+
+#[tokio::test]
+async fn registration_channel_nonce_less_registration_retires_unused_endpoint() {
+    tcp_registration_retires_unused_endpoint(false).await;
+}
+
+async fn tcp_registration_retires_unused_endpoint(present_nonce: bool) {
     let handle = SupervisorHandle::new();
     handle.set_spawn_nonce("channel-module", "legacy-test-nonce".into());
-    handle.set_reserved_nonce("channel-module", "legacy-test-nonce".into());
+    if present_nonce {
+        handle.set_reserved_nonce("channel-module", "legacy-test-nonce".into());
+    }
     let spawn = RegistrationSpawn::new(&handle, "channel-module", SpawnRole::Plain, None);
     spawn.ready();
     let (auth, info) = auth();
@@ -320,7 +331,7 @@ async fn registration_channel_nonce_registration_retires_unused_endpoint() {
     let mut nonce_hello = hello("channel-module");
     let mut body: subc_protocol::ModuleHelloBody =
         serde_json::from_slice(&nonce_hello.body).unwrap();
-    body.launch_nonce = Some("legacy-test-nonce".into());
+    body.launch_nonce = present_nonce.then(|| "legacy-test-nonce".into());
     nonce_hello = Frame::build(
         FrameType::Hello,
         super::super::control_flags(),

@@ -657,17 +657,13 @@ mod tests {
 
     #[cfg(unix)]
     async fn hello_rollback_case(candidate: bool) {
+        let worker = if candidate {
+            "supervise::registration::tests::candidate_hello_forwarding_rollback_worker"
+        } else {
+            "supervise::registration::tests::ordinary_hello_forwarding_rollback_worker"
+        };
         let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "supervise::registration::tests::hello_forwarding_rollback_worker",
-                "--ignored",
-                "--nocapture",
-            ])
-            .env(
-                "SUBC_TEST_HELLO_ROLLBACK",
-                if candidate { "candidate" } else { "ordinary" },
-            )
+            .args(["--exact", worker, "--ignored", "--nocapture"])
             .kill_on_drop(true)
             .spawn()
             .unwrap();
@@ -695,8 +691,19 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "subprocess fixture; invoked only by the bounded rollback tests"]
-    async fn hello_forwarding_rollback_worker() {
-        let candidate = std::env::var("SUBC_TEST_HELLO_ROLLBACK").unwrap() == "candidate";
+    async fn ordinary_hello_forwarding_rollback_worker() {
+        hello_forwarding_rollback_worker(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "subprocess fixture; invoked only by the bounded rollback tests"]
+    async fn candidate_hello_forwarding_rollback_worker() {
+        hello_forwarding_rollback_worker(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn hello_forwarding_rollback_worker(candidate: bool) {
         let (handle, registry, control) = setup();
         if candidate {
             assert_eq!(

@@ -45,6 +45,10 @@ impl RegistrationSpawn {
     pub(crate) fn set_content_probe_for_test(&self, probe: content_binding::ContentProbe) {
         self.binding.as_ref().unwrap().set_content_probe(probe);
     }
+    #[cfg(all(test, unix))]
+    pub(crate) fn defer_content_kill_for_test(&self) -> impl Drop {
+        self.binding.as_ref().unwrap().defer_content_kill_for_test()
+    }
 
     #[cfg(all(test, unix))]
     pub(crate) fn content_was_refused_for_test(&self) -> bool {

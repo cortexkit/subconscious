@@ -132,6 +132,131 @@ async fn claims_mint_obeys_recovery_and_resumes_after_approved_exit() {
     replacement.stop().await.unwrap();
 }
 
+async fn gated_claim_mint(primary: &mut crate::control::claims::tests::Net) -> subc_control::Claim {
+    use crate::control::claims::tests::request;
+    let reply = primary
+        .call(request(subc_control::ClaimMintRequest::new(
+            subc_control::ClaimPurpose::SelfConnection,
+        )))
+        .await;
+    assert_eq!(reply.header.ty, subc_protocol::FrameType::Response);
+    serde_json::from_slice::<subc_control::ClaimMintReply>(&reply.body)
+        .unwrap()
+        .claim
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claims_live_program_refusal_revokes_before_kill_or_exit_observation() {
+    use crate::control::claims::tests::{error, request, Net};
+    let mut fixture = gated_claim_fixture().await;
+    let token = gated_claim_mint(&mut fixture.primary).await;
+    let pending = gated_claim_mint(&mut fixture.primary).await;
+    let mut consumer = Net::new(fixture.router.clone()).await;
+    assert_eq!(
+        consumer
+            .call(request(subc_control::ClaimPresentRequest::new(token)))
+            .await
+            .header
+            .ty,
+        subc_protocol::FrameType::Response
+    );
+    // Only the test build can postpone the kill. Dropping this guard signals the
+    // original container even if an assertion panics, before fixture teardown.
+    let kill = fixture.spawn.defer_content_kill_for_test();
+    fixture.spawn.set_content_probe_for_test(Arc::new(|| {
+        Err(GateError::new("program_refused", "content witness changed"))
+    }));
+    error(
+        &fixture
+            .primary
+            .call(request(subc_control::ClaimMintRequest::new(
+                subc_control::ClaimPurpose::Helper,
+            )))
+            .await,
+        "claim_mint_not_allowed",
+    );
+    assert!(
+        !fixture.spawn.launch_ready(),
+        "permanent refusal must retire registration before killing the process"
+    );
+    assert!(
+        fixture.module.status().unwrap().process_alive,
+        "the child must still be alive while claims are revoked"
+    );
+    assert!(
+        consumer.recv().await.is_none(),
+        "content refusal must close claim-bound connections before exit"
+    );
+    let mut stale = Net::new(fixture.router.clone()).await;
+    error(
+        &stale
+            .call(request(subc_control::ClaimPresentRequest::new(pending)))
+            .await,
+        "claim_invalid",
+    );
+    assert!(stale.recv().await.is_none());
+    assert!(fixture.module.status().unwrap().process_alive);
+    drop(kill);
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn claims_transient_content_deferral_does_not_retire_live_registration() {
+    use crate::control::claims::tests::{error, request, Net};
+    let mut fixture = gated_claim_fixture().await;
+    let token = gated_claim_mint(&mut fixture.primary).await;
+    let mut consumer = Net::new(fixture.router.clone()).await;
+    assert_eq!(
+        consumer
+            .call(request(subc_control::ClaimPresentRequest::new(token)))
+            .await
+            .header
+            .ty,
+        subc_protocol::FrameType::Response
+    );
+    fixture.spawn.set_content_probe_for_test(Arc::new(|| {
+        Err(GateError::new(
+            "config_delivery_deferred",
+            "content witness temporarily busy",
+        ))
+    }));
+    error(
+        &fixture
+            .primary
+            .call(request(subc_control::ClaimMintRequest::new(
+                subc_control::ClaimPurpose::Helper,
+            )))
+            .await,
+        "claim_mint_not_allowed",
+    );
+    assert!(
+        fixture.spawn.launch_ready(),
+        "transient content deferral must not retire registration"
+    );
+    assert!(!fixture.spawn.content_was_refused_for_test());
+    assert!(fixture.module.status().unwrap().process_alive);
+    let ping = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Ping,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        9,
+        Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        consumer.call(ping).await.header.ty,
+        subc_protocol::FrameType::Pong
+    );
+    fixture
+        .spawn
+        .set_content_probe_for_test(Arc::new(|| Ok(())));
+    drop(consumer);
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
 fn rig() -> Rig {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

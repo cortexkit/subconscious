@@ -4,8 +4,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(all(test, unix))]
 pub(super) type ContentProbe = Arc<dyn Fn() -> Result<(), GateError> + Send + Sync>;
+#[cfg(all(test, unix))]
+pub(super) struct ContentKillDeferral(Arc<LiveProgramBinding>);
+
+#[cfg(all(test, unix))]
+impl Drop for ContentKillDeferral {
+    fn drop(&mut self) {
+        self.0.kill_deferred.store(false, Ordering::Release);
+        self.0.kill_container();
+    }
+}
 
 pub(super) struct LiveProgramBinding {
+    registration: std::sync::Weak<RegistrationSpawn>,
     launch: Mutex<ProgramLaunch>,
     process: subc_os::Process,
     start: u64,
@@ -14,6 +25,8 @@ pub(super) struct LiveProgramBinding {
     refused: AtomicBool,
     #[cfg(all(test, unix))]
     content_probe: Mutex<Option<ContentProbe>>,
+    #[cfg(all(test, unix))]
+    kill_deferred: AtomicBool,
     container: Option<Arc<containment::CarriedContainment>>,
     #[cfg(target_os = "linux")]
     cgroup: Option<(subc_cgroup::Placement, String)>,
@@ -28,6 +41,11 @@ impl LiveProgramBinding {
         base: subc_config::Digest,
     ) -> Option<Arc<Self>> {
         Some(Arc::new(Self {
+            registration: child
+                .registration_spawn
+                .as_ref()
+                .map(Arc::downgrade)
+                .unwrap_or_default(),
             launch: Mutex::new(launch),
             process: subc_os::Process::open(child.pid).ok()??,
             start: child.process_start_time?,
@@ -36,6 +54,8 @@ impl LiveProgramBinding {
             refused: AtomicBool::new(false),
             #[cfg(all(test, unix))]
             content_probe: Mutex::new(None),
+            #[cfg(all(test, unix))]
+            kill_deferred: AtomicBool::new(false),
             container: child.child.container(),
             #[cfg(target_os = "linux")]
             cgroup: child
@@ -54,12 +74,28 @@ impl LiveProgramBinding {
     pub(super) fn set_content_probe(&self, probe: ContentProbe) {
         *self.content_probe.lock().unwrap() = Some(probe);
     }
+    #[cfg(all(test, unix))]
+    pub(super) fn defer_kill_for_test(self: &Arc<Self>) -> ContentKillDeferral {
+        self.kill_deferred.store(true, Ordering::Release);
+        ContentKillDeferral(self.clone())
+    }
     pub(super) fn check(&self) -> Result<(), GateError> {
         let result = self.verdict();
         if let Err(error) = &result {
             if error.code == "program_refused" {
                 self.refused.store(true, Ordering::Release);
-                self.kill_container();
+                // A refused image loses its claims before the kill can race
+                // helpers or wait for the supervisor to observe process exit.
+                if let Some(registration) = self.registration.upgrade() {
+                    registration.retire();
+                }
+                #[cfg(all(test, unix))]
+                let kill_now = !self.kill_deferred.load(Ordering::Acquire);
+                #[cfg(not(all(test, unix)))]
+                let kill_now = true;
+                if kill_now {
+                    self.kill_container();
+                }
                 let module = self
                     .launch
                     .lock()

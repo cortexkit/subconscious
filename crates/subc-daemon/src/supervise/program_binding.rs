@@ -92,6 +92,15 @@ impl ProgramBindingPublication {
             .unwrap()
             .set_content_probe(probe);
     }
+    #[cfg(all(test, unix))]
+    pub(super) fn defer_content_kill_for_test(&self) -> content_binding::ContentKillDeferral {
+        self.live
+            .lock()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+            .defer_kill_for_test()
+    }
 
     #[cfg(all(test, unix))]
     pub(super) fn content_was_refused(&self) -> bool {

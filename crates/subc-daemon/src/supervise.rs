@@ -2785,7 +2785,6 @@ impl SupervisorHandle {
         presented: Option<&str>,
         channel: bool,
     ) -> Result<ReservedHelloVerification, ReservedHelloRejection> {
-        let presented = presented.filter(|nonce| !nonce.is_empty());
         let nonces = self
             .reserved_nonces
             .lock()
@@ -2796,8 +2795,9 @@ impl SupervisorHandle {
             // minted. Only a real minted nonce admits, in constant time.
             let authorized = channel
                 || match expected {
-                    Some(expected) => presented
-                        .is_some_and(|p| constant_time_eq(expected.as_bytes(), p.as_bytes())),
+                    Some(expected) => presented.is_some_and(|p| {
+                        !p.is_empty() && constant_time_eq(expected.as_bytes(), p.as_bytes())
+                    }),
                     None => false,
                 };
             if authorized {
@@ -2839,7 +2839,7 @@ impl SupervisorHandle {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&owner_module_id)
-                .is_some_and(|expected| constant_time_eq(expected.as_bytes(), presented.as_bytes()))
+                .is_some_and(|expected| !presented.is_empty() && constant_time_eq(expected.as_bytes(), presented.as_bytes()))
                 // While the owner is being swapped, children started by
                 // either of its two processes hold that process's nonce.
                 || self.swap_nonce_matches(&owner_module_id, presented)
@@ -2863,16 +2863,16 @@ impl SupervisorHandle {
     /// Absence of an expected spawn nonce is a hard failure: consumer_identity is
     /// accepted only for module ids the supervisor has spawned.
     pub fn spawned_consumer_authorized(&self, module_id: &str, presented: &str) -> bool {
-        if self.module_is_gated(module_id) || presented.is_empty() {
+        if self.module_is_gated(module_id) {
             return false;
         }
         let nonces = self
             .spawn_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let current = nonces
-            .get(module_id)
-            .is_some_and(|expected| constant_time_eq(expected.as_bytes(), presented.as_bytes()));
+        let current = nonces.get(module_id).is_some_and(|expected| {
+            !presented.is_empty() && constant_time_eq(expected.as_bytes(), presented.as_bytes())
+        });
         drop(nonces);
         // Before cutover both launches may attest. Promotion removes the
         // incumbent's token even if its process still needs time to drain.

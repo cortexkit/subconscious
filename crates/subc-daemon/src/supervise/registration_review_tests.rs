@@ -548,6 +548,99 @@ async fn registration_nonce_policy_empty_swap_token_never_authorizes_prefix() {
 }
 
 #[tokio::test]
+async fn registration_nonce_policy_empty_current_token_never_authorizes_prefix() {
+    let handle = SupervisorHandle::new();
+    handle.set_reserved_prefixes("prefix-owner", &["prefix:".into()]);
+    handle.set_spawn_nonce("prefix-owner", String::new());
+    let reply = nonce_hello_over_tcp(handle, "prefix:child", "").await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+}
+
+#[tokio::test]
+async fn registration_nonce_policy_empty_exact_token_never_authorizes_hello() {
+    let handle = SupervisorHandle::new();
+    handle.set_reserved_nonce("channel-module", String::new());
+    let reply = nonce_hello_over_tcp(handle, "channel-module", "").await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+}
+
+#[tokio::test]
+async fn registration_nonce_policy_empty_candidate_token_never_authorizes_hello() {
+    let handle = SupervisorHandle::new();
+    handle.open_swap("channel-module", String::new());
+    let reply = nonce_hello_over_tcp(handle, "channel-module", "").await;
+    assert_eq!(reply.header.ty, FrameType::Error);
+}
+
+async fn activity_identity_over_tcp(handle: SupervisorHandle, token: &str) -> serde_json::Value {
+    let control = crate::ControlHandler::new(Arc::new(Registry::default())).with_supervisor(handle);
+    let router = Arc::new(crate::Router::with_control_handler(Arc::new(control)));
+    let (auth, info) = auth();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(crate::server::serve_listener(listener, router, auth));
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    subc_transport::authenticate_client(&mut client, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let request = Frame::build(
+        FrameType::Request,
+        super::super::control_flags(),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&serde_json::json!({"op":"activity.query", "limit":1,
+            "consumer_identity":{"module_id":"callosum", "launch_nonce":token}}))
+        .unwrap(),
+    )
+    .unwrap();
+    subc_transport::write_frame(&mut client, &request)
+        .await
+        .unwrap();
+    let reply = subc_transport::read_frame(&mut client)
+        .await
+        .unwrap()
+        .unwrap();
+    server.abort();
+    serde_json::from_slice(&reply.body).unwrap()
+}
+
+#[tokio::test]
+async fn registration_nonce_policy_empty_current_token_never_attests_consumer() {
+    let handle = SupervisorHandle::new();
+    handle.set_spawn_nonce("callosum", String::new());
+    assert_eq!(
+        activity_identity_over_tcp(handle, "").await["code"],
+        "activity_read_forbidden"
+    );
+}
+
+#[tokio::test]
+async fn registration_nonce_policy_empty_promotion_clears_spawn_attestation() {
+    let handle = SupervisorHandle::new();
+    handle.set_spawn_nonce("callosum", "incumbent".into());
+    handle.open_swap("callosum", String::new());
+    handle.promote_swap_nonce("callosum", false);
+    handle.close_swap("callosum");
+    assert_eq!(
+        activity_identity_over_tcp(handle, "incumbent").await["code"],
+        "activity_read_forbidden"
+    );
+}
+
+#[tokio::test]
+async fn registration_nonce_policy_empty_promotion_clears_incumbent_swap_attestation() {
+    let handle = SupervisorHandle::new();
+    handle.set_spawn_nonce("callosum", "incumbent".into());
+    handle.open_swap("callosum", String::new());
+    handle.promote_swap_nonce("callosum", false);
+    assert_eq!(
+        activity_identity_over_tcp(handle, "incumbent").await["code"],
+        "activity_read_forbidden"
+    );
+}
+
+#[tokio::test]
 async fn registration_nonce_policy_empty_promotion_clears_incumbent_authority() {
     let handle = SupervisorHandle::new();
     handle.set_spawn_nonce("channel-module", "old-incumbent".into());

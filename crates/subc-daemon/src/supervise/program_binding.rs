@@ -83,6 +83,24 @@ impl ProgramBindingRetirement {
 }
 
 impl ProgramBindingPublication {
+    #[cfg(all(test, unix))]
+    pub(super) fn set_content_probe(&self, probe: content_binding::ContentProbe) {
+        self.live
+            .lock()
+            .unwrap()
+            .upgrade()
+            .unwrap()
+            .set_content_probe(probe);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn content_was_refused(&self) -> bool {
+        self.live
+            .lock()
+            .unwrap()
+            .upgrade()
+            .is_none_or(|live| live.is_refused())
+    }
     pub(super) fn attach_registration(&self, spawn: &Arc<RegistrationSpawn>) {
         *self.registration.lock().unwrap_or_else(|p| p.into_inner()) = Arc::downgrade(spawn);
     }
@@ -91,6 +109,16 @@ impl ProgramBindingPublication {
         &self.key.1
     }
     pub(super) fn check(&self) -> Result<(), crate::config_gate::GateError> {
+        self.verified_live()?.check()
+    }
+
+    pub(super) fn verdict(&self) -> Result<(), crate::config_gate::GateError> {
+        self.verified_live()?.verdict()
+    }
+
+    fn verified_live(
+        &self,
+    ) -> Result<Arc<content_binding::LiveProgramBinding>, crate::config_gate::GateError> {
         if *self.signal.borrow() != Some(true)
             || self.retired.load(std::sync::atomic::Ordering::Acquire)
         {
@@ -108,8 +136,7 @@ impl ProgramBindingPublication {
                     "program_refused",
                     "live launch witness is unavailable",
                 )
-            })?
-            .check()
+            })
     }
 
     #[cfg(windows)]

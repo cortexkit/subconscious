@@ -57,6 +57,134 @@ struct Fixture {
     plan: subc_control::config::ConfigPlanView,
 }
 
+async fn status_over_real_server(fixture: &Fixture) {
+    let router = Arc::new(crate::Router::with_control_handler(fixture.handler.clone()));
+    let info = subc_transport::ConnectionInfo {
+        schema: subc_transport::SCHEMA_VERSION,
+        wire_version: None,
+        endpoints: vec![],
+        key: vec![0x42; 32],
+        daemon_id: [0x24; 16],
+        pid: std::process::id(),
+        daemon_ver: "test".into(),
+    };
+    static NEXT_SOCKET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let relative_root = if cwd == root {
+        "target/scratch"
+    } else {
+        assert_eq!(cwd, root.join("crates/subc-daemon"));
+        "../../target/scratch"
+    };
+    let path = std::path::PathBuf::from(relative_root).join(format!(
+        "phone-verdict-{}-{}.sock",
+        std::process::id(),
+        NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+    ));
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let bound = crate::local_listener::BoundLocalListener::Unix {
+        listener,
+        path: path.clone(),
+    };
+    let server = tokio::spawn(crate::server::serve_local_listener(
+        bound,
+        router,
+        crate::server::ServerAuth::new(info.key.clone(), info.daemon_id, "test"),
+    ));
+    let mut client = tokio::net::UnixStream::connect(path).await.unwrap();
+    subc_transport::authenticate_client(&mut client, &info, std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
+    let status = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&ConfigControlRequest::Status {}).unwrap(),
+    )
+    .unwrap();
+    subc_transport::write_frame(&mut client, &status)
+        .await
+        .unwrap();
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        subc_transport::read_frame(&mut client),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn config_phone_verdict_hashes_once_off_async_worker_over_real_server() {
+    let fixture = Fixture::build(true).await;
+    let spawn = fixture
+        .handler
+        .supervisor
+        .registration_spawn(PHONE)
+        .unwrap();
+    let threads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = threads.clone();
+    spawn.set_content_probe_for_test(Arc::new(move || {
+        observed.lock().unwrap().push(std::thread::current().id());
+        Ok(())
+    }));
+    let async_thread = std::thread::current().id();
+    status_over_real_server(&fixture).await;
+    let threads = threads.lock().unwrap().clone();
+    fixture.stop().await;
+    assert_eq!(
+        threads.len(),
+        1,
+        "one phone-surface evaluation hashes content once"
+    );
+    assert!(
+        threads.iter().all(|thread| *thread != async_thread),
+        "content verification belongs on a blocking worker"
+    );
+}
+
+#[tokio::test]
+async fn config_phone_verdict_refusal_never_kills_from_real_status_request() {
+    let fixture = Fixture::build(true).await;
+    let spawn = fixture
+        .handler
+        .supervisor
+        .registration_spawn(PHONE)
+        .unwrap();
+    spawn.set_content_probe_for_test(Arc::new(|| {
+        Err(GateError::new(
+            "program_refused",
+            "test content witness changed",
+        ))
+    }));
+    status_over_real_server(&fixture).await;
+    let refused = spawn.content_was_refused_for_test();
+    let alive = fixture.module.status().unwrap().process_alive;
+    fixture.stop().await;
+    assert!(
+        !refused,
+        "a phone eligibility verdict must not record refusal or kill the launch"
+    );
+    assert!(
+        alive,
+        "a read-only status request must not kill a refused phone surface"
+    );
+}
+
 impl Fixture {
     async fn new() -> Self {
         Self::build(false).await
@@ -158,9 +286,7 @@ impl Fixture {
         let registry = Arc::new(Registry::default());
         let forwarding = Arc::new(crate::ForwardingTable::default());
         let handle = SupervisorHandle::new();
-        if lifecycle {
-            handle.capture_registration_channels_for_test();
-        }
+        handle.capture_registration_channels_for_test();
         let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
             .with_handle(handle.clone())
             .with_forwarding(forwarding.clone())
@@ -169,11 +295,7 @@ impl Fixture {
                 ..Default::default()
             })
             .with_drain_timeout(std::time::Duration::from_millis(10));
-        let supervisor = if lifecycle {
-            supervisor.with_config_runtime(owner.clone())
-        } else {
-            supervisor
-        };
+        let supervisor = supervisor.with_config_runtime(owner.clone());
         let (config, _) = crate::daemon_config::parse_with_activity(
             &std::fs::read_to_string(path.join("subc.jsonc")).unwrap(),
             path.join("subc.jsonc"),
@@ -185,18 +307,12 @@ impl Fixture {
             .find(|entry| entry.module_id == "callosum")
             .unwrap()
             .module_spec();
-        let module = if lifecycle {
-            supervisor.spawn_async(spec).await.unwrap()
-        } else {
-            supervisor.spawn(spec).unwrap()
-        };
+        let module = supervisor.spawn_async(spec).await.unwrap();
         let nonce = handle.spawn_launch_nonce_for("callosum");
-        if lifecycle {
-            handle
-                .registration_for_test("callosum")
-                .unwrap()
-                .bind(PHONE);
-        }
+        handle
+            .registration_for_test("callosum")
+            .unwrap()
+            .bind(PHONE);
         let handler = Arc::new(
             ControlHandler::with_forwarding(registry.clone(), forwarding.clone())
                 .with_supervisor(handle)
@@ -573,8 +689,7 @@ async fn config_phone_relay_cancel_disconnect_and_target_change_withdraw_without
 }
 
 #[tokio::test]
-async fn config_phone_surface_uses_compiled_policy_admission_and_current_nonce_not_the_module_name()
-{
+async fn config_phone_surface_requires_compiled_policy_and_current_program_binding() {
     let mut fixture = Fixture::new().await;
     assert!(fixture.handler.config_phone_surface().await.is_some());
     Arc::get_mut(&mut fixture.handler)
@@ -601,19 +716,19 @@ async fn config_phone_surface_uses_compiled_policy_admission_and_current_nonce_n
         .unwrap()
         .operator_app_policy
         .phone_enabled = true;
-    Arc::get_mut(&mut fixture.handler)
-        .unwrap()
-        .config_review_admission = Arc::new(crate::config_gate::MissingReviewAdmission);
-    assert!(fixture.handler.config_phone_surface().await.is_none());
-    Arc::get_mut(&mut fixture.handler)
-        .unwrap()
-        .config_review_admission = Arc::new(Admitted);
+    let binding = fixture
+        .handler
+        .supervisor
+        .registration_spawn(PHONE)
+        .unwrap();
     fixture
         .handler
-        .hello_launch_nonces
-        .lock()
-        .unwrap()
-        .record(PHONE, Some("wrong-launch"));
+        .supervisor
+        .forget_registration_connection(PHONE);
+    assert!(fixture.handler.config_phone_surface().await.is_none());
+    binding.bind(PHONE);
+    assert!(fixture.handler.config_phone_surface().await.is_some());
+    binding.retire();
     assert!(fixture.handler.config_phone_surface().await.is_none());
     fixture.stop().await;
 }

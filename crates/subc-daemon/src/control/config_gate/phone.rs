@@ -103,14 +103,11 @@ impl ControlHandler {
                 .subscribe_module_changes("callosum")
                 .map_err(|_| unavailable())?;
             let gate = runtime.module_gate("callosum")?;
+            let checked_phone = self.config_phone_surface().await;
             let (pending, invalidated, spawn, mut card) = {
                 let _gate = gate.lock().await;
-                if self
-                    .config_phone_surface()
-                    .await
-                    .as_ref()
-                    .map(|phone| phone.connection)
-                    != Some(connection.get())
+                if checked_phone.as_ref().map(|phone| phone.connection) != Some(connection.get())
+                    || self.config_phone_surface_snapshot().await != checked_phone
                 {
                     return Err(unavailable());
                 }

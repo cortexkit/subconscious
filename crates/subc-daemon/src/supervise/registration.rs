@@ -40,6 +40,15 @@ pub(crate) struct RegistrationSpawn {
 }
 
 impl RegistrationSpawn {
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_content_probe_for_test(&self, probe: content_binding::ContentProbe) {
+        self.binding.as_ref().unwrap().set_content_probe(probe);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn content_was_refused_for_test(&self) -> bool {
+        self.binding.as_ref().unwrap().content_was_refused()
+    }
     #[cfg(test)]
     pub(super) fn new(
         handle: &SupervisorHandle,
@@ -229,19 +238,36 @@ impl RegistrationSpawn {
     }
 
     pub(crate) fn check(&self) -> Result<(), &'static str> {
+        self.check_state()?;
+        if self
+            .binding
+            .as_ref()
+            .is_some_and(|binding| binding.check().is_err())
+        {
+            return Err("program_refused");
+        }
+        Ok(())
+    }
+
+    fn verdict(&self) -> Result<(), &'static str> {
+        self.check_state()?;
+        if self
+            .binding
+            .as_ref()
+            .is_some_and(|binding| binding.verdict().is_err())
+        {
+            return Err("program_refused");
+        }
+        self.check_state()
+    }
+
+    fn check_state(&self) -> Result<(), &'static str> {
         match *self.launch.borrow() {
             LaunchState::Dead => return Err("registration_channel_closed"),
             LaunchState::Pending => return Err("config_delivery_deferred"),
             LaunchState::Ready => {}
         }
         if self.requires_binding && self.binding.is_none() {
-            return Err("program_refused");
-        }
-        if self
-            .binding
-            .as_ref()
-            .is_some_and(|binding| binding.check().is_err())
-        {
             return Err("program_refused");
         }
         Ok(())
@@ -349,6 +375,25 @@ impl SupervisorHandle {
         connection: ConnectionId,
         nonce: Option<&str>,
     ) -> bool {
+        if !self.registration_snapshot_is_current_live(registry, module, connection, nonce) {
+            return false;
+        }
+        if self
+            .registration_spawn(connection)
+            .is_some_and(|spawn| spawn.verdict().is_err())
+        {
+            return false;
+        }
+        self.registration_snapshot_is_current_live(registry, module, connection, nonce)
+    }
+
+    pub(crate) fn registration_snapshot_is_current_live(
+        &self,
+        registry: &Registry,
+        module: &str,
+        connection: ConnectionId,
+        nonce: Option<&str>,
+    ) -> bool {
         if !registry
             .get_module(module)
             .ok()
@@ -368,7 +413,8 @@ impl SupervisorHandle {
         }
         if let Some(spawn) = self.registration_spawn(connection) {
             return spawn.module_id == module
-                && spawn.check().is_ok()
+                && spawn.check_state().is_ok()
+                && (!self.module_is_gated(module) || spawn.has_program_binding())
                 && spawn.identity.get().is_some_and(|identity| {
                     launch.pid == Some(identity.pid) && launch.start == Some(identity.start_time)
                 });

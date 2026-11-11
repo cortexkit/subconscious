@@ -700,10 +700,13 @@ impl ControlHandler {
                     ))
                 });
                 attempt_guard.commit_window = window.clone();
+                let checked_phone = self.config_phone_surface().await;
                 let locks = async {
                     let operation = self.supervisor.operation_lock().lock_owned().await;
                     let module_gates = runtime.approval_commit_gates(attempt).await?;
-                    let facts = self.config_approval_facts(ctx).await;
+                    let current_phone = self.config_phone_surface_snapshot().await;
+                    let phone = checked_phone.filter(|phone| Some(phone) == current_phone.as_ref());
+                    let facts = self.config_approval_facts_with_phone(ctx, phone).await;
                     Ok::<_, GateError>((operation, module_gates, facts))
                 };
                 let (operation, module_gates, facts) = if let Some(window) = &window {
@@ -855,6 +858,15 @@ impl ControlHandler {
     }
 
     async fn config_approval_facts(&self, ctx: &RouteCtx) -> ApprovalFacts {
+        let phone = self.config_phone_surface().await;
+        self.config_approval_facts_with_phone(ctx, phone).await
+    }
+
+    async fn config_approval_facts_with_phone(
+        &self,
+        ctx: &RouteCtx,
+        phone: Option<crate::config_gate::PhoneSurface>,
+    ) -> ApprovalFacts {
         let os_policy = crate::config_gate::os_prompt_policy_present();
         #[cfg(any(test, feature = "test-support"))]
         let os_policy = os_policy
@@ -874,7 +886,7 @@ impl ControlHandler {
                 self.forwarding.operator_confirms().config_gate_ready(),
                 os_policy,
             ),
-            phone: self.config_phone_surface().await,
+            phone,
             caller: self.resolve_caller(ctx.connection_id).await,
         }
     }
@@ -882,6 +894,17 @@ impl ControlHandler {
     // The caller holds Callosum's module gate while allocating its RPC or
     // committing approval. This snapshot grants nothing until revalidated there.
     async fn config_phone_surface(&self) -> Option<crate::config_gate::PhoneSurface> {
+        self.config_phone_surface_checked(true).await
+    }
+
+    async fn config_phone_surface_snapshot(&self) -> Option<crate::config_gate::PhoneSurface> {
+        self.config_phone_surface_checked(false).await
+    }
+
+    async fn config_phone_surface_checked(
+        &self,
+        content: bool,
+    ) -> Option<crate::config_gate::PhoneSurface> {
         if self
             .config_runtime
             .as_ref()
@@ -919,13 +942,10 @@ impl ControlHandler {
         {
             return None;
         }
-        if channel.is_none() {
-            let admission = self.review_admission();
-            let reviewer = registration.clone();
-            config_work(runtime.clone(), move |_| admission.check(&reviewer))
-                .await
-                .ok()?;
-        }
+        // Configuration approval requires a channel-bound phone launch.
+        // Enabling configuration gating invalidates legacy launch nonces,
+        // including an old registration whose process is still draining.
+        channel.as_ref()?;
         let module = self.supervisor.get("callosum")?;
         let status = module.status().ok()?;
         let (spec, _) = module.configuration().ok()?;
@@ -935,7 +955,7 @@ impl ControlHandler {
             .ok()?
             .nonce(registration.connection_id)
             .map(str::to_owned);
-        if !self.supervisor.registration_is_current_live(
+        if !self.supervisor.registration_snapshot_is_current_live(
             &self.registry,
             "callosum",
             registration.connection_id,
@@ -956,7 +976,25 @@ impl ControlHandler {
         if !approved.enabled || approved.module_spec() != spec {
             return None;
         }
-        if !self.supervisor.registration_is_current_live(
+        if content && channel.is_some() {
+            let supervisor = self.supervisor.clone();
+            let registry = self.registry.clone();
+            let nonce = nonce.clone();
+            if !config_work(runtime.clone(), move |_| {
+                Ok(supervisor.registration_is_current_live(
+                    &registry,
+                    "callosum",
+                    connection,
+                    nonce.as_deref(),
+                ))
+            })
+            .await
+            .ok()?
+            {
+                return None;
+            }
+        }
+        if !self.supervisor.registration_snapshot_is_current_live(
             &self.registry,
             "callosum",
             registration.connection_id,

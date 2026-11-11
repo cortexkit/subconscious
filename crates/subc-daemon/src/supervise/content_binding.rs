@@ -2,6 +2,9 @@ use super::*;
 use crate::config_gate::{program::ProgramLaunch, GateError};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(all(test, unix))]
+pub(super) type ContentProbe = Arc<dyn Fn() -> Result<(), GateError> + Send + Sync>;
+
 pub(super) struct LiveProgramBinding {
     launch: Mutex<ProgramLaunch>,
     process: subc_os::Process,
@@ -9,6 +12,8 @@ pub(super) struct LiveProgramBinding {
     owner: Arc<crate::config_gate::runtime::RuntimeOwner>,
     base: subc_config::Digest,
     refused: AtomicBool,
+    #[cfg(all(test, unix))]
+    content_probe: Mutex<Option<ContentProbe>>,
     container: Option<Arc<containment::CarriedContainment>>,
     #[cfg(target_os = "linux")]
     cgroup: Option<(subc_cgroup::Placement, String)>,
@@ -29,6 +34,8 @@ impl LiveProgramBinding {
             owner,
             base,
             refused: AtomicBool::new(false),
+            #[cfg(all(test, unix))]
+            content_probe: Mutex::new(None),
             container: child.child.container(),
             #[cfg(target_os = "linux")]
             cgroup: child
@@ -42,7 +49,36 @@ impl LiveProgramBinding {
     pub(super) fn is_refused(&self) -> bool {
         self.refused.load(Ordering::Acquire)
     }
+
+    #[cfg(all(test, unix))]
+    pub(super) fn set_content_probe(&self, probe: ContentProbe) {
+        *self.content_probe.lock().unwrap() = Some(probe);
+    }
     pub(super) fn check(&self) -> Result<(), GateError> {
+        let result = self.verdict();
+        if let Err(error) = &result {
+            if error.code == "program_refused" {
+                self.refused.store(true, Ordering::Release);
+                self.kill_container();
+                let module = self
+                    .launch
+                    .lock()
+                    .map(|launch| launch.spec.module_id.clone())
+                    .ok();
+                if let Some(module) = module {
+                    let _ = self.owner.record_program_refusal(
+                        &module,
+                        &self.base,
+                        subc_config::raw_digest(error.detail.as_bytes()),
+                    );
+                }
+            }
+        }
+        result
+    }
+
+    /// Read-only content verdict for callers that own their refusal policy.
+    pub(super) fn verdict(&self) -> Result<(), GateError> {
         let launch = self.launch.lock().map_err(|_| {
             GateError::new(
                 "config_delivery_deferred",
@@ -52,21 +88,10 @@ impl LiveProgramBinding {
         if self.is_refused() {
             return Err(GateError::new("program_refused", "spawn image was refused"));
         }
-        let result = self
-            .check_current(&launch)
-            .and_then(|()| launch.check_files(true));
-        if let Err(error) = &result {
-            if error.code == "program_refused" {
-                self.refused.store(true, Ordering::Release);
-                self.kill_container();
-                let _ = self.owner.record_program_refusal(
-                    &launch.spec.module_id,
-                    &self.base,
-                    subc_config::raw_digest(error.detail.as_bytes()),
-                );
-            }
-        }
-        result
+        self.check_current(&launch)?;
+        #[cfg(not(windows))]
+        launch.check_files(true)?;
+        Ok(())
     }
     #[cfg(windows)]
     pub(super) fn hello_accepted(&self) {
@@ -75,6 +100,10 @@ impl LiveProgramBinding {
         }
     }
     fn check_current(&self, launch: &ProgramLaunch) -> Result<(), GateError> {
+        #[cfg(all(test, unix))]
+        if let Some(probe) = self.content_probe.lock().unwrap().clone() {
+            probe()?;
+        }
         let unavailable = || {
             GateError::new(
                 "config_delivery_deferred",

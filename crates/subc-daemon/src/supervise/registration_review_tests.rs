@@ -116,3 +116,94 @@ async fn registration_channel_hello_at_three_seconds_uses_five_second_spawn_budg
     assert_eq!(reply.header.ty, FrameType::HelloAck);
     spawn.retire();
 }
+
+#[tokio::test]
+async fn registration_channel_pre_hello_ping_closes_endpoint() {
+    let handle = SupervisorHandle::new();
+    let spawn = RegistrationSpawn::new(&handle, "channel-module", SpawnRole::Plain, None);
+    spawn.ready();
+    let (auth, info) = auth();
+    let (_router, mut child, _copy) = serve(&handle, spawn.clone(), auth);
+    subc_transport::authenticate_client(&mut child, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let ping = Frame::build(
+        FrameType::Ping,
+        super::super::control_flags(),
+        0,
+        0,
+        1,
+        vec![],
+    )
+    .unwrap();
+    subc_transport::write_frame(&mut child, &ping)
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            subc_transport::read_frame(&mut child)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .is_none(),
+        "a pre-HELLO channel has no client or module operation surface"
+    );
+    assert!(!spawn.launch_ready());
+}
+
+#[tokio::test]
+async fn registration_channel_refused_hello_closes_endpoint() {
+    let handle = SupervisorHandle::new();
+    let spawn = RegistrationSpawn::new(&handle, "channel-module", SpawnRole::Plain, None);
+    spawn.ready();
+    let (auth, info) = auth();
+    let (_router, mut child, _copy) = serve(&handle, spawn.clone(), auth);
+    subc_transport::authenticate_client(&mut child, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    subc_transport::write_frame(&mut child, &hello("wrong-module"))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            subc_transport::read_frame(&mut child)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .is_none(),
+        "a refused one-shot HELLO ends the registration channel"
+    );
+    assert!(!spawn.launch_ready());
+}
+
+#[tokio::test]
+async fn registration_channel_own_id_still_obeys_reserved_prefix_owner() {
+    let handle = SupervisorHandle::new();
+    handle.set_reserved_prefixes("prefix-owner", &["channel:".into()]);
+    let spawn = RegistrationSpawn::new(&handle, "channel:module", SpawnRole::Plain, None);
+    spawn.ready();
+    let (auth, info) = auth();
+    let (_router, mut child, _copy) = serve(&handle, spawn.clone(), auth);
+    subc_transport::authenticate_client(&mut child, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    subc_transport::write_frame(&mut child, &hello("channel:module"))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            subc_transport::read_frame(&mut child)
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .is_none(),
+        "a spawn-bound module id does not own another module's reserved prefix"
+    );
+    assert!(!spawn.launch_ready());
+}

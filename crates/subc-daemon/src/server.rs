@@ -1093,6 +1093,14 @@ where
             }
         };
 
+        if let LocalOrigin::RegistrationChannel(spawn) = &origin {
+            let hello = frame.header.ty == subc_protocol::FrameType::Hello;
+            if (!spawn.registered() && !hello) || (spawn.registered() && hello) {
+                spawn.retire();
+                return Ok(ConnectionLoopExit::PeerClosed);
+            }
+        }
+
         if matches!(origin, LocalOrigin::Local)
             && frame.header.ty == subc_protocol::FrameType::Hello
         {

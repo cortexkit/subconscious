@@ -2731,6 +2731,32 @@ impl SupervisorHandle {
         module_id: &str,
         presented: Option<&str>,
     ) -> Result<ReservedHelloVerification, ReservedHelloRejection> {
+        self.hello_verification(module_id, presented, false)
+    }
+
+    pub(crate) fn channel_hello_verification(
+        &self,
+        module_id: &str,
+    ) -> Result<ReservedHelloVerification, ReservedHelloRejection> {
+        if self
+            .get(module_id)
+            .is_some_and(|module| module.declared_protocol().ok() == Some(ModuleProtocol::None))
+        {
+            return Err(ReservedHelloRejection::Exact {
+                module_id: module_id.into(),
+            });
+        }
+        let mut verification = self.hello_verification(module_id, None, true)?;
+        verification.nonce_verified = true;
+        Ok(verification)
+    }
+
+    fn hello_verification(
+        &self,
+        module_id: &str,
+        presented: Option<&str>,
+        channel: bool,
+    ) -> Result<ReservedHelloVerification, ReservedHelloRejection> {
         let nonces = self
             .reserved_nonces
             .lock()
@@ -2739,12 +2765,12 @@ impl SupervisorHandle {
             // `None` = reserved with no legitimate holder: refuse every
             // presentation, because no process can hold a nonce that was never
             // minted. Only a real minted nonce admits, in constant time.
-            let authorized = match expected {
-                Some(expected) => {
-                    presented.is_some_and(|p| constant_time_eq(expected.as_bytes(), p.as_bytes()))
-                }
-                None => false,
-            };
+            let authorized = channel
+                || match expected {
+                    Some(expected) => presented
+                        .is_some_and(|p| constant_time_eq(expected.as_bytes(), p.as_bytes())),
+                    None => false,
+                };
             if authorized {
                 return Ok(ReservedHelloVerification {
                     nonce_verified: true,
@@ -2769,8 +2795,11 @@ impl SupervisorHandle {
             return Ok(ReservedHelloVerification::default());
         };
 
-        let authorized = presented.is_some_and(|presented| {
-            self.spawn_nonces
+        let authorized = if channel {
+            owner_module_id == module_id
+        } else {
+            presented.is_some_and(|presented| {
+                self.spawn_nonces
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&owner_module_id)
@@ -2778,7 +2807,8 @@ impl SupervisorHandle {
                 // While the owner is being swapped, children started by
                 // either of its two processes hold that process's nonce.
                 || self.swap_nonce_matches(&owner_module_id, presented)
-        });
+            })
+        };
         if authorized {
             Ok(ReservedHelloVerification {
                 nonce_verified: true,
@@ -8043,8 +8073,30 @@ async fn supervise_loop(
                     wake_after,
                 });
             }
+            let registration = (!active.registered_since_spawn())
+                .then(|| active.registration_spawn.clone())
+                .flatten();
+            let registration_failed = async {
+                match &registration {
+                    Some(spawn) => spawn.wait_closed().await,
+                    None => std::future::pending().await,
+                }
+            };
             let active_child = child.as_mut().expect("child checked above");
             tokio::select! {
+                _ = registration_failed => {
+                    if !active_child.registered_since_spawn() && registration_child_is_running(active_child) {
+                        active_child.registration_deadline = None;
+                        active_child.spawn_failure = Some("registration_channel_closed".into());
+                        if let Err(error) = stop_unregistered_child(active_child).await {
+                            fail_after_wait_error(&spec.module_id, &snapshot, &runtime.terminal_ring,
+                                &runtime.spawn_events, format!("registration_channel_closed: {error}"),
+                                &runtime.failure_context(true));
+                            child = None;
+                        }
+                    }
+                    continue;
+                }
                 wait_result = active_child.wait() => {
                     if let Ok(mut state) = lock_snapshot(&snapshot) {
                         state.failed_retry.uptime_reset_at(no_checks, runtime.restart_policy.window);
@@ -14777,7 +14829,10 @@ fn classify_reaped_child_exit(
         state.reaped_pid = Some(child.pid);
         state.spawn_failure = child.spawn_failure.clone();
     });
-    if child.spawn_failure.as_deref() == Some("registration_timeout") {
+    if matches!(
+        child.spawn_failure.as_deref(),
+        Some("registration_timeout" | "registration_channel_closed")
+    ) {
         registration_failure_exit_report(classify_exit(status))
     } else {
         apply_deliberate_severance_marker(snapshot, child.process_identity(), classify_exit(status))

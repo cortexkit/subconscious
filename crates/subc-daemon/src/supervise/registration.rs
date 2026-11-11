@@ -131,6 +131,10 @@ impl RegistrationSpawn {
             .expect("served registration has a spawn deadline")
     }
 
+    pub(crate) fn registered(&self) -> bool {
+        self.registered.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn registration_expired(&self) {
         tokio::time::sleep_until(self.deadline()).await;
         if self.registered.load(Ordering::Acquire) {

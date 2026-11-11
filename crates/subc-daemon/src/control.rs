@@ -2668,6 +2668,17 @@ impl ControlHandler {
         wait_for_gate: bool,
     ) -> Result<Vec<Frame>, RouterError> {
         let channel_spawn = self.supervisor.registration_spawn(connection_id);
+        struct RefuseUnregisteredChannel(Option<Arc<crate::supervise::RegistrationSpawn>>);
+        impl Drop for RefuseUnregisteredChannel {
+            fn drop(&mut self) {
+                if let Some(spawn) = &self.0 {
+                    if !spawn.registered() {
+                        spawn.retire();
+                    }
+                }
+            }
+        }
+        let _channel_attempt = RefuseUnregisteredChannel(channel_spawn.clone());
         if let Some(spawn) = &channel_spawn {
             let value = serde_json::from_slice::<serde_json::Value>(&frame.body).ok();
             if let Err(code) = spawn.admit_hello(
@@ -3042,16 +3053,22 @@ impl ControlHandler {
         // Other registrations receive this catalog fact only when reserved-module
         // policy required and accepted a nonce; unreserved registrations require
         // no nonce check.
-        let verification = if swap_candidate || channel_spawn.is_some() {
+        let verification = if swap_candidate && channel_spawn.is_none() {
             ReservedHelloVerification {
                 nonce_verified: true,
                 prefix_owner: None,
             }
         } else {
-            match self.supervisor.reserved_hello_verification(
-                &hello.manifest.module_id,
-                hello.launch_nonce.as_deref(),
-            ) {
+            let verification = if channel_spawn.is_some() {
+                self.supervisor
+                    .channel_hello_verification(&hello.manifest.module_id)
+            } else {
+                self.supervisor.reserved_hello_verification(
+                    &hello.manifest.module_id,
+                    hello.launch_nonce.as_deref(),
+                )
+            };
+            match verification {
                 Ok(verified) => verified,
                 Err(rejection) => {
                     let message = match rejection {

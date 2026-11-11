@@ -134,3 +134,81 @@ async fn registration_channel_plain_stop_flushes_goodbye_before_shutdown() {
     child.start_kill().unwrap(); child.wait().await.unwrap(); child.finish_exit(false).await.unwrap();
     assert!(!ended_early, "plain stop must wait for the writer's bounded GOODBYE flush before retiring");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registration_channel_swap_keeps_inflight_reply_and_goodbyes_before_eof() {
+    let mut fixture = drain_wire_fixture().await;
+    let forwarding = fixture.runtime.forwarding.as_ref().unwrap().clone();
+    let handle = fixture.runtime.supervisor_handle.as_ref().unwrap().clone();
+    let endpoint = forwarding.active_module_endpoint("channel-module").unwrap().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (server_auth, _) = auth();
+    let server = tokio::spawn(crate::server::serve_listener(listener, fixture._router.clone(), server_auth));
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    subc_transport::authenticate_client(&mut client, &fixture._info, Duration::from_secs(2)).await.unwrap();
+    let open = Frame::build(FrameType::Request, super::super::control_flags(), 0, 0, 20,
+        serde_json::to_vec(&serde_json::json!({"op":"route.open", "target":{"kind":"tool_provider", "module_id":"channel-module"},
+            "identity":{"harness":"test", "session":"swap-wire"}})).unwrap()).unwrap();
+    subc_transport::write_frame(&mut client, &open).await.unwrap();
+    let bind = wire_next(&mut fixture.peer).await;
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&bind.body).unwrap()["op"], "route.bind");
+    let accepted = Frame::build(FrameType::Response, super::super::control_flags(), 0, 0, bind.header.corr,
+        serde_json::to_vec(&subc_protocol::session::ModuleControlResponse::RouteBindAck {}).unwrap()).unwrap();
+    subc_transport::write_frame(&mut fixture.peer, &accepted).await.unwrap();
+    let opened = wire_next(&mut client).await;
+    let opened: serde_json::Value = serde_json::from_slice(&opened.body).unwrap();
+    let channel = opened["route_channel"].as_u64().unwrap() as u16;
+    let epoch = opened["route_epoch"].as_u64().unwrap() as u32;
+    let request = Frame::build(FrameType::Request, super::super::control_flags(), channel, epoch, 21, b"held request".to_vec()).unwrap();
+    subc_transport::write_frame(&mut client, &request).await.unwrap();
+    let held = wire_next(&mut fixture.peer).await;
+    assert_eq!(held.body, b"held request");
+    assert_eq!(forwarding.endpoint_in_flight_count(endpoint).unwrap(), 1);
+
+    handle.open_swap("channel-module", String::new());
+    let candidate = RegistrationSpawn::new(&handle, "channel-module", SpawnRole::SwapCandidate, None);
+    candidate.ready();
+    let (auth, info) = auth();
+    fixture._router.install_registration_service(auth);
+    let (parent, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    peer.set_nonblocking(true).unwrap();
+    let mut candidate_peer = tokio::net::UnixStream::from_std(peer).unwrap();
+    handle.serve_registration(parent, candidate.clone(), std::process::id(), Instant::now() + Duration::from_secs(5));
+    subc_transport::authenticate_client(&mut candidate_peer, &info, Duration::from_secs(2)).await.unwrap();
+    subc_transport::write_frame(&mut candidate_peer, &hello("channel-module")).await.unwrap();
+    assert_eq!(wire_next(&mut candidate_peer).await.header.ty, FrameType::HelloAck);
+    forwarding.cutover_candidate("channel-module").unwrap().unwrap();
+    fixture.registry.promote_candidate("channel-module").unwrap().unwrap();
+    handle.promote_swap_nonce("channel-module", false);
+    let spec = fixture.spec.clone(); let runtime = fixture.runtime.clone(); let registry = fixture.registry.clone();
+    let child = fixture.child.take();
+    let drain = tokio::spawn(async move {
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        crate::supervise::swap::retire_incumbent(&spec, &runtime, &registry, &forwarding, &snapshot,
+            child, Some(endpoint), endpoint.connection_id, 1).await;
+    });
+    let draining = wire_next(&mut fixture.peer).await;
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&draining.body).unwrap()["op"], "module.draining");
+    let response = Frame::build(FrameType::Response, held.header.flags, held.header.channel, held.header.epoch, held.header.corr, b"held reply".to_vec()).unwrap();
+    subc_transport::write_frame(&mut fixture.peer, &response).await.unwrap();
+    loop {
+        let reply = wire_next(&mut client).await;
+        if reply.header.ty == FrameType::Response {
+            assert_eq!(reply.header.corr, 21); assert_eq!(reply.body, b"held reply"); break;
+        }
+    }
+    loop {
+        let verdict = wire_next(&mut client).await;
+        if verdict.header.ty == FrameType::Goodbye {
+            assert_eq!(verdict.header.channel, channel);
+            break;
+        }
+    }
+    let final_goodbye = wire_next(&mut fixture.peer).await;
+    assert_eq!(final_goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(final_goodbye.header.channel, 0);
+    assert!(subc_transport::read_frame(&mut fixture.peer).await.unwrap().is_none());
+    tokio::time::timeout(Duration::from_secs(5), drain).await.unwrap().unwrap();
+    candidate.retire(); server.abort();
+}

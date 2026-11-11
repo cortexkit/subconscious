@@ -1215,7 +1215,7 @@ async fn abandon_candidate(
 /// since the id's active registration is the candidate's and never goes away.
 /// The module's state is not touched: it describes the promoted candidate.
 #[allow(clippy::too_many_arguments)]
-async fn retire_incumbent(
+pub(super) async fn retire_incumbent(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
     registry: &Registry,
@@ -1227,11 +1227,10 @@ async fn retire_incumbent(
     incumbent_generation: u64,
 ) {
     let module_id = spec.module_id.as_str();
-    if let Some(incumbent) = &incumbent {
-        incumbent.retire_registration();
-    }
-    if let Some(endpoint) = incumbent_endpoint {
-        if let Err(err) = begin_forwarding_drain_with(
+    let mut incumbent = incumbent;
+    let mut observed_exit = None;
+    let stop_notice = if let Some(endpoint) = incumbent_endpoint {
+        let drain = begin_forwarding_drain_with(
             forwarding,
             ForwardingDrainContext {
                 spec,
@@ -1243,33 +1242,56 @@ async fn retire_incumbent(
             None,
             RouteCloseReason::Restart,
             runtime.drain_timeout,
-        )
-        .await
-        {
+        );
+        let result = if let Some(child) = incumbent.as_mut() {
+            tokio::select! {
+                status = child.wait() => {
+                    observed_exit = Some(status);
+                    Ok(StopNotice::NotSent)
+                }
+                result = drain => result,
+            }
+        } else {
+            drain.await
+        };
+        result.unwrap_or_else(|err| {
             warn!(module_id, error = %err, "draining the swapped-out incumbent failed; stopping it anyway");
-        }
-    }
+            StopNotice::NotSent
+        })
+    } else {
+        StopNotice::NoConnection
+    };
 
     let Some(mut incumbent) = incumbent else {
         return;
     };
+    // Cutover already revoked authority. Keep the transport for in-flight
+    // replies and drain notices until its bounded GOODBYE flush completes.
+    incumbent.retire_registration();
+    if observed_exit.is_none() && stop_notice != StopNotice::SentOverConnection {
+        request_graceful_stop(module_id, &incumbent);
+    }
     // The module GOODBYE above asks the incumbent to exit; give it the same
     // budget a plain restart gives the child it drains, then kill it.
-    let status = match timeout(runtime.drain_timeout, incumbent.wait()).await {
-        Ok(status) => status,
-        Err(_) => {
-            warn!(
-                module_id,
-                pid = incumbent.pid,
-                budget_ms = u64::try_from(runtime.drain_timeout.as_millis()).unwrap_or(u64::MAX),
-                reason = "swapped-out incumbent",
-                "drain budget expired before the module exited; killing it"
-            );
-            if let Err(err) = incumbent.start_kill() {
-                debug!(module_id, error = %err, "swapped-out incumbent kill failed; it may already have exited");
+    let status = match observed_exit {
+        Some(status) => status,
+        None => match timeout(runtime.drain_timeout, incumbent.wait()).await {
+            Ok(status) => status,
+            Err(_) => {
+                warn!(
+                    module_id,
+                    pid = incumbent.pid,
+                    budget_ms =
+                        u64::try_from(runtime.drain_timeout.as_millis()).unwrap_or(u64::MAX),
+                    reason = "swapped-out incumbent",
+                    "drain budget expired before the module exited; killing it"
+                );
+                if let Err(err) = incumbent.start_kill() {
+                    debug!(module_id, error = %err, "swapped-out incumbent kill failed; it may already have exited");
+                }
+                incumbent.wait().await
             }
-            incumbent.wait().await
-        }
+        },
     };
     let exit_report = match status {
         Ok(status) => classify_exit(&status),

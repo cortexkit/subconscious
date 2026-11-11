@@ -174,7 +174,7 @@ async fn config_recovery_registration_deadline_reap_retires_before_probe_await()
 }
 
 #[test]
-fn config_recovery_retired_records_follow_all_accepted_swap_nonces_in_either_exit_order() {
+fn config_recovery_retired_records_follow_only_live_swap_authority_in_either_exit_order() {
     for candidate_exits_first in [false, true] {
         let handle = SupervisorHandle::new();
         handle.set_spawn_nonce("overlap", "a".into());
@@ -195,16 +195,19 @@ fn config_recovery_retired_records_follow_all_accepted_swap_nonces_in_either_exi
             a.retire();
             b.retire();
         }
-        assert!(handle.has_program_binding_record("overlap", "a"));
+        assert!(
+            !handle.has_program_binding_record("overlap", "a"),
+            "promotion has already revoked the incumbent's nonce"
+        );
         assert!(handle.has_program_binding_record("overlap", "b"));
-        assert_eq!(handle.program_bindings.lock().unwrap().retired.len(), 2);
+        assert_eq!(handle.program_bindings.lock().unwrap().retired.len(), 1);
         handle.set_spawn_nonce("overlap", "c".into());
         handle.set_reserved_nonce("overlap", "c".into());
         let c = handle
             .begin_program_binding("overlap", SpawnRole::Plain)
             .unwrap();
         c.retire();
-        assert_eq!(handle.program_bindings.lock().unwrap().retired.len(), 3);
+        assert_eq!(handle.program_bindings.lock().unwrap().retired.len(), 2);
         handle.close_swap("overlap");
         a.retire();
         b.retire();

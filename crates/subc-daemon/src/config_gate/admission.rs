@@ -4,6 +4,14 @@ use super::*;
 use crate::config_gate::{program, CapturedInput, GateSnapshot, InputKey};
 use crate::supervise::ModuleSpec;
 
+// Copy of the supervisor's configured-ID set, not a read of live config files.
+// A stamped supervisor derives that set from approved configuration. Readers
+// reject an absent or poisoned source without locking its mutable set.
+pub(super) struct ConfiguredModuleSnapshot {
+    ids: std::collections::HashSet<String>,
+    source: std::sync::Weak<Mutex<std::collections::HashSet<String>>>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct AdmissionCache {
     state: StoreState,
@@ -257,11 +265,42 @@ impl RuntimeOwner {
             })
             .unwrap_or(true)
     }
-    pub(crate) fn module_is_gated(&self, _module: &str) -> bool {
-        self.admission
+    pub(crate) fn observe_supervisor_configured_ids(
+        &self,
+        ids: Option<&std::collections::HashSet<String>>,
+        source: std::sync::Weak<Mutex<std::collections::HashSet<String>>>,
+    ) {
+        *self
+            .configured_modules
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = ids.map(|ids| ConfiguredModuleSnapshot {
+            ids: ids.clone(),
+            source,
+        });
+    }
+
+    pub(crate) fn module_is_gated(&self, module: &str) -> bool {
+        {
+            let Ok(cache) = self.admission.read() else {
+                return true;
+            };
+            match cache.state {
+                StoreState::Unstamped => return false,
+                StoreState::Stamped if !cache.modules.contains_key(module) => {}
+                _ => return true,
+            }
+        }
+        self.configured_modules
             .read()
-            // Missing approval is a hold, not permission to redeem a nonce.
-            .map(|cache| !matches!(cache.state, StoreState::Unstamped))
+            .map(|snapshot| {
+                snapshot.as_ref().is_none_or(|snapshot| {
+                    snapshot
+                        .source
+                        .upgrade()
+                        .is_none_or(|source| source.is_poisoned())
+                        || snapshot.ids.contains(module)
+                })
+            })
             .unwrap_or(true)
     }
     pub(crate) fn checked_admission_hold(&self, module: Option<&str>) -> Result<()> {

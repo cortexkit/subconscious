@@ -3093,10 +3093,36 @@ impl SupervisorHandle {
     /// module's first process is spawned, so that by the time that process can
     /// register, [`Self::is_configured`] already answers true.
     fn mark_configured(&self, module_id: &str) {
-        self.configured_ids
+        self.update_configured_ids(|ids| {
+            ids.insert(module_id.to_string());
+        });
+    }
+
+    fn publish_configured_ids(&self, ids: Option<&HashSet<String>>) {
+        let owner = self
+            .gate_runtime
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(module_id.to_string());
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .and_then(|owner| owner.upgrade());
+        if let Some(owner) = owner {
+            owner.observe_supervisor_configured_ids(ids, Arc::downgrade(&self.configured_ids));
+        }
+    }
+
+    fn update_configured_ids(&self, update: impl FnOnce(&mut HashSet<String>)) {
+        match self.configured_ids.lock() {
+            Ok(mut ids) => {
+                update(&mut ids);
+                // Publish while this roster mutation is serialized, so an
+                // older snapshot can never overwrite a later configured id.
+                self.publish_configured_ids(Some(&ids));
+            }
+            Err(poisoned) => {
+                update(&mut poisoned.into_inner());
+                self.publish_configured_ids(None);
+            }
+        }
     }
 
     /// Undo [`Self::mark_configured`] for a module whose first spawn failed
@@ -3108,10 +3134,9 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !modules.contains_key(module_id) {
-            self.configured_ids
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(module_id);
+            self.update_configured_ids(|ids| {
+                ids.remove(module_id);
+            });
         }
     }
 
@@ -3216,10 +3241,9 @@ impl SupervisorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(module_id);
-        self.configured_ids
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(module_id);
+        self.update_configured_ids(|ids| {
+            ids.remove(module_id);
+        });
         self.remove_program_binding_records(module_id);
         removed
     }

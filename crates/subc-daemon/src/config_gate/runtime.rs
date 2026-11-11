@@ -33,6 +33,7 @@ pub struct RuntimeOwner {
     #[cfg(test)]
     spawn_exec_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     admission: std::sync::RwLock<admission::AdmissionCache>,
+    configured_modules: std::sync::RwLock<Option<admission::ConfiguredModuleSnapshot>>,
     approved_daemon: std::sync::RwLock<ApprovedDaemonView>,
     inner: Mutex<OwnerState>,
     capturer: ConfigCapturer,
@@ -675,6 +676,7 @@ impl RuntimeOwner {
             #[cfg(test)]
             spawn_exec_hook: Mutex::new(None),
             admission,
+            configured_modules: std::sync::RwLock::new(None),
             approved_daemon,
             inner: Mutex::new(OwnerState {
                 gate: ConfigGate::new(incarnation),

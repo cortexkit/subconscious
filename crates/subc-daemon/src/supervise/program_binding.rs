@@ -343,6 +343,9 @@ impl SupervisorHandle {
         owner: &Arc<crate::config_gate::runtime::RuntimeOwner>,
     ) {
         *self.gate_runtime.lock().unwrap_or_else(|p| p.into_inner()) = Some(Arc::downgrade(owner));
+        let ids = self.configured_ids.lock();
+        self.publish_configured_ids(ids.as_ref().ok().map(|ids| &**ids));
+        drop(ids);
         let key = Arc::as_ptr(&self.program_bindings) as usize;
         let bindings = Arc::downgrade(&self.program_bindings);
         owner.install_binding_retirement(key, move || {

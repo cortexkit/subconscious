@@ -50,6 +50,118 @@ fn spec(rig: &Rig) -> ModuleSpec {
         .module_spec()
 }
 
+async fn stamped_nonce_hello(
+    owner: Arc<RuntimeOwner>,
+    handle: SupervisorHandle,
+    module: &str,
+    nonce: Option<&str>,
+) -> subc_protocol::Frame {
+    let control = crate::ControlHandler::new(Arc::new(crate::Registry::default()))
+        .with_supervisor(handle)
+        .with_config_runtime(owner);
+    let router = Arc::new(crate::Router::with_control_handler(Arc::new(control)));
+    let info = subc_transport::ConnectionInfo {
+        schema: subc_transport::SCHEMA_VERSION,
+        wire_version: None,
+        endpoints: vec![],
+        key: vec![0x42; 32],
+        daemon_id: [0x24; 16],
+        pid: std::process::id(),
+        daemon_ver: "test".into(),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(crate::server::serve_listener(
+        listener,
+        router,
+        crate::server::ServerAuth::new(info.key.clone(), info.daemon_id, "test"),
+    ));
+    let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+    subc_transport::authenticate_client(&mut client, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let body = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder(module, "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: nonce.map(str::to_owned),
+    };
+    let frame = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
+    subc_transport::write_frame(&mut client, &frame)
+        .await
+        .unwrap();
+    let reply = subc_transport::read_frame(&mut client)
+        .await
+        .unwrap()
+        .unwrap();
+    server.abort();
+    reply
+}
+
+#[tokio::test]
+async fn gated_nonce_policy_unconfigured_standalone_hello_remains_legacy() {
+    let rig = rig();
+    let owner = Arc::new(rig.owner("standalone-nonce-policy"));
+    rig.stamp(&owner);
+    let handle = SupervisorHandle::new();
+    let _supervisor = Supervisor::new_for_test(
+        Arc::new(crate::Registry::default()),
+        RestartPolicy::default(),
+    )
+    .with_handle(handle.clone())
+    .with_config_runtime(owner.clone());
+    let reply = stamped_nonce_hello(owner, handle, "standalone", None).await;
+    assert_eq!(
+        reply.header.ty,
+        subc_protocol::FrameType::HelloAck,
+        "an id absent from both configured authority and approval cache stays unreserved legacy"
+    );
+}
+
+#[tokio::test]
+async fn gated_nonce_policy_configured_uncached_stopped_nonce_hello_is_refused() {
+    let rig = rig();
+    let owner = Arc::new(rig.owner("stopped-nonce-policy"));
+    rig.stamp(&owner);
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new_for_test(
+        Arc::new(crate::Registry::default()),
+        RestartPolicy::default(),
+    )
+    .with_handle(handle.clone())
+    .with_config_runtime(owner.clone());
+    let mut missing = spec(&rig);
+    missing.module_id = "stopped-uncached".into();
+    missing.protocol = subc_control::ModuleProtocol::Subc;
+    missing.reserved = true;
+    let _configured = supervisor
+        .register_configured_with_health(
+            missing,
+            false,
+            crate::supervise::HealthConfig::default(),
+            None,
+            RestartPolicy::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    handle.set_spawn_nonce("stopped-uncached", "old-nonce".into());
+    handle.set_reserved_nonce("stopped-uncached", "old-nonce".into());
+    let reply = stamped_nonce_hello(owner, handle, "stopped-uncached", Some("old-nonce")).await;
+    assert_eq!(
+        reply.header.ty,
+        subc_protocol::FrameType::Error,
+        "absence from approval cache must not ungate a configured stopped id"
+    );
+}
+
 #[tokio::test]
 async fn gated_nonce_policy_refuses_stopped_uncached_identity_over_real_server() {
     let rig = rig();
@@ -1681,10 +1793,13 @@ async fn config_admission_hello_accepts_only_the_approved_current_native_image()
         "the launch-local nonce gate must not rewrite approved role policy"
     );
     assert!(
-        handle.reserved_hello_authorized("a", None),
-        "the configured unreserved legacy policy must not be rewritten by content admission"
+        !handle.reserved_hello_authorized("a", None),
+        "configuration gating refuses nonce admission without rewriting the unreserved role policy"
     );
-    assert!(handle.reserved_hello_authorized("a", Some(&nonce)));
+    assert!(
+        !handle.reserved_hello_authorized("a", Some(&nonce)),
+        "a channel binding key is never a legacy nonce"
+    );
     assert!(
         handle.reserved_hello_authorized("a.child", None),
         "no capability or child-id prefix was reserved by the launch-local flag"
@@ -1724,7 +1839,11 @@ async fn config_admission_hello_accepts_only_the_approved_current_native_image()
     let reply = handler.handle_control(connection, frame).unwrap();
     registry.deregister_connection(connection).unwrap();
     module.stop().await.unwrap();
-    assert_eq!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
+    assert_eq!(
+        reply[0].header.ty,
+        subc_protocol::FrameType::HelloAck,
+        "{reply:?}"
+    );
 }
 
 #[tokio::test]

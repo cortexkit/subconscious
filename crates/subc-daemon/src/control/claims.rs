@@ -2,6 +2,10 @@
 //! lock, then launch-local claims, then the token/connection index. Index lookups
 //! release their lock before acquiring a spawn lock. No lock crosses an await;
 //! forwarding closes run after retirement releases the transition lock.
+//! Prefix HELLO publication then takes the reservation map, registry and
+//! forwarding locks, in that order. Its launch/index guards keep primary GOODBYE
+//! and binding removal from overtaking the registration commit. These guards
+//! are released before capability or activity callbacks run.
 //!
 //! GOODBYE prevents the primary from issuing new connection claims and voids
 //! pending tokens only. Already-bound consumers belong to the launch, so they
@@ -117,6 +121,36 @@ struct LaunchState {
     pending_visits: u64,
     #[cfg(test)]
     index_operations: u64,
+}
+
+pub(super) struct PrefixBindingGuard<'a> {
+    _launch: std::sync::MutexGuard<'a, LaunchState>,
+    _index: std::sync::MutexGuard<'a, State>,
+}
+
+pub(super) struct PrefixHelloAttempt {
+    handler: ControlHandler,
+    ctx: RouteCtx,
+    pub(super) accepted: bool,
+}
+
+impl Drop for PrefixHelloAttempt {
+    fn drop(&mut self) {
+        if !self.accepted {
+            self.ctx.egress.terminate_ingress();
+            self.handler
+                .claims
+                .connection_closed(self.ctx.connection_id);
+            self.handler.request_refusal_close(
+                self.ctx.connection_id,
+                Some(&self.ctx.egress),
+                CloseReason::new(
+                    "claim_prefix_refused",
+                    "prefix HELLO ended without acceptance",
+                ),
+            );
+        }
+    }
 }
 
 struct MintPermit {
@@ -258,6 +292,10 @@ pub(super) struct Claims(
     #[cfg(test)] Mutex<Vec<u64>>,
     #[cfg(test)] Mutex<Option<Arc<AttachHold>>>,
     #[cfg(test)] Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)] Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)] Mutex<Option<&'static str>>,
+    #[cfg(test)] Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)] Mutex<Option<Arc<std::sync::Barrier>>>,
 );
 
 #[cfg(test)]
@@ -267,6 +305,52 @@ struct AttachHold {
 }
 
 impl Claims {
+    #[cfg(test)]
+    pub(super) fn pause_prefix_hello_for_test(&self, stage: u8) {
+        let slot = match stage {
+            5 => &self.5,
+            7 => &self.7,
+            8 => &self.8,
+            _ => unreachable!(),
+        };
+        let hold = slot.lock().unwrap().take();
+        if let Some(hold) = hold {
+            hold.wait();
+            hold.wait();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn take_prefix_hello_failure_for_test(&self) -> Option<&'static str> {
+        self.6.lock().unwrap().take()
+    }
+
+    pub(super) fn lock_prefix_binding<'a>(
+        &'a self,
+        binding: &'a ClaimBinding,
+        connection: ConnectionId,
+    ) -> Option<PrefixBindingGuard<'a>> {
+        let launch = binding
+            .launch
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let index = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if !launch.active
+            || !launch.primary_live
+            || !launch.connections.contains_key(&connection)
+            || !index.bindings.get(&connection).is_some_and(|current| {
+                Arc::ptr_eq(&current.hello_attempted, &binding.hello_attempted)
+            })
+        {
+            return None;
+        }
+        Some(PrefixBindingGuard {
+            _launch: launch,
+            _index: index,
+        })
+    }
+
     pub(super) fn close_notifications_enabled(&self) -> bool {
         #[cfg(test)]
         {
@@ -310,6 +394,25 @@ impl Claims {
 }
 
 impl ControlHandler {
+    pub(super) fn prefix_hello_attempt(&self, ctx: &RouteCtx) -> PrefixHelloAttempt {
+        PrefixHelloAttempt {
+            handler: self.clone(),
+            ctx: ctx.clone(),
+            accepted: false,
+        }
+    }
+
+    pub(super) fn prefix_binding_live(
+        &self,
+        binding: &ClaimBinding,
+        connection: ConnectionId,
+    ) -> bool {
+        self.claim_primary_registered(binding.spawn, &binding.registration)
+            && self
+                .claims
+                .lock_prefix_binding(binding, connection)
+                .is_some()
+    }
     #[cfg(all(test, unix))]
     pub(crate) fn defer_refusal_notifications_for_test(&self) {
         self.claims
@@ -391,7 +494,7 @@ impl ControlHandler {
         state.bucket.tokens = 0;
         state.bucket.updated = tokio::time::Instant::now() + Duration::from_secs(60);
     }
-    fn claim_primary_registered(
+    pub(super) fn claim_primary_registered(
         &self,
         connection: ConnectionId,
         spawn: &RegistrationSpawn,
@@ -1947,6 +2050,308 @@ pub(crate) mod tests {
             FrameType::Response
         );
         child
+    }
+
+    async fn pause_prefix_hello(
+        rig: &Rig,
+        child: &mut Net,
+        module_id: &str,
+        stage: u8,
+    ) -> Arc<std::sync::Barrier> {
+        let hold = Arc::new(std::sync::Barrier::new(2));
+        let slot = match stage {
+            5 => &rig.handler.claims.5,
+            7 => &rig.handler.claims.7,
+            8 => &rig.handler.claims.8,
+            _ => unreachable!(),
+        };
+        *slot.lock().unwrap() = Some(hold.clone());
+        child.send(prefix_hello(module_id)).await;
+        let reached = hold.clone();
+        tokio::task::spawn_blocking(move || reached.wait())
+            .await
+            .unwrap();
+        hold
+    }
+
+    async fn release_prefix_hello(hold: Arc<std::sync::Barrier>) {
+        tokio::task::spawn_blocking(move || hold.wait())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_hello_keeps_ingress_binding_snapshot_after_detach() {
+        let mut rig = rig().await;
+        let mut child = prefix_connection(&mut rig, "claims:snapshot").await;
+        let id = child.connection_id(&rig.handler);
+        let hold = pause_prefix_hello(&rig, &mut child, "escaped-unreserved", 5).await;
+        rig.handler.claims.connection_closed(id);
+        release_prefix_hello(hold).await;
+        error(
+            &child.recv().await.unwrap(),
+            error_codes::CLAIM_PREFIX_REFUSED,
+        );
+        assert!(child.recv().await.is_none());
+        assert!(rig
+            .handler
+            .registry
+            .get_module("escaped-unreserved")
+            .unwrap()
+            .is_none());
+        assert!(rig.handler.claims.binding(id).is_none());
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_hello_checks_owner_and_binding_before_and_under_publication() {
+        for stage in [5, 7] {
+            for ended in ["primary", "active", "binding"] {
+                let mut rig = rig().await;
+                let mut child = prefix_connection(&mut rig, "claims:liveness").await;
+                let id = child.connection_id(&rig.handler);
+                let binding = rig.handler.claims.binding(id).unwrap();
+                let hold = pause_prefix_hello(&rig, &mut child, "claims:liveness", stage).await;
+                match ended {
+                    "primary" => {
+                        rig.handler
+                            .handle_goodbye(rig.primary.ctx.connection_id)
+                            .unwrap();
+                        assert!(
+                            rig.spawn.launch_ready(),
+                            "GOODBYE does not itself end the process"
+                        );
+                        assert!(!binding.launch.state.lock().unwrap().primary_live);
+                    }
+                    "active" => binding.launch.state.lock().unwrap().active = false,
+                    "binding" => rig.handler.claims.connection_closed(id),
+                    _ => unreachable!(),
+                }
+                release_prefix_hello(hold).await;
+                error(
+                    &child.recv().await.unwrap(),
+                    error_codes::CLAIM_PREFIX_REFUSED,
+                );
+                assert!(child.recv().await.is_none(), "{ended} at stage {stage}");
+                assert!(rig
+                    .handler
+                    .registry
+                    .get_module("claims:liveness")
+                    .unwrap()
+                    .is_none());
+                assert!(rig
+                    .handler
+                    .forwarding
+                    .module_endpoint_for_connection(id)
+                    .unwrap()
+                    .is_none());
+                assert!(rig.handler.claims.binding(id).is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_rescan_transfer_during_hello_prevents_stale_publication() {
+        let mut rig = rig().await;
+        let mut child = prefix_connection(&mut rig, "claims:rescan").await;
+        let (_other_primary, _other_spawn, other_module, _) =
+            network_primary(&rig, "new-owner").await;
+        let pid = rig._module.status().unwrap().pid;
+        let hold = pause_prefix_hello(&rig, &mut child, "claims:rescan", 7).await;
+        let (mut old_spec, old_health) = rig._module.configuration().unwrap();
+        old_spec.reserved_prefixes.clear();
+        rig._module
+            .update_configuration(old_spec, old_health, None)
+            .await
+            .unwrap();
+        let (mut next_spec, next_health) = other_module.configuration().unwrap();
+        next_spec.reserved_prefixes = vec!["claims:".into()];
+        other_module
+            .update_configuration(next_spec, next_health, None)
+            .await
+            .unwrap();
+        assert_eq!(rig._module.status().unwrap().pid, pid);
+        assert!(rig.spawn.launch_ready());
+        release_prefix_hello(hold).await;
+        error(
+            &child.recv().await.unwrap(),
+            error_codes::CLAIM_PREFIX_REFUSED,
+        );
+        assert!(child.recv().await.is_none());
+        assert!(rig
+            .handler
+            .registry
+            .get_module("claims:rescan")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_publication_holds_reservation_writer_lock_until_commit() {
+        let mut rig = rig().await;
+        let mut child = prefix_connection(&mut rig, "claims:locked").await;
+        let hold = pause_prefix_hello(&rig, &mut child, "claims:locked", 8).await;
+        let locked = rig.handler.supervisor.prefix_publication_locked_for_test();
+        release_prefix_hello(hold).await;
+        assert!(
+            locked,
+            "publication must own the same mutex as reservation writers"
+        );
+        assert_eq!(child.recv().await.unwrap().header.ty, FrameType::HelloAck);
+        rig.handler
+            .supervisor
+            .set_reserved_prefixes("new-owner", &["claims:".into()]);
+        assert!(!rig.handler.supervisor.prefix_publication_locked_for_test());
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_hello_errors_and_failed_flush_close_and_release_binding() {
+        for failure in ["error", "panic", "flush"] {
+            let mut rig = rig().await;
+            rig.handler
+                .supervisor
+                .set_reserved_prefixes("claims-module", &["claims:".into()]);
+            let token = mint(
+                &mut rig,
+                ClaimPurpose::Prefix {
+                    module_id: "claims:failure".into(),
+                },
+            )
+            .await
+            .claim;
+            let mut wire = Wire::new(&rig.router);
+            assert_eq!(
+                present(&rig, &mut wire, token).await.header.ty,
+                FrameType::Response
+            );
+            if failure == "flush" {
+                wire.replies.close();
+            } else {
+                *rig.handler.claims.6.lock().unwrap() = Some(failure);
+            }
+            let result = rig
+                .handler
+                .handle_control_frame_timed(&wire.ctx, prefix_hello("claims:wrong"), None)
+                .await;
+            assert!(result.is_err(), "{failure} must reach the failing exit");
+            assert!(wire.ctx.egress.ingress_terminal());
+            assert!(
+                rig.handler.claims.binding(wire.connection.id()).is_none(),
+                "{failure} leaked its binding"
+            );
+            wire.closed().await;
+            assert!(rig
+                .handler
+                .registry
+                .get_module("claims:wrong")
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_mint_requires_remainder_after_longest_prefix() {
+        let mut rig = rig().await;
+        rig.handler.supervisor.set_reserved_prefixes(
+            "claims-module",
+            &["claims:".into(), "claims:nested:".into()],
+        );
+        for module_id in ["claims:", "claims:nested:"] {
+            error(
+                &rig.primary
+                    .call(
+                        &rig.router,
+                        request(ClaimMintRequest::new(ClaimPurpose::Prefix {
+                            module_id: module_id.into(),
+                        })),
+                    )
+                    .await,
+                error_codes::CLAIM_PREFIX_REFUSED,
+            );
+        }
+        rig.handler
+            .supervisor
+            .set_reserved_prefixes("other-owner", &["claims:nested:".into()]);
+        error(
+            &rig.primary
+                .call(
+                    &rig.router,
+                    request(ClaimMintRequest::new(ClaimPurpose::Prefix {
+                        module_id: "claims:nested:".into(),
+                    })),
+                )
+                .await,
+            error_codes::CLAIM_PREFIX_REFUSED,
+        );
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_goodbye_closes_instead_of_becoming_direct() {
+        let mut rig = rig().await;
+        let mut child = prefix_connection(&mut rig, "claims:goodbye").await;
+        assert_eq!(
+            child.call(prefix_hello("claims:goodbye")).await.header.ty,
+            FrameType::HelloAck
+        );
+        let id = child.connection_id(&rig.handler);
+        child
+            .pipeline(&[
+                Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 71, Vec::new()).unwrap(),
+                request(serde_json::json!({"op":"server.describe"})),
+            ])
+            .await;
+        assert!(
+            child.recv().await.is_none(),
+            "GOODBYE must not leave a direct session"
+        );
+        assert!(rig.handler.claims.binding(id).is_none());
+        assert!(rig
+            .handler
+            .registry
+            .get_module("claims:goodbye")
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_push_allows_route_status_and_refuses_other_ops() {
+        let mut rig = rig().await;
+        let mut child = prefix_connection(&mut rig, "claims:push").await;
+        assert_eq!(
+            child.call(prefix_hello("claims:push")).await.header.ty,
+            FrameType::HelloAck
+        );
+        let push = |body| {
+            Frame::build(
+                FrameType::Push,
+                control_flags(),
+                0,
+                0,
+                81,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap()
+        };
+        let ping = || Frame::build(FrameType::Ping, control_flags(), 0, 0, 82, Vec::new()).unwrap();
+        child.send(push(serde_json::json!({"op":"route.status","route_channel":1,"route_epoch":1,"status":"idle"}))).await;
+        assert_eq!(child.call(ping()).await.header.ty, FrameType::Pong);
+        error(
+            &child
+                .call(push(serde_json::json!({"op":"route.status"})))
+                .await,
+            "invalid_control_body",
+        );
+        for op in [
+            "unknown.push",
+            "catalog.update",
+            "scope.sync",
+            "config.applied",
+        ] {
+            child
+                .pipeline(&[push(serde_json::json!({"op":op})), ping()])
+                .await;
+            error(&child.recv().await.unwrap(), "claim_operation_not_allowed");
+            assert_eq!(child.recv().await.unwrap().header.ty, FrameType::Pong);
+        }
     }
 
     #[tokio::test]

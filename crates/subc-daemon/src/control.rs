@@ -2198,9 +2198,14 @@ impl ControlHandler {
         }
         #[cfg(test)]
         self.claims.record_dispatch(frame.header.corr);
-        if self
-            .claims
-            .binding(ctx.connection_id)
+        let claim_binding = self.claims.binding(ctx.connection_id);
+        let mut prefix_attempt = (frame.header.ty == FrameType::Hello
+            && claim_binding
+                .as_ref()
+                .is_some_and(|binding| binding.prefix_module_id().is_some()))
+        .then(|| self.prefix_hello_attempt(ctx));
+        if claim_binding
+            .as_ref()
             .is_some_and(|binding| binding.prefix_module_id().is_some())
         {
             let registered = self
@@ -2212,6 +2217,17 @@ impl ControlHandler {
                 return self
                     .refuse_claim_connection(ctx, &frame, "claim_hello_required")
                     .await;
+            }
+            if registered && frame.header.ty == FrameType::Goodbye {
+                ctx.egress.terminate_ingress();
+                let result = self.handle_goodbye(ctx.connection_id);
+                self.claims.connection_closed(ctx.connection_id);
+                self.request_refusal_close(
+                    ctx.connection_id,
+                    Some(&ctx.egress),
+                    CloseReason::new("claim_registration_ended", "prefix registration ended"),
+                );
+                return result;
             }
             if registered && frame.header.ty == FrameType::Request {
                 let allowed =
@@ -2232,11 +2248,21 @@ impl ControlHandler {
                     )?]);
                 }
             }
+            if registered
+                && frame.header.ty == FrameType::Push
+                && !serde_json::from_slice::<ControlOpProbe>(&frame.body)
+                    .is_ok_and(|probe| probe.op == "route.status")
+            {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "claim_operation_not_allowed",
+                    "prefix registrations may push only route.status for routes they serve",
+                )?]);
+            }
         }
         match frame.header.ty {
             FrameType::Ping => Ok(vec![pong(&frame)?]),
             FrameType::Hello => {
-                let claim_binding = self.claims.binding(ctx.connection_id);
                 if claim_binding
                     .as_ref()
                     .is_some_and(|binding| binding.prefix_module_id().is_none())
@@ -2299,32 +2325,40 @@ impl ControlHandler {
                 let correlation = frame.header.corr;
                 let dispatcher = tracing::dispatcher::get_default(|dispatcher| dispatcher.clone());
                 let span = tracing::Span::current();
+                let hello_binding = claim_binding.clone();
                 let replies = tokio::task::spawn_blocking(move || {
                     tracing::dispatcher::with_default(&dispatcher, || {
                         span.in_scope(|| {
-                            handler.handle_hello_checked(connection, Some(egress), frame, true)
+                            handler.handle_hello_checked(
+                                connection,
+                                Some(egress),
+                                frame,
+                                true,
+                                hello_binding,
+                            )
                         })
                     })
                 })
                 .await
                 .map_err(|error| RouterError::backend(0, correlation, error.to_string()))??;
-                if claim_binding.is_some()
-                    && self
-                        .registry
-                        .get_module_by_connection(ctx.connection_id)
-                        .map_err(|err| RouterError::backend(0, correlation, err.to_string()))?
-                        .is_none()
-                {
-                    ctx.egress.terminate_ingress();
-                    for reply in replies {
-                        ctx.egress.send_flushed(reply).await?;
+                if let Some(attempt) = &mut prefix_attempt {
+                    let accepted = !replies
+                        .iter()
+                        .any(|reply| reply.header.ty == FrameType::Error)
+                        && self
+                            .registry
+                            .get_module_by_connection(ctx.connection_id)
+                            .map_err(|err| RouterError::backend(0, correlation, err.to_string()))?
+                            .is_some();
+                    if accepted {
+                        attempt.accepted = true;
+                    } else {
+                        ctx.egress.terminate_ingress();
+                        for reply in replies {
+                            ctx.egress.send_flushed(reply).await?;
+                        }
+                        return Ok(Vec::new());
                     }
-                    self.request_refusal_close(
-                        ctx.connection_id,
-                        Some(&ctx.egress),
-                        CloseReason::new("claim_prefix_refused", "prefix HELLO refused"),
-                    );
-                    return Ok(Vec::new());
                 }
                 Ok(replies)
             }
@@ -2864,7 +2898,8 @@ impl ControlHandler {
         egress: Option<crate::router::FrameSink>,
         frame: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
-        self.handle_hello_checked(connection_id, egress, frame, false)
+        let binding = self.claims.binding(connection_id);
+        self.handle_hello_checked(connection_id, egress, frame, false, binding)
     }
 
     fn handle_hello_checked(
@@ -2873,15 +2908,31 @@ impl ControlHandler {
         sink: Option<crate::FrameSink>,
         frame: Frame,
         wait_for_gate: bool,
+        prefix_binding: Option<claims::ClaimBinding>,
     ) -> Result<Vec<Frame>, RouterError> {
         let channel_spawn = self.supervisor.registration_spawn(connection_id);
-        let prefix_binding = self.claims.binding(connection_id);
+        #[cfg(test)]
+        if prefix_binding.is_some() {
+            self.claims.pause_prefix_hello_for_test(5);
+            match self.claims.take_prefix_hello_failure_for_test() {
+                Some("error") => {
+                    return Err(RouterError::backend(
+                        0,
+                        frame.header.corr,
+                        "injected HELLO failure",
+                    ))
+                }
+                Some("panic") => panic!("injected HELLO task panic"),
+                _ => {}
+            }
+        }
         if let Some(binding) = &prefix_binding {
             let value = serde_json::from_slice::<serde_json::Value>(&frame.body).ok();
             let module = value
                 .as_ref()
                 .and_then(|value| value["manifest"]["module_id"].as_str());
             if !binding.admit_prefix_hello(module)
+                || !self.prefix_binding_live(binding, connection_id)
                 || !module.is_some_and(|module| {
                     self.supervisor
                         .prefix_claim_authorized(&binding.registration.module_id, module)
@@ -3389,7 +3440,14 @@ impl ControlHandler {
         self.hello_launch_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .record(connection_id, hello.launch_nonce.as_deref());
+            .record(
+                connection_id,
+                if prefix_binding.is_some() {
+                    None
+                } else {
+                    hello.launch_nonce.as_deref()
+                },
+            );
         let control_ops = effective_module_control_ops(hello.control_ops);
         // Built before anything is registered so an encoding failure leaves no
         // registry or forwarding state behind.
@@ -3411,6 +3469,10 @@ impl ControlHandler {
         let publication_spawn = channel_spawn
             .as_ref()
             .or_else(|| prefix_binding.as_ref().map(|binding| &binding.registration));
+        #[cfg(test)]
+        if prefix_binding.is_some() {
+            self.claims.pause_prefix_hello_for_test(7);
+        }
         let _registration_publication = match publication_spawn {
             Some(spawn) => Some(match spawn.begin_publication() {
                 Ok(guard) => guard,
@@ -3424,6 +3486,31 @@ impl ControlHandler {
             }),
             None => None,
         };
+        let (_prefix_live, _prefix_ownership) = if let Some(binding) = &prefix_binding {
+            let live = self.claims.lock_prefix_binding(binding, connection_id);
+            let ownership = self.supervisor.prefix_claim_publication(
+                &binding.registration.module_id,
+                &hello.manifest.module_id,
+            );
+            if live.is_none()
+                || ownership.is_none()
+                || !self.claim_primary_registered(binding.spawn, &binding.registration)
+                || binding.prefix_module_id() != Some(hello.manifest.module_id.as_str())
+            {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    "claim_prefix_refused",
+                    "prefix authority ended before publication",
+                )?]);
+            }
+            (live, ownership)
+        } else {
+            (None, None)
+        };
+        #[cfg(test)]
+        if prefix_binding.is_some() {
+            self.claims.pause_prefix_hello_for_test(8);
+        }
         if swap_candidate {
             let module_id = hello.manifest.module_id.clone();
             let reply = self.register_swap_candidate(
@@ -3573,6 +3660,9 @@ impl ControlHandler {
             );
             return Ok(reply);
         }
+
+        drop(_prefix_ownership);
+        drop(_prefix_live);
 
         // Exposure over assumption: Concurrency's serde default is pinned to the
         // pre-field behavior (ModuleManaged), so a management surface that is

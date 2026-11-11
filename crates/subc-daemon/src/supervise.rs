@@ -2782,6 +2782,25 @@ impl SupervisorHandle {
     }
 
     pub(crate) fn prefix_claim_authorized(&self, owner: &str, module_id: &str) -> bool {
+        self.prefix_claim_publication(owner, module_id).is_some()
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn prefix_publication_locked_for_test(&self) -> bool {
+        matches!(
+            self.reserved_prefix_owners.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
+    // Keep this guard through registry/forwarding publication. Rescans replace
+    // prefix owners without stopping their launches, so the spawn guard alone
+    // cannot fence a reservation transfer.
+    pub(crate) fn prefix_claim_publication(
+        &self,
+        owner: &str,
+        module_id: &str,
+    ) -> Option<std::sync::MutexGuard<'_, HashMap<String, String>>> {
         if subc_protocol::manifest::validate_module_id(module_id).is_err()
             || self.module_is_gated(module_id)
             || self
@@ -2790,15 +2809,18 @@ impl SupervisorHandle {
                 .unwrap_or_else(|p| p.into_inner())
                 .contains_key(module_id)
         {
-            return false;
+            return None;
         }
-        self.reserved_prefix_owners
+        let owners = self
+            .reserved_prefix_owners
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(|p| p.into_inner());
+        let authorized = owners
             .iter()
             .filter(|(prefix, _)| module_id.starts_with(prefix.as_str()))
             .max_by_key(|(prefix, _)| prefix.len())
-            .is_some_and(|(_, holder)| holder == owner)
+            .is_some_and(|(prefix, holder)| holder == owner && module_id.len() > prefix.len());
+        authorized.then_some(owners)
     }
 
     fn hello_verification(

@@ -1093,6 +1093,11 @@ where
             }
         };
 
+        // A close notification can lose an unbiased select to buffered input.
+        // Terminal ingress fences both inline handling and every offload below.
+        if ctx.egress.ingress_terminal() {
+            return Ok(ConnectionLoopExit::PeerClosed);
+        }
         let first = ctx.egress.first_ingress_frame();
         if let LocalOrigin::RegistrationChannel(spawn) = &origin {
             let hello = frame.header.ty == subc_protocol::FrameType::Hello;

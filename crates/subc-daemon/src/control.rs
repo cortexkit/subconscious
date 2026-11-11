@@ -2132,6 +2132,11 @@ impl ControlHandler {
         dispatch_started_at: Option<StdInstant>,
         first: bool,
     ) -> Result<Vec<Frame>, RouterError> {
+        if ctx.egress.ingress_terminal() {
+            return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        self.claims.record_dispatch(frame.header.corr);
         match frame.header.ty {
             FrameType::Ping => Ok(vec![pong(&frame)?]),
             FrameType::Hello => {

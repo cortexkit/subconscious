@@ -76,9 +76,17 @@ struct State {
 }
 
 #[derive(Default)]
-pub(super) struct Claims(Mutex<State>);
+pub(super) struct Claims(
+    Mutex<State>,
+    #[cfg(test)] std::sync::atomic::AtomicBool,
+    #[cfg(test)] Mutex<Vec<u64>>,
+);
 
 impl Claims {
+    #[cfg(test)]
+    pub(super) fn record_dispatch(&self, corr: u64) {
+        self.2.lock().unwrap().push(corr);
+    }
     pub(crate) fn binding(&self, connection: ConnectionId) -> Option<ClaimBinding> {
         self.0
             .lock()
@@ -217,12 +225,19 @@ impl ControlHandler {
         if let Some(code) = refusal {
             // Close even on retryable refusal: no failed bearer presentation may
             // leave an authenticated but unbound direct connection behind.
+            ctx.egress.terminate_ingress();
             let refusal = control_error_frame(frame, code, "claim presentation refused")?;
             let sent = ctx.egress.send_flushed(refusal).await;
-            self.forwarding.request_connection_close(
-                connection,
-                CloseReason::new(code, "claim presentation refused"),
-            );
+            #[cfg(test)]
+            let notify = !self.claims.1.load(std::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(test))]
+            let notify = true;
+            if notify {
+                self.forwarding.request_connection_close(
+                    connection,
+                    CloseReason::new(code, "claim presentation refused"),
+                );
+            }
             sent?;
             return Ok(Vec::new());
         }
@@ -296,6 +311,118 @@ mod tests {
     use subc_control::ModuleProtocol;
     use subc_protocol::manifest::ModuleManifest;
     use tokio::sync::mpsc;
+
+    struct Net {
+        client: tokio::net::TcpStream,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Net {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl Net {
+        async fn new(router: Arc<Router>) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let info = subc_transport::ConnectionInfo {
+                schema: subc_transport::SCHEMA_VERSION,
+                wire_version: None,
+                endpoints: Vec::new(),
+                key: vec![0x42; 32],
+                daemon_id: [0x24; 16],
+                pid: std::process::id(),
+                daemon_ver: "test".into(),
+            };
+            let auth = crate::server::ServerAuth::new(info.key.clone(), info.daemon_id, "test");
+            let server = tokio::spawn(async move {
+                crate::server::serve_listener(listener, router, auth)
+                    .await
+                    .unwrap();
+            });
+            let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+            subc_transport::authenticate_client(&mut client, &info, Duration::from_secs(2))
+                .await
+                .unwrap();
+            Self { client, server }
+        }
+
+        async fn recv(&mut self) -> Option<Frame> {
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                subc_transport::read_frame(&mut self.client),
+            )
+            .await
+            .expect("server must settle the frame")
+            .unwrap()
+        }
+
+        async fn call(&mut self, frame: Frame) -> Frame {
+            subc_transport::write_frame(&mut self.client, &frame)
+                .await
+                .unwrap();
+            self.recv().await.expect("server reply")
+        }
+
+        async fn pipeline(&mut self, frames: &[Frame]) {
+            use tokio::io::AsyncWriteExt;
+            let mut bytes = Vec::new();
+            for frame in frames {
+                bytes.extend_from_slice(&frame.header.encode());
+                bytes.extend_from_slice(&frame.body);
+            }
+            self.client.write_all(&bytes).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn claims_refused_present_fences_pipelined_inline_and_offloaded_requests() {
+        let rig = rig().await;
+        for (index, (defer_notification, op)) in [
+            (true, "catalog.list"),
+            (true, "activity.query"),
+            (false, "catalog.list"),
+            (false, "activity.query"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // Withholding the close signal models the reader winning the race;
+            // delivering it normally also covers the close-first schedule.
+            rig.handler
+                .claims
+                .1
+                .store(defer_notification, std::sync::atomic::Ordering::Relaxed);
+            let mut net = Net::new(rig.router.clone()).await;
+            let bad = request(ClaimPresentRequest::new(Claim::new(
+                "AAAAAAAAAAAAAAAAAAAAAA",
+            )));
+            let corr = 9_000 + index as u64;
+            let following = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                corr,
+                serde_json::to_vec(&serde_json::json!({"op":op})).unwrap(),
+            )
+            .unwrap();
+            net.pipeline(&[bad, following]).await;
+            error(&net.recv().await.unwrap(), error_codes::CLAIM_INVALID);
+            while let Some(reply) = net.recv().await {
+                assert_ne!(
+                    reply.header.corr, corr,
+                    "a terminal connection cannot answer the pipelined request"
+                );
+            }
+            assert!(
+                !rig.handler.claims.2.lock().unwrap().contains(&corr),
+                "pipelined request reached control dispatch"
+            );
+        }
+    }
 
     struct Wire {
         connection: RouterConnection,

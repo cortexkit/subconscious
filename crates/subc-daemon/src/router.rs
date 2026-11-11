@@ -84,6 +84,7 @@ struct EgressAccounting {
     // Shared by the connection's sink clones so even an invalid data frame
     // spends the one opportunity to present a claim after authentication.
     ingress_seen: AtomicBool,
+    ingress_terminal: AtomicBool,
     byte_budget: usize,
     queued_bytes: AtomicUsize,
     queued_frames: AtomicUsize,
@@ -106,6 +107,7 @@ impl EgressAccounting {
     fn new(byte_budget: usize) -> Self {
         Self {
             ingress_seen: AtomicBool::new(false),
+            ingress_terminal: AtomicBool::new(false),
             byte_budget,
             queued_bytes: AtomicUsize::new(0),
             queued_frames: AtomicUsize::new(0),
@@ -365,6 +367,16 @@ pub struct FrameSink {
 }
 
 impl FrameSink {
+    pub(crate) fn terminate_ingress(&self) {
+        self.accounting
+            .ingress_terminal
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn ingress_terminal(&self) -> bool {
+        self.accounting.ingress_terminal.load(Ordering::Acquire)
+    }
+
     pub(crate) fn first_ingress_frame(&self) -> bool {
         !self.accounting.ingress_seen.swap(true, Ordering::Relaxed)
     }
@@ -1029,6 +1041,9 @@ impl Router {
         dispatch_started_at: Option<Instant>,
         first: bool,
     ) -> Result<(), RouterError> {
+        if ctx.egress.ingress_terminal() {
+            return Ok(());
+        }
         let channel = frame.header.channel;
         let epoch = frame.header.epoch;
         let corr = frame.header.corr;

@@ -1294,6 +1294,11 @@ impl SetupFixture {
                     "version": 1,
                     "storage": {"backend": "sqlite"},
                     "modules": {
+                        "subc-mcp": {
+                            "program": bin.join(platform_binary("ck-subc-mcp")),
+                            "args": ["module"],
+                            "reserved": true,
+                        },
                         "aft": {"program": bin.join(platform_binary("ck-aft"))},
                         "claustrum": installed_claustrum_entry(&bin),
                         "insula": {"program": bin.join(platform_binary("ck-insula"))},
@@ -2079,7 +2084,10 @@ fn setup_live_daemon_uses_core_release_not_connection_library_version() {
             .output()
             .unwrap();
         assert_exit(&output, 0);
-        assert_eq!(text(&output.stdout), "CortexKit is set up: daemon running, aft · claustrum · insula ok.\nOptional modules not installed: mc, synapse — run `ck setup mc` or `ck setup synapse`.\n");
+        assert_eq!(
+            text(&output.stdout),
+            "CortexKit is set up: daemon running, aft · claustrum · insula ok.\n"
+        );
         assert_eq!(
             (fs::read(&config).unwrap(), fs::read(&inventory).unwrap()),
             before
@@ -2089,6 +2097,86 @@ fn setup_live_daemon_uses_core_release_not_connection_library_version() {
         *index.requests.lock().unwrap(),
         vec!["/index.json", "/index.json"]
     );
+}
+
+#[test]
+fn setup_optional_components_line_is_shared_by_dry_run_and_apply() {
+    let fixture = SetupFixture::installed("ck-setup-optional-line");
+    let path = fixture.config_home.join("cortexkit/subc.jsonc");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["modules"]
+        .as_object_mut()
+        .unwrap()
+        .remove("subc-mcp");
+    fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    #[cfg(unix)]
+    set_setup_managed_modes(&fixture);
+    fs::remove_file(
+        fixture
+            .data_home
+            .join("cortexkit/bin")
+            .join(platform_binary("ck-insula")),
+    )
+    .unwrap();
+    let index = serve_signed_index(|base| {
+        let (mut document, assets) = setup_index(base, None);
+        document["components"]["insula"] = index_component(
+            "v0.1.0",
+            Some("0.1.0"),
+            &host_target(),
+            [(
+                "ck-insula",
+                fixture_asset(format!("{base}/unused.zip"), "00".repeat(32), 1, None),
+            )],
+        );
+        (document, assets)
+    });
+
+    for args in [&["setup", "--dry-run"][..], &["setup"][..]] {
+        let output = fixture.command(&index, args).output().unwrap();
+        assert_exit(&output, 0);
+        let lines = text(&output.stdout);
+        let offers = lines
+            .lines()
+            .filter(|line| line.starts_with("Optional modules:"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            offers,
+            ["Optional modules: insula. Add one with `ck setup <name>`."]
+        );
+    }
+}
+
+#[test]
+fn setup_rerun_applies_the_missing_core_gateway_entry() {
+    let fixture = SetupFixture::installed("ck-setup-repair-gateway");
+    let path = fixture.config_home.join("cortexkit/subc.jsonc");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    config["modules"]
+        .as_object_mut()
+        .unwrap()
+        .remove("subc-mcp");
+    fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    #[cfg(unix)]
+    set_setup_managed_modes(&fixture);
+    let index = serve_signed_index(|base| setup_index(base, None));
+
+    let output = fixture.command(&index, &["setup"]).output().unwrap();
+    assert_exit(&output, 0);
+    let written: Value = serde_json::from_str(
+        &subc_jsonc::jsonc_to_json(&fs::read_to_string(&path).unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        written["modules"]["subc-mcp"],
+        json!({
+            "program": fixture.data_home.join("cortexkit/bin").join(platform_binary("ck-subc-mcp")),
+            "args": ["module"],
+            "reserved": true,
+        })
+    );
+    assert_eq!(written["modules"]["aft"], config["modules"]["aft"]);
+    assert_eq!(*index.requests.lock().unwrap(), vec!["/index.json"]);
 }
 
 #[test]
@@ -2140,7 +2228,7 @@ fn setup_nothing_to_do_never_renders_outcome_no_op() {
     assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
     assert_eq!(
         text(&output.stdout),
-        "CortexKit is set up: daemon running, aft · claustrum · insula ok.\nOptional modules not installed: mc, synapse — run `ck setup mc` or `ck setup synapse`.\n"
+        "CortexKit is set up: daemon running, aft · claustrum · insula ok.\n"
     );
 }
 
@@ -2259,7 +2347,7 @@ fn setup_puts_ckni_beside_the_managed_ck_and_then_has_nothing_to_do() {
     assert_exit(&again, 0);
     assert_eq!(
         text(&again.stdout),
-        "CortexKit is set up: daemon running, aft · claustrum · insula ok.\nOptional modules not installed: mc, synapse — run `ck setup mc` or `ck setup synapse`.\n"
+        "CortexKit is set up: daemon running, aft · claustrum · insula ok.\n"
     );
 }
 

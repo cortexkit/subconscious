@@ -1,6 +1,6 @@
 [package]
 name = "subc-core"
-version = "0.21.4"
+version = "0.21.5"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -109,7 +109,7 @@ portable-pty = "0.9"
 tokio = { version = "1", features = ["test-util"] }
 subc-daemon = { path = "../subc-daemon", version = "0.44.9", features = ["test-support"] }
 # Keep required-feature CLI fixture targets enabled for integration tests.
-subc-core = { path = ".", version = "0.21.4", features = ["test-support"] }
+subc-core = { path = ".", version = "0.21.5", features = ["test-support"] }
 vt100 = "0.15"
 
 [lints.rust]

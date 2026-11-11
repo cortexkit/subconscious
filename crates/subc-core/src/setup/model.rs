@@ -566,7 +566,9 @@ impl fmt::Display for PlanOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SetupOperation {
     ObservePlatform,
-    OfferOptionalComponents,
+    OfferOptionalComponents {
+        components: Vec<Component>,
+    },
     OfferConversion {
         component: Component,
     },
@@ -655,7 +657,7 @@ impl SetupOperation {
             | Self::EnableComponent { component } => Some(*component),
             Self::BootstrapClaustrum { .. } => Some(Component::Claustrum),
             Self::ObservePlatform
-            | Self::OfferOptionalComponents
+            | Self::OfferOptionalComponents { .. }
             | Self::OfferConversion { .. }
             | Self::ConfirmConversion { .. }
             | Self::AdoptRunningCk { .. }
@@ -677,24 +679,23 @@ impl fmt::Display for SetupOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ObservePlatform => formatter.write_str("observe alpha platform support"),
-            Self::OfferOptionalComponents => {
-                // One line per component so a caveat reads against its owner
-                // rather than swallowing the components listed after it.
-                formatter.write_str(
-                    "offer optional components:\n\
-                     \x20 aft\n\
-                     \x20 mc\n\
-                     \x20 insula — browser-cookie providers dark by construction on Windows (Chrome App-Bound Encryption); file/API providers full; cookie lane via claustrum deposit\n\
-                     \x20 claustrum\n\
-                     \x20 synapse — healthy immediately with an empty catalog; inference remains typed-refused until model.load arrives",
-                )
-            }
+            Self::OfferOptionalComponents { components } => write!(
+                formatter,
+                "Optional modules: {}. Add one with `ck setup <name>`.",
+                components.iter().map(|component| component.label()).collect::<Vec<_>>().join(", ")
+            ),
             Self::OfferConversion { component } => {
                 write!(formatter, "offer standalone {component} conversion")
             }
             Self::ConfirmConversion { component } => {
                 write!(formatter, "confirm explicit {component} conversion")
             }
+            Self::InstallComponent { component: Component::Insula } => formatter.write_str(
+                "install insula — file/API providers; cookies only from vault deposits on every OS, never browser stores",
+            ),
+            Self::InstallComponent { component: Component::Synapse } => formatter.write_str(
+                "install synapse — healthy immediately with an empty catalog; inference remains typed-refused until model.load arrives",
+            ),
             Self::InstallComponent { component } => write!(formatter, "install {component}"),
             Self::ConfigureComponent { component } => write!(formatter, "configure {component}"),
             Self::BootstrapClaustrum {

@@ -153,6 +153,7 @@ pub(super) struct Claims(
     #[cfg(test)] std::sync::atomic::AtomicBool,
     #[cfg(test)] Mutex<Vec<u64>>,
     #[cfg(test)] Mutex<Option<Arc<AttachHold>>>,
+    #[cfg(test)] Mutex<Option<Arc<tokio::sync::Barrier>>>,
 );
 
 #[cfg(test)]
@@ -357,7 +358,7 @@ impl ControlHandler {
         let refusal = if !first {
             Some(error_codes::CLAIM_PRESENT_NOT_FIRST)
         } else {
-            self.consume_claim(ctx, frame).err()
+            self.consume_claim(ctx, frame).await.err()
         };
         if let Some(code) = refusal {
             return self.refuse_claim_connection(ctx, frame, code).await;
@@ -395,7 +396,7 @@ impl ControlHandler {
         Ok(Vec::new())
     }
 
-    fn consume_claim(&self, ctx: &RouteCtx, frame: &Frame) -> Result<(), &'static str> {
+    async fn consume_claim(&self, ctx: &RouteCtx, frame: &Frame) -> Result<(), &'static str> {
         let connection = ctx.connection_id;
         let request = serde_json::from_slice::<ClaimPresentRequest>(&frame.body)
             .map_err(|_| error_codes::CLAIM_INVALID)?;
@@ -413,6 +414,13 @@ impl ControlHandler {
                 .upgrade()
                 .ok_or(error_codes::CLAIM_INVALID)?
         };
+        #[cfg(test)]
+        {
+            let barrier = self.claims.4.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
+        }
         let registration = launch
             .registration
             .upgrade()
@@ -778,6 +786,14 @@ mod tests {
         rig: &Rig,
         module_id: &str,
     ) -> (Net, Arc<RegistrationSpawn>, SupervisedModule, ConnectionId) {
+        network_primary_with_hello(rig, module_id, true).await
+    }
+
+    async fn network_primary_with_hello(
+        rig: &Rig,
+        module_id: &str,
+        register: bool,
+    ) -> (Net, Arc<RegistrationSpawn>, SupervisedModule, ConnectionId) {
         let handle = rig.handler.supervisor.clone();
         let supervisor =
             Supervisor::new_for_test(rig.handler.registry.clone(), RestartPolicy::default())
@@ -813,31 +829,33 @@ mod tests {
             .unwrap()
             .0;
         spawn.bind(connection);
-        let hello = subc_protocol::ModuleHelloBody {
-            manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
-            protocol_ver: PROTOCOL_VERSION,
-            control_ops: None,
-            launch_nonce: None,
-        };
-        let reply = net
-            .call(
-                Frame::build(
-                    FrameType::Hello,
-                    control_flags(),
-                    0,
-                    0,
-                    3,
-                    serde_json::to_vec(&hello).unwrap(),
+        if register {
+            let hello = subc_protocol::ModuleHelloBody {
+                manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
+                protocol_ver: PROTOCOL_VERSION,
+                control_ops: None,
+                launch_nonce: None,
+            };
+            let reply = net
+                .call(
+                    Frame::build(
+                        FrameType::Hello,
+                        control_flags(),
+                        0,
+                        0,
+                        3,
+                        serde_json::to_vec(&hello).unwrap(),
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-            )
-            .await;
-        assert_eq!(
-            reply.header.ty,
-            FrameType::HelloAck,
-            "{}",
-            String::from_utf8_lossy(&reply.body)
-        );
+                .await;
+            assert_eq!(
+                reply.header.ty,
+                FrameType::HelloAck,
+                "{}",
+                String::from_utf8_lossy(&reply.body)
+            );
+        }
         (net, spawn, module, connection)
     }
 
@@ -1246,74 +1264,292 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claims_mint_requires_live_primary_never_claim_bound_or_nonce() {
-        let mut rig = rig().await;
-        let mut direct = Wire::new(&rig.router);
+    async fn claims_direct_connection_cannot_mint() {
+        let rig = rig().await;
+        let mut direct = Net::new(rig.router.clone()).await;
         error(
             &direct
-                .call(
-                    &rig.router,
-                    request(ClaimMintRequest::new(ClaimPurpose::SelfConnection)),
-                )
+                .call(request(ClaimMintRequest::new(ClaimPurpose::SelfConnection)))
                 .await,
             error_codes::CLAIM_MINT_NOT_ALLOWED,
         );
-        // Even an ordinary registered TCP module cannot mint without a channel.
-        let legacy = subc_protocol::ModuleHelloBody {
-            manifest: ModuleManifest::builder("legacy-module", "1.0.0").build(),
+    }
+
+    #[tokio::test]
+    async fn claims_nonce_style_registration_cannot_mint() {
+        let rig = rig().await;
+        let mut legacy = Net::new(rig.router.clone()).await;
+        let hello = subc_protocol::ModuleHelloBody {
+            manifest: ModuleManifest::builder("claims-legacy", "1.0.0").build(),
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,
             launch_nonce: None,
         };
-        let reply = direct
+        assert_eq!(
+            legacy
+                .call(
+                    Frame::build(
+                        FrameType::Hello,
+                        control_flags(),
+                        0,
+                        0,
+                        1,
+                        serde_json::to_vec(&hello).unwrap()
+                    )
+                    .unwrap()
+                )
+                .await
+                .header
+                .ty,
+            FrameType::HelloAck
+        );
+        error(
+            &legacy
+                .call(request(ClaimMintRequest::new(ClaimPurpose::SelfConnection)))
+                .await,
+            error_codes::CLAIM_MINT_NOT_ALLOWED,
+        );
+    }
+
+    #[tokio::test]
+    async fn claims_bound_connection_cannot_mint() {
+        let mut rig = rig().await;
+        let token = mint(&mut rig, ClaimPurpose::SelfConnection).await.claim;
+        let mut consumer = Net::new(rig.router.clone()).await;
+        assert_eq!(
+            consumer
+                .call(request(ClaimPresentRequest::new(token)))
+                .await
+                .header
+                .ty,
+            FrameType::Response
+        );
+        error(
+            &consumer
+                .call(request(ClaimMintRequest::new(ClaimPurpose::Helper)))
+                .await,
+            error_codes::CLAIM_MINT_NOT_ALLOWED,
+        );
+    }
+
+    #[tokio::test]
+    async fn claims_dead_primary_cannot_mint() {
+        let rig = rig().await;
+        let (mut primary, spawn, _module, _) = network_primary(&rig, "claims-dead").await;
+        spawn.retire();
+        error(
+            &primary
+                .call(request(ClaimMintRequest::new(ClaimPurpose::Relay)))
+                .await,
+            error_codes::CLAIM_MINT_NOT_ALLOWED,
+        );
+    }
+
+    #[tokio::test]
+    async fn claims_primary_must_complete_hello_before_minting() {
+        let rig = rig().await;
+        let (mut primary, _spawn, _module, _) =
+            network_primary_with_hello(&rig, "claims-unregistered", false).await;
+        error(
+            &primary
+                .call(request(ClaimMintRequest::new(ClaimPurpose::SelfConnection)))
+                .await,
+            error_codes::CLAIM_MINT_NOT_ALLOWED,
+        );
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_authority_is_not_consumer_authority() {
+        let rig = rig().await;
+        let (mut primary, _spawn, _module, _) = network_primary(&rig, "claims-prefix").await;
+        error(
+            &primary
+                .call(request(ClaimMintRequest::new(ClaimPurpose::Prefix {
+                    module_id: "claims-prefix:child".into(),
+                })))
+                .await,
+            error_codes::CLAIM_PREFIX_REFUSED,
+        );
+    }
+
+    struct SwapRig {
+        incumbent: Net,
+        candidate: Net,
+        module: SupervisedModule,
+        swap: tokio::task::JoinHandle<
+            Result<crate::supervise::SwapOutcome, crate::supervise::SuperviseError>,
+        >,
+        incumbent_id: ConnectionId,
+        candidate_id: ConnectionId,
+    }
+
+    async fn swap_candidate(rig: &Rig, module_id: &str) -> SwapRig {
+        let (incumbent, _spawn, module, incumbent_id) = network_primary(rig, module_id).await;
+        let swapping = module.clone();
+        let swap = tokio::spawn(async move { swapping.swap(Some(Duration::from_secs(5))).await });
+        let candidate = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let spawn = rig
+                    .handler
+                    .supervisor
+                    .registration_for_test(module_id)
+                    .unwrap();
+                if spawn.is_candidate() {
+                    spawn.wait_launch().await;
+                    break spawn;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("swap must create its candidate channel");
+        let mut net = Net::new(rig.router.clone()).await;
+        assert_eq!(
+            net.call(Frame::build(FrameType::Ping, control_flags(), 0, 0, 2, Vec::new()).unwrap())
+                .await
+                .header
+                .ty,
+            FrameType::Pong
+        );
+        let peer = net.client.local_addr().unwrap();
+        let candidate_id = *rig
+            .handler
+            .caller_endpoints
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, (_, remote))| *remote == peer)
+            .unwrap()
+            .0;
+        candidate.bind(candidate_id);
+        let mut manifest = ModuleManifest::builder(module_id, "1.0.0").build();
+        manifest.ready = Some(false);
+        let hello = subc_protocol::ModuleHelloBody {
+            manifest,
+            protocol_ver: PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: None,
+        };
+        let ack = net
             .call(
-                &rig.router,
                 Frame::build(
                     FrameType::Hello,
                     control_flags(),
                     0,
                     0,
-                    2,
-                    serde_json::to_vec(&legacy).unwrap(),
+                    3,
+                    serde_json::to_vec(&hello).unwrap(),
                 )
                 .unwrap(),
             )
             .await;
-        assert_eq!(reply.header.ty, FrameType::HelloAck);
-        error(
-            &direct
-                .call(
-                    &rig.router,
-                    request(ClaimMintRequest::new(ClaimPurpose::SelfConnection)),
-                )
-                .await,
-            error_codes::CLAIM_MINT_NOT_ALLOWED,
-        );
-        let token = mint(&mut rig, ClaimPurpose::SelfConnection).await.claim;
-        let mut bound = Wire::new(&rig.router);
         assert_eq!(
-            present(&rig, &mut bound, token).await.header.ty,
-            FrameType::Response
+            ack.header.ty,
+            FrameType::HelloAck,
+            "{}",
+            String::from_utf8_lossy(&ack.body)
         );
-        error(
-            &bound
-                .call(
-                    &rig.router,
-                    request(ClaimMintRequest::new(ClaimPurpose::Helper)),
-                )
-                .await,
-            error_codes::CLAIM_MINT_NOT_ALLOWED,
+        assert_eq!(
+            rig.handler
+                .forwarding
+                .module_id_for_connection(candidate_id)
+                .unwrap()
+                .as_deref(),
+            Some(module_id),
+            "candidate must be indexed by its connection"
         );
-        rig.spawn.retire();
-        error(
-            &rig.primary
-                .call(
-                    &rig.router,
-                    request(ClaimMintRequest::new(ClaimPurpose::Relay)),
-                )
-                .await,
-            error_codes::CLAIM_MINT_NOT_ALLOWED,
+        SwapRig {
+            incumbent,
+            candidate: net,
+            module,
+            swap,
+            incumbent_id,
+            candidate_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn claims_warming_candidate_primary_can_mint() {
+        let rig = rig().await;
+        let SwapRig {
+            incumbent: _incumbent,
+            mut candidate,
+            module,
+            swap,
+            incumbent_id,
+            candidate_id,
+        } = swap_candidate(&rig, "claims-candidate").await;
+        assert_ne!(candidate_id, incumbent_id);
+        assert_eq!(
+            rig.handler
+                .forwarding
+                .active_module_endpoint("claims-candidate")
+                .unwrap()
+                .unwrap()
+                .connection_id,
+            incumbent_id
         );
+        net_mint(&mut candidate, ClaimPurpose::SelfConnection).await;
+        drop(candidate);
+        drop(_incumbent);
+        module.stop().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), swap)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn claims_draining_incumbent_primary_can_mint() {
+        let rig = rig().await;
+        let SwapRig {
+            mut incumbent,
+            mut candidate,
+            module: _module,
+            swap,
+            incumbent_id,
+            candidate_id,
+        } = swap_candidate(&rig, "claims-draining").await;
+        let release = rig.handler.forwarding.hold_route_closing_for_test();
+        let ready = candidate
+            .call(request(
+                serde_json::json!({"op":"catalog.update","provides":[],"ready":true}),
+            ))
+            .await;
+        assert_eq!(ready.header.ty, FrameType::Response);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), swap)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            crate::supervise::SwapOutcome::Cutover
+        );
+        let notice = incumbent.recv().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&notice.body).unwrap();
+        assert_eq!(body["op"], "module.draining");
+        assert_eq!(
+            rig.handler
+                .forwarding
+                .active_module_endpoint("claims-draining")
+                .unwrap()
+                .unwrap()
+                .connection_id,
+            candidate_id
+        );
+        assert_eq!(
+            rig.handler
+                .forwarding
+                .module_id_for_connection(incumbent_id)
+                .unwrap()
+                .as_deref(),
+            Some("claims-draining"),
+            "draining incumbent must remain indexed by its connection"
+        );
+        net_mint(&mut incumbent, ClaimPurpose::Relay).await;
+        let _ = release.send(());
     }
 
     #[tokio::test]
@@ -1689,16 +1925,32 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn claims_concurrent_redemption_has_exactly_one_winner() {
         let mut rig = rig().await;
         let token = mint(&mut rig, ClaimPurpose::Helper).await.claim;
-        let mut a = Wire::new(&rig.router);
-        let mut b = Wire::new(&rig.router);
-        let (a_reply, b_reply) = tokio::join!(
-            present(&rig, &mut a, token.clone()),
-            present(&rig, &mut b, token)
-        );
+        let mut a = Net::new(rig.router.clone()).await;
+        let mut b = Net::new(rig.router.clone()).await;
+        // Both workers look up the same token before either redeems it. The
+        // async rendezvous holds no claims lock and never blocks a Tokio worker.
+        *rig.handler.claims.4.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(2)));
+        let first = request(ClaimPresentRequest::new(token.clone()));
+        let second = request(ClaimPresentRequest::new(token));
+        let a_task = tokio::spawn(async move {
+            let reply = a.call(first).await;
+            (a, reply)
+        });
+        let b_task = tokio::spawn(async move {
+            let reply = b.call(second).await;
+            (b, reply)
+        });
+        let ((mut a, a_reply), (mut b, b_reply)) =
+            tokio::time::timeout(Duration::from_secs(2), async {
+                (a_task.await.unwrap(), b_task.await.unwrap())
+            })
+            .await
+            .expect("two server workers must race redemption");
+        *rig.handler.claims.4.lock().unwrap() = None;
         assert_eq!(
             [a_reply.header.ty, b_reply.header.ty]
                 .iter()
@@ -1712,8 +1964,7 @@ mod tests {
             (&mut b, b_reply)
         };
         error(&reply, error_codes::CLAIM_INVALID);
-        loser.closed().await;
-        assert!(rig.handler.claims.binding(loser.connection.id()).is_none());
+        assert!(loser.recv().await.is_none());
     }
 
     #[tokio::test]

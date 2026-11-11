@@ -2341,6 +2341,10 @@ impl ControlHandler {
                 })
                 .await
                 .map_err(|error| RouterError::backend(0, correlation, error.to_string()))??;
+                #[cfg(test)]
+                if prefix_attempt.is_some() {
+                    self.claims.pause_prefix_commit_for_test(false).await;
+                }
                 if let Some(attempt) = &mut prefix_attempt {
                     let accepted = !replies
                         .iter()

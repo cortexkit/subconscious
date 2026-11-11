@@ -2868,7 +2868,7 @@ impl SupervisorHandle {
             return Ok(ReservedHelloVerification::default());
         };
 
-        if !channel && self.module_is_gated(&owner_module_id) {
+        if module_id.len() == prefix.len() || (!channel && self.module_is_gated(&owner_module_id)) {
             return Err(ReservedHelloRejection::Prefix {
                 prefix,
                 owner_module_id,

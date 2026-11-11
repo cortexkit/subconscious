@@ -138,9 +138,9 @@ impl Drop for PrefixHelloAttempt {
     fn drop(&mut self) {
         if !self.accepted {
             self.ctx.egress.terminate_ingress();
-            self.handler
-                .claims
-                .connection_closed(self.ctx.connection_id);
+            // A refused duplicate or a cancelled post-publication attempt may
+            // already have registry and forwarding state, not just a claim.
+            let _ = self.handler.cleanup_connection(self.ctx.connection_id);
             self.handler.request_refusal_close(
                 self.ctx.connection_id,
                 Some(&self.ctx.egress),
@@ -296,6 +296,8 @@ pub(super) struct Claims(
     #[cfg(test)] Mutex<Option<&'static str>>,
     #[cfg(test)] Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)] Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)] Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    #[cfg(test)] Mutex<Option<Arc<tokio::sync::Barrier>>>,
 );
 
 #[cfg(test)]
@@ -305,6 +307,15 @@ struct AttachHold {
 }
 
 impl Claims {
+    #[cfg(test)]
+    pub(super) async fn pause_prefix_commit_for_test(&self, mint: bool) {
+        let slot = if mint { &self.10 } else { &self.9 };
+        let hold = slot.lock().unwrap().take();
+        if let Some(hold) = hold {
+            hold.wait().await;
+            hold.wait().await;
+        }
+    }
     #[cfg(test)]
     pub(super) fn pause_prefix_hello_for_test(&self, stage: u8) {
         let slot = match stage {
@@ -667,6 +678,10 @@ impl ControlHandler {
         {
             return self.claim_refusal(frame, "config_gated");
         }
+        #[cfg(test)]
+        if matches!(request.purpose, ClaimPurpose::Prefix { .. }) {
+            self.claims.pause_prefix_commit_for_test(true).await;
+        }
         let Ok(_alive) = spawn.begin_publication() else {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
         };
@@ -676,6 +691,19 @@ impl ControlHandler {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
         }
         let mut index = self.claims.0.lock().unwrap_or_else(|p| p.into_inner());
+        // Serialize the final authority check and token insertion with prefix
+        // transfers, after all asynchronous content and recovery checks.
+        let _prefix_ownership = if let ClaimPurpose::Prefix { module_id } = &request.purpose {
+            match self
+                .supervisor
+                .prefix_claim_publication(&spawn.module_id, module_id)
+            {
+                Some(guard) => Some(guard),
+                None => return self.claim_refusal(frame, error_codes::CLAIM_PREFIX_REFUSED),
+            }
+        } else {
+            None
+        };
         let mut token = [0; 16];
         loop {
             getrandom::getrandom(&mut token).map_err(|_| {
@@ -2050,6 +2078,165 @@ pub(crate) mod tests {
             FrameType::Response
         );
         child
+    }
+
+    async fn prefix_wire(rig: &mut Rig, module_id: &str) -> Wire {
+        rig.handler
+            .supervisor
+            .set_reserved_prefixes("claims-module", &["claims:".into()]);
+        let token = mint(
+            rig,
+            ClaimPurpose::Prefix {
+                module_id: module_id.into(),
+            },
+        )
+        .await
+        .claim;
+        let mut wire = Wire::new(&rig.router);
+        assert_eq!(
+            present(rig, &mut wire, token).await.header.ty,
+            FrameType::Response
+        );
+        wire
+    }
+
+    fn assert_prefix_torn_down(rig: &Rig, connection: ConnectionId, module_id: &str) {
+        assert!(rig.handler.claims.binding(connection).is_none());
+        assert!(rig
+            .handler
+            .registry
+            .get_module(module_id)
+            .unwrap()
+            .is_none());
+        assert!(rig
+            .handler
+            .forwarding
+            .module_endpoint_for_connection(connection)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_followup_second_hello_tears_down_catalog_and_forwarding() {
+        let mut rig = rig().await;
+        let mut wire = prefix_wire(&mut rig, "claims:duplicate").await;
+        assert_eq!(
+            wire.call(&rig.router, prefix_hello("claims:duplicate"))
+                .await
+                .header
+                .ty,
+            FrameType::HelloAck
+        );
+        error(
+            &wire
+                .call(&rig.router, prefix_hello("claims:duplicate"))
+                .await,
+            error_codes::CLAIM_PREFIX_REFUSED,
+        );
+        wire.closed().await;
+        assert_prefix_torn_down(&rig, wire.connection.id(), "claims:duplicate");
+        assert!(!rig
+            .handler
+            .registry
+            .list_modules_with_nonce_verification()
+            .unwrap()
+            .1
+            .iter()
+            .any(|(registration, _)| registration.manifest.module_id == "claims:duplicate"));
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_followup_mint_rechecks_transfer_at_token_commit() {
+        let rig = rig().await;
+        rig.handler
+            .supervisor
+            .set_reserved_prefixes("claims-module", &["claims:".into()]);
+        let hold = Arc::new(tokio::sync::Barrier::new(2));
+        *rig.handler.claims.10.lock().unwrap() = Some(hold.clone());
+        let handler = rig.handler.clone();
+        let ctx = rig.primary.ctx.clone();
+        let minting = tokio::spawn(async move {
+            handler
+                .handle_claim_mint(
+                    &ctx,
+                    &request(ClaimMintRequest::new(ClaimPurpose::Prefix {
+                        module_id: "claims:transferred".into(),
+                    })),
+                )
+                .await
+        });
+        hold.wait().await;
+        rig.handler
+            .supervisor
+            .set_reserved_prefixes("new-owner", &["claims:".into()]);
+        hold.wait().await;
+        let replies = minting.await.unwrap().unwrap();
+        error(&replies[0], error_codes::CLAIM_PREFIX_REFUSED);
+        assert_eq!(rig.spawn.claims.get().unwrap().pending_count_for_test(), 0);
+        assert!(rig.handler.claims.0.lock().unwrap().pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_followup_cancel_after_publication_tears_down_consistently() {
+        let mut rig = rig().await;
+        let wire = prefix_wire(&mut rig, "claims:cancelled").await;
+        let hold = Arc::new(tokio::sync::Barrier::new(2));
+        *rig.handler.claims.9.lock().unwrap() = Some(hold.clone());
+        let handler = rig.handler.clone();
+        let ctx = wire.ctx.clone();
+        let ingress = tokio::spawn(async move {
+            handler
+                .handle_control_frame_timed(&ctx, prefix_hello("claims:cancelled"), None)
+                .await
+        });
+        hold.wait().await;
+        assert!(rig.handler.claims.binding(wire.connection.id()).is_some());
+        assert!(rig
+            .handler
+            .registry
+            .get_module("claims:cancelled")
+            .unwrap()
+            .is_some());
+        assert!(rig
+            .handler
+            .forwarding
+            .module_endpoint_for_connection(wire.connection.id())
+            .unwrap()
+            .is_some());
+        ingress.abort();
+        assert!(ingress.await.unwrap_err().is_cancelled());
+        let mut wire = wire;
+        wire.closed().await;
+        assert_prefix_torn_down(&rig, wire.connection.id(), "claims:cancelled");
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_followup_legacy_nonce_refuses_bare_longest_prefix() {
+        let rig = rig().await;
+        let supervisor = &rig.handler.supervisor;
+        supervisor.set_reserved_prefixes("legacy-owner", &["fed:".into(), "fed:nested:".into()]);
+        supervisor.set_spawn_nonce("legacy-owner", "legacy-nonce".into());
+        assert!(supervisor
+            .reserved_hello_verification("fed:child", Some("legacy-nonce"))
+            .is_ok());
+        for id in ["fed:", "fed:nested:"] {
+            assert!(
+                supervisor
+                    .reserved_hello_verification(id, Some("legacy-nonce"))
+                    .is_err(),
+                "bare prefix {id} is not a child"
+            );
+        }
+        supervisor.set_reserved_prefixes("nested-owner", &["fed:nested:".into()]);
+        supervisor.set_spawn_nonce("nested-owner", "nested-nonce".into());
+        for nonce in ["legacy-nonce", "nested-nonce"] {
+            assert!(supervisor
+                .reserved_hello_verification("fed:nested:", Some(nonce))
+                .is_err());
+        }
+        assert!(supervisor
+            .reserved_hello_verification("fed:nested:child", Some("nested-nonce"))
+            .is_ok());
     }
 
     async fn pause_prefix_hello(

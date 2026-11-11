@@ -374,9 +374,37 @@ const ROUTE_OPEN_NOT_SERVING_REASONS: &[&str] = &[
     "relay_send_failed",
 ];
 
+/// Observe test request cancellation relative to the connection's cleanup.
+#[cfg(test)]
+struct ActivityRequestPause {
+    connection: ConnectionId,
+    started: tokio::sync::Notify,
+    cancelled: tokio::sync::Notify,
+    cleanup_started: std::sync::atomic::AtomicBool,
+    cancelled_after_cleanup: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+struct ActivityRequestCancellation(Arc<ActivityRequestPause>);
+
+#[cfg(test)]
+impl Drop for ActivityRequestCancellation {
+    fn drop(&mut self) {
+        self.0.cancelled_after_cleanup.store(
+            self.0
+                .cleanup_started
+                .load(std::sync::atomic::Ordering::Acquire),
+            std::sync::atomic::Ordering::Release,
+        );
+        self.0.cancelled.notify_one();
+    }
+}
+
 /// Real channel-0 control handler for subc itself.
 #[derive(Clone)]
 pub struct ControlHandler {
+    #[cfg(test)]
+    activity_request_pause: Arc<Mutex<Option<Arc<ActivityRequestPause>>>>,
     claims: Arc<claims::Claims>,
     registry: Arc<Registry>,
     config_runtime: Option<Arc<crate::config_gate::runtime::RuntimeOwner>>,
@@ -1048,6 +1076,8 @@ impl ControlHandler {
         let route_outages = forwarding.route_outages();
         Self {
             registry,
+            #[cfg(test)]
+            activity_request_pause: Arc::new(Mutex::new(None)),
             claims: Arc::new(claims::Claims::default()),
             config_runtime: None,
             config_review_admission: Arc::new(crate::config_gate::MissingReviewAdmission),
@@ -2555,6 +2585,18 @@ impl ControlHandler {
         connection_id: ConnectionId,
         requested_reason: RegistrationEndReason,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        #[cfg(test)]
+        if let Some(pause) = self
+            .activity_request_pause
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|pause| pause.connection == connection_id)
+        {
+            pause
+                .cleanup_started
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         if let Some(runtime) = &self.config_runtime {
             runtime.disconnected(connection_id);
         }
@@ -4811,6 +4853,20 @@ impl ControlHandler {
         ctx: &RouteCtx,
         frame: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
+        #[cfg(test)]
+        {
+            let pause = self
+                .activity_request_pause
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|pause| pause.connection == ctx.connection_id);
+            if let Some(pause) = pause {
+                let _cancelled = ActivityRequestCancellation(pause.clone());
+                pause.started.notify_one();
+                std::future::pending::<()>().await;
+            }
+        }
         use subc_control::{
             ActivityQueryRequest, ActivitySubscribeRequest, ActivitySubscribeResponse,
             ACTIVITY_MALFORMED, ACTIVITY_READ_FORBIDDEN, ACTIVITY_UNAVAILABLE,

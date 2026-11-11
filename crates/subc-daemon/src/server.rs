@@ -666,6 +666,23 @@ enum ConnectionLoopExit {
     CloseRequested(CloseReason),
 }
 
+#[derive(Default)]
+struct ConnectionTasks {
+    routes: JoinSet<Result<(), RouterError>>,
+    privileged: JoinSet<Result<(), RouterError>>,
+    activity: JoinSet<Result<(), RouterError>>,
+}
+
+impl ConnectionTasks {
+    async fn shutdown(&mut self) {
+        self.activity.abort_all();
+        self.routes.shutdown().await;
+        self.privileged.shutdown().await;
+        // Accepted appends belong to the writer queue, not these reply waiters.
+        self.activity.shutdown().await;
+    }
+}
+
 /// Run the authenticated frame read -> route loop for one connection.
 ///
 /// Every accepted TCP connection must complete the key-auth prelude before any
@@ -834,8 +851,7 @@ where
         egress: egress.clone(),
     };
 
-    let mut route_open_tasks = JoinSet::new();
-    let mut privileged_tasks = JoinSet::new();
+    let mut tasks = ConnectionTasks::default();
     let registration_expired = async {
         match &channel_spawn {
             Some(spawn) => spawn.registration_expired().await,
@@ -850,8 +866,7 @@ where
         Arc::clone(&router),
         ctx.clone(),
         close_receiver,
-        &mut route_open_tasks,
-        &mut privileged_tasks,
+        &mut tasks,
         origin,
         ) => result,
     };
@@ -870,10 +885,9 @@ where
     // until its next await, and could commit a route for this connection after
     // cleanup has cleared it, with nothing left to refuse it and nothing to
     // clean it up. shutdown() aborts and then waits.
-    route_open_tasks.shutdown().await;
-    // Abort held approvals and wait for their withdrawal guards before lifting
-    // this connection's cleanup state or removing its caller endpoints.
-    privileged_tasks.shutdown().await;
+    // Include approval withdrawals and activity publishers before lifting the
+    // cleanup state or sweeping this connection's subscriptions and endpoints.
+    tasks.shutdown().await;
 
     drop(ctx);
     drop(egress);
@@ -1017,20 +1031,17 @@ pub(crate) fn config_test_connection_loop(
         }
     });
     let task = tokio::spawn(async move {
-        let mut routes = JoinSet::new();
-        let mut approvals = JoinSet::new();
+        let mut tasks = ConnectionTasks::default();
         let result = connection_loop(
             &mut read,
             router,
             ctx.clone(),
             close,
-            &mut routes,
-            &mut approvals,
+            &mut tasks,
             LocalOrigin::Local,
         )
         .await;
-        routes.shutdown().await;
-        approvals.shutdown().await;
+        tasks.shutdown().await;
         drop(ctx);
         drop(connection);
         writer.abort();
@@ -1045,14 +1056,17 @@ async fn connection_loop<R>(
     router: Arc<Router>,
     ctx: RouteCtx,
     mut close_receiver: ConnectionCloseReceiver,
-    route_open_tasks: &mut JoinSet<Result<(), RouterError>>,
-    privileged_tasks: &mut JoinSet<Result<(), RouterError>>,
+    tasks: &mut ConnectionTasks,
     origin: LocalOrigin,
 ) -> Result<ConnectionLoopExit, ConnectionError>
 where
     R: AsyncRead + Unpin,
 {
-    let mut activity_tasks = JoinSet::new();
+    let ConnectionTasks {
+        routes: route_open_tasks,
+        privileged: privileged_tasks,
+        activity: activity_tasks,
+    } = tasks;
     loop {
         while let Some(result) = activity_tasks.try_join_next() {
             finish_route_open_task(result)?;
@@ -1099,6 +1113,9 @@ where
             return Ok(ConnectionLoopExit::PeerClosed);
         }
         let first = ctx.egress.first_ingress_frame();
+        if frame.header.channel == 0 && frame.header.ty == subc_protocol::FrameType::Goodbye {
+            activity_tasks.shutdown().await;
+        }
         if let LocalOrigin::RegistrationChannel(spawn) = &origin {
             let hello = frame.header.ty == subc_protocol::FrameType::Hello;
             if (!spawn.registered() && !hello) || (spawn.registered() && hello) {

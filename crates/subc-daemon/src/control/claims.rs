@@ -959,6 +959,82 @@ pub(crate) mod tests {
         }
     }
 
+    async fn activity_cancellation_case(goodbye: bool) {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/scratch")
+            .join(format!("activity-cancel-{}-{goodbye}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let handler = Arc::new(
+            ControlHandler::new(Arc::new(Registry::default()))
+                .with_activity_ledger(&root, "activity-cancel".into()),
+        );
+        let router = Arc::new(Router::with_control_handler(handler.clone()));
+        let mut net = Net::new(router).await;
+        let ping = || Frame::build(FrameType::Ping, control_flags(), 0, 0, 2, Vec::new()).unwrap();
+        assert_eq!(net.call(ping()).await.header.ty, FrameType::Pong);
+        let baseline = net
+            .call(request(
+                serde_json::json!({"op":"activity.query", "limit":10}),
+            ))
+            .await;
+        assert_eq!(
+            baseline.header.ty,
+            FrameType::Response,
+            "{}",
+            String::from_utf8_lossy(&baseline.body)
+        );
+        let pause = Arc::new(ActivityRequestPause {
+            connection: net.connection_id(&handler),
+            started: tokio::sync::Notify::new(),
+            cancelled: tokio::sync::Notify::new(),
+            cleanup_started: std::sync::atomic::AtomicBool::new(false),
+            cancelled_after_cleanup: std::sync::atomic::AtomicBool::new(false),
+        });
+        *handler.activity_request_pause.lock().unwrap() = Some(pause.clone());
+        net.send(request(
+            serde_json::json!({"op":"activity.query", "limit":10}),
+        ))
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), pause.started.notified())
+            .await
+            .expect("real activity request must enter its owned task");
+        if goodbye {
+            net.send(
+                Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 3, Vec::new()).unwrap(),
+            )
+            .await;
+            assert_eq!(net.call(ping()).await.header.ty, FrameType::Pong);
+        } else {
+            tokio::io::AsyncWriteExt::shutdown(&mut net.client)
+                .await
+                .unwrap();
+            assert!(net.recv().await.is_none());
+        }
+        tokio::time::timeout(Duration::from_secs(2), pause.cancelled.notified())
+            .await
+            .expect("activity cancellation must finish before session cleanup");
+        assert!(
+            !pause
+                .cancelled_after_cleanup
+                .load(std::sync::atomic::Ordering::Acquire),
+            "activity task cancellation must complete before connection cleanup"
+        );
+        *handler.activity_request_pause.lock().unwrap() = None;
+        drop(net);
+        drop(handler);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn activity_request_cancellation_precedes_eof_cleanup() {
+        activity_cancellation_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn activity_request_cancellation_precedes_goodbye_cleanup() {
+        activity_cancellation_case(true).await;
+    }
+
     #[tokio::test]
     async fn claims_bound_connections_close_and_pending_claims_void_on_retirement() {
         let mut rig = rig().await;

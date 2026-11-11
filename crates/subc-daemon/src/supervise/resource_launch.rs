@@ -54,9 +54,42 @@ impl SupervisedModule {
 }
 
 impl SupervisorHandle {
+    #[cfg(all(test, unix))]
+    pub(crate) fn pause_resource_commit_for_test(&self, pause: std::sync::Arc<std::sync::Barrier>) {
+        *self.resource_commit_pause.lock().unwrap() = Some(pause);
+    }
     /// Keep launch replacement and nonce rotation excluded only for the short,
     /// syscall-free accounting commit, never while validating processes.
     pub(crate) fn with_current_resource_launch<T>(
+        &self,
+        id: &str,
+        nonce: &str,
+        launch: &ResourceLaunch,
+        commit: impl FnOnce() -> T,
+    ) -> Result<T, ResourceCommitError> {
+        #[cfg(test)]
+        if let Some(pause) = self.resource_commit_pause.lock().unwrap().take() {
+            pause.wait();
+            pause.wait();
+        }
+        let runtime = self
+            .gate_runtime
+            .try_lock()
+            .map_err(|_| ResourceCommitError::Busy)?
+            .clone();
+        if let Some(runtime) = runtime {
+            let owner = runtime.upgrade().ok_or(ResourceCommitError::Changed)?;
+            return owner
+                .with_legacy_nonce_authority(id, || {
+                    self.commit_current_resource_launch(id, nonce, launch, commit)
+                })
+                .map_err(|()| ResourceCommitError::Busy)?
+                .ok_or(ResourceCommitError::Changed)?;
+        }
+        self.commit_current_resource_launch(id, nonce, launch, commit)
+    }
+
+    fn commit_current_resource_launch<T>(
         &self,
         id: &str,
         nonce: &str,

@@ -2380,6 +2380,8 @@ struct SupervisedConfiguration {
 /// launch nonces recorded at spawn are checked by the same daemon instance.
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
+    #[cfg(test)]
+    resource_commit_pause: Arc<Mutex<Option<Arc<std::sync::Barrier>>>>,
     #[cfg(all(test, unix))]
     registration_test_channels: CapturedRegistrationChannels,
     registration_service: Arc<Mutex<Option<registration::RegistrationService>>>,

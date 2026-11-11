@@ -50,6 +50,130 @@ fn spec(rig: &Rig) -> ModuleSpec {
         .module_spec()
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gated_nonce_policy_stamp_between_agent_validation_and_commit_refuses_wire_declaration() {
+    let rig = rig();
+    std::fs::write(
+        rig.path.join("subc.jsonc"),
+        serde_json::to_vec(&json!({"version":1,"modules":{"a":{
+        "program":rig.path.join("program"),"args":["600"],"protocol":"subc"}}}))
+        .unwrap(),
+    )
+    .unwrap();
+    let owner = Arc::new(rig.owner("resource-stamp-race"));
+    let registry = Arc::new(crate::Registry::default());
+    let handle = SupervisorHandle::new();
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.supervise_configured(spec(&rig), true).unwrap();
+    let nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    let control = crate::ControlHandler::new(registry)
+        .with_supervisor(handle.clone())
+        .with_config_runtime(owner.clone());
+    let router = Arc::new(crate::Router::with_control_handler(Arc::new(control)));
+    let info = subc_transport::ConnectionInfo {
+        schema: subc_transport::SCHEMA_VERSION,
+        wire_version: None,
+        endpoints: vec![],
+        key: vec![0x42; 32],
+        daemon_id: [0x24; 16],
+        pid: std::process::id(),
+        daemon_ver: "test".into(),
+    };
+    let auth = crate::server::ServerAuth::new(info.key.clone(), info.daemon_id, "test");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(crate::server::serve_listener(listener, router, auth));
+    let mut peer = tokio::net::TcpStream::connect(address).await.unwrap();
+    subc_transport::authenticate_client(&mut peer, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: Some(nonce),
+    };
+    let frame = |ty, corr, body| {
+        subc_protocol::Frame::build(
+            ty,
+            subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .unwrap()
+    };
+    subc_transport::write_frame(
+        &mut peer,
+        &frame(
+            subc_protocol::FrameType::Hello,
+            1,
+            serde_json::to_vec(&hello).unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        subc_transport::read_frame(&mut peer)
+            .await
+            .unwrap()
+            .unwrap()
+            .header
+            .ty,
+        subc_protocol::FrameType::HelloAck
+    );
+    let pause = Arc::new(std::sync::Barrier::new(2));
+    handle.pause_resource_commit_for_test(pause.clone());
+    subc_transport::write_frame(
+        &mut peer,
+        &frame(
+            subc_protocol::FrameType::Request,
+            2,
+            serde_json::to_vec(
+                &json!({"op":"supervisor.agent_commands", "started":[], "finished":[]}),
+            )
+            .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    let reached = pause.clone();
+    tokio::task::spawn_blocking(move || {
+        reached.wait();
+    })
+    .await
+    .unwrap();
+    rig.stamp(&owner);
+    tokio::task::spawn_blocking(move || {
+        pause.wait();
+    })
+    .await
+    .unwrap();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(2),
+        subc_transport::read_frame(&mut peer),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    drop(peer);
+    module.stop().await.unwrap();
+    server.abort();
+    assert_eq!(
+        reply.header.ty,
+        subc_protocol::FrameType::Error,
+        "a new stamp must fence a validated but uncommitted nonce declaration"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap()["code"],
+        "not_supervised"
+    );
+}
+
 async fn stamped_nonce_hello(
     owner: Arc<RuntimeOwner>,
     handle: SupervisorHandle,

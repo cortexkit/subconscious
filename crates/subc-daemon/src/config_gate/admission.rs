@@ -303,6 +303,18 @@ impl RuntimeOwner {
             })
             .unwrap_or(true)
     }
+
+    pub(crate) fn with_legacy_nonce_authority<T>(
+        &self,
+        module: &str,
+        commit: impl FnOnce() -> T,
+    ) -> std::result::Result<Option<T>, ()> {
+        // Stamping takes this same owner mutex and publishes admission before
+        // releasing it. Keep it through the syscall-free accounting mutation,
+        // without an OwnerGuard whose drop would wake the delivery worker.
+        let _state = self.inner.try_lock().map_err(|_| ())?;
+        Ok((!self.module_is_gated(module)).then(commit))
+    }
     pub(crate) fn checked_admission_hold(&self, module: Option<&str>) -> Result<()> {
         {
             let mut state = self.lock()?;

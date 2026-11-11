@@ -2516,12 +2516,59 @@ impl ServeOptions {
         manifest: ModuleManifest,
         handler: H,
     ) -> Result<(), SubcModuleError> {
-        if let Some((_handle, future)) =
-            prepare_connection(connection_file, manifest, handler, self).await?
+        if let Some((_handle, future)) = self
+            .serve_with_handle(connection_file, manifest, handler)
+            .await?
         {
             future.await?;
         }
         Ok(())
+    }
+
+    /// Connect and register using the same launch inputs as [`Self::serve`],
+    /// returning a cloneable handle and the future that keeps the module serving.
+    ///
+    /// Reads `--subc <connection-file>` (or `--subc=<connection-file>`) from argv
+    /// and overrides the manifest's module id with `SUBC_MODULE_ID` when present.
+    /// Uses this options value's stop handle and writer drain timeout. A requested
+    /// stop before registration completes returns `Ok(None)`; this is an expected
+    /// outcome, not a connection error.
+    ///
+    /// The returned serve future **must be awaited or spawned**. A module can give
+    /// the returned handle to its handler's shared state before starting that future.
+    /// Spawn the serve future before slow startup work or awaiting control RPCs:
+    /// it reads their replies and answers health and stop.
+    pub async fn serve_from_env_with_handle<H: ModuleHandler>(
+        self,
+        mut manifest: ModuleManifest,
+        handler: H,
+    ) -> Result<Option<(ModuleHandle, ModuleServeFuture)>, SubcModuleError> {
+        let connection_file = parse_subc_arg(env::args_os().skip(1))?;
+        if let Some(module_id) = module_id_from_env()? {
+            manifest.module_id = module_id;
+        }
+        self.serve_with_handle(&connection_file, manifest, handler)
+            .await
+    }
+
+    /// Connect with an explicit connection file and an unchanged manifest,
+    /// returning a cloneable handle and the future that keeps the module serving.
+    ///
+    /// Uses this options value's stop handle and writer drain timeout. A requested
+    /// stop before registration completes returns `Ok(None)`; this is an expected
+    /// outcome, not a connection error.
+    ///
+    /// The returned serve future **must be awaited or spawned**. A module can give
+    /// the returned handle to its handler's shared state before starting that future.
+    /// Spawn the serve future before slow startup work or awaiting control RPCs:
+    /// it reads their replies and answers health and stop.
+    pub async fn serve_with_handle<H: ModuleHandler>(
+        self,
+        connection_file: &Path,
+        manifest: ModuleManifest,
+        handler: H,
+    ) -> Result<Option<(ModuleHandle, ModuleServeFuture)>, SubcModuleError> {
+        prepare_connection(connection_file, manifest, handler, self).await
     }
 }
 
@@ -2540,17 +2587,16 @@ impl ServeOptions {
 /// [`ModuleHandle::set_ready`]. Spawn the serve future before slow startup work
 /// or awaiting control RPCs: it reads their replies and answers health and stop.
 pub async fn serve_from_env_with_handle<H>(
-    mut manifest: ModuleManifest,
+    manifest: ModuleManifest,
     handler: H,
 ) -> Result<(ModuleHandle, ModuleServeFuture), SubcModuleError>
 where
     H: ModuleHandler,
 {
-    let connection_file = parse_subc_arg(env::args_os().skip(1))?;
-    if let Some(module_id) = module_id_from_env()? {
-        manifest.module_id = module_id;
-    }
-    serve_with_handle(&connection_file, manifest, handler).await
+    ServeOptions::default()
+        .serve_from_env_with_handle(manifest, handler)
+        .await?
+        .ok_or(SubcModuleError::ConnectionClosedBeforeHelloAck)
 }
 
 /// Run a module with an explicit connection-file path. The manifest is sent as
@@ -2578,7 +2624,8 @@ pub async fn serve_with_handle<H>(
 where
     H: ModuleHandler,
 {
-    prepare_connection(connection_file, manifest, handler, ServeOptions::default())
+    ServeOptions::default()
+        .serve_with_handle(connection_file, manifest, handler)
         .await?
         .ok_or(SubcModuleError::ConnectionClosedBeforeHelloAck)
 }

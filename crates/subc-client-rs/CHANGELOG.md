@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.38.5
+
+- Add `ServeOptions::serve_from_env_with_handle` and `ServeOptions::serve_with_handle`
+  to obtain a module handle before callers bind while preserving a custom stop
+  handle and writer drain timeout. A requested stop before registration completes
+  returns `Ok(None)` rather than an error. The free serving functions are unchanged.
+
 ## 0.38.4
 
 - Add `ModuleHandle::update_role_declarations` for daemon 0.44.9 or later. Gate sends on HELLO_ACK advertisement, replace or clear the whole map, and preserve typed daemon refusals. Require protocol 0.36.3 and control 0.38.3.

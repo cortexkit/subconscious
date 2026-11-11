@@ -221,9 +221,6 @@ impl ControlHandler {
                 )?])
             }
         };
-        if self.claims.binding(connection).is_some() {
-            return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
-        }
         let Some(spawn) = self.supervisor.registration_spawn(connection) else {
             return self.claim_refusal(frame, error_codes::CLAIM_MINT_NOT_ALLOWED);
         };

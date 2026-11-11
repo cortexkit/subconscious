@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.44.11
+
+- Test-only: the resource fixture's CPU-burning child no longer waits forever for the test's next marker. It gives up after a minute, or as soon as the test's scratch directory is gone, so a failed or cancelled test run no longer leaves it running. No daemon runtime changes.
+
 ## 0.44.10
 
 - Test-only: let resource fixtures exit cooperatively after supervisor draining begins on Windows. Hold the shared resource-reader isolation guard only during reader work, not fixture setup and shutdown. No daemon runtime changes.

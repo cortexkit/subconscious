@@ -17,10 +17,22 @@ fn burn() {
     }
 }
 
-fn wait(path: &std::path::Path) {
+/// Waits for the test to write `path`. A failed or cancelled test may never
+/// write it, and its scratch directory may already be gone, so this gives up
+/// after a minute or as soon as the directory disappears. The burning child is
+/// orphaned once its parent exits, so an unbounded wait here would outlive the
+/// test run indefinitely.
+fn wait(path: &std::path::Path) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while !path.exists() {
+        if std::time::Instant::now() >= deadline
+            || !path.parent().is_some_and(std::path::Path::exists)
+        {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
+    true
 }
 
 fn main() {
@@ -40,10 +52,14 @@ fn main() {
         )
         .unwrap();
         std::fs::write(dir.join("root-ready"), format!("{pid} {start}")).unwrap();
-        wait(&dir.join("burn-root"));
+        if !wait(&dir.join("burn-root")) {
+            return;
+        }
         burn();
         std::fs::write(dir.join("root-burned"), "").unwrap();
-        wait(&dir.join("finish-root"));
+        if !wait(&dir.join("finish-root")) {
+            return;
+        }
         let resources = subc_os::resource_usage(pid).unwrap();
         std::fs::write(
             dir.join("root-cpu"),

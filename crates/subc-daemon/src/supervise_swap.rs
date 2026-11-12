@@ -1820,7 +1820,7 @@ mod tests {
         std::fs::write(
             fixture.dir.join("subc.jsonc"),
             serde_json::to_vec(
-                &json!({"version":1,"modules":{"timed":{"program":"/bin/sleep","args":["600"]}}}),
+                &json!({"version":1,"modules":{"timed":{"program":"/bin/sleep","args":["600"],"registration_channel":true}}}),
             )
             .unwrap(),
         )

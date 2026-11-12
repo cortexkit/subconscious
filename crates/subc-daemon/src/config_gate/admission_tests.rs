@@ -2586,6 +2586,7 @@ async fn config_admission_exited_before_binding_keeps_its_real_exit_without_admi
     let mut doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(rig.path.join("subc.jsonc")).unwrap()).unwrap();
     doc["modules"]["a"]["protocol"] = json!("subc");
+    doc["modules"]["a"]["registration_channel"] = json!(true);
     std::fs::write(
         rig.path.join("subc.jsonc"),
         serde_json::to_vec(&doc).unwrap(),

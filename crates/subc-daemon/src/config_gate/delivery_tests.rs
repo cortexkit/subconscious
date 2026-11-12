@@ -1979,7 +1979,7 @@ fn supervised_fixture_with_program(
     let mut doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     for module in ["a", "b"] {
-        doc["modules"][module] = json!({"program":rig.path.join("program"),"args":[rig.path.join(format!("{module}.seen")),rig.path.join(format!("{module}.launches"))],"protocol":"subc","overlap":if carry_containment {"exclusive"}else{"safe"},"carry_containment":carry_containment});
+        doc["modules"][module] = json!({"program":rig.path.join("program"),"args":[rig.path.join(format!("{module}.seen")),rig.path.join(format!("{module}.launches"))],"protocol":"subc","registration_channel":true,"overlap":if carry_containment {"exclusive"}else{"safe"},"carry_containment":carry_containment});
     }
     doc["modules"]["a"]["carry_containment"] = json!(carry_containment);
     std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();

@@ -58,7 +58,7 @@ struct Fixture {
 }
 
 async fn status_over_real_server(fixture: &Fixture) {
-    status_polls_over_real_server(fixture, 1, false).await;
+    status_polls_over_real_server(fixture, 1, false, None).await;
 }
 
 fn take_delivery_notification(notifications: &tokio::sync::Notify) -> bool {
@@ -67,7 +67,12 @@ fn take_delivery_notification(notifications: &tokio::sync::Notify) -> bool {
     std::future::Future::poll(notified.as_mut(), &mut context).is_ready()
 }
 
-async fn status_polls_over_real_server(fixture: &Fixture, polls: usize, require_no_wakes: bool) {
+async fn status_polls_over_real_server(
+    fixture: &Fixture,
+    polls: usize,
+    require_no_wakes: bool,
+    authority_probe: Option<&std::sync::Mutex<Vec<std::thread::ThreadId>>>,
+) {
     // Registration and health observations also wake the configuration delivery
     // worker. Hold their gate so only status requests can notify during the check.
     let gate = fixture.owner.module_gate("callosum").unwrap();
@@ -155,13 +160,24 @@ async fn status_polls_over_real_server(fixture: &Fixture, polls: usize, require_
             );
         }
     }
+    if let Some(probes) = authority_probe {
+        assert!(
+            probes.lock().unwrap().is_empty(),
+            "status polls must not hash program content"
+        );
+        // Program replacement is observed at the next approval, admission or
+        // spawn, not by a status poll. Revalidate the phone approval's live
+        // program binding on the serving handler while the real connection
+        // remains open.
+        assert!(fixture.handler.config_phone_surface().await.is_some());
+    }
     server.abort();
 }
 
 #[tokio::test]
 async fn config_phone_status_polls_never_wake_delivery_without_a_change() {
     let fixture = Fixture::build(true).await;
-    status_polls_over_real_server(&fixture, 4, true).await;
+    status_polls_over_real_server(&fixture, 4, true, None).await;
     fixture.stop().await;
 }
 
@@ -180,7 +196,7 @@ async fn config_phone_verdict_hashes_once_off_async_worker_over_real_server() {
         Ok(())
     }));
     let async_thread = std::thread::current().id();
-    status_over_real_server(&fixture).await;
+    status_polls_over_real_server(&fixture, 1, false, Some(threads.as_ref())).await;
     let threads = threads.lock().unwrap().clone();
     fixture.stop().await;
     assert_eq!(

@@ -3134,6 +3134,9 @@ impl ControlHandler {
                 .config_runtime
                 .as_ref()
                 .is_some_and(|owner| owner.check_recovery().unwrap_or(true));
+            // Defence in depth: RuntimeOwner::module_is_gated in
+            // config_gate/admission.rs already gates every id during recovery.
+            // A registration channel still never uses the nonce fallback.
             if recovering
                 && channel_spawn.as_ref().is_none_or(|spawn| {
                     !self.supervisor.has_live_verified_channel_binding(spawn)
@@ -3370,6 +3373,8 @@ impl ControlHandler {
         // handle_hello_checked function. Its fresh, fail-closed store check
         // precedes parsing and this publication-gate check; this cached read
         // also observes any recovery transition published during that work.
+        // The nonce-connection-only fallback is defence in depth alongside
+        // RuntimeOwner::module_is_gated's all-id recovery gate.
         if recovering
             && channel_spawn.as_ref().is_none_or(|spawn| {
                 !self.supervisor.has_live_verified_channel_binding(spawn) || spawn.check().is_err()

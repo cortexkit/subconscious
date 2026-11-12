@@ -1,5 +1,166 @@
 use super::*;
 
+#[cfg(target_os = "linux")]
+fn audit2_gated_handle() -> (
+    cortexkit_test_support::ScratchDir,
+    Arc<crate::config_gate::runtime::RuntimeOwner>,
+    SupervisorHandle,
+) {
+    use crate::config_gate::{
+        capture::ConfigCapturer, runtime::RuntimeOwner, ApprovalFacts, ApprovalReply, PlanKind,
+        PresenceDecision,
+    };
+    let root = cortexkit_test_support::ScratchDir::new("gated-binding-alias");
+    std::fs::create_dir_all(root.join("store")).unwrap();
+    let path = root.join("subc.jsonc");
+    std::fs::write(&path, br#"{"version":1,"modules":{"binding-gated":{"program":"/bin/sleep","args":["600"],"protocol":"none"}}}"#).unwrap();
+    let owner = Arc::new(RuntimeOwner::new(
+        "binding-alias-test".into(),
+        crate::config_store::ConfigStore::open_digest_only_for_tests(
+            crate::config_store::StoreRoot::from_service_definition(root.join("store")).unwrap(),
+        ),
+        ConfigCapturer {
+            daemon_path: path,
+            config_home: root.to_path_buf(),
+            projects: Arc::new(crate::config_gate::capture::UnavailableProjectRegistry),
+        },
+    ));
+    let prepared = owner.prepare(PlanKind::Stamp).unwrap();
+    let plan = owner
+        .finish_plan(prepared, crate::config_gate::runtime::daemon_review)
+        .unwrap();
+    let facts = ApprovalFacts {
+        connection: 7,
+        owner_uid: true,
+        desktop_app: true,
+        attested_operator_app: true,
+        os_prompt_available: true,
+        phone: None,
+        caller: crate::caller_identity::CallerIdentity::default(),
+    };
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let challenge = owner.begin_approval(&plan.digest, &facts).unwrap();
+    owner
+        .finish_approval(
+            challenge.attempt(),
+            &facts,
+            ApprovalReply::Presence(PresenceDecision::InteractiveApproval),
+            1,
+        )
+        .unwrap();
+    let handle = SupervisorHandle::new();
+    handle.install_binding_retirement(&owner);
+    (root, owner, handle)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn audit2_gated_candidate_has_no_nonce_alias_or_prune_dependency() {
+    let (_root, _owner, handle) = audit2_gated_handle();
+    assert!(handle.module_is_gated("binding-gated"));
+    handle.open_swap("binding-gated", "candidate-nonce".into());
+    let publication = handle
+        .begin_program_binding("binding-gated", SpawnRole::SwapCandidate)
+        .unwrap();
+    let key = ("binding-gated".into(), publication.channel_key());
+    assert!(handle.program_bindings.lock().unwrap().aliases.is_empty());
+    handle.close_swap("binding-gated");
+    assert!(
+        handle
+            .program_bindings
+            .lock()
+            .unwrap()
+            .active
+            .contains_key(&key),
+        "closing a legacy token must not prune a gated channel's live binding"
+    );
+}
+
+#[test]
+fn audit2_reused_nonce_prunes_dead_keys_but_preserves_owned_publications() {
+    let handle = SupervisorHandle::new();
+    handle.set_spawn_nonce("reuse", "same-nonce".into());
+    for _ in 0..4 {
+        let publication = handle
+            .begin_program_binding("reuse", SpawnRole::Plain)
+            .unwrap();
+        assert!(
+            handle.program_bindings.lock().unwrap().retired.is_empty(),
+            "reusing an alias must replace the previous dead launch's refusal"
+        );
+        drop(publication);
+        let records = handle.program_bindings.lock().unwrap();
+        assert_eq!(records.retired.len(), 1);
+        assert_eq!(records.acceptable.len(), 1);
+        assert_eq!(records.publications.len(), 1);
+    }
+    let owned = handle
+        .begin_program_binding("reuse", SpawnRole::Plain)
+        .unwrap();
+    owned.retire();
+    let old_key = ("reuse".into(), owned.channel_key());
+    let current = handle
+        .begin_program_binding("reuse", SpawnRole::Plain)
+        .unwrap();
+    assert!(handle
+        .program_bindings
+        .lock()
+        .unwrap()
+        .retired
+        .contains_key(&old_key));
+    drop(owned);
+    assert!(!handle
+        .program_bindings
+        .lock()
+        .unwrap()
+        .retired
+        .contains_key(&old_key));
+    drop(current);
+    let records = handle.program_bindings.lock().unwrap();
+    assert_eq!(records.retired.len(), 1);
+    assert_eq!(records.acceptable.len(), 1);
+    assert_eq!(records.publications.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn audit2_channel_witness_lookup_does_not_hold_the_binding_table() {
+    let handle = SupervisorHandle::new();
+    let publication = handle
+        .begin_program_binding("witness-lock", SpawnRole::Plain)
+        .unwrap();
+    publication.signal.send_replace(Some(true));
+    let spawn = RegistrationSpawn::new(
+        &handle,
+        "witness-lock",
+        SpawnRole::Plain,
+        Some(publication.clone()),
+    );
+    let pause = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+    handle
+        .program_bindings
+        .lock()
+        .unwrap()
+        .active
+        .get_mut(&publication.key)
+        .unwrap()
+        .before_witness_pause = Some(pause.clone());
+    let lookup = {
+        let handle = handle.clone();
+        std::thread::spawn(move || handle.has_live_verified_channel_binding(&spawn))
+    };
+    pause.0.wait();
+    let unlocked = handle.program_bindings.try_lock().is_ok();
+    pause.1.wait();
+    assert!(!lookup.join().unwrap(), "the fixture has no live witness");
+    assert!(
+        unlocked,
+        "witness upgrade and destruction must occur outside the table lock"
+    );
+}
+
 #[tokio::test]
 async fn config_admission_post_exec_unattached_binding_never_publishes_ready() {
     let handle = SupervisorHandle::new();

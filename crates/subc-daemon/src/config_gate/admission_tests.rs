@@ -35,7 +35,7 @@ async fn gated_claim_fixture() -> GatedClaimFixture {
         .with_config_runtime(owner.clone());
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
     let proof = handle.registration_proof_for_test("a").unwrap();
-    assert!(handle.wait_program_binding("a", &proof).await);
+    assert!(handle.wait_program_binding_for_test("a", &proof).await);
     let spawn = handle.registration_for_test("a").unwrap();
     spawn.wait_launch().await;
     let control = Arc::new(
@@ -104,9 +104,53 @@ async fn refused_nonce_hello_pipeline(
 }
 
 #[tokio::test]
+async fn audit2_nonchannel_hello_cannot_use_a_channel_locator_as_nonce() {
+    let fixture = gated_claim_fixture().await;
+    let locator = String::from(&*fixture.handle.registration_proof_for_test("a").unwrap());
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = checks.clone();
+    fixture.spawn.set_content_probe_for_test(Arc::new(move || {
+        observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }));
+    let handler = crate::ControlHandler::new(Arc::new(crate::Registry::default()))
+        .with_supervisor(fixture.handle.clone());
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: Some(locator),
+    };
+    let frame = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&hello).unwrap(),
+    )
+    .unwrap();
+    let replies = handler
+        .handle_control(ConnectionId::new(901), frame)
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&replies[0].body).unwrap()["code"],
+        "program_refused"
+    );
+    assert_eq!(
+        checks.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a locator is not a nonce and cannot reach the channel's content witness"
+    );
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn claims_nonce_hello_early_content_refusal_is_terminal() {
     let fixture = gated_claim_fixture().await;
-    let key = String::from(&*fixture.handle.registration_proof_for_test("a").unwrap());
+    let proof = fixture.handle.registration_proof_for_test("a").unwrap();
+    let key = fixture.handle.program_binding_fixture_nonce("a", &proof);
     let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = checks.clone();
     fixture.spawn.set_content_probe_for_test(Arc::new(move || {
@@ -132,9 +176,15 @@ async fn claims_nonce_hello_early_content_refusal_is_terminal() {
 #[tokio::test]
 async fn claims_nonce_hello_wait_refusal_is_terminal() {
     let fixture = gated_claim_fixture().await;
-    let key = String::from(&*fixture.handle.registration_proof_for_test("a").unwrap());
+    let proof = fixture.handle.registration_proof_for_test("a").unwrap();
+    let key = fixture.handle.program_binding_fixture_nonce("a", &proof);
     fixture.spawn.retire();
-    assert!(!fixture.handle.wait_program_binding("a", &key).await);
+    assert!(
+        !fixture
+            .handle
+            .wait_program_binding_for_test("a", &key)
+            .await
+    );
     let handler = Arc::new(
         crate::ControlHandler::new(Arc::new(crate::Registry::default()))
             .with_supervisor(fixture.handle.clone()),
@@ -152,7 +202,8 @@ async fn claims_nonce_hello_wait_refusal_is_terminal() {
 #[tokio::test]
 async fn claims_nonce_hello_late_content_refusal_is_terminal() {
     let fixture = gated_claim_fixture().await;
-    let key = String::from(&*fixture.handle.registration_proof_for_test("a").unwrap());
+    let proof = fixture.handle.registration_proof_for_test("a").unwrap();
+    let key = fixture.handle.program_binding_fixture_nonce("a", &proof);
     let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = checks.clone();
     fixture.spawn.set_content_probe_for_test(Arc::new(move || {
@@ -1930,8 +1981,8 @@ async fn config_admission_swap_cutover_does_not_park_stop_behind_owner_publicati
     let candidate_nonce = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Some(nonce) = handle.candidate_registration_proof_for_test("a") {
-                if handle.has_live_verified_program_binding("a", &nonce)
-                    && handle.wait_program_binding("a", &nonce).await
+                if handle.has_live_verified_program_binding_for_test("a", &nonce)
+                    && handle.wait_program_binding_for_test("a", &nonce).await
                 {
                     break nonce;
                 }
@@ -2005,10 +2056,11 @@ async fn config_admission_swap_cutover_does_not_park_stop_behind_owner_publicati
         stopped.is_ok(),
         "the module gate parked stop behind blocking owner publication"
     );
-    assert!(
-        handle.has_program_binding_record("a", &handle.registration_proof_for_test("a").unwrap())
-    );
-    assert!(!handle.has_live_verified_program_binding("a", &candidate_nonce));
+    assert!(handle.has_program_binding_record_for_test(
+        "a",
+        &handle.registration_proof_for_test("a").unwrap()
+    ));
+    assert!(!handle.has_live_verified_program_binding_for_test("a", &candidate_nonce));
     let handler = crate::ControlHandler::new(registry.clone())
         .with_supervisor(handle)
         .with_config_runtime(owner.clone());
@@ -2566,7 +2618,7 @@ async fn config_admission_exited_before_binding_keeps_its_real_exit_without_admi
     assert_eq!(status.state, ModuleState::Failed);
     assert_eq!(status.spawn_generation, 1);
     assert!(!status.process_alive);
-    assert!(!handle.has_live_verified_program_binding("a", &nonce));
+    assert!(!handle.has_live_verified_program_binding_for_test("a", &nonce));
 }
 
 #[cfg(target_os = "linux")]
@@ -2689,7 +2741,7 @@ async fn config_admission_hello_accepts_only_the_approved_current_native_image()
         .with_config_runtime(owner.clone());
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
     let nonce = handle.registration_proof_for_test("a").unwrap();
-    assert!(handle.wait_program_binding("a", &nonce).await);
+    assert!(handle.wait_program_binding_for_test("a", &nonce).await);
     // The channel service waits for launch confirmation before dispatching
     // HELLO. A direct-handler fixture must wait for the same transition.
     handle
@@ -2770,7 +2822,7 @@ async fn config_recovery_dead_child_retires_channel_without_legacy_fallback() {
             .with_config_runtime(owner.clone());
         let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
         let nonce = handle.registration_proof_for_test("a").unwrap();
-        assert!(handle.wait_program_binding("a", &nonce).await);
+        assert!(handle.wait_program_binding_for_test("a", &nonce).await);
         if recovery {
             std::fs::write(
                 rig.path.join("store").join(crate::config_store::STORE_FILE),
@@ -2781,15 +2833,15 @@ async fn config_recovery_dead_child_retires_channel_without_legacy_fallback() {
         }
         if mode == 2 {
             approve(&rig, &owner, PlanKind::Unstamp);
-            assert!(!handle.has_program_binding_record("a", &nonce));
+            assert!(!handle.has_program_binding_record_for_test("a", &nonce));
         }
         module.stop().await.unwrap();
         assert!(handle.spawn_launch_nonce_for("a").is_none());
         assert!(
-            handle.has_program_binding_record("a", &nonce),
+            handle.has_program_binding_record_for_test("a", &nonce),
             "retirement must keep the legacy fallback closed"
         );
-        assert!(!handle.has_live_verified_program_binding("a", &nonce));
+        assert!(!handle.has_live_verified_program_binding_for_test("a", &nonce));
         let handler = crate::ControlHandler::new(registry.clone())
             .with_supervisor(handle)
             .with_config_runtime(owner);
@@ -2870,7 +2922,7 @@ async fn config_recovery_hello_accepts_only_a_preexisting_bound_launch() {
         .with_config_runtime(owner.clone());
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
     let nonce = handle.registration_proof_for_test("a").unwrap();
-    assert!(handle.wait_program_binding("a", &nonce).await);
+    assert!(handle.wait_program_binding_for_test("a", &nonce).await);
     std::fs::write(
         rig.path.join("store").join(crate::config_store::STORE_FILE),
         b"tampered",
@@ -3062,7 +3114,10 @@ async fn config_admission_hello_rechecks_script_and_declared_file_content() {
         let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
         assert!(
             handle
-                .wait_program_binding("a", &handle.registration_proof_for_test("a").unwrap())
+                .wait_program_binding_for_test(
+                    "a",
+                    &handle.registration_proof_for_test("a").unwrap()
+                )
                 .await
         );
         let changed = if script_changed {
@@ -3127,7 +3182,7 @@ async fn config_admission_hello_rejects_a_wrapper_that_execs_after_the_spawn_sam
             owner.take_activities()
         )
     });
-    assert!(handle.wait_program_binding("a", &nonce).await);
+    assert!(handle.wait_program_binding_for_test("a", &nonce).await);
     // Binding publication can precede suspended exec confirmation on macOS.
     // Wait for a reportable child before releasing its late-exec barrier.
     let pid = tokio::time::timeout(Duration::from_secs(5), async {
@@ -3244,7 +3299,7 @@ async fn config_recovery_reaped_child_refuses_hello_before_exit_cleanup() {
         let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
         let pid = reported_pid(&module).await;
         let mut nonce = handle.registration_proof_for_test("a").unwrap();
-        assert!(handle.wait_program_binding("a", &nonce).await);
+        assert!(handle.wait_program_binding_for_test("a", &nonce).await);
         let mut swapping = None;
         if case == "swap_candidate" {
             let mut manifest =
@@ -3265,7 +3320,7 @@ async fn config_recovery_reaped_child_refuses_hello_before_exit_cleanup() {
             nonce = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     if let Some(nonce) = handle.candidate_registration_proof_for_test("a") {
-                        if handle.has_live_verified_program_binding("a", &nonce) {
+                        if handle.has_live_verified_program_binding_for_test("a", &nonce) {
                             break nonce;
                         }
                     }
@@ -3296,8 +3351,8 @@ async fn config_recovery_reaped_child_refuses_hello_before_exit_cleanup() {
             .await
             .unwrap()
             .unwrap();
-        let retired = handle.has_program_binding_record("a", &nonce)
-            && !handle.has_live_verified_program_binding("a", &nonce);
+        let retired = handle.has_program_binding_record_for_test("a", &nonce)
+            && !handle.has_live_verified_program_binding_for_test("a", &nonce);
         let handler = crate::ControlHandler::new(registry.clone())
             .with_supervisor(handle)
             .with_config_runtime(owner);
@@ -3348,7 +3403,7 @@ async fn config_recovery_unstamped_respawn_admits_fresh_nonce_and_refuses_dead_n
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
     let pid = reported_pid(&module).await;
     let dead_nonce = handle.registration_proof_for_test("a").unwrap();
-    assert!(handle.wait_program_binding("a", &dead_nonce).await);
+    assert!(handle.wait_program_binding_for_test("a", &dead_nonce).await);
     approve(&rig, &owner, PlanKind::Unstamp);
     #[cfg(target_os = "linux")]
     let (reaped, release) = handle.pause_program_binding_exit_for_test("a", &dead_nonce);
@@ -3458,7 +3513,7 @@ async fn config_admission_hello_publication_rechecks_across_stamp_hold_and_new_s
         if let Some(nonce) = &nonce {
             assert!(tokio::time::timeout(
                 Duration::from_secs(5),
-                handle.wait_program_binding("a", nonce)
+                handle.wait_program_binding_for_test("a", nonce)
             )
             .await
             .unwrap());
@@ -3617,12 +3672,12 @@ async fn config_admission_unstamp_restores_unreserved_hello_without_a_synthetic_
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
     reported_pid(&module).await;
     let old_nonce = handle.registration_proof_for_test("a").unwrap();
-    assert!(handle.has_program_binding_record("a", &old_nonce));
+    assert!(handle.has_program_binding_record_for_test("a", &old_nonce));
     module.stop().await.unwrap();
     approve(&rig, &owner, PlanKind::Unstamp);
-    assert!(handle.has_program_binding_record("a", &old_nonce));
+    assert!(handle.has_program_binding_record_for_test("a", &old_nonce));
     assert!(
-        !handle.has_live_verified_program_binding("a", &old_nonce),
+        !handle.has_live_verified_program_binding_for_test("a", &old_nonce),
         "unstamp retained a retired content witness"
     );
     let handler = crate::ControlHandler::new(registry.clone())
@@ -3716,7 +3771,11 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
     .await
     .unwrap();
     assert!(handle.swap_open("a"));
-    assert!(handle.wait_program_binding("a", &candidate_proof).await);
+    assert!(
+        handle
+            .wait_program_binding_for_test("a", &candidate_proof)
+            .await
+    );
     candidate_proof.bind(candidate);
     let registering = crate::ControlHandler::new(registry.clone())
         .with_supervisor(handle.clone())
@@ -3769,7 +3828,7 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
     reported_pid(&module).await;
     let current = handle.registration_proof_for_test("a").unwrap();
     assert_ne!(original, current);
-    assert!(handle.wait_program_binding("a", &current).await);
+    assert!(handle.wait_program_binding_for_test("a", &current).await);
     tokio::time::timeout(Duration::from_secs(5), async {
         while handle.swap_open("a") {
             tokio::task::yield_now().await;
@@ -3800,7 +3859,7 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
     .unwrap();
     let fresh = handle.registration_proof_for_test("a").unwrap();
     assert_ne!(fresh, current);
-    assert!(handle.wait_program_binding("a", &fresh).await);
+    assert!(handle.wait_program_binding_for_test("a", &fresh).await);
     let connection = ConnectionId::new(713);
     let reply = handler
         .handle_control(connection, module_hello(Some(fresh), connection))
@@ -3831,7 +3890,7 @@ async fn config_admission_hold_after_final_hello_check_preserves_admission_but_r
     let nonce = handle.registration_proof_for_test("a").unwrap();
     assert!(tokio::time::timeout(
         Duration::from_secs(5),
-        handle.wait_program_binding("a", &nonce)
+        handle.wait_program_binding_for_test("a", &nonce)
     )
     .await
     .unwrap());
@@ -3928,7 +3987,11 @@ async fn config_recovery_late_swap_incumbent_cannot_erase_promoted_nonce_refusal
         let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
         let incumbent_pid = reported_pid(&module).await;
         let incumbent_nonce = handle.registration_proof_for_test("a").unwrap();
-        assert!(handle.wait_program_binding("a", &incumbent_nonce).await);
+        assert!(
+            handle
+                .wait_program_binding_for_test("a", &incumbent_nonce)
+                .await
+        );
         let mut manifest = subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build();
         manifest.ready = Some(true);
         let incumbent = ConnectionId::new(790);
@@ -3958,7 +4021,7 @@ async fn config_recovery_late_swap_incumbent_cannot_erase_promoted_nonce_refusal
         let candidate_nonce = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(nonce) = handle.candidate_registration_proof_for_test("a") {
-                    if handle.has_live_verified_program_binding("a", &nonce) {
+                    if handle.has_live_verified_program_binding_for_test("a", &nonce) {
                         break nonce;
                     }
                 }
@@ -4016,7 +4079,7 @@ async fn config_recovery_late_swap_incumbent_cannot_erase_promoted_nonce_refusal
             module.stop().await.unwrap();
             None
         };
-        assert!(handle.has_program_binding_record("a", &candidate_nonce));
+        assert!(handle.has_program_binding_record_for_test("a", &candidate_nonce));
         let handler = crate::ControlHandler::with_forwarding(registry.clone(), forwarding)
             .with_supervisor(handle.clone())
             .with_config_runtime(owner);
@@ -4066,8 +4129,8 @@ async fn config_recovery_late_swap_incumbent_cannot_erase_promoted_nonce_refusal
         .await
         .unwrap();
         if fresh_nonce.is_some() {
-            assert!(!handle.has_live_verified_program_binding("a", &candidate_nonce));
-            assert!(!handle.has_live_verified_program_binding("a", &incumbent_nonce));
+            assert!(!handle.has_live_verified_program_binding_for_test("a", &candidate_nonce));
+            assert!(!handle.has_live_verified_program_binding_for_test("a", &incumbent_nonce));
             assert_eq!(
                 registry.get_module("a").unwrap().unwrap().connection_id,
                 ConnectionId::new(793)
@@ -4150,7 +4213,7 @@ async fn config_recovery_carried_command_close_reap_retires_before_group_cleanup
     let mut module = supervisor.spawn_async(spec(&rig)).await.unwrap();
     reported_pid(&module).await;
     let nonce = handle.registration_proof_for_test("a").unwrap();
-    assert!(handle.wait_program_binding("a", &nonce).await);
+    assert!(handle.wait_program_binding_for_test("a", &nonce).await);
     let (reaped, release) = handle.pause_program_binding_exit_for_test("a", &nonce);
     approve(&rig, &owner, PlanKind::Unstamp);
     let closing = tokio::spawn({

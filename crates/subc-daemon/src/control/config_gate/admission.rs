@@ -182,6 +182,35 @@ mod dual_path_tests {
             assert!(self.owner.check_recovery().unwrap());
         }
 
+        fn approve(&self, kind: PlanKind) {
+            let prepared = self.owner.prepare(kind).unwrap();
+            let plan = self
+                .owner
+                .finish_plan(prepared, crate::config_gate::runtime::daemon_review)
+                .unwrap();
+            let facts = ApprovalFacts {
+                connection: 7,
+                owner_uid: true,
+                desktop_app: true,
+                attested_operator_app: true,
+                os_prompt_available: true,
+                phone: None,
+                caller: crate::caller_identity::CallerIdentity::default(),
+            };
+            self.owner
+                .desktop_view_delivered(ConnectionId::new(7), &plan)
+                .unwrap();
+            let challenge = self.owner.begin_approval(&plan.digest, &facts).unwrap();
+            self.owner
+                .finish_approval(
+                    challenge.attempt(),
+                    &facts,
+                    ApprovalReply::Presence(PresenceDecision::InteractiveApproval),
+                    1,
+                )
+                .unwrap();
+        }
+
         fn hello(&self, channel: bool, nonce: Option<&str>) -> Frame {
             if channel {
                 self.handler
@@ -274,6 +303,114 @@ mod dual_path_tests {
         f.review()
             .expect("an ungated channel retains supervised review authority");
         f.stop().await;
+    }
+
+    #[tokio::test]
+    async fn audit2_channel_reviewer_remains_available_after_unstamp() {
+        let f = Fixture::new(true, "subc").await;
+        assert_eq!(f.hello(true, None).header.ty, FrameType::HelloAck);
+        f.review().unwrap();
+        f.approve(PlanKind::Unstamp);
+        assert!(!f.owner.module_is_gated("ckbus"));
+        f.review()
+            .expect("an unstamped live channel uses the ungated image checks");
+        f.stop().await;
+    }
+
+    #[tokio::test]
+    async fn audit2_channel_reviewer_without_binding_is_refused_after_restamp() {
+        let f = Fixture::new(true, "subc").await;
+        assert_eq!(f.hello(true, None).header.ty, FrameType::HelloAck);
+        f.approve(PlanKind::Unstamp);
+        f.review().expect("review is available while ungated");
+        f.approve(PlanKind::Stamp);
+        assert!(f.owner.module_is_gated("ckbus"));
+        assert_eq!(f.review().unwrap_err().code, "program_refused");
+        f.stop().await;
+    }
+
+    #[tokio::test]
+    async fn audit2_recovery_revokes_matching_ungated_nonce_authority() {
+        for missing in [false, true] {
+            let f = Fixture::new(true, "subc").await;
+            let legacy = "legacy-ungated";
+            let nonce = "matching-legacy-nonce";
+            f.handler.supervisor.set_spawn_nonce(legacy, nonce.into());
+            assert!(!f.owner.module_is_gated(legacy));
+            assert!(f
+                .handler
+                .supervisor
+                .spawned_consumer_authorized(legacy, nonce));
+            if missing {
+                std::fs::remove_file(f.root.join("store").join(crate::config_store::STORE_FILE))
+                    .unwrap();
+                assert!(f.owner.check_recovery().unwrap());
+            } else {
+                f.recovery();
+            }
+            assert!(
+                !f.handler
+                    .supervisor
+                    .spawned_consumer_authorized(legacy, nonce),
+                "neither a missing nor an unverified store permits nonce authority"
+            );
+            f.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn audit2_recovering_channel_cannot_fall_back_to_its_matching_nonce() {
+        let f = Fixture::new(false, "subc").await;
+        let nonce = f.handler.supervisor.spawn_nonce("ckbus").unwrap();
+        assert!(!f
+            .handler
+            .supervisor
+            .registration_for_test("ckbus")
+            .unwrap()
+            .has_program_binding());
+        f.approve(PlanKind::Stamp);
+        f.recovery();
+        let refused = f.hello(true, Some(&nonce));
+        assert_eq!(refused.header.ty, FrameType::Error);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap()["code"],
+            "config_gated"
+        );
+        f.stop().await;
+    }
+
+    #[tokio::test]
+    async fn audit2_channel_review_rechecks_current_launch_after_image_verification() {
+        let f = Fixture::new(true, "subc").await;
+        assert_eq!(f.hello(true, None).header.ty, FrameType::HelloAck);
+        f.review().unwrap();
+        let pause = f
+            .handler
+            .supervisor
+            .hold_program_review_after_image_for_test();
+        let registration = f.handler.registry.get_module("ckbus").unwrap().unwrap();
+        let admission = SupervisedReviewAdmission(f.handler.clone());
+        let reviewing = tokio::task::spawn_blocking(move || admission.check(&registration));
+        pause.0.wait();
+        let replacement = f
+            ._supervisor
+            .spawn_async(Fixture::spec(&f.root.join("subc.jsonc")))
+            .await
+            .unwrap();
+        assert_ne!(
+            replacement.status().unwrap().pid,
+            f.module.status().unwrap().pid
+        );
+        pause.1.wait();
+        let result = reviewing.await.unwrap();
+        f.handler.cleanup_connection(PRIMARY).unwrap();
+        replacement.stop().await.unwrap();
+        f.stop().await;
+        assert_eq!(
+            result.unwrap_err().code,
+            "program_refused",
+            "a same-image Plain relaunch cannot inherit an in-flight channel review"
+        );
     }
 
     #[tokio::test]

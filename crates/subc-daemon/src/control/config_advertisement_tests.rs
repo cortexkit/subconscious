@@ -133,7 +133,7 @@ async fn config_admission_production_reviewer_requires_the_active_live_child_non
     let nonce = handle.spawn_launch_nonce_for("a").unwrap();
     assert!(tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        handle.wait_program_binding("a", &nonce)
+        handle.wait_program_binding_for_test("a", &nonce)
     )
     .await
     .unwrap());

@@ -1,3 +1,10 @@
+//! Identity policy updates read the running-protocol snapshot before taking the
+//! nonce locks. Nested identity locks are taken in this order: spawn nonces,
+//! reserved nonces, then `SupervisorHandle::implicit_protocol_none`.
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "supervise/audit_identity_tests.rs"]
+mod audit_identity_tests;
 mod resource_launch;
 pub(crate) use resource_launch::{ResourceCommitError, ResourceLaunch};
 
@@ -2433,6 +2440,10 @@ pub struct SupervisorHandle {
     /// holder, not the NAME (found live by CKCRED's canary probe registering
     /// against a reserved scratch id).
     reserved_nonces: Arc<Mutex<HashMap<String, Option<String>>>>,
+    /// Reservations installed only to prevent HELLO for a protocol:none process.
+    /// Replacement by a subc process releases them; explicitly reserved ids are
+    /// never placed in this set and still require an operator release.
+    implicit_protocol_none: Arc<Mutex<HashSet<String>>>,
     /// Module ids removed by an executed rescan and the unix-millisecond removal time.
     ///
     /// This is deliberately in-memory only: subc is state-free across daemon
@@ -2688,10 +2699,17 @@ impl SupervisorHandle {
     /// Record the launch nonce expected from the next HELLO for a reserved module,
     /// replacing any prior nonce (a respawn invalidates the previous one).
     pub fn set_reserved_nonce(&self, module_id: &str, nonce: String) {
-        self.reserved_nonces
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(module_id.to_string(), Some(nonce));
+        {
+            let mut reserved = self
+                .reserved_nonces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            self.implicit_protocol_none
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(module_id);
+            reserved.insert(module_id.to_string(), Some(nonce));
+        }
         self.refresh_program_binding_nonces(module_id);
     }
 
@@ -2721,11 +2739,20 @@ impl SupervisorHandle {
 
     pub(crate) fn apply_identity_configuration(&self, spec: &ModuleSpec) {
         self.set_reserved_prefixes(&spec.module_id, &spec.reserved_prefixes);
+        let protocol = self
+            .get(&spec.module_id)
+            .and_then(|module| {
+                let snapshot = module.inner.snapshot.lock().ok()?;
+                snapshot
+                    .process_alive
+                    .then_some(snapshot.spawned_protocol.unwrap_or(spec.protocol))
+            })
+            .unwrap_or(spec.protocol);
         let mut current_nonces = self
             .spawn_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if spec.protocol == ModuleProtocol::None {
+        if protocol == ModuleProtocol::None {
             current_nonces.remove(&spec.module_id);
         }
         let spawn_nonce = current_nonces.get(&spec.module_id).cloned();
@@ -2738,13 +2765,27 @@ impl SupervisorHandle {
             .reserved_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if spec.reserved || spec.protocol == ModuleProtocol::None {
+        let mut implicit = self
+            .implicit_protocol_none
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if spec.reserved {
+            implicit.remove(&spec.module_id);
+        } else if protocol == ModuleProtocol::None {
+            if !reserved_nonces.contains_key(&spec.module_id) {
+                implicit.insert(spec.module_id.clone());
+            }
+        } else if implicit.remove(&spec.module_id) {
+            reserved_nonces.remove(&spec.module_id);
+        }
+        if spec.reserved || protocol == ModuleProtocol::None {
             // `None` (no spawn nonce minted) is INSERTED, not skipped: a
             // reserved name whose module has never spawned has no legitimate
             // holder, and the entry's absence is what used to leave the name
             // open to the first claimant.
             reserved_nonces.insert(spec.module_id.clone(), spawn_nonce);
         }
+        drop(implicit);
         drop(reserved_nonces);
         drop(current_nonces);
         self.refresh_program_binding_nonces(&spec.module_id);
@@ -2942,7 +2983,8 @@ impl SupervisorHandle {
 
     /// Whether `presented` is either nonce of an open swap for `module_id`.
     fn swap_nonce_matches(&self, module_id: &str, presented: &str) -> bool {
-        if self.module_is_gated(module_id) || presented.is_empty() {
+        if self.module_is_gated(module_id) || self.protocol_none(module_id) || presented.is_empty()
+        {
             return false;
         }
         let swaps = self
@@ -3358,6 +3400,10 @@ impl SupervisorHandle {
             return false;
         }
         reserved_nonces.remove(module_id);
+        self.implicit_protocol_none
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(module_id);
         true
     }
 

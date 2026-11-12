@@ -270,8 +270,8 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     let candidate_nonce = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             if let Some(nonce) = handle.candidate_launch_nonce_for_test("a") {
-                if handle.has_live_verified_program_binding("a", &nonce)
-                    && handle.wait_program_binding("a", &nonce).await
+                if handle.has_live_verified_program_binding_for_test("a", &nonce)
+                    && handle.wait_program_binding_for_test("a", &nonce).await
                 {
                     break nonce;
                 }
@@ -1467,7 +1467,7 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
         .module_spec();
     let module = supervisor.spawn_async(spec).await.unwrap();
     let nonce = handle.spawn_launch_nonce_for("a").unwrap();
-    assert!(handle.wait_program_binding("a", &nonce).await);
+    assert!(handle.wait_program_binding_for_test("a", &nonce).await);
     if candidate {
         registry
             .register_with_control_ops(

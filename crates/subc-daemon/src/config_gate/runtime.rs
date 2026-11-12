@@ -551,6 +551,10 @@ pub struct ApprovedRollbackProgram {
 #[path = "runtime_tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "commit_pause.rs"]
+pub(crate) mod commit_pause;
+
 #[path = "delivery.rs"]
 pub(crate) mod delivery;
 

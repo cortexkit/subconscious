@@ -76,6 +76,11 @@ impl SupervisedModule {
 }
 
 impl SupervisorHandle {
+    #[cfg(test)]
+    pub(crate) fn resource_commit_pause_armed_for_test(&self) -> bool {
+        self.resource_commit_pause.lock().unwrap().is_some()
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn pause_resource_commit_for_test(
         &self,
@@ -98,9 +103,13 @@ impl SupervisorHandle {
         commit: impl FnOnce() -> T,
     ) -> Result<T, ResourceCommitError> {
         #[cfg(test)]
-        if let Some((reached, resume)) = self.resource_commit_pause.lock().unwrap().take() {
-            let _ = reached.send(());
-            let _ = resume.recv_timeout(std::time::Duration::from_secs(2));
+        {
+            let pause = self.resource_commit_pause.lock().unwrap().take();
+            if let Some((reached, resume)) = pause {
+                let _hold = crate::config_gate::runtime::commit_pause::Hold::current();
+                let _ = reached.send(());
+                let _ = resume.recv();
+            }
         }
         let runtime = self
             .gate_runtime
@@ -151,9 +160,13 @@ impl SupervisorHandle {
         commit: impl FnOnce() -> T,
     ) -> Result<T, ResourceCommitError> {
         #[cfg(test)]
-        if let Some((reached, resume)) = self.resource_commit_pause.lock().unwrap().take() {
-            let _ = reached.send(());
-            let _ = resume.recv_timeout(std::time::Duration::from_secs(2));
+        {
+            let pause = self.resource_commit_pause.lock().unwrap().take();
+            if let Some((reached, resume)) = pause {
+                let _hold = crate::config_gate::runtime::commit_pause::Hold::current();
+                let _ = reached.send(());
+                let _ = resume.recv();
+            }
         }
         let id = spawn.module_id.as_str();
         // A gated module's channel must carry a verified program. Gating changes

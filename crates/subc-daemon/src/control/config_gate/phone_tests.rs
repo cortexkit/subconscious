@@ -61,7 +61,21 @@ async fn status_over_real_server(fixture: &Fixture) {
     status_polls_over_real_server(fixture, 1, false).await;
 }
 
+fn take_delivery_notification(notifications: &tokio::sync::Notify) -> bool {
+    let mut notified = std::pin::pin!(notifications.notified());
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    std::future::Future::poll(notified.as_mut(), &mut context).is_ready()
+}
+
 async fn status_polls_over_real_server(fixture: &Fixture, polls: usize, require_no_wakes: bool) {
+    // Registration and health observations also wake the configuration delivery
+    // worker. Hold their gate so only status requests can notify during the check.
+    let gate = fixture.owner.module_gate("callosum").unwrap();
+    let _observations = if require_no_wakes {
+        Some(gate.lock().await)
+    } else {
+        None
+    };
     let router = Arc::new(crate::Router::with_control_handler(fixture.handler.clone()));
     let info = subc_transport::ConnectionInfo {
         schema: subc_transport::SCHEMA_VERSION,
@@ -105,10 +119,7 @@ async fn status_polls_over_real_server(fixture: &Fixture, polls: usize, require_
         .unwrap();
     let notifications = fixture.owner.delivery_notifications();
     if require_no_wakes {
-        while tokio::time::timeout(Duration::from_millis(10), notifications.notified())
-            .await
-            .is_ok()
-        {}
+        while take_delivery_notification(&notifications) {}
     }
     let status = Frame::build(
         FrameType::Request,
@@ -139,9 +150,7 @@ async fn status_polls_over_real_server(fixture: &Fixture, polls: usize, require_
         );
         if require_no_wakes {
             assert!(
-                tokio::time::timeout(Duration::from_millis(10), notifications.notified())
-                    .await
-                    .is_err(),
+                !take_delivery_notification(&notifications),
                 "a read-only status poll must not wake the delivery worker"
             );
         }

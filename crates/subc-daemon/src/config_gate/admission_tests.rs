@@ -915,6 +915,8 @@ async fn gated_nonce_policy_stamp_between_agent_validation_and_commit_refuses_wi
         .await
         .expect("declaration must reach the commit fence")
         .unwrap();
+    // The test fence excludes the stamp's filesystem work from the declaration
+    // deadline; only real validation and commit work consume that budget.
     rig.stamp(&owner);
     resume.send(()).unwrap();
     let reply = tokio::time::timeout(

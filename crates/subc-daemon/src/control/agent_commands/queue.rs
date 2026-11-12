@@ -275,7 +275,16 @@ async fn validate(
         .map_err(|_| timed_out())?
         .map_err(|_| timed_out())?;
     let worker_fence = Arc::clone(&fence);
+    #[cfg(test)]
+    let clock = handler
+        .supervisor
+        .resource_commit_pause_armed_for_test()
+        .then(crate::config_gate::runtime::commit_pause::Clock::new);
+    #[cfg(test)]
+    let worker_clock = clock.clone();
     let mut worker = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _clock = crate::config_gate::runtime::commit_pause::Clock::install(worker_clock);
         let _permit = permit;
         handler.handle_agent_commands_fenced(
             connection,
@@ -286,7 +295,14 @@ async fn validate(
             &worker_fence,
         )
     });
-    match tokio::time::timeout_at(deadline, &mut worker).await {
+    #[cfg(test)]
+    let result = match clock {
+        Some(clock) => clock.timeout(deadline, &mut worker).await,
+        None => tokio::time::timeout_at(deadline, &mut worker).await,
+    };
+    #[cfg(not(test))]
+    let result = tokio::time::timeout_at(deadline, &mut worker).await;
+    match result {
         Ok(result) => result.map_err(|error| RouterError::backend(0, corr, error.to_string()))?,
         Err(_) if fence.cancel() => Err(timed_out()),
         // The atomic commit decision preceded the timeout. Its short mutation
@@ -300,6 +316,51 @@ async fn validate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn unarmed_validation_still_expires_at_200ms() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(registry.clone());
+        assert!(!handler.supervisor.resource_commit_pause_armed_for_test());
+        let (locked, wait_locked) = std::sync::mpsc::channel();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let held = registry.clone();
+        let holder = std::thread::spawn(move || {
+            held.publish_registration_after(ConnectionId::new(906), || {
+                locked.send(()).unwrap();
+                let _ = wait_release.recv();
+                Ok::<_, ()>(())
+            })
+            .unwrap()
+            .unwrap();
+        });
+        wait_locked.recv().unwrap();
+        let attempted = registry.observe_next_lock_attempt();
+        let validation = tokio::spawn(validate(
+            handler,
+            ConnectionId::new(906),
+            frame(1),
+            Declaration::default(),
+            Arc::new(CommitFence::default()),
+        ));
+        // Keep virtual time stationary until validation attempts the held registry lock.
+        loop {
+            if let Ok(acquired) = attempted.try_recv() {
+                assert!(!acquired);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(199)).await;
+        assert!(!validation.is_finished());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let error = validation.await.unwrap().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("agent command validation timed out"));
+        drop(release);
+        holder.join().unwrap();
+    }
 
     #[tokio::test]
     async fn oversized_batches_are_refused_without_waiting_for_the_loss_metadata_lock() {

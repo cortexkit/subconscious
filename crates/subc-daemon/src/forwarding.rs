@@ -1969,9 +1969,10 @@ impl ForwardingTable {
 
         // These readiness reads are not atomic with publication: a route may
         // commit after Dead. Taking a spawn transition lock here would invert
-        // the publication lock order. Retirement synchronously terminates claim
-        // ingress and egress, fences primary-channel ingress and egress, and
-        // shuts that channel in the same critical section.
+        // the publication lock order. Retirement, in one critical section,
+        // stops every connection bound by the launch's claims and its own
+        // registration channel from reading or sending frames, and shuts that
+        // channel.
         // Once that step completes, no new request can cross the transient route
         // to or from the retired launch; connection teardown removes the route.
         match outcome {

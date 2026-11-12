@@ -147,8 +147,9 @@ impl ControlHandler {
     /// cannot confirm it, because it is briefly locked or because a cutover has
     /// promoted the registration and not yet rewritten the record, a live spawn
     /// the registry names as serving is [`LaunchStanding::Unsettled`], which
-    /// callers refuse with a retryable code. A record showing the launch
-    /// stopped or exited makes it not current: retrying would never succeed.
+    /// callers refuse with a retryable code. Only this spawn's own record
+    /// showing its process stopped or exited makes it not current, because
+    /// retrying would never succeed.
     ///
     /// This is an admission check. Scope sync evaluates it and publishes under
     /// one hold of the scope table's write lock, so a change admitted for the
@@ -189,19 +190,17 @@ impl ControlHandler {
             if !serving {
                 return LaunchStanding::NotCurrent;
             }
-            let Some(module) = self.supervisor.get(owner) else {
+            if self.supervisor.get(owner).is_none() {
                 return LaunchStanding::NotCurrent;
-            };
-            return match module.resource_launch() {
-                // The launch record is locked: nothing is known yet.
-                None => LaunchStanding::Unsettled,
-                // A stopping or exited launch will never be current again,
-                // even before its spawn's retirement is observed.
-                Some(launch) if !launch.enabled || !launch.alive => LaunchStanding::NotCurrent,
-                // The record names another process, as during a cutover that
-                // has promoted the registry but not rewritten the record, or it
-                // lacks this process's start time.
-                Some(_) => LaunchStanding::Unsettled,
+            }
+            return match self.supervisor.channel_launch_stopped(&spawn) {
+                // This spawn's own record shows it stopped or exited: it will
+                // never be current again, even before its retirement is seen.
+                Some(true) => LaunchStanding::NotCurrent,
+                // The record is locked, or does not describe this spawn yet: a
+                // cutover promoted the registry first, or a restart's new
+                // channel serves before the record names its process.
+                _ => LaunchStanding::Unsettled,
             };
         }
         self.hello_launch_nonces

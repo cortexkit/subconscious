@@ -411,14 +411,27 @@ type TestPause = (
     std::sync::mpsc::Receiver<()>,
 );
 
+/// A test hold for async code: signal arrival, then await release.
+#[cfg(test)]
+type AsyncTestPause = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
 /// Real channel-0 control handler for subc itself.
 #[derive(Clone)]
 pub struct ControlHandler {
     #[cfg(test)]
     activity_request_pause: Arc<Mutex<Option<Arc<ActivityRequestPause>>>>,
-    /// Holds connection cleanup just after it forgets the registration channel.
+    /// Holds connection cleanup at a numbered point: 0 is just after the agent
+    /// declaration queue closes, 1 just after the registration channel is
+    /// forgotten.
     #[cfg(test)]
-    cleanup_pause: Arc<Mutex<Option<TestPause>>>,
+    cleanup_pause: Arc<Mutex<Option<(u8, TestPause)>>>,
+    /// Holds a registration channel's HELLO after its reader resolved the
+    /// channel and before the blocking HELLO handler starts.
+    #[cfg(test)]
+    hello_ingress_pause: Arc<Mutex<Option<AsyncTestPause>>>,
     /// Holds an agent command declaration at a numbered point in its handler.
     #[cfg(test)]
     agent_commands_pause: Arc<Mutex<Option<(u8, TestPause)>>>,
@@ -1099,6 +1112,8 @@ impl ControlHandler {
             activity_request_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             cleanup_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            hello_ingress_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             agent_commands_pause: Arc::new(Mutex::new(None)),
             claims: Arc::new(claims::Claims::default()),
@@ -2306,7 +2321,11 @@ impl ControlHandler {
                         .refuse_claim_connection(ctx, &frame, "claim_hello_not_allowed")
                         .await;
                 }
-                if let Some(spawn) = self.supervisor.registration_spawn(ctx.connection_id) {
+                // Resolved once, here: the blocking HELLO below may outlive this
+                // reader and run after cleanup has forgotten the channel, and it
+                // must still be judged as this channel's HELLO.
+                let channel_spawn = self.supervisor.registration_spawn(ctx.connection_id);
+                if let Some(spawn) = &channel_spawn {
                     spawn.wait_launch().await;
                     // Refused launches close the channel. Leave their pending
                     // HELLO unanswered instead of racing a reply against shutdown.
@@ -2314,6 +2333,8 @@ impl ControlHandler {
                         ctx.egress.terminate_ingress();
                         return Ok(Vec::new());
                     }
+                    #[cfg(test)]
+                    self.pause_hello_ingress_for_test().await;
                 } else if claim_binding.is_none() {
                     if let Ok(hello) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
                         if let (Some(module), Some(nonce)) = (
@@ -2370,6 +2391,7 @@ impl ControlHandler {
                                 frame,
                                 true,
                                 hello_binding,
+                                channel_spawn,
                             )
                         })
                     })
@@ -2673,6 +2695,30 @@ impl ControlHandler {
         }
     }
 
+    #[cfg(test)]
+    fn pause_cleanup_for_test(&self, stage: u8) {
+        let mut slot = self.cleanup_pause.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_some_and(|(at, _)| *at == stage) {
+            let (_, (reached, release)) = slot.take().unwrap();
+            drop(slot);
+            let _ = reached.send(());
+            let _ = release.recv_timeout(Duration::from_secs(5));
+        }
+    }
+
+    #[cfg(test)]
+    async fn pause_hello_ingress_for_test(&self) {
+        let pause = self
+            .hello_ingress_pause
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
+
     pub fn cleanup_connection(
         &self,
         connection_id: ConnectionId,
@@ -2684,26 +2730,22 @@ impl ControlHandler {
         // queue is closed first: every declaration still queued or validating
         // has its commit fence cancelled before anything below can change how
         // the connection resolves. A HELLO whose reader was dropped keeps
-        // running on its blocking thread; its publication is serialized with
-        // the retirement below, and it never records a launch nonce for a
-        // registration channel, so it cannot leave this connection any nonce
-        // authority.
+        // running on its blocking thread. It carries the channel spawn its
+        // reader resolved at ingress instead of re-reading the index forgotten
+        // below, so it is still judged as that channel's HELLO: the retired
+        // spawn refuses it before it records anything, and a channel HELLO
+        // never records a launch nonce, so it cannot leave this connection any
+        // nonce authority.
         self.agent_declarations.close(connection_id);
+        #[cfg(test)]
+        self.pause_cleanup_for_test(0);
         if let Some(spawn) = self.supervisor.registration_spawn(connection_id) {
             spawn.retire();
         }
         self.supervisor
             .forget_registration_connection(connection_id);
         #[cfg(test)]
-        if let Some((reached, release)) = self
-            .cleanup_pause
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
-        {
-            let _ = reached.send(());
-            let _ = release.recv_timeout(Duration::from_secs(5));
-        }
+        self.pause_cleanup_for_test(1);
         self.local_connections
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2970,7 +3012,8 @@ impl ControlHandler {
         frame: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
         let binding = self.claims.binding(connection_id);
-        self.handle_hello_checked(connection_id, egress, frame, false, binding)
+        let channel_spawn = self.supervisor.registration_spawn(connection_id);
+        self.handle_hello_checked(connection_id, egress, frame, false, binding, channel_spawn)
     }
 
     fn handle_hello_checked(
@@ -2980,8 +3023,8 @@ impl ControlHandler {
         frame: Frame,
         wait_for_gate: bool,
         prefix_binding: Option<claims::ClaimBinding>,
+        channel_spawn: Option<Arc<crate::supervise::RegistrationSpawn>>,
     ) -> Result<Vec<Frame>, RouterError> {
-        let channel_spawn = self.supervisor.registration_spawn(connection_id);
         let primary_sink = channel_spawn.as_ref().and_then(|_| sink.clone());
         #[cfg(test)]
         if prefix_binding.is_some() {

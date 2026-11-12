@@ -60,6 +60,15 @@ impl SupervisedModule {
         self.inner.snapshot.lock().unwrap().process_alive = alive;
     }
 
+    /// Make the launch record describe an exited predecessor process, as it
+    /// does after a restart until the new launch is recorded.
+    #[cfg(all(test, unix, feature = "test-support"))]
+    pub(crate) fn set_launch_exited_predecessor_for_test(&self, pid: u32) {
+        let mut snapshot = self.inner.snapshot.lock().unwrap();
+        snapshot.pid = Some(pid);
+        snapshot.process_alive = false;
+    }
+
     pub(crate) fn resource_launch(&self) -> Option<ResourceLaunch> {
         let snapshot = self.inner.snapshot.try_lock().ok()?;
         Some(ResourceLaunch::from_snapshot(&snapshot))
@@ -108,6 +117,19 @@ impl SupervisorHandle {
                 .ok_or(ResourceCommitError::Changed)?;
         }
         self.commit_current_resource_launch(id, nonce, launch, commit)
+    }
+
+    /// Whether `spawn`'s own launch record shows its process stopped or exited.
+    /// `None` when that cannot be told: the record is locked or missing, or it
+    /// does not yet describe this spawn's process. After a restart the new
+    /// spawn's channel serves before the record is rewritten, so until then
+    /// the record still describes the exited predecessor.
+    pub(crate) fn channel_launch_stopped(&self, spawn: &super::RegistrationSpawn) -> Option<bool> {
+        let module = self.get(&spawn.module_id)?;
+        let launch = module.resource_launch()?;
+        let identity = spawn.identity.get()?;
+        (launch.pid == Some(identity.pid) && launch.start == Some(identity.start_time))
+            .then_some(!launch.enabled || !launch.alive)
     }
 
     /// The commit fence for a declaration made on a registration channel, which
@@ -356,8 +378,19 @@ mod tests {
         let retiring = spawn.clone();
         let retirement = handle
             .with_current_channel_resource_launch(&registry, serving, &spawn, &launch, || {
-                let retirement = std::thread::spawn(move || retiring.retire());
+                let (starting, started) = std::sync::mpsc::channel();
+                let retirement = std::thread::spawn(move || {
+                    starting.send(()).unwrap();
+                    retiring.retire();
+                });
+                // The thread has started and is about to take the transition
+                // guard; it must still be waiting for it once it had time to.
+                started.recv().unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(50));
+                assert!(
+                    !retirement.is_finished(),
+                    "retirement ran inside the commit"
+                );
                 assert!(spawn.launch_ready(), "retirement ran inside the commit");
                 retirement
             })
@@ -399,9 +432,14 @@ mod tests {
                     .unwrap();
                 registry.promote_candidate(id).unwrap().unwrap();
                 let rewriting = module.clone();
+                let (starting, started) = std::sync::mpsc::channel();
                 let rewrite = std::thread::spawn(move || {
+                    starting.send(()).unwrap();
                     rewriting.inner.snapshot.lock().unwrap().pid = Some(44);
                 });
+                // The thread is about to take the snapshot lock; it must still
+                // be waiting for it once it had time to.
+                started.recv().unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 assert!(
                     !rewrite.is_finished(),
@@ -413,6 +451,29 @@ mod tests {
         rewrite.join().unwrap();
         assert_eq!(
             fence(serving, &incumbent, &current),
+            Err(ResourceCommitError::Changed)
+        );
+        // The rewritten record alone refuses the superseded spawn, even under
+        // a registry that still names it as serving and against the record
+        // as it now reads.
+        let unpromoted = crate::Registry::default();
+        unpromoted
+            .register_with_control_ops(
+                subc_protocol::manifest::ModuleManifest::builder(id, "1.0.0").build(),
+                subc_protocol::PROTOCOL_VERSION,
+                serving,
+                Vec::new(),
+            )
+            .unwrap();
+        let rewritten = module.resource_launch().unwrap();
+        assert_eq!(
+            handle.with_current_channel_resource_launch(
+                &unpromoted,
+                serving,
+                &incumbent,
+                &rewritten,
+                || 1
+            ),
             Err(ResourceCommitError::Changed)
         );
         set_process(43, 200);

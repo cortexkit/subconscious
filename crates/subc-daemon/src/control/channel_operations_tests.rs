@@ -900,10 +900,10 @@ async fn channel_operations_warming_candidate_channel_proves_operator_confirm() 
     );
 }
 
-/// A supervised module registered over its registration channel on an
-/// in-process connection, with a HELLO that also presents the launch nonce
-/// its ungated spawn received.
-async fn channel_with_nonce(
+/// A supervised module's registration channel bound to an in-process
+/// connection that has not sent HELLO, and the launch nonce its ungated spawn
+/// also received.
+async fn unregistered_channel(
     rig: &Rig,
     module_id: &str,
 ) -> (Wire, Arc<RegistrationSpawn>, SupervisedModule, String) {
@@ -931,27 +931,37 @@ async fn channel_with_nonce(
     let nonce = handle
         .spawn_launch_nonce_for(module_id)
         .expect("an ungated spawn also gets a launch nonce");
-    let mut wire = Wire::new(&rig.router);
+    let wire = Wire::new(&rig.router);
     spawn.bind(wire.ctx.connection_id);
+    (wire, spawn, module, nonce)
+}
+
+fn hello_with_nonce(module_id: &str, nonce: &str) -> Frame {
     let body = subc_protocol::ModuleHelloBody {
         manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
         protocol_ver: PROTOCOL_VERSION,
         control_ops: None,
-        launch_nonce: Some(nonce.clone()),
+        launch_nonce: Some(nonce.into()),
     };
+    Frame::build(
+        FrameType::Hello,
+        control_flags(),
+        0,
+        0,
+        CORR,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap()
+}
+
+/// [`unregistered_channel`] after a HELLO that also presents the nonce.
+async fn channel_with_nonce(
+    rig: &Rig,
+    module_id: &str,
+) -> (Wire, Arc<RegistrationSpawn>, SupervisedModule, String) {
+    let (mut wire, spawn, module, nonce) = unregistered_channel(rig, module_id).await;
     let ack = wire
-        .call(
-            &rig.router,
-            Frame::build(
-                FrameType::Hello,
-                control_flags(),
-                0,
-                0,
-                CORR,
-                serde_json::to_vec(&body).unwrap(),
-            )
-            .unwrap(),
-        )
+        .call(&rig.router, hello_with_nonce(module_id, &nonce))
         .await;
     assert_eq!(ack.header.ty, FrameType::HelloAck, "{}", reply_text(&ack));
     (wire, spawn, module, nonce)
@@ -988,11 +998,11 @@ async fn channel_operations_declaration_running_during_cleanup_is_refused() {
     let rig = rig().await;
     let (wire, _spawn, _module, _nonce) = channel_with_nonce(&rig, "roles-queued").await;
     let connection = wire.ctx.connection_id;
-    // Hold the declaration on its queue's worker before its current-launch
-    // check. Its reply goes to a sink that retirement does not close.
-    let (reached_sender, reached) = oneshot::channel();
-    let (release, wait_release) = std::sync::mpsc::channel();
-    *rig.handler.agent_commands_pause.lock().unwrap() = Some((0, (reached_sender, wait_release)));
+    // Hold the declaration at its commit fence: authorized, with its fence
+    // registered in the queue. Everything until its release happens well
+    // inside the queue's validation window, so its own timeout cannot be what
+    // refuses it. Its reply goes to a sink that retirement does not close.
+    let (reached, resume) = rig.handler.supervisor.pause_resource_commit_for_test();
     let (sender, mut replies) = mpsc::channel(8);
     let ctx = RouteCtx {
         connection_id: connection,
@@ -1015,42 +1025,112 @@ async fn channel_operations_declaration_running_during_cleanup_is_refused() {
         .is_empty());
     tokio::time::timeout(Duration::from_secs(5), reached)
         .await
-        .expect("the declaration must reach its worker")
+        .expect("the declaration must reach its commit fence")
         .unwrap();
 
-    // Hold cleanup just after it forgets the registration channel.
+    // Cleanup closes the declaration queue and is held there, before it
+    // retires the spawn: the channel is still live and serving, so only the
+    // cancelled fence can stop the commit.
     let (cleanup_reached_sender, cleanup_reached) = oneshot::channel();
     let (cleanup_release, cleanup_wait) = std::sync::mpsc::channel();
-    *rig.handler.cleanup_pause.lock().unwrap() = Some((cleanup_reached_sender, cleanup_wait));
+    *rig.handler.cleanup_pause.lock().unwrap() = Some((0, (cleanup_reached_sender, cleanup_wait)));
     let handler = rig.handler.clone();
     let cleanup =
         tokio::task::spawn_blocking(move || handler.cleanup_connection(connection).map(|_| ()));
     tokio::time::timeout(Duration::from_secs(5), cleanup_reached)
         .await
-        .expect("cleanup must reach the forgotten channel")
+        .expect("cleanup must close the declaration queue")
         .unwrap();
-    assert!(
-        !rig.handler.agent_declarations.cancel(connection, 51),
-        "the declaration queue must close before the channel is forgotten"
-    );
-
-    // The declaration now runs inside the cleanup window.
-    release.send(()).unwrap();
+    resume.send(()).unwrap();
     let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv())
         .await
         .expect("the declaration must be answered")
         .unwrap()
         .frame;
     assert_eq!(reply.header.corr, 51);
+    assert_eq!(code(&reply), "busy", "{}", reply_text(&reply));
     assert_eq!(
-        reply.header.ty,
-        FrameType::Error,
-        "a declaration in the cleanup window committed: {}",
-        reply_text(&reply)
+        serde_json::from_slice::<ErrorBody>(&reply.body)
+            .unwrap()
+            .message,
+        "resource state is busy after revalidation; retry",
+        "the cancelled commit fence, not a timeout, must refuse the declaration"
     );
     cleanup_release.send(()).unwrap();
     cleanup.await.unwrap().unwrap();
     drop(wire);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_operations_hello_outliving_cleanup_records_no_nonce_and_never_registers() {
+    let rig = rig().await;
+    let (wire, _spawn, _module, nonce) = unregistered_channel(&rig, "roles-late-hello").await;
+    let connection = wire.ctx.connection_id;
+    // The reader resolves the channel and is held before the blocking HELLO
+    // handler starts, as when the HELLO outlives its reader.
+    let (reached_sender, reached) = oneshot::channel();
+    let (release, wait_release) = oneshot::channel();
+    *rig.handler.hello_ingress_pause.lock().unwrap() = Some((reached_sender, wait_release));
+    let router = rig.router.clone();
+    let ctx = wire.ctx.clone();
+    let hello = hello_with_nonce("roles-late-hello", &nonce);
+    let hello = tokio::spawn(async move { router.route_for_connection(&ctx, hello).await });
+    tokio::time::timeout(Duration::from_secs(5), reached)
+        .await
+        .expect("the HELLO must resolve its channel")
+        .unwrap();
+    // Cleanup retires the spawn and forgets the channel, and is held there.
+    let (cleanup_reached_sender, cleanup_reached) = oneshot::channel();
+    let (cleanup_release, cleanup_wait) = std::sync::mpsc::channel();
+    *rig.handler.cleanup_pause.lock().unwrap() = Some((1, (cleanup_reached_sender, cleanup_wait)));
+    let handler = rig.handler.clone();
+    let cleanup =
+        tokio::task::spawn_blocking(move || handler.cleanup_connection(connection).map(|_| ()));
+    tokio::time::timeout(Duration::from_secs(5), cleanup_reached)
+        .await
+        .expect("cleanup must forget the channel")
+        .unwrap();
+    assert!(rig
+        .handler
+        .supervisor
+        .registration_spawn(connection)
+        .is_none());
+    release.send(()).unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), hello)
+        .await
+        .expect("the HELLO must settle");
+    assert!(
+        rig.handler
+            .hello_launch_nonces
+            .lock()
+            .unwrap()
+            .nonce(connection)
+            .is_none(),
+        "a channel HELLO recorded a launch nonce after teardown"
+    );
+    assert!(
+        rig.handler
+            .registry
+            .get_module("roles-late-hello")
+            .unwrap()
+            .is_none(),
+        "a channel HELLO registered after its spawn retired"
+    );
+    cleanup_release.send(()).unwrap();
+    cleanup.await.unwrap().unwrap();
+    drop(wire);
+}
+
+#[tokio::test]
+async fn channel_operations_exited_predecessor_record_is_busy_not_final() {
+    let rig = rig().await;
+    let (mut net, _spawn, module, _) = network_primary(&rig, "roles-restarted").await;
+    // After a restart the new spawn serves before its launch record is
+    // rewritten, so the record still describes the exited predecessor. Pid 1
+    // is never this spawn's process.
+    module.set_launch_exited_predecessor_for_test(1);
+    assert_eq!(code(&ask(&mut net, sync_request(1)).await), "busy");
+    assert_eq!(code(&ask(&mut net, agent_commands()).await), "busy");
 }
 
 #[tokio::test]

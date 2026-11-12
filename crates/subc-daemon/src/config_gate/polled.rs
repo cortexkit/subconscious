@@ -89,7 +89,7 @@ impl RuntimeOwner {
 
     pub(super) fn status_projection(
         &self,
-        state: &OwnerState,
+        state: &mut OwnerState,
         mut snapshot: Option<super::super::GateSnapshot>,
     ) -> Projection {
         let store = state.store.loaded_status();
@@ -246,6 +246,32 @@ impl RuntimeOwner {
             if let Some((_, declaration)) = state.declarations.get(connection) {
                 config_declarations.insert(module.clone(), declaration.clone());
             }
+        }
+        if store.state == StoreState::Stamped {
+            // Include modules whose declarations or configuration views are
+            // refused with config_gated, without refreshing the store or
+            // allocating a delivery attempt.
+            let declared: Vec<_> = state
+                .declarations
+                .iter()
+                .map(|(connection, (module, _))| (*connection, module.clone()))
+                .collect();
+            for (connection, module) in declared {
+                if self
+                    .module_get_locked(
+                        state,
+                        connection,
+                        &module,
+                        subc_protocol::config::ConfigGetRequest::new(),
+                        false,
+                    )
+                    .is_err_and(|error| error.code == "config_gated")
+                {
+                    status.gated_modules.push(module);
+                }
+            }
+            status.gated_modules.sort();
+            status.gated_modules.dedup();
         }
         Projection {
             status,

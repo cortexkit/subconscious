@@ -1881,3 +1881,28 @@ async fn registration_declaration_stamp_names_all_enabled_entries_without_hello(
         actor.stop().await.unwrap();
     }
 }
+
+#[test]
+fn registration_declaration_polled_status_preserves_gated_declaration_diagnostics() {
+    let rig = Rig::new();
+    std::fs::write(
+        rig.path.join("cortexkit/a.jsonc"),
+        br#"{"credential":{"vault_ref":"approved"},"limit":2}"#,
+    )
+    .unwrap();
+    let owner = rig.owner("polled-declaration-diagnostics");
+    rig.declare(&owner, 10);
+    rig.stamp(&owner);
+    owner.complete_authority_exit(1).unwrap();
+    let mut changed = rig.declaration.clone();
+    changed.schema["properties"]["limit"]["default"] = json!(7);
+    owner
+        .declare(ConnectionId::new(11), "a", changed, true)
+        .unwrap();
+    assert!(owner
+        .polled_status()
+        .unwrap()
+        .gated_modules
+        .iter()
+        .any(|module| module == "a"));
+}

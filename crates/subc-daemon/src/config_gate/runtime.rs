@@ -445,9 +445,8 @@ impl std::ops::DerefMut for OwnerGuard<'_> {
 }
 impl Drop for OwnerGuard<'_> {
     fn drop(&mut self) {
-        let projection = self
-            .5
-            .status_projection(&self.0, self.0.observed_snapshot.clone());
+        let observed = self.0.observed_snapshot.clone();
+        let projection = self.5.status_projection(&mut self.0, observed);
         if let Ok(mut view) = self.5.projection.write() {
             *view = projection;
         }

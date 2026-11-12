@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.44.13
+
+- Add supervisor `state` and `expected_back` recovery metadata to route-open
+  availability refusals for supervised targets, preserving existing codes,
+  messages and readiness details. Unknown recovery verdicts remain absent;
+  required-capability refusals do not predict another module's recovery.
+  Declared-not-ready, not-yet-registered (`module_warming`) and planned-replacement
+  refusals expect the module to serve again without spending crash-restart
+  budget, even when that budget is zero.
+
 ## 0.44.12
 
 - Hold silence-based health restarts while the host is overloaded, using distinct late modules and a daemon scheduler-lag tick over a 60-second window. Held probes report degraded health with `host overloaded`; lane loss, process exits, and restart budgets keep their existing behavior. Resume counting new failures when the hold clears, and log hold transitions.

@@ -4808,7 +4808,55 @@ impl ControlHandler {
         message: impl Into<String>,
     ) -> Result<Frame, RouterError> {
         self.observe_route_open_refusal(ctx, caller, module_id, reason, code);
-        control_error_frame(frame, code, message.into())
+        let detail = if matches!(
+            reason,
+            "registration_not_active"
+                | "supervisor_not_live"
+                | "no_forwarding_connection"
+                | "reloading"
+        ) {
+            // A planned restart, reload or swap is already replacing the
+            // process; it does not need a slot in the crash-restart budget.
+            let expected_back = (reason == "reloading").then_some(true);
+            self.route_open_recovery_detail(module_id, frame.header.corr, None, expected_back)?
+        } else {
+            None
+        };
+        control_error_body_frame(
+            frame,
+            ErrorBody {
+                code: code.to_string(),
+                message: message.into(),
+                detail,
+            },
+        )
+    }
+
+    fn route_open_recovery_detail(
+        &self,
+        module_id: &str,
+        corr: u64,
+        detail: Option<serde_json::Value>,
+        expected_back: Option<bool>,
+    ) -> Result<Option<serde_json::Value>, RouterError> {
+        let Some((status, _)) = self.supervisor_status(module_id, corr)? else {
+            return Ok(detail);
+        };
+        let mut detail = detail.unwrap_or_else(|| serde_json::json!({}));
+        detail["state"] = serde_json::json!(status.state.to_string());
+        if let Some(expected_back) = expected_back {
+            detail["expected_back"] = serde_json::json!(expected_back);
+        } else if let Some(module) = self.supervisor.get(module_id) {
+            match module.will_recover_after_connection_loss() {
+                Ok(expected_back) => detail["expected_back"] = serde_json::json!(expected_back),
+                Err(err) => warn!(
+                    %module_id,
+                    error = %err,
+                    "failed to read route.open recovery verdict; omitting expected_back"
+                ),
+            }
+        }
+        Ok(Some(detail))
     }
 
     /// Answer a waiting `route.open` whose relayed bind was refused.
@@ -5075,7 +5123,23 @@ impl ControlHandler {
                 status.state, status.enabled, status.live
             )
         };
-        control_error_frame(frame, code, message)
+        // `module_warming` here means the process is starting, running or
+        // being restarted and has not registered yet. Nothing has to be
+        // restarted for it to serve, so the crash budget does not decide it.
+        let expected_back = (code == error_codes::MODULE_WARMING).then_some(true);
+        control_error_body_frame(
+            frame,
+            ErrorBody {
+                code: code.to_string(),
+                message,
+                detail: self.route_open_recovery_detail(
+                    module_id,
+                    frame.header.corr,
+                    None,
+                    expected_back,
+                )?,
+            },
+        )
     }
 
     async fn handle_route_open(
@@ -5269,6 +5333,8 @@ impl ControlHandler {
             // an outage from the caller's side even though its process is up.
             self.route_outages
                 .record_not_serving(&target_module_id, "declared_not_ready");
+            // The registered process can declare itself ready without a
+            // restart, so an exhausted crash budget does not prevent serving.
             return Ok(vec![control_error_body_frame(
                 &frame,
                 ErrorBody {
@@ -5276,9 +5342,12 @@ impl ControlHandler {
                     message: format!(
                         "module_id '{target_module_id}' is registered and has declared itself not ready; retry"
                     ),
-                    detail: Some(serde_json::json!({
-                        "reason": "declared_not_ready"
-                    })),
+                    detail: self.route_open_recovery_detail(
+                        &target_module_id,
+                        frame.header.corr,
+                        Some(serde_json::json!({ "reason": "declared_not_ready" })),
+                        Some(true),
+                    )?,
                 },
             )?]);
         }
@@ -9036,6 +9105,7 @@ pub(crate) fn send_route_control_pushes(
 mod tests {
     include!("control/agent_commands_tests.rs");
     include!("control/resource_revision_tests.rs");
+    include!("control/route_open_recovery_tests.rs");
     #[tokio::test]
     async fn route_busy_wait_attribution_resolves_targets_instead_of_trusting_selectors() {
         let registry = Arc::new(Registry::default());
@@ -15760,6 +15830,14 @@ mod tests {
         let client_connection = ConnectionId::new(96);
         let (client_ctx, _client_rx) = route_ctx(client_connection);
         let capture = EventCapture::default();
+        // tracing-core decides once per callsite whether its events are enabled,
+        // and caches the answer. If a parallel test with no subscriber reaches
+        // this callsite first, the cached answer is "disabled" and this test's
+        // capture sees nothing. Keeping a second dispatch alive makes tracing-core
+        // ask every live subscriber instead, while only this test's default
+        // receives the events.
+        static INTEREST_ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        INTEREST_ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
         let _subscriber =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
         let (route_task, bind) = relay_route_open(

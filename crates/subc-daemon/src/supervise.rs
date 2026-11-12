@@ -12598,6 +12598,7 @@ fn lock_snapshot(
 
 #[cfg(test)]
 mod terminal_history_tests {
+    include!("supervise_route_open_recovery_tests.rs");
     use std::{
         path::PathBuf,
         sync::Arc,

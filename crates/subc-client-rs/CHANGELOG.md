@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.38.6
+
+- Expose the daemon's optional `route.closed` terminal flag through
+  `CallError::terminal()` for `OutcomeUnknown` and `NotSent`. Older daemons and
+  client-side route ends report `None`. Close reasons and automatic reopen
+  classification are unchanged: restart and reload remain `MayReopen`.
+
 ## 0.38.5
 
 - Add `ServeOptions::serve_from_env_with_handle` and `ServeOptions::serve_with_handle`

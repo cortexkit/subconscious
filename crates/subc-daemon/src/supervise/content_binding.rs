@@ -34,6 +34,12 @@ pub(super) struct LiveProgramBinding {
     job: Option<Arc<Mutex<subc_jobobject::JobObject>>>,
 }
 impl LiveProgramBinding {
+    pub(super) fn expected_image(&self) -> Result<subc_os::RetainedFileIdentity, GateError> {
+        self.launch
+            .lock()
+            .map(|launch| launch.image)
+            .map_err(|_| GateError::new("program_refused", "bound launch image is unavailable"))
+    }
     pub(super) fn new(
         launch: ProgramLaunch,
         child: &SupervisedChild,

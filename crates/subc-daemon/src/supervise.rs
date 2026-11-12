@@ -2721,10 +2721,13 @@ impl SupervisorHandle {
 
     pub(crate) fn apply_identity_configuration(&self, spec: &ModuleSpec) {
         self.set_reserved_prefixes(&spec.module_id, &spec.reserved_prefixes);
-        let current_nonces = self
+        let mut current_nonces = self
             .spawn_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if spec.protocol == ModuleProtocol::None {
+            current_nonces.remove(&spec.module_id);
+        }
         let spawn_nonce = current_nonces.get(&spec.module_id).cloned();
         #[cfg(test)]
         if let Some(pause) = self.identity_sample_pause.lock().unwrap().take() {
@@ -2735,7 +2738,7 @@ impl SupervisorHandle {
             .reserved_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if spec.reserved {
+        if spec.reserved || spec.protocol == ModuleProtocol::None {
             // `None` (no spawn nonce minted) is INSERTED, not skipped: a
             // reserved name whose module has never spawned has no legitimate
             // holder, and the entry's absence is what used to leave the name
@@ -2921,7 +2924,7 @@ impl SupervisorHandle {
     /// Absence of an expected spawn nonce is a hard failure: consumer_identity is
     /// accepted only for module ids the supervisor has spawned.
     pub fn spawned_consumer_authorized(&self, module_id: &str, presented: &str) -> bool {
-        if self.module_is_gated(module_id) {
+        if self.module_is_gated(module_id) || self.protocol_none(module_id) {
             return false;
         }
         let nonces = self
@@ -3081,7 +3084,7 @@ impl SupervisorHandle {
         module_id: &str,
         presented: Option<&str>,
     ) -> SwapHelloAdmission {
-        if self.module_is_gated(module_id) {
+        if self.module_is_gated(module_id) || self.protocol_none(module_id) {
             return SwapHelloAdmission::Refused;
         }
         let swaps = self
@@ -3109,6 +3112,11 @@ impl SupervisorHandle {
             return SwapHelloAdmission::NotSwapping;
         }
         SwapHelloAdmission::Refused
+    }
+
+    fn protocol_none(&self, module: &str) -> bool {
+        self.get(module)
+            .is_some_and(|module| module.declared_protocol().ok() == Some(ModuleProtocol::None))
     }
 
     /// Exclude swap closure through the short, synchronous candidate publication.

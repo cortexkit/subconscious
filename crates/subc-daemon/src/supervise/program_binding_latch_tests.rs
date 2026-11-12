@@ -103,7 +103,7 @@ fn config_recovery_binding_retirement_is_nonce_specific_and_idempotent() {
     assert_eq!(records.retired.len(), 1);
     assert!(records
         .retired
-        .contains_key(&("bounded".into(), "fresh".into())));
+        .contains_key(&("bounded".into(), fresh.channel_key())));
 }
 
 #[cfg(target_os = "linux")]

@@ -3135,18 +3135,20 @@ impl ControlHandler {
                 .as_ref()
                 .is_some_and(|owner| owner.check_recovery().unwrap_or(true));
             if recovering
-                && channel_spawn
-                    .as_ref()
-                    .is_none_or(|spawn| !spawn.has_program_binding() || spawn.check().is_err())
-                && !hello_value
-                    .get("launch_nonce")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|nonce| {
-                        self.supervisor.spawned_consumer_authorized(module, nonce)
-                            && self
-                                .supervisor
-                                .has_live_verified_program_binding(module, nonce)
-                    })
+                && channel_spawn.as_ref().is_none_or(|spawn| {
+                    !self.supervisor.has_live_verified_channel_binding(spawn)
+                        || spawn.check().is_err()
+                })
+                && !(channel_spawn.is_none()
+                    && hello_value
+                        .get("launch_nonce")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|nonce| {
+                            self.supervisor.spawned_consumer_authorized(module, nonce)
+                                && self
+                                    .supervisor
+                                    .has_live_verified_program_binding(module, nonce)
+                        }))
             {
                 return Ok(vec![control_error_frame(
                     &frame,
@@ -3160,7 +3162,7 @@ impl ControlHandler {
                 .is_some_and(|owner| owner.module_is_gated(module))
                 && (channel_spawn
                     .as_ref()
-                    .is_none_or(|spawn| !spawn.has_program_binding())
+                    .is_none_or(|spawn| !self.supervisor.has_live_verified_channel_binding(spawn))
                     || self.config_runtime.as_ref().is_some_and(|owner| {
                         !recovering && owner.check_module_hold(module).is_err()
                     }))
@@ -3369,15 +3371,16 @@ impl ControlHandler {
         // precedes parsing and this publication-gate check; this cached read
         // also observes any recovery transition published during that work.
         if recovering
-            && channel_spawn
-                .as_ref()
-                .is_none_or(|spawn| !spawn.has_program_binding() || spawn.check().is_err())
-            && !hello.launch_nonce.as_deref().is_some_and(|nonce| {
-                self.supervisor.spawned_consumer_authorized(module, nonce)
-                    && self
-                        .supervisor
-                        .has_live_verified_program_binding(module, nonce)
+            && channel_spawn.as_ref().is_none_or(|spawn| {
+                !self.supervisor.has_live_verified_channel_binding(spawn) || spawn.check().is_err()
             })
+            && !(channel_spawn.is_none()
+                && hello.launch_nonce.as_deref().is_some_and(|nonce| {
+                    self.supervisor.spawned_consumer_authorized(module, nonce)
+                        && self
+                            .supervisor
+                            .has_live_verified_program_binding(module, nonce)
+                }))
         {
             return Ok(vec![control_error_frame(
                 &frame,
@@ -3388,7 +3391,7 @@ impl ControlHandler {
         if required
             && (channel_spawn
                 .as_ref()
-                .is_none_or(|spawn| !spawn.has_program_binding())
+                .is_none_or(|spawn| !self.supervisor.has_live_verified_channel_binding(spawn))
                 || self
                     .config_runtime
                     .as_ref()

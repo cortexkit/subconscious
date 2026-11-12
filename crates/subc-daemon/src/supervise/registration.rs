@@ -38,6 +38,7 @@ struct RetirementPause {
 #[derive(Debug)]
 pub(crate) struct RegistrationSpawn {
     pub(crate) incarnation: String,
+    pub(super) binding_key: program_binding::ProgramBindingKey,
     pub(crate) claims: std::sync::OnceLock<Arc<crate::control::claims::LaunchClaims>>,
     pub(crate) module_id: String,
     pub(super) role: SpawnRole,
@@ -93,14 +94,13 @@ impl RegistrationSpawn {
         requires_binding: bool,
     ) -> Arc<Self> {
         let (launch, _) = tokio::sync::watch::channel(LaunchState::Pending);
+        let binding_key = binding
+            .as_ref()
+            .map(|binding| binding.channel_key())
+            .unwrap_or_else(|| program_binding::ProgramBindingKey::new(handle));
         let spawn = Arc::new(Self {
-            incarnation: handle
-                .spawn_events
-                .0
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .daemon_incarnation
-                .clone(),
+            incarnation: binding_key.incarnation.clone(),
+            binding_key,
             claims: std::sync::OnceLock::new(),
             module_id: module.into(),
             role,
@@ -401,7 +401,7 @@ impl SupervisorHandle {
             key: channel
                 .binding
                 .as_ref()
-                .map(|binding| binding.key_for_test().to_owned())
+                .map(|binding| binding.key_for_test())
                 .unwrap_or_else(|| format!("channel-fixture:{:p}", Arc::as_ptr(&channel))),
             channel: Some(channel),
         })
@@ -417,7 +417,7 @@ impl SupervisorHandle {
             return None;
         }
         Some(RegistrationProof {
-            key: channel.binding.as_ref()?.key_for_test().into(),
+            key: channel.binding.as_ref()?.key_for_test(),
             channel: Some(channel),
         })
     }

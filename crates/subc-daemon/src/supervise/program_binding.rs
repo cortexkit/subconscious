@@ -1,10 +1,43 @@
 use super::*;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Internal channel identity, allocated before a process starts. Once launches
+/// own their spawn-event generation before HELLO, this type will use that
+/// generation instead of the private sequence without changing binding consumers.
+pub(super) struct ProgramBindingKey {
+    pub(super) incarnation: String,
+    channel_launch_seq: u64,
+}
+
+impl ProgramBindingKey {
+    pub(super) fn new(handle: &SupervisorHandle) -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self {
+            incarnation: handle
+                .spawn_events
+                .0
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .daemon_incarnation
+                .clone(),
+            channel_launch_seq: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn locator(&self) -> String {
+        format!("channel:{}:{}", self.incarnation, self.channel_launch_seq)
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ProgramBindingRecords {
-    active: HashMap<(String, String), ProgramBindingEntry>,
-    retired: HashMap<(String, String), ProgramBindingEntry>,
-    acceptable: HashSet<(String, String)>,
+    active: HashMap<(String, ProgramBindingKey), ProgramBindingEntry>,
+    retired: HashMap<(String, ProgramBindingKey), ProgramBindingEntry>,
+    acceptable: HashSet<(String, ProgramBindingKey)>,
+    // Legacy nonce admission resolves an alias to the same launch record. A
+    // channel never consults these aliases, even if its HELLO carries a nonce.
+    aliases: HashMap<(String, String), ProgramBindingKey>,
     configured: HashSet<String>,
     #[cfg(all(test, unix))]
     exit_pause: Option<ProgramBindingExitPause>,
@@ -12,21 +45,40 @@ pub(super) struct ProgramBindingRecords {
 type ProgramBindingTable = Mutex<ProgramBindingRecords>;
 pub(super) type ProgramBindings = Arc<ProgramBindingTable>;
 
+impl ProgramBindingRecords {
+    fn resolve(&self, module: &str, nonce: &str) -> Option<ProgramBindingKey> {
+        if let Some(key) = self.aliases.get(&(module.to_owned(), nonce.to_owned())) {
+            return Some(key.clone());
+        }
+        #[cfg(all(test, unix))]
+        return self
+            .active
+            .keys()
+            .chain(self.retired.keys())
+            .find(|(owner, key)| owner == module && key.locator() == nonce)
+            .map(|(_, key)| key.clone());
+        #[cfg(not(all(test, unix)))]
+        None
+    }
+
+    fn entry(&self, module: &str, nonce: &str) -> Option<ProgramBindingEntry> {
+        self.active
+            .get(&(module.to_owned(), self.resolve(module, nonce)?))
+            .cloned()
+    }
+}
+
 #[cfg(all(test, unix))]
 #[derive(Debug)]
 struct ProgramBindingExitPause {
-    key: (String, String),
+    key: (String, ProgramBindingKey),
     reached: tokio::sync::oneshot::Sender<()>,
     release: tokio::sync::oneshot::Receiver<()>,
 }
 
-// A negative record must survive child death: no record means an ungated legacy
-// launch, so erasing it would let the dead child's nonce bypass image checks.
-// Retain refusals for every nonce still accepted by identity, consumer or swap
-// admission. Keep a refusal for as long as any acceptance surface recognizes
-// its nonce; rotation and swap closure prune only nonces outside that union.
-// Configured-owner metadata survives unstamp so a later exit still records refusal.
-// Retirement refuses only the dead nonce, not a later unstamped spawn's fresh nonce.
+// Refused program bindings stay in `retired` while HELLO, consumer or open-swap
+// admission still accepts their nonce alias. Erasing a refusal earlier would let
+// a dead child's nonce bypass image checks by looking like an unbound legacy launch.
 #[derive(Clone, Debug)]
 pub(super) struct ProgramBindingEntry {
     receiver: tokio::sync::watch::Receiver<Option<bool>>,
@@ -38,7 +90,7 @@ pub(super) struct ProgramBindingPublication {
     signal: Arc<tokio::sync::watch::Sender<Option<bool>>>,
     live: Arc<Mutex<std::sync::Weak<content_binding::LiveProgramBinding>>>,
     bindings: std::sync::Weak<ProgramBindingTable>,
-    key: (String, String),
+    key: (String, ProgramBindingKey),
     retired: Arc<std::sync::atomic::AtomicBool>,
     registration: Arc<Mutex<std::sync::Weak<RegistrationSpawn>>>,
 }
@@ -51,7 +103,7 @@ pub(super) struct ProgramBindingRetirement {
     signal: std::sync::Weak<tokio::sync::watch::Sender<Option<bool>>>,
     live: std::sync::Weak<Mutex<std::sync::Weak<content_binding::LiveProgramBinding>>>,
     bindings: std::sync::Weak<ProgramBindingTable>,
-    key: (String, String),
+    key: (String, ProgramBindingKey),
     retired: Arc<std::sync::atomic::AtomicBool>,
     registration: Arc<Mutex<std::sync::Weak<RegistrationSpawn>>>,
     #[cfg(test)]
@@ -113,9 +165,12 @@ impl ProgramBindingPublication {
     pub(super) fn attach_registration(&self, spawn: &Arc<RegistrationSpawn>) {
         *self.registration.lock().unwrap_or_else(|p| p.into_inner()) = Arc::downgrade(spawn);
     }
+    pub(super) fn channel_key(&self) -> ProgramBindingKey {
+        self.key.1.clone()
+    }
     #[cfg(all(test, unix))]
-    pub(super) fn key_for_test(&self) -> &str {
-        &self.key.1
+    pub(super) fn key_for_test(&self) -> String {
+        self.key.1.locator()
     }
     pub(super) fn check(&self) -> Result<(), crate::config_gate::GateError> {
         self.verified_live()?.check()
@@ -255,9 +310,9 @@ impl Drop for ProgramBindingPublication {
     fn drop(&mut self) {
         if Arc::strong_count(&self.signal) == 1 {
             self.retire();
-            if self.key.1.starts_with("channel:") {
-                if let Some(bindings) = self.bindings.upgrade() {
-                    let mut records = bindings.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(bindings) = self.bindings.upgrade() {
+                let mut records = bindings.lock().unwrap_or_else(|p| p.into_inner());
+                if !records.aliases.values().any(|key| key == &self.key.1) {
                     records.active.remove(&self.key);
                     records.retired.remove(&self.key);
                     records.acceptable.remove(&self.key);
@@ -268,6 +323,12 @@ impl Drop for ProgramBindingPublication {
 }
 
 impl SupervisorHandle {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn supersede_review_launch_for_test(&self, module: &str) {
+        let module = self.get(module).unwrap();
+        let mut snapshot = module.inner.snapshot.lock().unwrap();
+        snapshot.process_start_time = snapshot.process_start_time.map(|start| start + 1);
+    }
     #[cfg(all(test, target_os = "linux"))]
     pub(super) fn release_program_binding_witnesses_for_test(&self) {
         self.program_bindings.lock().unwrap().active.clear();
@@ -316,18 +377,24 @@ impl SupervisorHandle {
             .program_bindings
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        records.active.retain(|(owner, nonce), _| {
-            owner != module || nonce.starts_with("channel:") || accepted.contains(nonce)
-        });
-        records.retired.retain(|(owner, nonce), _| {
-            owner != module || nonce.starts_with("channel:") || accepted.contains(nonce)
-        });
+        let removed: HashSet<_> = records
+            .aliases
+            .iter()
+            .filter(|((owner, nonce), _)| owner == module && !accepted.contains(nonce))
+            .map(|(_, key)| key.clone())
+            .collect();
+        records
+            .aliases
+            .retain(|(owner, nonce), _| owner != module || accepted.contains(nonce));
+        records
+            .active
+            .retain(|(owner, key), _| owner != module || !removed.contains(key));
+        records
+            .retired
+            .retain(|(owner, key), _| owner != module || !removed.contains(key));
         records
             .acceptable
-            .retain(|(owner, key)| owner != module || key.starts_with("channel:"));
-        records
-            .acceptable
-            .extend(accepted.into_iter().map(|nonce| (module.to_owned(), nonce)));
+            .retain(|(owner, key)| owner != module || !removed.contains(key));
     }
     #[cfg(all(test, unix))]
     pub(crate) fn pause_program_binding_exit_for_test(
@@ -340,8 +407,11 @@ impl SupervisorHandle {
     ) {
         let (reached, observed) = tokio::sync::oneshot::channel();
         let (release, waiting) = tokio::sync::oneshot::channel();
+        let key = self
+            .binding_key(module, nonce)
+            .expect("test launch binding");
         self.program_bindings.lock().unwrap().exit_pause = Some(ProgramBindingExitPause {
-            key: (module.into(), nonce.into()),
+            key: (module.into(), key),
             reached,
             release: waiting,
         });
@@ -385,16 +455,14 @@ impl SupervisorHandle {
     }
     #[cfg(windows)]
     pub(crate) fn program_hello_accepted(&self, module: &str, nonce: &str) {
+        let Some(key) = self.binding_key(module, nonce) else {
+            return;
+        };
         let live = self
             .program_bindings
             .lock()
             .ok()
-            .and_then(|bindings| {
-                bindings
-                    .active
-                    .get(&(module.to_owned(), nonce.to_owned()))
-                    .cloned()
-            })
+            .and_then(|bindings| bindings.active.get(&(module.to_owned(), key)).cloned())
             .and_then(|entry| entry.live.lock().ok()?.upgrade());
         if let Some(live) = live {
             live.hello_accepted();
@@ -405,8 +473,8 @@ impl SupervisorHandle {
             .lock()
             .map(|records| {
                 records
-                    .retired
-                    .contains_key(&(module.to_owned(), nonce.to_owned()))
+                    .resolve(module, nonce)
+                    .is_some_and(|key| records.retired.contains_key(&(module.to_owned(), key)))
                     || records.active.keys().any(|(owner, _)| owner == module)
             })
             .unwrap_or(true)
@@ -418,8 +486,24 @@ impl SupervisorHandle {
             .and_then(|records| {
                 records
                     .active
-                    .get(&(module.to_owned(), nonce.to_owned()))
+                    .get(&(module.to_owned(), records.resolve(module, nonce)?))
                     .map(|entry| *entry.receiver.borrow() == Some(true))
+            })
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn has_live_verified_channel_binding(&self, spawn: &RegistrationSpawn) -> bool {
+        self.program_bindings
+            .lock()
+            .ok()
+            .and_then(|records| {
+                let entry = records
+                    .active
+                    .get(&(spawn.module_id.clone(), spawn.binding_key.clone()))?;
+                Some(
+                    *entry.receiver.borrow() == Some(true)
+                        && entry.live.lock().ok()?.upgrade().is_some(),
+                )
             })
             .unwrap_or(false)
     }
@@ -431,6 +515,7 @@ impl SupervisorHandle {
         records.active.retain(|(owner, _), _| owner != module);
         records.retired.retain(|(owner, _), _| owner != module);
         records.acceptable.retain(|(owner, _)| owner != module);
+        records.aliases.retain(|(owner, _), _| owner != module);
         records.configured.remove(module);
     }
     pub(crate) fn check_current_program_binding(
@@ -448,9 +533,7 @@ impl SupervisorHandle {
             .program_bindings
             .lock()
             .map_err(|_| refused())?
-            .active
-            .get(&(module.to_owned(), nonce.to_owned()))
-            .cloned()
+            .entry(module, nonce)
             .ok_or_else(refused)?;
         if *entry.receiver.borrow() != Some(true) {
             return Err(refused());
@@ -480,6 +563,68 @@ impl SupervisorHandle {
         if self.has_program_binding_record(module, nonce) {
             self.check_current_program_binding(module, nonce)?;
         }
+        self.check_review_running_image(module, None, self.program_binding(module, nonce).is_some())
+    }
+
+    pub(crate) fn check_channel_program_review(
+        &self,
+        registry: &Registry,
+        module: &str,
+        connection: ConnectionId,
+    ) -> Result<(), crate::config_gate::GateError> {
+        let refused = || {
+            crate::config_gate::GateError::new(
+                "program_refused",
+                "review requires the current admitted supervised channel",
+            )
+        };
+        let spawn = self.registration_spawn(connection).ok_or_else(refused)?;
+        if !self.registration_is_current_live(registry, module, connection, None) {
+            return Err(refused());
+        }
+        let entry = self
+            .program_bindings
+            .lock()
+            .map_err(|_| refused())?
+            .active
+            .get(&(module.to_owned(), spawn.binding_key.clone()))
+            .cloned();
+        if spawn.has_program_binding() && entry.is_none() {
+            return Err(refused());
+        }
+        let mut expected = None;
+        if let Some(entry) = entry {
+            if *entry.receiver.borrow() != Some(true) {
+                return Err(refused());
+            }
+            let live = entry
+                .live
+                .lock()
+                .map_err(|_| refused())?
+                .upgrade()
+                .ok_or_else(refused)?;
+            live.check()?;
+            expected = Some(live.expected_image()?);
+        }
+        self.check_review_running_image(module, expected, false)?;
+        if !self.registration_is_current_live(registry, module, connection, None) {
+            return Err(refused());
+        }
+        Ok(())
+    }
+
+    fn check_review_running_image(
+        &self,
+        module: &str,
+        expected_image: Option<subc_os::RetainedFileIdentity>,
+        nonce_binding: bool,
+    ) -> Result<(), crate::config_gate::GateError> {
+        let refused = || {
+            crate::config_gate::GateError::new(
+                "program_refused",
+                "review requires the current live supervised image",
+            )
+        };
         let child = self.get(module).ok_or_else(refused)?;
         let (status, _identity) = child
             .status_with_snapshot_lock(&child.inner.snapshot, None)
@@ -496,7 +641,9 @@ impl SupervisorHandle {
             if Some(observed.start_time) != status.process_start_time {
                 return Err(refused());
             }
-            let expected = if self.program_binding(module, nonce).is_some() {
+            let expected = if let Some(expected) = expected_image {
+                expected
+            } else if nonce_binding {
                 _identity
                     .map(|identity| subc_os::FileIdentity {
                         device: identity.device,
@@ -513,6 +660,15 @@ impl SupervisorHandle {
         }
         #[cfg(windows)]
         {
+            let _ = nonce_binding;
+            if expected_image.is_some_and(|expected| {
+                _identity
+                    .as_ref()
+                    .and_then(|identity| identity.windows_image.as_ref())
+                    .is_none_or(|image| image.identity() != expected)
+            }) {
+                return Err(refused());
+            }
             let (_, image) = tokio::runtime::Handle::current()
                 .block_on(child.status_and_running_image_agreement())
                 .map_err(|_| refused())?;
@@ -538,28 +694,20 @@ impl SupervisorHandle {
         }
         .filter(|nonce| !nonce.is_empty());
         let (sender, receiver) = tokio::sync::watch::channel(None);
-        // Channel-only launches use an internal table locator, not a bearer
-        // nonce. The locator is never delivered to a child or accepted by an
-        // identity check; the owned publication signals launch verification.
-        let nonce = nonce.unwrap_or_else(|| {
-            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            format!(
-                "channel:{}",
-                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            )
-        });
+        let channel_key = ProgramBindingKey::new(self);
         let mut bindings = self.program_bindings.lock().ok()?;
         bindings.configured.insert(module.to_owned());
-        if nonce.starts_with("channel:") {
+        if let Some(nonce) = nonce {
             bindings
-                .acceptable
-                .insert((module.to_owned(), nonce.clone()));
+                .aliases
+                .insert((module.to_owned(), nonce), channel_key.clone());
         }
         if role == SpawnRole::Plain {
             bindings.active.retain(|(owner, _), _| owner != module);
         }
         let live = Arc::new(Mutex::new(std::sync::Weak::new()));
-        let key = (module.to_owned(), nonce);
+        let key = (module.to_owned(), channel_key);
+        bindings.acceptable.insert(key.clone());
         bindings.retired.remove(&key);
         bindings.active.insert(
             key.clone(),
@@ -584,11 +732,17 @@ impl SupervisorHandle {
         nonce: &str,
     ) -> Option<tokio::sync::watch::Receiver<Option<bool>>> {
         let records = self.program_bindings.lock().ok()?;
+        let key = records.resolve(module, nonce)?;
         records
             .active
-            .get(&(module.to_owned(), nonce.to_owned()))
-            .or_else(|| records.retired.get(&(module.to_owned(), nonce.to_owned())))
+            .get(&(module.to_owned(), key.clone()))
+            .or_else(|| records.retired.get(&(module.to_owned(), key)))
             .map(|entry| entry.receiver.clone())
+    }
+
+    #[cfg(any(windows, all(test, unix)))]
+    fn binding_key(&self, module: &str, nonce: &str) -> Option<ProgramBindingKey> {
+        self.program_bindings.lock().ok()?.resolve(module, nonce)
     }
 
     pub(crate) async fn wait_program_binding(&self, module: &str, nonce: &str) -> bool {

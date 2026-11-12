@@ -11,6 +11,10 @@ use super::claims::tests::{
     request, rig, rig_with, rig_with_module, swap_candidate, Net, Rig, SwapRig, Wire,
 };
 use super::*;
+use crate::scopes::LaunchStanding;
+use crate::supervise::{
+    ModuleOverlap, ModuleSpec, RegistrationSpawn, RestartPolicy, SupervisedModule, Supervisor,
+};
 use serde_json::{json, Value};
 use subc_control::{ClaimMintRequest, ClaimPresentRequest, ClaimPurpose};
 use subc_protocol::scope::{RouteAuthorizeExpected, RouteAuthorizeScope, ScopeKind};
@@ -44,6 +48,11 @@ fn ok(reply: &Frame) -> Value {
 /// the connection on its own, such as route binds and the drain notice.
 async fn ask(net: &mut Net, body: impl Serialize) -> Frame {
     net.send(request(body)).await;
+    answer(net).await
+}
+
+/// The answer to the request already sent with [`CORR`].
+async fn answer(net: &mut Net) -> Frame {
     loop {
         let frame = net.recv().await.expect("the connection must answer");
         if frame.header.corr == CORR
@@ -889,4 +898,207 @@ async fn channel_operations_warming_candidate_channel_proves_operator_confirm() 
             .confirm_channel_proven(rig.primary.ctx.connection_id, "claims-module"),
         Some(false)
     );
+}
+
+/// A supervised module registered over its registration channel on an
+/// in-process connection, with a HELLO that also presents the launch nonce
+/// its ungated spawn received.
+async fn channel_with_nonce(
+    rig: &Rig,
+    module_id: &str,
+) -> (Wire, Arc<RegistrationSpawn>, SupervisedModule, String) {
+    let handle = rig.handler.supervisor.clone();
+    let supervisor =
+        Supervisor::new_for_test(rig.handler.registry.clone(), RestartPolicy::default())
+            .with_handle(handle.clone())
+            .with_forwarding(rig.handler.forwarding.clone());
+    let module = supervisor
+        .spawn_async(ModuleSpec {
+            module_id: module_id.into(),
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "exec sleep 300".into()],
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: subc_control::ModuleProtocol::Subc,
+            overlap: ModuleOverlap::Safe,
+            carry_containment: false,
+        })
+        .await
+        .unwrap();
+    let spawn = handle.registration_for_test(module_id).unwrap();
+    spawn.wait_launch().await;
+    let nonce = handle
+        .spawn_launch_nonce_for(module_id)
+        .expect("an ungated spawn also gets a launch nonce");
+    let mut wire = Wire::new(&rig.router);
+    spawn.bind(wire.ctx.connection_id);
+    let body = subc_protocol::ModuleHelloBody {
+        manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
+        protocol_ver: PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: Some(nonce.clone()),
+    };
+    let ack = wire
+        .call(
+            &rig.router,
+            Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                CORR,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await;
+    assert_eq!(ack.header.ty, FrameType::HelloAck, "{}", reply_text(&ack));
+    (wire, spawn, module, nonce)
+}
+
+fn agent_commands() -> Value {
+    json!({"op":"supervisor.agent_commands","started":[],"finished":[]})
+}
+
+#[tokio::test]
+async fn channel_operations_channel_never_authenticates_through_a_presented_nonce() {
+    let rig = rig().await;
+    let (wire, _spawn, _module, nonce) = channel_with_nonce(&rig, "roles-nonce").await;
+    let connection = wire.ctx.connection_id;
+    assert_eq!(
+        rig.handler
+            .connection_is_current_launch("roles-nonce", connection, Some(&nonce)),
+        LaunchStanding::Current
+    );
+    // Cleanup forgets the channel before it deregisters the connection. In
+    // that interval the nonce the HELLO also carried must not stand in.
+    rig.handler
+        .supervisor
+        .forget_registration_connection(connection);
+    assert_eq!(
+        rig.handler
+            .connection_is_current_launch("roles-nonce", connection, Some(&nonce)),
+        LaunchStanding::NotCurrent
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_operations_declaration_running_during_cleanup_is_refused() {
+    let rig = rig().await;
+    let (wire, _spawn, _module, _nonce) = channel_with_nonce(&rig, "roles-queued").await;
+    let connection = wire.ctx.connection_id;
+    // Hold the declaration on its queue's worker before its current-launch
+    // check. Its reply goes to a sink that retirement does not close.
+    let (reached_sender, reached) = oneshot::channel();
+    let (release, wait_release) = std::sync::mpsc::channel();
+    *rig.handler.agent_commands_pause.lock().unwrap() = Some((0, (reached_sender, wait_release)));
+    let (sender, mut replies) = mpsc::channel(8);
+    let ctx = RouteCtx {
+        connection_id: connection,
+        egress: crate::FrameSink::new(sender),
+    };
+    let declaration = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        0,
+        0,
+        51,
+        serde_json::to_vec(&agent_commands()).unwrap(),
+    )
+    .unwrap();
+    assert!(rig
+        .handler
+        .handle_control_frame(&ctx, declaration)
+        .await
+        .unwrap()
+        .is_empty());
+    tokio::time::timeout(Duration::from_secs(5), reached)
+        .await
+        .expect("the declaration must reach its worker")
+        .unwrap();
+
+    // Hold cleanup just after it forgets the registration channel.
+    let (cleanup_reached_sender, cleanup_reached) = oneshot::channel();
+    let (cleanup_release, cleanup_wait) = std::sync::mpsc::channel();
+    *rig.handler.cleanup_pause.lock().unwrap() = Some((cleanup_reached_sender, cleanup_wait));
+    let handler = rig.handler.clone();
+    let cleanup =
+        tokio::task::spawn_blocking(move || handler.cleanup_connection(connection).map(|_| ()));
+    tokio::time::timeout(Duration::from_secs(5), cleanup_reached)
+        .await
+        .expect("cleanup must reach the forgotten channel")
+        .unwrap();
+    assert!(
+        !rig.handler.agent_declarations.cancel(connection, 51),
+        "the declaration queue must close before the channel is forgotten"
+    );
+
+    // The declaration now runs inside the cleanup window.
+    release.send(()).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+        .await
+        .expect("the declaration must be answered")
+        .unwrap()
+        .frame;
+    assert_eq!(reply.header.corr, 51);
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Error,
+        "a declaration in the cleanup window committed: {}",
+        reply_text(&reply)
+    );
+    cleanup_release.send(()).unwrap();
+    cleanup.await.unwrap().unwrap();
+    drop(wire);
+}
+
+#[tokio::test]
+async fn channel_operations_stopped_launch_is_not_current_rather_than_busy() {
+    let rig = rig().await;
+    let (mut net, _spawn, module, _) = network_primary(&rig, "roles-stopping").await;
+    ok(&ask(&mut net, sync_request(1)).await);
+    // The launch record shows the process gone before the spawn's exit has
+    // been observed: the spawn will never be current again.
+    module.set_launch_alive_for_test(false);
+    assert_eq!(
+        code(&ask(&mut net, sync_request(2)).await),
+        error_codes::SCOPE_SYNC_NOT_AUTHORITY
+    );
+    assert_eq!(
+        code(&ask(&mut net, agent_commands()).await),
+        "not_supervised"
+    );
+    module.set_launch_alive_for_test(true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_operations_busy_launch_read_after_admission_is_retryable() {
+    let rig = rig().await;
+    let (mut net, _spawn, module, _) = network_primary(&rig, "roles-second-busy").await;
+    // Hold the declaration after its current-launch check, then lock the
+    // launch record only for the read that follows.
+    let (reached_sender, reached) = oneshot::channel();
+    let (release, wait_release) = std::sync::mpsc::channel();
+    *rig.handler.agent_commands_pause.lock().unwrap() = Some((1, (reached_sender, wait_release)));
+    net.send(request(agent_commands())).await;
+    tokio::time::timeout(Duration::from_secs(5), reached)
+        .await
+        .expect("the declaration must pass its current-launch check")
+        .unwrap();
+    let (locked, wait_locked) = std::sync::mpsc::channel();
+    let (unlock, wait_unlock) = std::sync::mpsc::channel::<()>();
+    let held = module.clone();
+    let holder = std::thread::spawn(move || {
+        held.with_resource_snapshot_locked_for_test(|| {
+            locked.send(()).unwrap();
+            let _ = wait_unlock.recv_timeout(Duration::from_secs(5));
+        })
+    });
+    wait_locked.recv_timeout(Duration::from_secs(5)).unwrap();
+    release.send(()).unwrap();
+    assert_eq!(code(&answer(&mut net).await), "busy");
+    unlock.send(()).unwrap();
+    holder.join().unwrap();
+    ok(&ask(&mut net, agent_commands()).await);
 }

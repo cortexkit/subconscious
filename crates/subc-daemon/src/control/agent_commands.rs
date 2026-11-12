@@ -40,6 +40,22 @@ impl ControlHandler {
         );
     }
 
+    /// Hold at point `stage` when a test asked for it: 0 is before the
+    /// current-launch check, 1 is between that check and the launch read.
+    #[cfg(test)]
+    fn pause_agent_commands_for_test(&self, stage: u8) {
+        let mut slot = self
+            .agent_commands_pause
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_some_and(|(at, _)| *at == stage) {
+            let (_, (reached, release)) = slot.take().unwrap();
+            drop(slot);
+            let _ = reached.send(());
+            let _ = release.recv_timeout(Duration::from_secs(5));
+        }
+    }
+
     pub(super) fn handle_agent_commands(
         &self,
         connection_id: ConnectionId,
@@ -87,6 +103,8 @@ impl ControlHandler {
             )?]);
         };
         let id = registration.manifest.module_id;
+        #[cfg(test)]
+        self.pause_agent_commands_for_test(0);
         let nonce = self.supervisor.spawn_launch_nonce_for(&id);
         // A declaration on a registration channel commits through that spawn,
         // which carries no launch nonce; any other connection keeps the nonce.
@@ -111,13 +129,15 @@ impl ControlHandler {
                 "agent commands require the module's current supervised launch",
             )?]);
         };
-        let launch = module.resource_launch().ok_or_else(|| {
-            RouterError::backend(
-                0,
-                frame.header.corr,
+        #[cfg(test)]
+        self.pause_agent_commands_for_test(1);
+        let Some(launch) = module.resource_launch() else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "busy",
                 "module launch snapshot is busy; retry",
-            )
-        })?;
+            )?]);
+        };
         let Some(pid) = launch.pid.filter(|_| launch.enabled && launch.alive) else {
             return Ok(vec![control_error_frame(
                 &frame,

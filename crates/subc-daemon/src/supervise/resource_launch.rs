@@ -53,6 +53,13 @@ impl SupervisedModule {
         let _snapshot = self.inner.snapshot.lock().unwrap();
         work()
     }
+    /// Mark the launch record's process alive or exited without touching the
+    /// process or its registration channel.
+    #[cfg(test)]
+    pub(crate) fn set_launch_alive_for_test(&self, alive: bool) {
+        self.inner.snapshot.lock().unwrap().process_alive = alive;
+    }
+
     pub(crate) fn resource_launch(&self) -> Option<ResourceLaunch> {
         let snapshot = self.inner.snapshot.try_lock().ok()?;
         Some(ResourceLaunch::from_snapshot(&snapshot))
@@ -373,6 +380,43 @@ mod tests {
             Err(ResourceCommitError::Changed)
         );
         assert_eq!(fence(serving, &live_spawn(43, 200), &current), Ok(1));
+
+        // A cutover that promotes the registry after the checks cannot stop a
+        // commit already under the fence's locks. The snapshot rewrite that
+        // makes the candidate current waits for that commit, which therefore
+        // belongs to the launch the record still describes, and every later
+        // commit by the superseded spawn is refused.
+        let incumbent = live_spawn(43, 200);
+        let rewrite = handle
+            .with_current_channel_resource_launch(&registry, serving, &incumbent, &current, || {
+                registry
+                    .register_candidate_with_control_ops(
+                        subc_protocol::manifest::ModuleManifest::builder(id, "1.0.0").build(),
+                        subc_protocol::PROTOCOL_VERSION,
+                        crate::ConnectionId::new(7),
+                        Vec::new(),
+                    )
+                    .unwrap();
+                registry.promote_candidate(id).unwrap().unwrap();
+                let rewriting = module.clone();
+                let rewrite = std::thread::spawn(move || {
+                    rewriting.inner.snapshot.lock().unwrap().pid = Some(44);
+                });
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                assert!(
+                    !rewrite.is_finished(),
+                    "the launch record was rewritten inside the commit"
+                );
+                rewrite
+            })
+            .unwrap();
+        rewrite.join().unwrap();
+        assert_eq!(
+            fence(serving, &incumbent, &current),
+            Err(ResourceCommitError::Changed)
+        );
+        set_process(43, 200);
+        let current = module.resource_launch().unwrap();
 
         // Contention is reported as busy, never as a changed launch.
         let fresh = live_spawn(43, 200);

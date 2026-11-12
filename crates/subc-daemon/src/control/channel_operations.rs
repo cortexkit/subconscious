@@ -147,7 +147,8 @@ impl ControlHandler {
     /// cannot confirm it, because it is briefly locked or because a cutover has
     /// promoted the registration and not yet rewritten the record, a live spawn
     /// the registry names as serving is [`LaunchStanding::Unsettled`], which
-    /// callers refuse with a retryable code, never as not current.
+    /// callers refuse with a retryable code. A record showing the launch
+    /// stopped or exited makes it not current: retrying would never succeed.
     ///
     /// This is an admission check. Scope sync evaluates it and publishes under
     /// one hold of the scope table's write lock, so a change admitted for the
@@ -185,10 +186,22 @@ impl ControlHandler {
                     .ok()
                     .flatten()
                     .is_some_and(|registration| registration.connection_id == connection);
-            return if serving {
-                LaunchStanding::Unsettled
-            } else {
-                LaunchStanding::NotCurrent
+            if !serving {
+                return LaunchStanding::NotCurrent;
+            }
+            let Some(module) = self.supervisor.get(owner) else {
+                return LaunchStanding::NotCurrent;
+            };
+            return match module.resource_launch() {
+                // The launch record is locked: nothing is known yet.
+                None => LaunchStanding::Unsettled,
+                // A stopping or exited launch will never be current again,
+                // even before its spawn's retirement is observed.
+                Some(launch) if !launch.enabled || !launch.alive => LaunchStanding::NotCurrent,
+                // The record names another process, as during a cutover that
+                // has promoted the registry but not rewritten the record, or it
+                // lacks this process's start time.
+                Some(_) => LaunchStanding::Unsettled,
             };
         }
         self.hello_launch_nonces

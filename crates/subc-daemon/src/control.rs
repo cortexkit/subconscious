@@ -404,11 +404,24 @@ impl Drop for ActivityRequestCancellation {
     }
 }
 
+/// A test hold: signal arrival, then wait for release on the holding thread.
+#[cfg(test)]
+type TestPause = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
 /// Real channel-0 control handler for subc itself.
 #[derive(Clone)]
 pub struct ControlHandler {
     #[cfg(test)]
     activity_request_pause: Arc<Mutex<Option<Arc<ActivityRequestPause>>>>,
+    /// Holds connection cleanup just after it forgets the registration channel.
+    #[cfg(test)]
+    cleanup_pause: Arc<Mutex<Option<TestPause>>>,
+    /// Holds an agent command declaration at a numbered point in its handler.
+    #[cfg(test)]
+    agent_commands_pause: Arc<Mutex<Option<(u8, TestPause)>>>,
     claims: Arc<claims::Claims>,
     registry: Arc<Registry>,
     config_runtime: Option<Arc<crate::config_gate::runtime::RuntimeOwner>>,
@@ -1084,6 +1097,10 @@ impl ControlHandler {
             registry,
             #[cfg(test)]
             activity_request_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            cleanup_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            agent_commands_pause: Arc::new(Mutex::new(None)),
             claims: Arc::new(claims::Claims::default()),
             config_runtime: None,
             config_review_admission: Arc::new(crate::config_gate::MissingReviewAdmission),
@@ -2660,14 +2677,33 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        // The server loop joins its offloaded request tasks (route opens,
+        // privileged requests and activity reads) before this cleanup runs, and
+        // inline dispatch has ended. Two kinds of work are not joined. Agent
+        // command declarations run on their queue's detached worker, so the
+        // queue is closed first: every declaration still queued or validating
+        // has its commit fence cancelled before anything below can change how
+        // the connection resolves. A HELLO whose reader was dropped keeps
+        // running on its blocking thread; its publication is serialized with
+        // the retirement below, and it never records a launch nonce for a
+        // registration channel, so it cannot leave this connection any nonce
+        // authority.
+        self.agent_declarations.close(connection_id);
         if let Some(spawn) = self.supervisor.registration_spawn(connection_id) {
             spawn.retire();
         }
-        // Safe before deregistration: the connection's server loop has already
-        // joined every offloaded request task and ended inline dispatch, so no
-        // handler can still resolve this connection and find no channel.
         self.supervisor
             .forget_registration_connection(connection_id);
+        #[cfg(test)]
+        if let Some((reached, release)) = self
+            .cleanup_pause
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            let _ = reached.send(());
+            let _ = release.recv_timeout(Duration::from_secs(5));
+        }
         self.local_connections
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -3473,12 +3509,15 @@ impl ControlHandler {
         // presented the module's current launch nonce. Recorded before the
         // registration is attempted: a connection whose registration then fails
         // has no registration, so it cannot sync anyway, and cleanup forgets it.
+        // A registration channel's authority is the channel itself, never a
+        // nonce it also presented, and a prefix registration's is its claim:
+        // neither records one, so neither can fall back to nonce authority.
         self.hello_launch_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .record(
                 connection_id,
-                if prefix_binding.is_some() {
+                if prefix_binding.is_some() || channel_spawn.is_some() {
                     None
                 } else {
                     hello.launch_nonce.as_deref()

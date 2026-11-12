@@ -143,6 +143,10 @@ const SUBC_UNADVERTISED_CONTROL_OPS: &[&str] = &[
     "config.rollback",
 ];
 
+mod channel_operations;
+#[cfg(all(test, unix, feature = "test-support"))]
+#[path = "control/channel_operations_tests.rs"]
+mod channel_operations_tests;
 pub(crate) mod claims;
 #[cfg(test)]
 #[path = "control/config_advertisement_tests.rs"]
@@ -2436,6 +2440,13 @@ impl ControlHandler {
                 if op.as_ref().is_some_and(|probe| probe.op == "claim.mint") {
                     return self.handle_claim_mint(ctx, &frame).await;
                 }
+                if let Some(refusal) = self.registration_operation_refusal(
+                    ctx,
+                    &frame,
+                    op.as_ref().map(|probe| probe.op.as_str()),
+                )? {
+                    return Ok(vec![refusal]);
+                }
                 if let Some(probe) = op
                     .as_ref()
                     .filter(|probe| config_gate::is_module_config_op(&probe.op))
@@ -4470,10 +4481,16 @@ impl ControlHandler {
             .unwrap_or_else(|p| p.into_inner())
             .nonce(ctx.connection_id)
             .map(str::to_owned);
-        let nonce_proven = nonce.as_deref().is_some_and(|nonce| {
-            self.supervisor
-                .spawned_consumer_authorized(&module_id, nonce)
-        });
+        // A registration channel proves its own spawn; only a connection that
+        // registered over the launch nonce falls back to the nonce.
+        let nonce_proven = self
+            .confirm_channel_proven(ctx.connection_id, &module_id)
+            .unwrap_or_else(|| {
+                nonce.as_deref().is_some_and(|nonce| {
+                    self.supervisor
+                        .spawned_consumer_authorized(&module_id, nonce)
+                })
+            });
         let confirms = self.forwarding.operator_confirms();
         self.forwarding
             .with_operator_route(
@@ -4621,10 +4638,7 @@ impl ControlHandler {
         let scopes = Self::prepare_scope_records(scopes);
         let current_nonce = self.supervisor.spawn_launch_nonce_for(&owner);
         let is_current_launch = |connection: ConnectionId| {
-            self.hello_launch_nonces
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .presented(connection, current_nonce.as_deref())
+            self.connection_is_current_launch(&owner, connection, current_nonce.as_deref())
         };
         // Lock order is the scope table, then the forwarding table: the new
         // tags are published, and the routes the change closes are selected,
@@ -5114,28 +5128,50 @@ impl ControlHandler {
             #[serde(default)]
             consumer_identity: Option<ConsumerIdentity>,
         }
+        // A registration channel or claim-bound connection carries its module in
+        // its binding, so no request field can name another principal, and its
+        // subscription ends when the bound spawn's authority does.
+        let mut bound_spawn = None;
+        let legacy = match self.activity_reader(ctx.connection_id) {
+            channel_operations::ActivityReader::Module { module_id, spawn } => {
+                bound_spawn = Some(spawn);
+                Some(Ok(Principal::Reserved { module_id }))
+            }
+            // Refused outright: falling back to `direct` would admit it.
+            channel_operations::ActivityReader::Refused => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    ACTIVITY_READ_FORBIDDEN,
+                    "helper, relay and retired connections cannot read activity",
+                )?]);
+            }
+            channel_operations::ActivityReader::Legacy => None,
+        };
         // A registered module connection already identifies its caller. Ignore
         // consumer_identity there so a module cannot borrow a mirror's identity.
         // Only separate consumer connections use the Direct/nonce trust boundary.
-        let principal = match self
-            .forwarding
-            .module_id_for_connection(ctx.connection_id)
-            .map_err(RouterError::Forwarding)?
-        {
-            Some(module_id) => Ok(Principal::Reserved { module_id }),
-            None => {
-                let identity: Identity = match serde_json::from_slice(&frame.body) {
-                    Ok(identity) => identity,
-                    Err(_) => {
-                        return Ok(vec![control_error_frame(
-                            &frame,
-                            ACTIVITY_MALFORMED,
-                            "malformed activity read",
-                        )?])
-                    }
-                };
-                self.route_open_principal(&frame, identity.consumer_identity)?
-            }
+        let principal = match legacy {
+            Some(principal) => principal,
+            None => match self
+                .forwarding
+                .module_id_for_connection(ctx.connection_id)
+                .map_err(RouterError::Forwarding)?
+            {
+                Some(module_id) => Ok(Principal::Reserved { module_id }),
+                None => {
+                    let identity: Identity = match serde_json::from_slice(&frame.body) {
+                        Ok(identity) => identity,
+                        Err(_) => {
+                            return Ok(vec![control_error_frame(
+                                &frame,
+                                ACTIVITY_MALFORMED,
+                                "malformed activity read",
+                            )?])
+                        }
+                    };
+                    self.route_open_principal(&frame, identity.consumer_identity)?
+                }
+            },
         };
         let admitted = matches!(principal, Ok(Principal::Direct))
             || matches!(&principal, Ok(Principal::Reserved { module_id }) if module_id == "callosum" || module_id == "ckbus");
@@ -5207,7 +5243,7 @@ impl ControlHandler {
                 "activity subscription correlation id already in use",
             )?]);
         }
-        let task = tokio::spawn(async move {
+        let stream = async move {
             loop {
                 let entry = if let Some(entry) = subscription.replay.pop_front() {
                     Some(entry)
@@ -5243,6 +5279,20 @@ impl ControlHandler {
                 {
                     let _ = sink.send(end).await;
                 }
+            }
+        };
+        // The spawn's retirement revokes this connection's authority. End the
+        // subscription then, rather than when the connection's close is
+        // eventually processed or the next entry fails to send.
+        let task = tokio::spawn(async move {
+            match bound_spawn {
+                Some(spawn) => {
+                    tokio::select! {
+                        () = stream => {}
+                        () = spawn.wait_closed() => {}
+                    }
+                }
+                None => stream.await,
             }
         });
         streams.insert(key, task.abort_handle());

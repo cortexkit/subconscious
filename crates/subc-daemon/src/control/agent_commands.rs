@@ -88,11 +88,7 @@ impl ControlHandler {
         };
         let id = registration.manifest.module_id;
         let nonce = self.supervisor.spawn_launch_nonce_for(&id);
-        let authorized = self
-            .hello_launch_nonces
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .presented(connection_id, nonce.as_deref());
+        let authorized = self.connection_is_current_launch(&id, connection_id, nonce.as_deref());
         let module = self.supervisor.get(&id).filter(|_| authorized);
         let Some(module) = module else {
             return Ok(vec![control_error_frame(

@@ -1371,6 +1371,16 @@ pub(crate) mod tests {
     }
 
     async fn rig_with_activity(activity_root: Option<&std::path::Path>) -> Rig {
+        rig_with(|handler| match activity_root {
+            Some(root) => handler.with_activity_ledger(root, "prefix-test".into()),
+            None => handler,
+        })
+        .await
+    }
+
+    /// The claim fixture with extra handler configuration applied before the
+    /// handler is shared with its router.
+    pub(crate) async fn rig_with(customize: impl FnOnce(ControlHandler) -> ControlHandler) -> Rig {
         let registry = Arc::new(Registry::default());
         let forwarding = Arc::new(ForwardingTable::default());
         let handle = SupervisorHandle::new();
@@ -1400,12 +1410,9 @@ pub(crate) mod tests {
             "claim fixture launch failed: {:?}",
             module.status()
         );
-        let mut handler =
-            ControlHandler::with_forwarding(registry, forwarding).with_supervisor(handle);
-        if let Some(root) = activity_root {
-            handler = handler.with_activity_ledger(root, "prefix-test".into());
-        }
-        let handler = Arc::new(handler);
+        let handler = Arc::new(customize(
+            ControlHandler::with_forwarding(registry, forwarding).with_supervisor(handle),
+        ));
         let router = Arc::new(Router::with_control_handler(handler.clone()));
         let mut primary = Wire::new(&router);
         spawn.bind(primary.connection.id());
@@ -1444,14 +1451,14 @@ pub(crate) mod tests {
         }
     }
 
-    async fn network_primary(
+    pub(crate) async fn network_primary(
         rig: &Rig,
         module_id: &str,
     ) -> (Net, Arc<RegistrationSpawn>, SupervisedModule, ConnectionId) {
         network_primary_with_hello(rig, module_id, true).await
     }
 
-    async fn network_primary_with_hello(
+    pub(crate) async fn network_primary_with_hello(
         rig: &Rig,
         module_id: &str,
         register: bool,
@@ -1521,7 +1528,7 @@ pub(crate) mod tests {
         (net, spawn, module, connection)
     }
 
-    async fn net_mint(net: &mut Net, purpose: ClaimPurpose) -> ClaimMintReply {
+    pub(crate) async fn net_mint(net: &mut Net, purpose: ClaimPurpose) -> ClaimMintReply {
         let reply = net.call(request(ClaimMintRequest::new(purpose))).await;
         assert_eq!(
             reply.header.ty,
@@ -3048,18 +3055,18 @@ pub(crate) mod tests {
         );
     }
 
-    struct SwapRig {
-        incumbent: Net,
-        candidate: Net,
-        module: SupervisedModule,
-        swap: tokio::task::JoinHandle<
+    pub(crate) struct SwapRig {
+        pub(crate) incumbent: Net,
+        pub(crate) candidate: Net,
+        pub(crate) module: SupervisedModule,
+        pub(crate) swap: tokio::task::JoinHandle<
             Result<crate::supervise::SwapOutcome, crate::supervise::SuperviseError>,
         >,
-        incumbent_id: ConnectionId,
-        candidate_id: ConnectionId,
+        pub(crate) incumbent_id: ConnectionId,
+        pub(crate) candidate_id: ConnectionId,
     }
 
-    async fn swap_candidate(rig: &Rig, module_id: &str) -> SwapRig {
+    pub(crate) async fn swap_candidate(rig: &Rig, module_id: &str) -> SwapRig {
         let (incumbent, _spawn, module, incumbent_id) = network_primary(rig, module_id).await;
         let swapping = module.clone();
         let swap = tokio::spawn(async move { swapping.swap(Some(Duration::from_secs(5))).await });

@@ -77,6 +77,7 @@ mod registration;
 #[cfg(all(test, unix))]
 pub(crate) use registration::RegistrationProof;
 pub(crate) use registration::RegistrationSpawn;
+pub(crate) use registration::REGISTRATION_CHANNEL_CLOSED;
 #[cfg(all(test, unix))]
 pub(crate) mod unix_channel_placement_tests;
 use program_binding::ProgramBindingPublication;

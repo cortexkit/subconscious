@@ -88,7 +88,21 @@ impl ControlHandler {
         };
         let id = registration.manifest.module_id;
         let nonce = self.supervisor.spawn_launch_nonce_for(&id);
-        let authorized = self.connection_is_current_launch(&id, connection_id, nonce.as_deref());
+        // A declaration on a registration channel commits through that spawn,
+        // which carries no launch nonce; any other connection keeps the nonce.
+        let channel = self.supervisor.registration_spawn(connection_id);
+        let authorized =
+            match self.connection_is_current_launch(&id, connection_id, nonce.as_deref()) {
+                crate::scopes::LaunchStanding::Current => true,
+                crate::scopes::LaunchStanding::NotCurrent => false,
+                crate::scopes::LaunchStanding::Unsettled => {
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        "busy",
+                        "the module's current launch cannot be confirmed yet; retry",
+                    )?]);
+                }
+            };
         let module = self.supervisor.get(&id).filter(|_| authorized);
         let Some(module) = module else {
             return Ok(vec![control_error_frame(
@@ -144,15 +158,25 @@ impl ControlHandler {
                     "process ownership or membership is unknown; retry",
                 ));
             };
-            let committed = self.supervisor.with_current_resource_launch(
-                &id,
-                nonce.as_deref().unwrap_or_default(),
-                &launch,
-                || {
-                    self.resource_tracker
-                        .commit_fenced(&id, launch.generation(), prepared, fence)
-                },
-            );
+            let commit = || {
+                self.resource_tracker
+                    .commit_fenced(&id, launch.generation(), prepared, fence)
+            };
+            let committed = match &channel {
+                Some(spawn) => self.supervisor.with_current_channel_resource_launch(
+                    &self.registry,
+                    connection_id,
+                    spawn,
+                    &launch,
+                    commit,
+                ),
+                None => self.supervisor.with_current_resource_launch(
+                    &id,
+                    nonce.as_deref().unwrap_or_default(),
+                    &launch,
+                    commit,
+                ),
+            };
             let rejected = match committed {
                 Ok(rejected) => rejected,
                 Err(crate::supervise::ResourceCommitError::Busy) => {

@@ -17,6 +17,10 @@ use std::sync::{
     Weak,
 };
 
+/// The refusal code for any registration operation that reaches a spawn whose
+/// exit has been observed. Terminal: the channel never carries authority again.
+pub(crate) const REGISTRATION_CHANNEL_CLOSED: &str = "registration_channel_closed";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LaunchState {
     Pending,
@@ -248,7 +252,7 @@ impl RegistrationSpawn {
     pub(crate) fn begin_publication(&self) -> Result<std::sync::MutexGuard<'_, ()>, &'static str> {
         let guard = self.transition.lock().unwrap_or_else(|p| p.into_inner());
         if !self.launch_ready() {
-            return Err("registration_channel_closed");
+            return Err(REGISTRATION_CHANNEL_CLOSED);
         }
         Ok(guard)
     }
@@ -321,7 +325,7 @@ impl RegistrationSpawn {
 
     fn check_state(&self) -> Result<(), &'static str> {
         match *self.launch.borrow() {
-            LaunchState::Dead => return Err("registration_channel_closed"),
+            LaunchState::Dead => return Err(REGISTRATION_CHANNEL_CLOSED),
             LaunchState::Pending => return Err("config_delivery_deferred"),
             LaunchState::Ready => {}
         }

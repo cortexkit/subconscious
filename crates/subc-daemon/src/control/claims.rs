@@ -1381,6 +1381,14 @@ pub(crate) mod tests {
     /// The claim fixture with extra handler configuration applied before the
     /// handler is shared with its router.
     pub(crate) async fn rig_with(customize: impl FnOnce(ControlHandler) -> ControlHandler) -> Rig {
+        rig_with_module("claims-module", customize).await
+    }
+
+    /// [`rig_with`] whose primary registration channel belongs to `module_id`.
+    pub(crate) async fn rig_with_module(
+        module_id: &str,
+        customize: impl FnOnce(ControlHandler) -> ControlHandler,
+    ) -> Rig {
         let registry = Arc::new(Registry::default());
         let forwarding = Arc::new(ForwardingTable::default());
         let handle = SupervisorHandle::new();
@@ -1391,7 +1399,7 @@ pub(crate) mod tests {
             .with_drain_timeout(Duration::ZERO);
         let module = supervisor
             .spawn_async(ModuleSpec {
-                module_id: "claims-module".into(),
+                module_id: module_id.into(),
                 program: "/bin/sh".into(),
                 args: vec!["-c".into(), "exec sleep 300".into()],
                 env: Vec::new(),
@@ -1403,7 +1411,7 @@ pub(crate) mod tests {
             })
             .await
             .unwrap();
-        let spawn = handle.registration_for_test("claims-module").unwrap();
+        let spawn = handle.registration_for_test(module_id).unwrap();
         spawn.wait_launch().await;
         assert!(
             spawn.launch_ready(),
@@ -1417,7 +1425,7 @@ pub(crate) mod tests {
         let mut primary = Wire::new(&router);
         spawn.bind(primary.connection.id());
         let hello = subc_protocol::ModuleHelloBody {
-            manifest: ModuleManifest::builder("claims-module", "1.0.0").build(),
+            manifest: ModuleManifest::builder(module_id, "1.0.0").build(),
             protocol_ver: PROTOCOL_VERSION,
             control_ops: None,
             launch_nonce: None,
@@ -2144,7 +2152,7 @@ pub(crate) mod tests {
         );
     }
 
-    fn prefix_hello(module_id: &str) -> Frame {
+    pub(crate) fn prefix_hello(module_id: &str) -> Frame {
         Frame::build(
             FrameType::Hello,
             control_flags(),
@@ -2186,7 +2194,7 @@ pub(crate) mod tests {
         child
     }
 
-    async fn prefix_wire(rig: &mut Rig, module_id: &str) -> Wire {
+    pub(crate) async fn prefix_wire(rig: &mut Rig, module_id: &str) -> Wire {
         rig.handler
             .supervisor
             .set_reserved_prefixes("claims-module", &["claims:".into()]);

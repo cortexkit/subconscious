@@ -747,6 +747,29 @@ async fn claims_transient_content_deferral_does_not_retire_live_registration() {
     fixture.module.stop().await.unwrap();
 }
 
+/// A gated spawn carries no launch nonce, so its agent command declarations
+/// must commit through its registration channel's spawn instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gated_channel_agent_commands_commit_through_the_channel_spawn() {
+    use crate::control::claims::tests::request;
+    let mut fixture = gated_claim_fixture().await;
+    assert!(fixture.handle.spawn_launch_nonce_for("a").is_none());
+    let reply = fixture
+        .primary
+        .call(request(json!({
+            "op":"supervisor.agent_commands","started":[],"finished":[],
+        })))
+        .await;
+    assert_eq!(
+        reply.header.ty,
+        subc_protocol::FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
 fn rig() -> Rig {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

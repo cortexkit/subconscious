@@ -3,10 +3,12 @@
 //! supervised spawn's registration channel in its current, candidate and
 //! draining roles, plus the activity-read rules for channels and claims.
 
-use super::channel_operations::REGISTRATION_OPERATIONS;
+use super::channel_operations::{
+    CLAIM_OPERATION_NOT_ALLOWED, REGISTRATION_CHANNEL_CLOSED, REGISTRATION_OPERATIONS,
+};
 use super::claims::tests::{
-    mint, net_mint, network_primary, network_primary_with_hello, request, rig, rig_with,
-    swap_candidate, Net, Rig, SwapRig, Wire,
+    mint, net_mint, network_primary, network_primary_with_hello, prefix_hello, prefix_wire,
+    request, rig, rig_with, rig_with_module, swap_candidate, Net, Rig, SwapRig, Wire,
 };
 use super::*;
 use serde_json::{json, Value};
@@ -88,14 +90,12 @@ async fn cut_over(rig: &Rig, swap: &mut SwapRig) -> oneshot::Sender<()> {
     release
 }
 
-/// Answer a request on the fixture's primary channel after its spawn was seen
-/// to exit, as for a frame read just before retirement fenced the channel.
-async fn after_exit(rig: &Rig, body: impl Serialize) -> Frame {
-    rig.spawn.retire();
-    assert!(!rig.spawn.launch_ready());
+/// Answer a request for `connection` on a fresh sink, as for a frame its
+/// reader admitted just before retirement fenced the connection's own sink.
+async fn replay(rig: &Rig, connection: ConnectionId, body: impl Serialize) -> Frame {
     let (sender, _replies) = mpsc::channel(8);
     let ctx = RouteCtx {
-        connection_id: rig.primary.ctx.connection_id,
+        connection_id: connection,
         egress: crate::FrameSink::new(sender),
     };
     let mut replies = rig
@@ -105,6 +105,14 @@ async fn after_exit(rig: &Rig, body: impl Serialize) -> Frame {
         .unwrap();
     assert_eq!(replies.len(), 1, "{replies:?}");
     replies.pop().unwrap()
+}
+
+/// Answer a request on the fixture's primary channel after its spawn was seen
+/// to exit.
+async fn after_exit(rig: &Rig, body: impl Serialize) -> Frame {
+    rig.spawn.retire();
+    assert!(!rig.spawn.launch_ready());
+    replay(rig, rig.primary.ctx.connection_id, body).await
 }
 
 fn hello(module_id: &str) -> Frame {
@@ -369,6 +377,16 @@ async fn channel_operations_scope_sync_row_is_keyed_by_the_serving_spawn() {
     let mut swap = swap_candidate(&rig, "roles-scope").await;
     let mut bound = consumer(&rig, &mut swap.incumbent, ClaimPurpose::SelfConnection).await;
 
+    // Before anything holds authority, the warming candidate is refused
+    // because it is not current, not because another connection holds it.
+    let refused = ask(&mut swap.candidate, sync_request(100)).await;
+    assert_eq!(code(&refused), error_codes::SCOPE_SYNC_NOT_AUTHORITY);
+    assert!(
+        reply_text(&refused).contains("not the owner's current supervised launch"),
+        "{}",
+        reply_text(&refused)
+    );
+
     // The current spawn's channel holds authority: a full sync comes first,
     // and generations only move forward.
     assert_eq!(
@@ -389,7 +407,7 @@ async fn channel_operations_scope_sync_row_is_keyed_by_the_serving_spawn() {
     );
     assert_eq!(
         code(&ask(&mut bound, sync_request(100)).await),
-        "claim_operation_not_allowed"
+        CLAIM_OPERATION_NOT_ALLOWED
     );
     ok(&ask(&mut swap.incumbent, sync_request(7)).await);
 
@@ -500,6 +518,61 @@ fn operation_body(op: &str) -> Value {
     }
 }
 
+/// Every operation a module sends the daemon on channel 0, written out here
+/// instead of being read from the daemon's own lists, each marked with whether
+/// it needs the module's own registration.
+const MODULE_TO_DAEMON_OPERATIONS: &[(&str, bool)] = &[
+    ("config.declare", true),
+    ("config.get", true),
+    ("config.applied", true),
+    ("catalog.update", true),
+    ("activity.record", true),
+    ("claim.mint", true),
+    ("operator.confirm", true),
+    ("scope.sync", true),
+    ("scope.apply", true),
+    ("scope.describe", true),
+    ("route.authorize", true),
+    ("supervisor.live_roots", true),
+    ("supervisor.agent_commands", true),
+    ("scope.served_by", true),
+    // Connection setup, and reads a module makes as a client.
+    ("claim.present", false),
+    ("activity.query", false),
+    ("activity.subscribe", false),
+];
+
+fn registration_operations() -> Vec<&'static str> {
+    MODULE_TO_DAEMON_OPERATIONS
+        .iter()
+        .filter(|(_, registration)| *registration)
+        .map(|(op, _)| *op)
+        .collect()
+}
+
+#[test]
+fn channel_operations_every_module_operation_is_classified() {
+    for op in MODULE_TO_SUBC_CONTROL_OPS
+        .iter()
+        .chain(MODULE_TO_SUBC_UNADVERTISED_OPS)
+    {
+        assert!(
+            MODULE_TO_DAEMON_OPERATIONS
+                .iter()
+                .any(|(known, _)| known == op),
+            "{op} is a module operation this table does not classify"
+        );
+    }
+    let mut expected = registration_operations();
+    let mut gated = REGISTRATION_OPERATIONS.to_vec();
+    expected.sort_unstable();
+    gated.sort_unstable();
+    assert_eq!(
+        gated, expected,
+        "the registration check covers exactly these"
+    );
+}
+
 #[tokio::test]
 async fn channel_operations_refuse_consumer_claims_and_exited_spawns() {
     let mut rig = rig().await;
@@ -514,21 +587,23 @@ async fn channel_operations_refuse_consumer_claims_and_exited_spawns() {
         ok(&net.call(request(ClaimPresentRequest::new(claim))).await);
         consumers.push(net);
     }
-    for op in REGISTRATION_OPERATIONS {
+    // `claim.mint` is dispatched before the registration check and refuses
+    // both kinds of connection with its own code.
+    for op in registration_operations() {
         for net in &mut consumers {
-            let expected = if *op == "claim.mint" {
+            let expected = if op == "claim.mint" {
                 error_codes::CLAIM_MINT_NOT_ALLOWED
             } else {
-                "claim_operation_not_allowed"
+                CLAIM_OPERATION_NOT_ALLOWED
             };
             assert_eq!(code(&ask(net, operation_body(op)).await), expected, "{op}");
         }
     }
-    for op in REGISTRATION_OPERATIONS {
-        let expected = if *op == "claim.mint" {
+    for op in registration_operations() {
+        let expected = if op == "claim.mint" {
             error_codes::CLAIM_MINT_NOT_ALLOWED
         } else {
-            "registration_channel_closed"
+            REGISTRATION_CHANNEL_CLOSED
         };
         assert_eq!(
             code(&after_exit(&rig, operation_body(op)).await),
@@ -538,8 +613,7 @@ async fn channel_operations_refuse_consumer_claims_and_exited_spawns() {
     }
 }
 
-/// A fixture whose handler keeps an activity ledger, plus a running `callosum`
-/// module registered over its channel: one of the elevated activity readers.
+/// A fixture whose handler keeps an activity ledger.
 async fn activity_rig(label: &str) -> (Rig, std::path::PathBuf) {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/scratch")
@@ -661,4 +735,158 @@ async fn channel_operations_claim_subscriptions_end_when_the_binding_is_revoked(
     drop((reader, callosum));
     drop(rig);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn channel_operations_prefix_registration_dies_with_its_owner() {
+    let (mut rig, root) = activity_rig("prefix").await;
+    let mut child = prefix_wire(&mut rig, "claims:roles-child").await;
+    assert_eq!(
+        child
+            .call(&rig.router, prefix_hello("claims:roles-child"))
+            .await
+            .header
+            .ty,
+        FrameType::HelloAck
+    );
+    let child_id = child.ctx.connection_id;
+    let brokered = [
+        json!({"op":"catalog.update","provides":[],"ready":false}),
+        json!({"op":"activity.record","kind":"claims:roles-child.settled","summary":"Settled"}),
+        json!({"op":"scope.describe","owner":{"kind":"reserved","module_id":"claims-module"},"ref":"missing"}),
+        json!({"op":"supervisor.live_roots"}),
+    ];
+    for body in &brokered {
+        ok(&replay(&rig, child_id, body).await);
+    }
+    // The owner exits. Its prefix child's registry entry and binding remain
+    // until the connection's cleanup runs, but a frame read before the claim
+    // connection was fenced is refused.
+    rig.spawn.retire();
+    for body in &brokered {
+        assert_eq!(
+            code(&replay(&rig, child_id, body).await),
+            REGISTRATION_CHANNEL_CLOSED,
+            "{body}"
+        );
+    }
+    drop(child);
+    drop(rig);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn channel_operations_busy_launch_record_is_retryable_for_the_serving_spawn() {
+    let rig = rig().await;
+    let (mut net, _spawn, module, _) = network_primary(&rig, "roles-busy").await;
+    let agents = json!({"op":"supervisor.agent_commands","started":[],"finished":[]});
+    let (locked, wait_locked) = std::sync::mpsc::channel();
+    let (release, wait_release) = std::sync::mpsc::channel::<()>();
+    let held = module.clone();
+    let holder = std::thread::spawn(move || {
+        held.with_resource_snapshot_locked_for_test(|| {
+            locked.send(()).unwrap();
+            let _ = wait_release.recv_timeout(Duration::from_secs(5));
+        })
+    });
+    wait_locked.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(code(&ask(&mut net, sync_request(1)).await), "busy");
+    assert_eq!(code(&ask(&mut net, &agents).await), "busy");
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    ok(&ask(&mut net, sync_request(1)).await);
+    ok(&ask(&mut net, &agents).await);
+}
+
+#[tokio::test]
+async fn channel_operations_cutover_interval_is_retryable_for_the_promoted_spawn() {
+    let rig = rig().await;
+    let mut swap = swap_candidate(&rig, "roles-cutover").await;
+    // Publish what a cutover publishes first, the forwarding endpoint and the
+    // registry slot, and stop before the supervisor rewrites the launch
+    // record, which still describes the incumbent's process.
+    rig.handler
+        .forwarding
+        .cutover_candidate("roles-cutover")
+        .unwrap()
+        .expect("the candidate's endpoint takes over");
+    rig.handler
+        .registry
+        .promote_candidate("roles-cutover")
+        .unwrap()
+        .expect("the registry names the candidate");
+    let agents = json!({"op":"supervisor.agent_commands","started":[],"finished":[]});
+    assert_eq!(
+        code(&ask(&mut swap.candidate, sync_request(1)).await),
+        "busy"
+    );
+    assert_eq!(code(&ask(&mut swap.candidate, &agents).await), "busy");
+    assert_eq!(
+        code(&ask(&mut swap.incumbent, sync_request(1)).await),
+        error_codes::SCOPE_SYNC_NOT_AUTHORITY
+    );
+    assert_eq!(
+        code(&ask(&mut swap.incumbent, &agents).await),
+        "not_supervised"
+    );
+}
+
+#[tokio::test]
+async fn channel_operations_exited_reader_channel_and_claims_read_nothing() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/scratch")
+        .join(format!("channel-activity-exited-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let ledger = root.clone();
+    let mut rig = rig_with_module("callosum", move |handler| {
+        handler.with_activity_ledger(&ledger, "activity".into())
+    })
+    .await;
+    let claim = mint(&mut rig, ClaimPurpose::SelfConnection).await.claim;
+    let mut reader = Wire::new(&rig.router);
+    ok(&reader
+        .call(&rig.router, request(ClaimPresentRequest::new(claim)))
+        .await);
+    let readers = [rig.primary.ctx.connection_id, reader.ctx.connection_id];
+    for connection in readers {
+        ok(&replay(&rig, connection, query(None)).await);
+    }
+    rig.spawn.retire();
+    for connection in readers {
+        assert_eq!(
+            code(&replay(&rig, connection, query(None)).await),
+            subc_control::ACTIVITY_READ_FORBIDDEN
+        );
+    }
+    drop(reader);
+    drop(rig);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A warming candidate serves no route before cutover, and `operator.confirm`
+/// names a route its sender serves, so a candidate's confirm cannot succeed
+/// end to end. Check the channel proof it would carry directly.
+#[tokio::test]
+async fn channel_operations_warming_candidate_channel_proves_operator_confirm() {
+    let rig = rig().await;
+    let swap = swap_candidate(&rig, "roles-confirm-candidate").await;
+    for connection in [swap.candidate_id, swap.incumbent_id] {
+        assert_eq!(
+            rig.handler
+                .confirm_channel_proven(connection, "roles-confirm-candidate"),
+            Some(true)
+        );
+    }
+    assert_eq!(
+        rig.handler
+            .confirm_channel_proven(swap.candidate_id, "another-module"),
+        Some(false)
+    );
+    rig.spawn.retire();
+    assert_eq!(
+        rig.handler
+            .confirm_channel_proven(rig.primary.ctx.connection_id, "claims-module"),
+        Some(false)
+    );
 }

@@ -36,8 +36,15 @@
 //! the rules they had before.
 
 use super::*;
+use crate::scopes::LaunchStanding;
 use crate::supervise::RegistrationSpawn;
+pub(crate) use crate::supervise::REGISTRATION_CHANNEL_CLOSED;
 use subc_control::ClaimPurpose;
+
+/// The refusal for an operation a claim-bound connection may not use: any
+/// registration operation on a `self`, `helper` or `relay` connection, and
+/// anything outside a prefix registration's brokered set. Terminal.
+pub(crate) const CLAIM_OPERATION_NOT_ALLOWED: &str = "claim_operation_not_allowed";
 
 /// The operations that require the module's own registration.
 pub(super) const REGISTRATION_OPERATIONS: &[&str] = &[
@@ -90,7 +97,21 @@ impl ControlHandler {
         if !op.is_some_and(|op| REGISTRATION_OPERATIONS.contains(&op)) {
             return Ok(None);
         }
+        let closed = || {
+            control_error_frame(
+                frame,
+                REGISTRATION_CHANNEL_CLOSED,
+                "the spawn that owned this registration has exited",
+            )
+            .map(Some)
+        };
         if let Some(binding) = self.claims.binding(ctx.connection_id) {
+            // Retirement marks the spawn dead before it fences the claim
+            // connections, so a frame read in between still arrives here. A
+            // prefix registration lives on its owner's spawn and dies with it.
+            if !binding.registration.launch_ready() {
+                return closed();
+            }
             // A prefix-bound connection becomes the prefix child's
             // registration; ingress already limits it to brokered operations.
             if binding.prefix_module_id().is_some() {
@@ -98,7 +119,7 @@ impl ControlHandler {
             }
             return control_error_frame(
                 frame,
-                "claim_operation_not_allowed",
+                CLAIM_OPERATION_NOT_ALLOWED,
                 "a connection bound by a consumer claim has no registration operations",
             )
             .map(Some);
@@ -108,12 +129,7 @@ impl ControlHandler {
             .registration_spawn(ctx.connection_id)
             .is_some_and(|spawn| !spawn.launch_ready())
         {
-            return control_error_frame(
-                frame,
-                "registration_channel_closed",
-                "the spawn that owned this registration channel has exited",
-            )
-            .map(Some);
+            return closed();
         }
         Ok(None)
     }
@@ -126,28 +142,60 @@ impl ControlHandler {
     /// connection is current when it presented the module's recorded launch
     /// nonce at HELLO.
     ///
+    /// The registry slot decides a channel's role; the supervisor's launch
+    /// record then confirms the spawn is that launch's process. When the record
+    /// cannot confirm it, because it is briefly locked or because a cutover has
+    /// promoted the registration and not yet rewritten the record, a live spawn
+    /// the registry names as serving is [`LaunchStanding::Unsettled`], which
+    /// callers refuse with a retryable code, never as not current.
+    ///
+    /// This is an admission check. Scope sync evaluates it and publishes under
+    /// one hold of the scope table's write lock, so a change admitted for the
+    /// incumbent just before cutover can still publish just after it, as with
+    /// nonces, but it cannot overtake a sync the promoted spawn has completed.
+    /// Agent declarations repeat the check at commit, under the supervisor's
+    /// launch locks.
+    ///
     /// Scope sync calls this under the scope table's write lock. It takes the
-    /// registry, the supervisor's channel index and launch records, and the
-    /// HELLO nonce map, each released before it returns; none of them is held
-    /// while the scope table is taken.
+    /// registry, the supervisor's channel index, roster and launch records, the
+    /// gate runtime's admission state (to tell whether the module is gated),
+    /// and the HELLO nonce map, each released before it returns; none of them
+    /// is held while the scope table is taken.
     pub(super) fn connection_is_current_launch(
         &self,
         owner: &str,
         connection: ConnectionId,
         current_nonce: Option<&str>,
-    ) -> bool {
-        if self.supervisor.registration_spawn(connection).is_some() {
-            return self.supervisor.registration_snapshot_is_current_live(
+    ) -> LaunchStanding {
+        if let Some(spawn) = self.supervisor.registration_spawn(connection) {
+            if self.supervisor.registration_snapshot_is_current_live(
                 &self.registry,
                 owner,
                 connection,
                 None,
-            );
+            ) {
+                return LaunchStanding::Current;
+            }
+            let serving = spawn.module_id == owner
+                && spawn.launch_ready()
+                && (!self.supervisor.module_is_gated(owner) || spawn.has_program_binding())
+                && self
+                    .registry
+                    .get_module(owner)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|registration| registration.connection_id == connection);
+            return if serving {
+                LaunchStanding::Unsettled
+            } else {
+                LaunchStanding::NotCurrent
+            };
         }
         self.hello_launch_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .presented(connection, current_nonce)
+            .into()
     }
 
     /// Whether a registration channel proves the module for

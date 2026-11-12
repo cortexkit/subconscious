@@ -81,6 +81,31 @@ fn same_record_identity(a: &ScopeRecord, b: &ScopeRecord) -> bool {
     comparable == *b
 }
 
+/// Whether a connection belongs to its owner's current supervised launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchStanding {
+    Current,
+    NotCurrent,
+    /// The daemon cannot tell yet: the launch record is briefly busy, or a
+    /// cutover has promoted the registration but not yet rewritten the launch
+    /// record. A refusal for this reason is retryable, never terminal.
+    Unsettled,
+}
+
+impl From<bool> for LaunchStanding {
+    fn from(current: bool) -> Self {
+        if current {
+            Self::Current
+        } else {
+            Self::NotCurrent
+        }
+    }
+}
+
+/// The refusal for [`LaunchStanding::Unsettled`]: the daemon's generic
+/// retryable code, so no new wire constant is needed.
+pub(crate) const SCOPE_AUTHORITY_UNSETTLED: &str = "busy";
+
 /// The launch nonce each module connection presented in its HELLO, kept so the
 /// scope table can tell whether a connection belongs to its module's current
 /// launch. The registry keeps no nonce, and the supervisor's record says only
@@ -864,11 +889,11 @@ impl ScopeTable {
     /// supervisor records as the module's spawn nonce. A blue/green candidate
     /// before cutover, an incumbent after it, and a module the supervisor did
     /// not spawn are all not current.
-    pub(crate) fn sync(
+    pub(crate) fn sync<S: Into<LaunchStanding>>(
         &mut self,
         owner: &str,
         connection_id: ConnectionId,
-        is_current_launch: impl Fn(ConnectionId) -> bool,
+        is_current_launch: impl Fn(ConnectionId) -> S,
         generation: u64,
         scopes: impl Into<ScopeRecords>,
     ) -> Result<SyncApplied, SyncRefusal> {
@@ -882,11 +907,11 @@ impl ScopeTable {
         )
     }
 
-    pub(crate) fn apply(
+    pub(crate) fn apply<S: Into<LaunchStanding>>(
         &mut self,
         owner: &str,
         connection_id: ConnectionId,
-        is_current_launch: impl Fn(ConnectionId) -> bool,
+        is_current_launch: impl Fn(ConnectionId) -> S,
         generation: u64,
         upsert: impl Into<ScopeRecords>,
         end: Vec<ScopeEnd>,
@@ -901,11 +926,11 @@ impl ScopeTable {
         )
     }
 
-    fn change(
+    fn change<S: Into<LaunchStanding>>(
         &mut self,
         owner: &str,
         connection_id: ConnectionId,
-        is_current_launch: impl Fn(ConnectionId) -> bool,
+        is_current_launch: impl Fn(ConnectionId) -> S,
         generation: u64,
         scopes: ScopeRecords,
         end: Option<Vec<ScopeEnd>>,
@@ -957,12 +982,12 @@ impl ScopeTable {
         Ok(applied)
     }
 
-    fn sync_owner(
+    fn sync_owner<S: Into<LaunchStanding>>(
         &mut self,
         owner: &str,
         state: &mut OwnerScopes,
         connection_id: ConnectionId,
-        is_current_launch: &impl Fn(ConnectionId) -> bool,
+        is_current_launch: &impl Fn(ConnectionId) -> S,
         change: ScopeChange,
     ) -> Result<SyncApplied, SyncRefusal> {
         let ScopeChange {
@@ -1332,33 +1357,47 @@ impl ScopeTable {
 
     /// Whether this connection may sync for the owner, and whether doing so
     /// takes authority (which makes this sync a full replace at any generation).
-    fn check_authority(
+    fn check_authority<S: Into<LaunchStanding>>(
         state: &OwnerScopes,
         connection_id: ConnectionId,
-        is_current_launch: &impl Fn(ConnectionId) -> bool,
+        is_current_launch: &impl Fn(ConnectionId) -> S,
     ) -> Result<bool, SyncRefusal> {
         let not_authority = |message: &str| SyncRefusal {
             code: error_codes::SCOPE_SYNC_NOT_AUTHORITY,
             message: message.to_string(),
         };
-        if !is_current_launch(connection_id) {
+        let unsettled = || SyncRefusal {
+            code: SCOPE_AUTHORITY_UNSETTLED,
+            message: "whether this launch is the owner's current one cannot be told yet; retry"
+                .to_string(),
+        };
+        match is_current_launch(connection_id).into() {
+            LaunchStanding::Current => {}
             // Covers a swap candidate before cutover (its nonce is the swap's
             // candidate token, not the recorded spawn nonce), the incumbent
             // after cutover, and a module the supervisor never spawned.
-            return Err(not_authority(
-                "this connection is not the owner's current supervised launch",
-            ));
+            LaunchStanding::NotCurrent => {
+                return Err(not_authority(
+                    "this connection is not the owner's current supervised launch",
+                ))
+            }
+            LaunchStanding::Unsettled => return Err(unsettled()),
         }
         match state.authority {
             Some(authority) if authority.connection_id == connection_id => Ok(false),
             // A newer launch takes authority from an older launch's connection
             // that is still open, so a wedged predecessor cannot lock a
             // restarted owner out. Two connections of the current launch are
-            // not ordered by anything, so the second is refused.
-            Some(authority) if is_current_launch(authority.connection_id) => Err(not_authority(
-                "another connection of the owner's current launch holds sync authority",
-            )),
-            Some(_) | None => Ok(true),
+            // not ordered by anything, so the second is refused. A holder whose
+            // standing cannot be told yet keeps authority until it can.
+            Some(authority) => match is_current_launch(authority.connection_id).into() {
+                LaunchStanding::Current => Err(not_authority(
+                    "another connection of the owner's current launch holds sync authority",
+                )),
+                LaunchStanding::Unsettled => Err(unsettled()),
+                LaunchStanding::NotCurrent => Ok(true),
+            },
+            None => Ok(true),
         }
     }
 

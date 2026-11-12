@@ -2261,7 +2261,7 @@ impl ControlHandler {
                 if !allowed {
                     return Ok(vec![control_error_frame(
                         &frame,
-                        "claim_operation_not_allowed",
+                        channel_operations::CLAIM_OPERATION_NOT_ALLOWED,
                         "prefix registrations have only brokered module operations",
                     )?]);
                 }
@@ -2273,7 +2273,7 @@ impl ControlHandler {
             {
                 return Ok(vec![control_error_frame(
                     &frame,
-                    "claim_operation_not_allowed",
+                    channel_operations::CLAIM_OPERATION_NOT_ALLOWED,
                     "prefix registrations may push only route.status for routes they serve",
                 )?]);
             }
@@ -2663,6 +2663,9 @@ impl ControlHandler {
         if let Some(spawn) = self.supervisor.registration_spawn(connection_id) {
             spawn.retire();
         }
+        // Safe before deregistration: the connection's server loop has already
+        // joined every offloaded request task and ended inline dispatch, so no
+        // handler can still resolve this connection and find no channel.
         self.supervisor
             .forget_registration_connection(connection_id);
         self.local_connections

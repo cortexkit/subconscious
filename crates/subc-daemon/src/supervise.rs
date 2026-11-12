@@ -164,15 +164,9 @@ struct PrivacyExec {
 
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn test_privacy_trampoline() -> PathBuf {
-    // Cargo's unit-test executable lives in <profile>/deps; its fixture bin
-    // lives beside that directory. This honors custom CARGO_TARGET_DIR too.
-    let path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("privacy-trampoline-fixture");
+    // The fixture bin lives in the profile folder the unit-test executable was
+    // built into. This honors custom CARGO_TARGET_DIR too.
+    let path = cortexkit_test_support::cargo_profile_bin("privacy-trampoline-fixture");
     // Without the fixture every macOS spawn is refused, and the tests that
     // spawn fail later as a module in state Failed, which names the wrong
     // cause. `cargo test -p subc-daemon --lib` alone does not build it.
@@ -12634,14 +12628,7 @@ mod terminal_history_tests {
     /// not build `[[bin]]` targets, and a bare spawn then fails with a raw
     /// `NotFound` that reads as a broken test rather than an unbuilt dependency.
     pub(super) fn fake_aft_stub_path() -> PathBuf {
-        let mut path = std::env::current_exe().expect("current_exe available in tests");
-        path.pop();
-        path.pop();
-        path.push(if cfg!(windows) {
-            "fake-aft-stub.exe"
-        } else {
-            "fake-aft-stub"
-        });
+        let path = cortexkit_test_support::cargo_profile_bin("fake-aft-stub");
         assert!(
             path.exists(),
             "fake-aft-stub not built at {}: run `cargo test -p subc-core` (which builds \
@@ -17723,10 +17710,7 @@ mod job_containment_tests {
     /// documents: `--lib` does not build `[[bin]]` targets, and a bare spawn
     /// failure then reads as a broken test rather than an unbuilt dependency.
     fn stub_path() -> PathBuf {
-        let mut path = std::env::current_exe().expect("current_exe available in tests");
-        path.pop();
-        path.pop();
-        path.push("fake-aft-stub.exe");
+        let path = cortexkit_test_support::cargo_profile_bin("fake-aft-stub");
         assert!(
             path.exists(),
             "fake-aft-stub not built at {}: run `cargo test -p subc-core` (which builds \

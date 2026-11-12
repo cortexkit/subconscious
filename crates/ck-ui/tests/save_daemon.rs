@@ -14,13 +14,13 @@ mod kit;
 
 fn binary(name: &str) -> PathBuf {
     let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-    // This test runs from `<target>/<profile>/deps/`, or, when Cargo keeps a
-    // separate build folder, from `<target>/<build folder>/<profile>/deps/`.
+    // This test runs from inside `<target>/<profile>/` or, when Cargo keeps a
+    // separate build folder, inside `<target>/<build folder>/<profile>/`.
     // The kit binaries are always built into `<target>/<profile>/`. So try the
     // test's own profile folder first, then `<ancestor>/<profile>/` for a few
     // folders up, never further, so a stray build higher up isn't picked.
-    let exe = std::env::current_exe().unwrap();
-    let profile_dir = exe.parent().unwrap().parent().unwrap();
+    let profile_dir = cortexkit_test_support::cargo_profile_dir();
+    let profile_dir = profile_dir.as_path();
     let profile = profile_dir.file_name().unwrap();
     let path = std::iter::once(profile_dir.join(&file))
         .chain(

@@ -9261,10 +9261,10 @@ mod tests {
     ///
     /// `CARGO_BIN_EXE_*` (compile-time `env!` and runtime `std::env::var` alike)
     /// is only populated for `tests/*.rs` integration test binaries -- this file
-    /// compiles as part of the library target, which gets neither. This test's
-    /// own executable path is `<target-dir>/<profile>/deps/subc_core-<hash>`,
-    /// and the sibling binary lives two directories up at
-    /// `<target-dir>/<profile>/fake-aft-stub`.
+    /// compiles as part of the library target, which gets neither. The binary
+    /// lives in the profile folder this test was built into,
+    /// `<target-dir>/<profile>/fake-aft-stub`, which `cargo_profile_bin` finds
+    /// from the test's own path.
     ///
     /// THE BINARY IS NOT ALWAYS THERE, and the existence check below is why.
     /// `cargo test -p subc-core` builds every target including `[[bin]]`, so the
@@ -9276,14 +9276,7 @@ mod tests {
     /// run is worse than one that fails, because it reports health it never
     /// verified.
     fn fake_aft_stub_path() -> PathBuf {
-        let mut path = std::env::current_exe().expect("current_exe available in tests");
-        path.pop(); // .../deps/
-        path.pop(); // .../<profile>/
-        path.push(if cfg!(windows) {
-            "fake-aft-stub.exe"
-        } else {
-            "fake-aft-stub"
-        });
+        let path = cortexkit_test_support::cargo_profile_bin("fake-aft-stub");
         assert!(
             path.exists(),
             "fake-aft-stub not built at {}: run `cargo test -p subc-core` (which builds \

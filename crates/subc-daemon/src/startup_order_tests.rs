@@ -28,17 +28,7 @@ fn configured(module_id: &str, program: PathBuf, enabled: bool) -> ConfiguredMod
 }
 
 fn fake_aft_stub_path() -> PathBuf {
-    let stub = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join(if cfg!(windows) {
-            "fake-aft-stub.exe"
-        } else {
-            "fake-aft-stub"
-        });
+    let stub = cortexkit_test_support::cargo_profile_bin("fake-aft-stub");
     assert!(
         stub.is_file(),
         "build fake-aft-stub before daemon lib tests"

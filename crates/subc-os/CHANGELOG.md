@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.33
+
+- Tests find the admission fixture with `cortexkit_test_support::cargo_profile_bin`,
+  which also works in Cargo 1.100's test-executable layout. Test code only.
+
 ## 0.1.32
 
 - Enumerate Windows process creation identities with their parent and program names, and compare them against retained process handles instead of the adjustable wall clock. Clock rollback can no longer silently drop live processes; PID reuse remains explicit uncertainty.

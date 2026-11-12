@@ -340,13 +340,7 @@ mod tests {
     }
 
     fn fixture(marker: &std::path::Path) -> Command {
-        let executable = std::env::current_exe().unwrap();
-        let fixture = executable
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("subc-os-admission-fixture");
+        let fixture = cortexkit_test_support::cargo_profile_bin("subc-os-admission-fixture");
         assert!(
             fixture.is_file(),
             "build subc-os-admission-fixture with test-support before this test"

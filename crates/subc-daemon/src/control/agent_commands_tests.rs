@@ -146,16 +146,7 @@ async fn exercise_agent_commands_with_validation(
         let handle = SupervisorHandle::new();
         let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
             .with_handle(handle.clone());
-        let mut program = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("ckdev-resource-helper");
-        if cfg!(windows) {
-            program.set_extension("exe");
-        }
+        let program = cortexkit_test_support::cargo_profile_bin("ckdev-resource-helper");
         assert!(
             program.is_file(),
             "resource fixture was not built: {program:?}"

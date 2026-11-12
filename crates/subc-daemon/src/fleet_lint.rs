@@ -579,14 +579,7 @@ mod tests {
     }
 
     fn fake_aft_stub_path() -> PathBuf {
-        let mut path = std::env::current_exe().expect("current_exe available in tests");
-        path.pop(); // .../deps/
-        path.pop(); // .../<profile>/
-        path.push(if cfg!(windows) {
-            "fake-aft-stub.exe"
-        } else {
-            "fake-aft-stub"
-        });
+        let path = cortexkit_test_support::cargo_profile_bin("fake-aft-stub");
         assert!(
             path.exists(),
             "fake-aft-stub not built at {}: run `cargo test -p subc-core` (which builds [[bin]] targets) rather than `cargo test -p subc-core --lib` (which does not)",

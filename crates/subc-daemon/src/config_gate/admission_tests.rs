@@ -600,7 +600,22 @@ async fn claims_cancelled_presentation_keeps_reservation_until_content_worker_fi
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn claims_live_program_refusal_revokes_before_kill_or_exit_observation() {
     use crate::control::claims::tests::{error, request, Net};
-    let mut fixture = gated_claim_fixture().await;
+    let mut fixture = tokio::time::timeout(Duration::from_secs(10), gated_claim_fixture())
+        .await
+        .unwrap();
+    let connection = fixture.primary.connection_id(&fixture.handler);
+    assert!(Arc::ptr_eq(
+        &fixture.handle.registration_spawn(connection).unwrap(),
+        &fixture.spawn
+    ));
+    let primary_sink = fixture
+        .handler
+        .forwarding()
+        .config_delivery_sink("a", connection)
+        .unwrap()
+        .unwrap();
+    assert!(fixture.spawn.launch_ready());
+    assert!(!primary_sink.ingress_terminal() && !primary_sink.egress_terminal());
     let token = gated_claim_mint(&mut fixture.primary).await;
     let pending = gated_claim_mint(&mut fixture.primary).await;
     let mut consumer = Net::new(fixture.router.clone()).await;
@@ -612,24 +627,43 @@ async fn claims_live_program_refusal_revokes_before_kill_or_exit_observation() {
             .ty,
         subc_protocol::FrameType::Response
     );
+    assert_eq!(
+        fixture.spawn.claims.get().unwrap().pending_count_for_test(),
+        1
+    );
     // Only the test build can postpone the kill. Dropping this guard signals the
     // original container even if an assertion panics, before fixture teardown.
     let kill = fixture.spawn.defer_content_kill_for_test();
     fixture.spawn.set_content_probe_for_test(Arc::new(|| {
         Err(GateError::new("program_refused", "content witness changed"))
     }));
-    error(
-        &fixture
-            .primary
-            .call(request(subc_control::ClaimMintRequest::new(
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        subc_transport::write_frame(
+            &mut fixture.primary.client,
+            &request(subc_control::ClaimMintRequest::new(
                 subc_control::ClaimPurpose::Helper,
-            )))
-            .await,
-        "claim_mint_not_allowed",
-    );
-    assert!(
-        !fixture.spawn.launch_ready(),
-        "permanent refusal must retire registration before killing the process"
+            )),
+        ),
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.spawn.launch_ready() || !primary_sink.egress_terminal() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the mint's program check must refuse this exact launch");
+    assert!(fixture.spawn.content_was_refused_for_test());
+    assert!(primary_sink.ingress_terminal() && primary_sink.egress_terminal());
+    // Refusal retired the exact primary above, so its error reply is now
+    // suppressed. Empty claim state and fresh redemption prove revocation.
+    fixture.primary.assert_no_reply().await;
+    assert_eq!(
+        fixture.spawn.claims.get().unwrap().pending_count_for_test(),
+        0,
+        "refusal must void the old claim and must not mint another"
     );
     assert!(
         fixture.module.status().unwrap().process_alive,
@@ -648,9 +682,13 @@ async fn claims_live_program_refusal_revokes_before_kill_or_exit_observation() {
     );
     assert!(stale.recv().await.is_none());
     assert!(fixture.module.status().unwrap().process_alive);
+    drop(primary_sink);
     drop(kill);
     drop(fixture.primary);
-    fixture.module.stop().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), fixture.module.stop())
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

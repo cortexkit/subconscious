@@ -376,26 +376,39 @@ async fn registration_retirement_drop_keeps_launch_tie_while_pending_relays_exis
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn registration_retirement_goodbye_keeps_claim_bind_fence_until_read_side_cleanup() {
-    let mut rig = rig().await;
+    let mut rig = tokio::time::timeout(Duration::from_secs(10), rig())
+        .await
+        .unwrap();
     let mut provider = Wire::new(&rig.router);
     assert_eq!(
         provider
-            .call(&rig.router, provider_hello("retirement-provider"))
+            .call_bounded(&rig.router, provider_hello("retirement-provider"))
             .await
             .header
             .ty,
         FrameType::HelloAck
     );
-    let token = mint(&mut rig, ClaimPurpose::SelfConnection).await.claim;
+    let token = tokio::time::timeout(
+        Duration::from_secs(2),
+        mint(&mut rig, ClaimPurpose::SelfConnection),
+    )
+    .await
+    .unwrap()
+    .claim;
     let mut client = Wire::new(&rig.router);
     assert_eq!(
         client
-            .call(&rig.router, request(ClaimPresentRequest::new(token)))
+            .call_bounded(&rig.router, request(ClaimPresentRequest::new(token)))
             .await
             .header
             .ty,
         FrameType::Response
     );
+    let client_id = client.connection.id();
+    assert!(Arc::ptr_eq(
+        &rig.claim_registration_for_test(client_id),
+        &rig.spawn
+    ));
     rig.router
         .route_for_connection(
             &client.ctx,
@@ -404,6 +417,10 @@ async fn registration_retirement_goodbye_keeps_claim_bind_fence_until_read_side_
         )
         .await
         .unwrap();
+    assert!(Arc::ptr_eq(
+        &rig.claim_registration_for_test(client_id),
+        &rig.spawn
+    ));
     let open = subc_control::ClientControlRequest::RouteOpen {
         busy_refusals: None,
         target: subc_protocol::RouteTarget::ToolProvider {
@@ -430,6 +447,12 @@ async fn registration_retirement_goodbye_keeps_claim_bind_fence_until_read_side_
         "route.bind"
     );
     rig.spawn.retire();
+    assert!(!rig.spawn.launch_ready());
+    assert!(client.ctx.egress.ingress_terminal() && client.ctx.egress.egress_terminal());
+    assert!(
+        !provider.ctx.egress.ingress_terminal() && !provider.ctx.egress.egress_terminal(),
+        "the unrelated provider must remain live"
+    );
     let ack = subc_protocol::Frame::build(
         FrameType::Response,
         control_flags(),
@@ -444,19 +467,24 @@ async fn registration_retirement_goodbye_keeps_claim_bind_fence_until_read_side_
         .route_for_connection(&provider.ctx, ack)
         .await
         .unwrap();
-    opening.await.unwrap().unwrap();
-    let reply = client.replies.recv().await.unwrap().frame;
-    assert_eq!(
-        reply.header.ty,
-        FrameType::Error,
-        "GOODBYE must not erase a claim-bound opener's launch fence"
+    tokio::time::timeout(Duration::from_secs(2), opening)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    // The opener belongs to the retired launch, so even the refusal reply is
+    // suppressed. Forwarding state, not a reply on that sink, proves denial.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), client.replies.recv())
+            .await
+            .is_err(),
+        "a retired opener must not receive a post-retirement reply"
     );
     assert_eq!(
         rig.handler.forwarding().reserved_route_count().unwrap(),
         (0, 0)
     );
     assert_eq!(rig.handler.forwarding().active_binding_count().unwrap(), 0);
-    let client_id = client.connection.id();
     assert!(rig
         .handler
         .forwarding()

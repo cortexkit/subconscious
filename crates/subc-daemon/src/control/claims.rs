@@ -1071,6 +1071,24 @@ pub(crate) mod tests {
             .unwrap()
         }
 
+        pub(crate) async fn assert_no_reply(&mut self) {
+            use tokio::io::AsyncReadExt;
+            let mut byte = [0];
+            match tokio::time::timeout(Duration::from_millis(100), self.client.read(&mut byte))
+                .await
+            {
+                Err(_) | Ok(Ok(0)) => {}
+                Ok(Err(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::NotConnected
+                    ) => {}
+                result => panic!("a retired connection must not receive reply bytes: {result:?}"),
+            }
+        }
+
         pub(crate) async fn call(&mut self, frame: Frame) -> Frame {
             subc_transport::write_frame(&mut self.client, &frame)
                 .await
@@ -1309,6 +1327,13 @@ pub(crate) mod tests {
             reply.frame
         }
 
+        #[cfg(target_os = "linux")]
+        pub(crate) async fn call_bounded(&mut self, router: &Arc<Router>, frame: Frame) -> Frame {
+            tokio::time::timeout(Duration::from_secs(2), self.call(router, frame))
+                .await
+                .expect("a live fixture connection must answer promptly")
+        }
+
         async fn closed(&mut self) {
             let close = self.connection.take_close_receiver();
             tokio::time::timeout(Duration::from_secs(1), close)
@@ -1324,6 +1349,20 @@ pub(crate) mod tests {
         pub(crate) primary: Wire,
         pub(crate) spawn: Arc<RegistrationSpawn>,
         _module: SupervisedModule,
+    }
+
+    impl Rig {
+        #[cfg(target_os = "linux")]
+        pub(crate) fn claim_registration_for_test(
+            &self,
+            connection: ConnectionId,
+        ) -> Arc<RegistrationSpawn> {
+            self.handler
+                .claims
+                .binding(connection)
+                .expect("the connection must still be claim-bound")
+                .registration
+        }
     }
 
     pub(crate) async fn rig() -> Rig {
@@ -2030,14 +2069,57 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn claims_dead_primary_cannot_mint() {
-        let rig = rig().await;
-        let (mut primary, spawn, _module, _) = network_primary(&rig, "claims-dead").await;
+        let rig = tokio::time::timeout(Duration::from_secs(10), rig())
+            .await
+            .unwrap();
+        let (mut primary, spawn, _module, connection) = tokio::time::timeout(
+            Duration::from_secs(10),
+            network_primary(&rig, "claims-dead"),
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &rig.handler
+                .supervisor
+                .registration_spawn(connection)
+                .unwrap(),
+            &spawn
+        ));
+        let sink = rig
+            .handler
+            .forwarding
+            .config_delivery_sink("claims-dead", connection)
+            .unwrap()
+            .unwrap();
+        assert!(spawn.launch_ready());
+        assert!(!sink.ingress_terminal());
+        assert!(!sink.egress_terminal());
         spawn.retire();
-        error(
-            &primary
-                .call(request(ClaimMintRequest::new(ClaimPurpose::Relay)))
-                .await,
-            error_codes::CLAIM_MINT_NOT_ALLOWED,
+        assert!(!spawn.launch_ready());
+        assert!(sink.ingress_terminal() && sink.egress_terminal());
+        // The exact primary was retired; its denied mint can no longer carry
+        // an error reply. Closure or silence is expected, but minting is not.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(2),
+            subc_transport::write_frame(
+                &mut primary.client,
+                &request(ClaimMintRequest::new(ClaimPurpose::Relay)),
+            ),
+        )
+        .await
+        .unwrap();
+        primary.assert_no_reply().await;
+        assert!(
+            spawn.claims.get().is_none(),
+            "a dead primary must not initialize a claim launch"
+        );
+        assert!(
+            rig.handler.claims.0.lock().unwrap().pending.is_empty(),
+            "no bearer may be minted"
+        );
+        assert!(
+            rig.spawn.launch_ready(),
+            "the unrelated live launch must not be retired"
         );
     }
 

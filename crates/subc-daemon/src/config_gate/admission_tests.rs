@@ -748,7 +748,10 @@ async fn claims_transient_content_deferral_does_not_retire_live_registration() {
 }
 
 // These admission contracts exercise real process-table validation, not its
-// latency limit. Parallel process enumeration can exhaust the production budget.
+// latency limit. With several test binaries enumerating processes in parallel,
+// one read can take longer than the production 200 ms validation window
+// (`VALIDATION_WINDOW` in control/agent_commands/queue.rs), so these tests use
+// their own window. The tests of that limit keep the production value.
 const AGENT_COMMAND_CONTRACT_TEST_WINDOW: Duration = Duration::from_secs(5);
 
 /// A gated spawn carries no launch nonce, so its agent command declarations

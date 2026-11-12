@@ -23,6 +23,8 @@ use crate::{
 
 pub struct RuntimeOwner {
     #[cfg(test)]
+    agent_validation_window: Mutex<Option<Duration>>,
+    #[cfg(test)]
     pub(crate) warm_restart_pause: Mutex<Option<WarmRestartPause>>,
     #[cfg(test)]
     pub(crate) warm_restart_busy: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -670,6 +672,8 @@ impl RuntimeOwner {
         let delivery_changed = std::sync::Arc::new(tokio::sync::Notify::new());
         Self {
             #[cfg(test)]
+            agent_validation_window: Mutex::new(None),
+            #[cfg(test)]
             warm_restart_pause: Mutex::new(None),
             #[cfg(test)]
             warm_restart_busy: Mutex::new(None),
@@ -756,6 +760,16 @@ impl RuntimeOwner {
             .lock()
             .map_err(|_| GateError::new("config_unavailable", "module gate lock is poisoned"))?;
         Ok(gates.entry(module.into()).or_default().clone())
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn set_agent_validation_window_for_test(&self, window: Duration) {
+        *self.agent_validation_window.lock().unwrap() = Some(window);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_validation_window_for_test(&self) -> Option<Duration> {
+        *self.agent_validation_window.lock().unwrap()
     }
 
     pub(crate) fn install_binding_retirement(

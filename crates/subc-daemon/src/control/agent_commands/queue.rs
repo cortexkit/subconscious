@@ -268,6 +268,12 @@ async fn validate(
     // Declarations have their own bounded readers, not the list/sampler pool.
     let slots = SLOTS.get_or_init(|| Arc::new(Semaphore::new(4)));
     let deadline = tokio::time::Instant::now() + VALIDATION_WINDOW;
+    #[cfg(test)]
+    let deadline = handler
+        .config_runtime
+        .as_ref()
+        .and_then(|owner| owner.agent_validation_window_for_test())
+        .map_or(deadline, |window| tokio::time::Instant::now() + window);
     let corr = frame.header.corr;
     let timed_out = || RouterError::backend(0, corr, "agent command validation timed out; retry");
     let permit = tokio::time::timeout_at(deadline, Arc::clone(slots).acquire_owned())
@@ -319,6 +325,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn unarmed_validation_still_expires_at_200ms() {
+        assert_eq!(VALIDATION_WINDOW, Duration::from_millis(200));
         let registry = Arc::new(Registry::default());
         let handler = ControlHandler::new(registry.clone());
         assert!(!handler.supervisor.resource_commit_pause_armed_for_test());

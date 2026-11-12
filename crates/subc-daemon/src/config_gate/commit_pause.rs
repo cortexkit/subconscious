@@ -37,7 +37,10 @@ impl Clock {
         tokio::pin!(future);
         loop {
             let state = changes.borrow_and_update().clone();
-            if state.held_since.is_some() {
+            if let Some(started) = state.held_since {
+                if started >= deadline + state.elapsed {
+                    return tokio::time::timeout_at(deadline + state.elapsed, &mut future).await;
+                }
                 tokio::select! {
                     result = &mut future => return Ok(result),
                     _ = changes.changed() => {},
@@ -50,7 +53,9 @@ impl Clock {
                         // The blocking worker can enter the hold concurrently
                         // with the timer firing. Recheck before expiring it.
                         let current = changes.borrow();
-                        if result.is_ok() || (current.held_since.is_none()
+                        let expired_before_hold = current.held_since
+                            .is_none_or(|started| started >= deadline + current.elapsed);
+                        if result.is_ok() || (expired_before_hold
                             && Instant::now() >= deadline + current.elapsed)
                         {
                             return result;
@@ -120,4 +125,19 @@ async fn armed_clock_does_not_suspend_work_outside_the_hold() {
     );
     tokio::time::advance(Duration::from_millis(1)).await;
     assert!(waiter.await.unwrap().is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hold_cannot_revive_an_already_expired_validation() {
+    let clock = Clock::new();
+    let _installed = Clock::install(Some(clock.clone()));
+    let deadline = Instant::now() + Duration::from_millis(200);
+    tokio::time::advance(Duration::from_millis(201)).await;
+    let _hold = Hold::current();
+    let result = tokio::time::timeout(
+        Duration::from_millis(1),
+        clock.timeout(deadline, std::future::pending::<()>()),
+    )
+    .await;
+    assert!(matches!(result, Ok(Err(_))));
 }

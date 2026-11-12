@@ -747,12 +747,19 @@ async fn claims_transient_content_deferral_does_not_retire_live_registration() {
     fixture.module.stop().await.unwrap();
 }
 
+// These admission contracts exercise real process-table validation, not its
+// latency limit. Parallel process enumeration can exhaust the production budget.
+const AGENT_COMMAND_CONTRACT_TEST_WINDOW: Duration = Duration::from_secs(5);
+
 /// A gated spawn carries no launch nonce, so its agent command declarations
 /// must commit through its registration channel's spawn instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gated_channel_agent_commands_commit_through_the_channel_spawn() {
     use crate::control::claims::tests::request;
     let mut fixture = gated_claim_fixture().await;
+    fixture
+        .owner
+        .set_agent_validation_window_for_test(AGENT_COMMAND_CONTRACT_TEST_WINDOW);
     assert!(fixture.handle.spawn_launch_nonce_for("a").is_none());
     let reply = fixture
         .primary
@@ -823,6 +830,7 @@ async fn gated_nonce_policy_stamp_between_agent_validation_and_commit_refuses_wi
     )
     .unwrap();
     let owner = Arc::new(rig.owner("resource-stamp-race"));
+    owner.set_agent_validation_window_for_test(AGENT_COMMAND_CONTRACT_TEST_WINDOW);
     let registry = Arc::new(crate::Registry::default());
     let handle = SupervisorHandle::new();
     let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())

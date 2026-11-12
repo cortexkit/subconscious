@@ -71,7 +71,7 @@ impl ProgramBindingRecords {
 #[cfg(all(test, unix))]
 #[derive(Debug)]
 struct ProgramBindingExitPause {
-    key: (String, ProgramBindingKey),
+    key: (String, String),
     reached: tokio::sync::oneshot::Sender<()>,
     release: tokio::sync::oneshot::Receiver<()>,
 }
@@ -226,11 +226,10 @@ impl ProgramBindingPublication {
     pub(super) async fn pause_after_wait_for_test(&self) {
         let pause = self.bindings.upgrade().and_then(|bindings| {
             let mut records = bindings.lock().unwrap();
-            if records
-                .exit_pause
-                .as_ref()
-                .is_some_and(|pause| pause.key == self.key)
-            {
+            if records.exit_pause.as_ref().is_some_and(|pause| {
+                pause.key.0 == self.key.0
+                    && records.resolve(&pause.key.0, &pause.key.1).as_ref() == Some(&self.key.1)
+            }) {
                 records.exit_pause.take()
             } else {
                 None
@@ -407,11 +406,11 @@ impl SupervisorHandle {
     ) {
         let (reached, observed) = tokio::sync::oneshot::channel();
         let (release, waiting) = tokio::sync::oneshot::channel();
-        let key = self
-            .binding_key(module, nonce)
-            .expect("test launch binding");
+        // An active record can be removed while the child still owns its
+        // publication. Resolve the request at exit, after retirement has
+        // published the refusal record, rather than requiring a record to arm.
         self.program_bindings.lock().unwrap().exit_pause = Some(ProgramBindingExitPause {
-            key: (module.into(), key),
+            key: (module.into(), nonce.into()),
             reached,
             release: waiting,
         });
@@ -740,7 +739,7 @@ impl SupervisorHandle {
             .map(|entry| entry.receiver.clone())
     }
 
-    #[cfg(any(windows, all(test, unix)))]
+    #[cfg(windows)]
     fn binding_key(&self, module: &str, nonce: &str) -> Option<ProgramBindingKey> {
         self.program_bindings.lock().ok()?.resolve(module, nonce)
     }

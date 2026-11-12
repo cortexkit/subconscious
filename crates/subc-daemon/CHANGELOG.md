@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.44.14
+
+- Satisfy Rust 1.100 clippy (`needless_bool` in the running-image match,
+  `needless_range_loop` in an overload-hold test). No behaviour change.
+
 ## 0.44.13
 
 - Add supervisor `state` and `expected_back` recovery metadata to route-open

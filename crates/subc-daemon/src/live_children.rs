@@ -143,16 +143,14 @@ fn recorded_sh_interpreter(image: subc_os::FileIdentity) -> Option<InterpreterId
 
 impl ExecutableIdentity {
     fn matches(self, running: subc_os::FileIdentity) -> bool {
-        if self.device == running.device && self.inode == running.inode {
-            return true;
-        }
+        let direct = self.device == running.device && self.inode == running.inode;
         #[cfg(target_os = "macos")]
-        if self.macos_sh_interpreter.is_some_and(|interpreter| {
+        let via_interpreter = self.macos_sh_interpreter.is_some_and(|interpreter| {
             interpreter.device == running.device && interpreter.inode == running.inode
-        }) {
-            return true;
-        }
-        false
+        });
+        #[cfg(not(target_os = "macos"))]
+        let via_interpreter = false;
+        direct || via_interpreter
     }
 }
 

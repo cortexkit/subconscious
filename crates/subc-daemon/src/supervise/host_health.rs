@@ -307,8 +307,8 @@ mod tests {
     async fn four_silent_modules_hold_restarts_and_explain_each_probe() {
         for (count, running) in [(4, 4), (21, 13)] {
             let fleet = Fleet::new(count);
-            for index in 13..count {
-                let mut state = fleet.modules[index].handle.inner.snapshot.lock().unwrap();
+            for (index, module) in fleet.modules.iter().enumerate().skip(13) {
+                let mut state = module.handle.inner.snapshot.lock().unwrap();
                 if index < 17 {
                     state.spawned_protocol = Some(ModuleProtocol::None);
                 } else {

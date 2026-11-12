@@ -55,7 +55,7 @@ impl SupervisedModule {
     }
     /// Mark the launch record's process alive or exited without touching the
     /// process or its registration channel.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn set_launch_alive_for_test(&self, alive: bool) {
         self.inner.snapshot.lock().unwrap().process_alive = alive;
     }

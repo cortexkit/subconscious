@@ -649,6 +649,12 @@ impl ConfigStore {
     }
     pub fn status(&mut self) -> StoreStatus {
         let _ = self.check();
+        self.loaded_status()
+    }
+
+    /// State as of the last integrity check. This is not a fresh integrity read:
+    /// it performs no disk or keychain work.
+    pub(crate) fn loaded_status(&self) -> StoreStatus {
         StoreStatus {
             state: self.state,
             integrity: self.envelope.integrity,

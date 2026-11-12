@@ -163,6 +163,7 @@ impl RuntimeOwner {
             state.admission_releases.extend(modules);
         }
         state.authority_exit = None;
+        state.stamp_channel_cutover = false;
         state.recovery_exit_hold = false;
         drop(state);
         if unstamped {

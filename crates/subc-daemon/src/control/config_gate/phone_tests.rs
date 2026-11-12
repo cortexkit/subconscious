@@ -249,8 +249,8 @@ impl Fixture {
         std::fs::write(
             path.join("subc.jsonc"),
             serde_json::to_vec(&json!({"version":1,"modules":{
-                "a":{"program":path.join("program")},
-                "callosum":{"program":phone_program,"args":["600"],"reserved":true,
+                "a":{"program":path.join("program"),"registration_channel":true},
+                "callosum":{"program":phone_program,"args":["600"],"reserved":true,"registration_channel":true,
                     "overlap": if lifecycle { "safe" } else { "exclusive" }}
             }}))
             .unwrap(),
@@ -1169,4 +1169,60 @@ async fn config_connection_loop_phone_disconnect_withdraws_without_recording() {
 #[tokio::test]
 async fn config_connection_loop_cancel_before_tracking_never_prompts() {
     connection_approval_withdrawal(false, false, true).await;
+}
+
+#[tokio::test]
+async fn registration_declaration_phone_surface_belongs_only_to_current_channel() {
+    let fixture = Fixture::new().await;
+    assert!(fixture
+        .handler
+        .supervisor
+        .spawn_launch_nonce_for("callosum")
+        .is_none());
+    assert!(fixture
+        .handler
+        .hello_launch_nonces
+        .lock()
+        .unwrap()
+        .nonce(PHONE)
+        .is_none());
+    let surface = fixture
+        .handler
+        .config_phone_surface()
+        .await
+        .expect("gated Callosum channel must offer phone approval without a nonce");
+    assert_eq!(surface.connection, PHONE.get());
+    assert!(surface.channel_registered);
+    fixture
+        .handler
+        .registry
+        .deregister_connection(PHONE)
+        .unwrap();
+    let foreign = ConnectionId::new(999);
+    fixture
+        .handler
+        .registry
+        .register_unpublished_verified_with_control_ops(
+            subc_protocol::manifest::ModuleManifest::builder("callosum", "1.0.0").build(),
+            subc_protocol::PROTOCOL_VERSION,
+            foreign,
+            vec![subc_protocol::consent::CONSENT_V1.into()],
+            true,
+        )
+        .unwrap();
+    fixture
+        .handler
+        .registry
+        .publish_registration(foreign)
+        .unwrap();
+    assert!(
+        fixture.handler.config_phone_surface().await.is_none(),
+        "verified catalog metadata alone must not create a phone surface"
+    );
+    fixture
+        .handler
+        .registry
+        .deregister_connection(foreign)
+        .unwrap();
+    fixture.module.stop().await.unwrap();
 }

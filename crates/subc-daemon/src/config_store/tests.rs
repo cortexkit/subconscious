@@ -1136,3 +1136,30 @@ fn config_admission_refusal_limit_evicts_only_unheld_module_records() {
     assert!(records.iter().all(|record| record.module == "held"));
     assert_eq!(records[0].refused_identity, raw_digest(b"0"));
 }
+
+#[test]
+fn registration_declaration_loaded_status_matches_checked_status_without_io() {
+    let rig = Rig::new();
+    let mut store = rig.open(true);
+    commit(&mut store, CommitKind::Stamp);
+    store.check().unwrap();
+    let expected = store.status();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    store.observe_io_threads(events.clone());
+    let observed = store.loaded_status();
+    assert_eq!(observed.state, StoreState::Stamped);
+    assert_eq!(observed.revision, 1);
+    assert_eq!(format!("{observed:?}"), format!("{expected:?}"));
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "loaded metadata must not hash disk or load keychain state"
+    );
+    store.check().unwrap();
+    let recorded = events.lock().unwrap();
+    assert!(recorded
+        .iter()
+        .any(|(operation, _)| *operation == "keychain_load"));
+    assert!(recorded
+        .iter()
+        .any(|(operation, _)| *operation == "store_hash"));
+}

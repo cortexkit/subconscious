@@ -51,7 +51,7 @@ fn phone() -> PhoneSurface {
         opted_in: true,
         approved_declaration: true,
         reserved: true,
-        nonce_verified: true,
+        channel_registered: true,
         program_admitted: true,
         active_registration: true,
     }
@@ -345,7 +345,7 @@ fn approval_phone_requires_every_live_registration_proof() {
             1 => phone.opted_in = false,
             2 => phone.approved_declaration = false,
             3 => phone.reserved = false,
-            4 => phone.nonce_verified = false,
+            4 => phone.channel_registered = false,
             5 => phone.program_admitted = false,
             6 => phone.active_registration = false,
             _ => caller.phone = None,

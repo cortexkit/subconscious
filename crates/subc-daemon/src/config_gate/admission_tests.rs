@@ -21,6 +21,10 @@ struct GatedClaimFixture {
 }
 
 async fn gated_claim_fixture() -> GatedClaimFixture {
+    gated_claim_fixture_with_support(None).await
+}
+
+async fn gated_claim_fixture_with_support(support: Option<bool>) -> GatedClaimFixture {
     use crate::control::claims::tests::Net;
     let rig = rig();
     wire_fixture_document(&rig, json!(["600"]));
@@ -45,9 +49,21 @@ async fn gated_claim_fixture() -> GatedClaimFixture {
     );
     let router = Arc::new(crate::Router::with_control_handler(control.clone()));
     let mut primary = Net::new(router.clone()).await;
-    let ack = primary
-        .call(module_hello(Some(proof), ConnectionId::new(1)))
-        .await;
+    let mut hello = module_hello(Some(proof), ConnectionId::new(1));
+    if let Some(supported) = support {
+        let mut body: serde_json::Value = serde_json::from_slice(&hello.body).unwrap();
+        body["manifest"]["registration_channel"] = json!(supported);
+        hello = subc_protocol::Frame::build(
+            hello.header.ty,
+            hello.header.flags,
+            0,
+            0,
+            1,
+            serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+    }
+    let ack = primary.call(hello).await;
     assert_eq!(
         ack.header.ty,
         subc_protocol::FrameType::HelloAck,
@@ -2720,6 +2736,7 @@ fn wire_fixture_document(rig: &Rig, args: serde_json::Value) {
     let mut doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(rig.path.join("subc.jsonc")).unwrap()).unwrap();
     doc["modules"]["a"]["protocol"] = json!("subc");
+    doc["modules"]["a"]["registration_channel"] = json!(true);
     doc["modules"]["a"]["args"] = args;
     std::fs::write(
         rig.path.join("subc.jsonc"),
@@ -4246,4 +4263,318 @@ async fn config_recovery_carried_command_close_reap_retires_before_group_cleanup
         "registration_channel_closed",
         "carried pin reap must retire before the paused recover_group await: {reply:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn registration_declaration_unsupported_admission_never_spawns_or_spends_budget() {
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = Arc::new(rig.owner("unsupported-channel"));
+    rig.stamp(&owner);
+    owner.complete_authority_exit(1).unwrap();
+    let path = rig.path.join("subc.jsonc");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    document["modules"]["a"]["registration_channel"] = json!(false);
+    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let plan = owner
+        .finish_plan(owner.prepare(PlanKind::Change).unwrap(), daemon_review)
+        .unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let challenge = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
+    owner
+        .finish_approval(
+            challenge.attempt(),
+            &Rig::facts(),
+            ApprovalReply::Presence(super::super::super::PresenceDecision::InteractiveApproval),
+            2,
+        )
+        .unwrap();
+    let handle = channel_handle();
+    let registry = Arc::new(crate::Registry::default());
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor
+        .supervise_configured_requested_async(
+            spec(&rig),
+            true,
+            Default::default(),
+            None,
+            RestartPolicy::default(),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .unwrap();
+    let before = module.status().unwrap();
+    assert!(!before.process_alive);
+    assert_eq!(
+        before.spawn_generation, 0,
+        "refusal must precede process creation"
+    );
+    assert!(handle.registration_for_test("a").is_none());
+    for _ in 0..2 {
+        let error = module.restart(None).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(subc_control::REGISTRATION_CHANNEL_UNSUPPORTED),
+            "{error}"
+        );
+    }
+    tokio::time::advance(Duration::from_secs(7200)).await;
+    let after = module.status().unwrap();
+    assert_eq!(after.spawn_generation, 0);
+    assert_eq!(after.restart_count, before.restart_count);
+    assert_eq!(after.lifetime_restarts, before.lifetime_restarts);
+    assert!(module.next_retry_at_ms().unwrap().is_none());
+    let handler = crate::ControlHandler::new(registry)
+        .with_supervisor(handle)
+        .with_config_runtime(owner);
+    let body = registration_declaration_diagnostic(&handler, "supervisor.list").await;
+    assert_eq!(
+        body["modules"][0]["admission_refused"],
+        subc_control::REGISTRATION_CHANNEL_UNSUPPORTED,
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn registration_declaration_stamp_restarts_nonce_spawn_before_reporting_enabled() {
+    use crate::control::claims::tests::Net;
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = Arc::new(rig.owner("nonce-cutover"));
+    let handle = channel_handle();
+    let registry = Arc::new(crate::Registry::default());
+    let forwarding = Arc::new(crate::ForwardingTable::default());
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_forwarding(forwarding.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    let old = module.status().unwrap();
+    let nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    let handler = Arc::new(
+        crate::ControlHandler::with_forwarding(registry.clone(), forwarding)
+            .with_supervisor(handle.clone())
+            .with_config_runtime(owner.clone()),
+    );
+    let router = Arc::new(crate::Router::with_control_handler(handler.clone()));
+    let mut primary = Net::new(router.clone()).await;
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: Some(nonce.clone()),
+    };
+    let hello = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&hello).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        primary.call(hello).await.header.ty,
+        subc_protocol::FrameType::HelloAck
+    );
+    let legacy = registration_declaration_diagnostic(&handler, "supervisor.provenance").await;
+    assert_eq!(legacy["modules"][0]["registration"], "nonce", "{legacy}");
+    rig.stamp(&owner);
+    assert_ne!(owner.polled_status().unwrap().state, "stamped");
+    let (_, _, _, approved) = owner.authority_exit_configuration(1).unwrap().unwrap();
+    module
+        .reconcile_approved_configuration(approved.clone())
+        .await
+        .unwrap();
+    let fresh = module.status().unwrap();
+    assert!(
+        fresh.process_alive,
+        "cutover must launch before reconciliation returns: {fresh:?}"
+    );
+    assert!(fresh.spawn_generation > old.spawn_generation);
+    assert_ne!(fresh.pid, old.pid);
+    assert_eq!(fresh.restart_count, 0);
+    assert!(handle.spawn_launch_nonce_for("a").is_none());
+    assert!(!handle.spawned_consumer_authorized("a", &nonce));
+    let proof = handle.registration_proof_for_test("a").unwrap();
+    assert!(handle.wait_program_binding_for_test("a", &proof).await);
+    let mut channel = Net::new(router).await;
+    handle
+        .registration_for_test("a")
+        .unwrap()
+        .wait_launch()
+        .await;
+    assert_eq!(
+        channel
+            .call(module_hello(Some(proof), ConnectionId::new(2)))
+            .await
+            .header
+            .ty,
+        subc_protocol::FrameType::HelloAck
+    );
+    let response = registration_declaration_diagnostic(&handler, "supervisor.provenance").await;
+    assert_eq!(
+        response["modules"][0]["registration"], "channel",
+        "{response}"
+    );
+    owner.daemon_entry_reconciled(&approved, "a").unwrap();
+    owner.complete_authority_exit(1).unwrap();
+    assert_eq!(owner.polled_status().unwrap().state, "stamped");
+    drop(channel);
+    drop(primary);
+    module.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn registration_declaration_catalog_verifies_gated_ungated_and_prefix_channels() {
+    use crate::control::claims::tests as claims;
+    let gated = gated_claim_fixture().await;
+    let reply = registration_declaration_diagnostic(&gated.handler, "catalog.list").await;
+    assert_eq!(reply["modules"][0]["nonce_verified"], true, "{reply}");
+    drop(gated.primary);
+    gated.module.stop().await.unwrap();
+    let mut ungated = claims::rig().await;
+    let mut prefix = claims::prefix_connection(&mut ungated, "claims:catalog").await;
+    assert_eq!(
+        prefix
+            .call(claims::prefix_hello("claims:catalog"))
+            .await
+            .header
+            .ty,
+        subc_protocol::FrameType::HelloAck
+    );
+    let reply = registration_declaration_diagnostic(&ungated.handler, "catalog.list").await;
+    for id in ["claims-module", "claims:catalog"] {
+        let entry = reply["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["module_id"] == id)
+            .unwrap();
+        assert_eq!(entry["nonce_verified"], true, "{entry}");
+    }
+    drop(prefix);
+}
+
+#[tokio::test]
+async fn registration_declaration_census_includes_stopped_disabled_and_protocol_none() {
+    let rig = rig();
+    let path = rig.path.join("subc.jsonc");
+    std::fs::write(&path, serde_json::to_vec(&json!({"version":1,"modules":{
+        "stopped":{"program":rig.path.join("program"),"args":["600"],"registration_channel":true},
+        "disabled":{"program":rig.path.join("program"),"args":["600"],"enabled":false},
+        "non-wire":{"program":rig.path.join("program"),"args":["600"],"protocol":"none","enabled":false}
+    }})).unwrap()).unwrap();
+    let owner = Arc::new(rig.owner("declaration-census"));
+    rig.stamp(&owner);
+    let handle = channel_handle();
+    let registry = Arc::new(crate::Registry::default());
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let (configuration, _) =
+        crate::daemon_config::parse_with_activity(&std::fs::read_to_string(&path).unwrap(), &path)
+            .unwrap();
+    for entry in configuration.modules {
+        supervisor
+            .supervise_configured_requested_async(
+                entry.module_spec(),
+                false,
+                entry.health,
+                None,
+                RestartPolicy::default(),
+                Duration::from_secs(5),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+    let handler = crate::ControlHandler::new(registry)
+        .with_supervisor(handle)
+        .with_config_runtime(owner);
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let context = crate::RouteCtx {
+        connection_id: ConnectionId::new(50),
+        egress: crate::FrameSink::new(tx),
+    };
+    let frames = handler
+        .handle_control_frame(
+            &context,
+            crate::control::claims::tests::request(json!({"op":"supervisor.provenance"})),
+        )
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&frames[0].body).unwrap();
+    let modules = body["modules"].as_array().unwrap();
+    assert_eq!(modules.len(), 3);
+    for (id, declaration) in [
+        ("stopped", "declared"),
+        ("disabled", "undeclared"),
+        ("non-wire", "not_applicable"),
+    ] {
+        let entry = modules
+            .iter()
+            .find(|entry| entry["module_id"] == id)
+            .unwrap();
+        assert_eq!(entry["registration_declaration"], declaration, "{entry}");
+        assert!(
+            entry.get("registration").is_none(),
+            "a stopped spawn has no registration method: {entry}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn registration_declaration_false_hello_is_served_with_a_health_warning() {
+    let fixture = gated_claim_fixture_with_support(Some(false)).await;
+    let response = registration_declaration_diagnostic(&fixture.handler, "supervisor.health").await;
+    let module = response["modules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|module| module["module_id"] == "a")
+        .unwrap();
+    assert!(
+        module["detail"]
+            .as_str()
+            .unwrap()
+            .contains("a: HELLO registration_channel is false"),
+        "{module}"
+    );
+    let catalog = registration_declaration_diagnostic(&fixture.handler, "catalog.list").await;
+    assert_eq!(catalog["modules"][0]["module_id"], "a");
+    assert!(fixture.module.status().unwrap().live);
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
+async fn registration_declaration_diagnostic(
+    handler: &crate::ControlHandler,
+    operation: &str,
+) -> serde_json::Value {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let context = crate::RouteCtx {
+        connection_id: ConnectionId::new(500),
+        egress: crate::FrameSink::new(tx),
+    };
+    let mut frames = handler
+        .handle_control_frame(
+            &context,
+            crate::control::claims::tests::request(json!({"op":operation})),
+        )
+        .await
+        .unwrap();
+    let frame = if frames.is_empty() {
+        rx.recv().await.unwrap().frame.clone()
+    } else {
+        frames.remove(0)
+    };
+    serde_json::from_slice(&frame.body).unwrap()
 }

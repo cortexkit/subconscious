@@ -289,9 +289,9 @@ impl ControlHandler {
         if status.state != "stamped" || status.anchor_pending {
             return Ok(());
         }
-        if let Some(approved) = owner
-            .on_blocking(|owner| owner.approved_daemon_configuration())
-            .await?
+        if let crate::config_gate::runtime::ApprovedDaemonView::Approved {
+            config: approved, ..
+        } = owner.approved_daemon_view()
         {
             let mut rows = self.inactive_daemon_configuration(&approved)?;
             for row in &mut rows {

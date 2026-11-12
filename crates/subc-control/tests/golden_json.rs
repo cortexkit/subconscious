@@ -1694,3 +1694,17 @@ fn supervisor_spawn_event_forward_skew_ignores_unknown_fields() {
     assert_eq!(event.exit_code, None);
     assert_eq!(event.exit_signal, Some(9));
 }
+
+#[test]
+fn registration_declaration_provenance_golden_preserves_optional_companion_keys() {
+    let golden: serde_json::Value = serde_json::from_str(include_str!(
+        "golden/supervisor_registration_declaration.json"
+    ))
+    .unwrap();
+    let legacy: subc_control::SupervisorModuleProvenance =
+        serde_json::from_value(golden.clone()).unwrap();
+    let extension = subc_control::SupervisorModuleProvenanceExt::read_from(&golden).unwrap();
+    let mut written = serde_json::to_value(legacy).unwrap();
+    extension.write_to(&mut written).unwrap();
+    assert_eq!(written, golden);
+}

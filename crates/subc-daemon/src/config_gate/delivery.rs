@@ -872,6 +872,7 @@ impl RuntimeOwner {
             &self.delivery_changed,
             &self.module_gates,
             &self.approved_daemon,
+            self,
         );
         state.store.check()?;
         let spawn = allocate_spawn(&mut state, module, at, register, health)?;

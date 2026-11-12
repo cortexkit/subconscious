@@ -609,8 +609,9 @@ impl ControlHandler {
                 Ok(ConfigControlResponse::ProgramPlaced { generation })
             }
             ConfigControlRequest::Status {} => {
-                let mut status = runtime.on_blocking(|owner| owner.status()).await?;
-                let facts = self.config_approval_facts(ctx).await;
+                let mut status = runtime.on_blocking(|owner| owner.polled_status()).await?;
+                let phone = self.config_phone_surface_snapshot().await;
+                let facts = self.config_approval_facts_with_phone(ctx, phone).await;
                 status
                     .missing_approval_surfaces
                     .extend(crate::config_gate::missing_surfaces(
@@ -929,37 +930,29 @@ impl ControlHandler {
         {
             return None;
         }
-        let channel = self
+        let _spawn = self
             .supervisor
-            .registration_spawn(registration.connection_id);
-        if channel.is_some()
-            && !self
-                .forwarding
-                .active_module_endpoint("callosum")
-                .ok()
-                .flatten()
-                .is_some_and(|endpoint| endpoint.connection_id == registration.connection_id)
+            .registration_spawn(registration.connection_id)?;
+        if !self
+            .forwarding
+            .active_module_endpoint("callosum")
+            .ok()
+            .flatten()
+            .is_some_and(|endpoint| endpoint.connection_id == registration.connection_id)
         {
             return None;
         }
         // Configuration approval requires a channel-bound phone launch.
         // Enabling configuration gating invalidates legacy launch nonces,
         // including an old registration whose process is still draining.
-        channel.as_ref()?;
         let module = self.supervisor.get("callosum")?;
         let status = module.status().ok()?;
         let (spec, _) = module.configuration().ok()?;
-        let nonce = self
-            .hello_launch_nonces
-            .lock()
-            .ok()?
-            .nonce(registration.connection_id)
-            .map(str::to_owned);
         if !self.supervisor.registration_snapshot_is_current_live(
             &self.registry,
             "callosum",
             registration.connection_id,
-            nonce.as_deref(),
+            None,
         ) || !spec.reserved
             || !status.enabled
             || !status.process_alive
@@ -968,25 +961,24 @@ impl ControlHandler {
             return None;
         }
         let connection = registration.connection_id;
-        let approved = runtime
-            .on_blocking(move |owner| owner.approved_phone_entry(connection))
-            .await
-            .ok()??;
+        let approved = if content {
+            runtime
+                .on_blocking(move |owner| owner.approved_phone_entry(connection))
+                .await
+                .ok()??
+        } else {
+            runtime.polled_phone_entry(connection)?
+        };
         if !approved.enabled || approved.module_spec() != spec {
             return None;
         }
-        if content && channel.is_some() {
+        if content {
             let supervisor = self.supervisor.clone();
             let registry = self.registry.clone();
-            let nonce = nonce.clone();
             if !runtime
                 .on_blocking(move |_| {
-                    Ok(supervisor.registration_is_current_live(
-                        &registry,
-                        "callosum",
-                        connection,
-                        nonce.as_deref(),
-                    ))
+                    Ok(supervisor
+                        .registration_is_current_live(&registry, "callosum", connection, None))
                 })
                 .await
                 .ok()?
@@ -998,7 +990,7 @@ impl ControlHandler {
             &self.registry,
             "callosum",
             registration.connection_id,
-            nonce.as_deref(),
+            None,
         ) {
             return None;
         }
@@ -1010,7 +1002,7 @@ impl ControlHandler {
             opted_in: true,
             approved_declaration: true,
             reserved: true,
-            nonce_verified: true,
+            channel_registered: true,
             program_admitted: true,
             active_registration: true,
         })

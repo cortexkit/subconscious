@@ -2610,6 +2610,7 @@ mod tests {
             env: Vec::new(),
             log: None,
             enabled: true,
+            registration_channel: false,
             reserved: false,
             reserved_prefixes: Vec::new(),
             protocol: ModuleProtocol::None,

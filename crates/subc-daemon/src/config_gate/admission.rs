@@ -214,6 +214,7 @@ impl AdmissionCache {
             .modules
             .get(module)
             .ok_or_else(|| GateError::new("config_gated", "module is not approved"))?;
+        super::super::registration::require_channel_declaration(&authority.snapshot, module)?;
         if authority.held {
             return Err(GateError::new(
                 "config_gated",
@@ -417,6 +418,7 @@ impl RuntimeOwner {
                 &self.delivery_changed,
                 &self.module_gates,
                 &self.approved_daemon,
+                self,
             );
             Self::check_authority(&mut state, false)?;
             AdmissionCache::from_state(&state)

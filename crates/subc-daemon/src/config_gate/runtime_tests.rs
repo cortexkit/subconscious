@@ -564,7 +564,7 @@ impl Rig {
         std::fs::write(
             path.join("subc.jsonc"),
             serde_json::to_vec(
-                &json!({"version":1,"modules":{"a":{"program":path.join("program")}}}),
+                &json!({"version":1,"modules":{"a":{"program":path.join("program"),"registration_channel":true}}}),
             )
             .unwrap(),
         )
@@ -652,6 +652,21 @@ fn config_owner_raw_credential_reference_survives_commit_restart_and_get_byte_ex
     std::fs::write(rig.path.join("cortexkit/a.jsonc"), raw).unwrap();
     let owner = rig.owner("first");
     rig.declare(&owner, 10);
+    let path = rig.path.join("subc.jsonc");
+    let declared = std::fs::read(&path).unwrap();
+    let mut missing: serde_json::Value = serde_json::from_slice(&declared).unwrap();
+    missing["modules"]["a"]
+        .as_object_mut()
+        .unwrap()
+        .remove("registration_channel");
+    std::fs::write(&path, serde_json::to_vec(&missing).unwrap()).unwrap();
+    let refused = owner
+        .prepare(PlanKind::Stamp)
+        .err()
+        .expect("an enabled entry must declare channel support");
+    assert_eq!(refused.code, subc_control::REGISTRATION_CHANNEL_UNSUPPORTED);
+    assert!(refused.detail.ends_with(": a"), "{}", refused.detail);
+    std::fs::write(path, declared).unwrap();
     assert_eq!(rig.stamp(&owner), 1);
     let reply = owner
         .module_get(ConnectionId::new(10), "a", ConfigGetRequest::new())
@@ -1387,7 +1402,7 @@ fn config_phone_disconnect_refreshes_the_preserved_plans_idle_deadline() {
         opted_in: true,
         approved_declaration: true,
         reserved: true,
-        nonce_verified: true,
+        channel_registered: true,
         program_admitted: true,
         active_registration: true,
     });
@@ -1648,4 +1663,165 @@ async fn config_admission_windows_removed_ordinary_publication_keeps_handles() {
 #[tokio::test]
 async fn config_admission_windows_removed_candidate_publication_keeps_handles() {
     windows_removed_registration_preserves_binding(true).await;
+}
+
+async fn registration_declaration_poll(
+    handler: std::sync::Arc<crate::ControlHandler>,
+    op: &str,
+) -> serde_json::Value {
+    #[cfg(unix)]
+    let user = subc_os::local_peer::PeerUser::Uid(subc_os::effective_uid());
+    #[cfg(windows)]
+    let user =
+        subc_os::local_peer::PeerUser::Sid(subc_os::named_pipe::current_user_sid_string().unwrap());
+    handler.record_observed_peer(
+        ConnectionId::new(50),
+        subc_os::local_peer::ObservedPeer::Observed(subc_os::local_peer::PeerObservation {
+            user,
+            pid: std::process::id(),
+            exe: None,
+            signing_id: None,
+        }),
+    );
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(16);
+    let ctx = crate::RouteCtx {
+        connection_id: ConnectionId::new(50),
+        egress: crate::FrameSink::new(sender),
+    };
+    let frame = crate::control::claims::tests::request(json!({"op": op}));
+    let mut frames = handler.handle_control_frame(&ctx, frame).await.unwrap();
+    let frame = if frames.is_empty() {
+        receiver.recv().await.unwrap().frame.clone()
+    } else {
+        frames.remove(0)
+    };
+    serde_json::from_slice(&frame.body).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registration_declaration_polled_reads_do_not_join_the_owner() {
+    let rig = Rig::new();
+    let owner = std::sync::Arc::new(rig.owner("polled-held-owner"));
+    rig.stamp(&owner);
+    owner.complete_authority_exit(1).unwrap();
+    let handler = std::sync::Arc::new(
+        crate::ControlHandler::new(std::sync::Arc::new(crate::Registry::default()))
+            .with_config_runtime(owner.clone()),
+    );
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let held_owner = owner.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = held_owner.lock().unwrap();
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    entered_rx.await.unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        for op in ["config.status", "catalog.list", "supervisor.list"] {
+            let body = registration_declaration_poll(handler.clone(), op).await;
+            assert!(body.get("code").is_none(), "{op}: {body}");
+        }
+    })
+    .await;
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    result.expect("polls must complete before releasing the owner");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registration_declaration_raw_config_edit_is_pending_while_owner_is_held() {
+    let rig = Rig::new();
+    std::fs::write(
+        rig.path.join("cortexkit/a.jsonc"),
+        br#"{"credential":{"vault_ref":"approved"},"limit":2}"#,
+    )
+    .unwrap();
+    let owner = std::sync::Arc::new(rig.owner("polled-config-edit"));
+    rig.declare(&owner, 10);
+    rig.stamp(&owner);
+    owner.complete_authority_exit(1).unwrap();
+    assert_eq!(owner.polled_status().unwrap().pending_proposals, 0);
+    let handler = std::sync::Arc::new(
+        crate::ControlHandler::new(std::sync::Arc::new(crate::Registry::default()))
+            .with_config_runtime(owner.clone()),
+    );
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let held_owner = owner.clone();
+    let holder = std::thread::spawn(move || {
+        let _guard = held_owner.lock().unwrap();
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    entered_rx.await.unwrap();
+    std::fs::write(
+        rig.path.join("cortexkit/a.jsonc"),
+        br#"{"credential":{"vault_ref":"approved"},"limit":3}"#,
+    )
+    .unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        registration_declaration_poll(handler, "config.status"),
+    )
+    .await;
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let body = result.expect("raw file comparison must not acquire the held owner");
+    assert_eq!(body["status"]["pending_proposals"], 1, "{body}");
+}
+
+#[test]
+fn registration_declaration_commit_is_visible_in_the_next_projection() {
+    let rig = Rig::new();
+    let owner = rig.owner("polled-commit");
+    let before = owner.polled_status().unwrap();
+    assert!(before.approval_channels.is_empty());
+    rig.stamp(&owner);
+    let committed = owner.polled_status().unwrap();
+    assert_eq!(committed.approval_channels.len(), 1);
+    assert!(committed.revision > before.revision);
+    assert!(committed
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("registration channel cutover")));
+    owner.complete_authority_exit(1).unwrap();
+    assert_eq!(owner.polled_status().unwrap().state, "stamped");
+}
+
+#[test]
+fn registration_declaration_stamp_names_all_enabled_entries_without_hello() {
+    let rig = Rig::new();
+    std::fs::write(
+        rig.path.join("subc.jsonc"),
+        serde_json::to_vec(&json!({"version":1,"modules":{
+            "stopped":{"program":rig.path.join("program")},
+            "crashed":{"program":rig.path.join("program"),"registration_channel":false},
+            "never-registered":{"program":rig.path.join("program")},
+            "disabled":{"program":rig.path.join("program"),"enabled":false},
+            "non-wire":{"program":rig.path.join("program"),"protocol":"none"},
+            "supported":{"program":rig.path.join("program"),"registration_channel":true}
+        }}))
+        .unwrap(),
+    )
+    .unwrap();
+    let owner = rig.owner("stamp-census");
+    let error = owner
+        .prepare(PlanKind::Stamp)
+        .err()
+        .expect("missing declarations must refuse a stamp");
+    assert_eq!(error.code, subc_control::REGISTRATION_CHANNEL_UNSUPPORTED);
+    assert!(
+        error.detail.contains("stopped")
+            && error.detail.contains("crashed")
+            && error.detail.contains("never-registered"),
+        "{}",
+        error.detail
+    );
+    assert!(
+        !error.detail.contains("disabled")
+            && !error.detail.contains("non-wire")
+            && !error.detail.contains("supported,")
+    );
+    assert!(owner.polled_status().unwrap().approval_channels.is_empty());
 }

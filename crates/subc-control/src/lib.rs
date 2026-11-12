@@ -1009,6 +1009,11 @@ pub struct SupervisorModuleProvenanceExt {
     /// The running spawn's registration path. Absence makes no claim about it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registration: Option<RegistrationMethod>,
+    /// Durable configured channel support, including stopped and disabled modules:
+    /// `declared`, `undeclared`, or `not_applicable` for protocol-none children.
+    /// Absence means unknown; future strings are retained unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registration_declaration: Option<String>,
 }
 
 impl SupervisorModuleProvenanceExt {
@@ -1032,8 +1037,8 @@ impl SupervisorModuleProvenanceExt {
         serde_json::from_value(entry.clone())
     }
 
-    /// Replace the companion key in a single module entry. An absent method
-    /// removes a stale key rather than writing `null`.
+    /// Replace companion keys in a single module entry. Absent observations
+    /// remove stale keys rather than writing `null`.
     pub fn write_to(&self, entry: &mut serde_json::Value) -> serde_json::Result<()> {
         let object = entry.as_object_mut().ok_or_else(|| {
             serde_json::Error::custom("expected a module provenance entry object")
@@ -1041,6 +1046,13 @@ impl SupervisorModuleProvenanceExt {
         object.remove("registration");
         if let Some(method) = &self.registration {
             object.insert("registration".into(), serde_json::to_value(method)?);
+        }
+        object.remove("registration_declaration");
+        if let Some(declaration) = &self.registration_declaration {
+            object.insert(
+                "registration_declaration".into(),
+                declaration.clone().into(),
+            );
         }
         Ok(())
     }
@@ -2496,8 +2508,10 @@ pub struct CatalogEntry {
     /// Each role owns its schema; the daemon validates only keys, shape and size.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_declarations: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
-    /// True only when HELLO passes the launch-nonce check required for a reserved
-    /// module or swap candidate.
+    /// True when HELLO is bound to its configured spawn through a registration
+    /// channel (gated or ungated), a prefix claim, or the legacy launch-nonce
+    /// check for an ungated reserved module or swap candidate. The historical
+    /// field name does not imply that a channel registration presented a nonce.
     #[serde(default, skip_serializing_if = "is_false")]
     pub nonce_verified: bool,
     /// Active-spawn discovery facts, never an authorization source. Older
@@ -2682,8 +2696,7 @@ impl CatalogEntry {
         self
     }
 
-    /// Mark a registration as nonce-verified when HELLO passes the launch-nonce
-    /// check required for a reserved module or swap candidate.
+    /// Record HELLO's verified spawn or prefix binding; see `nonce_verified`.
     #[must_use]
     pub fn with_nonce_verified(mut self, nonce_verified: bool) -> Self {
         self.nonce_verified = nonce_verified;
@@ -4491,6 +4504,33 @@ mod claim_wire_tests {
         assert_ne!(ext.registration, Some(RegistrationMethod::Nonce));
         wire["registration"] = json!(false);
         assert!(SupervisorModuleProvenanceExt::read_from(&wire).is_err());
+    }
+
+    #[test]
+    fn registration_declaration_golden_is_optional_open_and_source_compatible() {
+        let original = serde_json::to_value(legacy_provenance()).unwrap();
+        for declaration in ["declared", "undeclared", "not_applicable", "future_support"] {
+            let mut golden = original.clone();
+            golden["registration_declaration"] = json!(declaration);
+            let extension = SupervisorModuleProvenanceExt::read_from(&golden).unwrap();
+            assert_eq!(
+                serde_json::to_value(&extension).unwrap(),
+                json!({
+                    "registration_declaration": declaration
+                })
+            );
+            let mut written = original.clone();
+            extension.write_to(&mut written).unwrap();
+            assert_eq!(written, golden);
+            assert_eq!(
+                serde_json::from_value::<SupervisorModuleProvenance>(golden).unwrap(),
+                legacy_provenance()
+            );
+            SupervisorModuleProvenanceExt::new()
+                .write_to(&mut written)
+                .unwrap();
+            assert_eq!(written, original);
+        }
     }
 
     #[test]

@@ -490,5 +490,6 @@ impl ConfigGate {
     }
 }
 
+mod registration;
 #[cfg(test)]
 mod tests;

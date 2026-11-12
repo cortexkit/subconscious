@@ -254,6 +254,17 @@ impl CapturedConfiguration {
 }
 
 impl ConfigCapturer {
+    /// Candidate configuration only: no approved-store access, keychain work or
+    /// executable capture belongs on a polled diagnostic read.
+    pub(crate) fn capture_polled(
+        &self,
+        declarations: &BTreeMap<String, ConfigDeclareRequest>,
+    ) -> Result<GateSnapshot> {
+        let daemon = CapturedFile::open(&self.daemon_path)?;
+        self.capture_layers(daemon, declarations, None, false, CapturedFile::open)
+            .map(|captured| captured.diagnostic)
+    }
+
     pub fn capture(
         &self,
         declarations: &BTreeMap<String, ConfigDeclareRequest>,
@@ -275,7 +286,7 @@ impl ConfigCapturer {
         selected: Option<&BTreeSet<String>>,
     ) -> Result<CapturedConfiguration> {
         let daemon = CapturedFile::open(&self.daemon_path)?;
-        self.capture_layers(daemon, declarations, selected, CapturedFile::open)
+        self.capture_layers(daemon, declarations, selected, true, CapturedFile::open)
     }
 
     /// Re-evaluate saved raw configuration rather than today's edited files.
@@ -333,7 +344,7 @@ impl ConfigCapturer {
             )?;
             files.insert(file.path.clone(), file);
         }
-        let captured = self.capture_layers(daemon, &delivery.declarations, None, |path| {
+        let captured = self.capture_layers(daemon, &delivery.declarations, None, true, |path| {
             files.remove(path).ok_or_else(invalid)
         })?;
         if !files.is_empty()
@@ -357,6 +368,7 @@ impl ConfigCapturer {
         daemon: CapturedFile,
         declarations: &BTreeMap<String, ConfigDeclareRequest>,
         selected: Option<&BTreeSet<String>>,
+        programs: bool,
         mut layer_file: impl FnMut(&Path) -> Result<CapturedFile>,
     ) -> Result<CapturedConfiguration> {
         let invalid_daemon =
@@ -404,7 +416,11 @@ impl ConfigCapturer {
                 );
             }
         }
-        if let Some(entries) = doc.get("modules").and_then(Value::as_object) {
+        if let Some(entries) = doc
+            .get("modules")
+            .and_then(Value::as_object)
+            .filter(|_| programs)
+        {
             for (module, entry) in entries {
                 if selected.is_some_and(|modules| !modules.contains(module)) {
                     continue;

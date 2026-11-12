@@ -15,6 +15,7 @@ fn configured(module_id: &str, program: PathBuf, enabled: bool) -> ConfiguredMod
         env: Vec::new(),
         log: None,
         enabled,
+        registration_channel: false,
         reserved: false,
         reserved_prefixes: Vec::new(),
         protocol: ModuleProtocol::Subc,

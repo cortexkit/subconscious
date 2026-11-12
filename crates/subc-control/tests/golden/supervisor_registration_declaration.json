@@ -1,0 +1,7 @@
+{
+  "module_id": "worker",
+  "module_declared": { "status": "unverifiable" },
+  "daemon_observed": { "running_image": { "status": "unavailable", "reason": "not_running" } },
+  "registration": "channel",
+  "registration_declaration": "declared"
+}

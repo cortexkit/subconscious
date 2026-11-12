@@ -65,6 +65,12 @@ impl OwnerState {
 }
 
 impl RuntimeOwner {
+    pub(super) fn phone_is_withdrawing(&self, connection: ConnectionId) -> bool {
+        self.phone_withdrawals
+            .lock()
+            .map(|queue| queue.withdrawing.contains_key(&connection))
+            .unwrap_or(true)
+    }
     #[cfg(all(test, feature = "dev-desktop-approval"))]
     pub(crate) fn set_desktop_receipt_hook(&self, hook: impl FnOnce() + Send + 'static) {
         *self.desktop_receipt_hook.lock().unwrap() = Some(Box::new(hook));
@@ -119,6 +125,14 @@ impl RuntimeOwner {
         let mut state = self.lock()?;
         Self::check_authority(&mut state, false)?;
         state.store.delivery_ready()?;
+        self.phone_entry_from_state(&state, connection)
+    }
+
+    pub(super) fn phone_entry_from_state(
+        &self,
+        state: &OwnerState,
+        connection: ConnectionId,
+    ) -> Result<Option<crate::daemon_config::ConfiguredModule>> {
         if state.active_declarations.get("callosum") != Some(&connection)
             || self
                 .phone_withdrawals
@@ -131,7 +145,7 @@ impl RuntimeOwner {
         let Some((module, declaration)) = state.declarations.get(&connection).cloned() else {
             return Ok(None);
         };
-        let body = state.store.body()?;
+        let (_, body) = state.store.loaded_admission_state();
         let tuple = crate::config_store::Tuple {
             module: "callosum".into(),
             project: None,

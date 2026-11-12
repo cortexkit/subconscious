@@ -21,7 +21,7 @@ pub struct PhoneSurface {
     pub opted_in: bool,
     pub approved_declaration: bool,
     pub reserved: bool,
-    pub nonce_verified: bool,
+    pub channel_registered: bool,
     pub program_admitted: bool,
     pub active_registration: bool,
 }
@@ -32,7 +32,7 @@ impl PhoneSurface {
             && self.opted_in
             && self.approved_declaration
             && self.reserved
-            && self.nonce_verified
+            && self.channel_registered
             && self.program_admitted
             && self.active_registration
     }

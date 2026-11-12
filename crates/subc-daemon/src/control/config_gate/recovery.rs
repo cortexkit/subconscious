@@ -27,16 +27,20 @@ impl ControlHandler {
     ) -> Result<Option<Frame>, RouterError> {
         // List is allowed even in recovery and is polled continuously. Its
         // cached view must not wait for authority verification or publication.
-        if op == Some("supervisor.list") {
+        if matches!(op, Some("supervisor.list" | "config.status")) {
             return Ok(None);
         }
         let Some(owner) = self.config_runtime.clone() else {
             return Ok(None);
         };
-        let recovering = owner
-            .on_blocking(|owner| owner.check_recovery())
-            .await
-            .unwrap_or(true);
+        let recovering = if op == Some("catalog.list") {
+            owner.is_recovering()
+        } else {
+            owner
+                .on_blocking(|owner| owner.check_recovery())
+                .await
+                .unwrap_or(true)
+        };
         if !recovering {
             return Ok(None);
         }

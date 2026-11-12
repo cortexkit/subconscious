@@ -2783,11 +2783,12 @@ impl SupervisorHandle {
     }
 
     fn apply_identity_policy(&self, spec: &ModuleSpec, protocol: ModuleProtocol) {
+        let channel_only = self.module_is_gated(&spec.module_id);
         let mut current_nonces = self
             .spawn_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if protocol == ModuleProtocol::None {
+        if protocol == ModuleProtocol::None || channel_only {
             current_nonces.remove(&spec.module_id);
         }
         let spawn_nonce = current_nonces.get(&spec.module_id).cloned();
@@ -8968,6 +8969,26 @@ async fn handle_supervisor_command(
                             containment::terminate(&runtime.child_roster.containment).await;
                         }
                     }
+                }
+                if next.protocol == ModuleProtocol::Subc
+                    && (child.as_ref().is_some_and(|child| child.admission_base.is_none())
+                        || (child.is_none() && lock_snapshot(snapshot)?.state == ModuleState::Restarting
+                            && runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.stamp_channel_cutover_pending())))
+                    && runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.module_is_gated(&spec.module_id))
+                {
+                    // The stamp cannot adopt an unverified legacy process. Stop
+                    // it and launch under the approved program/channel authority
+                    // before acknowledging entry reconciliation, without charging
+                    // an operator-requested cutover to the crash restart budget.
+                    if child.is_some() {
+                        restart_child_with_budget_policy(spec, runtime, registry,
+                            process_liveness, snapshot, child, runtime.drain_timeout, false).await?;
+                    }
+                    // Ordinary restart acknowledges a scheduled respawn. Stamp
+                    // reconciliation instead waits for that approved spawn before
+                    // it can publish that gating is enabled.
+                    update_snapshot(snapshot, Some(&spec.module_id), |state| state.respawn_pending = false)?;
+                    *child = Some(spawn_and_mark_running_async(spec, runtime, snapshot).await?);
                 }
                 info!(module_id=%spec.module_id, config_generation=approved.generation(), "approved daemon entry reconciled");
                 Ok(())

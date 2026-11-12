@@ -281,6 +281,9 @@ pub struct ConfiguredModule {
     /// `CK_LOG` is genuinely absent from the service-manager-minimal child env.
     pub log: Option<LoggingConfig>,
     pub enabled: bool,
+    /// Approved support for the inherited registration channel. Absence is false;
+    /// protocol-none children do not need a registration channel.
+    pub registration_channel: bool,
     /// When true, only the daemon-spawned process for this `module_id` may register
     /// it: subc injects a one-time launch nonce on spawn and rejects any HELLO for
     /// this id whose nonce does not match. Protects security-boundary modules (e.g.
@@ -452,6 +455,8 @@ struct RawModuleConfig {
     log: Option<RawLoggingConfig>,
     #[serde(default = "default_enabled")]
     enabled: bool,
+    #[serde(default)]
+    registration_channel: bool,
     #[serde(default)]
     reserved: bool,
     // Unknown module keys remain ignored. Retain them only to warn about the
@@ -933,6 +938,7 @@ fn parse_doc_with_activity(
                 env: module.env.into_iter().collect(),
                 log,
                 enabled: module.enabled,
+                registration_channel: module.registration_channel,
                 reserved: module.reserved,
                 reserved_prefixes: module.reserved_prefixes,
                 protocol,
@@ -3053,5 +3059,25 @@ mod activity_config_tests {
         assert!(!RestartRequiredSection::ALL
             .iter()
             .any(|section| section.label() == "activity"));
+    }
+}
+
+#[cfg(test)]
+mod registration_declaration_tests {
+    use super::*;
+    #[test]
+    fn registration_declaration_config_bool_is_optional_and_typed() {
+        let parse = |field: &str| {
+            parse_doc(
+                &format!(r#"{{"version":1,"modules":{{"worker":{{"program":"worker"{field}}}}}}}"#),
+                Path::new("subc.jsonc"),
+            )
+        };
+        assert!(!parse("").unwrap().modules[0].registration_channel);
+        assert!(
+            !parse(r#", "registration_channel":false"#).unwrap().modules[0].registration_channel
+        );
+        assert!(parse(r#", "registration_channel":true"#).unwrap().modules[0].registration_channel);
+        assert!(parse(r#", "registration_channel":"true""#).is_err());
     }
 }

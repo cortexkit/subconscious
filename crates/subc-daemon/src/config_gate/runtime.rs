@@ -37,6 +37,7 @@ pub struct RuntimeOwner {
     admission: std::sync::RwLock<admission::AdmissionCache>,
     configured_modules: std::sync::RwLock<Option<admission::ConfiguredModuleSnapshot>>,
     approved_daemon: std::sync::RwLock<ApprovedDaemonView>,
+    projection: std::sync::RwLock<polled::Projection>,
     inner: Mutex<OwnerState>,
     capturer: ConfigCapturer,
     startup_overrides: Vec<String>,
@@ -304,6 +305,8 @@ pub(crate) fn daemon_review(
 }
 
 struct OwnerState {
+    observed_snapshot: Option<super::GateSnapshot>,
+    stamp_channel_cutover: bool,
     gate: ConfigGate,
     store: ConfigStore,
     _writer_lock: Option<crate::config_store::StoreWriterLock>,
@@ -427,6 +430,7 @@ struct OwnerGuard<'a>(
     &'a tokio::sync::Notify,
     &'a Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     &'a std::sync::RwLock<ApprovedDaemonView>,
+    &'a RuntimeOwner,
 );
 impl std::ops::Deref for OwnerGuard<'_> {
     type Target = OwnerState;
@@ -441,6 +445,12 @@ impl std::ops::DerefMut for OwnerGuard<'_> {
 }
 impl Drop for OwnerGuard<'_> {
     fn drop(&mut self) {
+        let projection = self
+            .5
+            .status_projection(&self.0, self.0.observed_snapshot.clone());
+        if let Ok(mut view) = self.5.projection.write() {
+            *view = projection;
+        }
         // Project committed or invalidated authority before releasing its owner.
         // Parse changed generations outside the cheap reader lock, then publish
         // only the Arc; list polling never waits for store or keychain work.
@@ -577,6 +587,8 @@ pub(crate) use daemon_readers::ApprovedDaemonView;
 mod phone;
 #[path = "placement.rs"]
 mod placement;
+#[path = "polled.rs"]
+mod polled;
 #[path = "status_inputs.rs"]
 mod status_inputs;
 pub(crate) use approval_request::{ApprovalRequest, ApprovalRequestGuard, CancelApprovalRequest};
@@ -670,7 +682,7 @@ impl RuntimeOwner {
         };
         let approved_daemon = std::sync::RwLock::new(approved_daemon);
         let delivery_changed = std::sync::Arc::new(tokio::sync::Notify::new());
-        Self {
+        let owner = Self {
             #[cfg(test)]
             agent_validation_window: Mutex::new(None),
             #[cfg(test)]
@@ -686,7 +698,10 @@ impl RuntimeOwner {
             admission,
             configured_modules: std::sync::RwLock::new(None),
             approved_daemon,
+            projection: std::sync::RwLock::new(polled::Projection::default()),
             inner: Mutex::new(OwnerState {
+                observed_snapshot: None,
+                stamp_channel_cutover: false,
                 gate: ConfigGate::new(incarnation),
                 store,
                 _writer_lock: None,
@@ -751,7 +766,11 @@ impl RuntimeOwner {
             prepare_capture_hook: Mutex::new(None),
             #[cfg(all(test, unix))]
             approval_claim_pause: Mutex::new(None),
+        };
+        if let Ok(state) = owner.lock() {
+            drop(state);
         }
+        owner
     }
 
     pub fn module_gate(&self, module: &str) -> Result<std::sync::Arc<tokio::sync::Mutex<()>>> {
@@ -810,6 +829,7 @@ impl RuntimeOwner {
                     &self.delivery_changed,
                     &self.module_gates,
                     &self.approved_daemon,
+                    self,
                 )
             })
             .map_err(|_| {
@@ -842,6 +862,7 @@ impl RuntimeOwner {
                 &self.delivery_changed,
                 &self.module_gates,
                 &self.approved_daemon,
+                self,
             ),
         })
     }
@@ -1114,7 +1135,9 @@ impl RuntimeOwner {
 
     fn capture(&self, state: &mut OwnerState) -> Result<CapturedConfiguration> {
         let declarations = Self::declarations(state)?;
-        self.capturer.capture(&declarations)
+        let captured = self.capturer.capture(&declarations)?;
+        state.observed_snapshot = Some(captured.diagnostic.clone());
+        Ok(captured)
     }
 
     fn capture_modules(
@@ -1203,6 +1226,9 @@ impl RuntimeOwner {
         } else {
             (observed, None, None)
         };
+        if kind == PlanKind::Stamp {
+            super::registration::check_stamp(&candidate.diagnostic)?;
+        }
         let base_revision = state.store.status().base_revision;
         let old = if state.store.status().state == StoreState::Stamped {
             super::GateSnapshot::from_store(&state.store.body()?.approved)?
@@ -1656,6 +1682,7 @@ impl RuntimeOwner {
             state.authority_exit = None;
         }
         if stamped_files {
+            state.stamp_channel_cutover = true;
             let connections: Vec<_> = state.active_declarations.values().copied().collect();
             state.delivery.remember_stamp_connections(connections);
         }

@@ -628,6 +628,8 @@ pub(crate) type ConnectionCloseReceiver = oneshot::Receiver<CloseReason>;
 pub struct ForwardingTable {
     #[cfg(all(test, target_os = "linux"))]
     route_commit_pause: Mutex<Option<RouteCommitPause>>,
+    #[cfg(all(test, target_os = "linux"))]
+    cleanup_tie_observer: Mutex<Option<oneshot::Sender<(bool, usize)>>>,
     #[cfg(test)]
     policy_rebind_before_write: Mutex<Option<Arc<std::sync::Barrier>>>,
     inner: Arc<RwLock<ForwardingInner>>,
@@ -668,6 +670,12 @@ struct FrameDropWarning {
 type ChannelDropWarnings = HashMap<(u16, &'static str), FrameDropWarning>;
 
 impl ForwardingTable {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn observe_cleanup_tie_for_test(&self) -> oneshot::Receiver<(bool, usize)> {
+        let (send, receive) = oneshot::channel();
+        *self.cleanup_tie_observer.lock().unwrap() = Some(send);
+        receive
+    }
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn spawn_connection_recorded_for_test(&self, connection: ConnectionId) -> bool {
         self.read_inner()
@@ -967,8 +975,10 @@ impl ForwardingTable {
 
     pub(crate) fn unregister_connection_close(&self, connection_id: ConnectionId) {
         self.lock_close_registry().remove(&connection_id);
-        // RouterConnection drops only when the socket's work has ended.
-        // A channel-0 GOODBYE clears routes but leaves this launch tie intact.
+        // The read loop and its tasks have ended and connection cleanup has
+        // removed its routes and pending relays. The writer may still drain.
+        // A channel-0 GOODBYE preserves the connection-to-launch association
+        // until that cleanup.
         if let Ok(mut inner) = self.write_inner() {
             inner.spawn_connections.remove(&connection_id);
         }
@@ -3019,6 +3029,18 @@ impl ForwardingTable {
             .remove(&connection_id);
         let mut inner = self.write_inner()?;
         inner.closing_connections.insert(connection_id);
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(observe) = self.cleanup_tie_observer.lock().unwrap().take() {
+            let pending = inner
+                .pending_relays
+                .values()
+                .filter(|relay| relay.reservation.client_key.connection_id == connection_id)
+                .count();
+            let _ = observe.send((
+                inner.spawn_connections.contains_key(&connection_id),
+                pending,
+            ));
+        }
         let cleanup = if let Some(endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
             remove_module_connection_locked(&mut inner, endpoint)
         } else {

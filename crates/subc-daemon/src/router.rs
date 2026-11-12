@@ -85,6 +85,8 @@ struct EgressAccounting {
     // spends the one opportunity to present a claim after authentication.
     ingress_seen: AtomicBool,
     ingress_terminal: AtomicBool,
+    egress_terminal: AtomicBool,
+    egress_stopped: Notify,
     byte_budget: usize,
     queued_bytes: AtomicUsize,
     queued_frames: AtomicUsize,
@@ -108,6 +110,8 @@ impl EgressAccounting {
         Self {
             ingress_seen: AtomicBool::new(false),
             ingress_terminal: AtomicBool::new(false),
+            egress_terminal: AtomicBool::new(false),
+            egress_stopped: Notify::new(),
             byte_budget,
             queued_bytes: AtomicUsize::new(0),
             queued_frames: AtomicUsize::new(0),
@@ -245,8 +249,12 @@ pub(crate) struct EgressPermit {
 
 impl EgressPermit {
     /// Enqueue `frame` in the reserved slot. Returns true when the connection's
-    /// writer had already gone away, meaning the frame will never be written.
+    /// writer had already gone away or egress was retired, so the frame will
+    /// never be written.
     pub(crate) fn send(self, frame: Frame) -> bool {
+        if self.accounting.egress_terminal.load(Ordering::Acquire) {
+            return true;
+        }
         let charge = self
             .accounting
             .charge_unconditionally(queued_frame_bytes(&frame));
@@ -377,6 +385,20 @@ impl FrameSink {
         self.accounting.ingress_terminal.load(Ordering::Acquire)
     }
 
+    // Retirement fences every sink clone and reserved permit synchronously,
+    // including senders already waiting for bytes or a queue slot.
+    pub(crate) fn terminate_egress(&self) {
+        self.accounting
+            .egress_terminal
+            .store(true, Ordering::Release);
+        self.accounting.egress_stopped.notify_waiters();
+        self.accounting.freed.notify_waiters();
+    }
+
+    pub(crate) fn egress_terminal(&self) -> bool {
+        self.accounting.egress_terminal.load(Ordering::Acquire)
+    }
+
     pub(crate) fn first_ingress_frame(&self) -> bool {
         !self.accounting.ingress_seen.swap(true, Ordering::Relaxed)
     }
@@ -399,8 +421,11 @@ impl FrameSink {
     /// refused by the byte budget: they wait for the writer to free bytes, just
     /// as they wait for a free slot, which is the same backpressure they had
     /// when the queue was bounded by frame count alone. Returns `None` if the
-    /// writer goes away while waiting.
+    /// writer goes away or egress is retired while waiting.
     async fn charge_waiting(&self, bytes: usize) -> Option<EgressCharge> {
+        if self.egress_terminal() {
+            return None;
+        }
         if let Some(charge) = self.accounting.try_charge(bytes) {
             return Some(charge);
         }
@@ -420,6 +445,9 @@ impl FrameSink {
             // Register interest before checking, so a release that happens
             // between the check and the await still wakes this sender.
             freed.as_mut().enable();
+            if self.egress_terminal() {
+                return None;
+            }
             if let Some(charge) = self.accounting.try_charge(bytes) {
                 return Some(charge);
             }
@@ -430,20 +458,57 @@ impl FrameSink {
         }
     }
 
+    // Queue admission must recheck retirement after waiting for a frame slot,
+    // including when the bytes were charged before retirement began. Ordinary
+    // sends silently discard retired traffic; flush callers must not report it
+    // as queued or written.
+    async fn send_outbound(&self, outbound: OutboundFrame) -> Result<bool, RouterError> {
+        let stopped = self.accounting.egress_stopped.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        if self.egress_terminal() {
+            return Ok(false);
+        }
+        let header = &outbound.frame.header;
+        let closed = || {
+            RouterError::backend_with_epoch(
+                header.channel,
+                header.epoch,
+                header.corr,
+                "connection writer closed",
+            )
+        };
+        let permit = tokio::select! {
+            biased;
+            _ = &mut stopped => return Ok(false),
+            permit = self.tx.reserve() => permit.map_err(|_| closed())?,
+        };
+        if self.egress_terminal() {
+            return Ok(false);
+        }
+        permit.send(outbound);
+        Ok(true)
+    }
+
     pub async fn send(&self, frame: Frame) -> Result<(), RouterError> {
+        if self.egress_terminal() {
+            return Ok(());
+        }
         let channel = frame.header.channel;
         let epoch = frame.header.epoch;
         let corr = frame.header.corr;
         let closed =
             || RouterError::backend_with_epoch(channel, epoch, corr, "connection writer closed");
-        let charge = self
-            .charge_waiting(queued_frame_bytes(&frame))
+        let Some(charge) = self.charge_waiting(queued_frame_bytes(&frame)).await else {
+            return if self.egress_terminal() {
+                Ok(())
+            } else {
+                Err(closed())
+            };
+        };
+        self.send_outbound(OutboundFrame::charged(frame, charge))
             .await
-            .ok_or_else(closed)?;
-        self.tx
-            .send(OutboundFrame::charged(frame, charge))
-            .await
-            .map_err(|_| closed())
+            .map(|_| ())
     }
 
     /// Shutdown notices must leave the socket writer before an idle daemon exits.
@@ -470,22 +535,27 @@ impl FrameSink {
             .ok_or_else(|| RouterError::backend(0, 0, "connection writer closed"))?;
         let mut outbound = OutboundFrame::charged(frame, charge);
         outbound.flushed = Some(tx);
-        self.tx
-            .send(outbound)
-            .await
-            .map_err(|_| RouterError::backend(0, 0, "connection writer closed"))?;
+        if !self.send_outbound(outbound).await? {
+            return Err(RouterError::backend(0, 0, "connection egress retired"));
+        }
         queued();
         rx.await
             .map_err(|_| RouterError::backend(0, 0, "connection flush failed"))
     }
 
     pub(crate) async fn reserve_owned(&self) -> Result<EgressPermit, RouterError> {
-        let permit = self
-            .tx
-            .clone()
-            .reserve_owned()
-            .await
-            .map_err(|_| RouterError::backend(0, 0, "connection writer closed"))?;
+        let stopped = self.accounting.egress_stopped.notified();
+        tokio::pin!(stopped);
+        stopped.as_mut().enable();
+        if self.egress_terminal() {
+            return Err(RouterError::backend(0, 0, "connection egress retired"));
+        }
+        let permit = tokio::select! {
+            biased;
+            _ = &mut stopped => return Err(RouterError::backend(0, 0, "connection egress retired")),
+            permit = self.tx.clone().reserve_owned() => permit
+                .map_err(|_| RouterError::backend(0, 0, "connection writer closed"))?,
+        };
         Ok(EgressPermit {
             permit,
             accounting: Arc::clone(&self.accounting),
@@ -494,6 +564,9 @@ impl FrameSink {
 
     #[cfg(test)]
     pub(crate) fn try_reserve_owned(&self) -> Result<EgressPermit, RouterError> {
+        if self.egress_terminal() {
+            return Err(RouterError::backend(0, 0, "connection egress retired"));
+        }
         let permit = self
             .tx
             .clone()
@@ -526,6 +599,9 @@ impl FrameSink {
     /// A full queue can be a short fanout burst rather than a stopped reader.
     /// Spend only the grace the atomic backlog age has not already used.
     async fn send_to_client(&self, frame: Frame) -> Result<(), ClientDeliveryFailure> {
+        if self.egress_terminal() {
+            return Ok(());
+        }
         let frame_type = frame.header.ty;
         let flags = frame.header.flags;
         let stopped = self.accounting.client_delivery_stopped.notified();
@@ -586,6 +662,9 @@ impl FrameSink {
     }
 
     fn try_send_owned(&self, frame: Frame) -> Result<(), (Frame, RouterError)> {
+        if self.egress_terminal() {
+            return Ok(());
+        }
         let channel = frame.header.channel;
         let epoch = frame.header.epoch;
         let corr = frame.header.corr;
@@ -613,6 +692,9 @@ impl FrameSink {
         };
         // Return the refused frame for a bounded retry; dropping the rest of
         // the outbound wrapper returns its charge.
+        if self.egress_terminal() {
+            return Ok(());
+        }
         self.tx
             .try_send(OutboundFrame::charged(frame, charge))
             .map_err(|err| {
@@ -1577,11 +1659,14 @@ impl RouterConnection {
 
 impl Drop for RouterConnection {
     fn drop(&mut self) {
-        self.forwarding.unregister_connection_close(self.id);
         self.orphan_goodbyes.forget_connection(self.id);
         // GOODBYE (explicit) and connection-drop cleanup both call the same
         // idempotent deregistration path.
         let _ = self.control_handler.cleanup_connection(self.id);
+        // The read loop and its tasks have ended, but the writer can still
+        // drain. Keep the connection-to-launch association until pending relays
+        // and routes are gone.
+        self.forwarding.unregister_connection_close(self.id);
     }
 }
 
@@ -2128,6 +2213,85 @@ mod tests {
             },
             rx,
         )
+    }
+
+    #[tokio::test]
+    async fn retirement_egress_all_send_paths_drop_after_fence() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let sink = FrameSink::new(tx);
+        let reserved = sink.reserve_owned().await.unwrap();
+        let immediate = sink.try_reserve_owned().unwrap();
+        sink.terminate_egress();
+        assert!(reserved.send(ping(1)));
+        assert!(immediate.send(ping(2)));
+        sink.send(ping(3)).await.unwrap();
+        sink.try_send(ping(4)).unwrap();
+        sink.send_to_client(ping(5)).await.unwrap();
+        let queued = AtomicBool::new(false);
+        assert!(sink
+            .send_flushed_notifying_enqueue(ping(6), || queued.store(true, Ordering::Relaxed))
+            .await
+            .is_err());
+        assert!(!queued.load(Ordering::Relaxed));
+        assert!(sink.send_flushed(ping(7)).await.is_err());
+        assert!(sink.reserve_owned().await.is_err());
+        assert!(sink.try_reserve_owned().is_err());
+        assert!(
+            rx.try_recv().is_err(),
+            "retired frames must not enter any writer queue"
+        );
+        assert_eq!(sink.backlog().queued_frames, 0);
+        assert_eq!(sink.backlog().queued_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn retirement_egress_pending_budget_and_slot_sends_stop() {
+        for budget in [1, usize::MAX] {
+            let (tx, mut rx) = mpsc::channel(1);
+            let sink = FrameSink::with_byte_budget(tx, budget);
+            sink.try_send(ping(1)).unwrap();
+            let sending = sink.send(ping(2));
+            tokio::pin!(sending);
+            assert!(poll_once(sending.as_mut()).await.is_pending());
+            sink.terminate_egress();
+            tokio::time::timeout(Duration::from_secs(2), sending)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(rx.try_recv().unwrap());
+            assert!(
+                rx.try_recv().is_err(),
+                "a send parked before retirement must not enqueue afterward"
+            );
+            assert_eq!(sink.backlog().queued_bytes, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn retirement_egress_pending_flush_and_reservation_stop() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sink = FrameSink::new(tx);
+        sink.try_send(ping(1)).unwrap();
+        let queued = AtomicBool::new(false);
+        let sending =
+            sink.send_flushed_notifying_enqueue(ping(2), || queued.store(true, Ordering::Relaxed));
+        let reserving = sink.reserve_owned();
+        tokio::pin!(sending, reserving);
+        assert!(poll_once(sending.as_mut()).await.is_pending());
+        assert!(poll_once(reserving.as_mut()).await.is_pending());
+        sink.terminate_egress();
+        assert!(tokio::time::timeout(Duration::from_secs(2), sending)
+            .await
+            .unwrap()
+            .is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(2), reserving)
+            .await
+            .unwrap()
+            .is_err());
+        assert!(!queued.load(Ordering::Relaxed));
+        drop(rx.try_recv().unwrap());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(sink.backlog().queued_bytes, 0);
     }
 
     #[tokio::test]

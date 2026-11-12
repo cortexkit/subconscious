@@ -2915,6 +2915,7 @@ impl ControlHandler {
         prefix_binding: Option<claims::ClaimBinding>,
     ) -> Result<Vec<Frame>, RouterError> {
         let channel_spawn = self.supervisor.registration_spawn(connection_id);
+        let primary_sink = channel_spawn.as_ref().and_then(|_| sink.clone());
         #[cfg(test)]
         if prefix_binding.is_some() {
             self.claims.pause_prefix_hello_for_test(5);
@@ -3453,6 +3454,7 @@ impl ControlHandler {
                 },
             );
         let control_ops = effective_module_control_ops(hello.control_ops);
+        let prefix_submodule = verification.prefix_owner.is_some();
         // Built before anything is registered so an encoding failure leaves no
         // registry or forwarding state behind.
         let hello_ack = self.build_hello_ack(&frame, negotiated_ver, &hello.manifest.module_id)?;
@@ -3627,8 +3629,8 @@ impl ControlHandler {
                 },
             ) {
                 // No forwarding endpoint or route was published. The weak link
-                // from this connection to its launch remains until physical
-                // teardown. Remove the registry entry, which was never published
+                // from this connection to its launch remains through read-side
+                // cleanup. Remove the registry entry, which was never published
                 // or counted in the catalog generation, and signal the release
                 // watch directly.
                 if matches!(
@@ -3704,8 +3706,11 @@ impl ControlHandler {
         );
 
         if let Some(spawn) = &channel_spawn {
+            if let Some(sink) = primary_sink {
+                spawn.bind_primary_sink(sink);
+            }
             spawn.hello_accepted();
-        } else if prefix_binding.is_none() {
+        } else if !prefix_submodule {
             self.supervisor
                 .retire_unused_registration_channel(&registration.manifest.module_id, false);
         }

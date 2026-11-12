@@ -43,6 +43,7 @@ pub(crate) struct RegistrationSpawn {
     deadline: std::sync::OnceLock<Instant>,
     launch: tokio::sync::watch::Sender<LaunchState>,
     transition: Mutex<()>,
+    primary_sink: Mutex<Option<crate::FrameSink>>,
     #[cfg(test)]
     retirement_pause: Mutex<Option<RetirementPause>>,
     #[cfg(unix)]
@@ -105,6 +106,7 @@ impl RegistrationSpawn {
             deadline: std::sync::OnceLock::new(),
             launch,
             transition: Mutex::new(()),
+            primary_sink: Mutex::new(None),
             #[cfg(test)]
             retirement_pause: Mutex::new(None),
             #[cfg(any(unix, windows))]
@@ -152,6 +154,12 @@ impl RegistrationSpawn {
         self.retire_transition(self.transition.lock().unwrap_or_else(|p| p.into_inner()));
     }
 
+    // HELLO publication holds the transition guard, so retirement cannot miss
+    // the primary sink or race a replacement into this slot after Dead.
+    pub(crate) fn bind_primary_sink(&self, sink: crate::FrameSink) {
+        *self.primary_sink.lock().unwrap_or_else(|p| p.into_inner()) = Some(sink);
+    }
+
     pub(crate) fn end_primary_registration(&self) {
         let _transition = self.transition.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(claims) = self.claims.get() {
@@ -174,6 +182,15 @@ impl RegistrationSpawn {
                 return;
             }
             self.launch.send_replace(LaunchState::Dead);
+            if let Some(primary) = self
+                .primary_sink
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                primary.terminate_ingress();
+                primary.terminate_egress();
+            }
             revoked = self.claims.get().map(|claims| claims.revoke());
             #[cfg(any(unix, windows))]
             if let Some(endpoint) = self
@@ -586,6 +603,8 @@ impl SupervisorHandle {
 
 // Retire at the transport's first EOF, including during authentication or frame
 // decoding, rather than waiting for the connection loop to finish unwinding.
+// Interrupted skips only this transport-level revoke: frame and authentication
+// readers propagate it, so their connection cleanup still retires the launch.
 struct RegistrationStream<S> {
     stream: S,
     spawn: Arc<RegistrationSpawn>,

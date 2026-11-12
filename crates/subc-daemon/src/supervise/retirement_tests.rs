@@ -1,5 +1,5 @@
 use super::*;
-use crate::control::claims::tests::{mint, request, rig, Net, Wire};
+use crate::control::claims::tests::{mint, prefix_connection, request, rig, Net, Wire};
 use crate::forwarding::RouteBindRelayOutcome;
 use subc_control::{ClaimPresentRequest, ClaimPurpose};
 use subc_protocol::FrameType;
@@ -39,8 +39,343 @@ fn provider_hello(module: &str) -> subc_protocol::Frame {
     .unwrap()
 }
 
+async fn hold_retirement(
+    spawn: &Arc<RegistrationSpawn>,
+) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (reached, observed) = tokio::sync::oneshot::channel();
+    let (release, paused) = std::sync::mpsc::channel();
+    *spawn.retirement_pause.lock().unwrap() = Some(RetirementPause {
+        reached,
+        release: paused,
+    });
+    let spawn = spawn.clone();
+    let task = tokio::task::spawn_blocking(move || spawn.retire());
+    tokio::time::timeout(Duration::from_secs(2), observed)
+        .await
+        .unwrap()
+        .unwrap();
+    (release, task)
+}
+
+fn data_frame(ty: FrameType, channel: u16, epoch: u32, corr: u64) -> subc_protocol::Frame {
+    subc_protocol::Frame::build(
+        ty,
+        control_flags(),
+        channel,
+        epoch,
+        corr,
+        b"must-not-cross".to_vec(),
+    )
+    .unwrap()
+}
+
+async fn assert_open_socket_has_no_frame(net: &mut Net) {
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        subc_transport::read_frame(&mut net.client),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "retired egress delivered a frame, or teardown won before the check: {result:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn registration_retirement_goodbye_keeps_claim_bind_fence_until_socket_teardown() {
+async fn registration_retirement_egress_prefix_target_blocks_request_after_window_commit() {
+    let mut rig = rig().await;
+    let mut module = prefix_connection(&mut rig, "claims:egress-target").await;
+    assert_eq!(
+        module
+            .call(provider_hello("claims:egress-target"))
+            .await
+            .header
+            .ty,
+        FrameType::HelloAck
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while rig
+            .handler
+            .forwarding()
+            .active_module_endpoint("claims:egress-target")
+            .unwrap()
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let target = module.connection_id(&rig.handler);
+    let target_sink = rig
+        .spawn
+        .claims
+        .get()
+        .unwrap()
+        .connection_sink_for_test(target);
+    let forwarding = rig.handler.forwarding();
+    let mut client = Wire::new(&rig.router);
+    let mut pending = forwarding
+        .begin_route_bind_relay_for_test(
+            client.connection.id(),
+            client.ctx.egress.clone(),
+            910,
+            "claims:egress-target",
+        )
+        .unwrap();
+    let (checked, resume) = forwarding.pause_route_commit_for_test();
+    let table = forwarding.clone();
+    let corr = pending.corr;
+    let completion = tokio::task::spawn_blocking(move || {
+        table.complete_pending_relay(target, corr, RouteBindRelayOutcome::Accepted)
+    });
+    tokio::time::timeout(Duration::from_secs(2), checked)
+        .await
+        .unwrap()
+        .unwrap();
+    let (finish, retirement) = hold_retirement(&rig.spawn).await;
+    resume.send(()).unwrap();
+    assert!(completion.await.unwrap().unwrap().settled);
+    assert!(matches!(
+        pending.receiver.try_recv().unwrap(),
+        RouteBindRelayOutcome::Accepted
+    ));
+    drop(pending);
+    let reply = client.replies.recv().await.unwrap().frame;
+    let subc_control::ClientControlResponse::RouteOpen {
+        route_channel,
+        route_epoch,
+        ..
+    } = serde_json::from_slice(&reply.body).unwrap()
+    else {
+        panic!("expected committed route")
+    };
+    assert_eq!(forwarding.active_binding_count().unwrap(), 1);
+    rig.router
+        .route_for_connection(
+            &client.ctx,
+            data_frame(FrameType::Request, route_channel, route_epoch, 911),
+        )
+        .await
+        .unwrap();
+    assert_open_socket_has_no_frame(&mut module).await;
+    assert_eq!(
+        forwarding.active_binding_count().unwrap(),
+        1,
+        "close processing must remain held back"
+    );
+    assert!(target_sink.ingress_terminal());
+    assert!(target_sink.egress_terminal());
+    drop(target_sink);
+    finish.send(()).unwrap();
+    retirement.await.unwrap();
+    assert!(module.recv().await.is_none());
+    assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registration_retirement_egress_claim_opener_blocks_reverse_request_and_push() {
+    let mut rig = rig().await;
+    let mut provider = Wire::new(&rig.router);
+    assert_eq!(
+        provider
+            .call(&rig.router, provider_hello("egress-provider"))
+            .await
+            .header
+            .ty,
+        FrameType::HelloAck
+    );
+    let claim = mint(&mut rig, ClaimPurpose::SelfConnection).await.claim;
+    let mut client = Net::new(rig.router.clone()).await;
+    assert_eq!(
+        client
+            .call(request(ClaimPresentRequest::new(claim)))
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let connection = client.connection_id(&rig.handler);
+    let sink = rig
+        .spawn
+        .claims
+        .get()
+        .unwrap()
+        .connection_sink_for_test(connection);
+    let forwarding = rig.handler.forwarding();
+    let pending = forwarding
+        .begin_route_bind_relay_for_test(connection, sink.clone(), 920, "egress-provider")
+        .unwrap();
+    forwarding
+        .complete_pending_relay(
+            provider.connection.id(),
+            pending.corr,
+            RouteBindRelayOutcome::Accepted,
+        )
+        .unwrap();
+    assert_eq!(client.recv().await.unwrap().header.ty, FrameType::Response);
+    let (finish, retirement) = hold_retirement(&rig.spawn).await;
+    assert_eq!(forwarding.active_binding_count().unwrap(), 1);
+    for (ty, corr) in [(FrameType::Request, 921), (FrameType::Push, 0)] {
+        rig.router
+            .route_for_connection(
+                &provider.ctx,
+                data_frame(ty, pending.module_channel, pending.module_epoch, corr),
+            )
+            .await
+            .unwrap();
+    }
+    assert_open_socket_has_no_frame(&mut client).await;
+    assert_eq!(
+        forwarding.active_binding_count().unwrap(),
+        1,
+        "teardown must not make the delivery assertion pass"
+    );
+    assert!(sink.egress_terminal());
+    drop(sink);
+    finish.send(()).unwrap();
+    retirement.await.unwrap();
+    assert!(client.recv().await.is_none());
+    assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registration_retirement_primary_fences_reverse_request_buffered_with_bind_ack() {
+    let handle = SupervisorHandle::new();
+    let control =
+        crate::ControlHandler::new(Arc::new(Registry::default())).with_supervisor(handle.clone());
+    let forwarding = control.forwarding();
+    let router = Arc::new(crate::Router::with_control_handler(Arc::new(control)));
+    let spawn = RegistrationSpawn::new(&handle, "buffered-primary", SpawnRole::Plain, None);
+    spawn.ready();
+    let mut primary = Wire::new(&router);
+    spawn.bind(primary.connection.id());
+    assert_eq!(
+        primary
+            .call(&router, provider_hello("buffered-primary"))
+            .await
+            .header
+            .ty,
+        FrameType::HelloAck
+    );
+    let mut client = Wire::new(&router);
+    let pending = forwarding
+        .begin_route_bind_relay_for_test(
+            client.connection.id(),
+            client.ctx.egress.clone(),
+            930,
+            "buffered-primary",
+        )
+        .unwrap();
+    let ack = subc_protocol::Frame::build(
+        FrameType::Response,
+        control_flags(),
+        0,
+        0,
+        pending.corr,
+        serde_json::to_vec(&subc_protocol::session::ModuleControlResponse::RouteBindAck {})
+            .unwrap(),
+    )
+    .unwrap();
+    let reverse = data_frame(
+        FrameType::Request,
+        pending.module_channel,
+        pending.module_epoch,
+        931,
+    );
+    let (daemon, module) = std::os::unix::net::UnixStream::pair().unwrap();
+    *spawn.endpoint.lock().unwrap() = Some(daemon.try_clone().unwrap());
+    daemon.set_nonblocking(true).unwrap();
+    module.set_nonblocking(true).unwrap();
+    let mut daemon = tokio::net::UnixStream::from_std(daemon).unwrap();
+    let mut module = tokio::net::UnixStream::from_std(module).unwrap();
+    let mut bytes = Vec::new();
+    for frame in [&ack, &reverse] {
+        bytes.extend_from_slice(&frame.header.encode());
+        bytes.extend_from_slice(&frame.body);
+    }
+    module.write_all(&bytes).await.unwrap();
+    let decoded_ack = subc_transport::read_frame(&mut daemon)
+        .await
+        .unwrap()
+        .unwrap();
+    router
+        .route_for_connection(&primary.ctx, decoded_ack)
+        .await
+        .unwrap();
+    assert_eq!(
+        client.replies.recv().await.unwrap().frame.header.ty,
+        FrameType::Response
+    );
+    let (finish, retirement) = hold_retirement(&spawn).await;
+    // Choose the read branch explicitly: queued bytes can win the server's
+    // select even though the channel-closed notification is also ready.
+    let decoded_reverse = subc_transport::read_frame(&mut daemon)
+        .await
+        .unwrap()
+        .expect("queued bytes remain readable after shutdown on Linux");
+    assert_eq!(decoded_reverse.header.corr, 931);
+    router
+        .route_for_connection_ingress(&primary.ctx, decoded_reverse, None, false)
+        .await
+        .unwrap();
+    assert!(
+        client.replies.try_recv().is_err(),
+        "a primary frame decoded after shutdown must not reach a client"
+    );
+    assert!(primary.ctx.egress.ingress_terminal());
+    assert!(primary.ctx.egress.egress_terminal());
+    assert_eq!(
+        forwarding.active_binding_count().unwrap(),
+        1,
+        "cleanup must not make the ingress assertion pass"
+    );
+    finish.send(()).unwrap();
+    retirement.await.unwrap();
+    drop(client);
+    assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn registration_retirement_drop_keeps_launch_tie_while_pending_relays_exist() {
+    let mut rig = rig().await;
+    let token = mint(&mut rig, ClaimPurpose::SelfConnection).await.claim;
+    let mut client = Wire::new(&rig.router);
+    assert_eq!(
+        client
+            .call(&rig.router, request(ClaimPresentRequest::new(token)))
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let forwarding = rig.handler.forwarding();
+    let connection = client.connection.id();
+    let _pending = forwarding
+        .begin_route_bind_relay_for_test(
+            connection,
+            client.ctx.egress.clone(),
+            940,
+            "claims-module",
+        )
+        .unwrap();
+    let observed = forwarding.observe_cleanup_tie_for_test();
+    drop(client);
+    let (linked, pending) = observed.await.unwrap();
+    assert_eq!(
+        pending, 1,
+        "the cleanup boundary must still contain a pending bind"
+    );
+    assert!(
+        linked,
+        "the launch tie must survive until pending bind cleanup runs"
+    );
+    assert!(!forwarding.spawn_connection_recorded_for_test(connection));
+    assert_eq!(forwarding.reserved_route_count().unwrap(), (0, 0));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registration_retirement_goodbye_keeps_claim_bind_fence_until_read_side_cleanup() {
     let mut rig = rig().await;
     let mut provider = Wire::new(&rig.router);
     assert_eq!(
@@ -131,7 +466,7 @@ async fn registration_retirement_goodbye_keeps_claim_bind_fence_until_socket_tea
         !rig.handler
             .forwarding()
             .spawn_connection_recorded_for_test(client_id),
-        "physical connection teardown must forget the launch tie"
+        "read-side cleanup must release the launch tie after routes are gone"
     );
 }
 
@@ -247,7 +582,7 @@ async fn registration_retirement_target_after_readiness_cannot_deliver_committed
         }
     })
     .await
-    .expect("physical teardown must remove the transient route");
+    .expect("read-side cleanup must remove the transient route");
 }
 
 struct PreExecSibling {

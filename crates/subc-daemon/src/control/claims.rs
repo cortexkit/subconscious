@@ -246,6 +246,16 @@ impl LaunchClaims {
     pub(crate) fn pending_count_for_test(&self) -> usize {
         self.state.lock().unwrap().pending.len()
     }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn connection_sink_for_test(&self, connection: ConnectionId) -> crate::FrameSink {
+        self.state
+            .lock()
+            .unwrap()
+            .connections
+            .get(&connection)
+            .unwrap()
+            .clone()
+    }
     pub(crate) fn end_primary_registration(&self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.primary_live = false;
@@ -273,6 +283,7 @@ impl LaunchClaims {
         let connections = std::mem::take(&mut state.connections);
         for sink in connections.values() {
             sink.terminate_ingress();
+            sink.terminate_egress();
         }
         connections.into_keys().collect()
     }
@@ -998,7 +1009,7 @@ pub(crate) mod tests {
     use tokio::sync::mpsc;
 
     pub(crate) struct Net {
-        client: tokio::net::TcpStream,
+        pub(crate) client: tokio::net::TcpStream,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -2061,7 +2072,7 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    async fn prefix_connection(rig: &mut Rig, module_id: &str) -> Net {
+    pub(crate) async fn prefix_connection(rig: &mut Rig, module_id: &str) -> Net {
         rig.handler
             .supervisor
             .set_reserved_prefixes("claims-module", &["claims:".into()]);
@@ -2121,6 +2132,45 @@ pub(crate) mod tests {
             FrameType::HelloAck
         );
         assert!(unrelated.launch_ready(), "a prefix HELLO belongs to its owner's launch, not a supervised launch with the child's id");
+        assert!(rig.spawn.launch_ready());
+    }
+
+    #[tokio::test]
+    async fn claims_nonce_prefix_hello_does_not_retire_unrelated_supervised_channel() {
+        let rig = rig().await;
+        let (_peer, unrelated, _module, _) =
+            network_primary_with_hello(&rig, "claims:nonce-unrelated", false).await;
+        rig.handler
+            .supervisor
+            .set_reserved_prefixes("claims-module", &["claims:".into()]);
+        let owner_nonce = rig
+            .handler
+            .supervisor
+            .spawn_launch_nonce_for("claims-module")
+            .unwrap();
+        let mut frame = prefix_hello("claims:nonce-unrelated");
+        let mut hello: subc_protocol::ModuleHelloBody =
+            serde_json::from_slice(&frame.body).unwrap();
+        hello.launch_nonce = Some(owner_nonce);
+        frame = Frame::build(
+            FrameType::Hello,
+            control_flags(),
+            0,
+            0,
+            8,
+            serde_json::to_vec(&hello).unwrap(),
+        )
+        .unwrap();
+        let mut child = Wire::new(&rig.router);
+        assert!(rig.handler.claims.binding(child.connection.id()).is_none());
+        assert_eq!(
+            child.call(&rig.router, frame).await.header.ty,
+            FrameType::HelloAck
+        );
+        assert!(
+            unrelated.launch_ready(),
+            "a verified owner-nonce prefix HELLO must not retire an unrelated launch"
+        );
         assert!(rig.spawn.launch_ready());
     }
 

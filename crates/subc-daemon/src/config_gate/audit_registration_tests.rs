@@ -1,0 +1,441 @@
+#![cfg(target_os = "linux")]
+use super::*;
+
+fn entry(rig: &Rig, field: &str, value: serde_json::Value) {
+    let path = rig.path.join("subc.jsonc");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    document["modules"]["a"][field] = value;
+    std::fs::write(path, serde_json::to_vec(&document).unwrap()).unwrap();
+}
+
+async fn until(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !condition() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("supervisor transition must complete");
+}
+
+struct Legacy {
+    rig: Rig,
+    owner: Arc<RuntimeOwner>,
+    handle: SupervisorHandle,
+    module: crate::supervise::SupervisedModule,
+    handler: Arc<crate::ControlHandler>,
+    registry: Arc<crate::Registry>,
+    router: Arc<crate::Router>,
+    primary: crate::control::claims::tests::Net,
+    nonce: String,
+}
+
+async fn legacy() -> Legacy {
+    use crate::control::claims::tests::Net;
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    entry(&rig, "overlap", json!("safe"));
+    let owner = Arc::new(rig.owner("legacy-cutover"));
+    let handle = channel_handle();
+    let registry = Arc::new(crate::Registry::default());
+    let forwarding = Arc::new(crate::ForwardingTable::default());
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_forwarding(forwarding.clone())
+        .with_config_runtime(owner.clone())
+        .with_drain_timeout(Duration::from_millis(20));
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    let nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    let handler = Arc::new(
+        crate::ControlHandler::with_forwarding(registry.clone(), forwarding)
+            .with_supervisor(handle.clone())
+            .with_supervisor_rescan(supervisor, rig.path.join("subc.jsonc"), None)
+            .with_config_runtime(owner.clone()),
+    );
+    let router = Arc::new(crate::Router::with_control_handler(handler.clone()));
+    let mut primary = Net::new(router.clone()).await;
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: Some(nonce.clone()),
+    };
+    let hello = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&hello).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        primary.call(hello).await.header.ty,
+        subc_protocol::FrameType::HelloAck
+    );
+    Legacy {
+        rig,
+        owner,
+        handle,
+        module,
+        handler,
+        registry,
+        router,
+        primary,
+        nonce,
+    }
+}
+
+#[tokio::test]
+async fn audit_registration_committed_stamp_retries_or_parks_cutover_without_failed_apply() {
+    for mode in ["busy", "recovery", "refused"] {
+        let fixture = legacy().await;
+        let old = fixture.module.status().unwrap();
+        if mode == "recovery" {
+            fixture.owner.lock().unwrap().recovery_exit_hold = true;
+        }
+        fixture.rig.stamp(&fixture.owner);
+        let gate = fixture.owner.module_gate("a").unwrap();
+        let held = if mode == "busy" {
+            Some(gate.lock_owned().await)
+        } else {
+            None
+        };
+        if mode == "refused" {
+            std::fs::write(fixture.rig.path.join("changed"), b"unapproved program").unwrap();
+            std::fs::rename(
+                fixture.rig.path.join("changed"),
+                fixture.rig.path.join("program"),
+            )
+            .unwrap();
+        }
+        fixture.handler.reconcile_cutover_for_test(fixture.owner.clone(), 1).await
+            .expect("a committed stamp must not become a failed apply when replacement admission defers or refuses");
+        let status = fixture.module.status().unwrap();
+        assert!(
+            !status.process_alive || status.pid != old.pid,
+            "legacy child remains: {status:?}"
+        );
+        assert!(!fixture.handle.legacy_nonce_present_for_test("a"));
+        assert!(!fixture
+            .handle
+            .spawned_consumer_authorized("a", &fixture.nonce));
+        if mode == "busy" {
+            assert!(fixture.owner.stamp_channel_cutover_pending());
+            assert_eq!(status.state, ModuleState::Restarting);
+            drop(held);
+            until(|| fixture.module.status().unwrap().process_alive).await;
+            fixture
+                .handler
+                .reconcile_cutover_for_test(fixture.owner.clone(), 1)
+                .await
+                .unwrap();
+            assert!(!fixture.owner.stamp_channel_cutover_pending());
+        } else {
+            drop(held);
+            assert!(!fixture.owner.stamp_channel_cutover_pending());
+        }
+        drop(fixture.primary);
+        fixture.module.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn audit_registration_stamp_protocol_none_stops_the_running_nonce_child() {
+    let fixture = legacy().await;
+    let old = fixture.module.status().unwrap();
+    entry(&fixture.rig, "protocol", json!("none"));
+    fixture.rig.stamp(&fixture.owner);
+    fixture
+        .handler
+        .reconcile_cutover_for_test(fixture.owner.clone(), 1)
+        .await
+        .unwrap();
+    let next = fixture.module.status().unwrap();
+    assert!(next.process_alive);
+    assert_ne!(next.pid, old.pid);
+    assert_eq!(next.protocol, subc_control::ModuleProtocol::None);
+    assert!(!next.legacy_registration_spawn);
+    assert!(!fixture.handle.legacy_nonce_present_for_test("a"));
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn audit_registration_candidate_promotion_after_stamp_cannot_restore_a_nonce() {
+    use crate::control::claims::tests::Net;
+    let fixture = legacy().await;
+    let swapping = {
+        let module = fixture.module.clone();
+        tokio::spawn(async move { module.swap(Some(Duration::from_secs(10))).await })
+    };
+    until(|| {
+        fixture
+            .handle
+            .registration_for_test("a")
+            .is_some_and(|spawn| spawn.is_candidate())
+    })
+    .await;
+    let proof = fixture.handle.registration_proof_for_test("a").unwrap();
+    let mut candidate = Net::new(fixture.router.clone()).await;
+    let hello = module_hello(Some(proof), ConnectionId::new(2));
+    let mut body: serde_json::Value = serde_json::from_slice(&hello.body).unwrap();
+    body["manifest"]["ready"] = json!(false);
+    let hello = subc_protocol::Frame::build(
+        hello.header.ty,
+        hello.header.flags,
+        0,
+        0,
+        1,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        candidate.call(hello).await.header.ty,
+        subc_protocol::FrameType::HelloAck
+    );
+    fixture.rig.stamp(&fixture.owner);
+    fixture
+        .handle
+        .apply_identity_configuration(&spec(&fixture.rig));
+    assert!(!fixture.handle.legacy_nonce_present_for_test("a"));
+    fixture
+        .registry
+        .replace_catalog_for_connection(ConnectionId::new(2), vec![], None, Some(true))
+        .unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), swapping)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    eprintln!("cross-stamp swap outcome: {outcome:?}");
+    assert!(
+        !fixture.handle.legacy_nonce_present_for_test("a"),
+        "promotion restored a nonce after the stamp retired it"
+    );
+    fixture
+        .handler
+        .reconcile_cutover_for_test(fixture.owner.clone(), 1)
+        .await
+        .unwrap();
+    assert!(!fixture.module.status().unwrap().legacy_registration_spawn);
+    drop(candidate);
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn audit_registration_missing_support_holds_crash_budget_and_reapproval_revives() {
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = Arc::new(rig.owner("declaration-release"));
+    rig.stamp(&owner);
+    let handle = channel_handle();
+    let registry = Arc::new(crate::Registry::default());
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    let before = module.status().unwrap();
+    entry(&rig, "registration_channel", json!(false));
+    approve(&rig, &owner, PlanKind::Change);
+    assert!(owner.exit_is_held("a"));
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(before.pid.unwrap() as i32).unwrap(),
+        rustix::process::Signal::KILL,
+    )
+    .unwrap();
+    until(|| !module.status().unwrap().process_alive).await;
+    until(|| module.status().unwrap().state == ModuleState::Stopped).await;
+    let held = module.status().unwrap();
+    assert_eq!(held.restart_count, before.restart_count);
+    assert_eq!(held.lifetime_restarts, before.lifetime_restarts);
+    assert!(module.next_retry_at_ms().unwrap().is_none());
+    assert_eq!(module.terminal_history().entries.len(), 1);
+    let handler = Arc::new(
+        crate::ControlHandler::new(registry)
+            .with_supervisor(handle)
+            .with_config_runtime(owner.clone()),
+    );
+    let worker = handler.spawn_config_delivery_worker().unwrap();
+    entry(&rig, "registration_channel", json!(true));
+    approve(&rig, &owner, PlanKind::Change);
+    until(|| module.status().unwrap().process_alive).await;
+    let revived = module.status().unwrap();
+    worker.abort();
+    module.stop().await.unwrap();
+    assert_eq!(revived.spawn_generation, before.spawn_generation + 1);
+    assert_eq!(revived.restart_count, before.restart_count);
+}
+
+#[test]
+fn audit_registration_recorded_program_proposal_remains_pending_on_poll() {
+    let rig = rig();
+    let owner = rig.owner("program-proposal");
+    rig.stamp(&owner);
+    std::fs::write(rig.path.join("program"), b"changed program bytes").unwrap();
+    owner.observe_file_proposal().unwrap();
+    assert!(owner
+        .lock()
+        .unwrap()
+        .store
+        .loaded_admission_state()
+        .1
+        .proposal
+        .is_some());
+    assert_eq!(owner.polled_status().unwrap().pending_proposals, 1);
+}
+
+#[test]
+fn audit_registration_poisoned_owner_is_not_a_current_status_projection() {
+    let rig = rig();
+    let owner = Arc::new(rig.owner("poisoned-status"));
+    rig.stamp(&owner);
+    let held = owner.clone();
+    assert!(std::thread::spawn(move || {
+        let _guard = held.inner.lock().unwrap();
+        panic!("poison configuration owner");
+    })
+    .join()
+    .is_err());
+    assert_eq!(
+        owner.polled_status().unwrap_err().code,
+        "config_unavailable"
+    );
+    assert!(matches!(
+        owner.approved_daemon_view(),
+        ApprovedDaemonView::Unavailable
+    ));
+    assert!(owner.is_recovering());
+}
+
+#[test]
+fn audit_registration_cutover_status_uses_the_committed_snapshot() {
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = rig.owner("cutover-status");
+    rig.stamp(&owner);
+    assert!(owner.stamp_channel_cutover_pending());
+    entry(&rig, "args", json!(["599"]));
+    let status = owner.polled_status().unwrap();
+    assert_eq!(status.state, "stamped");
+    assert_eq!(status.pending_proposals, 1);
+}
+
+#[tokio::test]
+async fn audit_registration_unreadable_unstamped_census_is_unknown() {
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = Arc::new(rig.owner("bounded-census"));
+    let handle = channel_handle();
+    let registry = Arc::new(crate::Registry::default());
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone());
+    let module = supervisor
+        .supervise_configured_requested_async(
+            spec(&rig),
+            false,
+            Default::default(),
+            None,
+            RestartPolicy::default(),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut second = spec(&rig);
+    second.module_id = "b".into();
+    let second = supervisor
+        .supervise_configured_requested_async(
+            second,
+            false,
+            Default::default(),
+            None,
+            RestartPolicy::default(),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .unwrap();
+    let handler = crate::ControlHandler::new(registry)
+        .with_supervisor(handle)
+        .with_config_runtime(owner.clone());
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = calls.clone();
+    *owner.census_probe.lock().unwrap() = Some(Arc::new(move || {
+        observed.lock().unwrap().push(std::thread::current().id())
+    }));
+    let async_thread = std::thread::current().id();
+    registration_declaration_diagnostic(&handler, "supervisor.provenance").await;
+    assert_eq!(
+        calls.lock().unwrap().len(),
+        1,
+        "one census read, not one per module"
+    );
+    assert_ne!(calls.lock().unwrap()[0], async_thread);
+    calls.lock().unwrap().clear();
+    let path = rig.path.join("subc.jsonc");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    let response = registration_declaration_diagnostic(&handler, "supervisor.provenance").await;
+    assert!(
+        response["modules"][0]
+            .get("registration_declaration")
+            .is_none(),
+        "{response}"
+    );
+    assert_eq!(calls.lock().unwrap().len(), 1);
+    assert_ne!(calls.lock().unwrap()[0], async_thread);
+    module.stop().await.unwrap();
+    second.stop().await.unwrap();
+    std::fs::remove_dir(path).unwrap();
+}
+
+#[tokio::test]
+async fn audit_registration_list_does_not_refuse_disabled_or_running_modules() {
+    let rig = rig();
+    wire_fixture_document(&rig, json!(["600"]));
+    let owner = Arc::new(rig.owner("actual-refusal"));
+    rig.stamp(&owner);
+    let handle = channel_handle();
+    let registry = Arc::new(crate::Registry::default());
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
+    entry(&rig, "registration_channel", json!(false));
+    approve(&rig, &owner, PlanKind::Change);
+    let handler = crate::ControlHandler::new(registry)
+        .with_supervisor(handle)
+        .with_config_runtime(owner.clone());
+    let running = registration_declaration_diagnostic(&handler, "supervisor.list").await;
+    assert!(module.status().unwrap().process_alive);
+    assert!(
+        running["modules"][0].get("admission_refused").is_none(),
+        "{running}"
+    );
+    module.set_enabled(false).await.unwrap();
+    let disabled = registration_declaration_diagnostic(&handler, "supervisor.list").await;
+    assert!(
+        disabled["modules"][0].get("admission_refused").is_none(),
+        "{disabled}"
+    );
+}
+
+#[tokio::test]
+async fn audit_registration_hello_warning_compares_the_in_force_entry() {
+    let fixture = gated_claim_fixture_with_support(Some(false)).await;
+    entry(&fixture.rig, "registration_channel", json!(false));
+    approve(&fixture.rig, &fixture.owner, PlanKind::Change);
+    let response = registration_declaration_diagnostic(&fixture.handler, "supervisor.health").await;
+    assert!(
+        !response["modules"][0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("HELLO registration_channel"),
+        "{response}"
+    );
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}

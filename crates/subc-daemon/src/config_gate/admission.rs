@@ -13,7 +13,7 @@ pub(super) struct ConfiguredModuleSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct AdmissionCache {
+pub(crate) struct AdmissionCache {
     state: StoreState,
     file_authoritative: bool,
     unstamp_exit_pending: bool,
@@ -32,6 +32,19 @@ struct ModuleAdmission {
 }
 
 impl AdmissionCache {
+    pub(super) fn registration_declarations(&self) -> Option<BTreeMap<String, String>> {
+        (self.state == StoreState::Stamped).then(|| {
+            self.modules
+                .iter()
+                .map(|(module, authority)| {
+                    (
+                        module.clone(),
+                        super::super::registration::declaration(&authority.snapshot, module).into(),
+                    )
+                })
+                .collect()
+        })
+    }
     pub(super) fn is_recovering(&self) -> bool {
         matches!(
             self.state,
@@ -157,6 +170,8 @@ impl AdmissionCache {
             let config_gated = snapshot
                 .inputs
                 .contains_key(&InputKey::Declaration(module.clone()));
+            let channel_unsupported =
+                super::super::registration::declaration(&snapshot, &module) == "undeclared";
             cache.modules.insert(
                 module,
                 ModuleAdmission {
@@ -165,6 +180,7 @@ impl AdmissionCache {
                         || versions.is_some_and(|versions| versions.active.is_some()),
                     generation: generation.unwrap_or(0),
                     held: refused
+                        || channel_unsupported
                         || (deferred && generation.is_none())
                         || (config_gated
                             && versions.is_some_and(|versions| {
@@ -247,7 +263,7 @@ impl SpawnAdmission {
 impl RuntimeOwner {
     /// Only a committed, still-pending unstamp may stage enabled state while held.
     pub(crate) fn can_stage_unstamp_enable(&self) -> bool {
-        self.admission
+        self.published
             .read()
             .map(|cache| cache.unstamp_exit_pending)
             .unwrap_or(false)
@@ -255,7 +271,7 @@ impl RuntimeOwner {
     /// A committed unstamp permits its definition reconciliation while the
     /// separate recovery admission hold still prevents every child spawn.
     pub(crate) fn file_configuration_is_gated(&self, module: &str) -> bool {
-        self.admission
+        self.published
             .read()
             .map(|cache| {
                 !cache.file_authoritative
@@ -281,8 +297,11 @@ impl RuntimeOwner {
     }
 
     pub(crate) fn module_is_gated(&self, module: &str) -> bool {
+        if self.inner.is_poisoned() {
+            return true;
+        }
         {
-            let Ok(cache) = self.admission.read() else {
+            let Ok(cache) = self.published.read() else {
                 return true;
             };
             match cache.state {
@@ -325,7 +344,7 @@ impl RuntimeOwner {
             Some(module) => self.check_module_hold(module),
             None => {
                 if self
-                    .admission
+                    .published
                     .read()
                     .is_ok_and(|cache| cache.state == StoreState::Stamped)
                 {
@@ -354,7 +373,7 @@ impl RuntimeOwner {
         }
     }
     pub(crate) fn exit_is_held(&self, module: &str) -> bool {
-        self.admission
+        self.published
             .read()
             .map(|cache| {
                 matches!(
@@ -414,10 +433,9 @@ impl RuntimeOwner {
                         "configuration publication is busy",
                     )
                 })?,
-                &self.admission,
+                &self.published,
                 &self.delivery_changed,
                 &self.module_gates,
-                &self.approved_daemon,
                 self,
             );
             Self::check_authority(&mut state, false)?;
@@ -488,7 +506,7 @@ impl RuntimeOwner {
     /// Called under exactly one module gate. Only the verified memory copy is read.
     pub(crate) fn check_spawn(&self, module: &str, admission: &SpawnAdmission) -> Result<()> {
         let cache = self
-            .admission
+            .published
             .read()
             .map_err(|_| GateError::new("config_gated", "admission authority is unavailable"))?;
         let current = cache.decision(module)?;
@@ -507,7 +525,7 @@ impl RuntimeOwner {
     }
 
     pub(crate) fn check_module_hold(&self, module: &str) -> Result<()> {
-        self.admission
+        self.published
             .read()
             .map_err(|_| GateError::new("config_gated", "admission authority is unavailable"))?
             .decision(module)
@@ -516,7 +534,7 @@ impl RuntimeOwner {
 
     pub(crate) fn check_rescan_hold(&self) -> Result<()> {
         let cache = self
-            .admission
+            .published
             .read()
             .map_err(|_| GateError::new("config_gated", "admission authority is unavailable"))?;
         if matches!(

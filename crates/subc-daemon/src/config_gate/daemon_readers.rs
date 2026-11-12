@@ -55,9 +55,12 @@ impl RuntimeOwner {
     /// Polling list readers clone verified memory only; they never join a
     /// publication's store lock, disk checks or platform keychain work.
     pub(crate) fn approved_daemon_view(&self) -> ApprovedDaemonView {
-        self.approved_daemon
+        if self.inner.is_poisoned() {
+            return ApprovedDaemonView::Unavailable;
+        }
+        self.published
             .read()
-            .map(|view| view.clone())
+            .map(|view| view.approved_daemon.clone())
             .unwrap_or(ApprovedDaemonView::Unavailable)
     }
 

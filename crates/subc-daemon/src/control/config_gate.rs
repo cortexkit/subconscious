@@ -609,8 +609,14 @@ impl ControlHandler {
                 Ok(ConfigControlResponse::ProgramPlaced { generation })
             }
             ConfigControlRequest::Status {} => {
-                let mut status = runtime.on_blocking(|owner| owner.polled_status()).await?;
-                let phone = self.config_phone_surface_snapshot().await;
+                let snapshot = runtime.polled_snapshot()?;
+                let captured = snapshot.clone();
+                let mut status = runtime
+                    .on_blocking(move |owner| owner.polled_status_from(&captured))
+                    .await?;
+                let phone = self
+                    .config_phone_surface_checked(false, Some(&snapshot))
+                    .await;
                 let facts = self.config_approval_facts_with_phone(ctx, phone).await;
                 status
                     .missing_approval_surfaces
@@ -621,7 +627,7 @@ impl ControlHandler {
                 if let Err(error) = self.config_desktop_identity(ctx.connection_id) {
                     status.missing_approval_surfaces.push(error.code);
                 }
-                self.report_daemon_configuration(&runtime, &mut status)
+                self.report_daemon_configuration(&snapshot.approved_daemon, &mut status)
                     .await?;
                 Ok(ConfigControlResponse::Status { status })
             }
@@ -895,22 +901,21 @@ impl ControlHandler {
     // The caller holds Callosum's module gate while allocating its RPC or
     // committing approval. This snapshot grants nothing until revalidated there.
     async fn config_phone_surface(&self) -> Option<crate::config_gate::PhoneSurface> {
-        self.config_phone_surface_checked(true).await
+        self.config_phone_surface_checked(true, None).await
     }
 
     async fn config_phone_surface_snapshot(&self) -> Option<crate::config_gate::PhoneSurface> {
-        self.config_phone_surface_checked(false).await
+        self.config_phone_surface_checked(false, None).await
     }
 
     async fn config_phone_surface_checked(
         &self,
         content: bool,
+        publication: Option<&crate::config_gate::runtime::Published>,
     ) -> Option<crate::config_gate::PhoneSurface> {
-        if self
-            .config_runtime
-            .as_ref()
-            .is_some_and(|owner| owner.is_recovering())
-        {
+        if self.config_runtime.as_ref().is_some_and(|owner| {
+            publication.map_or_else(|| owner.is_recovering(), |view| view.is_recovering())
+        }) {
             return None;
         }
         if !self.operator_app_policy.phone_enabled {
@@ -967,7 +972,11 @@ impl ControlHandler {
                 .await
                 .ok()??
         } else {
-            runtime.polled_phone_entry(connection)?
+            if let Some(snapshot) = publication {
+                runtime.polled_phone_entry_from(snapshot, connection)?
+            } else {
+                runtime.polled_phone_entry(connection)?
+            }
         };
         if !approved.enabled || approved.module_spec() != spec {
             return None;

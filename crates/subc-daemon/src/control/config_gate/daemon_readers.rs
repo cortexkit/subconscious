@@ -283,7 +283,7 @@ impl ControlHandler {
 
     pub(super) async fn report_daemon_configuration(
         &self,
-        owner: &Arc<crate::config_gate::runtime::RuntimeOwner>,
+        published: &crate::config_gate::runtime::ApprovedDaemonView,
         status: &mut subc_control::config::ConfigStatus,
     ) -> Result<(), GateError> {
         if status.state != "stamped" || status.anchor_pending {
@@ -291,9 +291,9 @@ impl ControlHandler {
         }
         if let crate::config_gate::runtime::ApprovedDaemonView::Approved {
             config: approved, ..
-        } = owner.approved_daemon_view()
+        } = published
         {
-            let mut rows = self.inactive_daemon_configuration(&approved)?;
+            let mut rows = self.inactive_daemon_configuration(approved)?;
             for row in &mut rows {
                 row["generation"] = serde_json::json!(status
                     .approval_channels

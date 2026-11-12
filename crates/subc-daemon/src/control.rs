@@ -3824,6 +3824,12 @@ impl ControlHandler {
             && self
                 .supervisor
                 .module_is_gated(&registration.manifest.module_id)
+            && self
+                .config_runtime
+                .as_ref()
+                .and_then(|owner| owner.registration_declaration(&registration.manifest.module_id))
+                .as_deref()
+                == Some("declared")
         {
             warn!(module_id = %registration.manifest.module_id,
                 "HELLO registration_channel is false despite the approved channel declaration; registration remains admitted");
@@ -7220,15 +7226,17 @@ impl ControlHandler {
                     .configured_enabled(&status.module_id),
                 ApprovedDaemonView::Unavailable => None,
             };
-            let admission_refused = self
-                .config_runtime
-                .as_ref()
-                .filter(|owner| owner.module_is_gated(&status.module_id))
-                .filter(|owner| {
-                    owner.registration_declaration(&status.module_id).as_deref()
+            let admission_refused = status
+                .admission_refused
+                .clone()
+                .filter(|_| status.enabled && !status.process_alive)
+                .filter(|_| {
+                    self.config_runtime
+                        .as_ref()
+                        .and_then(|owner| owner.registration_declaration(&status.module_id))
+                        .as_deref()
                         == Some("undeclared")
-                })
-                .map(|_| subc_control::REGISTRATION_CHANNEL_UNSUPPORTED.to_owned());
+                });
             // Keep the retired policy field on the wire for one release so
             // existing status consumers still receive the platform policy.
             modules.push(
@@ -7548,6 +7556,14 @@ impl ControlHandler {
         };
 
         let target = targeted.then(|| selected[0].module_id());
+        let declarations = if let Some(owner) = &self.config_runtime {
+            owner
+                .on_blocking(|owner| owner.registration_declarations())
+                .await
+                .ok()
+        } else {
+            None
+        };
         self.observe_control_wait(ctx, target, ops::SUPERVISOR_PROVENANCE, async {
             let mut modules = Vec::with_capacity(selected.len());
             let mut extensions = Vec::with_capacity(selected.len());
@@ -7579,19 +7595,10 @@ impl ControlHandler {
                 let registration = self.running_registration_method(&status.module_id);
                 let mut extension = subc_control::SupervisorModuleProvenanceExt::new()
                     .with_registration(registration);
-                extension.registration_declaration = Some(
-                    self.config_runtime
-                        .as_ref()
-                        .and_then(|owner| owner.registration_declaration(&status.module_id))
-                        .unwrap_or_else(|| {
-                            if status.protocol == ModuleProtocol::None {
-                                "not_applicable"
-                            } else {
-                                "undeclared"
-                            }
-                            .into()
-                        }),
-                );
+                extension.registration_declaration = declarations
+                    .as_ref()
+                    .and_then(|entries| entries.get(&status.module_id))
+                    .cloned();
                 extensions.push(extension);
                 modules.push(SupervisorModuleProvenance {
                     module_id: status.module_id,
@@ -7673,6 +7680,7 @@ impl ControlHandler {
                 let declaration_warning = self.registry.get_module(&module_id).ok().flatten()
                     .filter(|registration| registration.manifest.registration_channel == Some(false))
                     .filter(|_| self.supervisor.module_is_gated(&module_id))
+                    .filter(|_| self.config_runtime.as_ref().and_then(|owner| owner.registration_declaration(&module_id)).as_deref() == Some("declared"))
                     .map(|_| format!("{module_id}: HELLO registration_channel is false despite the approved channel declaration"));
                 let capability_detail = append_capability_problem_detail(capability_detail, declaration_warning);
                 Ok(SupervisorHealthEntry {

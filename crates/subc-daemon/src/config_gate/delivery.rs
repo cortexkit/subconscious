@@ -868,10 +868,9 @@ impl RuntimeOwner {
                     "configuration publication is busy",
                 )
             })?,
-            &self.admission,
+            &self.published,
             &self.delivery_changed,
             &self.module_gates,
-            &self.approved_daemon,
             self,
         );
         state.store.check()?;

@@ -1537,6 +1537,8 @@ pub struct ExitReport {
 /// module process.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleStatus {
+    pub(crate) admission_refused: Option<String>,
+    pub(crate) legacy_registration_spawn: bool,
     pub module_id: String,
     /// Retained configuration-exit infrastructure failure. Cleared only after a
     /// successful launch; an ordinary stop has no infrastructure stop reason.
@@ -1621,6 +1623,8 @@ struct ActorSelectCheckpoint {
 
 #[derive(Debug, Clone, PartialEq)]
 struct SupervisorSnapshot {
+    admission_refused: Option<String>,
+    legacy_registration_spawn: bool,
     stop_reason: Option<ModuleStopReason>,
     subtree_target: crate::subtree_resources::Target,
     failed_retry: FailedRetry,
@@ -1778,6 +1782,8 @@ impl SupervisorSnapshot {
 
     fn new(state: ModuleState, enabled: bool) -> Self {
         Self {
+            admission_refused: None,
+            legacy_registration_spawn: false,
             stop_reason: None,
             subtree_target: crate::subtree_resources::Target::Unavailable("not_running"),
             failed_retry: FailedRetry::default(),
@@ -2747,6 +2753,11 @@ impl SupervisorHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(module_id)
             .cloned()
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn legacy_nonce_present_for_test(&self, module: &str) -> bool {
+        self.spawn_nonces.lock().unwrap().contains_key(module)
     }
 
     pub(crate) fn apply_identity_configuration(&self, spec: &ModuleSpec) {
@@ -4815,6 +4826,8 @@ impl SupervisedModule {
 
         Ok((
             ModuleStatus {
+                admission_refused: snapshot.admission_refused,
+                legacy_registration_spawn: snapshot.legacy_registration_spawn,
                 stop_reason: snapshot.stop_reason,
                 waiting_for_previous_pid: retained
                     .as_ref()
@@ -6884,6 +6897,12 @@ fn hold_config_spawn(
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
 ) -> Result<(), SuperviseError> {
+    let admission_refused = runtime
+        .config_delivery
+        .as_ref()
+        .and_then(|delivery| delivery.0.check_module_hold(&spec.module_id).err())
+        .filter(|error| error.code == subc_control::REGISTRATION_CHANNEL_UNSUPPORTED)
+        .map(|error| error.code);
     *runtime
         .scheduled_respawn
         .lock()
@@ -6901,6 +6920,7 @@ fn hold_config_spawn(
         }));
     }
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.admission_refused = admission_refused;
         state.state = ModuleState::Stopped;
         state.respawn_pending = false;
         state.failed_retry.pending = None;
@@ -8970,25 +8990,32 @@ async fn handle_supervisor_command(
                         }
                     }
                 }
-                if next.protocol == ModuleProtocol::Subc
-                    && (child.as_ref().is_some_and(|child| child.admission_base.is_none())
+                if (child.as_ref().is_some_and(|child| child.registration_spawn.is_some() && child.admission_base.is_none())
                         || (child.is_none() && lock_snapshot(snapshot)?.state == ModuleState::Restarting
                             && runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.stamp_channel_cutover_pending())))
                     && runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.module_is_gated(&spec.module_id))
                 {
-                    // The stamp cannot adopt an unverified legacy process. Stop
-                    // it and launch under the approved program/channel authority
-                    // before acknowledging entry reconciliation, without charging
-                    // an operator-requested cutover to the crash restart budget.
+                    // A stamp cannot adopt an unverified legacy process, even
+                    // when its approved replacement no longer speaks subc.
+                    // Stopping that process spends no crash restart budget.
                     if child.is_some() {
                         restart_child_with_budget_policy(spec, runtime, registry,
                             process_liveness, snapshot, child, runtime.drain_timeout, false).await?;
                     }
-                    // Ordinary restart acknowledges a scheduled respawn. Stamp
-                    // reconciliation instead waits for that approved spawn before
-                    // it can publish that gating is enabled.
+                    // The stamp is already committed. A deferred or held launch
+                    // belongs to the normal retry/hold loop, not a failed apply.
                     update_snapshot(snapshot, Some(&spec.module_id), |state| state.respawn_pending = false)?;
-                    *child = Some(spawn_and_mark_running_async(spec, runtime, snapshot).await?);
+                    match spawn_and_mark_running_async(spec, runtime, snapshot).await {
+                        Ok(replacement) => *child = Some(replacement),
+                        Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
+                            defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn)?;
+                        }
+                        Err(SuperviseError::ConfigHeld { .. }) => hold_config_spawn(spec, runtime, snapshot)?,
+                        Err(error) => {
+                            fail_snapshot(snapshot, Some(&spec.module_id), None, &runtime.failure_context(false));
+                            error!(module_id=%spec.module_id, %error, "committed stamp replacement is parked");
+                        }
+                    }
                 }
                 info!(module_id=%spec.module_id, config_generation=approved.generation(), "approved daemon entry reconciled");
                 Ok(())
@@ -15074,6 +15101,9 @@ fn set_running(
     }
     state.drain_disposition_detail = None;
     state.spawn_failure = None;
+    state.admission_refused = None;
+    state.legacy_registration_spawn =
+        child.registration_spawn.is_some() && child.admission_base.is_none();
     state.stop_reason = None;
     state.waiting_for_previous_pid = None;
     state.waiting_for_previous_detail = None;
@@ -15118,6 +15148,7 @@ fn set_running(
 }
 
 fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
+    state.legacy_registration_spawn = false;
     state.subtree_target = crate::subtree_resources::Target::Unavailable("not_running");
     state.failed_retry.healthy_since = None;
     state.failed_retry.running_since = None;

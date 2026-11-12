@@ -4,7 +4,6 @@ use super::*;
 #[derive(Clone, Default)]
 pub(super) struct Projection {
     pub status: subc_control::config::ConfigStatus,
-    pub declarations: BTreeMap<String, String>,
     pub phone: Option<(ConnectionId, crate::daemon_config::ConfiguredModule)>,
     pub config_declarations: BTreeMap<String, ConfigDeclareRequest>,
     pub approved: super::super::GateSnapshot,
@@ -13,29 +12,38 @@ pub(super) struct Projection {
 
 impl RuntimeOwner {
     pub(crate) fn stamp_channel_cutover_pending(&self) -> bool {
-        self.projection
+        self.published
             .read()
-            .map(|view| view.channel_cutover_pending)
+            .map(|view| view.projection.channel_cutover_pending)
             .unwrap_or(true)
     }
+    #[cfg(test)]
     pub(crate) fn polled_status(&self) -> Result<subc_control::config::ConfigStatus> {
-        let view = self
-            .projection
-            .read()
-            .map(|view| view.clone())
-            .map_err(|_| {
-                GateError::new("config_unavailable", "status projection is unavailable")
-            })?;
-        let mut status = view.status;
+        let snapshot = self.polled_snapshot()?;
+        self.polled_status_from(snapshot.as_ref())
+    }
+
+    pub(crate) fn polled_status_from(
+        &self,
+        snapshot: &Published,
+    ) -> Result<subc_control::config::ConfigStatus> {
+        if self.inner.is_poisoned() {
+            return Err(GateError::new(
+                "config_unavailable",
+                "configuration owner lock is poisoned",
+            ));
+        }
+        let view = &snapshot.projection;
+        let mut status = view.status.clone();
         if matches!(status.state.as_str(), "stamped" | "unstamped") && !status.anchor_pending {
             let candidate = self.capturer.capture_polled(&view.config_declarations)?;
             if status.state == "stamped" {
-                status.pending_proposals = u64::from(
-                    candidate
-                        .changed_keys(&view.approved)
-                        .iter()
-                        .any(|key| !key.is_program()),
-                );
+                let changed = candidate
+                    .changed_keys(&view.approved)
+                    .iter()
+                    .any(|key| !key.is_program());
+                // A config-only read cannot disprove a recorded program change.
+                status.pending_proposals = status.pending_proposals.max(u64::from(changed));
             } else {
                 let coverage = std::mem::take(&mut status.interpreter_only_covered);
                 status_inputs::report_snapshot(&candidate, &mut status);
@@ -46,41 +54,71 @@ impl RuntimeOwner {
     }
 
     pub(crate) fn registration_declaration(&self, module: &str) -> Option<String> {
-        let view = self.projection.read().ok()?;
-        if view.status.state == "unstamped" && !view.channel_cutover_pending {
-            drop(view);
-            let document = std::fs::read_to_string(&self.capturer.daemon_path).ok()?;
-            let (configuration, _) =
-                crate::daemon_config::parse_with_activity(&document, &self.capturer.daemon_path)
-                    .ok()?;
-            let entry = configuration
-                .modules
-                .into_iter()
-                .find(|entry| entry.module_id == module)?;
-            return Some(
-                if entry.protocol == subc_control::ModuleProtocol::None {
-                    "not_applicable"
-                } else if entry.registration_channel {
-                    "declared"
-                } else {
-                    "undeclared"
-                }
-                .into(),
-            );
+        self.polled_snapshot()
+            .ok()?
+            .admission
+            .registration_declarations()?
+            .get(module)
+            .cloned()
+    }
+
+    /// A census reads one bounded regular file only when no approved store is in
+    /// force. The caller runs this method on a blocking worker once per request.
+    pub(crate) fn registration_declarations(&self) -> Result<BTreeMap<String, String>> {
+        let snapshot = self.polled_snapshot()?;
+        if let Some(declarations) = snapshot.admission.registration_declarations() {
+            return Ok(declarations);
         }
-        view.declarations.get(module).cloned()
+        if !matches!(snapshot.approved_daemon, ApprovedDaemonView::NotStamped) {
+            return Err(GateError::new(
+                "config_unavailable",
+                "approved declarations are unavailable",
+            ));
+        }
+        #[cfg(test)]
+        if let Some(probe) = self.census_probe.lock().unwrap().clone() {
+            probe();
+        }
+        let candidate = self.capturer.capture_polled(&BTreeMap::new())?;
+        if candidate
+            .inputs
+            .get(&super::super::InputKey::Daemon)
+            .is_none_or(|input| !matches!(input.state, subc_config::InputState::Present { .. }))
+        {
+            return Err(GateError::new(
+                "config_unavailable",
+                "daemon configuration is unavailable",
+            ));
+        }
+        Ok(candidate
+            .modules()
+            .into_iter()
+            .map(|module| {
+                let declaration =
+                    super::super::registration::declaration(&candidate, &module).into();
+                (module, declaration)
+            })
+            .collect())
     }
 
     pub(crate) fn polled_phone_entry(
         &self,
         connection: ConnectionId,
     ) -> Option<crate::daemon_config::ConfiguredModule> {
+        let snapshot = self.polled_snapshot().ok()?;
+        self.polled_phone_entry_from(snapshot.as_ref(), connection)
+    }
+
+    pub(crate) fn polled_phone_entry_from(
+        &self,
+        snapshot: &Published,
+        connection: ConnectionId,
+    ) -> Option<crate::daemon_config::ConfiguredModule> {
         if self.phone_is_withdrawing(connection) {
             return None;
         }
-        self.projection
-            .read()
-            .ok()?
+        snapshot
+            .projection
             .phone
             .as_ref()
             .filter(|(id, _)| *id == connection)
@@ -91,6 +129,7 @@ impl RuntimeOwner {
         &self,
         state: &mut OwnerState,
         mut snapshot: Option<super::super::GateSnapshot>,
+        admission: &admission::AdmissionCache,
     ) -> Projection {
         let store = state.store.loaded_status();
         let mut status = subc_control::config::ConfigStatus::default();
@@ -119,7 +158,6 @@ impl RuntimeOwner {
         } else if state.stamp_channel_cutover {
             // Durable publication precedes stopping old nonce-authorized children.
             // Do not report the gate enabled while those children still run.
-            status.state = "unstamped".into();
             status
                 .warnings
                 .push("approved stamp is waiting for registration channel cutover".into());
@@ -193,16 +231,9 @@ impl RuntimeOwner {
                 }
             }
         }
-        let mut declarations = BTreeMap::new();
         let approved = snapshot.clone().unwrap_or_default();
         if let Some(snapshot) = snapshot {
             status_inputs::report_snapshot(&snapshot, &mut status);
-            for module in snapshot.modules() {
-                declarations.insert(
-                    module.clone(),
-                    super::super::registration::declaration(&snapshot, &module).into(),
-                );
-            }
             for (key, input) in &snapshot.inputs {
                 if let (
                     super::super::InputKey::Program { module, .. },
@@ -219,7 +250,7 @@ impl RuntimeOwner {
                 }
             }
         }
-        status.gated_modules = admission::AdmissionCache::from_state(state).held_modules();
+        status.gated_modules = admission.held_modules();
         let phone = (store.state == StoreState::Stamped
             && !store.anchor_pending
             && !state.recovery_exit_hold)
@@ -275,7 +306,6 @@ impl RuntimeOwner {
         }
         Projection {
             status,
-            declarations,
             phone,
             config_declarations,
             approved,

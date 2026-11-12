@@ -23,6 +23,10 @@ use crate::{
 
 pub struct RuntimeOwner {
     #[cfg(test)]
+    polled_capture_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    census_probe: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
     agent_validation_window: Mutex<Option<Duration>>,
     #[cfg(test)]
     pub(crate) warm_restart_pause: Mutex<Option<WarmRestartPause>>,
@@ -34,10 +38,8 @@ pub struct RuntimeOwner {
     test_hooks: Option<crate::config_store::testing::TestSupport>,
     #[cfg(test)]
     spawn_exec_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
-    admission: std::sync::RwLock<admission::AdmissionCache>,
+    published: std::sync::RwLock<std::sync::Arc<Published>>,
     configured_modules: std::sync::RwLock<Option<admission::ConfiguredModuleSnapshot>>,
-    approved_daemon: std::sync::RwLock<ApprovedDaemonView>,
-    projection: std::sync::RwLock<polled::Projection>,
     inner: Mutex<OwnerState>,
     capturer: ConfigCapturer,
     startup_overrides: Vec<String>,
@@ -426,10 +428,9 @@ impl OwnerState {
 
 struct OwnerGuard<'a>(
     std::sync::MutexGuard<'a, OwnerState>,
-    &'a std::sync::RwLock<admission::AdmissionCache>,
+    &'a std::sync::RwLock<std::sync::Arc<Published>>,
     &'a tokio::sync::Notify,
     &'a Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
-    &'a std::sync::RwLock<ApprovedDaemonView>,
     &'a RuntimeOwner,
 );
 impl std::ops::Deref for OwnerGuard<'_> {
@@ -445,24 +446,16 @@ impl std::ops::DerefMut for OwnerGuard<'_> {
 }
 impl Drop for OwnerGuard<'_> {
     fn drop(&mut self) {
-        let observed = self.0.observed_snapshot.clone();
-        let projection = self.5.status_projection(&mut self.0, observed);
-        if let Ok(mut view) = self.5.projection.write() {
-            *view = projection;
-        }
         // Project committed or invalidated authority before releasing its owner.
         // Parse changed generations outside the cheap reader lock, then publish
         // only the Arc; list polling never waits for store or keychain work.
         let previous = self
-            .4
+            .1
             .read()
-            .map(|view| view.clone())
+            .map(|view| view.approved_daemon.clone())
             .unwrap_or(ApprovedDaemonView::Unavailable);
-        let next =
+        let approved_daemon =
             ApprovedDaemonView::from_store(&self.0.store, self.0.recovery_exit_hold, &previous);
-        if let Ok(mut view) = self.4.write() {
-            *view = next;
-        }
         // Volatile holds follow the same lifetime as their durable records.
         // Approving another program identity retires the previous identity's
         // volatile hold, even if that previous identity is later approved again.
@@ -476,6 +469,8 @@ impl Drop for OwnerGuard<'_> {
             .refused_generations
             .retain(|module, base| valid.contains(&(module.clone(), base.clone())));
         let next = admission::AdmissionCache::from_state(&self.0);
+        let observed = self.0.observed_snapshot.clone();
+        let projection = self.4.status_projection(&mut self.0, observed, &next);
         if let Ok(mut cache) = self.1.write() {
             let (holds, releases) = next.transitions_from(&cache);
             let changed = next.is_recovering() != cache.is_recovering()
@@ -483,7 +478,11 @@ impl Drop for OwnerGuard<'_> {
                 || !releases.is_empty();
             self.0.admission_holds.extend(holds);
             self.0.admission_releases.extend(releases);
-            *cache = next;
+            *cache = std::sync::Arc::new(Published {
+                admission: next,
+                approved_daemon,
+                projection,
+            });
             if changed {
                 self.2.notify_one();
             }
@@ -588,6 +587,9 @@ mod phone;
 mod placement;
 #[path = "polled.rs"]
 mod polled;
+#[path = "published.rs"]
+mod published;
+pub(crate) use published::Published;
 #[path = "status_inputs.rs"]
 mod status_inputs;
 pub(crate) use approval_request::{ApprovalRequest, ApprovalRequestGuard, CancelApprovalRequest};
@@ -668,7 +670,7 @@ impl RuntimeOwner {
     }
     pub fn new(incarnation: String, mut store: ConfigStore, capturer: ConfigCapturer) -> Self {
         let initial_generation = store.body().map(|body| body.last_generation).unwrap_or(0);
-        let admission = std::sync::RwLock::new(admission::AdmissionCache::from_store(&store));
+        let admission = admission::AdmissionCache::from_store(&store);
         let approved_daemon =
             ApprovedDaemonView::from_store(&store, false, &ApprovedDaemonView::Unavailable);
         let reconciled_entries = match &approved_daemon {
@@ -679,9 +681,17 @@ impl RuntimeOwner {
                 .collect(),
             _ => BTreeMap::new(),
         };
-        let approved_daemon = std::sync::RwLock::new(approved_daemon);
+        let published = std::sync::RwLock::new(std::sync::Arc::new(Published {
+            admission,
+            approved_daemon,
+            projection: polled::Projection::default(),
+        }));
         let delivery_changed = std::sync::Arc::new(tokio::sync::Notify::new());
         let owner = Self {
+            #[cfg(test)]
+            polled_capture_hook: Mutex::new(None),
+            #[cfg(test)]
+            census_probe: Mutex::new(None),
             #[cfg(test)]
             agent_validation_window: Mutex::new(None),
             #[cfg(test)]
@@ -694,10 +704,8 @@ impl RuntimeOwner {
             test_hooks: store.test_support().cloned(),
             #[cfg(test)]
             spawn_exec_hook: Mutex::new(None),
-            admission,
+            published,
             configured_modules: std::sync::RwLock::new(None),
-            approved_daemon,
-            projection: std::sync::RwLock::new(polled::Projection::default()),
             inner: Mutex::new(OwnerState {
                 observed_snapshot: None,
                 stamp_channel_cutover: false,
@@ -824,17 +832,13 @@ impl RuntimeOwner {
             .map(|guard| {
                 OwnerGuard(
                     guard,
-                    &self.admission,
+                    &self.published,
                     &self.delivery_changed,
                     &self.module_gates,
-                    &self.approved_daemon,
                     self,
                 )
             })
             .map_err(|_| {
-                if let Ok(mut view) = self.approved_daemon.write() {
-                    *view = ApprovedDaemonView::Unavailable;
-                }
                 GateError::new("config_unavailable", "configuration owner lock is poisoned")
             })?;
         #[cfg(feature = "test-support")]
@@ -857,10 +861,9 @@ impl RuntimeOwner {
             owner: self,
             state: OwnerGuard(
                 state,
-                &self.admission,
+                &self.published,
                 &self.delivery_changed,
                 &self.module_gates,
-                &self.approved_daemon,
                 self,
             ),
         })

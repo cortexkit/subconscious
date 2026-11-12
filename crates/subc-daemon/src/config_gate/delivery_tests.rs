@@ -1,4 +1,8 @@
 use super::*;
+
+#[cfg(unix)]
+#[path = "audit_generation_tests.rs"]
+mod audit_generation;
 use crate::config_gate::runtime::{AppliedDisposition, DeliveryObserver};
 use subc_protocol::config::{ConfigAppliedRequest, ConfigApplyResult};
 

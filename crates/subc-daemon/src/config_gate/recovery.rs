@@ -62,7 +62,10 @@ impl RuntimeOwner {
         }
     }
     pub(crate) fn is_recovering(&self) -> bool {
-        self.admission
+        if self.inner.is_poisoned() {
+            return true;
+        }
+        self.published
             .read()
             .map(|cache| cache.is_recovering())
             .unwrap_or(true)

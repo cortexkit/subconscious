@@ -2,6 +2,9 @@ use super::*;
 use crate::supervise::{ModuleSpec, ModuleState, RestartPolicy, Supervisor, SupervisorHandle};
 use std::{os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
 
+#[path = "audit_registration_tests.rs"]
+mod audit_registration;
+
 fn channel_handle() -> SupervisorHandle {
     let handle = SupervisorHandle::new();
     handle.capture_registration_channels_for_test();
@@ -4344,7 +4347,7 @@ async fn registration_declaration_unsupported_admission_never_spawns_or_spends_b
 }
 
 #[tokio::test]
-async fn registration_declaration_stamp_restarts_nonce_spawn_before_reporting_enabled() {
+async fn registration_declaration_stamp_restarts_nonce_spawn_before_completing_cutover() {
     use crate::control::claims::tests::Net;
     let rig = rig();
     wire_fixture_document(&rig, json!(["600"]));
@@ -4388,7 +4391,10 @@ async fn registration_declaration_stamp_restarts_nonce_spawn_before_reporting_en
     let legacy = registration_declaration_diagnostic(&handler, "supervisor.provenance").await;
     assert_eq!(legacy["modules"][0]["registration"], "nonce", "{legacy}");
     rig.stamp(&owner);
-    assert_ne!(owner.polled_status().unwrap().state, "stamped");
+    // Stamped describes committed authority, even while the old child is being
+    // replaced. The separate cutover marker stays set until reconciliation.
+    assert_eq!(owner.polled_status().unwrap().state, "stamped");
+    assert!(owner.stamp_channel_cutover_pending());
     let (_, _, _, approved) = owner.authority_exit_configuration(1).unwrap().unwrap();
     module
         .reconcile_approved_configuration(approved.clone())
@@ -4428,6 +4434,7 @@ async fn registration_declaration_stamp_restarts_nonce_spawn_before_reporting_en
     owner.daemon_entry_reconciled(&approved, "a").unwrap();
     owner.complete_authority_exit(1).unwrap();
     assert_eq!(owner.polled_status().unwrap().state, "stamped");
+    assert!(!owner.stamp_channel_cutover_pending());
     drop(channel);
     drop(primary);
     module.stop().await.unwrap();

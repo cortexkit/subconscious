@@ -1,6 +1,14 @@
 use super::*;
 
 impl ControlHandler {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) async fn reconcile_cutover_for_test(
+        &self,
+        owner: Arc<crate::config_gate::runtime::RuntimeOwner>,
+        generation: u64,
+    ) -> std::result::Result<(), GateError> {
+        self.reconcile_authority_exit(owner, generation).await
+    }
     #[cfg(all(test, feature = "test-support", unix))]
     pub(crate) fn with_recovery_exit_retry_pause_for_test(
         mut self,
@@ -182,6 +190,23 @@ impl ControlHandler {
         #[cfg(test)]
         if let Some(hook) = self.recovery_exit_test_after_step {
             hook(0)?;
+        }
+        if owner.stamp_channel_cutover_pending() {
+            for module in self.supervisor.list() {
+                let status = module
+                    .status()
+                    .map_err(|error| GateError::new("config_unavailable", error.to_string()))?;
+                let parked = !status.process_alive
+                    && matches!(
+                        status.state,
+                        crate::supervise::ModuleState::Stopped
+                            | crate::supervise::ModuleState::Failed
+                            | crate::supervise::ModuleState::Disabled
+                    );
+                if !(parked || (status.process_alive && !status.legacy_registration_spawn)) {
+                    return Ok(());
+                }
+            }
         }
         // complete_authority_exit releases admission and clears the pending
         // recovery-exit marker. Earlier failure leaves both the hold and marker

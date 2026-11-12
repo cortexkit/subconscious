@@ -1688,7 +1688,15 @@ async fn registration_declaration_poll(
         connection_id: ConnectionId::new(50),
         egress: crate::FrameSink::new(sender),
     };
-    let frame = crate::control::claims::tests::request(json!({"op": op}));
+    let frame = subc_protocol::Frame::build(
+        subc_protocol::FrameType::Request,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&json!({"op": op})).unwrap(),
+    )
+    .unwrap();
     let mut frames = handler.handle_control_frame(&ctx, frame).await.unwrap();
     let frame = if frames.is_empty() {
         receiver.recv().await.unwrap().frame.clone()
@@ -1789,22 +1797,67 @@ fn registration_declaration_commit_is_visible_in_the_next_projection() {
     assert_eq!(owner.polled_status().unwrap().state, "stamped");
 }
 
-#[test]
-fn registration_declaration_stamp_names_all_enabled_entries_without_hello() {
+#[cfg(unix)]
+#[tokio::test]
+async fn registration_declaration_stamp_names_all_enabled_entries_without_hello() {
+    use crate::supervise::{ModuleState, RestartPolicy, Supervisor};
     let rig = Rig::new();
+    let path = rig.path.join("subc.jsonc");
     std::fs::write(
-        rig.path.join("subc.jsonc"),
+        &path,
         serde_json::to_vec(&json!({"version":1,"modules":{
-            "stopped":{"program":rig.path.join("program")},
-            "crashed":{"program":rig.path.join("program"),"registration_channel":false},
-            "never-registered":{"program":rig.path.join("program")},
-            "disabled":{"program":rig.path.join("program"),"enabled":false},
-            "non-wire":{"program":rig.path.join("program"),"protocol":"none"},
-            "supported":{"program":rig.path.join("program"),"registration_channel":true}
+            "stopped":{"program":"/bin/sleep","args":["600"]},
+            "crashed":{"program":"/bin/sleep","args":["not-a-number"],"registration_channel":false},
+            "never-registered":{"program":"/bin/sleep","args":["600"]},
+            "disabled":{"program":"/bin/sleep","enabled":false},
+            "non-wire":{"program":"/bin/sleep","protocol":"none"},
+            "supported":{"program":"/bin/sleep","registration_channel":true}
         }}))
         .unwrap(),
     )
     .unwrap();
+    let registry = std::sync::Arc::new(crate::Registry::default());
+    let policy = RestartPolicy::new(0, Duration::from_millis(1));
+    let supervisor = Supervisor::new_for_test(registry.clone(), policy)
+        .with_drain_timeout(Duration::from_millis(10));
+    let (config, _) =
+        crate::daemon_config::parse_with_activity(&std::fs::read_to_string(&path).unwrap(), &path)
+            .unwrap();
+    let mut actors = Vec::new();
+    for id in ["stopped", "crashed", "never-registered"] {
+        let entry = config
+            .modules
+            .iter()
+            .find(|entry| entry.module_id == id)
+            .unwrap();
+        actors.push(
+            supervisor
+                .supervise_configured_requested_async(
+                    entry.module_spec(),
+                    true,
+                    Default::default(),
+                    None,
+                    policy,
+                    Duration::from_secs(120),
+                    None,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    actors[0].stop().await.unwrap();
+    assert_eq!(actors[0].status().unwrap().state, ModuleState::Stopped);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while actors[1].status().unwrap().state != ModuleState::Failed {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("invalid sleep argument must produce a real failed spawn");
+    assert!(!actors[1].status().unwrap().process_alive);
+    assert!(actors[2].status().unwrap().process_alive);
+    assert!(!actors[2].status().unwrap().registration_active);
+    assert!(registry.list_modules().unwrap().1.is_empty());
     let owner = rig.owner("stamp-census");
     let error = owner
         .prepare(PlanKind::Stamp)
@@ -1824,4 +1877,7 @@ fn registration_declaration_stamp_names_all_enabled_entries_without_hello() {
             && !error.detail.contains("supported,")
     );
     assert!(owner.polled_status().unwrap().approval_channels.is_empty());
+    for actor in actors {
+        actor.stop().await.unwrap();
+    }
 }

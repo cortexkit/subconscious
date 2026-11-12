@@ -477,6 +477,13 @@ impl SupervisedChild {
             .is_some_and(|watch| *watch.changes.borrow() != watch.baseline)
     }
 
+    fn awaiting_registration(&self) -> bool {
+        // Admission failure retires the channel before its kill becomes
+        // waitable. That closure must not replace the admission failure with
+        // a registration failure and spend crash restart budget.
+        self.spawn_failure.is_none() && !self.registered_since_spawn()
+    }
+
     fn id(&self) -> Option<u32> {
         Some(self.pid)
     }
@@ -8184,7 +8191,7 @@ async fn supervise_loop(
                     );
                 }
             }
-            if runtime.child_roster.is_closed() || active.registered_since_spawn() {
+            if runtime.child_roster.is_closed() || !active.awaiting_registration() {
                 active.registration_deadline = None;
             }
             let registration_deadline = active.registration_deadline;
@@ -8228,9 +8235,24 @@ async fn supervise_loop(
                     wake_after,
                 });
             }
-            let registration = (!active.registered_since_spawn())
+            let registration = active
+                .awaiting_registration()
                 .then(|| active.registration_spawn.clone())
                 .flatten();
+            #[cfg(all(test, target_os = "linux"))]
+            let registration_before_exit = !runtime.child_roster.admission_event_for_test(
+                &spec.module_id,
+                "observe_registration_before_exit",
+                Some(active.pid),
+            ) && registration.is_some();
+            #[cfg(not(all(test, target_os = "linux")))]
+            let registration_before_exit = false;
+            #[cfg(all(test, target_os = "linux"))]
+            let registration_child_is_running = |child: &mut SupervisedChild| {
+                // Model the interval after SIGKILL is accepted but before the
+                // child becomes waitable, without delaying the actual kill.
+                registration_before_exit || registration_child_is_running(child)
+            };
             let registration_failed = async {
                 match &registration {
                     Some(spawn) => spawn.wait_registration_failure().await,
@@ -8252,7 +8274,7 @@ async fn supervise_loop(
                     }
                     continue;
                 }
-                wait_result = active_child.wait() => {
+                wait_result = active_child.wait(), if !registration_before_exit => {
                     if let Ok(mut state) = lock_snapshot(&snapshot) {
                         state.failed_retry.uptime_reset_at(no_checks, runtime.restart_policy.window);
                     }
@@ -13075,9 +13097,10 @@ fn arm_registration_deadline(
     budget: Duration,
     registration_watch: Option<RegistrationWatch>,
 ) {
-    child.registration_deadline =
-        (child.protocol == ModuleProtocol::Subc).then_some(child.spawned_at + budget);
     child.registration_watch = registration_watch;
+    child.registration_deadline = (child.protocol == ModuleProtocol::Subc
+        && child.awaiting_registration())
+    .then_some(child.spawned_at + budget);
 }
 
 async fn stop_unregistered_child(child: &mut SupervisedChild) -> io::Result<()> {

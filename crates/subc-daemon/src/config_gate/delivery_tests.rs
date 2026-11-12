@@ -2170,30 +2170,48 @@ async fn config_delivery_supervisor_pre_hello_crash_defers_respawn_without_spend
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn config_delivery_supervisor_pre_hello_crash_after_unavailable_witness_spends_budget() {
-    exit_after_unavailable_image("after_content_witness_check", true).await;
+    exit_after_unavailable_image("after_content_witness_check", true, false).await;
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn config_delivery_supervisor_pre_hello_crash_after_unavailable_initial_image_spends_budget()
 {
-    exit_after_unavailable_image("after_spawn_image_sample", true).await;
+    exit_after_unavailable_image("after_spawn_image_sample", true, false).await;
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn config_delivery_supervisor_unavailable_witness_admission_kill_spends_no_budget() {
-    exit_after_unavailable_image("after_content_witness_check", false).await;
+    exit_after_unavailable_image("after_content_witness_check", false, false).await;
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn config_delivery_supervisor_unavailable_initial_image_admission_kill_spends_no_budget() {
-    exit_after_unavailable_image("after_spawn_image_sample", false).await;
+    exit_after_unavailable_image("after_spawn_image_sample", false, false).await;
 }
 
 #[cfg(target_os = "linux")]
-async fn exit_after_unavailable_image(unavailable_stage: &'static str, child_exits: bool) {
+#[tokio::test]
+async fn config_delivery_supervisor_unavailable_witness_registration_before_exit_spends_no_budget()
+{
+    exit_after_unavailable_image("after_content_witness_check", false, true).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn config_delivery_supervisor_unavailable_initial_image_registration_before_exit_spends_no_budget(
+) {
+    exit_after_unavailable_image("after_spawn_image_sample", false, true).await;
+}
+
+#[cfg(target_os = "linux")]
+async fn exit_after_unavailable_image(
+    unavailable_stage: &'static str,
+    child_exits: bool,
+    registration_before_exit: bool,
+) {
     use std::io::Write;
     let (rig, owner, supervisor, _handler) = supervised_fixture_with_program(
         true,
@@ -2210,12 +2228,19 @@ async fn exit_after_unavailable_image(unavailable_stage: &'static str, child_exi
     let checked_hook = checked.clone();
     let kill_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let kill_sent_hook = kill_sent.clone();
+    let exit_observation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exit_observation_hook = exit_observation.clone();
     let launched = rig.path.join("a.launches");
     supervisor.set_admission_hook_for_test(move |module, stage, pid| {
         if module != "a" {
             return true;
         }
         match stage {
+            "observe_registration_before_exit" if registration_before_exit => {
+                // Force the first actor turn to see registration retirement
+                // before the admission-killed child is observed as waitable.
+                exit_observation_hook.swap(true, std::sync::atomic::Ordering::SeqCst)
+            }
             "after_admission_kill_sent" => {
                 kill_sent_hook.store(true, std::sync::atomic::Ordering::SeqCst);
                 true
@@ -2268,6 +2293,9 @@ async fn exit_after_unavailable_image(unavailable_stage: &'static str, child_exi
     })
     .await;
     assert!(checked.load(std::sync::atomic::Ordering::SeqCst));
+    if registration_before_exit {
+        assert!(exit_observation.load(std::sync::atomic::Ordering::SeqCst));
+    }
     assert!(
         kill_sent.load(std::sync::atomic::Ordering::SeqCst),
         "the admission kill must have been sent, even if the program's own exit won"

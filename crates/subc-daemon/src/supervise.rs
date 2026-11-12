@@ -481,7 +481,8 @@ impl SupervisedChild {
         // Admission failure retires the channel before its kill becomes
         // waitable. That closure must not replace the admission failure with
         // a registration failure and spend crash restart budget.
-        self.spawn_failure.is_none() && !self.registered_since_spawn()
+        let admission_failed = self.admission_kill_sent && self.spawn_failure.is_some();
+        !admission_failed && !self.registered_since_spawn()
     }
 
     fn id(&self) -> Option<u32> {

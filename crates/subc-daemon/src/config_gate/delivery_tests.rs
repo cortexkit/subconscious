@@ -3140,6 +3140,9 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
     let registry = Arc::new(crate::Registry::default());
     let forwarding = Arc::new(crate::ForwardingTable::default());
     let handle = SupervisorHandle::new();
+    // Modules register directly in this fixture. Capture their inherited
+    // channels so the absent socket service does not cause launch refusal.
+    handle.capture_registration_channels_for_test();
     let supervisor =
         Supervisor::new_for_test(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
             .with_handle(handle.clone())
@@ -3656,6 +3659,9 @@ async fn restart_after_busy_swap_warmup(candidate_exits_first: bool) {
     let registry = Arc::new(crate::Registry::default());
     let forwarding = Arc::new(crate::ForwardingTable::default());
     let handle = SupervisorHandle::new();
+    // Modules register directly in this fixture. Capture their inherited
+    // channels so the absent socket service does not cause launch refusal.
+    handle.capture_registration_channels_for_test();
     let supervisor =
         Supervisor::new_for_test(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
             .with_handle(handle.clone())

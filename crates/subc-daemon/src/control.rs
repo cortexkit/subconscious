@@ -18797,6 +18797,60 @@ mod tests {
             );
         }
 
+        #[tokio::test]
+        async fn audit4_ungated_removed_candidate_publication_rolls_back_admission() {
+            let mut swap = swap_with_incumbent().await;
+            let hold = Arc::new(std::sync::Barrier::new(2));
+            let handler = swap
+                .handler
+                .clone()
+                .with_hello_registry_to_forwarding_hold(hold.clone());
+            handler
+                .supervisor
+                .open_swap("aft", "candidate-nonce".into());
+            let hello = {
+                let handler = handler.clone();
+                let ctx = swap.candidate_ctx.clone();
+                std::thread::spawn(move || {
+                    handler
+                        .handle_hello(
+                            CANDIDATE,
+                            Some(ctx.egress),
+                            hello_frame_with_nonce(
+                                "aft",
+                                PROTOCOL_VERSION,
+                                8,
+                                Some("candidate-nonce"),
+                            ),
+                        )
+                        .unwrap()
+                })
+            };
+            hold.wait();
+            assert_eq!(
+                swap.registry
+                    .deregister_connection(CANDIDATE)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            hold.wait();
+            assert!(hello.join().unwrap().is_empty());
+            assert_eq!(
+                swap.candidate_rx.try_recv().unwrap().frame.header.ty,
+                FrameType::HelloAck
+            );
+            assert!(swap.registry.get_candidate("aft").unwrap().is_none());
+            assert_eq!(
+                handler
+                    .supervisor
+                    .swap_hello_admission("aft", Some("candidate-nonce")),
+                SwapHelloAdmission::Candidate,
+                "failed publication must roll back candidate_admitted for an ungated nonce swap"
+            );
+            handler.supervisor.close_swap("aft");
+        }
+
         fn keyed_total(counters: &Value, key: &str) -> u64 {
             counters[key]
                 .as_object()

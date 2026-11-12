@@ -2422,6 +2422,8 @@ pub struct SupervisorHandle {
     program_bindings: program_binding::ProgramBindings,
     #[cfg(test)]
     identity_sample_pause: Arc<Mutex<Option<IdentitySamplePause>>>,
+    #[cfg(all(test, unix))]
+    plain_identity_policy_pause: Arc<Mutex<Option<(String, IdentitySamplePause)>>>,
     restart_intent: Arc<Mutex<DaemonRestartIntent>>,
     activity: Arc<Mutex<Option<crate::activity::ActivityLedger>>>,
     activity_images: Arc<Mutex<HashMap<String, activity::ActivityImage>>>,
@@ -2748,6 +2750,9 @@ impl SupervisorHandle {
     }
 
     pub(crate) fn apply_identity_configuration(&self, spec: &ModuleSpec) {
+        // Prefix ownership follows staged configuration, not the running
+        // child's launch settings. A respawn may still carry an older spec.
+        self.set_reserved_prefixes(&spec.module_id, &spec.reserved_prefixes);
         let protocol = self
             .get(&spec.module_id)
             .and_then(|module| {
@@ -2760,8 +2765,24 @@ impl SupervisorHandle {
         self.apply_identity_policy(spec, protocol);
     }
 
+    #[cfg(all(test, unix))]
+    pub(crate) fn pause_plain_identity_policy_for_test(
+        &self,
+        module: &str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, waiting) = std::sync::mpsc::channel();
+        let (release, paused) = std::sync::mpsc::channel();
+        *self.plain_identity_policy_pause.lock().unwrap() = Some((
+            module.to_owned(),
+            IdentitySamplePause {
+                reached,
+                release: paused,
+            },
+        ));
+        (waiting, release)
+    }
+
     fn apply_identity_policy(&self, spec: &ModuleSpec, protocol: ModuleProtocol) {
-        self.set_reserved_prefixes(&spec.module_id, &spec.reserved_prefixes);
         let mut current_nonces = self
             .spawn_nonces
             .lock()
@@ -10471,6 +10492,24 @@ fn apply_wire_spawn_args_for_admission(
     command.env_remove(subc_os::registration_channel::DAEMON_PID_ENV);
     if role == SpawnRole::Plain {
         if let Some(handle) = handle {
+            #[cfg(all(test, unix))]
+            {
+                let pause = {
+                    let mut slot = handle.plain_identity_policy_pause.lock().unwrap();
+                    if slot
+                        .as_ref()
+                        .is_some_and(|(module, _)| module == &spec.module_id)
+                    {
+                        slot.take().map(|(_, pause)| pause)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(pause) = pause {
+                    pause.reached.send(()).unwrap();
+                    pause.release.recv().unwrap();
+                }
+            }
             // A rescan preserves the running child's nonce and reservation.
             // Replacement spawn preparation applies the new protocol now,
             // before protocol:none can return without minting a nonce.

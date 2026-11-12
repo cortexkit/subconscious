@@ -202,11 +202,11 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         .unwrap()
         .modules[0]
         .module_spec();
-    let module = supervisor.spawn_async(spec).await.unwrap();
+    let rejected_module = supervisor.spawn_async(spec.clone()).await.unwrap();
     let before = std::fs::OpenOptions::new().write(true).open(&covered);
     let excluded = before.as_ref().err().and_then(|error| error.raw_os_error());
     drop(before);
-    let proof = handle.registration_proof_for_test("a").unwrap();
+    let rejected_proof = handle.registration_proof_for_test("a").unwrap();
     handle
         .registration_for_test("a")
         .unwrap()
@@ -221,7 +221,7 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         manifest,
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
-        launch_nonce: proof.nonce(),
+        launch_nonce: rejected_proof.nonce(),
     };
     let frame = subc_protocol::Frame::build(
         subc_protocol::FrameType::Hello,
@@ -236,6 +236,7 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     let mut invalid: serde_json::Value = serde_json::from_slice(&malformed.body).unwrap();
     invalid["protocol_ver"] = json!(0);
     malformed.body = serde_json::to_vec(&invalid).unwrap();
+    rejected_proof.bind(ConnectionId::new(778));
     let (rejected_tx, mut rejected_rx) = tokio::sync::mpsc::channel(8);
     let rejected = handler
         .handle_control_frame(
@@ -253,6 +254,28 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         .err()
         .and_then(|error| error.raw_os_error());
     drop(after_rejection);
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].header.ty, subc_protocol::FrameType::Error);
+    let rejection: serde_json::Value = serde_json::from_slice(&rejected[0].body).unwrap();
+    assert_eq!(rejection["code"], "invalid_manifest");
+    assert!(rejection["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("HELLO protocol_ver 0 does not match manifest protocol_ver"));
+    handler.cleanup_connection(ConnectionId::new(778)).unwrap();
+    rejected_module.stop().await.unwrap();
+    let module = supervisor.spawn_async(spec).await.unwrap();
+    let proof = handle.registration_proof_for_test("a").unwrap();
+    handle
+        .registration_for_test("a")
+        .unwrap()
+        .wait_launch()
+        .await;
+    let ordinary_excluded = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&covered)
+        .err()
+        .and_then(|error| error.raw_os_error());
     let connection = ConnectionId::new(777);
     proof.bind(connection);
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -342,7 +365,6 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         Some(32),
         "covered file must keep its no-write-share witness after resume and before HELLO"
     );
-    assert_ne!(rejected[0].header.ty, subc_protocol::FrameType::HelloAck);
     assert_eq!(
         still_excluded,
         Some(32),
@@ -354,6 +376,7 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         "production forwarding queues the ACK rather than returning it"
     );
     assert_eq!(ack.frame.header.ty, subc_protocol::FrameType::HelloAck);
+    assert_eq!(ordinary_excluded, Some(32));
     assert!(
         released,
         "successful HELLO releases the Windows write-exclusion handles"
@@ -1580,14 +1603,31 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
         .err()
         .and_then(|error| error.raw_os_error());
     let launch_check = launch.check();
+    // Inspect failed publication while the swap is still open and the child
+    // is running; stopping the module would also cancel a successful swap.
+    assert!(module.status().unwrap().process_alive);
+    assert_eq!(
+        launch_check,
+        Err(crate::supervise::REGISTRATION_CHANNEL_CLOSED),
+        "the removed publication must retire the candidate's channel authority before cleanup"
+    );
+    if candidate {
+        assert!(registry
+            .registration(crate::registry::RegistrationSlot::Candidate("a"))
+            .unwrap()
+            .is_none());
+        assert!(
+            handle
+                .with_swap_candidate_admission("a", || ((), false))
+                .is_some(),
+            "an unpublished candidate must not consume the open swap's admission slot"
+        );
+    }
     handler.cleanup_connection(connection).unwrap();
     handler.cleanup_connection(ConnectionId::new(770)).unwrap();
     module.stop().await.unwrap();
     if let Some(swapping) = swapping {
-        assert!(
-            swapping.await.unwrap().is_err(),
-            "the unpublished candidate must not cut over"
-        );
+        let _ = swapping.await.unwrap();
     }
     assert!(reply.is_empty());
     assert_eq!(ack, subc_protocol::FrameType::HelloAck);
@@ -1596,8 +1636,6 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
         Some(32),
         "removed registration must not release retained content handles"
     );
-    assert_eq!(launch_check, Err(crate::supervise::REGISTRATION_CHANNEL_CLOSED),
-        "an unpublished channel HELLO retires its authority without releasing the running child's content handles");
 }
 
 #[cfg(windows)]

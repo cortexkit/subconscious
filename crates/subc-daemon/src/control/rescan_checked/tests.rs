@@ -200,6 +200,112 @@ fn entry(enabled: bool) -> Value {
     json!({"program": "subc-rescan-checked-test-missing-program", "protocol": "none", "enabled": enabled})
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit4_rescan_prefix_transfer_survives_an_old_plain_spawn_spec() {
+    use crate::control::claims::tests::{prefix_hello, request, Wire};
+    use subc_protocol::claim::{ClaimMintReply, ClaimMintRequest, ClaimPurpose};
+
+    let dir = ScratchDir::new("rescan-prefix-respawn");
+    let rig = Arc::new(Rig::new(&dir.join("subc.jsonc"), "prefix-respawn"));
+    let handle = rig.handler.supervisor.clone();
+    handle.capture_registration_channels_for_test();
+    let sleeper = |prefixes: &[&str]| {
+        json!({
+            "program": "/bin/sleep", "args": ["600"], "protocol": "subc",
+            "reserved": true, "reserved_prefixes": prefixes, "drain_timeout_ms": 0,
+            "env": {"XDG_DATA_HOME": dir.path(), "XDG_RUNTIME_DIR": dir.path(), "XDG_CONFIG_HOME": dir.path()},
+        })
+    };
+    rig.write(&doc(
+        json!({"a-new-owner": sleeper(&[]), "z-old-owner": sleeper(&["p:"])}),
+    ));
+    rig.apply_file().await;
+    assert!(handle.prefix_claim_authorized("z-old-owner", "p:child"));
+    let old = handle.get("z-old-owner").unwrap();
+    let new = handle.get("a-new-owner").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !old.status().unwrap().process_alive || !new.status().unwrap().process_alive {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (reached, release) = handle.pause_plain_identity_policy_for_test("z-old-owner");
+    let restarting = tokio::spawn({
+        let old = old.clone();
+        async move { old.restart(None).await }
+    });
+    tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(5)).unwrap())
+        .await
+        .unwrap();
+
+    rig.write(&doc(
+        json!({"a-new-owner": sleeper(&["p:"]), "z-old-owner": sleeper(&[])}),
+    ));
+    let rescanning = tokio::spawn({
+        let rig = rig.clone();
+        async move { rig.apply_file().await }
+    });
+    // Rescan stages the new owner's supervisor configuration first by ID.
+    // The old owner's update is queued behind its replacement preparation.
+    let transferred = tokio::time::timeout(Duration::from_secs(5), async {
+        while !handle.prefix_claim_authorized("a-new-owner", "p:child") {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    release.send(()).unwrap();
+    transferred.expect("the new owner must stage before the paused old owner resumes");
+    restarting.await.unwrap().unwrap();
+    rescanning.await.unwrap();
+
+    let owner_preserved = handle.prefix_claim_authorized("a-new-owner", "p:child");
+    let router = Arc::new(crate::Router::with_control_handler(Arc::new(
+        rig.handler.clone(),
+    )));
+    let mut outsider = Wire::new(&router);
+    let refused = outsider.call(&router, prefix_hello("p:child")).await;
+    let mut primary = Wire::new(&router);
+    let launch = handle.registration_for_test("a-new-owner").unwrap();
+    launch.wait_launch().await;
+    launch.bind(primary.connection.id());
+    let primary_reply = primary.call(&router, prefix_hello("a-new-owner")).await;
+    assert_eq!(primary_reply.header.ty, FrameType::HelloAck);
+    let minted = primary
+        .call(
+            &router,
+            request(ClaimMintRequest::new(ClaimPurpose::Prefix {
+                module_id: "p:child".into(),
+            })),
+        )
+        .await;
+    rig.handler
+        .cleanup_connection(primary.connection.id())
+        .unwrap();
+    rig.handler
+        .cleanup_connection(outsider.connection.id())
+        .unwrap();
+    old.stop().await.unwrap();
+    new.stop().await.unwrap();
+    assert!(
+        owner_preserved,
+        "the queued old-owner update must not erase the staged new owner"
+    );
+    assert_eq!(refused.header.ty, FrameType::Error);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&refused.body).unwrap()["code"],
+        "reserved_module"
+    );
+    assert_eq!(
+        minted.header.ty,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&minted.body)
+    );
+    let _: ClaimMintReply = serde_json::from_slice(&minted.body).unwrap();
+}
+
 #[tokio::test]
 async fn a_candidate_preview_changes_nothing_on_disk_or_in_the_running_set() {
     let dir = ScratchDir::new("rescan-checked-noop");

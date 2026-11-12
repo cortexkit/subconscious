@@ -2,6 +2,9 @@
 //! the spawn transition, claim state/index, then forwarding, in that order.
 //! Bind commits read only the launch watch, never the spawn transition lock.
 //! No forwarding guard is held while awaiting a module.
+//! HELLO publication holds Registry before ForwardingTable::inner so an ACK
+//! cannot be observed before registry publication. Code holding inner must not
+//! take the registry lock, including through a callback.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},

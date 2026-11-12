@@ -716,6 +716,30 @@ where
     handle_connection_with_peer(stream, router, auth, origin, None).await
 }
 
+fn clone_tcp_socket(stream: &tokio::net::TcpStream) -> io::Result<std::net::TcpStream> {
+    #[cfg(unix)]
+    let socket = {
+        use std::os::fd::AsFd;
+        stream.as_fd().try_clone_to_owned()?
+    };
+    #[cfg(windows)]
+    let socket = {
+        use std::os::windows::io::AsSocket;
+        stream.as_socket().try_clone_to_owned()?
+    };
+    Ok(socket.into())
+}
+
+struct ShutdownTcpOnDrop(std::net::TcpStream);
+
+impl Drop for ShutdownTcpOnDrop {
+    fn drop(&mut self) {
+        // Dropping our descriptors is not enough if a forked pre-exec child
+        // retained another copy of this endpoint. Shutdown affects every copy.
+        let _ = self.0.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 async fn handle_connection_with_peer<S>(
     mut stream: S,
     router: Arc<Router>,
@@ -803,6 +827,14 @@ where
     };
     drop(permit);
 
+    // Keep shutdown until after writer drain, including when the connection
+    // future is cancelled. Authentication refusals retain their existing path.
+    let _tcp_shutdown = (&stream as &dyn Any)
+        .downcast_ref::<tokio::net::TcpStream>()
+        .map(|tcp| clone_tcp_socket(tcp).map(ShutdownTcpOnDrop))
+        .transpose()
+        .map_err(|err| ConnectionError::FrameIo(FrameIoError::Io(err)))?;
+
     let mut connection = router.begin_connection();
     let connection_id = connection.id();
     if let LocalOrigin::RegistrationChannel(spawn) = &origin {
@@ -872,8 +904,8 @@ where
     };
 
     // EOF and errors revoke the launch before task withdrawal or writer drain
-    // can await. Socket shutdown invalidates copies of the daemon's endpoint
-    // retained by a child that forked before closing inherited descriptors.
+    // can await. The TCP shutdown guard invalidates inherited endpoint copies
+    // after queued output has had its bounded drain.
     if let Some(spawn) = &channel_spawn {
         spawn.retire();
     }
@@ -1776,6 +1808,44 @@ mod tests {
         // buffer must stay alive so the server's writer cannot finish naturally.
         connection.client.shutdown().await.unwrap();
         connection.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_teardown_sends_eof_while_another_endpoint_copy_is_open() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        // Model the descriptor held by a sibling between fork and exec without
+        // making the test depend on process scheduling or descriptor inheritance.
+        let inherited_copy = clone_tcp_socket(&stream).unwrap();
+        let (auth, conn) = test_auth();
+        let router = echo_router();
+        let server = tokio::spawn(handle_connection(stream, Arc::clone(&router), auth));
+        authenticate(&mut peer, &conn).await;
+        write_frame(&mut peer, &request(7, 1, b"ready"))
+            .await
+            .unwrap();
+        read_frame(&mut peer).await.unwrap().unwrap();
+        assert!(router.forwarding().request_connection_close(
+            crate::registry::ConnectionId::new(1),
+            CloseReason::new("test_close", "test requested close"),
+        ));
+        timeout(TEST_DEADLINE, server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            timeout(TEST_DEADLINE, peer.read(&mut byte))
+                .await
+                .expect("teardown must send EOF without waiting for inherited descriptors")
+                .unwrap(),
+            0,
+        );
+        drop(inherited_copy);
     }
 
     #[tokio::test(start_paused = true)]

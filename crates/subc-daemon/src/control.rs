@@ -557,6 +557,8 @@ pub struct ControlHandler {
     #[cfg(test)]
     hello_registry_to_forwarding_hold: Option<Arc<std::sync::Barrier>>,
     #[cfg(test)]
+    hello_ack_to_publication_hold: Option<Arc<std::sync::Barrier>>,
+    #[cfg(test)]
     hello_before_publication_hold: Option<Arc<std::sync::Barrier>>,
     #[cfg(test)]
     hello_after_launch_check_hold: Option<Arc<std::sync::Barrier>>,
@@ -1180,6 +1182,8 @@ impl ControlHandler {
             #[cfg(test)]
             hello_registry_to_forwarding_hold: None,
             #[cfg(test)]
+            hello_ack_to_publication_hold: None,
+            #[cfg(test)]
             hello_before_publication_hold: None,
             #[cfg(test)]
             hello_after_launch_check_hold: None,
@@ -1342,6 +1346,16 @@ impl ControlHandler {
     #[cfg(test)]
     fn hold_between_registry_and_forwarding(&self) {
         if let Some(hold) = &self.hello_registry_to_forwarding_hold {
+            hold.wait();
+            hold.wait();
+        }
+    }
+
+    /// Park after the ACK is queued and forwarding is installed, until a test
+    /// has read the ACK and issued a registry lookup from another connection.
+    #[cfg(test)]
+    fn hold_between_ack_and_publication(&self) {
+        if let Some(hold) = &self.hello_ack_to_publication_hold {
             hold.wait();
             hold.wait();
         }
@@ -3606,39 +3620,59 @@ impl ControlHandler {
         #[cfg(test)]
         self.hold_between_registry_and_forwarding();
 
-        let reply = if let Some(sink) = sink {
-            // The forwarding table's module store is also the daemon-to-module
-            // control-RPC lane, so every HELLO gets a live endpoint even when the
-            // manifest has no routable provider role. Non-routable modules still
-            // cannot receive route.bind in production: `handle_route_open` checks
-            // the registry manifest with `target_has_required_role` before the
-            // only production call to `begin_route_bind_relay_for` below that
-            // route.open path. The remaining direct relay callers are unit tests
-            // and benchmark harnesses that construct forwarding state explicitly.
-            //
-            // The HELLO_ACK is queued by the forwarding table itself, before the
-            // endpoint becomes visible, and is NOT returned as a reply. A module
-            // reads HELLO_ACK first and exits on anything else; a reply is only
-            // written after this handler returns, by which time a route.open on
-            // another connection could already have queued a route.bind request
-            // for this module ahead of it.
-            let concurrency = manifest_concurrency(&registration.manifest);
-            if let Err(err) = self.forwarding.register_module_connection_acked(
-                connection_id,
-                registration.manifest.module_id.clone(),
-                negotiated_ver,
-                concurrency,
-                sink,
-                crate::forwarding::ModuleHelloAck {
-                    frame: hello_ack,
-                    verified_prefix_owner: verification.prefix_owner,
-                },
-            ) {
-                // No forwarding endpoint or route was published. The weak link
-                // from this connection to its launch remains through read-side
-                // cleanup. Remove the registry entry, which was never published
-                // or counted in the catalog generation, and signal the release
-                // watch directly.
+        let mut reply = Vec::new();
+        // Registry readers must wait from before the ACK can be read until
+        // publication. Nest forwarding inside the registry lock, never reverse.
+        let publication = self
+            .registry
+            .publish_registration_after(connection_id, || {
+                if let Some(sink) = sink {
+                    // The forwarding table's module store is also the daemon-to-module
+                    // control-RPC lane, so every HELLO gets a live endpoint even when the
+                    // manifest has no routable provider role. Non-routable modules still
+                    // cannot receive route.bind in production: `handle_route_open` checks
+                    // the registry manifest with `target_has_required_role` before the
+                    // only production call to `begin_route_bind_relay_for` below that
+                    // route.open path. The remaining direct relay callers are unit tests
+                    // and benchmark harnesses that construct forwarding state explicitly.
+                    //
+                    // The HELLO_ACK is queued by the forwarding table itself, before the
+                    // endpoint becomes visible, and is NOT returned as a reply. A module
+                    // reads HELLO_ACK first and exits on anything else; a reply is only
+                    // written after this handler returns, by which time a route.open on
+                    // another connection could already have queued a route.bind request
+                    // for this module ahead of it.
+                    let concurrency = manifest_concurrency(&registration.manifest);
+                    self.forwarding.register_module_connection_acked(
+                        connection_id,
+                        registration.manifest.module_id.clone(),
+                        negotiated_ver,
+                        concurrency,
+                        sink,
+                        crate::forwarding::ModuleHelloAck {
+                            frame: hello_ack,
+                            verified_prefix_owner: verification.prefix_owner,
+                        },
+                    )?;
+                } else {
+                    // No sink means no forwarding endpoint, so nothing can be routed
+                    // ahead of the ack; it goes out as the reply.
+                    reply.push(hello_ack);
+                }
+                #[cfg(test)]
+                self.hold_between_ack_and_publication();
+                Ok(())
+            })
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let published = match publication {
+            Ok(published) => published,
+            Err(err) => {
+                // The registry lock has been released, so rollback can take it
+                // again. No forwarding endpoint or route was published. Keep
+                // forwarding's weak connection-to-spawn association until the
+                // connection's read loop ends and removes its remaining routes.
+                // Removing this unpublished entry does not advance the catalog
+                // generation.
                 if matches!(
                     self.rollback_unpublished_hello(connection_id),
                     Ok(r) if !r.is_empty()
@@ -3655,22 +3689,8 @@ impl ControlHandler {
                     err.to_string(),
                 )?]);
             }
-            Vec::new()
-        } else {
-            // No sink means no forwarding endpoint, so nothing can be routed
-            // ahead of the ack; it goes out as the reply.
-            vec![hello_ack]
         };
-
-        // The module is routable now (or, without a sink, as routable as it
-        // will ever be), so the catalog may list it. Publishing bumps the
-        // catalog generation in the same registry critical section that makes
-        // the module listed.
-        if !self
-            .registry
-            .publish_registration(connection_id)
-            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
-        {
+        if !published {
             debug!(
                 module_id = %registration.manifest.module_id,
                 connection_id = connection_id.get(),
@@ -3842,19 +3862,34 @@ impl ControlHandler {
         };
         #[cfg(test)]
         self.hold_between_registry_and_forwarding();
-        let reply = if let Some(sink) = sink {
-            // Same ordering as an ordinary HELLO: the forwarding table queues
-            // the HELLO_ACK before the candidate endpoint is inserted, because
-            // a module exits if its first frame after HELLO is anything else.
-            let concurrency = manifest_concurrency(&registration.manifest);
-            if let Err(err) = self.forwarding.register_candidate_module_connection_acked(
-                connection_id,
-                module_id.clone(),
-                negotiated_ver,
-                concurrency,
-                sink,
-                hello_ack,
-            ) {
+        let mut reply = Vec::new();
+        let publication = self
+            .registry
+            .publish_registration_after(connection_id, || {
+                if let Some(sink) = sink {
+                    // Same ordering as an ordinary HELLO: queue the ACK before
+                    // inserting the endpoint, and keep registry readers excluded
+                    // until the candidate is published.
+                    let concurrency = manifest_concurrency(&registration.manifest);
+                    self.forwarding.register_candidate_module_connection_acked(
+                        connection_id,
+                        module_id.clone(),
+                        negotiated_ver,
+                        concurrency,
+                        sink,
+                        hello_ack,
+                    )?;
+                } else {
+                    reply.push(hello_ack);
+                }
+                #[cfg(test)]
+                self.hold_between_ack_and_publication();
+                Ok(())
+            })
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let published = match publication {
+            Ok(published) => published,
+            Err(err) => {
                 if matches!(
                     self.rollback_unpublished_hello(connection_id),
                     Ok(r) if !r.is_empty()
@@ -3867,15 +3902,8 @@ impl ControlHandler {
                     err.to_string(),
                 )?]);
             }
-            Vec::new()
-        } else {
-            vec![hello_ack]
         };
-        if !self
-            .registry
-            .publish_registration(connection_id)
-            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
-        {
+        if !published {
             debug!(
                 module_id = %module_id,
                 connection_id = connection_id.get(),
@@ -13031,6 +13059,88 @@ mod tests {
         (handler, hold, hello, module_ctx, module_rx)
     }
 
+    /// If a lookup can acquire the registry while publication is parked, let
+    /// the lookup finish before releasing HELLO. Otherwise release HELLO only
+    /// after the lookup has tried the lock. Both schedules avoid timing guesses
+    /// and return the actual lookup result, including an unpublished snapshot
+    /// when the publication lock is missing.
+    fn lookup_during_hello_publication<T: Send + 'static>(
+        registry: &Registry,
+        hold: &std::sync::Barrier,
+        lookup: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let attempted = registry.observe_next_lock_attempt();
+        let reader = std::thread::spawn(lookup);
+        if attempted.recv().unwrap() {
+            let result = reader.join().unwrap();
+            hold.wait();
+            result
+        } else {
+            hold.wait();
+            reader.join().unwrap()
+        }
+    }
+
+    #[test]
+    fn catalog_read_after_hello_ack_waits_for_publication() {
+        let registry = Arc::new(Registry::default());
+        let hold = Arc::new(std::sync::Barrier::new(2));
+        let mut handler = ControlHandler::with_forwarding(
+            Arc::clone(&registry),
+            Arc::new(ForwardingTable::default()),
+        );
+        handler.hello_ack_to_publication_hold = Some(Arc::clone(&hold));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(40));
+        let hello = {
+            let handler = handler.clone();
+            std::thread::spawn(move || {
+                handler
+                    .handle_hello(
+                        module_ctx.connection_id,
+                        Some(module_ctx.egress),
+                        hello_frame("aft", PROTOCOL_VERSION, 7),
+                    )
+                    .unwrap()
+            })
+        };
+        hold.wait();
+        assert_eq!(
+            module_rx.try_recv().unwrap().frame.header.ty,
+            FrameType::HelloAck
+        );
+        let replies = lookup_during_hello_publication(&registry, &hold, move || {
+            // A different connection can issue catalog.list as soon as the
+            // module has read its ACK, even while HELLO has not returned.
+            let request = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                300,
+                serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None }).unwrap(),
+            )
+            .unwrap();
+            handler.handle_catalog_list(request, None).unwrap()
+        });
+        assert!(hello.join().unwrap().is_empty());
+        let ClientControlResponse::CatalogList {
+            generation,
+            modules,
+            ..
+        } = serde_json::from_slice(&replies[0].body).unwrap()
+        else {
+            panic!("not a catalog.list reply");
+        };
+        assert_eq!(
+            modules
+                .iter()
+                .map(|entry| entry.module_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["aft"]
+        );
+        assert_eq!(generation, 1);
+    }
+
     /// While a HELLO has reserved its registry entry but its forwarding
     /// endpoint is not installed yet, `route.open` to the module can only be
     /// refused. `catalog.list` must not list the module in that window: a
@@ -18491,6 +18601,57 @@ mod tests {
                 .module_endpoint_for_connection(CANDIDATE)
                 .unwrap()
                 .is_some());
+        }
+
+        #[tokio::test]
+        async fn candidate_lookup_after_hello_ack_waits_for_publication() {
+            let mut swap = swap_with_incumbent().await;
+            let hold = Arc::new(std::sync::Barrier::new(2));
+            swap.handler.hello_ack_to_publication_hold = Some(Arc::clone(&hold));
+            swap.handler
+                .supervisor
+                .open_swap("aft", "candidate-nonce".to_string());
+            let hello = {
+                let handler = swap.handler.clone();
+                let candidate_ctx = swap.candidate_ctx.clone();
+                std::thread::spawn(move || {
+                    handler
+                        .handle_hello(
+                            CANDIDATE,
+                            Some(candidate_ctx.egress),
+                            hello_frame_with_nonce(
+                                "aft",
+                                PROTOCOL_VERSION,
+                                8,
+                                Some("candidate-nonce"),
+                            ),
+                        )
+                        .unwrap()
+                })
+            };
+            hold.wait();
+            assert_eq!(
+                swap.candidate_rx.try_recv().unwrap().frame.header.ty,
+                FrameType::HelloAck
+            );
+            let reader_registry = Arc::clone(&swap.registry);
+            let published = lookup_during_hello_publication(&swap.registry, &hold, move || {
+                reader_registry
+                    .published_registration(crate::registry::RegistrationSlot::Candidate("aft"))
+                    .unwrap()
+            });
+            assert!(hello.join().unwrap().is_empty());
+            assert_eq!(
+                published
+                    .expect("ACK makes candidate publication visible")
+                    .connection_id,
+                CANDIDATE
+            );
+            assert_eq!(
+                swap.registry.generation().unwrap(),
+                1,
+                "candidate is not a second catalog entry"
+            );
         }
 
         fn keyed_total(counters: &Value, key: &str) -> u64 {

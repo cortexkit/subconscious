@@ -130,6 +130,8 @@ pub struct RegistryCutover {
 #[derive(Debug, Default)]
 pub struct Registry {
     inner: Mutex<RegistryInner>,
+    #[cfg(test)]
+    next_lock_attempt: Mutex<Option<std::sync::mpsc::Sender<bool>>>,
 }
 
 #[derive(Debug, Default)]
@@ -423,18 +425,35 @@ impl Registry {
     /// no registration any more, or it was already published.
     pub fn publish_registration(&self, connection_id: ConnectionId) -> Result<bool, RegistryError> {
         let mut inner = self.lock_inner()?;
-        if !inner.unpublished.remove(&connection_id) {
-            return Ok(false);
+        Ok(inner.publish_registration(connection_id))
+    }
+
+    /// Install forwarding and publish without letting a registry reader observe
+    /// the interval after HELLO_ACK is queued but before publication. The install
+    /// callback may take forwarding's lock, but must not re-enter the registry:
+    /// the lock order is Registry -> ForwardingTable::inner.
+    ///
+    /// An install error leaves the registration unpublished. The caller must
+    /// roll it back after this method releases the registry lock. The outer
+    /// result reports registry locking errors; the inner result reports install
+    /// errors or whether the registration was published.
+    pub(crate) fn publish_registration_after<E>(
+        &self,
+        connection_id: ConnectionId,
+        install: impl FnOnce() -> Result<(), E>,
+    ) -> Result<Result<bool, E>, RegistryError> {
+        let mut inner = self.lock_inner()?;
+        if let Err(err) = install() {
+            return Ok(Err(err));
         }
-        let Some((slot, registration)) = inner.find_by_connection(connection_id) else {
-            return Ok(false);
-        };
-        let module_id = registration.manifest.module_id.clone();
-        if matches!(slot, SlotKind::Active) {
-            inner.bump_generation();
-        }
-        inner.notify_module_changed(&module_id);
-        Ok(true)
+        Ok(Ok(inner.publish_registration(connection_id)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_next_lock_attempt(&self) -> std::sync::mpsc::Receiver<bool> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        *self.next_lock_attempt.lock().unwrap() = Some(sender);
+        receiver
     }
 
     /// Move the candidate for `module_id` into the active slot and demote the
@@ -775,6 +794,25 @@ impl Registry {
     }
 
     fn lock_inner(&self) -> Result<MutexGuard<'_, RegistryInner>, RegistryError> {
+        #[cfg(test)]
+        {
+            let observer = self.next_lock_attempt.lock().unwrap().take();
+            if let Some(observer) = observer {
+                // Tell a held-publication test whether its reader acquired the
+                // lock or must wait. This lets it release publication only after
+                // the reader actually attempts the lookup, without a timer.
+                match self.inner.try_lock() {
+                    Ok(inner) => {
+                        observer.send(true).unwrap();
+                        return Ok(inner);
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => observer.send(false).unwrap(),
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(RegistryError::Poisoned);
+                    }
+                }
+            }
+        }
         self.inner.lock().map_err(|_| RegistryError::Poisoned)
     }
 }
@@ -788,6 +826,21 @@ enum SlotKind {
 }
 
 impl RegistryInner {
+    fn publish_registration(&mut self, connection_id: ConnectionId) -> bool {
+        if !self.unpublished.remove(&connection_id) {
+            return false;
+        }
+        let Some((slot, registration)) = self.find_by_connection(connection_id) else {
+            return false;
+        };
+        let module_id = registration.manifest.module_id.clone();
+        if matches!(slot, SlotKind::Active) {
+            self.bump_generation();
+        }
+        self.notify_module_changed(&module_id);
+        true
+    }
+
     fn notify_module_changed(&self, module_id: &str) {
         if let Some(sender) = self.module_changes.get(module_id) {
             sender.send_modify(|_| {});

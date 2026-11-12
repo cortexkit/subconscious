@@ -267,9 +267,10 @@ impl LaunchClaims {
         }
         state.pending.clear();
     }
-    // Called under the spawn transition lock. Fence ingress before releasing the
-    // lock, then deliver close notifications after releasing the transition,
-    // launch-local claims, and token/connection index locks.
+    // Called under the spawn transition lock, after fencing the primary channel.
+    // Fence claim ingress and egress before releasing the lock, then deliver
+    // close notifications after releasing the transition, launch-local claims,
+    // and token/connection index locks.
     pub(crate) fn revoke(&self) -> Vec<ConnectionId> {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         state.active = false;

@@ -336,6 +336,330 @@ async fn registration_retirement_primary_fences_reverse_request_buffered_with_bi
     assert_eq!(forwarding.active_binding_count().unwrap(), 0);
 }
 
+async fn candidate_primary_fixture(
+    promoted: bool,
+) -> (
+    Arc<crate::Router>,
+    SupervisorHandle,
+    Arc<RegistrationSpawn>,
+    Wire,
+    Wire,
+) {
+    let registry = Arc::new(Registry::default());
+    let handle = SupervisorHandle::new();
+    let control = crate::ControlHandler::new(registry.clone()).with_supervisor(handle.clone());
+    let router = Arc::new(crate::Router::with_control_handler(Arc::new(control)));
+    let mut incumbent = Wire::new(&router);
+    assert_eq!(
+        incumbent
+            .call_bounded(&router, provider_hello("candidate-primary"))
+            .await
+            .header
+            .ty,
+        FrameType::HelloAck
+    );
+    handle.set_spawn_nonce("candidate-primary", "incumbent".into());
+    handle.open_swap("candidate-primary", "candidate".into());
+    let spawn =
+        RegistrationSpawn::new(&handle, "candidate-primary", SpawnRole::SwapCandidate, None);
+    spawn.ready();
+    let mut candidate = Wire::new(&router);
+    spawn.bind(candidate.connection.id());
+    assert_eq!(
+        candidate
+            .call_bounded(&router, provider_hello("candidate-primary"))
+            .await
+            .header
+            .ty,
+        FrameType::HelloAck
+    );
+    assert!(spawn.registered());
+    assert_eq!(
+        registry
+            .get_candidate("candidate-primary")
+            .unwrap()
+            .unwrap()
+            .connection_id,
+        candidate.connection.id()
+    );
+    if promoted {
+        let cutover = router
+            .forwarding()
+            .cutover_candidate("candidate-primary")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cutover.promoted.connection_id, candidate.connection.id());
+        registry
+            .promote_candidate("candidate-primary")
+            .unwrap()
+            .unwrap();
+        handle.promote_swap_nonce("candidate-primary", false);
+    } else {
+        assert_eq!(
+            router
+                .forwarding()
+                .active_module_endpoint("candidate-primary")
+                .unwrap()
+                .unwrap()
+                .connection_id,
+            incumbent.connection.id(),
+            "warming must not promote the candidate"
+        );
+    }
+    (router, handle, spawn, incumbent, candidate)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registration_retirement_warming_candidate_primary_fences_both_directions() {
+    let (router, _handle, spawn, incumbent, mut candidate) = candidate_primary_fixture(false).await;
+    let (finish, retirement) = hold_retirement(&spawn).await;
+    assert!(
+        candidate.ctx.egress.ingress_terminal(),
+        "warming candidate primary ingress must be fenced"
+    );
+    assert!(
+        candidate.ctx.egress.egress_terminal(),
+        "warming candidate primary egress must be fenced"
+    );
+    assert!(!incumbent.ctx.egress.ingress_terminal() && !incumbent.ctx.egress.egress_terminal());
+    router
+        .route_for_connection(
+            &candidate.ctx,
+            subc_protocol::Frame::build(FrameType::Ping, control_flags(), 0, 0, 1001, Vec::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    candidate
+        .ctx
+        .egress
+        .send(data_frame(FrameType::Request, 1, 1, 1002))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), candidate.replies.recv())
+            .await
+            .is_err()
+    );
+    finish.send(()).unwrap();
+    retirement.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registration_retirement_promoted_candidate_primary_blocks_buffered_and_post_dead_routes() {
+    let (router, _handle, spawn, _incumbent, mut candidate) = candidate_primary_fixture(true).await;
+    let forwarding = router.forwarding();
+    let mut client = Wire::new(&router);
+    let route = forwarding
+        .begin_route_bind_relay_for_test(
+            client.connection.id(),
+            client.ctx.egress.clone(),
+            1010,
+            "candidate-primary",
+        )
+        .unwrap();
+    forwarding
+        .complete_pending_relay(
+            candidate.connection.id(),
+            route.corr,
+            RouteBindRelayOutcome::Accepted,
+        )
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), client.replies.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .frame
+            .header
+            .ty,
+        FrameType::Response
+    );
+    let mut pending = forwarding
+        .begin_route_bind_relay_for_test(
+            client.connection.id(),
+            client.ctx.egress.clone(),
+            1011,
+            "candidate-primary",
+        )
+        .unwrap();
+    let ack = subc_protocol::Frame::build(
+        FrameType::Response,
+        control_flags(),
+        0,
+        0,
+        pending.corr,
+        serde_json::to_vec(&subc_protocol::session::ModuleControlResponse::RouteBindAck {})
+            .unwrap(),
+    )
+    .unwrap();
+    let reverse = data_frame(
+        FrameType::Request,
+        route.module_channel,
+        route.module_epoch,
+        1012,
+    );
+    let (daemon, module) = std::os::unix::net::UnixStream::pair().unwrap();
+    *spawn.endpoint.lock().unwrap() = Some(daemon.try_clone().unwrap());
+    daemon.set_nonblocking(true).unwrap();
+    module.set_nonblocking(true).unwrap();
+    let mut daemon = tokio::net::UnixStream::from_std(daemon).unwrap();
+    let mut module = tokio::net::UnixStream::from_std(module).unwrap();
+    let mut bytes = Vec::new();
+    for frame in [&ack, &reverse] {
+        bytes.extend_from_slice(&frame.header.encode());
+        bytes.extend_from_slice(&frame.body);
+    }
+    module.write_all(&bytes).await.unwrap();
+    let decoded = subc_transport::read_frame(&mut daemon)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(decoded.header.corr, pending.corr);
+    let (checked, resume) = forwarding.pause_route_commit_for_test();
+    let table = forwarding.clone();
+    let connection = candidate.connection.id();
+    let completion = tokio::task::spawn_blocking(move || {
+        table.complete_pending_relay(
+            connection,
+            decoded.header.corr,
+            RouteBindRelayOutcome::Accepted,
+        )
+    });
+    tokio::time::timeout(Duration::from_secs(2), checked)
+        .await
+        .unwrap()
+        .unwrap();
+    let (finish, retirement) = hold_retirement(&spawn).await;
+    resume.send(()).unwrap();
+    assert!(completion.await.unwrap().unwrap().settled);
+    assert!(matches!(
+        pending.receiver.try_recv().unwrap(),
+        RouteBindRelayOutcome::Accepted
+    ));
+    let opened = tokio::time::timeout(Duration::from_secs(2), client.replies.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .frame;
+    let subc_control::ClientControlResponse::RouteOpen {
+        route_channel,
+        route_epoch,
+        ..
+    } = serde_json::from_slice(&opened.body).unwrap()
+    else {
+        panic!("expected post-Dead commit")
+    };
+    let buffered = subc_transport::read_frame(&mut daemon)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(buffered.header.corr, 1012);
+    router
+        .route_for_connection_ingress(&candidate.ctx, buffered, None, false)
+        .await
+        .unwrap();
+    assert!(
+        client.replies.try_recv().is_err(),
+        "a buffered promoted-candidate reverse request must not reach its client"
+    );
+    router
+        .route_for_connection(
+            &client.ctx,
+            data_frame(FrameType::Request, route_channel, route_epoch, 1013),
+        )
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), candidate.replies.recv())
+            .await
+            .is_err(),
+        "a post-Dead route must not enqueue to the promoted candidate"
+    );
+    assert!(candidate.ctx.egress.ingress_terminal() && candidate.ctx.egress.egress_terminal());
+    assert_eq!(
+        forwarding.active_binding_count().unwrap(),
+        2,
+        "held cleanup must not make the fence checks pass"
+    );
+    finish.send(()).unwrap();
+    retirement.await.unwrap();
+    drop(client);
+    assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registration_retirement_claim_sink_stays_revocable_until_forwarding_cleanup() {
+    let mut rig = rig().await;
+    let mut prefix = prefix_connection(&mut rig, "claims:cleanup").await;
+    assert_eq!(
+        prefix
+            .call(provider_hello("claims:cleanup"))
+            .await
+            .header
+            .ty,
+        FrameType::HelloAck
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while rig
+            .handler
+            .forwarding()
+            .active_module_endpoint("claims:cleanup")
+            .unwrap()
+            .is_none()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let connection = prefix.connection_id(&rig.handler);
+    let sink = rig
+        .spawn
+        .claims
+        .get()
+        .unwrap()
+        .connection_sink_for_test(connection);
+    let forwarding = rig.handler.forwarding();
+    let client = Wire::new(&rig.router);
+    let pending = forwarding
+        .begin_route_bind_relay_for_test(
+            client.connection.id(),
+            client.ctx.egress.clone(),
+            1020,
+            "claims:cleanup",
+        )
+        .unwrap();
+    forwarding
+        .complete_pending_relay(connection, pending.corr, RouteBindRelayOutcome::Accepted)
+        .unwrap();
+    let (reached, release) = forwarding.pause_cleanup_for_test();
+    // This is the cleanup reached after the peer's read loop ends. Pause while
+    // routes still exist, before its independently draining writer is done.
+    let handler = rig.handler.clone();
+    let cleanup = tokio::task::spawn_blocking(move || handler.cleanup_connection(connection));
+    tokio::time::timeout(Duration::from_secs(2), reached)
+        .await
+        .unwrap()
+        .unwrap();
+    rig.spawn.retire();
+    assert!(
+        sink.ingress_terminal() && sink.egress_terminal(),
+        "cleanup must not hide a still-routable claim sink from retirement"
+    );
+    sink.send(data_frame(
+        FrameType::Request,
+        pending.module_channel,
+        pending.module_epoch,
+        1021,
+    ))
+    .await
+    .unwrap();
+    release.send(()).unwrap();
+    cleanup.await.unwrap().unwrap();
+    assert_eq!(forwarding.active_binding_count().unwrap(), 0);
+}
+
 #[tokio::test]
 async fn registration_retirement_drop_keeps_launch_tie_while_pending_relays_exist() {
     let mut rig = rig().await;

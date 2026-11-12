@@ -2635,7 +2635,6 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
-        self.claims.connection_closed(connection_id);
         if let Some(spawn) = self.supervisor.registration_spawn(connection_id) {
             spawn.retire();
         }
@@ -2672,10 +2671,14 @@ impl ControlHandler {
         self.forwarding
             .operator_confirms()
             .connection_closed(connection_id);
-        self.cleanup_connection_with_end_reason(
+        let cleanup = self.cleanup_connection_with_end_reason(
             connection_id,
             RegistrationEndReason::ConnectionClosed,
-        )
+        );
+        // A draining writer can still be reached by a route until forwarding
+        // cleanup finishes. Keep its claim sink visible to launch retirement.
+        self.claims.connection_closed(connection_id);
+        cleanup
     }
 
     fn cleanup_connection_with_end_reason(
@@ -3543,6 +3546,9 @@ impl ControlHandler {
                     .flatten()
                     .is_some()
                 {
+                    if let Some(sink) = primary_sink {
+                        spawn.bind_primary_sink(sink);
+                    }
                     spawn.hello_accepted();
                 }
             } else if self

@@ -103,6 +103,8 @@ struct EgressAccounting {
     freed: Notify,
     client_delivery_closed: AtomicBool,
     client_delivery_stopped: Notify,
+    #[cfg(test)]
+    retire_after_reserve: AtomicBool,
 }
 
 impl EgressAccounting {
@@ -121,6 +123,8 @@ impl EgressAccounting {
             freed: Notify::new(),
             client_delivery_closed: AtomicBool::new(false),
             client_delivery_stopped: Notify::new(),
+            #[cfg(test)]
+            retire_after_reserve: AtomicBool::new(false),
         }
     }
 
@@ -556,6 +560,17 @@ impl FrameSink {
             permit = self.tx.clone().reserve_owned() => permit
                 .map_err(|_| RouterError::backend(0, 0, "connection writer closed"))?,
         };
+        #[cfg(test)]
+        if self
+            .accounting
+            .retire_after_reserve
+            .swap(false, Ordering::Relaxed)
+        {
+            self.terminate_egress();
+        }
+        if self.egress_terminal() {
+            return Err(RouterError::backend(0, 0, "connection egress retired"));
+        }
         Ok(EgressPermit {
             permit,
             accounting: Arc::clone(&self.accounting),
@@ -2242,6 +2257,27 @@ mod tests {
         );
         assert_eq!(sink.backlog().queued_frames, 0);
         assert_eq!(sink.backlog().queued_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn retirement_egress_reservation_rechecks_after_slot_acquisition() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sink = FrameSink::new(tx);
+        // Choose retirement after reserve returns its slot, not while waiting
+        // on egress_stopped, so the final atomic recheck is exercised.
+        sink.accounting
+            .retire_after_reserve
+            .store(true, Ordering::Relaxed);
+        assert!(
+            sink.reserve_owned().await.is_err(),
+            "a slot acquired before retirement must not escape as a live reservation"
+        );
+        assert_eq!(
+            sink.tx.capacity(),
+            1,
+            "refusal must release the reserved slot"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

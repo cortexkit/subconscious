@@ -630,6 +630,8 @@ pub struct ForwardingTable {
     route_commit_pause: Mutex<Option<RouteCommitPause>>,
     #[cfg(all(test, target_os = "linux"))]
     cleanup_tie_observer: Mutex<Option<oneshot::Sender<(bool, usize)>>>,
+    #[cfg(all(test, target_os = "linux"))]
+    cleanup_pause: Mutex<Option<RouteCommitPause>>,
     #[cfg(test)]
     policy_rebind_before_write: Mutex<Option<Arc<std::sync::Barrier>>>,
     inner: Arc<RwLock<ForwardingInner>>,
@@ -670,6 +672,18 @@ struct FrameDropWarning {
 type ChannelDropWarnings = HashMap<(u16, &'static str), FrameDropWarning>;
 
 impl ForwardingTable {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn pause_cleanup_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, observed) = oneshot::channel();
+        let (release, paused) = std::sync::mpsc::channel();
+        *self.cleanup_pause.lock().unwrap() = Some(RouteCommitPause {
+            reached,
+            release: paused,
+        });
+        (observed, release)
+    }
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn observe_cleanup_tie_for_test(&self) -> oneshot::Receiver<(bool, usize)> {
         let (send, receive) = oneshot::channel();
@@ -1956,7 +1970,8 @@ impl ForwardingTable {
         // These readiness reads are not atomic with publication: a route may
         // commit after Dead. Taking a spawn transition lock here would invert
         // the publication lock order. Retirement synchronously terminates claim
-        // ingress and shuts the launch's channel in the same critical section.
+        // ingress and egress, fences primary-channel ingress and egress, and
+        // shuts that channel in the same critical section.
         // Once that step completes, no new request can cross the transient route
         // to or from the retired launch; connection teardown removes the route.
         match outcome {
@@ -3029,6 +3044,14 @@ impl ForwardingTable {
             .remove(&connection_id);
         let mut inner = self.write_inner()?;
         inner.closing_connections.insert(connection_id);
+        #[cfg(all(test, target_os = "linux"))]
+        if let Some(pause) = self.cleanup_pause.lock().unwrap().take() {
+            let _ = pause.reached.send(());
+            pause
+                .release
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test must release connection cleanup");
+        }
         #[cfg(all(test, target_os = "linux"))]
         if let Some(observe) = self.cleanup_tie_observer.lock().unwrap().take() {
             let pending = inner

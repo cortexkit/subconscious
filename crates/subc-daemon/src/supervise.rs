@@ -2897,7 +2897,7 @@ impl SupervisorHandle {
         if authorized {
             Ok(ReservedHelloVerification {
                 nonce_verified: true,
-                prefix_owner: Some(owner_module_id),
+                prefix_owner: (owner_module_id != module_id).then_some(owner_module_id),
             })
         } else {
             Err(ReservedHelloRejection::Prefix {
@@ -6946,6 +6946,26 @@ fn jittered_health_delay(module_id: &str, probe_index: u64, cadence: Duration) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_retirement_self_prefixed_owner_is_not_a_prefix_submodule() {
+        let handle = SupervisorHandle::new();
+        handle.set_spawn_nonce("prefix:owner", "owner-nonce".into());
+        handle.set_reserved_prefixes("prefix:owner", &["prefix:".into()]);
+        let owner = handle
+            .reserved_hello_verification("prefix:owner", Some("owner-nonce"))
+            .unwrap();
+        assert!(owner.nonce_verified);
+        assert!(
+            owner.prefix_owner.is_none(),
+            "an unreserved programmatic owner is not its own prefix child"
+        );
+        let child = handle
+            .reserved_hello_verification("prefix:child", Some("owner-nonce"))
+            .unwrap();
+        assert!(child.nonce_verified);
+        assert_eq!(child.prefix_owner.as_deref(), Some("prefix:owner"));
+    }
 
     #[test]
     fn readding_a_module_clears_its_rescan_removal_tombstone() {

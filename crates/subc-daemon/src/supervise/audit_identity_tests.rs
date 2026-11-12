@@ -113,3 +113,133 @@ async fn audit2_protocol_none_owner_cannot_authorize_prefix_children_with_swap_n
     );
     assert!(!prefix_authorized);
 }
+
+async fn restart_with_staged_protocol(module: &SupervisedModule, next: ModuleSpec) {
+    let generation = module.status().unwrap().spawn_generation;
+    module
+        .update_configuration(next.clone(), HealthConfig::default(), None)
+        .await
+        .unwrap();
+    module.restart(None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = module.status().unwrap();
+            if status.state == ModuleState::Running && status.spawn_generation > generation {
+                assert_eq!(status.protocol, next.protocol);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the same supervised module must finish its staged restart");
+}
+
+fn legacy_hello(module: &str, nonce: &str) -> subc_protocol::Frame {
+    subc_protocol::Frame::build(
+        subc_protocol::FrameType::Hello,
+        subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&subc_protocol::ModuleHelloBody {
+            manifest: subc_protocol::manifest::ModuleManifest::builder(module, "1.0.0").build(),
+            protocol_ver: subc_protocol::PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: Some(nonce.into()),
+        })
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn audit3_in_place_restart_to_none_retires_nonce_and_reserves_identity() {
+    let root = cortexkit_test_support::ScratchDir::new("restart-subc-to-none");
+    let handle = SupervisorHandle::new();
+    let supervisor = supervisor(&handle);
+    let initial = spec(&root, ModuleProtocol::Subc, false);
+    let module = supervisor.spawn_async(initial.clone()).await.unwrap();
+    let old_nonce = handle.spawn_nonce(&initial.module_id).unwrap();
+    let mut next = initial;
+    next.protocol = ModuleProtocol::None;
+    restart_with_staged_protocol(&module, next.clone()).await;
+    let handler =
+        crate::ControlHandler::new(supervisor.registry.clone()).with_supervisor(handle.clone());
+    let reply = handler
+        .handle_control(
+            ConnectionId::new(805),
+            legacy_hello(&next.module_id, &old_nonce),
+        )
+        .unwrap();
+    let nonce = handle.spawn_nonce(&next.module_id);
+    let implicit = handle
+        .implicit_protocol_none
+        .lock()
+        .unwrap()
+        .contains(&next.module_id);
+    module.stop().await.unwrap();
+    assert!(
+        nonce.is_none(),
+        "in-place replacement must remove the old spawn nonce"
+    );
+    assert!(
+        implicit,
+        "the none replacement needs its implicit no-holder reservation"
+    );
+    assert_eq!(reply[0].header.ty, subc_protocol::FrameType::Error);
+}
+
+#[tokio::test]
+async fn audit3_in_place_restart_to_unreserved_subc_releases_implicit_reservation() {
+    let root = cortexkit_test_support::ScratchDir::new("restart-none-to-subc");
+    let handle = SupervisorHandle::new();
+    let supervisor = supervisor(&handle);
+    let initial = spec(&root, ModuleProtocol::None, false);
+    let module = supervisor.spawn_async(initial.clone()).await.unwrap();
+    let mut next = initial;
+    next.protocol = ModuleProtocol::Subc;
+    restart_with_staged_protocol(&module, next.clone()).await;
+    let nonce = handle
+        .spawn_nonce(&next.module_id)
+        .expect("the subc replacement gets a fresh legacy nonce");
+    let unreserved = handle.reserved_hello_authorized(&next.module_id, None);
+    let implicit = handle
+        .implicit_protocol_none
+        .lock()
+        .unwrap()
+        .contains(&next.module_id);
+    let handler =
+        crate::ControlHandler::new(supervisor.registry.clone()).with_supervisor(handle.clone());
+    let reply = handler
+        .handle_control(
+            ConnectionId::new(806),
+            legacy_hello(&next.module_id, &nonce),
+        )
+        .unwrap();
+    handler.cleanup_connection(ConnectionId::new(806)).unwrap();
+    module.stop().await.unwrap();
+    assert!(
+        unreserved,
+        "the old implicit reservation is not an operator reservation"
+    );
+    assert!(!implicit);
+    assert_eq!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
+}
+
+#[tokio::test]
+async fn audit3_protocol_none_owner_refuses_a_stale_prefix_spawn_nonce() {
+    let root = cortexkit_test_support::ScratchDir::new("none-prefix-nonce");
+    let handle = SupervisorHandle::new();
+    let supervisor = supervisor(&handle);
+    let mut initial = spec(&root, ModuleProtocol::None, false);
+    initial.reserved_prefixes = vec!["implicit:".into()];
+    let module = supervisor.spawn_async(initial.clone()).await.unwrap();
+    handle.set_spawn_nonce(&initial.module_id, "stale-owner-nonce".into());
+    let authorized = handle.reserved_hello_authorized("implicit:child", Some("stale-owner-nonce"));
+    module.stop().await.unwrap();
+    assert!(
+        !authorized,
+        "a protocol-none owner cannot authorize a prefix child through a stale spawn nonce"
+    );
+}

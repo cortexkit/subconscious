@@ -180,7 +180,7 @@ impl ProgramBindingPublication {
     pub(super) fn channel_key(&self) -> ProgramBindingKey {
         self.key.1.clone()
     }
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(super) fn key_for_test(&self) -> String {
         self.key.1.locator()
     }
@@ -535,14 +535,6 @@ impl SupervisorHandle {
             }
         });
     }
-    #[cfg(all(test, windows))]
-    pub(crate) fn candidate_launch_nonce_for_test(&self, module: &str) -> Option<String> {
-        self.swaps
-            .lock()
-            .ok()?
-            .get(module)
-            .map(|swap| swap.candidate_nonce.clone())
-    }
     #[cfg(windows)]
     pub(crate) fn program_hello_accepted(&self, module: &str, nonce: &str) {
         let Some(key) = self.binding_key(module, nonce) else {
@@ -828,15 +820,7 @@ impl SupervisorHandle {
             }
         }
         if role == SpawnRole::Plain {
-            let owned: HashSet<_> = bindings
-                .publications
-                .iter()
-                .filter(|(_, publication)| publication.strong_count() != 0)
-                .map(|(key, _)| key.clone())
-                .collect();
-            bindings
-                .active
-                .retain(|key, _| key.0 != module || owned.contains(key));
+            bindings.active.retain(|(owner, _), _| owner != module);
         }
         let live = Arc::new(Mutex::new(std::sync::Weak::new()));
         let key = (module.to_owned(), channel_key);

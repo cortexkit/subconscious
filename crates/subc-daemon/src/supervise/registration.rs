@@ -375,12 +375,12 @@ impl SupervisorHandle {
             launch.retire_unused();
         }
     }
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn capture_registration_channels_for_test(&self) {
         *self.registration_test_channels.lock().unwrap() = Some(Vec::new());
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn registration_for_test(&self, module: &str) -> Option<Arc<RegistrationSpawn>> {
         self.registration_test_channels
             .lock()
@@ -392,7 +392,7 @@ impl SupervisorHandle {
             .map(|(spawn, _)| spawn.clone())
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn registration_proof_for_test(&self, module: &str) -> Option<RegistrationProof> {
         let Some(channel) = self.registration_for_test(module) else {
             return self.spawn_nonce(module).map(Into::into);
@@ -407,7 +407,7 @@ impl SupervisorHandle {
         })
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn candidate_registration_proof_for_test(
         &self,
         module: &str,
@@ -548,11 +548,14 @@ impl SupervisorHandle {
                 return;
             }
         }
-        #[cfg(all(test, unix))]
+        #[cfg(test)]
         {
             let mut captured = self.registration_test_channels.lock().unwrap();
             if let Some(channels) = &mut *captured {
-                channels.push((spawn, channel));
+                channels.push((
+                    spawn,
+                    super::CapturedRegistrationEndpoint { _channel: channel },
+                ));
                 return;
             }
         }
@@ -663,38 +666,38 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for RegistrationStr
 /// A unit fixture owns the daemon endpoint while it dispatches HELLO directly,
 /// without a socket reader. Its table key locates a channel; it is not sent as a
 /// launch nonce. Full transport tests use the authenticated service instead.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct RegistrationProof {
     key: String,
     channel: Option<Arc<RegistrationSpawn>>,
 }
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl std::ops::Deref for RegistrationProof {
     type Target = str;
     fn deref(&self) -> &str {
         &self.key
     }
 }
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl PartialEq for RegistrationProof {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
     }
 }
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl From<String> for RegistrationProof {
     fn from(key: String) -> Self {
         Self { key, channel: None }
     }
 }
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl From<&str> for RegistrationProof {
     fn from(key: &str) -> Self {
         key.to_owned().into()
     }
 }
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl RegistrationProof {
     pub(crate) fn bind(&self, connection: ConnectionId) {
         if let Some(channel) = &self.channel {

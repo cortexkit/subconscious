@@ -360,23 +360,82 @@ mod dual_path_tests {
 
     #[tokio::test]
     async fn audit2_recovering_channel_cannot_fall_back_to_its_matching_nonce() {
-        let f = Fixture::new(false, "subc").await;
-        let nonce = f.handler.supervisor.spawn_nonce("ckbus").unwrap();
+        let f = Fixture::new(true, "subc").await;
+        let spawn = f.handler.supervisor.registration_for_test("ckbus").unwrap();
+        assert!(f
+            .handler
+            .supervisor
+            .has_live_verified_channel_binding(&spawn));
+        f.approve(PlanKind::Unstamp);
+        let nonce = "matching-legacy-nonce";
+        f.handler.supervisor.set_spawn_nonce("ckbus", nonce.into());
+        assert!(f
+            .handler
+            .supervisor
+            .spawned_consumer_authorized("ckbus", nonce));
+        f.approve(PlanKind::Stamp);
+        f.recovery();
+        assert!(spawn.has_program_binding());
         assert!(!f
             .handler
             .supervisor
-            .registration_for_test("ckbus")
-            .unwrap()
-            .has_program_binding());
-        f.approve(PlanKind::Stamp);
-        f.recovery();
-        let refused = f.hello(true, Some(&nonce));
+            .has_live_verified_channel_binding(&spawn));
+        spawn
+            .check()
+            .expect("the retained publication is live; only its active table binding was removed");
+        let refused = f.hello(true, Some(nonce));
         assert_eq!(refused.header.ty, FrameType::Error);
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&refused.body).unwrap()["code"],
             "config_gated"
         );
         f.stop().await;
+    }
+
+    async fn delayed_plain_hello_after_replacement(recovery: bool) {
+        let f = Fixture::new(true, "subc").await;
+        let old = f.handler.supervisor.registration_for_test("ckbus").unwrap();
+        let replacement = f
+            ._supervisor
+            .spawn_async(Fixture::spec(&f.root.join("subc.jsonc")))
+            .await
+            .unwrap();
+        let current = f.handler.supervisor.registration_for_test("ckbus").unwrap();
+        current.wait_launch().await;
+        assert!(!Arc::ptr_eq(&old, &current));
+        assert!(f.module.status().unwrap().process_alive);
+        assert!(old.has_program_binding());
+        old.check()
+            .expect("the older process remains alive with its verified publication");
+        if recovery {
+            f.recovery();
+        }
+        old.bind(PRIMARY);
+        let refused = f.hello(false, None);
+        assert_eq!(
+            refused.header.ty,
+            FrameType::Error,
+            "a delayed first HELLO cannot publish a superseded Plain launch"
+        );
+        f.handler.cleanup_connection(PRIMARY).unwrap();
+        assert_eq!(
+            f.hello(true, None).header.ty,
+            FrameType::HelloAck,
+            "the current Plain launch keeps the id in normal admission and recovery"
+        );
+        f.handler.cleanup_connection(PRIMARY).unwrap();
+        replacement.stop().await.unwrap();
+        f.stop().await;
+    }
+
+    #[tokio::test]
+    async fn audit3_delayed_plain_hello_is_refused_after_replacement() {
+        delayed_plain_hello_after_replacement(false).await;
+    }
+
+    #[tokio::test]
+    async fn audit3_delayed_plain_hello_is_refused_after_replacement_in_recovery() {
+        delayed_plain_hello_after_replacement(true).await;
     }
 
     #[tokio::test]

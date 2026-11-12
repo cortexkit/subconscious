@@ -191,6 +191,7 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     let registry = Arc::new(crate::Registry::default());
     let forwarding = Arc::new(crate::ForwardingTable::default());
     let handle = SupervisorHandle::new();
+    handle.capture_registration_channels_for_test();
     let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
         .with_handle(handle.clone())
         .with_config_runtime(owner.clone())
@@ -205,7 +206,12 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     let before = std::fs::OpenOptions::new().write(true).open(&covered);
     let excluded = before.as_ref().err().and_then(|error| error.raw_os_error());
     drop(before);
-    let nonce = handle.spawn_launch_nonce_for("a").unwrap();
+    let proof = handle.registration_proof_for_test("a").unwrap();
+    handle
+        .registration_for_test("a")
+        .unwrap()
+        .wait_launch()
+        .await;
     let handler = crate::ControlHandler::with_forwarding(registry.clone(), forwarding)
         .with_supervisor(handle.clone())
         .with_config_runtime(owner);
@@ -215,7 +221,7 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         manifest,
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
-        launch_nonce: Some(nonce),
+        launch_nonce: proof.nonce(),
     };
     let frame = subc_protocol::Frame::build(
         subc_protocol::FrameType::Hello,
@@ -248,6 +254,7 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         .and_then(|error| error.raw_os_error());
     drop(after_rejection);
     let connection = ConnectionId::new(777);
+    proof.bind(connection);
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let reply = handler
         .handle_control_frame(
@@ -267,13 +274,13 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         let module = module.clone();
         tokio::spawn(async move { module.swap(Some(std::time::Duration::from_secs(5))).await })
     };
-    let candidate_nonce = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let candidate_proof = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            if let Some(nonce) = handle.candidate_launch_nonce_for_test("a") {
-                if handle.has_live_verified_program_binding_for_test("a", &nonce)
-                    && handle.wait_program_binding_for_test("a", &nonce).await
+            if let Some(proof) = handle.candidate_registration_proof_for_test("a") {
+                if handle.has_live_verified_program_binding_for_test("a", &proof)
+                    && handle.wait_program_binding_for_test("a", &proof).await
                 {
-                    break nonce;
+                    break proof;
                 }
             }
             tokio::task::yield_now().await;
@@ -288,7 +295,7 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         .and_then(|error| error.raw_os_error());
     drop(before_candidate_ack);
     let mut candidate_hello = hello;
-    candidate_hello.launch_nonce = Some(candidate_nonce);
+    candidate_hello.launch_nonce = candidate_proof.nonce();
     let candidate_frame = subc_protocol::Frame::build(
         subc_protocol::FrameType::Hello,
         subc_protocol::Flags::new(false, subc_protocol::Priority::Passive, false),
@@ -299,6 +306,7 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     )
     .unwrap();
     let candidate_connection = ConnectionId::new(779);
+    candidate_proof.bind(candidate_connection);
     let (candidate_tx, mut candidate_rx) = tokio::sync::mpsc::channel(8);
     let candidate_reply = handler
         .handle_control_frame(
@@ -1438,7 +1446,7 @@ async fn config_admission_windows_protocol_none_keeps_binding_until_child_exit()
 
 #[cfg(windows)]
 async fn windows_removed_registration_preserves_binding(candidate: bool) {
-    use crate::supervise::{RestartPolicy, Supervisor, SupervisorHandle, SwapHelloAdmission};
+    use crate::supervise::{RestartPolicy, Supervisor, SupervisorHandle};
     use std::sync::Arc;
     let rig = Rig::new();
     let program = rig.path.join("program.exe");
@@ -1455,6 +1463,7 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
     let registry = Arc::new(crate::Registry::default());
     let forwarding = Arc::new(crate::ForwardingTable::default());
     let handle = SupervisorHandle::new();
+    handle.capture_registration_channels_for_test();
     let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
         .with_handle(handle.clone())
         .with_config_runtime(owner.clone())
@@ -1466,32 +1475,28 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
         .modules[0]
         .module_spec();
     let module = supervisor.spawn_async(spec).await.unwrap();
-    let nonce = handle.spawn_launch_nonce_for("a").unwrap();
-    assert!(handle.wait_program_binding_for_test("a", &nonce).await);
-    if candidate {
-        registry
-            .register_with_control_ops(
-                subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
-                subc_protocol::PROTOCOL_VERSION,
-                ConnectionId::new(770),
-                vec![],
-            )
-            .unwrap();
-        // Exercise candidate registration with the real child's open handles
-        // that prevent writes to its approved program and covered files;
-        // this test does not run the asynchronous swap coordinator.
-        handle.open_swap("a", nonce.clone());
-    }
-    let hold = Arc::new(std::sync::Barrier::new(2));
+    let initial_proof = handle.registration_proof_for_test("a").unwrap();
+    handle
+        .registration_for_test("a")
+        .unwrap()
+        .wait_launch()
+        .await;
+    assert!(
+        handle
+            .wait_program_binding_for_test("a", &initial_proof)
+            .await
+    );
+    assert!(initial_proof.nonce().is_none());
     let handler = crate::ControlHandler::with_forwarding(registry.clone(), forwarding)
         .with_supervisor(handle.clone())
-        .with_config_runtime(owner)
-        .with_hello_registry_to_forwarding_hold(hold.clone());
+        .with_config_runtime(owner);
+    let mut manifest = subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build();
+    manifest.ready = Some(true);
     let hello = subc_protocol::ModuleHelloBody {
-        manifest: subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+        manifest,
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
         control_ops: None,
-        launch_nonce: Some(nonce.clone()),
+        launch_nonce: initial_proof.nonce(),
     };
     let frame = subc_protocol::Frame::build(
         subc_protocol::FrameType::Hello,
@@ -1502,7 +1507,54 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
         serde_json::to_vec(&hello).unwrap(),
     )
     .unwrap();
+    let (incumbent_sender, mut incumbent_frames) = tokio::sync::mpsc::channel(8);
+    let (proof, swapping) = if candidate {
+        let incumbent = ConnectionId::new(770);
+        initial_proof.bind(incumbent);
+        let reply = handler
+            .handle_control_frame(
+                &crate::RouteCtx {
+                    connection_id: incumbent,
+                    egress: crate::FrameSink::new(incumbent_sender),
+                },
+                frame.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(reply.is_empty());
+        assert_eq!(
+            incumbent_frames.try_recv().unwrap().frame.header.ty,
+            subc_protocol::FrameType::HelloAck
+        );
+        let swapping = {
+            let module = module.clone();
+            tokio::spawn(async move { module.swap(Some(std::time::Duration::from_secs(5))).await })
+        };
+        let proof = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(proof) = handle.candidate_registration_proof_for_test("a") {
+                    if handle.has_live_verified_program_binding_for_test("a", &proof)
+                        && handle.wait_program_binding_for_test("a", &proof).await
+                    {
+                        break proof;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        (proof, Some(swapping))
+    } else {
+        (initial_proof, None)
+    };
+    let launch = handle.registration_for_test("a").unwrap();
+    launch.wait_launch().await;
+    assert_eq!(launch.is_candidate(), candidate);
+    let hold = Arc::new(std::sync::Barrier::new(2));
+    let handler = handler.with_hello_registry_to_forwarding_hold(hold.clone());
     let connection = ConnectionId::new(771);
+    proof.bind(connection);
     let (sender, mut frames) = tokio::sync::mpsc::channel(8);
     let ctx = crate::RouteCtx {
         connection_id: connection,
@@ -1527,17 +1579,16 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
         .open(&covered)
         .err()
         .and_then(|error| error.raw_os_error());
-    let candidate_still_available = !candidate
-        || matches!(
-            handle.swap_hello_admission("a", Some(&nonce)),
-            SwapHelloAdmission::Candidate
-        );
+    let launch_check = launch.check();
     handler.cleanup_connection(connection).unwrap();
-    registry
-        .deregister_connection(ConnectionId::new(770))
-        .unwrap();
-    handle.close_swap("a");
+    handler.cleanup_connection(ConnectionId::new(770)).unwrap();
     module.stop().await.unwrap();
+    if let Some(swapping) = swapping {
+        assert!(
+            swapping.await.unwrap().is_err(),
+            "the unpublished candidate must not cut over"
+        );
+    }
     assert!(reply.is_empty());
     assert_eq!(ack, subc_protocol::FrameType::HelloAck);
     assert_eq!(
@@ -1545,10 +1596,8 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
         Some(32),
         "removed registration must not release retained content handles"
     );
-    assert!(
-        candidate_still_available,
-        "unpublished candidate must not consume its admission nonce"
-    );
+    assert_eq!(launch_check, Err(crate::supervise::REGISTRATION_CHANNEL_CLOSED),
+        "an unpublished channel HELLO retires its authority without releasing the running child's content handles");
 }
 
 #[cfg(windows)]
@@ -1559,6 +1608,6 @@ async fn config_admission_windows_removed_ordinary_publication_keeps_handles() {
 
 #[cfg(windows)]
 #[tokio::test]
-async fn config_admission_windows_removed_candidate_publication_keeps_handles_and_nonce() {
+async fn config_admission_windows_removed_candidate_publication_keeps_handles() {
     windows_removed_registration_preserves_binding(true).await;
 }

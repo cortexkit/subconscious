@@ -361,9 +361,19 @@ fn privacy_command(
 type SpawnRegistrationChannel = std::os::unix::net::UnixStream;
 #[cfg(windows)]
 type SpawnRegistrationChannel = subc_os::registration_channel::RegistrationPipe;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 type CapturedRegistrationChannels =
-    Arc<Mutex<Option<Vec<(Arc<RegistrationSpawn>, SpawnRegistrationChannel)>>>>;
+    Arc<Mutex<Option<Vec<(Arc<RegistrationSpawn>, CapturedRegistrationEndpoint)>>>>;
+#[cfg(test)]
+struct CapturedRegistrationEndpoint {
+    _channel: SpawnRegistrationChannel,
+}
+#[cfg(test)]
+impl fmt::Debug for CapturedRegistrationEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CapturedRegistrationEndpoint")
+    }
+}
 
 struct SupervisedChild {
     registration_spawn: Option<Arc<RegistrationSpawn>>,
@@ -2403,7 +2413,7 @@ struct SupervisedConfiguration {
 pub struct SupervisorHandle {
     #[cfg(test)]
     resource_commit_pause: Arc<Mutex<Option<resource_launch::ResourceCommitPause>>>,
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     registration_test_channels: CapturedRegistrationChannels,
     registration_service: Arc<Mutex<Option<registration::RegistrationService>>>,
     registration_connections: Arc<Mutex<HashMap<ConnectionId, Arc<RegistrationSpawn>>>>,
@@ -2738,7 +2748,6 @@ impl SupervisorHandle {
     }
 
     pub(crate) fn apply_identity_configuration(&self, spec: &ModuleSpec) {
-        self.set_reserved_prefixes(&spec.module_id, &spec.reserved_prefixes);
         let protocol = self
             .get(&spec.module_id)
             .and_then(|module| {
@@ -2748,6 +2757,11 @@ impl SupervisorHandle {
                     .then_some(snapshot.spawned_protocol.unwrap_or(spec.protocol))
             })
             .unwrap_or(spec.protocol);
+        self.apply_identity_policy(spec, protocol);
+    }
+
+    fn apply_identity_policy(&self, spec: &ModuleSpec, protocol: ModuleProtocol) {
+        self.set_reserved_prefixes(&spec.module_id, &spec.reserved_prefixes);
         let mut current_nonces = self
             .spawn_nonces
             .lock()
@@ -2926,7 +2940,10 @@ impl SupervisorHandle {
             return Ok(ReservedHelloVerification::default());
         };
 
-        if module_id.len() == prefix.len() || (!channel && self.module_is_gated(&owner_module_id)) {
+        if module_id.len() == prefix.len()
+            || (!channel
+                && (self.module_is_gated(&owner_module_id) || self.protocol_none(&owner_module_id)))
+        {
             return Err(ReservedHelloRejection::Prefix {
                 prefix,
                 owner_module_id,
@@ -10452,6 +10469,14 @@ fn apply_wire_spawn_args_for_admission(
     command.env_remove(subc_os::registration_channel::REGISTRATION_FD_ENV);
     command.env_remove(subc_os::registration_channel::REGISTRATION_PIPE_ENV);
     command.env_remove(subc_os::registration_channel::DAEMON_PID_ENV);
+    if role == SpawnRole::Plain {
+        if let Some(handle) = handle {
+            // A rescan preserves the running child's nonce and reservation.
+            // Replacement spawn preparation applies the new protocol now,
+            // before protocol:none can return without minting a nonce.
+            handle.apply_identity_policy(spec, spec.protocol);
+        }
+    }
     if spec.protocol == ModuleProtocol::None {
         return Ok(None);
     }

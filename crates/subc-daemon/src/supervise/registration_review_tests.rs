@@ -65,7 +65,7 @@ async fn registration_channel_sync_spawn_budget_ignores_previous_same_id_configu
     );
 }
 
-fn hello(module: &str) -> Frame {
+pub(super) fn hello(module: &str) -> Frame {
     let hello = subc_protocol::ModuleHelloBody {
         manifest: subc_protocol::manifest::ModuleManifest::builder(module, "1.0.0").build(),
         protocol_ver: subc_protocol::PROTOCOL_VERSION,
@@ -83,7 +83,7 @@ fn hello(module: &str) -> Frame {
     .unwrap()
 }
 
-fn auth() -> (crate::server::ServerAuth, subc_transport::ConnectionInfo) {
+pub(super) fn auth() -> (crate::server::ServerAuth, subc_transport::ConnectionInfo) {
     let info = subc_transport::ConnectionInfo {
         schema: subc_transport::SCHEMA_VERSION,
         wire_version: None,
@@ -113,7 +113,7 @@ fn serve(
     serve_control(handle, spawn, auth, control)
 }
 
-fn serve_control(
+pub(super) fn serve_control(
     handle: &SupervisorHandle,
     spawn: Arc<RegistrationSpawn>,
     auth: crate::server::ServerAuth,

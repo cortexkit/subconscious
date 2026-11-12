@@ -5,6 +5,251 @@ use subc_control::{ClaimPresentRequest, ClaimPurpose};
 use subc_protocol::FrameType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+fn provider_hello(module: &str) -> subc_protocol::Frame {
+    use subc_protocol::manifest::{
+        Concurrency, ExecutionMode, IdentityScope, ModuleManifest, ProviderRole, Tool,
+    };
+    let body = subc_protocol::ModuleHelloBody {
+        manifest: ModuleManifest::builder(module, "1.0.0")
+            .provides(vec![ProviderRole::ToolProvider {
+                tools: vec![Tool {
+                    name: "read".into(),
+                    description: None,
+                    execution_mode: ExecutionMode::Pure,
+                    schema: serde_json::json!({"type":"object"}),
+                }],
+                identity_scope: vec![IdentityScope::Project, IdentityScope::Session],
+                concurrency: Concurrency::ModuleManaged,
+                emits_push: true,
+                sub_supervises: false,
+            }])
+            .build(),
+        protocol_ver: subc_protocol::PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: None,
+    };
+    subc_protocol::Frame::build(
+        FrameType::Hello,
+        control_flags(),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&body).unwrap(),
+    )
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registration_retirement_goodbye_keeps_claim_bind_fence_until_socket_teardown() {
+    let mut rig = rig().await;
+    let mut provider = Wire::new(&rig.router);
+    assert_eq!(
+        provider
+            .call(&rig.router, provider_hello("retirement-provider"))
+            .await
+            .header
+            .ty,
+        FrameType::HelloAck
+    );
+    let token = mint(&mut rig, ClaimPurpose::SelfConnection).await.claim;
+    let mut client = Wire::new(&rig.router);
+    assert_eq!(
+        client
+            .call(&rig.router, request(ClaimPresentRequest::new(token)))
+            .await
+            .header
+            .ty,
+        FrameType::Response
+    );
+    rig.router
+        .route_for_connection(
+            &client.ctx,
+            subc_protocol::Frame::build(FrameType::Goodbye, control_flags(), 0, 0, 2, Vec::new())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let open = subc_control::ClientControlRequest::RouteOpen {
+        busy_refusals: None,
+        target: subc_protocol::RouteTarget::ToolProvider {
+            module_id: "retirement-provider".into(),
+        },
+        identity: subc_protocol::BindIdentity::new("retirement-test", "goodbye"),
+        consumer_identity: None,
+        consumer_capabilities: None,
+        role_versions: None,
+        admission_facts: None,
+        scope: None,
+    };
+    let router = rig.router.clone();
+    let ctx = client.ctx.clone();
+    let opening =
+        tokio::spawn(async move { router.route_for_connection(&ctx, request(open)).await });
+    let bind = tokio::time::timeout(Duration::from_secs(2), provider.replies.recv())
+        .await
+        .unwrap()
+        .unwrap()
+        .frame;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bind.body).unwrap()["op"],
+        "route.bind"
+    );
+    rig.spawn.retire();
+    let ack = subc_protocol::Frame::build(
+        FrameType::Response,
+        control_flags(),
+        0,
+        0,
+        bind.header.corr,
+        serde_json::to_vec(&subc_protocol::session::ModuleControlResponse::RouteBindAck {})
+            .unwrap(),
+    )
+    .unwrap();
+    rig.router
+        .route_for_connection(&provider.ctx, ack)
+        .await
+        .unwrap();
+    opening.await.unwrap().unwrap();
+    let reply = client.replies.recv().await.unwrap().frame;
+    assert_eq!(
+        reply.header.ty,
+        FrameType::Error,
+        "GOODBYE must not erase a claim-bound opener's launch fence"
+    );
+    assert_eq!(
+        rig.handler.forwarding().reserved_route_count().unwrap(),
+        (0, 0)
+    );
+    assert_eq!(rig.handler.forwarding().active_binding_count().unwrap(), 0);
+    let client_id = client.connection.id();
+    assert!(rig
+        .handler
+        .forwarding()
+        .spawn_connection_recorded_for_test(client_id));
+    drop(client);
+    assert!(
+        !rig.handler
+            .forwarding()
+            .spawn_connection_recorded_for_test(client_id),
+        "physical connection teardown must forget the launch tie"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registration_retirement_target_after_readiness_cannot_deliver_committed_request() {
+    let registry = Arc::new(Registry::default());
+    let handle = SupervisorHandle::new();
+    let control = crate::ControlHandler::new(registry.clone()).with_supervisor(handle.clone());
+    let forwarding = control.forwarding();
+    let spawn = RegistrationSpawn::new(&handle, "racing-target", SpawnRole::Plain, None);
+    spawn.ready();
+    let (auth, info) = super::review_tests::auth();
+    let (router, mut target, _copy) =
+        super::review_tests::serve_control(&handle, spawn.clone(), auth, control);
+    subc_transport::authenticate_client(&mut target, &info, Duration::from_secs(2))
+        .await
+        .unwrap();
+    subc_transport::write_frame(&mut target, &provider_hello("racing-target"))
+        .await
+        .unwrap();
+    assert_eq!(
+        subc_transport::read_frame(&mut target)
+            .await
+            .unwrap()
+            .unwrap()
+            .header
+            .ty,
+        FrameType::HelloAck
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !spawn.registered() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let target_id = registry
+        .get_module("racing-target")
+        .unwrap()
+        .unwrap()
+        .connection_id;
+    let mut client = Wire::new(&router);
+    let mut pending = forwarding
+        .begin_route_bind_relay_for_test(
+            client.connection.id(),
+            client.ctx.egress.clone(),
+            800,
+            "racing-target",
+        )
+        .unwrap();
+    let (observed, release) = forwarding.pause_route_commit_for_test();
+    let table = forwarding.clone();
+    let completion = tokio::task::spawn_blocking(move || {
+        table.complete_pending_relay(target_id, pending.corr, RouteBindRelayOutcome::Accepted)
+    });
+    tokio::time::timeout(Duration::from_secs(2), observed)
+        .await
+        .unwrap()
+        .unwrap();
+    spawn.retire();
+    assert!(!spawn.launch_ready());
+    release.send(()).unwrap();
+    assert!(completion.await.unwrap().unwrap().settled);
+    assert!(
+        matches!(
+            pending.receiver.try_recv().unwrap(),
+            RouteBindRelayOutcome::Accepted
+        ),
+        "the fixture must reach the permitted check-then-commit window"
+    );
+    let opened = client.replies.recv().await.unwrap().frame;
+    let subc_control::ClientControlResponse::RouteOpen {
+        route_channel,
+        route_epoch,
+        ..
+    } = serde_json::from_slice(&opened.body).unwrap()
+    else {
+        panic!("expected a committed route.open")
+    };
+    router
+        .route_for_connection(
+            &client.ctx,
+            subc_protocol::Frame::build(
+                FrameType::Request,
+                control_flags(),
+                route_channel,
+                route_epoch,
+                801,
+                b"must-not-cross".to_vec(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let received = tokio::time::timeout(
+        Duration::from_secs(2),
+        subc_transport::read_frame(&mut target),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !matches!(received, Ok(Some(_))),
+        "a retired target received a frame through the committed route: {received:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while forwarding.active_binding_count().unwrap() != 0
+            || forwarding
+                .module_endpoint_for_connection(target_id)
+                .unwrap()
+                .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("physical teardown must remove the transient route");
+}
+
 struct PreExecSibling {
     release: std::io::PipeWriter,
     task: tokio::task::JoinHandle<()>,

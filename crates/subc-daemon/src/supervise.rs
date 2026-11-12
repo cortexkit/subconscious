@@ -907,6 +907,7 @@ impl SupervisedChild {
     }
 
     fn start_admission_kill(&mut self) -> io::Result<()> {
+        self.retire_registration();
         #[cfg(windows)]
         let result = {
             // Preserve the leader's distinctive status before ending the whole
@@ -13076,25 +13077,8 @@ async fn stop_unregistered_child(child: &mut SupervisedChild) -> io::Result<()> 
         // Process-group safety rule: only signal a group while its leader is
         // our unreaped child. Even a zombie leader reserves its pid/group id;
         // reaping it before KILL would let that id name an unrelated group.
-        // Observe without reaping so helpers still get the full TERM grace and
-        // the leader continues to reserve the group id until the final KILL.
-        let grace = sleep(crate::child_roster::TERM_TO_KILL);
-        tokio::pin!(grace);
-        tokio::select! {
-            biased;
-            _ = async {
-                loop {
-                    match subc_os::child_exit::observe(child.pid) {
-                        Ok(None) => sleep(Duration::from_millis(1)).await,
-                        _ => {
-                            child.retire_registration();
-                            break;
-                        }
-                    }
-                }
-            } => grace.await,
-            _ = &mut grace => {},
-        }
+        // Sleep without waiting so TERM-ignoring helpers get the full grace.
+        sleep(crate::child_roster::TERM_TO_KILL).await;
         let group = unreaped_registration_group(child)?;
         let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
     }
@@ -20363,6 +20347,27 @@ mod job_containment_tests {
     #[tokio::test]
     async fn admission_kill_reaps_grandchild_with_carried_job() {
         assert_admission_kill_reaps_grandchild(true).await;
+    }
+
+    #[tokio::test]
+    async fn admission_kill_retires_registration_before_wait() {
+        let mut fixture = fixture("admission-registration", "admission-registration");
+        let handle = SupervisorHandle::new();
+        let spawn =
+            RegistrationSpawn::new(&handle, "admission-registration", SpawnRole::Plain, None);
+        spawn.ready();
+        let child = fixture.child.as_mut().unwrap();
+        child.registration_spawn = Some(spawn.clone());
+        child.start_admission_kill().unwrap();
+        assert!(
+            !spawn.launch_ready(),
+            "admission kill must retire before its caller can await the child"
+        );
+        timeout(Duration::from_secs(10), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        child.finish_exit(false).await.unwrap();
     }
 
     impl Fixture {

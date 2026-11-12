@@ -3626,10 +3626,11 @@ impl ControlHandler {
                     verified_prefix_owner: verification.prefix_owner,
                 },
             ) {
-                // Forwarding registration failed, so there is no forwarding
-                // state to tear down. Remove the registry entry, which was never
-                // published and so never listed or counted in the catalog
-                // generation, and signal the release watch directly.
+                // No forwarding endpoint or route was published. The weak link
+                // from this connection to its launch remains until physical
+                // teardown. Remove the registry entry, which was never published
+                // or counted in the catalog generation, and signal the release
+                // watch directly.
                 if matches!(
                     self.rollback_unpublished_hello(connection_id),
                     Ok(r) if !r.is_empty()
@@ -3704,7 +3705,7 @@ impl ControlHandler {
 
         if let Some(spawn) = &channel_spawn {
             spawn.hello_accepted();
-        } else {
+        } else if prefix_binding.is_none() {
             self.supervisor
                 .retire_unused_registration_channel(&registration.manifest.module_id, false);
         }

@@ -1268,7 +1268,7 @@ pub(crate) mod tests {
     pub(crate) struct Wire {
         pub(crate) connection: RouterConnection,
         pub(crate) ctx: RouteCtx,
-        replies: mpsc::Receiver<OutboundFrame>,
+        pub(crate) replies: mpsc::Receiver<OutboundFrame>,
     }
 
     impl Wire {
@@ -2103,6 +2103,25 @@ pub(crate) mod tests {
             FrameType::Response
         );
         wire
+    }
+
+    #[tokio::test]
+    async fn claims_prefix_hello_does_not_retire_unrelated_supervised_channel() {
+        let mut rig = rig().await;
+        let (_peer, unrelated, _module, _) =
+            network_primary_with_hello(&rig, "claims:unrelated", false).await;
+        assert!(unrelated.launch_ready());
+        let mut child = prefix_wire(&mut rig, "claims:unrelated").await;
+        assert_eq!(
+            child
+                .call(&rig.router, prefix_hello("claims:unrelated"))
+                .await
+                .header
+                .ty,
+            FrameType::HelloAck
+        );
+        assert!(unrelated.launch_ready(), "a prefix HELLO belongs to its owner's launch, not a supervised launch with the child's id");
+        assert!(rig.spawn.launch_ready());
     }
 
     fn assert_prefix_torn_down(rig: &Rig, connection: ConnectionId, module_id: &str) {

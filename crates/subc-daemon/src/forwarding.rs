@@ -626,6 +626,8 @@ pub(crate) type ConnectionCloseReceiver = oneshot::Receiver<CloseReason>;
 /// Dynamic forwarding state shared by the control plane and data-plane router.
 #[derive(Debug, Default)]
 pub struct ForwardingTable {
+    #[cfg(all(test, target_os = "linux"))]
+    route_commit_pause: Mutex<Option<RouteCommitPause>>,
     #[cfg(test)]
     policy_rebind_before_write: Mutex<Option<Arc<std::sync::Barrier>>>,
     inner: Arc<RwLock<ForwardingInner>>,
@@ -648,6 +650,13 @@ pub struct ForwardingTable {
     route_outages: Arc<crate::route_outage::RouteOutageTracker>,
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Debug)]
+struct RouteCommitPause {
+    reached: oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
 pub(crate) type PolicyRevocation = (Vec<EndpointRoute>, Vec<GoodbyeTarget>);
 
 #[derive(Debug)]
@@ -659,6 +668,25 @@ struct FrameDropWarning {
 type ChannelDropWarnings = HashMap<(u16, &'static str), FrameDropWarning>;
 
 impl ForwardingTable {
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn spawn_connection_recorded_for_test(&self, connection: ConnectionId) -> bool {
+        self.read_inner()
+            .unwrap()
+            .spawn_connections
+            .contains_key(&connection)
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn pause_route_commit_for_test(
+        &self,
+    ) -> (oneshot::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached, observed) = oneshot::channel();
+        let (release, paused) = std::sync::mpsc::channel();
+        *self.route_commit_pause.lock().unwrap() = Some(RouteCommitPause {
+            reached,
+            release: paused,
+        });
+        (observed, release)
+    }
     pub(crate) fn bind_spawn(
         &self,
         connection: ConnectionId,
@@ -939,6 +967,11 @@ impl ForwardingTable {
 
     pub(crate) fn unregister_connection_close(&self, connection_id: ConnectionId) {
         self.lock_close_registry().remove(&connection_id);
+        // RouterConnection drops only when the socket's work has ended.
+        // A channel-0 GOODBYE clears routes but leaves this launch tie intact.
+        if let Ok(mut inner) = self.write_inner() {
+            inner.spawn_connections.remove(&connection_id);
+        }
     }
 
     /// Close every established connection, modules and clients alike, as the
@@ -1910,6 +1943,12 @@ impl ForwardingTable {
             });
         }
 
+        // These readiness reads are not atomic with publication: a route may
+        // commit after Dead. Taking a spawn transition lock here would invert
+        // the publication lock order. Retirement synchronously terminates claim
+        // ingress and shuts the launch's channel in the same critical section.
+        // Once that step completes, no new request can cross the transient route
+        // to or from the retired launch; connection teardown removes the route.
         match outcome {
             // Three shapes of "the client is not there to receive this route" that
             // must resolve identically: its egress is already closed, or it is
@@ -2047,6 +2086,14 @@ impl ForwardingTable {
                 });
             }
             RouteBindRelayOutcome::Accepted => {
+                #[cfg(all(test, target_os = "linux"))]
+                if let Some(pause) = self.route_commit_pause.lock().unwrap().take() {
+                    let _ = pause.reached.send(());
+                    pause
+                        .release
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("test must release bind publication");
+                }
                 let abandoned = commit_route_locked(&mut inner, pending)?;
                 return Ok(PendingRelayCompletion {
                     settled: true,
@@ -2972,7 +3019,6 @@ impl ForwardingTable {
             .remove(&connection_id);
         let mut inner = self.write_inner()?;
         inner.closing_connections.insert(connection_id);
-        inner.spawn_connections.remove(&connection_id);
         let cleanup = if let Some(endpoint) = inner.endpoint_by_connection.remove(&connection_id) {
             remove_module_connection_locked(&mut inner, endpoint)
         } else {

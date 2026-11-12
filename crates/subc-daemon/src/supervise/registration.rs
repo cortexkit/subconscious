@@ -1,6 +1,9 @@
 //! Per-launch registration, tracked separately from nonce checks keyed by module ID.
 //! Locks only protect snapshots; neither service nor launch waits hold them.
 
+#[cfg(test)]
+#[path = "registration_read_tests.rs"]
+mod read_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "retirement_tests.rs"]
 mod retirement_tests;
@@ -598,7 +601,12 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RegistrationStrea
         let before = buf.filled().len();
         let can_read = buf.remaining() != 0;
         let result = std::pin::Pin::new(&mut this.stream).poll_read(cx, buf);
-        if can_read && result.is_ready() && buf.filled().len() == before {
+        let ended = match &result {
+            std::task::Poll::Ready(Ok(())) => can_read && buf.filled().len() == before,
+            std::task::Poll::Ready(Err(error)) => error.kind() != io::ErrorKind::Interrupted,
+            std::task::Poll::Pending => false,
+        };
+        if ended {
             this.spawn.retire();
         }
         result

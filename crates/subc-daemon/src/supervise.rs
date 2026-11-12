@@ -2752,6 +2752,7 @@ impl SupervisorHandle {
     pub(crate) fn apply_identity_configuration(&self, spec: &ModuleSpec) {
         // Prefix ownership follows staged configuration, not the running
         // child's launch settings. A respawn may still carry an older spec.
+        self.set_reserved_prefixes(&spec.module_id, &spec.reserved_prefixes);
         let protocol = self
             .get(&spec.module_id)
             .and_then(|module| {
@@ -2782,7 +2783,6 @@ impl SupervisorHandle {
     }
 
     fn apply_identity_policy(&self, spec: &ModuleSpec, protocol: ModuleProtocol) {
-        self.set_reserved_prefixes(&spec.module_id, &spec.reserved_prefixes);
         let mut current_nonces = self
             .spawn_nonces
             .lock()

@@ -1320,7 +1320,7 @@ fn worker_fixture_with_key(
     std::fs::write(
         rig.path.join("subc.jsonc"),
         serde_json::to_vec(&json!({"version":1,"modules":{
-            "a":{"program":rig.path.join("program")}, "b":{"program":rig.path.join("program")}
+            "a":{"program":rig.path.join("program"),"registration_channel":true}, "b":{"program":rig.path.join("program"),"registration_channel":true}
         }}))
         .unwrap(),
     )
@@ -3251,7 +3251,7 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
         .to_string_lossy()
         .into_owned();
     // The approved generation, not live file staging, selects the next command.
-    std::fs::write(rig.path.join("subc.jsonc"), serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":next.program,"args":next.args,"overlap":"safe"}}})).unwrap()).unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"), serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":next.program,"args":next.args,"overlap":"safe","registration_channel":true}}})).unwrap()).unwrap();
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::ModuleRestart]);
     let gate = owner.module_gate("a").unwrap();
     let guard = gate.lock().await;
@@ -3679,7 +3679,7 @@ async fn restart_after_busy_swap_warmup(candidate_exits_first: bool) {
     let mut spec = supervised_spec(&rig, "a");
     spec.protocol = subc_control::ModuleProtocol::Subc;
     spec.overlap = ModuleOverlap::Safe;
-    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":spec.program,"args":spec.args,"protocol":"subc","overlap":"safe"}}})).unwrap()).unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":spec.program,"args":spec.args,"protocol":"subc","overlap":"safe","registration_channel":true}}})).unwrap()).unwrap();
     let owner = Arc::new(rig.owner("restart-after-candidate-exit"));
     rig.declare(&owner, INCUMBENT.get());
     rig.stamp(&owner);
@@ -3758,7 +3758,7 @@ async fn restart_after_busy_swap_warmup(candidate_exits_first: bool) {
         .join("a.current.launches")
         .to_string_lossy()
         .into_owned();
-    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":next.program,"args":next.args,"protocol":"subc","overlap":"safe"}}})).unwrap()).unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":next.program,"args":next.args,"protocol":"subc","overlap":"safe","registration_channel":true}}})).unwrap()).unwrap();
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::ModuleRestart]);
     let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
     let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();

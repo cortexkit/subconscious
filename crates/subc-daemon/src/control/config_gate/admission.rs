@@ -86,7 +86,7 @@ mod dual_path_tests {
             let path = root.join("subc.jsonc");
             std::fs::write(&path, serde_json::to_vec(&json!({
                 "version": 1, "modules": {"ckbus": {
-                    "program": "/bin/sleep", "args": ["600"], "protocol": protocol,
+                    "program": "/bin/sleep", "args": ["600"], "protocol": protocol, "registration_channel": true,
                     "env": {"HOME": root.to_string_lossy(), "XDG_DATA_HOME": root.to_string_lossy(),
                         "XDG_CONFIG_HOME": root.to_string_lossy(), "XDG_RUNTIME_DIR": root.to_string_lossy()}
                 }}

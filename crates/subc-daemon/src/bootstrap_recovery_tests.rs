@@ -1085,6 +1085,10 @@ async fn config_recovery_spawned_unstamp_reconciles_changed_existing_actor_while
     doc["modules"]["held-fixture"]["args"] = json!(["3599"]);
     std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
     rig.reject_store(false);
+    // config.status reports the last store check. config.plan checks the damaged
+    // store and updates the status returned by the following poll.
+    let checked = rpc(&mut client, json!({"op":"config.plan"})).await;
+    assert_eq!(checked["code"], "config_gated", "{checked}");
     assert_eq!(
         rpc(&mut client, json!({"op":"config.status"})).await["status"]["state"],
         "store_unverified"
@@ -1185,6 +1189,10 @@ async fn config_recovery_spawned_unstamp_stages_enable_until_exit_completion() {
         std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
         if !stamp {
             rig.reject_store(false);
+            // A config.status poll does not check the store. config.plan detects
+            // the damage and updates the status to store_unverified for the next poll.
+            let checked = rpc(&mut client, json!({"op":"config.plan"})).await;
+            assert_eq!(checked["code"], "config_gated", "{checked}");
             assert_eq!(
                 rpc(&mut client, json!({"op":"config.status"})).await["status"]["state"],
                 "store_unverified"

@@ -1081,7 +1081,7 @@ fn config_owner_unrelated_invalid_layer_does_not_stale_a_reviewed_module() {
     };
     std::fs::write(rig.path.join("cortexkit/a.jsonc"), layer(1)).unwrap();
     std::fs::write(rig.path.join("cortexkit/b.jsonc"), layer(1)).unwrap();
-    std::fs::write(rig.path.join("subc.jsonc"), serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":rig.path.join("program")},"b":{"program":rig.path.join("program")}}})).unwrap()).unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"), serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":rig.path.join("program"),"registration_channel":true},"b":{"program":rig.path.join("program"),"registration_channel":true}}})).unwrap()).unwrap();
     let owner = rig.owner("unrelated");
     rig.declare(&owner, 10);
     owner

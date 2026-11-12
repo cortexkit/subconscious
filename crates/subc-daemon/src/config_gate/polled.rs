@@ -156,8 +156,9 @@ impl RuntimeOwner {
                 .warnings
                 .push("approved recovery exit is waiting for reconciliation".into());
         } else if state.stamp_channel_cutover {
-            // Durable publication precedes stopping old nonce-authorized children.
-            // Do not report the gate enabled while those children still run.
+            // The stamped snapshot already governs admission. Keep the warning
+            // until processes launched with nonce-based registration have stopped
+            // and their replacements have started or been parked by admission.
             status
                 .warnings
                 .push("approved stamp is waiting for registration channel cutover".into());

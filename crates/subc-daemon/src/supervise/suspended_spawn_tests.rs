@@ -157,26 +157,32 @@ async fn macos_ungated_script_starts_without_a_code_directory() {
     .unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut spec = probe.spec(&marker);
-    spec.program = script;
+    spec.program = script.clone();
     spec.args.clear();
-    for runtime in [runtime(), gated_runtime(&probe, &spec, false)] {
-        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
-        child.confirm_privacy_exec().await;
-        assert_eq!(child.spawn_failure, None);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while std::fs::read(&marker).ok().as_deref() != Some(b"started") {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(std::fs::read(&marker).unwrap(), b"started");
-        assert!(child.report_ready.get().is_some());
-        child.start_kill().unwrap();
-        child.wait().await.unwrap();
-        child.release_roster();
-        std::fs::remove_file(&marker).unwrap();
+    for direct_interpreter in [false, true] {
+        if direct_interpreter {
+            spec.program = "/bin/sh".into();
+            spec.args = vec![script.to_string_lossy().into_owned()];
+        }
+        for runtime in [runtime(), gated_runtime(&probe, &spec, false)] {
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+            let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
+            child.confirm_privacy_exec().await;
+            assert_eq!(child.spawn_failure, None);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while std::fs::read(&marker).ok().as_deref() != Some(b"started") {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(&marker).unwrap(), b"started");
+            assert!(child.report_ready.get().is_some());
+            child.start_kill().unwrap();
+            child.wait().await.unwrap();
+            child.release_roster();
+            std::fs::remove_file(&marker).unwrap();
+        }
     }
 }
 
@@ -223,7 +229,7 @@ async fn macos_suspended_refusal_never_runs_marker_target() {
 }
 
 #[tokio::test]
-async fn macos_gated_script_approval_does_not_admit_changed_content_or_another_script() {
+async fn macos_gated_scripts_are_refused_before_interpreter_substitution() {
     let probe = Probe::new();
     use std::os::unix::fs::PermissionsExt;
     for replace_path in [false, true] {
@@ -235,14 +241,22 @@ async fn macos_gated_script_approval_does_not_admit_changed_content_or_another_s
         let mut spec = probe.spec(&marker);
         spec.program = script.clone();
         spec.args.clear();
-        let runtime = gated_runtime(&probe, &spec, true);
+        let owner = gated_owner(&probe.root, &spec, false);
+        // Refuse the script before approval of its interpreter image can
+        // grant launch authority, even when the script has not changed.
+        let error = owner
+            .prepare(crate::config_gate::PlanKind::Stamp)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "program_refused");
+        assert!(error.detail.contains("compiled program"));
         let unapproved = format!(
             "#!/bin/sh\nprintf started > '{}'\nexec /bin/sleep 30\n",
             marker.display()
         );
         if replace_path {
-            // Both scripts use the approved interpreter. Substituting B at A's
-            // launch path must not inherit A's approval through that image.
+            // Both scripts use the same interpreter. Substituting a second
+            // script at the configured path must not make it admissible.
             std::fs::write(&other, unapproved).unwrap();
             std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
             std::fs::remove_file(&script).unwrap();
@@ -250,20 +264,11 @@ async fn macos_gated_script_approval_does_not_admit_changed_content_or_another_s
         } else {
             std::fs::write(&script, unapproved).unwrap();
         }
-        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        let refused = match spawn_and_mark_running(&spec, &runtime, &snapshot) {
-            Err(SuperviseError::ConfigHeld { code, .. }) => code == "program_refused",
-            Err(error) => panic!("unexpected script refusal: {error:?}"),
-            Ok(mut child) => {
-                child.confirm_privacy_exec().await;
-                let refused = child.spawn_failure.is_some();
-                let _ = child.start_kill();
-                child.wait().await.unwrap();
-                child.release_roster();
-                refused
-            }
-        };
-        assert!(refused, "unapproved script content was admitted through an interpreter wildcard; replace_path={replace_path}");
+        let error = owner
+            .prepare(crate::config_gate::PlanKind::Stamp)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "program_refused", "replace_path={replace_path}");
         assert!(!marker.exists());
     }
 }

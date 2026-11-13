@@ -43,23 +43,6 @@ pub(super) fn report_snapshot(
             _ => None,
         })
         .collect();
-    status.interpreter_only_covered = snapshot
-        .inputs
-        .iter()
-        .filter_map(|(key, input)| {
-            let InputKey::Program { module, .. } = key else {
-                return None;
-            };
-            let subc_config::RecordedValue::Value { value } = &input.value else {
-                return None;
-            };
-            (value.get("coverage").and_then(serde_json::Value::as_str)
-                == Some("interpreter only covered"))
-            .then(|| module.clone())
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
 }
 
 #[cfg(test)]

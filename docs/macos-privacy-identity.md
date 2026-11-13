@@ -42,7 +42,11 @@ group, and records the named spawn failure under the usual restart budget. A
 script retains the existing orphan-identity rule: the kernel's selected
 interpreter image is recorded, but the trampoline image is never accepted.
 A script module's privacy identity is its interpreter's, so a script needing
-permission should be shipped as a signed binary.
+permission should be shipped as a signed binary. These script identity rules
+apply only with the config gate off (unstamped). With the gate on, both `#!`
+scripts and modules launched through a known interpreter are refused with
+`program_refused`: the interpreter re-reads the script by path after the gate
+checks it. Ship a compiled program instead.
 
 Before confirmation the shutdown roster owns the pid but records no executable.
 Orphan cleanup cannot signal such an unverified record. After confirmation it

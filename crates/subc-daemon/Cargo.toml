@@ -24,6 +24,11 @@ name = "ckdev-config-store-fixture"
 path = "tests/fixtures/config-store.rs"
 required-features = ["test-support"]
 
+[[bin]]
+name = "config-gate-fixture"
+path = "src/bin/config-gate-fixture.rs"
+required-features = ["test-support"]
+
 [dependencies]
 base64 = "0.22"
 cortexkit-log = { version = "0.3.3" }

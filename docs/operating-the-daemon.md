@@ -134,6 +134,17 @@ An approved stamp switches authority from live files to the approved store.
 After stamping, edits are proposals, not authority. The whole `subc.jsonc`
 document is covered, including ungated modules' entries and top-level policy.
 An ungated module still reads its own files unchecked; status lists that gap.
+
+While the config gate is on, script modules are refused with `program_refused`.
+This includes executable `#!` scripts and modules launched through a known
+interpreter such as Node, Bun, Deno, Python or sh, even when the script is listed
+as a covered program file. The interpreter re-reads the script by path after the
+gate checks it, leaving a window for the file to be swapped. Ship the module as
+a compiled program instead. With the gate off (unstamped), scripts still start
+as before. The `config.status` field `interpreter_only_covered` remains on the
+wire for compatibility, but is always empty; interpreters are no longer admitted
+with partial coverage.
+
 For changes, use:
 
 ```sh

@@ -12,6 +12,8 @@ mod status_placement;
 struct Rig {
     path: std::path::PathBuf,
     declaration: ConfigDeclareRequest,
+    #[cfg(unix)]
+    program_mode: std::sync::OnceLock<&'static str>,
 }
 
 #[test]
@@ -584,7 +586,12 @@ impl Rig {
             path.join("cortexkit/a.jsonc").to_string_lossy(),
             vec![],
         );
-        Self { path, declaration }
+        Self {
+            path,
+            declaration,
+            #[cfg(unix)]
+            program_mode: std::sync::OnceLock::new(),
+        }
     }
 
     fn owner(&self, incarnation: &str) -> RuntimeOwner {
@@ -624,7 +631,46 @@ impl Rig {
         }
     }
 
+    #[cfg(unix)]
+    fn write_native_program(&self, mode: &'static str) {
+        // Cargo builds the native fixture alongside the test binary; no shell
+        // wrapper or runtime compiler is needed for gated launch fixtures.
+        let binary = crate::config_gate::program::native_fixture_for_test();
+        std::fs::copy(binary, self.path.join("program")).unwrap();
+        self.program_mode
+            .set(mode)
+            .expect("fixture mode already set");
+        #[cfg(target_os = "macos")]
+        assert!(std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(self.path.join("program"))
+            .status()
+            .unwrap()
+            .success());
+    }
+
     fn stamp(&self, owner: &RuntimeOwner) -> u64 {
+        #[cfg(unix)]
+        if let Some(mode) = self.program_mode.get() {
+            let path = self.path.join("subc.jsonc");
+            let mut doc: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            for entry in doc["modules"].as_object_mut().unwrap().values_mut() {
+                if entry["program"] == json!(self.path.join("program")) {
+                    let args = entry
+                        .as_object_mut()
+                        .unwrap()
+                        .entry("args")
+                        .or_insert_with(|| json!([]))
+                        .as_array_mut()
+                        .unwrap();
+                    if args.first() != Some(&json!(mode)) {
+                        args.insert(0, json!(mode));
+                    }
+                }
+            }
+            std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        }
         let prepared = owner.prepare(PlanKind::Stamp).unwrap();
         let plan = owner.finish_plan(prepared, daemon_review).unwrap();
         owner

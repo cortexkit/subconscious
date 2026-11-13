@@ -45,9 +45,7 @@ impl RuntimeOwner {
                 // A config-only read cannot disprove a recorded program change.
                 status.pending_proposals = status.pending_proposals.max(u64::from(changed));
             } else {
-                let coverage = std::mem::take(&mut status.interpreter_only_covered);
                 status_inputs::report_snapshot(&candidate, &mut status);
-                status.interpreter_only_covered = coverage;
             }
         }
         Ok(status)
@@ -237,21 +235,6 @@ impl RuntimeOwner {
         let approved = snapshot.clone().unwrap_or_default();
         if let Some(snapshot) = snapshot {
             status_inputs::report_snapshot(&snapshot, &mut status);
-            for (key, input) in &snapshot.inputs {
-                if let (
-                    super::super::InputKey::Program { module, .. },
-                    subc_config::RecordedValue::Value { value },
-                ) = (key, &input.value)
-                {
-                    if value.get("coverage").and_then(serde_json::Value::as_str)
-                        == Some("interpreter only covered")
-                    {
-                        status
-                            .warnings
-                            .push(format!("{module}: interpreter only covered"));
-                    }
-                }
-            }
         }
         status.gated_modules = admission.held_modules();
         let phone = (store.state == StoreState::Stamped

@@ -1,6 +1,125 @@
 use super::*;
 
 #[tokio::test]
+async fn staged_unstamp_enable_preserves_a_live_child_instead_of_parking_it() {
+    let (_scratch, owner, supervisor, _, spec) =
+        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+    std::fs::write(&spec.args[0], b"keep running").unwrap();
+    let RegisteredConfiguredModule {
+        mut spec,
+        mut runtime,
+        module,
+        mut commands,
+    } = supervisor
+        .register_configured_with_health(
+            spec,
+            true,
+            Default::default(),
+            None,
+            Default::default(),
+            DEFAULT_REGISTER_TIMEOUT,
+        )
+        .unwrap();
+    let mut child = Some(
+        spawn_and_mark_running_async(&spec, &runtime, &module.inner.snapshot)
+            .await
+            .unwrap(),
+    );
+    let before = module.status().unwrap();
+    // Model the desired-state update before reaping: the actor still owns a
+    // live child even though its desired enabled flag has already been cleared.
+    update_snapshot(&module.inner.snapshot, Some("a"), |state| {
+        state.enabled = false
+    })
+    .unwrap();
+    let plan = owner
+        .finish_plan(
+            owner
+                .prepare(crate::config_gate::PlanKind::Unstamp)
+                .unwrap(),
+            crate::config_gate::runtime::daemon_review,
+        )
+        .unwrap();
+    let facts = crate::config_gate::ApprovalFacts {
+        connection: 7,
+        owner_uid: true,
+        desktop_app: true,
+        attested_operator_app: true,
+        os_prompt_available: true,
+        phone: None,
+        caller: Default::default(),
+    };
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let approval = owner.begin_approval(&plan.digest, &facts).unwrap();
+    owner
+        .finish_approval(
+            approval.attempt(),
+            &facts,
+            crate::config_gate::ApprovalReply::Presence(
+                crate::config_gate::PresenceDecision::InteractiveApproval,
+            ),
+            2,
+        )
+        .unwrap();
+    assert!(owner.can_stage_unstamp_enable());
+    let (tx, rx) = oneshot::channel();
+    let command = SupervisorCommand::SetEnabled {
+        enabled: true,
+        reset_budget: true,
+        requester: Some(Principal::Direct),
+        reply: tx,
+    };
+    assert!(
+        handle_supervisor_command(
+            command,
+            &mut spec,
+            &mut runtime,
+            &supervisor.registry,
+            &supervisor.process_liveness,
+            &module.inner.snapshot,
+            &mut child,
+            &mut commands,
+            &mut VecDeque::new()
+        )
+        .await
+    );
+    assert!(rx.await.unwrap().unwrap());
+    let staged = module.status().unwrap();
+    let parked = lock_snapshot(&module.inner.snapshot)
+        .unwrap()
+        .config_hold_parked;
+    let (tx, rx) = oneshot::channel();
+    assert!(
+        !handle_supervisor_command(
+            SupervisorCommand::Drain {
+                requester: None,
+                reply: tx
+            },
+            &mut spec,
+            &mut runtime,
+            &supervisor.registry,
+            &supervisor.process_liveness,
+            &module.inner.snapshot,
+            &mut child,
+            &mut commands,
+            &mut VecDeque::new()
+        )
+        .await
+    );
+    rx.await.unwrap().unwrap();
+    assert!(staged.enabled && staged.process_alive);
+    assert_eq!(staged.pid, before.pid);
+    assert_eq!(staged.spawn_generation, before.spawn_generation);
+    assert_eq!(staged.state, ModuleState::Running);
+    assert!(
+        !parked,
+        "an actor with its live child is not parked for release"
+    );
+}
+
+#[tokio::test]
 async fn config_exit_hold_completes_behind_a_queued_config_restart_without_an_active_generation() {
     let (_scratch, owner, supervisor, handler, spec) =
         crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();

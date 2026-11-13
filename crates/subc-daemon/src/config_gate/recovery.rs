@@ -19,6 +19,7 @@ impl ApprovedDaemonConfiguration {
         ApprovalIdentity {
             generation: self.generation,
             approval_digest: self.approval_digest.clone(),
+            authority_incarnation: self.authority_incarnation.clone(),
         }
     }
     pub(crate) fn generation(&self) -> u64 {
@@ -105,6 +106,7 @@ impl RuntimeOwner {
             return Ok(None);
         }
         state.store.delivery_ready()?;
+        let authority_incarnation = state.authority_incarnation.clone();
         let body = state.store.body()?;
         let layer = body
             .generations
@@ -118,6 +120,7 @@ impl RuntimeOwner {
         let mut approved = ApprovedDaemonConfiguration {
             generation,
             approval_digest: body.generations[&generation].generation.plan_digest.clone(),
+            authority_incarnation,
             daemon: std::sync::Arc::new(layer.clone()),
             changed_entries: BTreeSet::new(),
         };

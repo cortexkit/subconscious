@@ -311,6 +311,7 @@ pub(crate) fn daemon_review(
 }
 
 struct OwnerState {
+    authority_incarnation: std::sync::Arc<()>,
     observed_snapshot: Option<super::GateSnapshot>,
     stamp_channel_cutover: bool,
     gate: ConfigGate,
@@ -553,17 +554,30 @@ pub struct ApprovedRollbackCommands {
 pub(crate) struct ApprovedDaemonConfiguration {
     generation: u64,
     approval_digest: Digest,
+    authority_incarnation: std::sync::Arc<()>,
     daemon: std::sync::Arc<ConfigLayerSnapshot>,
     changed_entries: BTreeSet<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct ApprovalIdentity {
-    // Recovery rebuilds generation numbering. The committed approval digest
-    // distinguishes a fresh authority from an earlier generation with this id.
     generation: u64,
     approval_digest: Digest,
+    // An unchanged recovery stamp can repeat both the generation and plan digest.
+    // Keep an owner-local authority token alive in every witness and failure latch
+    // so rebuilding authority cannot alias the previous store's numbering.
+    authority_incarnation: std::sync::Arc<()>,
 }
+
+impl PartialEq for ApprovalIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation
+            && self.approval_digest == other.approval_digest
+            && std::sync::Arc::ptr_eq(&self.authority_incarnation, &other.authority_incarnation)
+    }
+}
+
+impl Eq for ApprovalIdentity {}
 
 pub struct ApprovedRollbackProgram {
     pub path: String,
@@ -724,6 +738,7 @@ impl RuntimeOwner {
             published,
             configured_modules: std::sync::RwLock::new(None),
             inner: Mutex::new(OwnerState {
+                authority_incarnation: std::sync::Arc::new(()),
                 observed_snapshot: None,
                 stamp_channel_cutover: false,
                 gate: ConfigGate::new(incarnation),
@@ -1686,6 +1701,9 @@ impl RuntimeOwner {
                 )
             });
         if let Some((generation, unstamp)) = committed_exit {
+            if was_recovery {
+                state.authority_incarnation = std::sync::Arc::new(());
+            }
             state.authority_exit = Some(generation);
             state.recovery_exit_hold = was_recovery;
             if was_recovery || unstamp {

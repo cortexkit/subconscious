@@ -7145,7 +7145,13 @@ impl ControlHandler {
         let approved = publication
             .as_ref()
             .map(|view| view.approved_daemon.clone())
-            .unwrap_or(ApprovedDaemonView::NotStamped);
+            .unwrap_or_else(|| {
+                if self.config_runtime.is_some() {
+                    ApprovedDaemonView::Unavailable
+                } else {
+                    ApprovedDaemonView::NotStamped
+                }
+            });
         let generation = self
             .registry
             .generation()

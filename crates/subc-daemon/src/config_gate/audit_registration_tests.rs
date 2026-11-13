@@ -357,7 +357,7 @@ async fn audit_registration_pending_cutover_worker_uses_retry_backoff() {
     tokio::time::pause();
     let changed = fixture.owner.delivery_notifications();
     let mut notification = std::pin::pin!(changed.notified());
-    std::future::poll_fn(|cx| Poll::Ready(notification.as_mut().poll(cx))).await;
+    let _ = std::future::poll_fn(|cx| Poll::Ready(notification.as_mut().poll(cx))).await;
     let (tx, mut wakes) = tokio::sync::mpsc::unbounded_channel();
     let handler = Arc::new((*fixture.handler).clone().with_delivery_wakes_for_test(tx));
     let worker = handler.spawn_config_delivery_worker().unwrap();
@@ -548,6 +548,31 @@ fn audit_registration_poisoned_owner_is_not_a_current_status_projection() {
         ApprovedDaemonView::Unavailable
     ));
     assert!(owner.is_recovering());
+}
+
+#[tokio::test]
+async fn audit_registration_list_does_not_treat_an_unavailable_publication_as_unstamped() {
+    let fixture = legacy().await;
+    let handler = Arc::new(
+        (*fixture.handler)
+            .clone()
+            .with_capability_config([("a".into(), true)], Default::default()),
+    );
+    fixture.rig.stamp(&fixture.owner);
+    let owner = fixture.owner.clone();
+    assert!(std::thread::spawn(move || {
+        let _guard = owner.inner.lock().unwrap();
+        panic!("poison configuration owner");
+    })
+    .join()
+    .is_err());
+    let list = registration_declaration_poll(handler, "supervisor.list").await;
+    assert!(
+        list["modules"][0].get("configured_enabled").is_none(),
+        "{list}"
+    );
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
 }
 
 #[test]

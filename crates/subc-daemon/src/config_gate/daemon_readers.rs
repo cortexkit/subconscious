@@ -52,8 +52,8 @@ fn parse_daemon(snapshot: &DeliverySnapshot) -> Result<DaemonConfig> {
 }
 
 impl RuntimeOwner {
-    /// Polling list readers clone verified memory only; they never join a
-    /// publication's store lock, disk checks or platform keychain work.
+    /// Test readers inspect the published approved daemon view without consulting the store.
+    #[cfg(test)]
     pub(crate) fn approved_daemon_view(&self) -> ApprovedDaemonView {
         if self.inner.is_poisoned() {
             return ApprovedDaemonView::Unavailable;

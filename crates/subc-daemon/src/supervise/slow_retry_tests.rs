@@ -151,16 +151,7 @@ async fn recovery_slow_retry_roundtrip(release_after_park: bool, refused_before_
     assert_eq!(module.retry_deadline_for_test(), deadline);
     // Recovery does not consume a Failed actor's retry. When the existing
     // deadline fires, launch admission parks it instead of starting a child.
-    eprintln!(
-        "retry park before advance: now={:?}, deadline={deadline:?}, snapshot={:?}",
-        Instant::now(),
-        module.inner.snapshot.lock().unwrap()
-    );
     tokio::time::advance(Duration::from_secs(600)).await;
-    eprintln!(
-        "retry park after advance: now={:?}, deadline={deadline:?}",
-        Instant::now()
-    );
     let observed_at = std::time::Instant::now();
     let mut reported = false;
     wait_for("scheduled retry parks under recovery", || {

@@ -36,7 +36,7 @@ async fn failed_module() -> SupervisedModule {
 }
 
 #[tokio::test(start_paused = true)]
-async fn config_recovery_cancels_a_preexisting_slow_retry_without_spending_budget() {
+async fn config_recovery_preserves_slow_retry_until_it_parks_without_spawning() {
     let dir = cortexkit_test_support::ScratchDir::new("recovery-slow-retry");
     let path = dir.join("subc.jsonc");
     std::fs::write(
@@ -119,23 +119,29 @@ async fn config_recovery_cancels_a_preexisting_slow_retry_without_spending_budge
     .unwrap();
     assert!(owner.check_recovery().unwrap());
     let before = module.status().unwrap();
+    let deadline = module.retry_deadline_for_test();
     let handler = Arc::new(
         crate::ControlHandler::with_forwarding(registry, forwarding)
             .with_supervisor(handle)
             .with_config_runtime(owner),
     );
     let worker = handler.spawn_config_delivery_worker().unwrap();
-    wait_for("recovery cancels the already-armed retry", || {
-        module.next_retry_at_ms().unwrap().is_none()
+    module.config_exit_hold().await.unwrap();
+    assert_eq!(module.status().unwrap().restart_count, before.restart_count);
+    assert_eq!(module.retry_deadline_for_test(), deadline);
+    // Recovery does not consume a Failed actor's retry. When the existing
+    // deadline fires, launch admission parks it instead of starting a child.
+    tokio::time::advance(Duration::from_secs(600)).await;
+    wait_for("scheduled retry parks under recovery", || {
+        module.state().unwrap() == ModuleState::Stopped
     })
     .await;
-    assert_eq!(module.status().unwrap().restart_count, before.restart_count);
-    assert!(module.next_retry_at_ms().unwrap().is_none());
     tokio::time::advance(Duration::from_secs(7200)).await;
     tokio::task::yield_now().await;
     let after = module.status().unwrap();
     assert_eq!(after.spawn_generation, before.spawn_generation);
     assert_eq!(after.lifetime_restarts, before.lifetime_restarts);
+    assert_eq!(after.restart_count, 0);
     assert!(module.next_retry_at_ms().unwrap().is_none());
     worker.abort();
 }

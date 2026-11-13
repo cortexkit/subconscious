@@ -8978,17 +8978,6 @@ async fn handle_supervisor_command(
     ) {
         runtime.recovery_is_daemon = false;
     }
-    if matches!(
-        command,
-        SupervisorCommand::Drain { .. }
-            | SupervisorCommand::Retire { .. }
-            | SupervisorCommand::SetEnabled { .. }
-            | SupervisorCommand::Restart { .. }
-    ) {
-        let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-            state.failed_retry.cancel()
-        });
-    }
     let blocked = runtime
         .config_delivery
         .as_ref()
@@ -9055,6 +9044,19 @@ async fn handle_supervisor_command(
     } else {
         command
     };
+    // A refused start or restart leaves the Failed actor's existing recovery
+    // deadline intact. Cancel only after the command passes admission.
+    if matches!(
+        command,
+        SupervisorCommand::Drain { .. }
+            | SupervisorCommand::Retire { .. }
+            | SupervisorCommand::SetEnabled { .. }
+            | SupervisorCommand::Restart { .. }
+    ) {
+        let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+            state.failed_retry.cancel()
+        });
+    }
     match command {
         SupervisorCommand::ApprovedConfiguration { approved, reply } => {
             let result = async {
@@ -9246,10 +9248,8 @@ async fn handle_supervisor_command(
                     {
                         state.state = ModuleState::Stopped;
                         state.config_hold_parked = true;
-                    }
-                    state.respawn_pending = false;
-                    state.failed_retry.pending = None;
-                    if child.is_none() {
+                        state.respawn_pending = false;
+                        state.failed_retry.pending = None;
                         clear_current_process_facts(state);
                     }
                 })

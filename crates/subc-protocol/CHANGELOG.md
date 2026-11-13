@@ -1,21 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.37.0
 
-- Add standalone, opt-in `config.review`, `config.declare`, `config.get`,
-  `config.applied` and `config.changed` bodies and the `config.gate` capability.
-  `config.get` separates the active view from an optional pending delivery.
-  Existing exhaustive control enums, HELLO bodies and manifest fields are unchanged.
-- Add `consent/v1` request/reply bodies bound to the plan digest, base revision
-  and input vector, with shared golden fixtures for requesters and responders.
-  Unknown decisions never approve; unknown apply results never ACK.
-- Define the shared config-gate refusal spellings, including
-  `not_delivery_target`, which does not change module delivery state.
-- Expose `subc-config` 0.1 types, including `Digest`, `Layer` and `FieldChange`,
-  in the public API. A breaking `subc-config` release requires a breaking
-  `subc-protocol` release. Add `subc-config` and `base64` dependencies; no new
-  Cargo features are enabled. Snapshot bytes use canonical padded base64 and
-  decode only when their raw-byte digest matches.
+- **Rust migration:** `RouteCloseReason` adds `AuthorityChanged` and is now
+  non-exhaustive. Handle `authority_changed` as reopenable and include a
+  wildcard arm in downstream matches. Existing non-exhaustive manifests gain
+  optional registration-channel support and provider declarations; builders
+  preserve absent fields for older peers.
+- Add child-bound registration claims, caller and route-target attestations,
+  catalog authority metadata and negotiated close-reason declarations.
+  Discovery metadata is not authorization evidence; unknown authority values
+  must not be treated as verified spawn authority.
+- Add opt-in `config.review`, `config.declare`, `config.get`,
+  `config.applied` and `config.changed` bodies, plus immutable `consent/v1`
+  approval cards. The approved store tracks active and pending delivery
+  separately; unknown decisions never approve and unknown results never ACK.
+- The gate ships with the stamp off and unstamped installs behave as before.
+  Stamped operation requires explicit capability adoption, approved program and
+  configuration inputs, and private child registration; script entry points are
+  refused while stamped. Rollback uses retained inputs but rechecks changed
+  programs. Legacy exhaustive control request enums are unchanged.
+- Expose the new subc-config 0.1 schema, digest, approval and generation types.
+  Adopt their validation and redaction helpers rather than inventing a separate
+  approval or canonicalization format.
 
 ## 0.36.3
 

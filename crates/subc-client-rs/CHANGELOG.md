@@ -1,17 +1,29 @@
 # Changelog
 
-## Unreleased
+## 0.39.0
 
-- Correct the adopting sample's closed schema and review of absent or unchanged
-  fields; exercise the documented hooks against a gate-capable daemon.
-- Add optional `ModuleHandler` configuration hooks: declare once, review immutable
-  snapshots, apply complete views, and observe wire-named delivery/refusal states.
-  Existing handlers advertise and send no new operations. Only a daemon without
-  `config.gate` invokes the opted-in module's legacy file-reader hook.
-- Retain the last view on `config_gated` and `not_delivery_target`, expose a typed
-  no-approved-config detail when no view exists, and retry `anchor_pending`
-  reports on the next change hint. Configuration work does not block the reader,
-  health checks, drain hooks or stop. Re-export shared schema helpers for reviews.
+- **Rust migration:** `RouteCloseReason` adds `AuthorityChanged` and is now
+  non-exhaustive. Add a wildcard match arm; the new reason is reopenable.
+  Adopt protocol 0.37, control 0.39 and transport 0.18 public types together.
+- Add optional `ModuleHandler` configuration hooks to declare, review immutable
+  changes, apply complete views and observe delivery or refusal state. Adoption
+  occurs only when serving, not when constructing a handler or merely declaring
+  a schema. Existing handlers send no new operations. A legacy file reader is
+  called only when the daemon does not advertise `config.gate`.
+- Preserve the last active view on gated/refused delivery and expose typed
+  no-approved-configuration availability on a first refusal. Connection-bound
+  ACK/NACK and anchor retries keep configuration work off the reader's health,
+  drain and stop paths. Rollback delivery uses approved retained bytes; changed
+  programs still require renewed approval by the daemon.
+- Use the inherited private registration channel for supported supervised
+  launches and expose bounded claims for helper/provider identities. Upgrade
+  module SDKs and opt in to channel support before stamping; stamped script
+  entry points are refused. The gate ships with the stamp off and unstamped
+  installs behave as before.
+- Expose catalog subscriptions and optional route-target/caller authority
+  metadata. Discovery is not authorization evidence; unknown wire close reasons
+  are retained and treated conservatively. The configuration sample now reviews
+  absent and unchanged fields under a closed schema.
 
 ## 0.38.6
 

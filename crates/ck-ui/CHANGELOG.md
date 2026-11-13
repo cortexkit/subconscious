@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.0
+
+- Adopt client/control 0.39, protocol 0.37 and transport 0.18 types. Public
+  live-state fields expose the upgraded client/control types, so applications
+  using them must upgrade direct dependencies together. Route-close reasons
+  are now non-exhaustive and include `AuthorityChanged`. UI behavior is unchanged.
+
 ## 0.7.0
 
 - Adopt subc-client-rs 0.38.0 for scoped managed calls and watches. This is a breaking Rust dependency upgrade because the public API exposes SDK types; downstream users must upgrade their SDK dependency too. No wire behavior changes.

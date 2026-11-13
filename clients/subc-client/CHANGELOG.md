@@ -1,17 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.25.0
 
-- Correct the adopting sample's closed schema and review of absent or unchanged
-  fields; exercise the sample against a gate-capable daemon.
-- Providers retain HELLO_ACK `subc_capabilities` across registration and reconnect.
-- Add opt-in module configuration delivery through the provider's `config` option:
-  declare per connection, pure review, immutable views, pending-generation ACK/NACK,
-  changed-hint refresh and bounded anchor retries. Gate refusals retain the last
-  view; a first refusal carries typed `no_approved_config` availability without
-  file bytes. Only a daemon lacking `config.gate` permits the legacy file reader.
-- Add a small adopting sample and isolated unstamped daemon coverage, plus
-  golden-driven wire tests for stamped delivery, refusals and unknown statuses.
+- **TypeScript migration:** exported `KnownRouteCloseReason` adds
+  `authority_changed`. Update exhaustive switches or records for the new
+  member; it is reopenable. Unknown reasons remain conservatively classified.
+- Add opt-in provider `config` hooks for declaration, immutable review, apply,
+  ACK/NACK, changed hints and bounded anchor retries. Adoption begins only when
+  serving. Refusals retain the last view, and a first refusal exposes typed
+  `no_approved_config` availability without file bytes. Only daemons lacking
+  `config.gate` permit the legacy file reader. The sample handles absent and
+  unchanged fields under a closed schema.
+- Add private inherited child registration and explicit helper/provider claims.
+  Upgrade supervised providers and declare registration-channel support before
+  stamping; stamped script entry points are refused. Release packaging now
+  requires all six native registration builds and checks their presence before
+  publishing. Ordinary consumer clients need no native registration channel.
+- Add optional caller/target authority metadata, catalog watches and negotiated
+  close reasons. Discovery metadata is not authorization evidence; unsafe
+  authority integers are rejected and unknown origins remain unmarked.
+- The gate ships with the stamp off and unstamped installs behave as before.
+  Stamped delivery comes from the approved store, not edited files. Rollback
+  restores retained configuration inputs while the daemon rechecks and
+  re-reviews changed programs; an approval is not a completed delivery.
 
 ## 0.24.5
 

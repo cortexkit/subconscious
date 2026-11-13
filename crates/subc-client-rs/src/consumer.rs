@@ -822,6 +822,7 @@ pub struct ControlPush {
 /// as [`Self::Unknown`] and classify it conservatively rather than refusing to
 /// deliver the enclosing control push.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RouteCloseReason {
     Reload,
     Restart,

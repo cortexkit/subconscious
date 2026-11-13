@@ -1,45 +1,24 @@
 # Changelog
 
-## Unreleased
+## 0.1.35
 
-- Expose typed macOS process code-directory hashes through a safe `csops`
-  wrapper. Extract approved per-slice and alternate hashes from one retained
-  descriptor witness, validating code pages and embedded special-slot blobs
-  before returning an identity. Bound Mach-O metadata, slices, pages and slots;
-  malformed signatures are distinct from unsigned files. No new dependencies.
-  Require full, nonzero code-region coverage and a valid directory in every
-  universal-file slice. Process hashes also require the kernel's `CS_VALID`
-  status rather than treating a retained hash as proof of valid running code.
-  Sample the hash again after status and defer if exec changed it between calls.
-
-- Open bounded configuration inputs without following the leaf or blocking on
-  substituted FIFOs. Verify regular-file type on the retained Unix or Windows
-  handle before returning it to a caller.
-
-- Expose file-object identity from a retained file handle on Unix and Windows.
-  Share the complete Windows volume/file-id query with executable capture.
-
-- Add `durable_replace` for already-synced files: rename plus parent-directory
-  sync on Unix, and write-through replacement on Windows without a weaker
-  fallback. Configuration authority publication uses this flush boundary.
-
-- Add the safe `config_keychain` API for a team-signed macOS daemon's sealing
-  key, content-bound anchor and monotonic revision high-water. Access denial
-  stays distinct from absence; unstamp clears the pair without losing history.
-- Add a file-backed key-store seam and `ckdev-os-keychain` fixture, available
-  only with `test-support` and a development executable name. Keys and encoded
-  copies use zeroizing storage and debug output redacts the key.
-
-- Report whether an atomic replacement occurred before a durability error, so
-  callers can invalidate the previous approval for bytes published despite the
-  error. Keep Windows write-through replacement and classify uncertain failures
-  conservatively using the retained source file's volume and file index.
-
-- Expose a safe owned registration-pipe shutdown handle. Retirement disconnects
-  the instance synchronously and cancels a pending child-accept wait.
-- Keep a registration pipe's first instance reserved after a foreign connector
-  disconnects, including before acceptance begins. Foreign disconnect errors
-  cannot cancel the child's registration opportunity before its deadline.
+- Add bounded, no-follow regular-file capture, retained file identities and
+  durable replacement for approved configuration stores. Replacement errors say
+  whether bytes may already have been published; callers must not keep treating
+  the old approval as authoritative after such an error.
+- Add sealing-key and anchor storage, with redacted, zeroizing key handling and
+  a macOS keychain implementation for appropriately signed daemons. Test-only
+  file-backed stores require both `test-support` and a development executable
+  name; they are not a production keychain fallback.
+- Add child-bound private registration channels and retained child-spawn
+  witnesses. Windows pipes keep their first instance reserved across foreign
+  disconnects and expose synchronous retirement. Module SDKs can adopt these
+  APIs without exposing a launch nonce to unrelated local connections.
+- Expose macOS process code-directory hashes and validated per-slice file hashes
+  for checking approved executable content, including kernel validity and exec
+  race checks. Keep master's narrowed process-table reads and coverage checks.
+  These primitives do not enable configuration stamping: the gate ships with
+  the stamp off, and unstamped installs behave as before.
 
 ## 0.1.34
 

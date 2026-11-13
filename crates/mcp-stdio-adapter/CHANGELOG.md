@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0
+
+- Adopt client 0.39 and protocol 0.37. This is a breaking Rust dependency
+  upgrade because the public adapter API exposes client types; update direct
+  SDK dependencies together. Route-close reasons now include `AuthorityChanged`
+  and are non-exhaustive. MCP framing and adapter behavior are unchanged.
+
 ## 0.6.0
 
 - Adopt subc-client-rs 0.38.0 for scoped managed calls and watches. This is a breaking Rust dependency upgrade because the public API exposes SDK types; downstream users must upgrade their SDK dependency too. No wire behavior changes.

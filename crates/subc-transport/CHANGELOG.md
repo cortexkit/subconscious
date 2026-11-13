@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.18.0
+
+- Adopt protocol 0.37 types in public frame I/O and raise the OS helper floor
+  to 0.1.35. This is a breaking Rust dependency upgrade: downstream code
+  exchanging protocol frames or errors must upgrade its protocol dependency
+  too. `RouteCloseReason` now includes `AuthorityChanged` and is
+  non-exhaustive; include a wildcard arm in matches. Transport wire framing is
+  unchanged.
+
 ## 0.17.0
 
 - Adopt the coordinated protocol 0.36 scope-type dependency family. **Rust migration:** add a wildcard arm to any `ScopeKind` match; `ScopeKind` is now non-exhaustive and includes `Federated`. Existing wire traffic to non-declaring providers is unchanged.

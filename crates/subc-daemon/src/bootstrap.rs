@@ -2283,6 +2283,7 @@ fn non_empty_os_var(key: &str) -> Option<OsString> {
 /// Bootstrap-layer errors are deliberately typed so startup never panics for
 /// ordinary daemon-discovery races or stale filesystem state.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BootstrapError {
     ConfigStore(String),
     /// The bound server could not authenticate its own readiness probe.

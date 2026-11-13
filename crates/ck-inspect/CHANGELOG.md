@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0
+
+- Adopt client/control 0.39 and protocol 0.37. The public `manifest()`
+  returns the new protocol type, so downstream callers must upgrade their
+  protocol dependency together. The manifest gains optional private-registration
+  and provider-declaration fields; inspection behavior is unchanged.
+
 ## 0.4.4
 
 - Tests only: write test scripts through a `sh` child instead of `std::fs::write`, so a

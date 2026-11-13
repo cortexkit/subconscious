@@ -1,8 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.2.1
 
-- Report an authorized non-interactive polkit preflight as `Outcome::AuthorizedWithoutPrompt`, distinct from an interactive approval, so callers can require a person to confirm a request.
+- Report non-interactive polkit authorization separately as
+  `Outcome::AuthorizedWithoutPrompt`. Callers that require a person's presence,
+  such as configuration stamping and approval, must accept only interactive
+  `Approved`; callers preserving policy-authorized legacy operations can
+  explicitly accept the new outcome. `Outcome` remains non-exhaustive, so
+  existing wildcard matches remain source-compatible.
 
 ## 0.2.0
 

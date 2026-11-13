@@ -1,10 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.39.0
 
-- Expose each generation's approval channel in config status and history.
-- Add standalone config-gate client requests, plan views, status and responses;
-  preserve the legacy exhaustive control enums and require capability opt-in.
+- Adopt protocol 0.37 public types. **Rust migration:** `RouteCloseReason`
+  includes `AuthorityChanged` and is now non-exhaustive; downstream matches
+  must include a wildcard arm. This coordinated dependency upgrade requires
+  updating applications that exchange protocol types with this crate.
+- Add standalone configuration status, plan, approval, apply, stamp, unstamp,
+  history and rollback requests and replies without extending legacy exhaustive
+  control enums. Plans bind approval to immutable inputs; status separates
+  approved, active, pending and refused generations and reports approval
+  channels and restart requirements. A proposal is not an approval.
+- Add registration provenance, bounded claim bodies, catalog watches and
+  optional caller/target authority metadata. `nonce_verified` now means a
+  verified spawn or prefix binding, including a private registration channel or
+  claim, not necessarily presentation of a launch nonce. Do not use catalog
+  discovery as authorization evidence.
+- The configuration gate ships with the stamp off; unstamped installs behave as
+  before. Stamped installs use the approved store and require child-channel
+  support; script entry points are refused. Clients should display delivery
+  outcomes and rollback plans, including programs requiring renewed review,
+  rather than treating an approval response as completed delivery.
 
 ## 0.38.3
 

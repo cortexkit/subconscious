@@ -149,17 +149,20 @@ impl ControlHandler {
                             .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
                     }
                 } else {
-                    context
+                    let registered = context
                         .supervisor
-                        .supervise_configured_requested_async(
+                        .register_configured_with_health(
                             module.module_spec(),
                             module.enabled,
                             module.health.clone(),
                             module.drain_timeout_ms,
                             module.restart,
                             module.register_timeout,
-                            Some(Principal::Direct),
                         )
+                        .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
+                    context
+                        .supervisor
+                        .start_registered_approved_async(registered, Principal::Direct)
                         .await
                         .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
                 }

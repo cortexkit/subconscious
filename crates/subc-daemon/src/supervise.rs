@@ -4330,6 +4330,26 @@ impl Supervisor {
         requester: Option<Principal>,
         daemon_initiated: bool,
     ) -> Result<SupervisedModule, SuperviseError> {
+        self.start_registered_with_failure_policy(registered, requester, daemon_initiated, false)
+            .await
+    }
+
+    pub(crate) async fn start_registered_approved_async(
+        &self,
+        registered: RegisteredConfiguredModule,
+        requester: Principal,
+    ) -> Result<SupervisedModule, SuperviseError> {
+        self.start_registered_with_failure_policy(registered, Some(requester), false, true)
+            .await
+    }
+
+    async fn start_registered_with_failure_policy(
+        &self,
+        registered: RegisteredConfiguredModule,
+        requester: Option<Principal>,
+        daemon_initiated: bool,
+        propagate_spawn_failure: bool,
+    ) -> Result<SupervisedModule, SuperviseError> {
         let RegisteredConfiguredModule {
             spec,
             mut runtime,
@@ -4339,6 +4359,7 @@ impl Supervisor {
         runtime.start_requester = requester;
         runtime.recovery_is_daemon = daemon_initiated;
         let snapshot = &module.inner.snapshot;
+        let mut startup_error = None;
         let should_spawn = {
             let state = lock_snapshot(snapshot)?;
             state.enabled && state.waiting_for_previous_pid.is_none()
@@ -4385,6 +4406,9 @@ impl Supervisor {
                         None,
                         &runtime.failure_context(daemon_initiated),
                     );
+                    if propagate_spawn_failure {
+                        startup_error = Some(err);
+                    }
                     None
                 }
             }
@@ -4392,7 +4416,10 @@ impl Supervisor {
             None
         };
         self.start_monitor(spec, runtime, &module, child, commands);
-        Ok(module)
+        // Applying an operator-approved configuration must report a spawn error
+        // without removing the Failed actor or its monitor. Bootstrap instead
+        // tolerates failed starts so other configured modules can still run.
+        startup_error.map_or(Ok(module), Err)
     }
 
     fn runtime_config(&self) -> SupervisorRuntimeConfig {

@@ -163,6 +163,25 @@ async fn audit_registration_stamp_protocol_none_stops_the_running_nonce_child() 
 }
 
 #[tokio::test]
+async fn audit_registration_unstamp_completes_with_stamp_cutover_pending() {
+    let fixture = legacy().await;
+    fixture.rig.stamp(&fixture.owner);
+    assert!(fixture.owner.stamp_channel_cutover_pending());
+    let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Unstamp);
+    assert!(!fixture.owner.stamp_channel_cutover_pending());
+    fixture
+        .handler
+        .reconcile_cutover_for_test(fixture.owner.clone(), generation)
+        .await
+        .unwrap();
+    assert_eq!(fixture.owner.lock().unwrap().authority_exit, None);
+    assert_eq!(fixture.owner.polled_status().unwrap().state, "unstamped");
+    assert!(!fixture.owner.is_recovering());
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn audit_registration_recovery_restamp_reports_commit_while_actor_reconciles() {
     let fixture = legacy().await;
     let connection = ConnectionId::new(500);
@@ -285,7 +304,7 @@ async fn audit_registration_candidate_promotion_after_stamp_cannot_restore_a_non
         .unwrap()
         .unwrap()
         .unwrap();
-    eprintln!("cross-stamp swap outcome: {outcome:?}");
+    assert_eq!(outcome, crate::supervise::SwapOutcome::Cutover);
     assert!(
         !fixture.handle.legacy_nonce_present_for_test("a"),
         "promotion restored a nonce after the stamp retired it"

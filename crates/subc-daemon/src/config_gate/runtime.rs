@@ -1677,6 +1677,7 @@ impl RuntimeOwner {
                     .reset_for_authority_exit(if unstamp { generation } else { 0 });
             }
             if unstamp {
+                state.stamp_channel_cutover = false;
                 state.reconciled_entries.clear();
                 state.unstamp_hints.extend(unstamp_hints);
             }

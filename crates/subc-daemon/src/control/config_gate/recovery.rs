@@ -191,7 +191,7 @@ impl ControlHandler {
         if let Some(hook) = self.recovery_exit_test_after_step {
             hook(0)?;
         }
-        if owner.stamp_channel_cutover_pending() {
+        if stamped && owner.stamp_channel_cutover_pending() {
             for module in self.supervisor.list() {
                 let status = module
                     .status()

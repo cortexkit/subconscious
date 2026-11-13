@@ -175,9 +175,9 @@ impl ConfigGate {
 
     /// As [`Self::plan`], also recording which modules' admitted reviewers
     /// answered `config.review` for this plan, and which build each module's
-    /// approved configuration now rests on. Without that record the plan
-    /// carries none, and the next reader counts every module as reviewed by
-    /// the programs the plan approved.
+    /// approved configuration now rests on. A generation planned without that
+    /// record makes later plans treat each of its modules as reviewed by the
+    /// program that generation approved for it.
     pub(crate) fn plan_reviewed(
         &mut self,
         store: &mut ConfigStore,

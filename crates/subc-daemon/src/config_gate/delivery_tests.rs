@@ -1036,7 +1036,8 @@ async fn config_delivery_mixed_module_restart_and_next_supervision_wait_for_spaw
 }
 
 /// Replacing a module's program under the same path, with its layers and
-/// declaration unchanged, yields a plan without reviewed fields. The process
+/// declaration unchanged, yields a plan whose changeset has no field changes
+/// from module review, so field apply kinds alone would call it live. The process
 /// still running was launched from the old program, so it must not acknowledge
 /// that generation: only a child spawned for it can, after warm-up.
 #[tokio::test]

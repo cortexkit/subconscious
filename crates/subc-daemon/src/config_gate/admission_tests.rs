@@ -1630,8 +1630,8 @@ fn config_admission_refusal_from_an_old_base_cannot_hold_the_new_approval() {
         .is_empty());
 }
 
-/// A program change is approved launch-only, because neither the held new
-/// program nor the old one can review for it. Once a child of the new program
+/// A program change is approved launch-only, because neither the new program
+/// (refused to start until approved) nor the old one can review for it. Once a child of the new program
 /// has made that generation active, the next plan re-reviews the approved
 /// layers with it and records that build; status names the module until then.
 #[test]

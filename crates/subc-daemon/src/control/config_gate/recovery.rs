@@ -1,6 +1,11 @@
 use super::*;
 
 impl ControlHandler {
+    #[cfg(all(test, feature = "test-support", unix))]
+    pub(crate) fn with_recovery_exit_completed_hook_for_test(mut self, hook: fn(u64)) -> Self {
+        self.recovery_exit_test_completed = Some(hook);
+        self
+    }
     #[cfg(all(test, unix))]
     pub(crate) async fn reconcile_exit_for_test(
         &self,
@@ -289,6 +294,10 @@ impl ControlHandler {
         // are not parked and cannot be revived by that release. Unlatched errors
         // above retain the exit for a later reconciliation attempt.
         config_work(owner, move |owner| owner.complete_authority_exit(&approved)).await?;
+        #[cfg(test)]
+        if let Some(completed) = self.recovery_exit_test_completed {
+            completed(generation);
+        }
         if !failed_modules.is_empty() {
             return Err(GateError::new("rescan_failed", failed_modules.join("; ")));
         }

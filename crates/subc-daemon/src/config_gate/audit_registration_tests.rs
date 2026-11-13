@@ -610,8 +610,17 @@ async fn committed_enable_ordered(
             .await
             .unwrap()
     });
+    let mut failed_approval = None;
     if worker_first {
         arrived.await.unwrap();
+        failed_approval = Some(
+            fixture
+                .owner
+                .authority_exit_configuration(1)
+                .unwrap()
+                .unwrap()
+                .3,
+        );
         let worker = handler.spawn_config_delivery_worker().unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -674,11 +683,11 @@ async fn committed_enable_ordered(
         );
         assert_eq!(parked.state, ModuleState::Failed);
         if worker_first {
-            let (_, _, _, approved) = fixture
-                .owner
-                .authority_exit_configuration(1)
-                .unwrap()
-                .expect("the failed generation must remain unreconciled");
+            let approved = failed_approval.take().unwrap();
+            // The exit completes for other modules; this actor retains its own
+            // failed entry and the launch failure keyed to this approval until
+            // a successful start clears that actor's failure.
+            assert_eq!(fixture.owner.pending_authority_exit().unwrap(), None);
             assert!(approved.changes_entry("a"));
             let identity = approved.identity();
             assert!(

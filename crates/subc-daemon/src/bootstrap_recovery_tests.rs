@@ -697,6 +697,16 @@ impl crate::config_gate::ReviewAdmission for Admitted {
 
 fn adapt_control(mut handler: ControlHandler) -> ControlHandler {
     handler = handler.with_config_os_prompt_policy_for_tests();
+    handler = handler.with_recovery_exit_completed_hook_for_test(|generation| {
+        let socket =
+            PathBuf::from(std::env::var_os("RECOVERY_SOCKET_DIR").unwrap()).join("exit-completed");
+        if socket.exists() {
+            std::os::unix::net::UnixDatagram::unbound()
+                .unwrap()
+                .send_to(&generation.to_be_bytes(), socket)
+                .unwrap();
+        }
+    });
     handler = handler.with_recovery_exit_retry_pause_for_test(|generation| {
         let root = PathBuf::from(std::env::var_os("RECOVERY_ROOT").unwrap());
         let pause = root.join("pause-exit-retry");
@@ -1264,6 +1274,7 @@ async fn config_recovery_spawned_unstamp_stages_enable_until_exit_completion() {
 #[cfg(feature = "dev-desktop-approval")]
 #[tokio::test]
 async fn config_recovery_spawned_stamped_exit_installs_reserved_capabilities_before_hello() {
+    use std::os::unix::fs::DirBuilderExt;
     let _serial = DAEMONS.lock().await;
     let rig = Rig::new(true);
     let path = rig.dir.join("subc.jsonc");
@@ -1272,10 +1283,13 @@ async fn config_recovery_spawned_stamped_exit_installs_reserved_capabilities_bef
     std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
     rig.seed();
     rig.reject_store(false);
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&rig.socket_dir)
+        .unwrap();
+    let completed = tokio::net::UnixDatagram::bind(rig.socket_dir.join("exit-completed")).unwrap();
     let daemon = rig.start().await;
     let mut client = rig.local().await;
-    let applied = apply(&mut client, "config.stamp").await;
-    assert_eq!(applied["generation"], 1, "{applied}");
     let mut claimant = rig.tcp().await;
     let mut manifest =
         subc_protocol::manifest::ModuleManifest::builder("unconfigured-claimant", "1.0.0").build();
@@ -1290,13 +1304,25 @@ async fn config_recovery_spawned_stamped_exit_installs_reserved_capabilities_bef
         control_ops: None,
         launch_nonce: None,
     };
-    send(
-        &mut claimant,
-        FrameType::Hello,
-        79,
-        serde_json::to_value(hello).unwrap(),
-    )
-    .await;
+    let hello = serde_json::to_value(hello).unwrap();
+    send(&mut claimant, FrameType::Hello, 78, hello.clone()).await;
+    let held: Value = serde_json::from_slice(&receive(&mut claimant).await.body).unwrap();
+    assert_eq!(held["code"], "config_gated", "{held}");
+    drop(claimant);
+    let applied = apply(&mut client, "config.stamp").await;
+    assert_eq!(applied["generation"], 1, "{applied}");
+    // The apply reply confirms the configuration was committed, but deferred
+    // starts may still hold admission. This signal follows the owner's actual
+    // admission release and publication, rather than a timer or a status retry.
+    let mut generation = [0; 8];
+    let received = tokio::time::timeout(Duration::from_secs(10), completed.recv(&mut generation))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(received, 8);
+    assert_eq!(u64::from_be_bytes(generation), 1);
+    let mut claimant = rig.tcp().await;
+    send(&mut claimant, FrameType::Hello, 79, hello).await;
     let refused: Value = serde_json::from_slice(&receive(&mut claimant).await.body).unwrap();
     assert_eq!(refused["code"], "reserved_capability", "{refused}");
     drop(daemon);

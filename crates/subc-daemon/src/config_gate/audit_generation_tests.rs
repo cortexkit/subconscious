@@ -314,9 +314,13 @@ async fn fence_only_approved_enable(has_active: bool) {
         )
         .await
         .unwrap();
+    let approved = owner.authority_exit_configuration(1).unwrap().unwrap().3;
     if has_active {
         applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
         assert_active(&owner, INCUMBENT, 1);
+        // Keep the approved daemon-entry witness. The next generation changes
+        // module values, not the daemon entry being enabled behind its fence.
+        approve(&rig, &owner, 2);
     }
     let spawn = owner
         .spawned(
@@ -338,7 +342,6 @@ async fn fence_only_approved_enable(has_active: bool) {
             "config_delivery_deferred"
         );
     }
-    let approved = owner.authority_exit_configuration(1).unwrap().unwrap().3;
     module
         .reconcile_approved_configuration(approved)
         .await

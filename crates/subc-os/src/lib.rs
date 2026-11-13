@@ -89,7 +89,9 @@ pub mod config_keychain;
 mod durable_replace;
 #[cfg(any(unix, windows))]
 mod retained_file;
-pub use durable_replace::durable_replace;
+#[cfg(feature = "test-support")]
+pub use durable_replace::durable_replace_with_rename_hook;
+pub use durable_replace::{durable_replace, DurableReplaceError};
 #[cfg(any(unix, windows))]
 pub use retained_file::{
     open_regular_nofollow, retained_file_identity, OpenRegularError, RetainedFileIdentity,

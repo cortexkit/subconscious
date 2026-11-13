@@ -158,6 +158,34 @@ fn publication_sequence_survives_repeated_counters_and_anchor_error() {
         "anchor retry is not a new publication"
     );
 }
+
+#[cfg(feature = "test-support")]
+#[test]
+fn publication_sequence_advances_when_renamed_publication_cannot_sync_parent() {
+    let rig = Rig::new();
+    let mut store = rig.open(false);
+    store
+        .commit_generation(entry(CommitKind::Stamp), snapshot(1, 1), snapshot(1, 1), 1)
+        .unwrap();
+    let before = rig.bytes();
+    let sequence = store.publication_sequence();
+    store.set_test_publication_failure(disk::PausePoint::AfterRenameBeforeSync);
+    let error = store
+        .commit_generation(
+            entry(CommitKind::Approved),
+            snapshot(2, 1),
+            snapshot(2, 1),
+            2,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("AfterRenameBeforeSync"),
+        "{error}"
+    );
+    assert_ne!(rig.bytes(), before, "the replacement really happened");
+    assert_eq!(store.publication_sequence(), sequence + 1);
+    assert_eq!(store.loaded_status().state, StoreState::StoreUnverified);
+}
 fn entry(kind: CommitKind) -> HistoryEntry {
     HistoryEntry {
         delivery: None,

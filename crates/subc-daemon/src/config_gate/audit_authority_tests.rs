@@ -122,6 +122,47 @@ fn authority_commit_anchor_error_still_rotates_rebuilt_authority() {
     assert!(state.recovery_exit_hold);
 }
 
+#[cfg(feature = "test-support")]
+#[test]
+fn authority_commit_directory_sync_error_still_rotates_rebuilt_authority() {
+    let rig = Rig::new();
+    let owner = rig.owner("sync-error-authority");
+    assert_eq!(rig.stamp(&owner), 1);
+    owner.complete_authority_exit_for_test(1).unwrap();
+    tamper(&rig, &owner);
+    let before = owner.lock().unwrap().authority_incarnation.clone();
+    let sequence = owner.lock().unwrap().store.publication_sequence();
+    let (attempt, _, facts) = stamp_attempt(&owner);
+    owner.lock().unwrap().store.set_test_publication_failure(
+        crate::config_store::testing::PausePoint::AfterRenameBeforeSync,
+    );
+    let error = finish_stamp(
+        &owner,
+        attempt,
+        &facts,
+        crate::config_gate::PresenceDecision::InteractiveApproval,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("AfterRenameBeforeSync"),
+        "{error}"
+    );
+    let published =
+        std::fs::read(rig.path.join("store").join(crate::config_store::STORE_FILE)).unwrap();
+    assert_ne!(published, b"tampered");
+    let state = owner.lock().unwrap();
+    assert_eq!(state.store.publication_sequence(), sequence + 1);
+    assert!(!std::sync::Arc::ptr_eq(
+        &before,
+        &state.authority_incarnation
+    ));
+    assert_eq!(
+        state.store.loaded_status().state,
+        crate::config_store::StoreState::StoreUnverified
+    );
+    assert!(state.recovery_exit_hold);
+}
+
 #[test]
 fn authority_commit_failed_duplicate_keeps_pending_exit_and_token() {
     let rig = Rig::new();

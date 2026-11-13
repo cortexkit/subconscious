@@ -30,6 +30,13 @@
   only with `test-support` and a development executable name. Keys and encoded
   copies use zeroizing storage and debug output redacts the key.
 
+## 0.1.34
+
+- Report whether an atomic replacement occurred before a durability error, so
+  callers can invalidate the previous approval for bytes published despite the
+  error. Keep Windows write-through replacement and classify uncertain failures
+  conservatively using the retained source file's volume and file index.
+
 ## 0.1.33
 
 - Expose a safe owned registration-pipe shutdown handle. Retirement disconnects

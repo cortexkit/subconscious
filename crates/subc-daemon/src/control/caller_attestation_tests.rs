@@ -229,7 +229,7 @@ async fn caller_attestation_claim_bound_openers_attest_their_spawn_and_claim() {
         );
         assert_eq!(caller["origin"], "other");
         assert_eq!(caller["approved_declarations_digest"], "");
-        // The mark is hard-false until the mark itself is built.
+        // No spawn is first-party yet: the daemon never raises the mark.
         assert_eq!(caller["first_party"], false, "{bind}");
         assert!(caller.get("declaration").is_none(), "{bind}");
         assert!(caller.get("declaration_digest").is_none(), "{bind}");
@@ -504,8 +504,8 @@ async fn caller_attestation_authority_change_closes_unscoped_routes_of_the_spawn
         }
     };
     let reason: RouteCloseReason = serde_json::from_value(closed["reason"].clone()).unwrap();
-    // Before per-recipient close reasons this is `authority_changed`; after
-    // them an opener that did not declare it gets another reopenable reason.
+    // The reason is `authority_changed`, or another reason that permits
+    // reopening for an opener that did not declare it accepts that one.
     assert!(
         reason.may_reopen(),
         "a live spawn's authority change permits reopening: {closed}"

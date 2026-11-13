@@ -3587,14 +3587,14 @@ impl ForwardingTable {
     }
 
     /// The epoch published for a spawn, for tests of the commit re-check.
-    #[cfg(test)]
+    #[cfg(all(test, unix, feature = "test-support"))]
     pub(crate) fn published_spawn_epoch(&self, key: &SpawnKey) -> u64 {
         published_epoch_locked(&self.read_inner().unwrap(), key)
     }
 
     /// The caller and target authority each live route opened by `client`
     /// recorded at commit.
-    #[cfg(test)]
+    #[cfg(all(test, unix, feature = "test-support"))]
     pub(crate) fn route_authority_for_test(
         &self,
         client: ConnectionId,

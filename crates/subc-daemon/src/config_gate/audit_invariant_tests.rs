@@ -143,10 +143,15 @@ async fn approval_latch_clears_after_a_successful_registered_reload() {
     })
     .await
     .unwrap();
-    let mut primary = crate::control::claims::tests::Net::new(fixture.router.clone()).await;
-    let hello = primary
-        .call(module_hello(Some(proof), ConnectionId::new(1)))
+    fixture
+        .handle
+        .registration_for_test("a")
+        .unwrap()
+        .wait_launch()
         .await;
+    let mut primary = crate::control::claims::tests::Net::new(fixture.router.clone()).await;
+    let connection = primary.connection_id(&fixture.handler);
+    let hello = primary.call(module_hello(Some(proof), connection)).await;
     assert_eq!(
         hello.header.ty,
         subc_protocol::FrameType::HelloAck,

@@ -15,7 +15,7 @@ async fn config_spawn_contended_or_poisoned_admission_backs_off_without_spinning
         &runtime.failure_context(true),
     )
     .unwrap();
-    let scheduled = runtime.scheduled_respawn.lock().unwrap().unwrap();
+    let scheduled = runtime.scheduled_respawn.lock().unwrap().clone().unwrap();
     assert!(
         scheduled.deadline > Instant::now(),
         "contention and poison must not re-arm an already-ready timer"

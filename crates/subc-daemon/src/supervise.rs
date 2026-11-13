@@ -1631,6 +1631,8 @@ struct SupervisorSnapshot {
     /// Preserve daemon attribution for a paused start so a failing release can
     /// schedule the next slow retry instead of treating the start as operator work.
     config_hold_daemon_initiated: bool,
+    /// The approval that owns the parked attempt, not whichever approval is latest.
+    config_hold_approval: Option<crate::config_gate::runtime::ApprovalIdentity>,
     /// Retain an approved launch failure across competing reconciliation passes.
     approved_start_failure: Option<(crate::config_gate::runtime::ApprovalIdentity, String)>,
     legacy_registration_spawn: bool,
@@ -1795,6 +1797,7 @@ impl SupervisorSnapshot {
             admission_refused: None,
             config_hold_parked: false,
             config_hold_daemon_initiated: false,
+            config_hold_approval: None,
             approved_start_failure: None,
             legacy_registration_spawn: false,
             registration_declaration: None,
@@ -2348,11 +2351,21 @@ enum RespawnKind {
     Reload,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PendingRespawn {
     deadline: Instant,
     kind: RespawnKind,
     daemon_initiated: bool,
+    approval: Option<crate::config_gate::runtime::ApprovalIdentity>,
+}
+
+impl PendingRespawn {
+    fn failure_context(&self, runtime: &SupervisorRuntimeConfig) -> FailureContext {
+        FailureContext {
+            approval: self.approval.clone(),
+            ..runtime.failure_context(self.daemon_initiated)
+        }
+    }
 }
 
 type ReloadReply = oneshot::Sender<Result<(), SuperviseError>>;
@@ -2410,6 +2423,7 @@ impl SupervisorRuntimeConfig {
     fn failure_context(&self, daemon_initiated: bool) -> FailureContext {
         FailureContext {
             daemon_initiated,
+            approval: None,
             shutdown: self.child_roster.shutdown_flag(),
         }
     }
@@ -4411,6 +4425,10 @@ impl Supervisor {
         runtime.recovery_is_daemon = daemon_initiated;
         let snapshot = &module.inner.snapshot;
         let mut startup_error = None;
+        let failure = FailureContext {
+            approval: approved_generation.clone(),
+            ..runtime.failure_context(daemon_initiated)
+        };
         let should_spawn = {
             let state = lock_snapshot(snapshot)?;
             state.enabled && state.waiting_for_previous_pid.is_none()
@@ -4435,23 +4453,12 @@ impl Supervisor {
                     Some(child)
                 }
                 Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
-                    defer_config_spawn(
-                        &spec,
-                        &runtime,
-                        snapshot,
-                        RespawnKind::Spawn,
-                        &runtime.failure_context(daemon_initiated),
-                    )?;
+                    defer_config_spawn(&spec, &runtime, snapshot, RespawnKind::Spawn, &failure)?;
                     None
                 }
                 Err(mut err) => {
                     if matches!(err, SuperviseError::ConfigHeld { .. }) {
-                        match hold_config_spawn(
-                            &spec,
-                            &runtime,
-                            snapshot,
-                            &runtime.failure_context(daemon_initiated),
-                        ) {
+                        match hold_config_spawn(&spec, &runtime, snapshot, &failure) {
                             Ok(()) => {
                                 self.start_monitor(spec, runtime, &module, None, commands);
                                 return Ok(module);
@@ -4466,12 +4473,7 @@ impl Supervisor {
                         error!(module_id = %spec.module_id, program = %spec.program.display(), error = %err,
                             "configured module failed to spawn; marking failed and continuing");
                     }
-                    fail_snapshot(
-                        snapshot,
-                        Some(&spec.module_id),
-                        None,
-                        &runtime.failure_context(daemon_initiated),
-                    );
+                    fail_snapshot(snapshot, Some(&spec.module_id), None, &failure);
                     if let Some(generation) = approved_generation {
                         let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                             state.approved_start_failure = Some((generation, err.to_string()));
@@ -4677,6 +4679,17 @@ impl SupervisedModule {
                 .as_ref()
                 .is_some_and(|(failed, _)| failed == identity)
         })
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn config_hold_origin_for_test(
+        &self,
+    ) -> (bool, Option<crate::config_gate::runtime::ApprovalIdentity>) {
+        let state = lock_snapshot(&self.inner.snapshot).unwrap();
+        (
+            state.config_hold_daemon_initiated,
+            state.config_hold_approval.clone(),
+        )
     }
 
     pub(crate) async fn config_policy_probe(
@@ -7100,6 +7113,7 @@ fn park_config_spawn(
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
         state.admission_refused = admission_refused;
         state.config_hold_daemon_initiated = failure.daemon_initiated;
+        state.config_hold_approval = failure.approval.clone();
         state.config_hold_parked = true;
         state.state = ModuleState::Stopped;
         state.respawn_pending = false;
@@ -7142,13 +7156,36 @@ fn try_park_config_attempt(
             Ok(false)
         }
     })();
-    if result.is_err() {
+    if let Err(error) = &result {
         // A failed park still belongs to the attempt that tried to park. Mark it
         // Failed here, before the monitor can use a daemon/operator origin saved
         // for a different attempt to decide whether to schedule a slow retry.
         fail_snapshot(snapshot, Some(&spec.module_id), None, failure);
+        record_approved_attempt_failure(spec, snapshot, failure, error);
     }
     result
+}
+
+fn record_approved_attempt_failure(
+    spec: &ModuleSpec,
+    snapshot: &SharedSnapshot,
+    failure: &FailureContext,
+    error: &SuperviseError,
+) {
+    let Some(approval) = &failure.approval else {
+        return;
+    };
+    let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        if state.enabled
+            && state.state == ModuleState::Failed
+            && state
+                .approved_start_failure
+                .as_ref()
+                .is_none_or(|(identity, _)| identity != approval)
+        {
+            state.approved_start_failure = Some((approval.clone(), error.to_string()));
+        }
+    });
 }
 
 fn hold_config_spawn(
@@ -7187,6 +7224,7 @@ fn schedule_respawn(
         deadline: Instant::now() + delay,
         kind,
         daemon_initiated,
+        approval: None,
     });
     Ok(())
 }
@@ -7212,6 +7250,7 @@ fn defer_config_spawn(
         deadline: Instant::now() + CONFIG_ADMISSION_RETRY_DELAY,
         kind,
         daemon_initiated: failure.daemon_initiated,
+        approval: failure.approval.clone(),
     });
     Ok(())
 }
@@ -8781,7 +8820,7 @@ async fn supervise_loop(
                             // arrives during the backoff must cancel the pending
                             // respawn instead of waiting for it to spawn first.
                             child = None;
-                            pending_respawn = Some(PendingRespawn { deadline: Instant::now() + delay, kind: RespawnKind::Spawn, daemon_initiated: true });
+                            pending_respawn = Some(PendingRespawn { deadline: Instant::now() + delay, kind: RespawnKind::Spawn, daemon_initiated: true, approval: None });
                              let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = true);
                         }
                     }
@@ -8863,7 +8902,7 @@ async fn supervise_loop(
                     }
                 }
             }
-        } else if let Some(pending) = pending_respawn {
+        } else if let Some(pending) = pending_respawn.clone() {
             tokio::select! {
                 _ = runtime.child_roster.closed() => {
                     pending_respawn = None;
@@ -8880,6 +8919,7 @@ async fn supervise_loop(
                     }
                 } => {
                     pending_respawn = None;
+                    let failure = pending.failure_context(&runtime);
                 let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = false);
                     // A command handled below while the backoff elapsed may
                     // have stopped the module; never respawn past an operator's
@@ -8903,8 +8943,9 @@ async fn supervise_loop(
                         runtime.forwarding.as_deref(),
                         &snapshot,
                         &spec.module_id,
-                        &runtime.failure_context(runtime.recovery_is_daemon),
+                        &failure,
                     ).await {
+                        record_approved_attempt_failure(&spec, &snapshot, &failure, &err);
                         error!(module_id = %spec.module_id, error = %err, "registration did not release before restart");
                         continue;
                     }
@@ -8938,12 +8979,13 @@ async fn supervise_loop(
                             let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = true);
                         }
                         Err(SuperviseError::ConfigHeld { .. }) => {
-                            let _ = hold_config_spawn(&spec, &runtime, &snapshot, &runtime.failure_context(pending.daemon_initiated));
+                            let _ = hold_config_spawn(&spec, &runtime, &snapshot, &failure);
                             runtime.pending_activity_restart = false;
                             process_liveness.untrack_if_current(&spec.module_id, &snapshot);
                         }
                         Err(err) => {
-                            fail_snapshot(&snapshot, Some(&spec.module_id), None, &runtime.failure_context(runtime.recovery_is_daemon));
+                            fail_snapshot(&snapshot, Some(&spec.module_id), None, &failure);
+                            record_approved_attempt_failure(&spec, &snapshot, &failure, &err);
                             process_liveness.untrack_if_current(&spec.module_id, &snapshot);
                             error!(module_id = %spec.module_id, error = %err, "failed to restart supervised module");
                         }
@@ -9134,14 +9176,23 @@ async fn handle_supervisor_command(
                 && !state.process_alive
                 && child.is_none()
                 && state.state == ModuleState::Stopped)
-                .then_some(state.config_hold_daemon_initiated)
+                .then(|| {
+                    (
+                        state.config_hold_daemon_initiated,
+                        state.config_hold_approval.clone(),
+                    )
+                })
         });
         // Clearing a configuration-delivery block must not restart a child that
         // exited on its own or exhausted its crash budget. Resume only an actor
         // stopped by a configuration hold; otherwise leave its slow retry alone.
-        let result = if let Some(daemon_initiated) = parked {
+        let result = if let Some((daemon_initiated, approval)) = parked {
             runtime.recovery_is_daemon = daemon_initiated;
-            set_child_enabled_with_budget_policy(
+            let failure = FailureContext {
+                approval,
+                ..runtime.failure_context(daemon_initiated)
+            };
+            let result = set_child_enabled_with_budget_policy(
                 spec,
                 runtime,
                 registry,
@@ -9149,10 +9200,14 @@ async fn handle_supervisor_command(
                 snapshot,
                 child,
                 true,
-                &runtime.failure_context(daemon_initiated),
+                &failure,
                 false,
             )
-            .await
+            .await;
+            if let Err(error) = &result {
+                record_approved_attempt_failure(spec, snapshot, &failure, error);
+            }
+            result
         } else {
             Ok(false)
         };
@@ -9298,6 +9353,10 @@ async fn handle_supervisor_command(
                     })?;
                 }
                 if enabled != next.enabled || retry_failed {
+                    let failure = FailureContext {
+                        approval: next.enabled.then(|| approved.identity()),
+                        ..runtime.failure_context(false)
+                    };
                     let held = next.enabled && runtime.config_delivery.as_ref()
                         .is_some_and(|delivery| delivery.0.has_recorded_admission_hold(&spec.module_id)
                             || delivery.0.check_module_hold(&spec.module_id).is_err_and(|error| error.code == "config_delivery_deferred"));
@@ -9312,12 +9371,12 @@ async fn handle_supervisor_command(
                             }
                         })?;
                         if child.is_none() && lock_snapshot(snapshot)?.waiting_for_previous_pid.is_none() {
-                            hold_config_spawn(spec, runtime, snapshot, &runtime.failure_context(false))?;
+                            hold_config_spawn(spec, runtime, snapshot, &failure)?;
                         }
                     } else {
                         match set_child_enabled_with_budget_policy(
                             spec, runtime, registry, process_liveness, snapshot, child,
-                            next.enabled, &runtime.failure_context(false), true,
+                            next.enabled, &failure, true,
                         ).await {
                             Ok(_) => {},
                             Err(SuperviseError::ConfigHeld { .. }) if next.enabled => {},
@@ -9333,6 +9392,10 @@ async fn handle_supervisor_command(
                             && runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.stamp_channel_cutover_pending())))
                     && runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.module_is_gated(&spec.module_id))
                 {
+                    let failure = FailureContext {
+                        approval: Some(approved.identity()),
+                        ..runtime.failure_context(false)
+                    };
                     // A stamp cannot adopt an unverified legacy process, even
                     // when its approved replacement no longer speaks subc.
                     // Stopping that process spends no crash restart budget.
@@ -9346,11 +9409,11 @@ async fn handle_supervisor_command(
                     match spawn_and_mark_running_async(spec, runtime, snapshot).await {
                         Ok(replacement) => *child = Some(replacement),
                         Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
-                            defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn, &runtime.failure_context(false))?;
+                            defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn, &failure)?;
                         }
-                        Err(SuperviseError::ConfigHeld { .. }) => hold_config_spawn(spec, runtime, snapshot, &runtime.failure_context(false))?,
+                        Err(SuperviseError::ConfigHeld { .. }) => hold_config_spawn(spec, runtime, snapshot, &failure)?,
                         Err(error) => {
-                            fail_snapshot(snapshot, Some(&spec.module_id), None, &runtime.failure_context(false));
+                            fail_snapshot(snapshot, Some(&spec.module_id), None, &failure);
                             return Err(error);
                         }
                     }
@@ -10393,7 +10456,9 @@ async fn set_child_enabled_with_budget_policy(
         Ok(true)
     } else {
         update_snapshot(snapshot, Some(&spec.module_id), |state| {
-            state.config_hold_parked = false
+            state.config_hold_parked = false;
+            state.config_hold_daemon_initiated = false;
+            state.config_hold_approval = None;
         })?;
         let stop_notice = begin_forwarding_drain_if_configured(
             spec,
@@ -15569,6 +15634,8 @@ fn set_running(
     state.spawn_failure = None;
     state.admission_refused = None;
     state.config_hold_parked = false;
+    state.config_hold_daemon_initiated = false;
+    state.config_hold_approval = None;
     state.legacy_registration_spawn =
         child.registration_spawn.is_some() && child.admission_base.is_none();
     state.registration_declaration = child.registration_declaration.clone();
@@ -15696,6 +15763,8 @@ fn fail_snapshot(
     if let Err(err) = update_snapshot(snapshot, module_id, |state| {
         state.state = ModuleState::Failed;
         state.config_hold_parked = false;
+        state.config_hold_daemon_initiated = false;
+        state.config_hold_approval = None;
         clear_current_process_facts(state);
         if failure.may_retry() && state.enabled {
             state.failed_retry.schedule(module_id.unwrap_or("unknown"));

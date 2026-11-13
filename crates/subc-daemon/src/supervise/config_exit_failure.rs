@@ -19,6 +19,7 @@ impl SupervisedModule {
             state.failed_retry.pending = None;
             state.config_hold_parked = false;
             state.config_hold_daemon_initiated = false;
+            state.config_hold_approval = None;
             clear_current_process_facts(state);
             state.stop_reason = Some(reason);
         })

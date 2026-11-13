@@ -870,6 +870,10 @@ impl RuntimeOwner {
         self.lock().unwrap().delivery.failed_spawn_module = Some(module.into());
     }
     #[cfg(all(test, unix))]
+    pub(crate) fn clear_delivery_spawn_failure_for_test(&self) {
+        self.lock().unwrap().delivery.failed_spawn_module = None;
+    }
+    #[cfg(all(test, unix))]
     pub(crate) fn set_spawn_preflight_hook_for_test(&self, hook: impl FnOnce() + Send + 'static) {
         *self.spawn_preflight_hook.lock().unwrap() = Some(Box::new(hook));
     }

@@ -20,6 +20,7 @@ pub(super) struct FailedRetry {
 #[derive(Debug, Clone)]
 pub(super) struct FailureContext {
     pub(super) daemon_initiated: bool,
+    pub(super) approval: Option<crate::config_gate::runtime::ApprovalIdentity>,
     pub(super) shutdown: crate::child_roster::DaemonShutdownFlag,
 }
 
@@ -27,6 +28,7 @@ impl FailureContext {
     pub(super) fn operator() -> Self {
         Self {
             daemon_initiated: false,
+            approval: None,
             shutdown: Default::default(),
         }
     }

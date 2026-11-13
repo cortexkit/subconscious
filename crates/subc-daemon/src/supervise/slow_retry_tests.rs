@@ -706,6 +706,7 @@ fn parked_actor(
             deadline: Instant::now(),
             kind: RespawnKind::Spawn,
             daemon_initiated,
+            approval: None,
         });
     }
     if previous {

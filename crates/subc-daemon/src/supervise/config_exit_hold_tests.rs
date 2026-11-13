@@ -68,6 +68,7 @@ async fn held_pending_work(work: &str, operator_restart: bool) {
                 RespawnKind::Spawn
             },
             daemon_initiated: true,
+            approval: None,
         });
     }
     let (reload_reply, mut reload_result) = oneshot::channel();
@@ -117,7 +118,7 @@ async fn held_pending_work(work: &str, operator_restart: bool) {
         runtime.recovery_is_daemon,
         "refused commands cannot relabel pending daemon work"
     );
-    let scheduled = *runtime.scheduled_respawn.lock().unwrap();
+    let scheduled = runtime.scheduled_respawn.lock().unwrap().clone();
     if work == "wait" {
         assert!(scheduled.is_none());
     } else {
@@ -240,6 +241,7 @@ async fn stale_config_exit_hold_keeps_reload_work_and_answers_its_caller() {
         deadline: Instant::now() + Duration::from_millis(20),
         kind: RespawnKind::Reload,
         daemon_initiated: false,
+        approval: None,
     });
     let (reply, held) = oneshot::channel();
     let mut child = None;
@@ -312,6 +314,7 @@ async fn stale_config_exit_hold_preserves_crash_backoff_deadline() {
         deadline,
         kind: RespawnKind::Spawn,
         daemon_initiated: true,
+        approval: None,
     });
     let before = format!("{:?}", module.status().unwrap());
     let (reply, held) = oneshot::channel();
@@ -330,7 +333,7 @@ async fn stale_config_exit_hold_preserves_crash_backoff_deadline() {
         .await
     );
     held.await.unwrap().unwrap();
-    let pending = runtime.scheduled_respawn.lock().unwrap().unwrap();
+    let pending = runtime.scheduled_respawn.lock().unwrap().clone().unwrap();
     assert_eq!(
         pending.deadline, deadline,
         "stale holds must not shorten crash backoff"

@@ -37,15 +37,20 @@ async fn failed_module() -> SupervisedModule {
 
 #[tokio::test(start_paused = true)]
 async fn config_recovery_preserves_slow_retry_until_it_parks_without_spawning() {
-    recovery_slow_retry_roundtrip(false).await;
+    recovery_slow_retry_roundtrip(false, false).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn config_recovery_release_after_retry_park_preserves_daemon_retry_chain() {
-    recovery_slow_retry_roundtrip(true).await;
+    recovery_slow_retry_roundtrip(true, false).await;
 }
 
-async fn recovery_slow_retry_roundtrip(release_after_park: bool) {
+#[tokio::test(start_paused = true)]
+async fn config_recovery_refused_restart_before_retry_park_keeps_daemon_chain() {
+    recovery_slow_retry_roundtrip(true, true).await;
+}
+
+async fn recovery_slow_retry_roundtrip(release_after_park: bool, refused_before_retry: bool) {
     let dir = cortexkit_test_support::ScratchDir::new("recovery-slow-retry");
     let path = dir.join("subc.jsonc");
     std::fs::write(
@@ -136,6 +141,12 @@ async fn recovery_slow_retry_roundtrip(release_after_park: bool) {
     );
     let worker = handler.spawn_config_delivery_worker().unwrap();
     module.config_exit_hold().await.unwrap();
+    if refused_before_retry {
+        assert!(matches!(
+            module.restart(None).await,
+            Err(SuperviseError::ConfigHeld { .. })
+        ));
+    }
     assert_eq!(module.status().unwrap().restart_count, before.restart_count);
     assert_eq!(module.retry_deadline_for_test(), deadline);
     // Recovery does not consume a Failed actor's retry. When the existing

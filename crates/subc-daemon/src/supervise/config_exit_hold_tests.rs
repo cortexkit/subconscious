@@ -1,6 +1,144 @@
 use super::*;
 
 #[tokio::test]
+async fn current_hold_notification_preserves_pending_reload() {
+    held_pending_work("reload", false).await;
+}
+
+#[tokio::test]
+async fn current_hold_notification_preserves_crash_backoff() {
+    held_pending_work("spawn", false).await;
+}
+
+#[tokio::test]
+async fn current_hold_notification_preserves_previous_instance_wait() {
+    held_pending_work("wait", false).await;
+}
+
+#[tokio::test]
+async fn refused_restart_preserves_pending_reload_and_daemon_attribution() {
+    held_pending_work("reload", true).await;
+}
+
+async fn held_pending_work(work: &str, operator_restart: bool) {
+    let (_scratch, owner, supervisor, _, spec) =
+        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+    std::fs::write(
+        spec.program
+            .parent()
+            .unwrap()
+            .join("store")
+            .join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(owner.check_recovery().unwrap());
+    let RegisteredConfiguredModule {
+        mut spec,
+        mut runtime,
+        module,
+        mut commands,
+    } = supervisor
+        .register_configured_with_health(
+            spec,
+            true,
+            Default::default(),
+            None,
+            Default::default(),
+            DEFAULT_REGISTER_TIMEOUT,
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    update_snapshot(&module.inner.snapshot, Some("a"), |state| {
+        if work == "wait" {
+            state.waiting_for_previous_pid = Some(4242);
+            state.waiting_for_previous_detail = Some("previous process still alive".into());
+        } else {
+            state.state = ModuleState::Restarting;
+            state.respawn_pending = true;
+        }
+    })
+    .unwrap();
+    if work != "wait" {
+        *runtime.scheduled_respawn.lock().unwrap() = Some(PendingRespawn {
+            deadline,
+            kind: if work == "reload" {
+                RespawnKind::Reload
+            } else {
+                RespawnKind::Spawn
+            },
+            daemon_initiated: true,
+        });
+    }
+    let (reload_reply, mut reload_result) = oneshot::channel();
+    if work == "reload" {
+        *runtime.deferred_reload_reply.lock().unwrap() = Some(reload_reply);
+    }
+    runtime.recovery_is_daemon = true;
+    let before = module.inner.snapshot.lock().unwrap().clone();
+    let (reply, result) = oneshot::channel();
+    let command = if operator_restart {
+        SupervisorCommand::Restart {
+            requester: None,
+            drain_timeout_ms: None,
+            received_at_generation: 0,
+            queued_at: Instant::now(),
+            reply,
+        }
+    } else {
+        SupervisorCommand::ConfigExitHold { reply }
+    };
+    assert!(
+        handle_supervisor_command(
+            command,
+            &mut spec,
+            &mut runtime,
+            &supervisor.registry,
+            &supervisor.process_liveness,
+            &module.inner.snapshot,
+            &mut None,
+            &mut commands,
+            &mut VecDeque::new()
+        )
+        .await
+    );
+    let answer = result.await.unwrap();
+    if operator_restart {
+        assert!(matches!(answer, Err(SuperviseError::ConfigHeld { .. })));
+    } else {
+        answer.unwrap();
+    }
+    assert_eq!(
+        *module.inner.snapshot.lock().unwrap(),
+        before,
+        "a notification or refused command cannot own the pending work"
+    );
+    assert!(
+        runtime.recovery_is_daemon,
+        "refused commands cannot relabel pending daemon work"
+    );
+    let scheduled = *runtime.scheduled_respawn.lock().unwrap();
+    if work == "wait" {
+        assert!(scheduled.is_none());
+    } else {
+        let pending = scheduled.expect("the command erased pending work");
+        assert_eq!(pending.deadline, deadline);
+        assert_eq!(
+            matches!(pending.kind, RespawnKind::Reload),
+            work == "reload"
+        );
+        assert!(pending.daemon_initiated);
+    }
+    if work == "reload" {
+        assert!(runtime.deferred_reload_reply.lock().unwrap().is_some());
+        assert!(matches!(
+            reload_result.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+}
+
+#[tokio::test]
 async fn deferred_restart_keeps_target_unavailable_wire_code() {
     deferred_wire_code("restart", "target_unavailable").await;
 }

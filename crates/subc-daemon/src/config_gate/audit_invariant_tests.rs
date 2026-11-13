@@ -162,3 +162,157 @@ async fn approval_latch_clears_after_a_successful_registered_reload() {
         "a successful reload must clear its old approved-start failure: {reconcile:?}"
     );
 }
+
+#[tokio::test]
+async fn superseded_program_refusal_exits_with_crash_accounting_and_starts_new_approval() {
+    superseded_program_exit(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reapproval_release_before_old_program_park_does_not_strand_replacement() {
+    superseded_program_exit(true).await;
+}
+
+async fn superseded_program_exit(release_before_park: bool) {
+    let fixture = gated_claim_fixture().await;
+    let before = fixture.module.status().unwrap();
+    let mut kill = Some(fixture.spawn.defer_content_kill_for_test());
+    let (reached, arrived) = tokio::sync::oneshot::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    if release_before_park {
+        *fixture.owner.config_park_hook.lock().unwrap() = Some(Box::new(move || {
+            reached.send(()).unwrap();
+            resume.recv_timeout(Duration::from_secs(10)).unwrap();
+        }));
+    }
+    let refuse = || {
+        fixture.spawn.set_content_probe_for_test(Arc::new(|| {
+            Err(GateError::new(
+                "program_refused",
+                "the superseded child failed its content witness",
+            ))
+        }))
+    };
+    if release_before_park {
+        refuse();
+        assert_eq!(fixture.spawn.check().unwrap_err(), "program_refused");
+        assert!(fixture.owner.has_recorded_admission_hold("a"));
+        drop(kill.take());
+        tokio::time::timeout(Duration::from_secs(3), arrived)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fixture.module.status().unwrap().process_alive);
+    }
+    let replacement = fixture.rig.path.join("replacement");
+    std::fs::copy(fixture.rig.path.join("program"), &replacement).unwrap();
+    std::fs::rename(replacement, fixture.rig.path.join("program")).unwrap();
+    let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Change);
+    fixture.owner.complete_authority_exit(generation).unwrap();
+    assert!(!fixture.owner.has_recorded_admission_hold("a"));
+    if release_before_park {
+        for exit in fixture.owner.delivery_exits().unwrap() {
+            fixture.owner.delivery_release_exit(&exit).unwrap();
+        }
+        let (wakes, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let handler = Arc::new(
+            (*fixture.handler)
+                .clone()
+                .with_delivery_wakes_for_test(wakes),
+        );
+        let worker = handler.spawn_config_delivery_worker().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), observed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fixture.owner.lock().unwrap().admission_releases.is_empty());
+        assert!(fixture.module.status().unwrap().process_alive);
+        worker.abort();
+        let _ = worker.await;
+        release.send(()).unwrap();
+    } else {
+        refuse();
+        assert_eq!(fixture.spawn.check().unwrap_err(), "program_refused");
+        assert!(!fixture.owner.has_recorded_admission_hold("a"));
+        drop(kill.take());
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let state = fixture.module.status().unwrap();
+            if !state.process_alive || state.spawn_generation > before.spawn_generation {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.module.config_exit_hold().await.unwrap();
+    let classified = fixture.module.status().unwrap();
+    if classified.state == ModuleState::Stopped {
+        drop(fixture.primary);
+        fixture.module.stop().await.unwrap();
+        panic!("the superseded refusal has no current hold and cannot park: {classified:?}");
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.module.status().unwrap().spawn_generation == before.spawn_generation {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let restarted = fixture.module.status().unwrap();
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+    assert!(restarted.process_alive);
+    assert_eq!(
+        restarted.restart_count,
+        before.restart_count + 1,
+        "superseded refusal must use ordinary crash accounting, not a budget-free 100ms Spawn"
+    );
+    assert_eq!(restarted.spawn_generation, before.spawn_generation + 1);
+}
+
+#[tokio::test]
+async fn delivery_failure_park_saves_the_daemon_attempt_before_release() {
+    let fixture = gated_claim_fixture().await;
+    let connection = fixture.primary.connection_id(&fixture.handler);
+    std::fs::write(
+        fixture
+            .rig
+            .path
+            .join("store")
+            .join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(fixture.owner.check_recovery().unwrap());
+    fixture
+        .module
+        .config_delivery_failed(connection, true)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while fixture.module.status().unwrap().state != ModuleState::Stopped {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let parked = fixture.module.status().unwrap();
+    assert!(!parked.process_alive);
+    let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Unstamp);
+    fixture.owner.complete_authority_exit(generation).unwrap();
+    let mut missing = spec(&fixture.rig);
+    missing.program = fixture.rig.path.join("missing-program");
+    fixture
+        .module
+        .update_configuration(missing, Default::default(), None)
+        .await
+        .unwrap();
+    assert!(fixture.module.release_config_hold().await.is_err());
+    let next_retry = fixture.module.next_retry_at_ms().unwrap();
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+    assert!(next_retry.is_some(), "a delivery-failure park must retain daemon attribution so a failing release schedules its slow retry");
+}

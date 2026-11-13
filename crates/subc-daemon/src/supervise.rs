@@ -8668,6 +8668,8 @@ async fn supervise_loop(
                         });
                         NextAction::Restart {schedule:None}
                     } else if active_child.live_program_binding.as_ref().is_some_and(|binding|binding.is_refused()) || runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.exit_is_held(&spec.module_id)) {
+                        #[cfg(test)]
+                        if let Some(delivery) = &runtime.config_delivery { delivery.0.pause_before_config_park_for_test(); }
                         record_terminal_with_detail(&spec.module_id, &runtime.terminal_ring, &runtime.spawn_events, &exit_report, TerminalDisposition::Stopped, active_child.spawn_failure.clone().or_else(|| Some("config_gated".into())));
                         if active_child.live_program_binding.as_ref().is_some_and(|binding| binding.is_refused()) {
                             // This child's content refusal is permanent even when

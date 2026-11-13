@@ -99,6 +99,12 @@ async fn parking_poison_startup(strict: bool, synchronous: bool) {
     let rig = rig();
     let owner = Arc::new(rig.owner("poison-during-startup-park"));
     rig.stamp(&owner);
+    let approval = owner
+        .authority_exit_configuration(1)
+        .unwrap()
+        .unwrap()
+        .3
+        .identity();
     std::fs::write(
         rig.path.join("store").join(crate::config_store::STORE_FILE),
         b"tampered",
@@ -132,7 +138,7 @@ async fn parking_poison_startup(strict: bool, synchronous: bool) {
     }));
     let result = if strict {
         supervisor
-            .start_registered_approved_async(registered, subc_protocol::Principal::Direct, 1)
+            .start_registered_approved_async(registered, subc_protocol::Principal::Direct, approval)
             .await
     } else if synchronous {
         supervisor.start_registered_configured(registered, None, true)
@@ -672,6 +678,7 @@ async fn committed_enable_ordered(
                 .unwrap()
                 .expect("the failed generation must remain unreconciled");
             assert!(approved.changes_entry("a"));
+            let identity = approved.identity();
             assert!(
                 reconciled
                     .reconcile_approved_configuration(approved)
@@ -680,7 +687,7 @@ async fn committed_enable_ordered(
                 "every reconcile must retain the generation's launch failure"
             );
             reconciled.set_enabled(false).await.unwrap();
-            assert!(reconciled.check_approved_start_failure(1).is_err(),
+            assert!(reconciled.check_approved_start_failure(&identity).is_err(),
                 "a later disable is not an operator start and cannot erase the approved generation's failure");
         }
         assert!(fixture.owner.check_module_hold("a").is_ok());

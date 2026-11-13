@@ -165,51 +165,69 @@ impl ControlHandler {
                     .on_blocking(move |owner| owner.daemon_entry_reconciled(&witness, &id))
                     .await?;
             }
+            let mut failed_modules = Vec::new();
             for (index, module) in config.modules.into_iter().enumerate() {
-                if let Some(existing) = self.supervisor.get(&module.module_id) {
-                    existing
-                        .check_approved_start_failure(approved.generation())
-                        .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
-                    if approved.changes_entry(&module.module_id) {
+                let module_id = module.module_id.clone();
+                let result = async {
+                    if let Some(existing) = self.supervisor.get(&module.module_id) {
                         existing
-                            .reconcile_approved_configuration(approved.clone())
+                            .check_approved_start_failure(&approved.identity())
+                            .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
+                        if approved.changes_entry(&module.module_id) {
+                            existing
+                                .reconcile_approved_configuration(approved.clone())
+                                .await
+                                .map_err(|error| {
+                                    GateError::new("rescan_failed", error.to_string())
+                                })?;
+                        }
+                    } else {
+                        let registered = context
+                            .supervisor
+                            .register_configured_with_health(
+                                module.module_spec(),
+                                module.enabled,
+                                module.health.clone(),
+                                module.drain_timeout_ms,
+                                module.restart,
+                                module.register_timeout,
+                            )
+                            .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
+                        context
+                            .supervisor
+                            .start_registered_approved_async(
+                                registered,
+                                Principal::Direct,
+                                approved.identity(),
+                            )
                             .await
                             .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
                     }
-                } else {
-                    let registered = context
-                        .supervisor
-                        .register_configured_with_health(
-                            module.module_spec(),
-                            module.enabled,
-                            module.health.clone(),
-                            module.drain_timeout_ms,
-                            module.restart,
-                            module.register_timeout,
-                        )
-                        .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
-                    context
-                        .supervisor
-                        .start_registered_approved_async(
-                            registered,
-                            Principal::Direct,
-                            approved.generation(),
-                        )
-                        .await
-                        .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
+                    let witness = approved.clone();
+                    owner
+                        .on_blocking(move |owner| {
+                            owner.daemon_entry_reconciled(&witness, &module.module_id)
+                        })
+                        .await?;
+                    Ok::<(), GateError>(())
                 }
-                let witness = approved.clone();
-                owner
-                    .on_blocking(move |owner| {
-                        owner.daemon_entry_reconciled(&witness, &module.module_id)
-                    })
-                    .await?;
+                .await;
+                if let Err(error) = result {
+                    if error.code != "rescan_failed" {
+                        return Err(error);
+                    }
+                    failed_modules.push(format!("{module_id}: {}", error.detail));
+                    continue;
+                }
                 #[cfg(test)]
                 if let Some(hook) = self.recovery_exit_test_after_step {
                     hook(index + 1)?;
                 }
                 #[cfg(not(test))]
                 let _ = index;
+            }
+            if !failed_modules.is_empty() {
+                return Err(GateError::new("rescan_failed", failed_modules.join("; ")));
             }
         } else {
             self.reconcile_supervised_modules(

@@ -552,8 +552,17 @@ pub struct ApprovedRollbackCommands {
 #[derive(Clone, Debug)]
 pub(crate) struct ApprovedDaemonConfiguration {
     generation: u64,
+    approval_digest: Digest,
     daemon: std::sync::Arc<ConfigLayerSnapshot>,
     changed_entries: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ApprovalIdentity {
+    // Recovery rebuilds generation numbering. The committed approval digest
+    // distinguishes a fresh authority from an earlier generation with this id.
+    generation: u64,
+    approval_digest: Digest,
 }
 
 pub struct ApprovedRollbackProgram {

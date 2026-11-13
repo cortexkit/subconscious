@@ -15,6 +15,12 @@ impl OwnerState {
 }
 
 impl ApprovedDaemonConfiguration {
+    pub(crate) fn identity(&self) -> ApprovalIdentity {
+        ApprovalIdentity {
+            generation: self.generation,
+            approval_digest: self.approval_digest.clone(),
+        }
+    }
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -111,6 +117,7 @@ impl RuntimeOwner {
         let stamped = body.stamped;
         let mut approved = ApprovedDaemonConfiguration {
             generation,
+            approval_digest: body.generations[&generation].generation.plan_digest.clone(),
             daemon: std::sync::Arc::new(layer.clone()),
             changed_entries: BTreeSet::new(),
         };

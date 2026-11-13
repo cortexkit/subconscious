@@ -1632,7 +1632,7 @@ struct SupervisorSnapshot {
     /// schedule the next slow retry instead of treating the start as operator work.
     config_hold_daemon_initiated: bool,
     /// Retain an approved launch failure across competing reconciliation passes.
-    approved_start_failure: Option<(u64, String)>,
+    approved_start_failure: Option<(crate::config_gate::runtime::ApprovalIdentity, String)>,
     legacy_registration_spawn: bool,
     registration_declaration: Option<String>,
     stop_reason: Option<ModuleStopReason>,
@@ -4355,7 +4355,7 @@ impl Supervisor {
         &self,
         registered: RegisteredConfiguredModule,
         requester: Principal,
-        generation: u64,
+        generation: crate::config_gate::runtime::ApprovalIdentity,
     ) -> Result<SupervisedModule, SuperviseError> {
         self.start_registered_with_failure_policy(
             registered,
@@ -4371,7 +4371,7 @@ impl Supervisor {
         registered: RegisteredConfiguredModule,
         requester: Option<Principal>,
         daemon_initiated: bool,
-        approved_generation: Option<u64>,
+        approved_generation: Option<crate::config_gate::runtime::ApprovalIdentity>,
     ) -> Result<SupervisedModule, SuperviseError> {
         let RegisteredConfiguredModule {
             spec,
@@ -4619,17 +4619,18 @@ impl fmt::Debug for SupervisedModule {
 impl SupervisedModule {
     pub(crate) fn check_approved_start_failure(
         &self,
-        generation: u64,
+        generation: &crate::config_gate::runtime::ApprovalIdentity,
     ) -> Result<(), SuperviseError> {
-        let state = lock_snapshot(&self.inner.snapshot)?;
+        let mut state = lock_snapshot(&self.inner.snapshot)?;
         if let Some((failed_generation, detail)) = &state.approved_start_failure {
-            if *failed_generation == generation {
+            if failed_generation == generation {
                 return Err(SuperviseError::ReloadFailed {
                     module_id: self.inner.module_id.clone(),
                     reason: detail.clone(),
                 });
             }
         }
+        state.approved_start_failure = None;
         Ok(())
     }
 
@@ -9212,7 +9213,7 @@ async fn handle_supervisor_command(
                 {
                     let mut state = lock_snapshot(snapshot)?;
                     if let Some((generation, detail)) = &state.approved_start_failure {
-                        if *generation == approved.generation() && next.enabled {
+                        if *generation == approved.identity() && next.enabled {
                             return Err(SuperviseError::Spawn {
                                 program: spec.program.clone(),
                                 source: std::io::Error::other(detail.clone()),
@@ -9300,10 +9301,10 @@ async fn handle_supervisor_command(
                         && state
                             .approved_start_failure
                             .as_ref()
-                            .is_none_or(|(generation, _)| *generation != approved.generation())
+                            .is_none_or(|(generation, _)| *generation != approved.identity())
                     {
                         state.approved_start_failure =
-                            Some((approved.generation(), error.to_string()));
+                            Some((approved.identity(), error.to_string()));
                     }
                 });
             }
@@ -15464,6 +15465,7 @@ fn set_running(
     state.configuration_updated_since_spawn = false;
     state.spawned_protocol = Some(child.protocol);
     state.state = ModuleState::Running;
+    state.approved_start_failure = None;
     state.enabled = true;
     state.process_alive = true;
     state.pid = child.id();

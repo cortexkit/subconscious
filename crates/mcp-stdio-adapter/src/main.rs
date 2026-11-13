@@ -97,6 +97,9 @@ async fn run() -> Result<()> {
 
 fn manifest_json(manifest: ModuleManifest) -> Result<serde_json::Value> {
     let mut value = serde_json::to_value(manifest)?;
+    // The adapter executes third-party servers; its identity must never qualify
+    // their calls for first-party automatic grants.
+    value["hosts_third_party_code"] = serde_json::Value::Bool(true);
     value
         .as_object_mut()
         .expect("serialized module manifest is an object")

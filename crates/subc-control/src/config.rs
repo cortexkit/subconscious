@@ -31,6 +31,9 @@ pub enum ConfigControlRequest {
         module_id: String,
         path: String,
         sha256: Digest,
+        /// Offline manifest reported by the placement tool, not executed by the daemon.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest: Option<serde_json::Value>,
     },
 }
 

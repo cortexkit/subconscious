@@ -85,6 +85,7 @@ if [ "${1:-}" = config ] && [ "${2:-}" = place-program ]; then
   printf 'place-program %s\n' "${3:-}" >>"$CK_CALLS"
   [ "${CK_CONFIG_PLACE_REFUSE:-0}" = 0 ] || exit 1
   [ "$(shasum -a 256 "$4" | cut -d' ' -f1)" = "$5" ] || exit 1
+  [ "${6:-}" = "$("$4" --manifest)" ] || { echo 'placed manifest was not recorded' >&2; exit 1; }
   exit 0
 fi
 if [ "${1:-}" = module ] && { [ "${2:-}" = stop ] || [ "${2:-}" = start ] || [ "${2:-}" = restart ]; }; then
@@ -332,7 +333,7 @@ case_config_gate_forward_and_install() {
 import pathlib,sys
 source=pathlib.Path(sys.argv[1]).read_text()
 functions=[]
-for name in ("config_gate_preflight", "record_program_placement"):
+for name in ("config_gate_preflight", "probe_cli_faces", "record_program_placement"):
     body=source.split(name+"() {\n",1)[1].split("\n}\n",1)[0]
     functions.append(name+"() {\n"+body+"\n}\n")
 tail=source.split('say "=== place"\ncp "$STAGED"',1)[1]

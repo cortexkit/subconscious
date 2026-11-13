@@ -35,6 +35,7 @@ pub enum CommitKind {
     Approved,
     Rollback,
     Development,
+    DeclarationApproval,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +91,9 @@ pub const PROGRAM_REFUSAL_LIMIT: usize = 256;
 /// use a list because JSON object keys cannot represent structured tuples.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct StoreBody {
+    /// Last person-approved provider-entry digests, retained across development placements.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub approved_declarations: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub program_refusals: Vec<ProgramRefusal>,
     pub stamped: bool,
@@ -113,12 +117,15 @@ impl StoreBody {
         // each module's newest placement until a person-approved generation
         // supersedes the development overlay.
         let mut placed_modules = BTreeSet::new();
-        for (&id, entry) in self
-            .generations
-            .iter()
-            .rev()
-            .take_while(|(_, entry)| entry.kind == CommitKind::Development)
-        {
+        for (&id, entry) in self.generations.iter().rev().take_while(|(_, entry)| {
+            matches!(
+                entry.kind,
+                CommitKind::Development | CommitKind::DeclarationApproval
+            )
+        }) {
+            if entry.kind != CommitKind::Development {
+                continue;
+            }
             for module in entry.generation.changeset.launch_manifests.keys() {
                 if placed_modules.insert(module) {
                     keep.insert(id);
@@ -137,7 +144,11 @@ impl StoreBody {
             if daemon_versions.len() == 2 {
                 break;
             }
-            if entry.kind == CommitKind::Development || entry.generation.development {
+            if matches!(
+                entry.kind,
+                CommitKind::Development | CommitKind::DeclarationApproval
+            ) || entry.generation.development
+            {
                 continue;
             }
             let Some(daemon) = entry

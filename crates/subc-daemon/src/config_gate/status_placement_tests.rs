@@ -1,5 +1,92 @@
 use super::*;
 
+#[cfg(all(unix, feature = "dev-placement"))]
+#[test]
+fn origins_placement_records_exact_launch_and_rederives_after_reload() {
+    use crate::{program_origin::LaunchWitness, spawn_authority::SpawnAuthorityRecord};
+    use subc_protocol::peer::CallerOrigin;
+    let rig = program_rig();
+    let owner = rig.owner("origin-placement");
+    rig.stamp(&owner);
+    let digest = replace_program(&rig);
+    let manifest = json!({"module_id":"a", "hosts_third_party_code":false,
+        "provider_declarations":{"provider":{"operation":"read"}},
+        "provenance":{"build_git_sha":"a".repeat(40)}});
+    let id = owner
+        .place_program_with_manifest(
+            "a",
+            rig.path.join("program").to_str().unwrap(),
+            &digest,
+            Some(&manifest),
+        )
+        .unwrap()
+        .unwrap();
+    {
+        let mut state = owner.lock().unwrap();
+        let evidence = &state.store.body().unwrap().generations[&id]
+            .generation
+            .changeset
+            .launch_manifests["a"]["origin_evidence"];
+        assert_eq!(evidence["module_id"], "a");
+        assert_eq!(evidence["published_commit"], "a".repeat(40));
+        assert_eq!(evidence["hosts_third_party_code"], false);
+        assert_eq!(evidence["declarations"], manifest["provider_declarations"]);
+        assert_eq!(
+            evidence["launch"]["working_directory"],
+            std::env::current_dir().unwrap().to_str().unwrap()
+        );
+    }
+    drop(owner);
+    let owner = rig.owner("origin-placement-reloaded");
+    let spec = module_spec(&rig);
+    let admission = owner.prepare_spawn(&spec).unwrap();
+    let witness = LaunchWitness::capture(&spec).unwrap();
+    let record = SpawnAuthorityRecord::new("incarnation", 1, "a");
+    admission.initialize_origin(&record, &witness);
+    assert_eq!(record.capture().unwrap().origin, CallerOrigin::Development);
+    let requested = serde_json::from_value(manifest["provider_declarations"].clone()).unwrap();
+    let differing = record.initialize_declarations(requested);
+    let plan = owner.plan_development_widening(&record, differing).unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let challenge = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
+    owner
+        .finish_approval(
+            challenge.attempt(),
+            &Rig::facts(),
+            ApprovalReply::Presence(crate::config_gate::PresenceDecision::InteractiveApproval),
+            1,
+        )
+        .unwrap();
+    assert_eq!(
+        owner.check_spawn("a", &admission).unwrap_err().code,
+        "config_delivery_deferred"
+    );
+    drop(owner);
+    let owner = rig.owner("origin-placement-after-widening");
+    let admission = owner.prepare_spawn(&spec).unwrap();
+    let next = SpawnAuthorityRecord::new("incarnation", 2, "a");
+    admission.initialize_origin(&next, &witness);
+    assert_eq!(next.capture().unwrap().origin, CallerOrigin::Development);
+    assert!(next
+        .initialize_declarations(
+            serde_json::from_value(manifest["provider_declarations"].clone()).unwrap()
+        )
+        .is_empty());
+    assert!(next
+        .capture()
+        .unwrap()
+        .approved
+        .entries
+        .contains_key("provider"));
+    let mut changed = witness;
+    changed.working_directory = rig.path.join("different-directory");
+    let respawn = SpawnAuthorityRecord::new("incarnation", 3, "a");
+    admission.initialize_origin(&respawn, &changed);
+    assert_eq!(respawn.capture().unwrap().origin, CallerOrigin::Other);
+}
+
 #[test]
 fn config_status_tracks_live_declarations_without_approved_config() {
     let rig = Rig::new();

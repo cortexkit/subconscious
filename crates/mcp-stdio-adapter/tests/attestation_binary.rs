@@ -24,6 +24,7 @@ fn manifest_is_emitted_offline_before_startup_attestation() {
         serde_json::from_slice(&output.stdout).expect("manifest JSON");
     assert_eq!(manifest["runtime_computed"], serde_json::json!([]));
     assert_eq!(manifest["module_id"], "mcp-stdio-adapter");
+    assert_eq!(manifest["hosts_third_party_code"], true);
     // Other workspace crates can enable serde_json's preserve_order feature;
     // compare the pre-logger manifest independent of map serialization order.
     let normalized = String::from_utf8(output.stdout).unwrap().replace(
@@ -33,7 +34,11 @@ fn manifest_is_emitted_offline_before_startup_attestation() {
     let baseline = "{\"module_id\":\"mcp-stdio-adapter\",\"module_version\":\"0.1.0\",\"protocol_ver\":2,\"provides\":[{\"concurrency\":\"module_managed\",\"config_schema\":{\"type\":\"object\"},\"identity_scope\":[\"project\",\"session\"],\"observability\":[{\"kind\":\"snapshot\",\"name\":\"health\"}],\"operations\":[{\"description\":\"List the MCP tools exposed by the configured child servers and return their names, descriptions, and input schemas.\",\"kind\":\"query\",\"name\":\"tools/list\"},{\"description\":\"Invoke a named tool on a configured child server and return the child's MCP result.\",\"kind\":\"mutate\",\"name\":\"tools/call\"}],\"role\":\"management_surface\"}],\"runtime_computed\":[]}";
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&normalized).unwrap(),
-        serde_json::from_str::<serde_json::Value>(baseline).unwrap()
+        {
+            let mut expected = serde_json::from_str::<serde_json::Value>(baseline).unwrap();
+            expected["hosts_third_party_code"] = serde_json::json!(true);
+            expected
+        }
     );
 }
 

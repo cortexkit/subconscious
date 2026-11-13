@@ -38,6 +38,7 @@ pub mod observability;
 pub mod operator_apps;
 pub mod operator_confirm;
 pub mod privileged_prompt;
+pub(crate) mod program_origin;
 #[allow(dead_code)]
 mod provenance;
 pub mod registry;

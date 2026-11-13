@@ -397,6 +397,20 @@ pub(crate) struct RegistrationService {
 }
 
 impl SupervisorHandle {
+    /// Includes warming and not-yet-registered launches, not just the active slot.
+    pub(crate) fn spawn_authority_records_for_module(
+        &self,
+        module: &str,
+    ) -> Vec<Arc<crate::spawn_authority::SpawnAuthorityRecord>> {
+        self.registration_launches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|spawn| spawn.module_id == module)
+            .map(|spawn| spawn.authority.clone())
+            .collect()
+    }
     /// The daemon incarnation spawn generations and authority records belong to.
     pub(crate) fn daemon_incarnation(&self) -> String {
         self.spawn_events

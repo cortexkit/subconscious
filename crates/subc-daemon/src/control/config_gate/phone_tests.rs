@@ -244,6 +244,10 @@ impl Fixture {
     }
 
     async fn build(lifecycle: bool) -> Self {
+        Self::build_with_development_module(lifecycle, false).await
+    }
+
+    async fn build_with_development_module(lifecycle: bool, development_module: bool) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/scratch")
@@ -258,14 +262,23 @@ impl Fixture {
             ));
         std::fs::create_dir_all(path.join("store")).unwrap();
         std::fs::create_dir_all(path.join("cortexkit")).unwrap();
-        std::fs::copy("/bin/sh", path.join("program")).unwrap();
+        std::fs::copy(
+            if development_module {
+                "/bin/sleep"
+            } else {
+                "/bin/sh"
+            },
+            path.join("program"),
+        )
+        .unwrap();
         // Keep the dummy phone surface's native image stable for content verification:
         // a shell can exec sleep after its own image was sampled.
         let phone_program = std::path::PathBuf::from("/bin/sleep");
         std::fs::write(
             path.join("subc.jsonc"),
             serde_json::to_vec(&json!({"version":1,"modules":{
-                "a":{"program":path.join("program"),"registration_channel":true},
+                "a":{"program":path.join("program"),"registration_channel":true,
+                    "args": if development_module { vec!["600"] } else { vec![] }},
                 "callosum":{"program":phone_program,"args":["600"],"reserved":true,"registration_channel":true,
                     "overlap": if lifecycle { "safe" } else { "exclusive" }}
             }}))
@@ -1241,4 +1254,141 @@ async fn registration_declaration_phone_surface_belongs_only_to_current_channel(
         .deregister_connection(foreign)
         .unwrap();
     fixture.module.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn origins_hello_files_one_phone_card_and_publishes_approved_entries() {
+    let mut fixture = Fixture::build_with_development_module(false, true).await;
+    let supervisor =
+        Supervisor::new_for_test(fixture.handler.registry.clone(), RestartPolicy::default())
+            .with_handle(fixture.handler.supervisor.clone())
+            .with_forwarding(fixture.handler.forwarding.clone())
+            .with_config_runtime(fixture.owner.clone());
+    let config = crate::daemon_config::load(fixture.scratch.0.join("subc.jsonc"))
+        .unwrap()
+        .unwrap();
+    let module = supervisor
+        .spawn_async(
+            config
+                .modules
+                .iter()
+                .find(|entry| entry.module_id == "a")
+                .unwrap()
+                .module_spec(),
+        )
+        .await
+        .unwrap();
+    let spawn = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(spawn) = fixture.handler.supervisor.registration_for_test("a") {
+                spawn.wait_launch().await;
+                break spawn;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    spawn.authority.initialize_origin(
+        subc_protocol::peer::CallerOrigin::Development,
+        Default::default(),
+        Some(false),
+    );
+    let connection = ConnectionId::new(20);
+    spawn.bind(connection);
+    let entries = json!({"provider-a":{"items":["one"]},"provider-b":{"operation":"read"}});
+    let mut manifest = subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build();
+    manifest.provider_declarations = Some(serde_json::from_value(entries.clone()).unwrap());
+    let hello = Frame::build(
+        FrameType::Hello,
+        control_flags(),
+        0,
+        0,
+        10,
+        serde_json::to_vec(&subc_protocol::ModuleHelloBody {
+            manifest,
+            protocol_ver: subc_protocol::PROTOCOL_VERSION,
+            control_ops: None,
+            launch_nonce: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let (sender, mut module_frames) = mpsc::channel(8);
+    fixture
+        .handler
+        .handle_hello(
+            connection,
+            Some(crate::FrameSink::new(sender)),
+            hello.clone(),
+        )
+        .unwrap();
+    let ack = module_frames.recv().await.unwrap();
+    assert_eq!(ack.frame.header.ty, FrameType::HelloAck);
+    assert!(spawn
+        .authority
+        .capture()
+        .unwrap()
+        .approved
+        .entries
+        .is_empty());
+    let mut outbound =
+        tokio::time::timeout(std::time::Duration::from_secs(5), fixture.frames.recv())
+            .await
+            .expect("development HELLO must file a phone card")
+            .unwrap();
+    let request: ConsentRequest = serde_json::from_slice(&outbound.frame.body).unwrap();
+    assert!(request.is_consistent());
+    assert_eq!(
+        request.plan.changeset.launch_manifests["a"]["origin"],
+        "development"
+    );
+    assert_eq!(
+        request.plan.changeset.launch_manifests["a"]["provider_declarations"],
+        entries
+    );
+    if let Some(flushed) = outbound.flushed.take() {
+        let _ = flushed.send(());
+    }
+    fixture.answer(PHONE, outbound.frame.header.corr, &request);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let capture = spawn.authority.capture().unwrap();
+            if capture.epoch == 1 && capture.approved.entries.len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the approved set and epoch must be published");
+    assert_eq!(
+        fixture
+            .owner
+            .history()
+            .unwrap()
+            .0
+            .last()
+            .unwrap()
+            .approval_channel,
+        subc_config::ApprovalChannel::PhoneCard
+    );
+    let duplicate = fixture
+        .handler
+        .handle_hello(connection, None, hello)
+        .unwrap();
+    assert!(duplicate
+        .iter()
+        .any(|frame| frame.header.ty == FrameType::Error));
+    assert!(
+        fixture.frames.try_recv().is_err(),
+        "one card covers all differing keys for the spawn"
+    );
+    fixture
+        .handler
+        .registry
+        .deregister_connection(connection)
+        .unwrap();
+    module.stop().await.unwrap();
+    fixture.stop().await;
 }

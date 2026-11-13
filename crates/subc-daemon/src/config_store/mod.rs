@@ -988,7 +988,25 @@ impl ConfigStore {
         body.stamped = kind != CommitKind::Unstamp;
         // Development generations describe program placement, not a new active
         // configuration vector. Their tuple pointers remain untouched.
-        if kind != CommitKind::Development {
+        if kind == CommitKind::DeclarationApproval {
+            let approval: crate::program_origin::DevelopmentApproval = serde_json::from_value(
+                entry.generation.changeset.apply_plan["review"]["development_widening"].clone(),
+            )
+            .map_err(StoreError::serialization)?;
+            let digests = body
+                .approved_declarations
+                .entry(approval.module_id)
+                .or_default();
+            for (provider, value) in approval.requested_entries {
+                let digest = crate::spawn_authority::entry_digest(&provider, &value)
+                    .map_err(StoreError::serialization)?;
+                digests.insert(provider, digest);
+            }
+        }
+        if !matches!(
+            kind,
+            CommitKind::Development | CommitKind::DeclarationApproval
+        ) {
             body.approved = approved;
             if kind == CommitKind::Unstamp {
                 body.program_refusals.clear();

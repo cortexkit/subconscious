@@ -318,7 +318,7 @@ async fn fence_only_approved_enable(has_active: bool) {
     if has_active {
         applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
         assert_active(&owner, INCUMBENT, 1);
-        // Keep the approved daemon-entry witness. The next generation changes
+        // Keep the approved daemon-entry configuration. The next generation changes
         // module values, not the daemon entry being enabled behind its fence.
         approve(&rig, &owner, 2);
     }

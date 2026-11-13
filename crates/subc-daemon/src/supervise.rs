@@ -4417,7 +4417,7 @@ impl Supervisor {
         };
         self.start_monitor(spec, runtime, &module, child, commands);
         // Applying an operator-approved configuration must report a spawn error
-        // without removing the Failed actor or its monitor. Bootstrap instead
+        // without removing the failed module or its monitor. Bootstrap instead
         // tolerates failed starts so other configured modules can still run.
         startup_error.map_or(Ok(module), Err)
     }

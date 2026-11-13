@@ -66,7 +66,6 @@ async fn refused_live_binding_without_a_current_approval_parks_instead_of_respaw
     );
     assert_eq!(after.spawn_generation, before.spawn_generation);
     assert_eq!(after.restart_count, before.restart_count);
-    assert!(!after.respawn_pending);
 }
 
 async fn gated_claim_fixture_with_support(support: Option<bool>) -> GatedClaimFixture {

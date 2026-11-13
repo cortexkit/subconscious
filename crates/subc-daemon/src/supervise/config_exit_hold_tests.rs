@@ -1,6 +1,76 @@
 use super::*;
 
 #[tokio::test]
+async fn deferred_restart_keeps_target_unavailable_wire_code() {
+    deferred_wire_code("restart", "target_unavailable").await;
+}
+
+#[tokio::test]
+async fn deferred_reload_keeps_reload_failed_wire_code() {
+    deferred_wire_code("reload", "reload_failed").await;
+}
+
+#[tokio::test]
+async fn deferred_enable_keeps_target_unavailable_wire_code() {
+    deferred_wire_code("set_enabled", "target_unavailable").await;
+}
+
+async fn deferred_wire_code(operation: &str, expected: &str) {
+    let (_scratch, _, supervisor, _, spec) =
+        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+    let RegisteredConfiguredModule {
+        module,
+        mut commands,
+        ..
+    } = supervisor
+        .register_configured_with_health(
+            spec,
+            true,
+            Default::default(),
+            None,
+            Default::default(),
+            DEFAULT_REGISTER_TIMEOUT,
+        )
+        .unwrap();
+    let responder = tokio::spawn(async move {
+        let error = SuperviseError::ConfigDeliveryDeferred {
+            module_id: "a".into(),
+        };
+        match commands.recv().await.unwrap() {
+            SupervisorCommand::Restart { reply, .. } | SupervisorCommand::Reload { reply, .. } => {
+                reply.send(Err(error)).unwrap();
+            }
+            SupervisorCommand::SetEnabled { reply, .. } => {
+                reply.send(Err(error)).unwrap();
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    });
+    let handler = crate::ControlHandler::new(supervisor.registry.clone())
+        .with_supervisor(supervisor.supervisor_handle.as_ref().unwrap().clone());
+    let (tx, _rx) = mpsc::channel(8);
+    let ctx = crate::RouteCtx {
+        connection_id: ConnectionId::new(51),
+        egress: crate::FrameSink::new(tx),
+    };
+    let request = serde_json::json!({"op":format!("supervisor.{operation}"),"module_id":module.module_id(),"enabled":true});
+    let frames = handler
+        .handle_control_frame(&ctx, crate::control::claims::tests::request(request))
+        .await
+        .unwrap();
+    responder.await.unwrap();
+    let reply: serde_json::Value = serde_json::from_slice(&frames[0].body).unwrap();
+    assert_eq!(reply["code"], expected, "{reply}");
+    assert!(
+        reply["message"]
+            .as_str()
+            .unwrap()
+            .contains("exited delivery target"),
+        "{reply}"
+    );
+}
+
+#[tokio::test]
 async fn stale_config_exit_hold_keeps_reload_work_and_answers_its_caller() {
     let (_scratch, owner, supervisor, _, spec) =
         crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();

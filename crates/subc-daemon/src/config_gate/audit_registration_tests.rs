@@ -638,8 +638,15 @@ async fn committed_enable_ordered(
         .handle
         .get("a")
         .expect("even a failed new actor must stay in the roster");
-    reconciled.config_exit_hold().await.unwrap();
     let parked = reconciled.status().unwrap();
+    reconciled.config_exit_hold().await.unwrap();
+    let after_barrier = reconciled.status().unwrap();
+    assert_eq!(
+        after_barrier.state, parked.state,
+        "the monitor barrier must not create the state under test"
+    );
+    assert_eq!(after_barrier.process_alive, parked.process_alive);
+    assert_eq!(after_barrier.spawn_generation, parked.spawn_generation);
     drop(fixture.primary);
     reconciled.stop().await.unwrap();
     assert!(parked.enabled);

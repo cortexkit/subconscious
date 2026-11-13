@@ -1025,6 +1025,7 @@ impl RuntimeOwner {
     pub(crate) fn unregistered_spawn_count_for_test(&self) -> usize {
         self.lock().unwrap().delivery.unregistered_children.len()
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn delivery_spawned_for_admission_in_slot(
         &self,
         module: &str,

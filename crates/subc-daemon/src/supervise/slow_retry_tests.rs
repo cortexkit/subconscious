@@ -37,6 +37,15 @@ async fn failed_module() -> SupervisedModule {
 
 #[tokio::test(start_paused = true)]
 async fn config_recovery_preserves_slow_retry_until_it_parks_without_spawning() {
+    recovery_slow_retry_roundtrip(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn config_recovery_release_after_retry_park_preserves_daemon_retry_chain() {
+    recovery_slow_retry_roundtrip(true).await;
+}
+
+async fn recovery_slow_retry_roundtrip(release_after_park: bool) {
     let dir = cortexkit_test_support::ScratchDir::new("recovery-slow-retry");
     let path = dir.join("subc.jsonc");
     std::fs::write(
@@ -123,7 +132,7 @@ async fn config_recovery_preserves_slow_retry_until_it_parks_without_spawning() 
     let handler = Arc::new(
         crate::ControlHandler::with_forwarding(registry, forwarding)
             .with_supervisor(handle)
-            .with_config_runtime(owner),
+            .with_config_runtime(owner.clone()),
     );
     let worker = handler.spawn_config_delivery_worker().unwrap();
     module.config_exit_hold().await.unwrap();
@@ -144,6 +153,55 @@ async fn config_recovery_preserves_slow_retry_until_it_parks_without_spawning() 
     assert_eq!(after.restart_count, 0);
     assert!(module.next_retry_at_ms().unwrap().is_none());
     worker.abort();
+    let _ = worker.await;
+    if release_after_park {
+        // A daemon-internal hold notification must not turn this already parked
+        // daemon retry into an operator-owned attempt.
+        module.config_exit_hold().await.unwrap();
+        let mut missing = crashing_spec();
+        missing.program = dir.join("missing-program");
+        module
+            .update_configuration(missing, HealthConfig::default(), None)
+            .await
+            .unwrap();
+        let plan = owner
+            .prepare(crate::config_gate::PlanKind::Unstamp)
+            .unwrap();
+        let plan = owner
+            .finish_plan(plan, crate::config_gate::runtime::daemon_review)
+            .unwrap();
+        owner
+            .desktop_view_delivered(crate::ConnectionId::new(7), &plan)
+            .unwrap();
+        let challenge = owner.begin_approval(&plan.digest, &facts).unwrap();
+        let generation = owner
+            .finish_approval(
+                challenge.attempt(),
+                &facts,
+                crate::config_gate::ApprovalReply::Presence(
+                    crate::config_gate::PresenceDecision::InteractiveApproval,
+                ),
+                2,
+            )
+            .unwrap();
+        owner.complete_authority_exit(generation).unwrap();
+        assert!(owner.check_module_hold("slow-retry-child").is_ok());
+        let attempt = module.inner.snapshot.lock().unwrap().failed_retry.attempt;
+        let released_at = Instant::now();
+        assert!(
+            module.release_config_hold().await.is_err(),
+            "the missing program must fail the resumed attempt"
+        );
+        let failed = module.inner.snapshot.lock().unwrap().clone();
+        module.stop().await.unwrap();
+        assert_eq!(failed.state, ModuleState::Failed);
+        let retry = failed.failed_retry.pending.expect(
+            "a daemon retry parked by admission must continue its slow-retry chain after release",
+        );
+        assert_eq!(retry.attempt, attempt + 1);
+        assert_eq!(retry.delay, Duration::from_secs(1200));
+        assert_eq!(retry.deadline, released_at + Duration::from_secs(1200));
+    }
 }
 
 async fn wait_failed(module: &SupervisedModule, generation: u64) {

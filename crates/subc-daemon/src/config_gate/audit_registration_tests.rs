@@ -1,5 +1,52 @@
 use super::*;
 
+#[tokio::test]
+async fn audit_registration_non_hold_enable_error_fails_reconciliation() {
+    let fixture = legacy().await;
+    fixture.module.set_enabled(false).await.unwrap();
+    fixture.owner.exhaust_delivery_spawns_for_test();
+    fixture.rig.stamp(&fixture.owner);
+    let result = fixture
+        .handler
+        .reconcile_cutover_for_test(fixture.owner.clone(), 1)
+        .await;
+    let status = fixture.owner.polled_status().unwrap();
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+    let error =
+        result.expect_err("an unrecorded internal gate failure must fail apply reconciliation");
+    assert_eq!(error.code, "rescan_failed");
+    assert!(
+        error.detail.contains("delivery_spawn_exhausted"),
+        "{error:?}"
+    );
+    assert!(
+        status.gated_modules.is_empty(),
+        "internal failure is not an admission hold"
+    );
+}
+
+#[tokio::test]
+async fn audit_registration_approved_enable_resets_the_operator_crash_budget() {
+    let fixture = legacy().await;
+    fixture.module.set_enabled(false).await.unwrap();
+    fixture.module.seed_crash_budget_for_test(2);
+    fixture.rig.stamp(&fixture.owner);
+    fixture
+        .handler
+        .reconcile_cutover_for_test(fixture.owner.clone(), 1)
+        .await
+        .unwrap();
+    let status = fixture.module.status().unwrap();
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+    assert!(status.enabled && status.process_alive);
+    assert_eq!(
+        status.restart_count, 0,
+        "an approved disabled-to-enabled transition is an operator enable"
+    );
+}
+
 fn entry(rig: &Rig, field: &str, value: serde_json::Value) {
     let path = rig.path.join("subc.jsonc");
     let mut document: serde_json::Value =
@@ -370,7 +417,7 @@ async fn audit_registration_pending_cutover_worker_uses_retry_backoff() {
         } else {
             notifications += 1;
             assert!(
-                notifications < 10,
+                notifications <= 1,
                 "worker consumed its own reconciliation wakeups"
             );
         }

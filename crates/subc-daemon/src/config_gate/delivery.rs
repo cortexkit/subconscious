@@ -849,6 +849,10 @@ impl RuntimeOwner {
             hook();
         }
     }
+    #[cfg(test)]
+    pub(crate) fn exhaust_delivery_spawns_for_test(&self) {
+        self.lock().unwrap().delivery.next_spawn = u64::MAX;
+    }
     #[cfg(all(test, unix))]
     pub(crate) fn set_spawn_preflight_hook_for_test(&self, hook: impl FnOnce() + Send + 'static) {
         *self.spawn_preflight_hook.lock().unwrap() = Some(Box::new(hook));

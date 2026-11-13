@@ -4722,6 +4722,15 @@ impl SupervisedModule {
             }))
     }
 
+    #[cfg(test)]
+    pub(crate) fn retry_deadline_for_test(&self) -> Option<Instant> {
+        lock_snapshot(&self.inner.snapshot)
+            .unwrap()
+            .failed_retry
+            .pending
+            .map(|retry| retry.deadline)
+    }
+
     pub(crate) fn record_deliberate_severance(
         &self,
         identity: ProcessIdentity,

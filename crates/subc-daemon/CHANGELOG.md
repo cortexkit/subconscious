@@ -26,8 +26,9 @@
   entry points are refused; unstamped script launches retain legacy behavior.
   Retired children cannot retain registration or agent-command authority.
 - Preserve narrowed process-table accounting and shared declaration walks.
-  Pending-root retention and final accounting commits both recheck the current
-  child-bound registration or legacy launch nonce.
+  Retaining newly reported command-process roots while validation is pending
+  and committing their accounting both recheck the current child-bound
+  registration or legacy launch nonce.
 - **Rust migration:** exhaustive `ConfiguredModule` literals must add
   `registration_channel` (`false` preserves legacy configuration). Set it to
   `true` only for modules supporting the private channel. `BootstrapError`

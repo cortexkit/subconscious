@@ -159,6 +159,8 @@ mod tests {
             ("daemon_config.rs", 4),
             ("live_children.rs", 1),
             ("privileged_prompt.rs", 1),
+            // Ignored benchmark inputs, not startup overrides.
+            ("resource_totals/latency_bench.rs", 2),
             ("run_dir_lock.rs", 2),
             ("supervise.rs", 12),
             ("systemd_kill_mode.rs", 1),

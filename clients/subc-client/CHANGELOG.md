@@ -6,7 +6,8 @@
   `authority_changed`. Update exhaustive switches or records for the new
   member; it is reopenable. Unknown reasons remain conservatively classified.
 - Add opt-in provider `config` hooks for declaration, immutable review, apply,
-  ACK/NACK, changed hints and bounded anchor retries. Adoption begins only when
+  ACK/NACK and changed hints. Rate-limit retries of application reports while
+  the daemon finishes securing the approved generation. Adoption begins only when
   serving. Refusals retain the last view, and a first refusal exposes typed
   `no_approved_config` availability without file bytes. Only daemons lacking
   `config.gate` permit the legacy file reader. The sample handles absent and

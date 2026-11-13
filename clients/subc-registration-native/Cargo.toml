@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 [dependencies]
 napi = { version = "=2.16.17", default-features = false, features = ["napi8", "tokio_rt", "dyn-symbols"] }
 napi-derive = "=2.16.13"
-subc-os = { path = "../../crates/subc-os" }
+subc-os = { path = "../../crates/subc-os", version = "0.1.35" }
 tokio = { version = "1", features = ["net", "io-util", "sync", "macros"] }
 zeroize = "1"
 

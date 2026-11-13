@@ -12,7 +12,8 @@
   called only when the daemon does not advertise `config.gate`.
 - Preserve the last active view on gated/refused delivery and expose typed
   no-approved-configuration availability on a first refusal. Connection-bound
-  ACK/NACK and anchor retries keep configuration work off the reader's health,
+  ACK/NACK and retries of application reports while the daemon finishes securing
+  the approved generation keep configuration work off the reader's health,
   drain and stop paths. Rollback delivery uses approved retained bytes; changed
   programs still require renewed approval by the daemon.
 - Use the inherited private registration channel for supported supervised

@@ -16,7 +16,8 @@
   APIs without exposing a launch nonce to unrelated local connections.
 - Expose macOS process code-directory hashes and validated per-slice file hashes
   for checking approved executable content, including kernel validity and exec
-  race checks. Keep master's narrowed process-table reads and coverage checks.
+  race checks. Preserve narrowed process-table reads and coverage checks for
+  daemon resource accounting.
   These primitives do not enable configuration stamping: the gate ships with
   the stamp off, and unstamped installs behave as before.
 

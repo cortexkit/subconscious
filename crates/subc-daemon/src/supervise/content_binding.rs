@@ -101,6 +101,10 @@ impl LiveProgramBinding {
                     .map(|launch| launch.spec.module_id.clone())
                     .ok();
                 if let Some(module) = module {
+                    // Publishing the hold may wait for the owner lock and a
+                    // store write. Claims are already retired; delaying the kill
+                    // is intentional so a concurrent check cannot let the
+                    // supervisor reap the child before its refusal is recorded.
                     let _ = self.owner.record_program_refusal(
                         &module,
                         &self.base,

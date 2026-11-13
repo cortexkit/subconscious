@@ -174,10 +174,7 @@ impl Shared {
             _ => {
                 let (entry, reason) = {
                     let mut inner = self.lock_inner();
-                    (
-                        inner.remove_pending(&key),
-                        inner.route_end_reason(handle.channel),
-                    )
+                    (inner.remove_pending(&key), inner.route_end(handle.channel))
                 };
                 if let Some(entry) = entry {
                     settle_route_pending_entries(

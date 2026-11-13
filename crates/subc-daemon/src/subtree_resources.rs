@@ -358,33 +358,38 @@ fn unavailable(error: &std::io::Error) -> SubtreeReading {
 
 #[cfg(test)]
 pub(crate) async fn read(targets: Vec<Target>) -> Vec<SubtreeReading> {
+    // Pipeline-budget fixtures must not compete with unrelated native process
+    // walks in the daemon-wide pool; admission pressure is tested separately.
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_READERS));
     let mut readings = vec![SubtreeReading::unavailable("read_failed"); targets.len()];
     let mut tasks = tokio::task::JoinSet::new();
     let mut pending = targets.into_iter().enumerate();
     // Start budgets only as targets enter the bounded pipeline, not while
     // later modules are queued behind earlier work in this list.
     for (index, target) in pending.by_ref().take(MAX_READERS) {
-        tasks.spawn(async move { (index, read_target(target).await) });
+        let slots = Arc::clone(&slots);
+        tasks.spawn(async move { (index, read_target(target, slots).await) });
     }
     while let Some(result) = tasks.join_next().await {
         if let Ok((index, reading)) = result {
             readings[index] = reading;
         }
         if let Some((index, target)) = pending.next() {
-            tasks.spawn(async move { (index, read_target(target).await) });
+            let slots = Arc::clone(&slots);
+            tasks.spawn(async move { (index, read_target(target, slots).await) });
         }
     }
     readings
 }
 
 #[cfg(test)]
-async fn read_target(target: Target) -> SubtreeReading {
+async fn read_target(target: Target, slots: Arc<tokio::sync::Semaphore>) -> SubtreeReading {
     if matches!(target, Target::Unavailable(_)) {
         return target.read(Instant::now() + READ_TIMEOUT, &AtomicU64::new(u64::MAX));
     }
     let counted = Arc::new(AtomicU64::new(u64::MAX));
     let worker_count = Arc::clone(&counted);
-    bounded(
+    bounded_with_slots(
         Instant::now() + READ_TIMEOUT,
         move |deadline| target.read(deadline, &worker_count),
         move |reason| {
@@ -395,6 +400,7 @@ async fn read_target(target: Target) -> SubtreeReading {
             }
             reading
         },
+        slots,
     )
     .await
 }
@@ -454,6 +460,15 @@ pub(crate) async fn bounded<T: Send + 'static>(
 ) -> T {
     static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     let slots = SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_READERS)));
+    bounded_with_slots(deadline, read, unavailable, Arc::clone(slots)).await
+}
+
+async fn bounded_with_slots<T: Send + 'static>(
+    deadline: Instant,
+    read: impl FnOnce(Instant) -> T + Send + 'static,
+    unavailable: impl Fn(&'static str) -> T,
+    slots: Arc<tokio::sync::Semaphore>,
+) -> T {
     if Instant::now() >= deadline {
         tracing::debug!(
             cause = "deadline",
@@ -464,7 +479,7 @@ pub(crate) async fn bounded<T: Send + 'static>(
     }
     let Ok(Ok(permit)) = tokio::time::timeout(
         deadline.saturating_duration_since(Instant::now()),
-        Arc::clone(slots).acquire_owned(),
+        slots.acquire_owned(),
     )
     .await
     else {

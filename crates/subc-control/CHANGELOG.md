@@ -6,6 +6,10 @@
 - Add standalone config-gate client requests, plan views, status and responses;
   preserve the legacy exhaustive control enums and require capability opt-in.
 
+## 0.38.3
+
+- Require protocol 0.36.3 for the additive live role-declaration update contract; client-facing catalog bodies are unchanged.
+
 ## 0.38.2
 
 - Mirror optional operation_deferral metadata in non-exhaustive CatalogEntry, omitted when absent. Require protocol 0.36.2.

@@ -1945,6 +1945,9 @@ mod tests {
         observed
             .releases
             .insert(Component::Core, ReleaseAvailability::Available);
+        observed
+            .releases
+            .insert(Component::Aft, ReleaseAvailability::Available);
         let plan = super::super::planner::plan_setup(
             &observed,
             &super::super::model::SetupRequest::install(Vec::new()),
@@ -1957,7 +1960,7 @@ mod tests {
         )));
         assert!(plan.operations.iter().any(|operation| matches!(
             operation,
-            super::super::model::SetupOperation::OfferOptionalComponents
+            super::super::model::SetupOperation::OfferOptionalComponents { .. }
         )));
     }
 

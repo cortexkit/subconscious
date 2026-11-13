@@ -10,11 +10,18 @@ pub(crate) struct VerifiedRoot {
     pub process: Option<Arc<subc_os::Process>>,
 }
 
+pub(super) enum Validation {
+    Valid(VerifiedRoot),
+    Invalid,
+    Incomplete,
+}
+
 pub(crate) struct Prepared {
     pub scope_target: crate::subtree_resources::Target,
     pub module_pid: u32,
     pub before_cpu: Option<(u128, u64)>,
     pub started: Vec<(AgentCommandRoot, Option<VerifiedRoot>)>,
+    pub pending: Vec<AgentCommandRoot>,
     pub finished: Vec<AgentCommandFinished>,
     pub known: Option<Vec<(AgentCommandRoot, Option<VerifiedRoot>)>>,
     pub table: ProcessTable,
@@ -25,16 +32,24 @@ pub(crate) struct Prepared {
 }
 
 pub(super) struct Snapshot {
-    before_cpu: Option<(u128, u64)>,
+    pub(super) before_cpu: Option<(u128, u64)>,
     pub(super) table: ProcessTable,
     #[cfg(unix)]
-    scope: Option<(TreeReading, BTreeSet<(u32, u64)>)>,
+    pub(super) scope: Option<(TreeReading, BTreeSet<(u32, u64)>)>,
 }
 
 impl Snapshot {
+    #[cfg(test)]
     pub(super) fn read(target: &crate::subtree_resources::Target) -> Option<Self> {
+        Self::read_with(target, || ProcessTable::read().ok())
+    }
+
+    pub(super) fn read_with(
+        target: &crate::subtree_resources::Target,
+        read_table: impl FnOnce() -> Option<ProcessTable>,
+    ) -> Option<Self> {
         let before_cpu = target.counter_cpu();
-        let table = ProcessTable::read().ok()?;
+        let table = read_table()?;
         #[cfg(unix)]
         let scope = target
             .has_container()
@@ -74,78 +89,38 @@ pub(super) fn prepare_snapshot(
     let table = snapshot.table;
     #[cfg(unix)]
     let scope = snapshot.scope;
-    let validate = |root: AgentCommandRoot, resync| -> Option<Option<VerifiedRoot>> {
-        if root.pid == module_pid
-            || (resync
-                && !trusted.keys().any(|known| {
-                    known.pid == root.pid
-                        && known.start_time_ms.abs_diff(root.start_time_ms)
-                            < subc_os::process_start_time_precision_ms()
-                }))
-            || is_ancestor(&table, root.pid, module_pid)
-        {
-            return Some(None);
+    let validate = |root: AgentCommandRoot, resync| {
+        let native = trusted.iter().find_map(|(known, start)| {
+            (known.pid == root.pid
+                && known.start_time_ms.abs_diff(root.start_time_ms)
+                    < subc_os::process_start_time_precision_ms())
+            .then_some(*start)
+        });
+        if resync && native.is_none() {
+            Validation::Invalid
+        } else {
+            validate_root(
+                module_pid,
+                &target,
+                root,
+                &table,
+                resync.then_some(native).flatten(),
+            )
         }
-        let Some(process) = subc_os::Process::open(root.pid).ok().flatten() else {
-            return Some(None);
-        };
-        let Some(observed) = process.observe() else {
-            return Some(None);
-        };
-        if resync
-            && !trusted.iter().any(|(known, start)| {
-                known.pid == root.pid
-                    && known.start_time_ms.abs_diff(root.start_time_ms)
-                        < subc_os::process_start_time_precision_ms()
-                    && *start == observed.start_time
-            })
-        {
-            return Some(None);
-        }
-        let Some(start_time_ms) = subc_os::process_start_time_ms(root.pid) else {
-            return Some(None);
-        };
-        if start_time_ms.abs_diff(root.start_time_ms) >= subc_os::process_start_time_precision_ms()
-        {
-            return Some(None);
-        }
-        let direct_child = subc_os::parent_pid(root.pid) == Some(module_pid);
-        // Membership is read after identity validation, then the same native
-        // identity is rechecked. Windows queries the retained handle itself.
-        let Some(contained) = target.contains_identity(root.pid, observed.start_time, &process)
-        else {
-            return Some(None);
-        };
-        if (!direct_child && !resync) || subc_os::start_time(root.pid) != Some(observed.start_time)
-        {
-            return Some(None);
-        }
-        let members = match table.tree_identities(root.pid, observed.start_time, true) {
-            Some(members) => members,
-            None if resync => BTreeSet::from([(root.pid, observed.start_time)]),
-            None => return Some(None),
-        };
-        Some(Some(VerifiedRoot {
-            root: AgentCommandRoot {
-                pid: root.pid,
-                start_time_ms,
-            },
-            native_start: observed.start_time,
-            inside: if target.has_container() {
-                contained
-            } else {
-                direct_child && !cfg!(windows)
-            },
-            members,
-            #[cfg(windows)]
-            process: Some(Arc::new(process)),
-        }))
     };
+    let mut pending = Vec::new();
     let started: Vec<_> = batch
         .started
         .into_iter()
-        .map(|root| Some((root, validate(root, false)?)))
-        .collect::<Option<_>>()?;
+        .filter_map(|root| match validate(root, false) {
+            Validation::Valid(verified) => Some((root, Some(verified))),
+            Validation::Invalid => Some((root, None)),
+            Validation::Incomplete => {
+                pending.push(root);
+                None
+            }
+        })
+        .collect();
     let known = match batch.known {
         Some(roots) => Some(
             roots
@@ -163,7 +138,10 @@ pub(super) fn prepare_snapshot(
                         if accepted_start.is_some() {
                             accepted_start
                         } else {
-                            validate(root, true)?
+                            match validate(root, true) {
+                                Validation::Valid(verified) => Some(verified),
+                                Validation::Invalid | Validation::Incomplete => None,
+                            }
                         },
                     ))
                 })
@@ -176,6 +154,7 @@ pub(super) fn prepare_snapshot(
         module_pid,
         before_cpu,
         started,
+        pending,
         finished: batch.finished,
         known,
         table,
@@ -183,6 +162,75 @@ pub(super) fn prepare_snapshot(
         finish_until,
         #[cfg(unix)]
         scope,
+    })
+}
+
+/// Unknown ownership is not evidence of an invalid declaration. Keep starts
+/// pending until a later snapshot can prove both identity and tree membership.
+pub(super) fn validate_root(
+    module_pid: u32,
+    target: &crate::subtree_resources::Target,
+    root: AgentCommandRoot,
+    table: &ProcessTable,
+    trusted_start: Option<u64>,
+) -> Validation {
+    if root.pid == module_pid || is_ancestor(table, root.pid, module_pid) {
+        return Validation::Invalid;
+    }
+    let process = match subc_os::Process::open(root.pid) {
+        Ok(Some(process)) => process,
+        Ok(None) => return Validation::Invalid,
+        Err(_) => return Validation::Incomplete,
+    };
+    let Some(observed) = process.observe() else {
+        return Validation::Incomplete;
+    };
+    if trusted_start.is_some_and(|start| start != observed.start_time) {
+        return Validation::Invalid;
+    }
+    let Some(start_time_ms) = subc_os::process_start_time_ms(root.pid) else {
+        return Validation::Incomplete;
+    };
+    if start_time_ms.abs_diff(root.start_time_ms) >= subc_os::process_start_time_precision_ms() {
+        return Validation::Invalid;
+    }
+    let direct_child = match subc_os::parent_pid(root.pid) {
+        Some(parent) => parent == module_pid,
+        None if trusted_start.is_some() => false,
+        None => return Validation::Incomplete,
+    };
+    if !direct_child && trusted_start.is_none() {
+        return Validation::Invalid;
+    }
+    // Membership is read after identity validation, then the same native
+    // identity is rechecked. Windows queries the retained handle itself.
+    let Some(contained) = target.contains_identity(root.pid, observed.start_time, &process) else {
+        return Validation::Incomplete;
+    };
+    match subc_os::start_time(root.pid) {
+        Some(start) if start != observed.start_time => return Validation::Invalid,
+        None => return Validation::Incomplete,
+        Some(_) => {}
+    }
+    let members = match table.tree_identities(root.pid, observed.start_time, true) {
+        Some(members) => members,
+        None if trusted_start.is_some() => BTreeSet::from([(root.pid, observed.start_time)]),
+        None => return Validation::Incomplete,
+    };
+    Validation::Valid(VerifiedRoot {
+        root: AgentCommandRoot {
+            pid: root.pid,
+            start_time_ms,
+        },
+        native_start: observed.start_time,
+        inside: if target.has_container() {
+            contained
+        } else {
+            direct_child && !cfg!(windows)
+        },
+        members,
+        #[cfg(windows)]
+        process: Some(Arc::new(process)),
     })
 }
 

@@ -1439,6 +1439,74 @@ async fn module_handle_set_ready_controls_new_binds_without_interrupting_health_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn module_handle_role_declarations_update_round_trips_with_daemon() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-role-declarations-update");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let module_id = "role-declarations-update";
+    let initial = json!({"media-provider/v1": {"engines": ["old"]}, "old/v1": {}});
+    let mut manifest = inline_module_manifest(module_id, &["tool"]);
+    manifest.role_declarations = serde_json::from_value(initial.clone()).unwrap();
+    let (handle, serve_task) = spawn_inline_module(&daemon.connection_file, manifest).await;
+    wait_for_catalog_module(&daemon.connection_file, module_id, START_TIMEOUT).await;
+    assert_eq!(
+        catalog_modules(&daemon.connection_file, Some(module_id), 10001).await[0]
+            ["role_declarations"],
+        initial
+    );
+    for declarations in [
+        json!({"media-provider/v1": {"engines": ["new"]}}),
+        json!({}),
+    ] {
+        handle
+            .update_role_declarations(serde_json::from_value(declarations.clone()).unwrap())
+            .await
+            .unwrap();
+        let modules = catalog_modules(&daemon.connection_file, Some(module_id), 10002).await;
+        if declarations.as_object().unwrap().is_empty() {
+            assert!(modules[0].get("role_declarations").is_none());
+        } else {
+            assert_eq!(modules[0]["role_declarations"], declarations);
+        }
+    }
+    let invalid = serde_json::from_value(json!({"bad key": {}})).unwrap();
+    let Err(subc_client_rs::CatalogUpdateError::Rejected(body)) =
+        handle.update_role_declarations(invalid).await
+    else {
+        panic!("expected typed declaration refusal");
+    };
+    assert_eq!(body.code, "invalid_role_declarations");
+    assert_eq!(
+        body.message,
+        "role_declarations key must use capability-name grammar"
+    );
+    assert!(
+        catalog_modules(&daemon.connection_file, Some(module_id), 10003).await[0]
+            .get("role_declarations")
+            .is_none()
+    );
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn module_handle_catalog_update_refreshes_catalog_without_dropping_open_routes() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(

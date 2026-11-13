@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0
+## Unreleased
 
 - Name unapproved development placements explicitly in generation history.
 

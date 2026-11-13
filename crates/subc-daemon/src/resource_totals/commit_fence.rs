@@ -25,6 +25,15 @@ impl CommitFence {
         }
     }
 
+    /// Only the winner of a new timeout may replace validation with retention.
+    /// If the caller already cancelled explicitly, this returns false, so a
+    /// cancelled declaration is never retained as pending afterwards.
+    pub(crate) fn cancel_for_retention(&self) -> bool {
+        self.0
+            .compare_exchange(OPEN, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     /// Call only after every lock and validation needed for commit is held.
     pub(crate) fn claim_commit(&self) -> bool {
         self.0
@@ -37,6 +46,20 @@ impl CommitFence {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn only_a_new_timeout_can_authorize_pending_retention() {
+        let cancelled = CommitFence::default();
+        assert!(cancelled.cancel());
+        assert!(!cancelled.cancel_for_retention());
+        let timed_out = CommitFence::default();
+        assert!(timed_out.cancel_for_retention());
+        assert!(!timed_out.cancel_for_retention());
+        assert!(!timed_out.claim_commit(), "late validation cannot publish");
+        let committed = CommitFence::default();
+        assert!(committed.claim_commit());
+        assert!(!committed.cancel_for_retention());
+    }
 
     #[test]
     fn timeout_and_commit_have_one_atomic_winner() {

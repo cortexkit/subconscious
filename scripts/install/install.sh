@@ -613,4 +613,20 @@ write_manifest "$manifest" "$destination" "$candidate_digest" "$profile_path" "$
 retirement_manifest_written=1
 verify_cli_resolution
 
+# The profile change reaches new shells only. This script runs in a child of
+# the user's shell (curl | bash), so it cannot change that shell's PATH; say
+# how to load it here, unless the command directory is already on the PATH
+# this script inherited (a re-run, or a terminal opened after the first one).
+cmd_dir_on_path=0
+IFS=':' read -r -a inherited_path_entries <<<"${PATH:-}"
+for entry in "${inherited_path_entries[@]}"; do
+  if [[ -n "$entry" && "$entry" -ef "$cmd_dir" ]]; then
+    cmd_dir_on_path=1
+    break
+  fi
+done
+if [[ "$cmd_dir_on_path" -eq 0 ]]; then
+  printf 'Added ck to PATH in %s. New terminals find it.\n' "$profile_path"
+  printf 'To use ck in this terminal, run:\n  source %q\n' "$profile_path"
+fi
 printf 'Next: ck setup\n'

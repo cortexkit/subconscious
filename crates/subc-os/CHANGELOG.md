@@ -30,20 +30,21 @@
   only with `test-support` and a development executable name. Keys and encoded
   copies use zeroizing storage and debug output redacts the key.
 
-## 0.1.34
-
 - Report whether an atomic replacement occurred before a durability error, so
   callers can invalidate the previous approval for bytes published despite the
   error. Keep Windows write-through replacement and classify uncertain failures
   conservatively using the retained source file's volume and file index.
-
-## 0.1.33
 
 - Expose a safe owned registration-pipe shutdown handle. Retirement disconnects
   the instance synchronously and cancels a pending child-accept wait.
 - Keep a registration pipe's first instance reserved after a foreign connector
   disconnects, including before acceptance begins. Foreign disconnect errors
   cannot cancel the child's registration opportunity before its deadline.
+
+## 0.1.33
+
+- Tests find the admission fixture with `cortexkit_test_support::cargo_profile_bin`,
+  which also works in Cargo 1.100's test-executable layout. Test code only.
 
 ## 0.1.32
 

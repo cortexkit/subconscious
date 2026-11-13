@@ -329,6 +329,7 @@ mod tests {
             module_pid: pid,
             before_cpu: None,
             started: Vec::new(),
+            pending: Vec::new(),
             finished: Vec::new(),
             known: Some(Vec::new()),
             table,

@@ -9,7 +9,7 @@
 //! |---|---|---|---|
 //! | HELLO | once | once | no |
 //! | `config.get`, `config.applied` | yes | yes | no |
-//! | `catalog.update`, `activity.record` | yes | yes | yes |
+//! | `catalog.update`, `catalog.update_role_declarations`, `activity.record` | yes | yes | yes |
 //! | `claim.mint` | yes | yes | yes |
 //! | `operator.confirm` | yes | yes | yes |
 //! | `scope.sync`, `scope.apply` | yes | no | no |
@@ -52,6 +52,7 @@ pub(super) const REGISTRATION_OPERATIONS: &[&str] = &[
     "config.get",
     "config.applied",
     MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+    MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS,
     ops::ACTIVITY_RECORD,
     "claim.mint",
     "operator.confirm",

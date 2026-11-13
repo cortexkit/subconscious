@@ -448,7 +448,7 @@ impl SetupBackend {
                     ));
                 }
                 SetupOperation::ObservePlatform
-                | SetupOperation::OfferOptionalComponents
+                | SetupOperation::OfferOptionalComponents { .. }
                 | SetupOperation::OfferConversion { .. }
                 | SetupOperation::ConfirmConversion { .. }
                 | SetupOperation::RescanComponent { .. }
@@ -1140,7 +1140,7 @@ impl SetupExecutor for SetupBackend {
             }
             SetupOperation::RemoveManagedComponent { .. }
             | SetupOperation::ObservePlatform
-            | SetupOperation::OfferOptionalComponents
+            | SetupOperation::OfferOptionalComponents { .. }
             | SetupOperation::OfferConversion { .. }
             | SetupOperation::ConfirmConversion { .. }
             | SetupOperation::Validate { .. }

@@ -15,6 +15,7 @@
 
 use std::{
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -23,8 +24,8 @@ use subc_client_rs::{
     async_trait, HandlerOutcome, ModuleHandler, ModuleStopHandle, RequestCtx, ServeOptions,
 };
 use subc_protocol::{
-    manifest::ModuleManifest, Flags, Frame, FrameType, ModuleHelloAckBody, Priority,
-    PROTOCOL_VERSION,
+    manifest::ModuleManifest, session::ModuleControlRequest, BindIdentity, Flags, Frame, FrameType,
+    ModuleHelloAckBody, ModuleHelloBody, Priority, RouteTarget, PROTOCOL_VERSION,
 };
 use subc_transport::{
     authenticate_server, generate_daemon_id, generate_key, read_frame, write_atomic, write_frame,
@@ -33,6 +34,7 @@ use subc_transport::{
 use tokio::{
     io::AsyncWriteExt,
     net::{TcpListener, TcpStream},
+    sync::Notify,
     task::JoinHandle,
     time::timeout,
 };
@@ -119,6 +121,13 @@ fn start_module(
 /// Accept and authenticate the module, read its HELLO, then send HELLO_ACK and
 /// a PING in one write so the PING is already queued when the module stops.
 async fn accept_and_ack(daemon: &FakeDaemon) -> TcpStream {
+    accept_and_ack_with_ops(daemon, Vec::new()).await.0
+}
+
+async fn accept_and_ack_with_ops(
+    daemon: &FakeDaemon,
+    subc_ops: Vec<String>,
+) -> (TcpStream, ModuleHelloBody) {
     let (mut stream, _) = timeout(Duration::from_secs(5), daemon.listener.accept())
         .await
         .expect("module must connect")
@@ -138,9 +147,10 @@ async fn accept_and_ack(daemon: &FakeDaemon) -> TcpStream {
         .unwrap()
         .expect("module must send HELLO");
     assert_eq!(hello.header.ty, FrameType::Hello);
+    let manifest = serde_json::from_slice(&hello.body).unwrap();
     let ack = ModuleHelloAckBody {
         negotiated_ver: PROTOCOL_VERSION,
-        subc_ops: Vec::new(),
+        subc_ops,
         subc_capabilities: Vec::new(),
         storage: None,
         machine_id: None,
@@ -160,7 +170,7 @@ async fn accept_and_ack(daemon: &FakeDaemon) -> TcpStream {
     write_frame(&mut bytes, &ping).await.unwrap();
     stream.write_all(&bytes).await.unwrap();
     stream.flush().await.unwrap();
-    stream
+    (stream, manifest)
 }
 
 /// Read the module's GOODBYE and then its FIN, the way a daemon does, and fail
@@ -300,4 +310,197 @@ async fn drain_waits_for_a_daemon_that_never_closes_only_until_the_budget() {
         "serve returned after {elapsed:?}, before its {budget:?} drain budget, so it did not wait for the daemon to close"
     );
     drop(stream);
+}
+
+struct HeldRequest {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait]
+impl ModuleHandler for HeldRequest {
+    async fn handle(&self, ctx: RequestCtx, _body: Vec<u8>) -> HandlerOutcome {
+        self.entered.notify_one();
+        tokio::select! {
+            () = ctx.cancelled() => HandlerOutcome::Response(b"cancelled".to_vec()),
+            () = self.release.notified() => HandlerOutcome::Response(b"finished".to_vec()),
+        }
+    }
+}
+
+async fn receive(stream: &mut TcpStream) -> Frame {
+    timeout(Duration::from_secs(5), read_frame(stream))
+        .await
+        .expect("module must send a frame")
+        .unwrap()
+        .expect("module must send a frame before EOF")
+}
+
+#[tokio::test]
+async fn options_handle_sets_ready_then_stop_drains_inflight_before_goodbye() {
+    let daemon = fake_daemon().await;
+    let stop = ModuleStopHandle::new();
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let handler = HeldRequest {
+        entered: entered.clone(),
+        release: release.clone(),
+    };
+    let manifest = ModuleManifest::builder("options-handle", "1.0.0")
+        .ready(false)
+        .build();
+    let options = ServeOptions::default()
+        .with_stop_handle(stop.clone())
+        .with_writer_drain_timeout(Duration::from_secs(10));
+    let (connected, (mut stream, hello)) = tokio::join!(
+        options.serve_with_handle(&daemon.path, manifest, handler),
+        accept_and_ack_with_ops(&daemon, vec!["catalog.update".into()]),
+    );
+    assert_eq!(hello.manifest.module_id, "options-handle");
+    let (handle, serve) = connected.unwrap().expect("module must register");
+    let serving = tokio::spawn(serve);
+    assert_eq!(receive(&mut stream).await.header.ty, FrameType::Pong);
+
+    // Use the returned handle before any caller binds. Its control reply is
+    // read by the concurrently running serve future.
+    let (ready, ()) = tokio::join!(handle.set_ready(true), async {
+        let request = receive(&mut stream).await;
+        assert_eq!(request.header.ty, FrameType::Request);
+        assert_eq!(request.header.channel, 0);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+            serde_json::json!({"op": "catalog.update", "provides": [], "ready": true}),
+        );
+        let reply = Frame::build(
+            FrameType::Response,
+            control_flags(),
+            0,
+            0,
+            request.header.corr,
+            br#"{"op":"catalog.update"}"#.to_vec(),
+        )
+        .unwrap();
+        write_frame(&mut stream, &reply).await.unwrap();
+    });
+    ready.unwrap();
+
+    let bind = ModuleControlRequest::RouteBind {
+        route_channel: 1,
+        epoch: 1,
+        target: RouteTarget::ToolProvider {
+            module_id: "options-handle".into(),
+        },
+        identity: BindIdentity::new("test", "drain"),
+        principal: None,
+        consumer_capabilities: None,
+        role_versions: None,
+        admission_facts: None,
+        scope: None,
+        call_mode: None,
+    };
+    let bind = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        0,
+        0,
+        41,
+        serde_json::to_vec(&bind).unwrap(),
+    )
+    .unwrap();
+    write_frame(&mut stream, &bind).await.unwrap();
+    assert_eq!(receive(&mut stream).await.header.ty, FrameType::Response);
+    let request = Frame::build(
+        FrameType::Request,
+        control_flags(),
+        1,
+        1,
+        42,
+        b"held".to_vec(),
+    )
+    .unwrap();
+    write_frame(&mut stream, &request).await.unwrap();
+    timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("request must enter the handler");
+    stop.stop();
+    // Hold the accepted request longer than the default two-second budget,
+    // so replacing just the custom drain timeout also loses its terminal reply.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(!serving.is_finished());
+    release.notify_one();
+    let response = receive(&mut stream).await;
+    assert_eq!(response.header.ty, FrameType::Response);
+    assert_eq!(response.header.corr, 42);
+    assert_eq!(response.body, b"finished");
+    let goodbye = timeout(Duration::from_secs(5), read_frame(&mut stream))
+        .await
+        .expect("stop must finish draining and send GOODBYE after the in-flight reply")
+        .unwrap()
+        .expect("GOODBYE must precede EOF");
+    assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+    assert_eq!(goodbye.header.channel, 0);
+    drop(stream);
+    timeout(Duration::from_secs(5), serving)
+        .await
+        .expect("serve must finish after the daemon closes")
+        .unwrap()
+        .unwrap();
+    assert!(handle.is_closed());
+}
+
+#[tokio::test]
+async fn options_handle_stopped_before_connect_returns_none_without_connecting() {
+    let daemon = fake_daemon().await;
+    let stop = ModuleStopHandle::new();
+    stop.stop();
+    let result = ServeOptions::default()
+        .with_stop_handle(stop.clone())
+        .serve_with_handle(
+            &daemon.path,
+            ModuleManifest::builder("stopped", "1.0.0").build(),
+            StopOnHelloAck {
+                stop,
+                hold_handshake: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(result.is_none());
+    assert!(
+        timeout(Duration::from_millis(100), daemon.listener.accept())
+            .await
+            .is_err(),
+        "a pre-stopped module must not connect",
+    );
+}
+
+#[tokio::test]
+async fn options_handle_stopped_during_registration_returns_none_after_goodbye() {
+    let daemon = fake_daemon().await;
+    let stop = ModuleStopHandle::new();
+    let options = ServeOptions::default()
+        .with_stop_handle(stop.clone())
+        .with_writer_drain_timeout(Duration::from_secs(10));
+    let path = daemon.path.clone();
+    let connecting = tokio::spawn(async move {
+        options
+            .serve_with_handle(
+                &path,
+                ModuleManifest::builder("stopped", "1.0.0").build(),
+                StopOnHelloAck {
+                    stop,
+                    hold_handshake: true,
+                },
+            )
+            .await
+    });
+    let mut stream = accept_and_ack(&daemon).await;
+    expect_goodbye_then_clean_eof(&mut stream, Duration::from_secs(1)).await;
+    drop(stream);
+    let result = timeout(Duration::from_secs(3), connecting)
+        .await
+        .expect("requested stop must complete registration teardown")
+        .unwrap()
+        .unwrap();
+    assert!(result.is_none());
 }

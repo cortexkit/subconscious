@@ -47,10 +47,19 @@ deps=$(dirname "$test_binary")
 printf '%s\n' "$helpers" | awk '{print $3}' | while read -r helper; do
   [ -n "$helper" ] || continue
   for dir in "$deps" "$(dirname "$deps")"; do
-    # Skip a destination that already is this file: cargo hard-links built
-    # binaries between the two folders, and Windows paths may be spelled
-    # differently, so compare files rather than path strings.
-    [ "$helper" -ef "$dir/$(basename "$helper")" ] || cp "$helper" "$dir/"
+    dest="$dir/$(basename "$helper")"
+    # Skip a destination that already is this file or has the same bytes:
+    # cargo hard-links built binaries between the two folders, and Windows
+    # paths may be spelled differently, so compare files rather than path
+    # strings.
+    [ "$helper" -ef "$dest" ] && continue
+    cmp -s "$helper" "$dest" && continue
+    # Copy beside the destination, then rename over it. A test still running
+    # from another invocation may be executing the old helper, and writing
+    # into a running executable fails ("Text file busy" on Linux), while
+    # replacing its name does not.
+    tmp="$dest.tmp.$$"
+    cp "$helper" "$tmp" && mv -f "$tmp" "$dest"
   done
 done
 exec "$test_binary" "$@"

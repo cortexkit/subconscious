@@ -72,9 +72,17 @@ async fn refused_live_binding_without_a_current_approval_uses_ordinary_exit_acco
 }
 
 async fn gated_claim_fixture_with_support(support: Option<bool>) -> GatedClaimFixture {
+    gated_claim_fixture_with_program(support, "/bin/sleep", json!(["600"])).await
+}
+
+async fn gated_claim_fixture_with_program(
+    support: Option<bool>,
+    program: &str,
+    args: serde_json::Value,
+) -> GatedClaimFixture {
     use crate::control::claims::tests::Net;
-    let rig = rig();
-    wire_fixture_document(&rig, json!(["600"]));
+    let rig = rig_with_program(program);
+    wire_fixture_document(&rig, args);
     let owner = Arc::new(rig.owner("claims-recovery"));
     rig.stamp(&owner);
     let handle = channel_handle();
@@ -897,7 +905,72 @@ async fn gated_channel_agent_commands_commit_through_the_channel_spawn() {
     fixture.module.stop().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gated_channel_deferred_agent_commands_retain_starts_then_commit() {
+    use crate::control::claims::tests::request;
+    let mut fixture =
+        gated_claim_fixture_with_program(None, "/bin/sh", json!(["-c", "sleep 600 & wait"])).await;
+    fixture
+        .owner
+        .set_agent_validation_window_for_test(Duration::from_millis(200));
+    assert!(fixture.handle.spawn_launch_nonce_for("a").is_none());
+    let pid = reported_pid(&fixture.module).await;
+    let (table, root) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let table = subc_os::ProcessTable::read().unwrap();
+            let root = table
+                .members()
+                .find(|process| process.parent_pid == pid)
+                .map(|process| subc_protocol::session::AgentCommandRoot {
+                    pid: process.pid,
+                    start_time_ms: process.start_time_ms,
+                });
+            if let Some(root) = root {
+                break (table, root);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the gated shell must spawn its command child");
+    let tracker = &fixture.handler.resource_tracker;
+    // Force the unchanged validation deadline to expire with a real child
+    // start. Unlike an empty batch, it must retain pending roots on the channel.
+    tracker.inject_validation_table_for_test(table.clone(), Duration::from_secs(1));
+    let declaration = json!({
+        "op":"supervisor.agent_commands", "started":[root], "finished":[],
+    });
+    let reply = fixture.primary.call(request(declaration.clone())).await;
+    assert_eq!(
+        reply.header.ty,
+        subc_protocol::FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    assert_eq!(tracker.root_counts_for_test("a"), (0, 1, 0));
+
+    tracker.inject_validation_table_for_test(table, Duration::ZERO);
+    fixture
+        .owner
+        .set_agent_validation_window_for_test(AGENT_COMMAND_CONTRACT_TEST_WINDOW);
+    let reply = fixture.primary.call(request(declaration)).await;
+    assert_eq!(
+        reply.header.ty,
+        subc_protocol::FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    assert_eq!(tracker.root_counts_for_test("a"), (1, 0, 0));
+    tracker.clear_validation_table_for_test();
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
 fn rig() -> Rig {
+    rig_with_program("/bin/sleep")
+}
+
+fn rig_with_program(program: &str) -> Rig {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/scratch")
@@ -908,7 +981,7 @@ fn rig() -> Rig {
         ));
     std::fs::create_dir_all(path.join("store")).unwrap();
     std::fs::create_dir_all(path.join("cortexkit")).unwrap();
-    std::fs::copy("/bin/sleep", path.join("program")).unwrap();
+    std::fs::copy(program, path.join("program")).unwrap();
     #[cfg(target_os = "macos")]
     assert!(
         std::process::Command::new("/usr/bin/codesign")

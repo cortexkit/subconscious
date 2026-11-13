@@ -634,6 +634,11 @@ rollback_mode() {
   [ -f "$rollback_sidecar" ] || refuse "rollback sidecar not found: $rollback_sidecar"
   (cd "$STAGING" && shasum -c "$(basename "$rollback_sidecar")" >/dev/null 2>&1) \
     || refuse "rollback sidecar does not verify its artifact: $(basename "$rollback_sidecar")"
+  # A rollback across a terminal placement must be terminal too: the build it
+  # restores would otherwise start beside what the newer build left running.
+  if [ "$(cat "$rollback_file.placement" 2>/dev/null)" = terminal ] && [ "$TERMINAL" -ne 1 ]; then
+    refuse "$(basename "$rollback_file") was taken by a terminal placement, so rolling back to it must be terminal too; pass --terminal"
+  fi
   rollback_digest=$(shasum -a 256 "$rollback_file" | awk '{print $1}')
   sidecar_digest=$(awk 'NR==1{print $1}' "$rollback_sidecar")
   [ -n "$sidecar_digest" ] && [ "$rollback_digest" = "$sidecar_digest" ] \
@@ -1001,6 +1006,25 @@ if [ -n "$root_manifest" ]; then
   # under the flat one. Accept either rather than forcing a seat to restructure:
   # what the declaration is FOR is naming which thing is live, and both spellings
   # do that unambiguously.
+  # The owner may declare how its card must be placed. `placement=terminal`
+  # means the new build must not start beside anything the old build left
+  # running (for example host processes a restart would keep), so a plain
+  # restart is refused here rather than trusted to a flag in a hand-off.
+  want_placement=$(awk -F= '$1=="placement"{print $2}' "$root_manifest")
+  case "$want_placement" in
+    "" | restart) ;;
+    terminal)
+      [ "$TERMINAL" -eq 1 ] || {
+        echo "REFUSED: $CUR.current declares placement=terminal; pass --terminal" >&2
+        exit 2
+      }
+      say "placement: terminal, as $CUR.current declares"
+      ;;
+    *)
+      echo "REFUSED: $CUR.current declares unknown placement=$want_placement (restart or terminal)" >&2
+      exit 2
+      ;;
+  esac
   if [ "$staged_dir" = "$want_stage" ] || [ "$STAGED" = "$want_stage" ]; then
     say "currency: matches $CUR.current (owner-declared stage), rev ${want_rev:0:12}"
   elif [ "$OLDER" -eq 1 ]; then
@@ -1564,6 +1588,12 @@ rb_digest=$(shasum -a 256 "$rb" | awk '{print $1}')
   || refuse "rollback snapshot does not match the live binary it was copied from (live $live_digest, snapshot $rb_digest); nothing has been placed"
 (cd "$STAGING" && shasum -a 256 "$(basename "$rb")" > "$(basename "$rb").sha256")
 say "rollback $(basename "$rb") matches live (${live_digest%"${live_digest#????????}"}), holds: $("$rb" --version 2>&1 | head -1)"
+# Record that this snapshot was taken by a terminal placement, so a rollback to
+# it is refused unless it is terminal as well.
+if [ "$TERMINAL" -eq 1 ]; then
+  printf 'terminal\n' > "$rb.placement"
+  say "rollback to $(basename "$rb") must be terminal (recorded in $(basename "$rb").placement)"
+fi
 # The rollback image keeps the format-versions map of the build it snapshots, so
 # re-placing it later is checked against the floors like any card. An image
 # placed before maps existed has none, and the floor check refuses it once

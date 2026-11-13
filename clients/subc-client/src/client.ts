@@ -59,6 +59,10 @@ const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 /** Optional capability discovery must not spend a route's normal request budget. */
 export const CAPABILITY_PROBE_TIMEOUT = 2_000;
+const DEFAULT_SLEEP_GRACE_MS = 15_000;
+// Timer jitter and a starved event loop advance both clocks, not just wall time,
+// so they must not count as sleep. Require a clear gap before extending a deadline.
+const SLEEP_DETECTION_THRESHOLD_MS = 2_000;
 // Socket timers use milliseconds; never dispatch with less than one left.
 const MIN_REQUEST_BUDGET_MS = 1;
 // When a request-timeout timer fires, its reply may already be sitting in the
@@ -240,6 +244,8 @@ export interface RequestOptions {
   priority?: Priority;
   admissionClass?: AdmissionClass;
   timeoutMs?: number;
+  /** Override the client's one-time post-sleep reply window (ms); 0 disables it. */
+  sleepGraceMs?: number;
   /**
    * Set when the request body is opaque bytes rather than JSON. This flag is the
    * receiver's only signal about the body representation; reply decoding follows
@@ -447,6 +453,12 @@ interface Pending {
   reject: (err: Error, frame?: Frame) => void;
   onProgress?: (body: Uint8Array) => void;
   timer: ReturnType<typeof setTimeout> | null;
+  sleepGrace?: {
+    wallStartMs: number;
+    awakeStartMs: number;
+    ms: number;
+    used: boolean;
+  };
   classifyFailure?: (err: Error) => Error;
   /** True for a held-open subscription (never drained — always aborted on close). */
   subscription?: boolean;
@@ -508,6 +520,11 @@ export interface ConnectOptions {
    * exposed mainly so tests can prove the arbitration deterministically.
    */
   timeoutArbitrationGraceMs?: number;
+  /**
+   * One-time reply window when a request deadline passes during detected sleep.
+   * Defaults to 15,000 ms; 0 disables it. Must be finite and in 0..2,147,483,647.
+   */
+  sleepGraceMs?: number;
   /**
    * Deadline budget (ms) without progress for reading a frame body after its
    * header arrives. Each incoming chunk pushes the deadline out again.
@@ -618,6 +635,7 @@ interface NormalizedConnectOptions {
   random: () => number;
   routeOpenRetryDeadlineMs: number;
   timeoutArbitrationGraceMs: number;
+  sleepGraceMs: number;
   bodyReadTimeoutMs?: number;
   livenessProbeWindowMs: number;
   onControlPush?: (push: ControlPush) => void;
@@ -976,6 +994,7 @@ export class SubcClient {
       undefined,
       binary,
       opts.signal,
+      validatedSleepGraceMs(opts.sleepGraceMs ?? this.opts.sleepGraceMs ?? DEFAULT_SLEEP_GRACE_MS),
     );
     return this.decodeReply(reply);
   }
@@ -1407,10 +1426,10 @@ export class SubcClient {
   private send(
     ...args: Parameters<SubcClient["sendAttempt"]>
   ): Promise<Frame> {
-    const [handle, body, priority, admission, timeoutMs, onProgress, acceptFrame, onLateResponse, binary, signal] = args;
+    const [handle, body, priority, admission, timeoutMs, onProgress, acceptFrame, onLateResponse, binary, signal, sleepGraceMs] = args;
     if (!handle || !this.gates.has(handle)) return this.sendAttempt(...args);
     return this.gatedRequest(handle, false, timeoutMs, signal, (slot, remaining) =>
-      this.sendAttempt(handle, body, priority, admission, remaining, onProgress, acceptFrame, onLateResponse, binary, signal, slot));
+      this.sendAttempt(handle, body, priority, admission, remaining, onProgress, acceptFrame, onLateResponse, binary, signal, sleepGraceMs, slot));
   }
 
   private async gatedRequest(
@@ -1485,7 +1504,7 @@ export class SubcClient {
     const closed = new Promise<void>((resolve, reject) => { resolveClosed = resolve; rejectClosed = reject; });
     const ended = new Promise<SubscriptionEnd>((resolve) => { resolveEnded = resolve; });
     void this.gatedRequest(handle, true, undefined, abort.signal, (slot, remaining) =>
-      this.sendAttempt(handle, bytes, priority, admission, remaining, onEvent, undefined, undefined, false, undefined, slot, true,
+      this.sendAttempt(handle, bytes, priority, admission, remaining, onEvent, undefined, undefined, false, undefined, undefined, slot, true,
         (key, pending, corr) => { current = { key, pending, corr }; }))
       .then((frame) => {
         if (cancelled) return;
@@ -1524,6 +1543,7 @@ export class SubcClient {
     onLateResponse?: (frame: Frame) => void,
     binary = false,
     signal?: AbortSignal,
+    sleepGraceMs = this.opts.sleepGraceMs ?? DEFAULT_SLEEP_GRACE_MS,
     slot?: RequestSlot,
     subscription = false,
     registered?: (key: string, pending: Pending, corr: bigint) => void,
@@ -1561,7 +1581,7 @@ export class SubcClient {
         slot,
         subscription,
       };
-      if (!subscription) pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, channel, corr, ms), ms);
+      if (!subscription) this.armRequestTimeout(key, pending, channel, corr, ms, sleepGraceMs);
       this.pending.set(key, pending);
       registered?.(key, pending, corr);
       if (slot && handle) { slot.inFlight = true; this.slots.set(key, { handle, slot }); }
@@ -1578,6 +1598,11 @@ export class SubcClient {
       // and the daemon can only cancel a correlation it has already received.
       if (signal) this.attachCancelSignal(signal, key, handle, corr, priority);
     });
+  }
+
+  private armRequestTimeout(key: string, pending: Pending, channel: number, corr: bigint, ms: number, sleepGraceMs: number): void {
+    pending.sleepGrace = { wallStartMs: Date.now(), awakeStartMs: performance.now(), ms: sleepGraceMs, used: false };
+    pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, channel, corr, ms), ms);
   }
 
   /**
@@ -1613,6 +1638,19 @@ export class SubcClient {
         setImmediate(arbitrate);
         return;
       }
+      const sleep = pending.sleepGrace;
+      if (sleep && !sleep.used && sleep.ms > 0) {
+        const wallElapsed = Date.now() - sleep.wallStartMs;
+        const awakeElapsed = performance.now() - sleep.awakeStartMs;
+        const sleptMs = wallElapsed - awakeElapsed;
+        // Some platforms count sleep in performance.now() too. Then the clocks
+        // advance together and no grace is granted: the safe, unchanged behaviour.
+        if (sleptMs > SLEEP_DETECTION_THRESHOLD_MS) {
+          sleep.used = true;
+          pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, channel, corr, ms), sleep.ms);
+          return;
+        }
+      }
       settleAsTimeout();
     };
     setImmediate(arbitrate);
@@ -1633,6 +1671,7 @@ export class SubcClient {
         opts.onProgress,
         binary,
         opts.signal,
+        validatedSleepGraceMs(opts.sleepGraceMs ?? this.opts.sleepGraceMs ?? DEFAULT_SLEEP_GRACE_MS),
       );
       return this.decodeReply(reply);
     } catch (error) {
@@ -1644,10 +1683,10 @@ export class SubcClient {
   private sendManaged(
     ...args: Parameters<SubcClient["sendManagedAttempt"]>
   ): Promise<Frame> {
-    const [handle, body, priority, admission, timeoutMs, onProgress, binary, signal] = args;
+    const [handle, body, priority, admission, timeoutMs, onProgress, binary, signal, sleepGraceMs] = args;
     if (!this.gates.has(handle)) return this.sendManagedAttempt(...args);
     return this.gatedRequest(handle, false, timeoutMs, signal, (slot, remaining) =>
-      this.sendManagedAttempt(handle, body, priority, admission, remaining, onProgress, binary, signal, slot));
+      this.sendManagedAttempt(handle, body, priority, admission, remaining, onProgress, binary, signal, sleepGraceMs, slot));
   }
 
   private sendManagedAttempt(
@@ -1659,6 +1698,7 @@ export class SubcClient {
     onProgress: ((body: Uint8Array) => void) | undefined,
     binary = false,
     signal?: AbortSignal,
+    sleepGraceMs = this.opts.sleepGraceMs ?? DEFAULT_SLEEP_GRACE_MS,
     slot?: RequestSlot,
   ): Promise<Frame> {
     try {
@@ -1713,7 +1753,7 @@ export class SubcClient {
         classifyFailure,
         slot,
       };
-      pending.timer = setTimeout(() => this.arbitrateTimeout(key, pending, handle.channel, corr, ms), ms);
+      this.armRequestTimeout(key, pending, handle.channel, corr, ms, sleepGraceMs);
       this.pending.set(key, pending);
       if (slot) { slot.inFlight = true; this.slots.set(key, { handle, slot }); }
       const write = writeTrackedBorrowed(this.sock, encodeFrame(frame), Date.now() + ms);
@@ -2802,10 +2842,18 @@ function normalizeConnectOptions(opts: ConnectOptions): NormalizedConnectOptions
     random: opts.random ?? Math.random,
     routeOpenRetryDeadlineMs: opts.routeOpenRetryDeadlineMs ?? ROUTE_OPEN_RETRY_DEADLINE_MS,
     timeoutArbitrationGraceMs: opts.timeoutArbitrationGraceMs ?? TIMEOUT_ARBITRATION_GRACE_MS,
+    sleepGraceMs: validatedSleepGraceMs(opts.sleepGraceMs ?? DEFAULT_SLEEP_GRACE_MS),
     bodyReadTimeoutMs: opts.bodyReadTimeoutMs,
     livenessProbeWindowMs: opts.livenessProbeWindowMs ?? LIVENESS_PROBE_WINDOW_MS,
     onControlPush: opts.onControlPush,
   };
+}
+
+function validatedSleepGraceMs(ms: number): number {
+  if (!Number.isFinite(ms) || ms < 0 || ms > 2_147_483_647) {
+    throw new RangeError("sleepGraceMs must be finite and in 0..2147483647 milliseconds");
+  }
+  return ms;
 }
 
 /** Validate the exact capability-grammar identifier before catalog I/O. */

@@ -1449,18 +1449,9 @@ async fn config_delivery_io_get_checks_keychain_and_store_hash_off_the_runtime_t
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn config_spawn_async_io_checks_keychain_and_store_hash_off_the_runtime_thread() {
-    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+    use std::sync::Arc;
     let rig = Rig::new();
-    std::fs::write(
-        rig.path.join("program"),
-        b"#!/bin/sh\nwhile :; do /bin/sleep 600; done\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(
-        rig.path.join("program"),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
+    rig.write_native_program("sleep");
     write(&rig, 1);
     let key = crate::config_store::TestStoreKey::default();
     let owner = Arc::new(sealed_owner(&rig, &key, "async-spawn-io"));
@@ -1914,16 +1905,22 @@ fn supervised_spec(rig: &Rig, module: &str) -> crate::supervise::ModuleSpec {
     crate::supervise::ModuleSpec {
         module_id: module.into(),
         program: rig.path.join("program"),
-        args: vec![
-            rig.path
-                .join(format!("{module}.seen"))
-                .to_string_lossy()
-                .into_owned(),
-            rig.path
-                .join(format!("{module}.launches"))
-                .to_string_lossy()
-                .into_owned(),
-        ],
+        args: rig
+            .program_mode
+            .get()
+            .into_iter()
+            .map(|mode| (*mode).to_owned())
+            .chain([
+                rig.path
+                    .join(format!("{module}.seen"))
+                    .to_string_lossy()
+                    .into_owned(),
+                rig.path
+                    .join(format!("{module}.launches"))
+                    .to_string_lossy()
+                    .into_owned(),
+            ])
+            .collect(),
         env: vec![],
         reserved: false,
         reserved_prefixes: vec![],
@@ -1955,28 +1952,23 @@ fn supervised_fixture_with_carry(
     crate::supervise::Supervisor,
     std::sync::Arc<crate::ControlHandler>,
 ) {
-    supervised_fixture_with_program(has_active, carry_containment, b"#!/bin/sh\nprintf 'started\\n' >> \"$2\"\nif [ ! -e \"$1\" ]; then : > \"$1\"; exit 23; fi\nwhile :; do /bin/sleep 600; done\n")
+    supervised_fixture_with_program(has_active, carry_containment, "mark-first-exit23")
 }
 
 #[cfg(unix)]
 fn supervised_fixture_with_program(
     has_active: bool,
     carry_containment: bool,
-    program: &[u8],
+    program: &'static str,
 ) -> (
     Rig,
     std::sync::Arc<RuntimeOwner>,
     crate::supervise::Supervisor,
     std::sync::Arc<crate::ControlHandler>,
 ) {
-    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+    use std::sync::Arc;
     let rig = Rig::new();
-    std::fs::write(rig.path.join("program"), program).unwrap();
-    std::fs::set_permissions(
-        rig.path.join("program"),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
+    rig.write_native_program(program);
     write(&rig, 1);
     let path = rig.path.join("subc.jsonc");
     let mut doc: serde_json::Value =
@@ -2216,11 +2208,8 @@ async fn exit_after_unavailable_image(
     registration_before_exit: bool,
 ) {
     use std::io::Write;
-    let (rig, owner, supervisor, _handler) = supervised_fixture_with_program(
-        true,
-        false,
-        b"#!/bin/sh\nprintf 'started\\n' >> \"$2\"\nread -r release < \"$1\"\nexit 23\n",
-    );
+    let (rig, owner, supervisor, _handler) =
+        supervised_fixture_with_program(true, false, "fifo-exit23");
     let release = rig.path.join("a.seen");
     assert!(std::process::Command::new("mkfifo")
         .arg(&release)
@@ -3213,7 +3202,7 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
         let module = module.clone();
         tokio::spawn(async move { module.swap(Some(Duration::from_secs(30))).await })
     };
-    wait_for_supervised_stage(&module, "incumbent and candidate scripts start", || {
+    wait_for_supervised_stage(&module, "incumbent and candidate programs start", || {
         std::fs::read_to_string(rig.path.join("a.launches"))
             .is_ok_and(|text| text.lines().count() == 2)
     })
@@ -3248,12 +3237,12 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
     let mut next = spec;
     next.program = rig.path.join("next-program");
     std::fs::copy(rig.path.join("program"), &next.program).unwrap();
-    next.args[1] = rig
+    next.args[2] = rig
         .path
         .join("a.next-command.launches")
         .to_string_lossy()
         .into_owned();
-    // The approved generation, not live file staging, selects the next command.
+    // The approved config, not the copied program file alone, selects the next command.
     std::fs::write(rig.path.join("subc.jsonc"), serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":next.program,"args":next.args,"overlap":"safe","registration_channel":true}}})).unwrap()).unwrap();
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::ModuleRestart]);
     let gate = owner.module_gate("a").unwrap();
@@ -3281,7 +3270,7 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
     registry.deregister_connection(INCUMBENT).unwrap();
     drop(guard);
     wait_for_supervised_stage(&module, "approved current command starts", || {
-        // Shell redirection creates the file before echo writes its record.
+        // Opening the launch log creates the file before its record is written.
         std::fs::read_to_string(rig.path.join("a.next-command.launches"))
             .is_ok_and(|text| !text.is_empty())
     })
@@ -3464,23 +3453,11 @@ async fn config_delivery_route_unhealthy_fresh_probe_restores_policy_through_the
 async fn config_delivery_route_worker_requests_immediate_health_and_uses_delivery_failure_for_unhealthy_or_timeout(
 ) {
     use crate::supervise::{HealthConfig, RestartPolicy, Supervisor, SupervisorHandle};
-    use std::{
-        os::unix::fs::PermissionsExt,
-        sync::{atomic::Ordering, Arc},
-    };
+    use std::sync::{atomic::Ordering, Arc};
     use subc_protocol::session::{HealthStatus, ModuleControlResponse};
     for answer in [Some(HealthStatus::Ok), Some(HealthStatus::Failing), None] {
         let rig = Rig::new();
-        std::fs::write(
-            rig.path.join("program"),
-            b"#!/bin/sh\nwhile :; do /bin/sleep 600; done\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            rig.path.join("program"),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
+        rig.write_native_program("sleep");
         write(&rig, 1);
         let authority = Arc::new(FakeRouteAuthority::default());
         authority.new_open_generation.store(1, Ordering::SeqCst);
@@ -3666,19 +3643,10 @@ async fn config_delivery_swap_owner_release_supersedes_retained_restart_exactly_
 #[cfg(unix)]
 async fn restart_after_busy_swap_warmup(candidate_exits_first: bool) {
     use crate::supervise::{ModuleOverlap, RestartPolicy, Supervisor, SupervisorHandle};
-    use std::{os::unix::fs::PermissionsExt, sync::Arc};
+    use std::sync::Arc;
     let rig = Rig::new();
     write(&rig, 1);
-    std::fs::write(
-        rig.path.join("program"),
-        b"#!/bin/sh\nprintf '%s\\n' \"$$\" >> \"$2\"\nwhile :; do /bin/sleep 600; done\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(
-        rig.path.join("program"),
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .unwrap();
+    rig.write_native_program("pid-sleep");
     let mut spec = supervised_spec(&rig, "a");
     spec.protocol = subc_control::ModuleProtocol::Subc;
     spec.overlap = ModuleOverlap::Safe;
@@ -3756,7 +3724,7 @@ async fn restart_after_busy_swap_warmup(candidate_exits_first: bool) {
     let mut next = spec;
     next.program = rig.path.join("next-program");
     std::fs::copy(rig.path.join("program"), &next.program).unwrap();
-    next.args[1] = rig
+    next.args[2] = rig
         .path
         .join("a.current.launches")
         .to_string_lossy()

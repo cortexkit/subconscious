@@ -106,11 +106,7 @@ async fn audit_registration_failed_retry_survives_refused_operator_restart() {
 #[cfg(unix)]
 async fn failed_retry_through_recovery(operator_restart: Option<bool>) {
     use crate::supervise::ModuleState;
-    let (rig, owner, supervisor, _) = supervised_fixture_with_program(
-        true,
-        false,
-        b"#!/bin/sh\nprintf 'started\\n' >> \"$2\"\nwhile :; do /bin/sleep 600; done\n",
-    );
+    let (rig, owner, supervisor, _) = supervised_fixture_with_program(true, false, "mark-sleep");
     let module = supervisor
         .spawn_async(supervised_spec(&rig, "a"))
         .await
@@ -193,8 +189,8 @@ async fn audit_registration_fence_release_preserves_deliberate_clean_exit() {
 #[cfg(unix)]
 async fn terminal_fence_release(crash: bool) {
     use crate::supervise::ModuleState;
-    let (rig, owner, supervisor, _) = supervised_fixture_with_program(true, false,
-        b"#!/bin/sh\nprintf 'started\\n' >> \"$2\"\nwhile [ ! -e \"$1\" ]; do /bin/sleep 0.01; done\nexit 0\n");
+    let (rig, owner, supervisor, _) =
+        supervised_fixture_with_program(true, false, "mark-wait-exit0");
     let module = supervisor
         .spawn_async(supervised_spec(&rig, "a"))
         .await

@@ -925,7 +925,11 @@ fn rig() -> Rig {
         path.join("cortexkit/a.jsonc").to_string_lossy(),
         vec![],
     );
-    Rig { path, declaration }
+    Rig {
+        path,
+        declaration,
+        program_mode: std::sync::OnceLock::new(),
+    }
 }
 
 fn spec(rig: &Rig) -> ModuleSpec {
@@ -1596,15 +1600,11 @@ fn config_admission_missing_approved_command_never_falls_back_to_the_live_spec()
 }
 
 #[tokio::test]
-async fn config_admission_spawn_rehashes_scripts_and_covered_files_after_preparation() {
+async fn config_admission_spawn_rehashes_programs_and_covered_files_after_preparation() {
     use std::io::Write;
-    for script_changed in [false, true] {
+    for program_changed in [false, true] {
         let rig = rig();
-        std::fs::write(
-            rig.path.join("program"),
-            "#!/bin/sh\nwhile :; do /bin/sleep 600; done\n",
-        )
-        .unwrap();
+        rig.write_native_program("sleep");
         let covered = rig.path.join("covered");
         std::fs::write(&covered, b"approved").unwrap();
         let mut doc: serde_json::Value =
@@ -1617,7 +1617,7 @@ async fn config_admission_spawn_rehashes_scripts_and_covered_files_after_prepara
         .unwrap();
         let owner = Arc::new(rig.owner("spawn-double-check"));
         rig.stamp(&owner);
-        let path = if script_changed {
+        let path = if program_changed {
             rig.path.join("program")
         } else {
             covered
@@ -1762,7 +1762,7 @@ fn config_admission_declared_files_are_covered_but_argument_files_are_not() {
 }
 
 #[test]
-fn config_admission_shebang_forms_resolve_interpreter_once_and_reject_env_options() {
+fn config_admission_shebang_forms_are_refused() {
     let rig = rig();
     let interpreter = rig.path.join("node");
     std::fs::copy("/bin/sleep", &interpreter).unwrap();
@@ -1774,32 +1774,78 @@ fn config_admission_shebang_forms_resolve_interpreter_once_and_reject_env_option
     spec.env
         .push(("PATH".into(), rig.path.to_string_lossy().into_owned()));
     spec.args = vec!["argument".into()];
-    let launch = crate::config_gate::program::capture(&spec, &[]).unwrap();
-    assert_eq!(launch.spec.program, interpreter);
-    assert_eq!(
-        launch.spec.args,
-        [script.to_string_lossy().as_ref(), "argument"]
-    );
-    assert_eq!(launch.inputs.len(), 2);
-    assert!(launch.inputs.values().any(|input| matches!(&input.value, subc_config::RecordedValue::Value { value } if value["coverage"] == "interpreter only covered")));
     for rejected in [
+        "#!/usr/bin/env node\n",
+        "#!/bin/sleep 600\n",
         "#!/usr/bin/env -S node --flag\n",
         "#!relative\n",
         "#!/usr/bin/env NAME=value\n",
+        "#!\n",
     ] {
         std::fs::write(&script, rejected).unwrap();
-        assert_eq!(
-            crate::config_gate::program::capture(&spec, &[])
-                .err()
-                .unwrap()
-                .code,
-            "program_refused"
-        );
+        let error = crate::config_gate::program::capture(&spec, &[])
+            .err()
+            .expect("a shebang script must not be admitted");
+        assert_eq!(error.code, "program_refused");
+        assert!(error
+            .detail
+            .contains("script modules are refused while the config gate is on"));
+        assert!(error
+            .detail
+            .contains("interpreter re-reads the script by path after the check"));
+        assert!(error.detail.contains("compiled program"));
     }
-    std::fs::write(&script, "#!/bin/sleep 600\n").unwrap();
-    let launch = crate::config_gate::program::capture(&spec, &[]).unwrap();
-    assert_eq!(launch.spec.args[0], "600");
-    assert_eq!(launch.inputs.len(), 2);
+}
+
+#[test]
+fn config_admission_known_interpreters_are_refused_even_with_covered_scripts() {
+    let rig = rig();
+    let script = rig.path.join("main.cjs");
+    std::fs::write(&script, "code\n").unwrap();
+    for name in [
+        "node",
+        "bun",
+        "deno",
+        "python",
+        "python3",
+        "python3.12",
+        "sh",
+        "bash",
+        "python.exe",
+    ] {
+        let interpreter = rig.path.join(name);
+        std::fs::copy("/bin/sleep", &interpreter).unwrap();
+        let mut spec = spec(&rig);
+        spec.program = interpreter;
+        spec.args = vec![script.to_string_lossy().into_owned()];
+        for covered in [vec![], vec![script.to_string_lossy().into_owned()]] {
+            let error = crate::config_gate::program::capture(&spec, &covered)
+                .err()
+                .expect("an interpreter must not be admitted, even when its script is covered");
+            assert_eq!(error.code, "program_refused");
+            assert!(error
+                .detail
+                .contains("interpreter re-reads the script by path after the check"));
+            assert!(error.detail.contains("compiled program"));
+        }
+    }
+}
+
+#[test]
+fn config_admission_refuses_in_place_script_substitution_before_capture() {
+    let rig = rig();
+    let spec = spec(&rig);
+    let path = spec.program.clone();
+    let identity = subc_os::file_identity(&path).unwrap();
+    crate::config_gate::program::before_capture_for_test(move || {
+        std::fs::write(&path, b"#!/bin/sh\nexec /bin/sleep 600\n").unwrap();
+        assert_eq!(subc_os::file_identity(&path), Some(identity));
+    });
+    let error = crate::config_gate::program::capture(&spec, &[])
+        .err()
+        .expect("the hashed bytes are a script, even though classification saw a native image");
+    assert_eq!(error.code, "program_refused");
+    assert!(error.detail.contains("compiled program"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -2632,7 +2678,7 @@ fn config_admission_daemon_restart_precedence_keeps_the_active_command_until_a_n
 #[tokio::test]
 async fn config_admission_exited_before_binding_keeps_its_real_exit_without_admitting_hello() {
     let rig = rig();
-    std::fs::write(rig.path.join("program"), "#!/bin/sh\nexit 23\n").unwrap();
+    rig.write_native_program("exit23");
     let mut doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(rig.path.join("subc.jsonc")).unwrap()).unwrap();
     doc["modules"]["a"]["protocol"] = json!("subc");
@@ -2692,7 +2738,7 @@ async fn config_admission_exited_before_binding_keeps_its_real_exit_without_admi
 #[tokio::test]
 async fn config_admission_wrapper_exec_to_a_different_program_is_program_refused() {
     let rig = rig();
-    std::fs::write(rig.path.join("program"), "#!/bin/sh\nexec /bin/sleep 600\n").unwrap();
+    rig.write_native_program("exec-sleep");
     let owner = Arc::new(rig.owner("wrapper-exec"));
     rig.stamp(&owner);
     let supervisor = Supervisor::new_for_test(
@@ -3152,15 +3198,11 @@ async fn config_admission_post_exec_checks_protocol_none_covered_files_after_pri
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
-async fn config_admission_hello_rechecks_script_and_declared_file_content() {
+async fn config_admission_hello_rechecks_declared_file_content_after_append_or_replacement() {
     use std::io::Write;
-    for script_changed in [false, true] {
+    for replace_path in [false, true] {
         let rig = rig();
-        std::fs::write(
-            rig.path.join("program"),
-            "#!/bin/sh\nwhile :; do /bin/sleep 600; done\n",
-        )
-        .unwrap();
+        rig.write_native_program("sleep");
         wire_fixture_document(&rig, json!([]));
         let covered = rig.path.join("covered");
         std::fs::write(&covered, b"approved").unwrap();
@@ -3188,17 +3230,22 @@ async fn config_admission_hello_rechecks_script_and_declared_file_content() {
                 )
                 .await
         );
-        let changed = if script_changed {
-            rig.path.join("program")
+        let changed = if replace_path {
+            let replacement = rig.path.join("changed-covered");
+            std::fs::copy(&covered, &replacement).unwrap();
+            replacement
         } else {
-            covered
+            covered.clone()
         };
         std::fs::OpenOptions::new()
             .append(true)
-            .open(changed)
+            .open(&changed)
             .unwrap()
             .write_all(b"\n# unapproved bytes\n")
             .unwrap();
+        if replace_path {
+            std::fs::rename(changed, covered).unwrap();
+        }
         refused_content_hello(&rig, owner, handle, registry, module).await;
     }
 }
@@ -3208,32 +3255,7 @@ async fn config_admission_hello_rechecks_script_and_declared_file_content() {
 async fn config_admission_hello_rejects_a_wrapper_that_execs_after_the_spawn_sample() {
     let rig = rig();
     let marker = rig.path.join("release-wrapper");
-    #[cfg(target_os = "linux")]
-    std::fs::write(
-        rig.path.join("program"),
-        "#!/bin/sh\nwhile [ ! -f \"$1\" ]; do /bin/sleep 0.01; done\nexec /bin/sleep 600\n",
-    )
-    .unwrap();
-    #[cfg(target_os = "macos")]
-    {
-        // Approved macOS programs must be signed images. A native wrapper
-        // keeps the late exec under test without requiring script admission.
-        let source = rig.path.join("late-exec.c");
-        std::fs::write(&source, include_str!("../../tests/fixtures/late-exec.c")).unwrap();
-        assert!(std::process::Command::new("/usr/bin/cc")
-            .arg(&source)
-            .arg("-o")
-            .arg(rig.path.join("program"))
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("/usr/bin/codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(rig.path.join("program"))
-            .status()
-            .unwrap()
-            .success());
-    }
+    rig.write_native_program("wait-exec");
     wire_fixture_document(&rig, json!([marker]));
     let owner = Arc::new(rig.owner("late-exec"));
     rig.stamp(&owner);

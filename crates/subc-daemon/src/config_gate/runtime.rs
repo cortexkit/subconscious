@@ -1880,23 +1880,6 @@ impl RuntimeOwner {
                     entry.generation.id
                 ));
             }
-            if let Ok(snapshot) = super::GateSnapshot::from_store(&body.approved) {
-                for (key, input) in &snapshot.inputs {
-                    if let (
-                        super::InputKey::Program { module, .. },
-                        subc_config::RecordedValue::Value { value },
-                    ) = (key, &input.value)
-                    {
-                        if value.get("coverage").and_then(serde_json::Value::as_str)
-                            == Some("interpreter only covered")
-                        {
-                            status
-                                .warnings
-                                .push(format!("{module}: interpreter only covered"));
-                        }
-                    }
-                }
-            }
             status.approval_channels = body
                 .generations
                 .iter()

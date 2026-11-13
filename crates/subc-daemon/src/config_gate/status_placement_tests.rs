@@ -378,7 +378,7 @@ fn config_placement_channel_is_refused_for_non_development_commits() {
 }
 
 #[test]
-fn config_status_lists_interpreter_only_covered() {
+fn config_status_refuses_interpreters_instead_of_reporting_partial_coverage() {
     let rig = Rig::new();
     #[cfg(unix)]
     let interpreter = "/bin/sh";
@@ -396,7 +396,25 @@ fn config_status_lists_interpreter_only_covered() {
     )
     .unwrap();
     let owner = rig.owner("interpreter-status");
-    assert_eq!(owner.status().unwrap().interpreter_only_covered, ["a"]);
+    assert_eq!(owner.status().unwrap_err().code, "program_refused");
+    assert_eq!(
+        owner.prepare(PlanKind::Stamp).err().unwrap().code,
+        "program_refused"
+    );
+    std::fs::write(
+        rig.path.join("subc.jsonc"),
+        serde_json::to_vec(&json!({
+            "version":1,"modules":{"a":{"program":rig.path.join("program")}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let status = owner.status().unwrap();
+    assert!(status.interpreter_only_covered.is_empty());
+    assert_eq!(
+        serde_json::to_value(status).unwrap()["interpreter_only_covered"],
+        json!([])
+    );
 }
 
 #[test]

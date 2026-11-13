@@ -2,8 +2,9 @@
 # Run subc-daemon's library tests with their helper programs in place.
 #
 # Several daemon tests start helper programs (fake-aft-stub,
-# ckdev-resource-helper, the privacy trampoline fixture and others) and find
-# them by walking up from the test binary. `cargo test` builds the test binary
+# ckdev-resource-helper, config-gate-fixture, the privacy trampoline fixture and
+# others) and find them by walking up from the test binary. `cargo test` builds
+# the test binary
 # but not those helpers, and a separate `cargo build` may not put them where
 # the walk looks, so a plain `cargo test -p subc-daemon --lib` fails dozens of
 # tests on a fresh build-server checkout for reasons unrelated to the code.

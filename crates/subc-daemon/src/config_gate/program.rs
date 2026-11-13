@@ -1,8 +1,11 @@
 //! Resolve once for both program approval and execution. Arguments are never code inputs.
 
-use super::{capture::capture_program, CapturedInput, GateError, InputKey, Result};
+use super::{
+    capture::{capture_program, capture_program_classified},
+    CapturedInput, GateError, InputKey, Result,
+};
 use crate::supervise::{ModuleSpec, SpawnProgramBinding};
-use std::{collections::BTreeMap, fs::File, io::Read, path::Path};
+use std::{collections::BTreeMap, fs::File, path::Path};
 
 pub(crate) fn approved_base(snapshot: &super::GateSnapshot, module: &str) -> subc_config::Digest {
     subc_config::raw_digest(
@@ -163,38 +166,6 @@ fn resolve(spec: &ModuleSpec) -> Result<SpawnProgramBinding> {
         .map_err(|error| GateError::new("program_refused", error))
 }
 
-fn shebang(file: &File) -> Result<Option<Vec<String>>> {
-    let mut bytes = Vec::new();
-    file.try_clone()
-        .map_err(|error| GateError::new("program_refused", error))?
-        .take(4097)
-        .read_to_end(&mut bytes)
-        .map_err(|error| GateError::new("program_refused", error))?;
-    if !bytes.starts_with(b"#!") {
-        return Ok(None);
-    }
-    let line = bytes
-        .split(|byte| *byte == b'\n')
-        .next()
-        .unwrap_or_default();
-    if line.len() > 4096 {
-        return Err(GateError::new("program_refused", "shebang is too long"));
-    }
-    let line = std::str::from_utf8(&line[2..])
-        .map_err(|_| GateError::new("program_refused", "shebang is not UTF-8"))?;
-    let words: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
-    if words.is_empty()
-        || words.len() > 2
-        || (words[0] != "/usr/bin/env" && !Path::new(&words[0]).is_absolute())
-    {
-        return Err(GateError::new(
-            "program_refused",
-            "unsupported shebang; use an absolute interpreter and at most one argument",
-        ));
-    }
-    Ok(Some(words))
-}
-
 fn known_interpreter(path: &Path) -> bool {
     let name = path
         .file_name()
@@ -207,12 +178,31 @@ fn known_interpreter(path: &Path) -> bool {
             let number =
                 |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
             parts.next().is_some_and(number)
-                && parts.next().is_some_and(number)
+                && parts.next().is_none_or(number)
                 && parts.next().is_none()
         })
 }
 
-const GATED_SCRIPTS_ALLOWED: bool = true;
+#[cfg(all(test, unix))]
+thread_local! {
+    static BEFORE_CAPTURE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+pub(super) fn before_capture_for_test(hook: impl FnOnce() + 'static) {
+    BEFORE_CAPTURE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn native_fixture_for_test() -> std::path::PathBuf {
+    let executable = std::env::current_exe().unwrap();
+    let deps = executable.parent().unwrap();
+    let name = "config-gate-fixture";
+    [deps.join(name), deps.parent().unwrap().join(name)]
+        .into_iter()
+        .find(|path| path.is_file())
+        .expect("config-gate-fixture not built; run scripts/test-daemon-lib.sh")
+}
 
 pub(crate) fn capture(spec: &ModuleSpec, covered: &[String]) -> Result<ProgramLaunch> {
     let binding = resolve(spec)?;
@@ -220,63 +210,13 @@ pub(crate) fn capture(spec: &ModuleSpec, covered: &[String]) -> Result<ProgramLa
     launch.program = std::path::absolute(&binding.path)
         .map_err(|error| GateError::new("program_refused", error))?;
     let mut paths = vec![launch.program.clone()];
-    let script = subc_os::open_regular_nofollow(
-        &std::fs::canonicalize(&launch.program)
-            .map_err(|error| GateError::new("program_refused", error))?,
-    )
-    .map_err(|error| GateError::new("program_refused", error))?;
-    let mut image = binding.identity;
-    if let Some(words) = shebang(&script)? {
-        if !GATED_SCRIPTS_ALLOWED {
-            return Err(GateError::new(
-                "program_refused",
-                "gated scripts are disabled",
-            ));
+    #[cfg(all(test, unix))]
+    BEFORE_CAPTURE.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
         }
-        let env_form = words[0] == "/usr/bin/env";
-        if env_form
-            && (words.len() != 2
-                || words[1].starts_with('-')
-                || words[1].contains(['/', '=', '\\']))
-        {
-            return Err(GateError::new("program_refused", "env shebang requires exactly one bare program name, without options or assignments"));
-        }
-        let mut interpreter = spec.clone();
-        interpreter.program = if env_form {
-            words[1].clone().into()
-        } else {
-            words[0].clone().into()
-        };
-        let binding = resolve(&interpreter)?;
-        let mut interpreter_file = subc_os::open_regular_nofollow(
-            &std::fs::canonicalize(&binding.path)
-                .map_err(|error| GateError::new("program_refused", error))?,
-        )
-        .map_err(|error| GateError::new("program_refused", error))?;
-        let mut prefix = [0; 2];
-        let count = interpreter_file
-            .read(&mut prefix)
-            .map_err(|error| GateError::new("program_refused", error))?;
-        if count == 2 && prefix == *b"#!" {
-            return Err(GateError::new(
-                "program_refused",
-                "nested shebang interpreters are unsupported",
-            ));
-        }
-        let script_path = launch.program.clone();
-        launch.program = std::path::absolute(&binding.path)
-            .map_err(|error| GateError::new("program_refused", error))?;
-        let mut args = Vec::new();
-        if !env_form && words.len() == 2 {
-            args.push(words[1].clone());
-        }
-        args.push(script_path.to_string_lossy().into_owned());
-        args.extend(spec.args.clone());
-        launch.args = args;
-        paths.push(launch.program.clone());
-        image = binding.identity;
-    }
-    let interpreter_only = covered.is_empty() && known_interpreter(&launch.program);
+    });
+    let image = binding.identity;
     let launch_identity = image;
     paths.extend(covered.iter().map(Into::into));
     let mut inputs = BTreeMap::new();
@@ -299,7 +239,13 @@ pub(crate) fn capture(spec: &ModuleSpec, covered: &[String]) -> Result<ProgramLa
                 )
                 .map_err(|error| GateError::new("program_refused", error))?
         };
-        let (file, captured) = capture_program(&path)?;
+        let (file, captured, script) = capture_program_classified(&path)?;
+        if path == launch.program && (script || known_interpreter(&path)) {
+            return Err(GateError::new(
+                "program_refused",
+                "script modules are refused while the config gate is on because the interpreter re-reads the script by path after the check; ship the module as a compiled program",
+            ));
+        }
         let retained = subc_os::retained_file_identity(&file)
             .map_err(|error| GateError::new("program_refused", error))?;
         #[cfg(windows)]
@@ -325,16 +271,6 @@ pub(crate) fn capture(spec: &ModuleSpec, covered: &[String]) -> Result<ProgramLa
         #[cfg(windows)]
         windows_files.push(no_delete);
         files.push(file);
-    }
-    if interpreter_only {
-        if let Some(input) = inputs.get_mut(&InputKey::Program {
-            module: spec.module_id.clone(),
-            path: launch.program.to_string_lossy().into_owned(),
-        }) {
-            if let subc_config::RecordedValue::Value { value } = &mut input.value {
-                value["coverage"] = serde_json::Value::String("interpreter only covered".into());
-            }
-        }
     }
     Ok(ProgramLaunch {
         spec: launch,

@@ -217,8 +217,9 @@ pub(crate) struct SpawnAuthorityRecord {
     // value immutable so forwarding can project it without taking state under
     // its own lock. Mutable approvals will need publication with the epoch.
     approved: ApprovedDeclarations,
-    // Tests stand in for approvals that origin evidence will supply. Set once
-    // by a test, before the reads it should affect.
+    // Tests stand in for approvals that release records and development
+    // placement records will supply once origins are derived. Set once by a
+    // test, before the reads it should affect.
     #[cfg(test)]
     approved_for_test: std::sync::OnceLock<ApprovedDeclarations>,
     state: Mutex<AuthorityState>,

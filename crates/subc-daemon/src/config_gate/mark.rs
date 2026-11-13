@@ -1,5 +1,7 @@
-//! The first-party mark's activation and lowering (the first-party mark
-//! design, §2), decided while the gate holds its delivery state.
+//! The first-party mark's activation and lowering, decided while the gate
+//! holds its delivery state. The mark tells providers that a route's caller
+//! or target is a supervised spawn of a program the operator admitted, so
+//! they may apply grants its approved provider declarations cover.
 //!
 //! The gate is where a spawn's acknowledgement of its module's active
 //! generation is observed, so it decides the mark there; readiness comes from

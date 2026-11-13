@@ -512,9 +512,9 @@ pub(super) fn bind_get(
 }
 
 /// The catch-up attempt that asks a fresh spawn to acknowledge its module's
-/// active generation, so the spawn can earn the first-party mark (the
-/// first-party mark design, §2: a spawn is marked only after it acknowledged
-/// the active generation and reported ready, on every start path). Delivering
+/// active generation, so the spawn can earn the first-party mark: a spawn is
+/// marked only after it acknowledged the active generation and reported
+/// ready, on every start path. Delivering
 /// the active view at launch is not proof the spawn applied it, and without a
 /// pending change a crash, health, manual or boot restart is otherwise never
 /// asked for an acknowledgement.

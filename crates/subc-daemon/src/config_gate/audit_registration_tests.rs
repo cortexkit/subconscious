@@ -148,6 +148,11 @@ async fn audit_registration_wire_restart_keeps_unrecorded_gate_error_code() {
     operator_gate_error_reply("restart").await;
 }
 
+#[tokio::test]
+async fn audit_registration_wire_reload_keeps_unrecorded_gate_error_code() {
+    operator_gate_error_reply("reload").await;
+}
+
 async fn operator_gate_error_reply(operation: &str) {
     let rig = rig();
     let owner = Arc::new(rig.owner("operator-error-code"));
@@ -184,8 +189,8 @@ async fn operator_gate_error_reply(operation: &str) {
     // earlier admission preflight. The supervisor still has the real gate.
     let handler = Arc::new(crate::ControlHandler::new(registry).with_supervisor(handle));
     registration_declaration_poll(handler.clone(), "supervisor.list").await;
-    let request = if operation == "restart" {
-        json!({"op":"supervisor.restart","module_id":"not-approved"})
+    let request = if matches!(operation, "restart" | "reload") {
+        json!({"op":format!("supervisor.{operation}"),"module_id":"not-approved"})
     } else {
         json!({"op":"supervisor.set_enabled","module_id":"not-approved","enabled":true})
     };

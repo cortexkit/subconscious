@@ -7752,9 +7752,7 @@ impl ControlHandler {
             self.route_outages
                 .operator_action_ended_unrefused(&module_id);
             let (code, message) = match err {
-                crate::supervise::SuperviseError::ConfigHeld { .. } => {
-                    ("config_gated", err.to_string())
-                }
+                _ if err.is_config_gate_error() => ("config_gated", err.to_string()),
                 crate::supervise::SuperviseError::Disabled { .. } => {
                     ("module_disabled", err.to_string())
                 }
@@ -7884,9 +7882,7 @@ impl ControlHandler {
             self.route_outages
                 .operator_action_ended_unrefused(&module_id);
             let (code, message) = match err {
-                crate::supervise::SuperviseError::ConfigHeld { .. } => {
-                    ("config_gated", err.to_string())
-                }
+                _ if err.is_config_gate_error() => ("config_gated", err.to_string()),
                 crate::supervise::SuperviseError::Disabled { .. } => {
                     ("module_disabled", err.to_string())
                 }
@@ -8529,7 +8525,7 @@ impl ControlHandler {
                     .operator_action_ended_unrefused(&module_id);
                 return Ok(vec![control_error_frame(
                     &frame,
-                    if matches!(err, crate::supervise::SuperviseError::ConfigHeld { .. }) {
+                    if err.is_config_gate_error() {
                         "config_gated"
                     } else {
                         "target_unavailable"

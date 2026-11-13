@@ -142,7 +142,7 @@ pub(super) fn gate_hold_error(
     } else {
         SuperviseError::Spawn {
             program: spec.program.clone(),
-            source: std::io::Error::other(error.to_string()),
+            source: std::io::Error::other(error),
             cgroup_path: None,
         }
     }

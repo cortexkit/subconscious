@@ -7148,6 +7148,9 @@ fn hold_config_spawn(
     snapshot: &SharedSnapshot,
     failure: &FailureContext,
 ) -> Result<(), SuperviseError> {
+    if !lock_snapshot(snapshot)?.enabled {
+        return Ok(());
+    }
     if !try_park_config_attempt(spec, runtime, snapshot, failure, None)? {
         // This caller consumed an actual start attempt. If its hold ended before
         // parking, retain that attempt instead of waiting for a lost release.

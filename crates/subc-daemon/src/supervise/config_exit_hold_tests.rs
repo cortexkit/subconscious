@@ -810,3 +810,39 @@ async fn operator_enable_park_error_does_not_inherit_daemon_retry_attribution() 
         "a failed operator enable cannot arm the stale daemon work's retry"
     );
 }
+
+#[tokio::test]
+async fn disabled_config_spawn_hold_leaves_snapshot_and_pending_work_unchanged() {
+    let (_scratch, _, supervisor, _, spec) =
+        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+    let RegisteredConfiguredModule {
+        spec,
+        runtime,
+        module,
+        ..
+    } = supervisor
+        .register_configured_with_health(
+            spec,
+            false,
+            Default::default(),
+            None,
+            Default::default(),
+            DEFAULT_REGISTER_TIMEOUT,
+        )
+        .unwrap();
+    let before = module.inner.snapshot.lock().unwrap().clone();
+    hold_config_spawn(
+        &spec,
+        &runtime,
+        &module.inner.snapshot,
+        &runtime.failure_context(true),
+    )
+    .unwrap();
+    assert_eq!(
+        *module.inner.snapshot.lock().unwrap(),
+        before,
+        "a disabled module has no consumed start attempt to defer"
+    );
+    assert!(runtime.scheduled_respawn.lock().unwrap().is_none());
+    assert!(runtime.deferred_reload_reply.lock().unwrap().is_none());
+}

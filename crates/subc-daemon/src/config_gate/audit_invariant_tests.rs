@@ -148,6 +148,39 @@ async fn approval_latch_does_not_block_later_modules_in_the_same_reconcile() {
 }
 
 #[tokio::test]
+async fn approval_latch_does_not_alias_an_identical_recovery_stamp() {
+    let fixture = failed_approved_actor(false).await;
+    let old = fixture
+        .owner
+        .authority_exit_configuration(1)
+        .unwrap()
+        .unwrap()
+        .3;
+    std::fs::write(
+        fixture
+            .rig
+            .path
+            .join("store")
+            .join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(fixture.owner.check_recovery().unwrap());
+    assert_eq!(fixture.rig.stamp(&fixture.owner), 1);
+    let fresh = fixture
+        .owner
+        .authority_exit_configuration(1)
+        .unwrap()
+        .unwrap()
+        .3;
+    let actor = fixture.handle.get("a").unwrap();
+    let result = actor.check_approved_start_failure(&fresh.identity());
+    drop(fixture.primary);
+    actor.stop().await.unwrap();
+    assert!(result.is_ok(), "an identical recovery stamp is new authority even if its generation and plan digest repeat; old={:?}, fresh={:?}: {result:?}", old.identity(), fresh.identity());
+}
+
+#[tokio::test]
 async fn approval_latch_clears_after_a_successful_registered_reload() {
     let fixture = failed_approved_actor(false).await;
     fixture.owner.restore_unused_delivery_spawns_for_test();

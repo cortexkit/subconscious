@@ -7,7 +7,14 @@ async fn config_spawn_contended_or_poisoned_admission_backs_off_without_spinning
         crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
     let runtime = supervisor.runtime_config();
     let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-    defer_config_spawn(&spec, &runtime, &snapshot, RespawnKind::Spawn).unwrap();
+    defer_config_spawn(
+        &spec,
+        &runtime,
+        &snapshot,
+        RespawnKind::Spawn,
+        &runtime.failure_context(true),
+    )
+    .unwrap();
     let scheduled = runtime.scheduled_respawn.lock().unwrap().unwrap();
     assert!(
         scheduled.deadline > Instant::now(),

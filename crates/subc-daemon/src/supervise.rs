@@ -3983,11 +3983,22 @@ impl Supervisor {
         let mut child = match spawned {
             Ok(child) => child,
             Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
-                defer_config_spawn(&spec, &runtime, &snapshot, RespawnKind::Spawn)?;
+                defer_config_spawn(
+                    &spec,
+                    &runtime,
+                    &snapshot,
+                    RespawnKind::Spawn,
+                    &runtime.failure_context(runtime.recovery_is_daemon),
+                )?;
                 return Ok(self.supervised_module(spec, runtime, snapshot, None));
             }
             Err(SuperviseError::ConfigHeld { .. }) => {
-                hold_config_spawn(&spec, &runtime, &snapshot, EndedConfigHold::RetrySpawn)?;
+                hold_config_spawn(
+                    &spec,
+                    &runtime,
+                    &snapshot,
+                    &runtime.failure_context(runtime.recovery_is_daemon),
+                )?;
                 return Ok(self.supervised_module(spec, runtime, snapshot, None));
             }
             Err(err) => {
@@ -4026,12 +4037,23 @@ impl Supervisor {
         let mut child = match spawned {
             Ok(child) => child,
             Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
-                defer_config_spawn(&spec, &runtime, &snapshot, RespawnKind::Spawn)?;
+                defer_config_spawn(
+                    &spec,
+                    &runtime,
+                    &snapshot,
+                    RespawnKind::Spawn,
+                    &runtime.failure_context(runtime.recovery_is_daemon),
+                )?;
                 identity.committed = true;
                 return Ok(self.supervised_module(spec, runtime, snapshot, None));
             }
             Err(SuperviseError::ConfigHeld { .. }) => {
-                hold_config_spawn(&spec, &runtime, &snapshot, EndedConfigHold::RetrySpawn)?;
+                hold_config_spawn(
+                    &spec,
+                    &runtime,
+                    &snapshot,
+                    &runtime.failure_context(runtime.recovery_is_daemon),
+                )?;
                 identity.committed = true;
                 return Ok(self.supervised_module(spec, runtime, snapshot, None));
             }
@@ -4292,7 +4314,13 @@ impl Supervisor {
                     Some(child)
                 }
                 Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
-                    defer_config_spawn(&spec, &runtime, snapshot, RespawnKind::Spawn)?;
+                    defer_config_spawn(
+                        &spec,
+                        &runtime,
+                        snapshot,
+                        RespawnKind::Spawn,
+                        &runtime.failure_context(daemon_initiated),
+                    )?;
                     None
                 }
                 Err(mut err) => {
@@ -4301,7 +4329,7 @@ impl Supervisor {
                             &spec,
                             &runtime,
                             snapshot,
-                            EndedConfigHold::RetrySpawn,
+                            &runtime.failure_context(daemon_initiated),
                         ) {
                             Ok(()) => {
                                 self.start_monitor(spec, runtime, &module, None, commands);
@@ -4407,7 +4435,13 @@ impl Supervisor {
                     Some(child)
                 }
                 Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
-                    defer_config_spawn(&spec, &runtime, snapshot, RespawnKind::Spawn)?;
+                    defer_config_spawn(
+                        &spec,
+                        &runtime,
+                        snapshot,
+                        RespawnKind::Spawn,
+                        &runtime.failure_context(daemon_initiated),
+                    )?;
                     None
                 }
                 Err(mut err) => {
@@ -4416,7 +4450,7 @@ impl Supervisor {
                             &spec,
                             &runtime,
                             snapshot,
-                            EndedConfigHold::RetrySpawn,
+                            &runtime.failure_context(daemon_initiated),
                         ) {
                             Ok(()) => {
                                 self.start_monitor(spec, runtime, &module, None, commands);
@@ -7029,16 +7063,11 @@ fn cancel_deferred_reload(runtime: &SupervisorRuntimeConfig, module_id: &str, re
     }
 }
 
-#[derive(Clone, Copy)]
-enum EndedConfigHold {
-    PreserveWork,
-    RetrySpawn,
-}
-
 fn park_config_spawn(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
+    failure: &FailureContext,
     admission_refused: Option<String>,
 ) -> Result<(), SuperviseError> {
     *runtime
@@ -7059,9 +7088,7 @@ fn park_config_spawn(
     }
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
         state.admission_refused = admission_refused;
-        if !state.config_hold_parked {
-            state.config_hold_daemon_initiated = runtime.recovery_is_daemon;
-        }
+        state.config_hold_daemon_initiated = failure.daemon_initiated;
         state.config_hold_parked = true;
         state.state = ModuleState::Stopped;
         state.respawn_pending = false;
@@ -7070,47 +7097,49 @@ fn park_config_spawn(
     })
 }
 
-fn hold_config_spawn(
+fn try_park_config_attempt(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
-    ended: EndedConfigHold,
-) -> Result<(), SuperviseError> {
-    {
-        let state = lock_snapshot(snapshot)?;
-        if !state.enabled
-            || (!state.config_hold_parked
-                && matches!(
-                    state.state,
-                    ModuleState::Failed | ModuleState::Stopped | ModuleState::Disabled
-                ))
-        {
-            return Ok(());
-        }
+    failure: &FailureContext,
+    program_base: Option<&subc_config::Digest>,
+) -> Result<bool, SuperviseError> {
+    if !lock_snapshot(snapshot)?.enabled {
+        return Ok(false);
     }
     #[cfg(test)]
     if let Some(delivery) = &runtime.config_delivery {
         delivery.0.pause_before_config_park_for_test();
     }
-    if let Some(delivery) = &runtime.config_delivery {
-        let parked = delivery
-            .0
-            .with_recorded_admission_hold(&spec.module_id, |admission_refused| {
-                park_config_spawn(spec, runtime, snapshot, admission_refused)
-            })
-            .map_err(|error| config_delivery::gate_hold_error(spec, error, Some(delivery)))?;
-        if let Some(result) = parked {
-            return result;
-        }
+    let Some(delivery) = &runtime.config_delivery else {
+        return Ok(false);
+    };
+    let parked = delivery
+        .0
+        .with_recorded_admission_hold(&spec.module_id, program_base, |refusal| {
+            park_config_spawn(spec, runtime, snapshot, failure, refusal)
+        })
+        .map_err(|error| config_delivery::gate_hold_error(spec, error, Some(delivery)))?;
+    if let Some(result) = parked {
+        result?;
+        Ok(true)
+    } else {
+        Ok(false)
     }
-    match ended {
-        EndedConfigHold::PreserveWork => Ok(()),
-        // Only a caller that already abandoned its spawn work needs a new
-        // attempt when the hold ends before parking and its release is gone.
-        EndedConfigHold::RetrySpawn => {
-            defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn)
-        }
+}
+
+fn hold_config_spawn(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    failure: &FailureContext,
+) -> Result<(), SuperviseError> {
+    if !try_park_config_attempt(spec, runtime, snapshot, failure, None)? {
+        // This caller consumed an actual start attempt. If its hold ended before
+        // parking, retain that attempt instead of waiting for a lost release.
+        defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn, failure)?;
     }
+    Ok(())
 }
 
 fn schedule_respawn(
@@ -7143,6 +7172,7 @@ fn defer_config_spawn(
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
     kind: RespawnKind,
+    failure: &FailureContext,
 ) -> Result<(), SuperviseError> {
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
         state.state = ModuleState::Restarting;
@@ -7155,7 +7185,7 @@ fn defer_config_spawn(
         .unwrap_or_else(|p| p.into_inner()) = Some(PendingRespawn {
         deadline: Instant::now() + CONFIG_ADMISSION_RETRY_DELAY,
         kind,
-        daemon_initiated: runtime.recovery_is_daemon,
+        daemon_initiated: failure.daemon_initiated,
     });
     Ok(())
 }
@@ -8659,6 +8689,12 @@ async fn supervise_loop(
                     // retain its ordinary crash/clean-exit accounting.
                     let admission_kill = admission_exit::is_admission_kill(active_child.admission_kill_sent, &exit_report);
                     let deferred_spawn=admission_kill && active_child.spawn_failure.as_deref().is_some_and(|detail|detail.starts_with("config_delivery_deferred:"));
+                    let refused_program = active_child.live_program_binding.as_ref().is_some_and(|binding| binding.is_refused());
+                    let exit_held = !deferred_spawn && (refused_program || runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.exit_is_held(&spec.module_id)));
+                    let parked = exit_held && (!refused_program || active_child.admission_base.is_some())
+                        && try_park_config_attempt(&spec, &runtime, &snapshot, &runtime.failure_context(true),
+                            if refused_program { active_child.admission_base.as_ref() } else { None })
+                            .unwrap_or_else(|error| { warn!(module_id=%spec.module_id, %error, "exit hold could not be recorded; using ordinary exit accounting"); false });
                     let next = if deferred_spawn {
                         record_terminal_with_detail(&spec.module_id,&runtime.terminal_ring,&runtime.spawn_events,&exit_report,TerminalDisposition::Restarting,active_child.spawn_failure.clone());
                         let _=update_snapshot(&snapshot,Some(&spec.module_id),|state| {
@@ -8667,18 +8703,8 @@ async fn supervise_loop(
                             state.last_exit=Some(exit_report.clone());
                         });
                         NextAction::Restart {schedule:None}
-                    } else if active_child.live_program_binding.as_ref().is_some_and(|binding|binding.is_refused()) || runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.exit_is_held(&spec.module_id)) {
-                        #[cfg(test)]
-                        if let Some(delivery) = &runtime.config_delivery { delivery.0.pause_before_config_park_for_test(); }
+                    } else if parked {
                         record_terminal_with_detail(&spec.module_id, &runtime.terminal_ring, &runtime.spawn_events, &exit_report, TerminalDisposition::Stopped, active_child.spawn_failure.clone().or_else(|| Some("config_gated".into())));
-                        if active_child.live_program_binding.as_ref().is_some_and(|binding| binding.is_refused()) {
-                            // This child's content refusal is permanent even when
-                            // approval changed or was removed, so recording a
-                            // refusal against its original program digest fails.
-                            let _ = park_config_spawn(&spec, &runtime, &snapshot, None);
-                        } else {
-                            let _ = hold_config_spawn(&spec, &runtime, &snapshot, EndedConfigHold::RetrySpawn);
-                        }
                         NextAction::Stop { registration_released: registry.get_module(&spec.module_id).ok().flatten().is_none() }
                     } else { on_child_exit(
                         &spec,
@@ -8886,7 +8912,7 @@ async fn supervise_loop(
                             let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = true);
                         }
                         Err(SuperviseError::ConfigHeld { .. }) => {
-                            let _ = hold_config_spawn(&spec, &runtime, &snapshot, EndedConfigHold::RetrySpawn);
+                            let _ = hold_config_spawn(&spec, &runtime, &snapshot, &runtime.failure_context(pending.daemon_initiated));
                             runtime.pending_activity_restart = false;
                             process_liveness.untrack_if_current(&spec.module_id, &snapshot);
                         }
@@ -8945,10 +8971,10 @@ async fn supervise_loop(
                                 match spawn_and_mark_running_async(&spec, &runtime, &snapshot).await {
                                     Ok(next_child) => child = Some(next_child),
                                     Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
-                                        let _ = defer_config_spawn(&spec, &runtime, &snapshot, RespawnKind::Spawn);
+                                        let _ = defer_config_spawn(&spec, &runtime, &snapshot, RespawnKind::Spawn, &runtime.failure_context(true));
                                     }
                                     Err(SuperviseError::ConfigHeld { .. }) => {
-                                        let _ = hold_config_spawn(&spec, &runtime, &snapshot, EndedConfigHold::RetrySpawn);
+                                        let _ = hold_config_spawn(&spec, &runtime, &snapshot, &runtime.failure_context(true));
                                     }
                                     Err(error) => {
                                         fail_snapshot(&snapshot, Some(&spec.module_id), None, &runtime.failure_context(true));
@@ -9107,15 +9133,6 @@ async fn handle_supervisor_command(
         let _ = reply.send(result);
         return true;
     }
-    if !matches!(
-        command,
-        SupervisorCommand::UpdateConfiguration { .. }
-            | SupervisorCommand::ApprovedConfiguration { .. }
-            | SupervisorCommand::ConfigPolicyProbe { .. }
-            | SupervisorCommand::ConfigExitHold { .. }
-    ) {
-        runtime.recovery_is_daemon = false;
-    }
     let blocked = runtime
         .config_delivery
         .as_ref()
@@ -9132,9 +9149,6 @@ async fn handle_supervisor_command(
                 .map(|(pid, reason)| previous_instance_error(spec, pid, reason))
         });
     let command = if let Some(error) = blocked {
-        if matches!(error, SuperviseError::ConfigHeld { .. }) && child.is_none() {
-            let _ = hold_config_spawn(spec, runtime, snapshot, EndedConfigHold::PreserveWork);
-        }
         match command {
             SupervisorCommand::Restart { reply, .. } | SupervisorCommand::Reload { reply, .. } => {
                 let _ = reply.send(Err(error));
@@ -9152,6 +9166,7 @@ async fn handle_supervisor_command(
                 ..
             } => {
                 if matches!(error, SuperviseError::ConfigHeld { .. })
+                    && lock_snapshot(snapshot).is_ok_and(|state| !state.enabled)
                     && runtime
                         .config_delivery
                         .as_ref()
@@ -9164,14 +9179,24 @@ async fn handle_supervisor_command(
                     let result = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                         changed = !state.enabled;
                         state.enabled = true;
-                        if child.is_none() {
-                            state.config_hold_daemon_initiated = false;
-                            state.config_hold_parked = true;
-                            state.state = ModuleState::Stopped;
+                        if child.is_none() && state.waiting_for_previous_pid.is_none() {
+                            state.state = ModuleState::Starting;
                             state.failed_retry.cancel();
                         }
                     })
-                    .map(|_| changed);
+                    .and_then(|_| {
+                        if child.is_none()
+                            && lock_snapshot(snapshot)?.waiting_for_previous_pid.is_none()
+                        {
+                            hold_config_spawn(
+                                spec,
+                                runtime,
+                                snapshot,
+                                &runtime.failure_context(false),
+                            )?;
+                        }
+                        Ok(changed)
+                    });
                     if result.is_ok() && changed {
                         runtime.start_requester = requester;
                     }
@@ -9195,15 +9220,8 @@ async fn handle_supervisor_command(
             | SupervisorCommand::SetEnabled { .. }
             | SupervisorCommand::Restart { .. }
     ) {
-        let starts = matches!(
-            command,
-            SupervisorCommand::Restart { .. } | SupervisorCommand::SetEnabled { enabled: true, .. }
-        );
         let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
             state.failed_retry.cancel();
-            if starts {
-                state.approved_start_failure = None;
-            }
         });
     }
     match command {
@@ -9247,10 +9265,13 @@ async fn handle_supervisor_command(
                         reset_restart_count(snapshot, &spec.module_id)?;
                         update_snapshot(snapshot, Some(&spec.module_id), |state| {
                             state.enabled = true;
-                            state.config_hold_daemon_initiated = false;
-                            state.config_hold_parked = true;
-                            state.state = ModuleState::Stopped;
+                            if child.is_none() && state.waiting_for_previous_pid.is_none() {
+                                state.state = ModuleState::Starting;
+                            }
                         })?;
+                        if child.is_none() && lock_snapshot(snapshot)?.waiting_for_previous_pid.is_none() {
+                            hold_config_spawn(spec, runtime, snapshot, &runtime.failure_context(false))?;
+                        }
                     } else {
                         match set_child_enabled_with_budget_policy(
                             spec, runtime, registry, process_liveness, snapshot, child,
@@ -9283,9 +9304,9 @@ async fn handle_supervisor_command(
                     match spawn_and_mark_running_async(spec, runtime, snapshot).await {
                         Ok(replacement) => *child = Some(replacement),
                         Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
-                            defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn)?;
+                            defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn, &runtime.failure_context(false))?;
                         }
-                        Err(SuperviseError::ConfigHeld { .. }) => hold_config_spawn(spec, runtime, snapshot, EndedConfigHold::RetrySpawn)?,
+                        Err(SuperviseError::ConfigHeld { .. }) => hold_config_spawn(spec, runtime, snapshot, &runtime.failure_context(false))?,
                         Err(error) => {
                             fail_snapshot(snapshot, Some(&spec.module_id), None, &runtime.failure_context(false));
                             return Err(error);
@@ -9401,23 +9422,38 @@ async fn handle_supervisor_command(
             true
         }
         SupervisorCommand::ConfigExitHold { reply } => {
-            let result = if child.is_none() {
-                hold_config_spawn(spec, runtime, snapshot, EndedConfigHold::PreserveWork)
-            } else if runtime
-                .config_delivery
-                .as_ref()
-                .is_some_and(|delivery| delivery.0.has_recorded_admission_hold(&spec.module_id))
-            {
-                cancel_deferred_reload(
-                    runtime,
-                    &spec.module_id,
-                    "configuration delivery has no active generation",
-                );
-                *runtime
+            // A notification owns no start, backoff, reload reply or previous-
+            // instance wait. Only an idle, registered initial start has no work
+            // to preserve; its initialized startup context can be parked here.
+            let idle_start = child.is_none()
+                && lock_snapshot(snapshot).is_ok_and(|state| {
+                    state.enabled
+                        && state.state == ModuleState::Starting
+                        && !state.process_alive
+                        && !state.respawn_pending
+                        && state.waiting_for_previous_pid.is_none()
+                        && state.waiting_for_previous_detail.is_none()
+                        && state.failed_retry.pending.is_none()
+                })
+                && runtime
                     .scheduled_respawn
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner()) = None;
-                Ok(())
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_none()
+                && runtime
+                    .deferred_reload_reply
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_none();
+            let result = if idle_start {
+                try_park_config_attempt(
+                    spec,
+                    runtime,
+                    snapshot,
+                    &runtime.failure_context(runtime.recovery_is_daemon),
+                    None,
+                )
+                .map(|_| ())
             } else {
                 Ok(())
             };
@@ -9464,16 +9500,37 @@ async fn handle_supervisor_command(
                         &runtime.failure_context(true),
                     )
                     .await;
-                    if drained.is_ok()
-                        && runtime.config_delivery.as_ref().is_some_and(|delivery| {
-                            delivery.0.has_recorded_admission_hold(&spec.module_id)
-                        })
-                    {
-                        let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                            state.state = ModuleState::Stopped;
-                            state.config_hold_parked = state.enabled;
-                            state.failed_retry.pending = None;
-                        });
+                    if drained.is_ok() {
+                        match try_park_config_attempt(
+                            spec,
+                            runtime,
+                            snapshot,
+                            &runtime.failure_context(true),
+                            None,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                if let Err(error) = budgeted_restart_child(
+                                    spec,
+                                    runtime,
+                                    registry,
+                                    process_liveness,
+                                    snapshot,
+                                    child,
+                                    SupervisorHealthStatus::Unknown,
+                                    Some("configuration delivery failed after its hold ended"),
+                                    unix_ms_now(),
+                                    false,
+                                )
+                                .await
+                                {
+                                    warn!(module_id=%spec.module_id, %error, "configuration failure restart could not be scheduled");
+                                }
+                            }
+                            Err(error) => {
+                                warn!(module_id=%spec.module_id, %error, "configuration failure could not be parked")
+                            }
+                        }
                     }
                 }
             } else if let Err(error) = budgeted_restart_child(
@@ -10039,12 +10096,24 @@ async fn finish_reload_child(
     let next_child = match spawn_and_mark_running_async(spec, runtime, snapshot).await {
         Ok(next_child) => next_child,
         Err(error @ SuperviseError::ConfigDeliveryDeferred { .. }) => {
-            defer_config_spawn(spec, runtime, snapshot, RespawnKind::Reload)?;
+            defer_config_spawn(
+                spec,
+                runtime,
+                snapshot,
+                RespawnKind::Reload,
+                &runtime.failure_context(runtime.recovery_is_daemon),
+            )?;
             return Err(error);
         }
         Err(error @ SuperviseError::ConfigHeld { .. }) => {
-            hold_config_spawn(spec, runtime, snapshot, EndedConfigHold::RetrySpawn)?;
-            return Err(error);
+            let failure = runtime.failure_context(runtime.recovery_is_daemon);
+            if try_park_config_attempt(spec, runtime, snapshot, &failure, None)? {
+                return Err(error);
+            }
+            defer_config_spawn(spec, runtime, snapshot, RespawnKind::Reload, &failure)?;
+            return Err(SuperviseError::ConfigDeliveryDeferred {
+                module_id: spec.module_id.clone(),
+            });
         }
         Err(err) => {
             return handle_reload_spawn_failure(
@@ -10261,11 +10330,11 @@ async fn set_child_enabled_with_budget_policy(
         let next_child = match spawn_and_mark_running_async(spec, runtime, snapshot).await {
             Ok(next_child) => next_child,
             Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
-                defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn)?;
+                defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn, failure)?;
                 return Ok(true);
             }
             Err(error @ SuperviseError::ConfigHeld { .. }) => {
-                hold_config_spawn(spec, runtime, snapshot, EndedConfigHold::RetrySpawn)?;
+                hold_config_spawn(spec, runtime, snapshot, failure)?;
                 return Err(error);
             }
             Err(err) => {

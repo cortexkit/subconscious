@@ -574,6 +574,7 @@ impl RuntimeOwner {
     pub(crate) fn with_recorded_admission_hold<T>(
         &self,
         module: &str,
+        program_base: Option<&Digest>,
         park: impl FnOnce(Option<String>) -> T,
     ) -> Result<Option<T>> {
         if self.inner.is_poisoned() {
@@ -588,7 +589,16 @@ impl RuntimeOwner {
                 "configuration publication is poisoned",
             )
         })?;
+        if program_base.is_some_and(|expected| {
+            view.admission
+                .modules
+                .get(module)
+                .is_none_or(|current| &current.program_base != expected)
+        }) {
+            return Ok(None);
+        }
         if !view.admission.is_recovering()
+            && !view.admission.fenced.contains(module)
             && !view
                 .admission
                 .held_modules()
@@ -602,8 +612,10 @@ impl RuntimeOwner {
             .err()
             .filter(|error| error.code == subc_control::REGISTRATION_CHANNEL_UNSUPPORTED)
             .map(|error| error.code);
-        // Keep publication pinned until the actor records its parked state.
-        // Clearing the hold must publish after that state, or before this check.
+        // Pin the current recorded hold through the park. A child's content
+        // refusal is eligible only while that same program remains approved.
+        // A pending delivery exit blocks new starts until its failure is recorded;
+        // completing that record queues release for actors parked under its fence.
         Ok(Some(park(refusal)))
     }
 

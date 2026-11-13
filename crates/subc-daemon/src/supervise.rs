@@ -4288,11 +4288,21 @@ impl Supervisor {
                     defer_config_spawn(&spec, &runtime, snapshot, RespawnKind::Spawn)?;
                     None
                 }
-                Err(SuperviseError::ConfigHeld { .. }) => {
-                    hold_config_spawn(&spec, &runtime, snapshot, EndedConfigHold::RetrySpawn)?;
-                    None
-                }
-                Err(err) => {
+                Err(mut err) => {
+                    if matches!(err, SuperviseError::ConfigHeld { .. }) {
+                        match hold_config_spawn(
+                            &spec,
+                            &runtime,
+                            snapshot,
+                            EndedConfigHold::RetrySpawn,
+                        ) {
+                            Ok(()) => {
+                                self.start_monitor(spec, runtime, &module, None, commands);
+                                return Ok(module);
+                            }
+                            Err(parking_error) => err = parking_error,
+                        }
+                    }
                     if runtime.health.critical {
                         error!(
                             module_id = %spec.module_id,
@@ -4387,11 +4397,20 @@ impl Supervisor {
                     defer_config_spawn(&spec, &runtime, snapshot, RespawnKind::Spawn)?;
                     None
                 }
-                Err(err) => {
+                Err(mut err) => {
                     if matches!(err, SuperviseError::ConfigHeld { .. }) {
-                        hold_config_spawn(&spec, &runtime, snapshot, EndedConfigHold::RetrySpawn)?;
-                        self.start_monitor(spec, runtime, &module, None, commands);
-                        return Ok(module);
+                        match hold_config_spawn(
+                            &spec,
+                            &runtime,
+                            snapshot,
+                            EndedConfigHold::RetrySpawn,
+                        ) {
+                            Ok(()) => {
+                                self.start_monitor(spec, runtime, &module, None, commands);
+                                return Ok(module);
+                            }
+                            Err(parking_error) => err = parking_error,
+                        }
                     }
                     if runtime.health.critical {
                         error!(module_id = %spec.module_id, program = %spec.program.display(), error = %err,

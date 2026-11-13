@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1
+
+- Refuse profiles when one-minute host load exceeds twice the logical CPU count,
+  without spending the module cooldown; unreadable load fails open.
+
 ## 0.5.0
 
 - Adopt client/control 0.39 and protocol 0.37. The public `manifest()`

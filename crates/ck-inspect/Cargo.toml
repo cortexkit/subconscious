@@ -1,6 +1,6 @@
 [package]
 name = "ck-inspect"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "MIT"
 description = "Read-only supervised process inspection over subc routes."
@@ -20,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subc-client-rs = { path = "../subc-client-rs", version = "0.39.0" }
 subc-control = { path = "../subc-control", version = "0.39.0" }
+subc-os = { path = "../subc-os", version = "0.1.35" }
 subc-protocol = { path = "../subc-protocol", version = "0.37.0" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }
@@ -31,7 +32,7 @@ rustix = { version = "1", features = ["process", "param"] }
 cortexkit-store-types = "0.2.2"
 
 [dev-dependencies]
-ck-inspect = { path = ".", version = "0.5.0", features = ["test-support"] }
+ck-inspect = { path = ".", version = "0.5.1", features = ["test-support"] }
 tokio = { version = "1", features = ["test-util"] }
 
 [lints.rust]

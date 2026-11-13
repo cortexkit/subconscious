@@ -12,11 +12,28 @@ name: Release npm
 # which matches `*-v*` and would fail on a non-existent crate of that name.
 on:
   push:
+    branches:
+      - "train/**"
     tags:
       - "subc-client@*"
       - "store@*"
       - "log@*"
       - "private-files@*"
+    paths:
+      - "clients/subc-client/**"
+      - "clients/subc-registration-native/**"
+      - "crates/subc-os/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/release-npm.yml"
+  pull_request:
+    paths:
+      - "clients/subc-client/**"
+      - "clients/subc-registration-native/**"
+      - "crates/subc-os/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/release-npm.yml"
 
 concurrency:
   group: release-npm-${{ github.ref }}-${{ github.sha }}
@@ -24,9 +41,96 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write # REQUIRED: lets the job mint the GitHub OIDC token npm verifies.
 
 jobs:
+  subc-client-prebuilds:
+    name: Registration N-API v8 prebuild (${{ matrix.platform }}-${{ matrix.arch }})
+    if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/train/') || startsWith(github.ref, 'refs/tags/subc-client@')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: x64
+            library: libsubc_registration_native.so
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            arch: arm64
+            library: libsubc_registration_native.so
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            platform: darwin
+            arch: x64
+            library: libsubc_registration_native.dylib
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: darwin
+            arch: arm64
+            library: libsubc_registration_native.dylib
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: win32
+            arch: x64
+            library: subc_registration_native.dll
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            platform: win32
+            arch: arm64
+            library: subc_registration_native.dll
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build registration helper
+        run: cargo build --locked --release -p subc-registration-native --target ${{ matrix.target }}
+      # Every artifact carries the same loader, declarations and CommonJS package
+      # scope; merging them leaves six distinct binaries beside that loader.
+      - name: Stage bundle-local native package
+        shell: bash
+        run: |
+          mkdir -p clients/subc-client/native
+          cp clients/subc-registration-native/{index.js,index.d.ts,package.json} clients/subc-client/native/
+          cp "target/${{ matrix.target }}/release/${{ matrix.library }}" \
+            "clients/subc-client/native/subc-registration-${{ matrix.platform }}-${{ matrix.arch }}.node"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: subc-client-prebuild-${{ matrix.platform }}-${{ matrix.arch }}
+          path: clients/subc-client/native/
+          if-no-files-found: error
+
+  subc-client-bundle-check:
+    name: Check SDK native release bundle (no publish)
+    needs: subc-client-prebuilds
+    if: github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/train/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+      - name: Assemble registration prebuilds
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: subc-client-prebuild-*
+          path: clients/subc-client/native/
+          merge-multiple: true
+      - name: Install SDK dev dependencies
+        working-directory: clients/subc-client
+        run: bun install --frozen-lockfile
+      - name: Check publishable SDK bundle
+        working-directory: clients/subc-client
+        run: bun run prepublishOnly
+
   private-files-prebuilds:
     name: Native N-API v8 prebuild (${{ matrix.arch }})
     if: startsWith(github.ref_name, 'private-files@')
@@ -69,12 +173,13 @@ jobs:
 
   publish:
     name: Publish npm package
-    needs: private-files-prebuilds
-    # Other npm tags skip the native job and retain their existing publish path.
-    if: ${{ !cancelled() && (needs.private-files-prebuilds.result == 'success' || needs.private-files-prebuilds.result == 'skipped') }}
-    # Blacksmith runner (private repo on the free plan blocks GitHub-hosted
-    # Actions). Blacksmith is a drop-in that honors GitHub-native OIDC, so
-    # trusted publishing works unchanged as long as id-token: write is granted.
+    needs: [private-files-prebuilds, subc-client-prebuilds]
+    # PRs and branch pushes only check the SDK bundle. Publishing stays tag-only,
+    # and a failed native build must not be treated like an unrelated skipped lane.
+    if: ${{ !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && (needs.private-files-prebuilds.result == 'success' || needs.private-files-prebuilds.result == 'skipped') && (needs.subc-client-prebuilds.result == 'success' || needs.subc-client-prebuilds.result == 'skipped') }}
+    permissions:
+      contents: read
+      id-token: write # Required for npm OIDC trusted publishing, never for PR checks.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -112,6 +217,14 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: latest
+
+      - name: Assemble registration prebuilds
+        if: ${{ steps.pkg.outputs.dir == 'clients/subc-client' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: subc-client-prebuild-*
+          path: clients/subc-client/native/
+          merge-multiple: true
 
       # Store and log use the locked sibling private-files package before its first publish.
       - name: Build sibling private-files for store and log
@@ -154,6 +267,11 @@ jobs:
         working-directory: clients/private-files
         run: node scripts/check-prebuilds.mjs
 
+      - name: Check publishable SDK bundle
+        if: ${{ steps.pkg.outputs.dir == 'clients/subc-client' }}
+        working-directory: clients/subc-client
+        run: bun run prepublishOnly
+
       # Guard: the tag version must match package.json, so a stale or mistyped
       # tag can't publish the wrong version (mirrors the crate release guard).
       - name: Assert tag matches package.json version
@@ -170,13 +288,8 @@ jobs:
       # Idempotent: a retag of an already-published version (recovery re-run) is
       # treated as success rather than failing the release.
       #
-      # Provenance is DISABLED: sigstore provenance attestation is only accepted
-      # from github-hosted runners, and this repo is forced onto Blacksmith
-      # (self-hosted class) because the free-plan org blocks private-repo
-      # GitHub-hosted Actions. OIDC trusted-publishing AUTH itself works on
-      # Blacksmith; only the provenance bundle is rejected (E422). npm >= 11.5.1
-      # auto-enables provenance under trusted publishing, so we override it off
-      # explicitly via NPM_CONFIG_PROVENANCE.
+      # Keep the existing provenance policy: npm >= 11.5.1 auto-enables it
+      # under trusted publishing unless NPM_CONFIG_PROVENANCE overrides it.
       - name: Publish (OIDC trusted publishing)
         working-directory: ${{ steps.pkg.outputs.dir }}
         env:

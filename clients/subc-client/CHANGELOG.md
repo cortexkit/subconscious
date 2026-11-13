@@ -2,6 +2,9 @@
 
 ## 0.25.0
 
+- The npm package now carries all six native registration helpers (Linux,
+  macOS and Windows, each x64 and arm64). PR and train builds check the same
+  assembled bundle as tag releases before publishing is allowed.
 - **TypeScript migration:** exported `KnownRouteCloseReason` adds
   `authority_changed`. Update exhaustive switches or records for the new
   member; it is reopenable. Unknown reasons remain conservatively classified.

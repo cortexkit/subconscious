@@ -7118,28 +7118,37 @@ fn try_park_config_attempt(
     failure: &FailureContext,
     program_base: Option<&subc_config::Digest>,
 ) -> Result<bool, SuperviseError> {
-    if !lock_snapshot(snapshot)?.enabled {
-        return Ok(false);
+    let result = (|| {
+        if !lock_snapshot(snapshot)?.enabled {
+            return Ok(false);
+        }
+        #[cfg(test)]
+        if let Some(delivery) = &runtime.config_delivery {
+            delivery.0.pause_before_config_park_for_test();
+        }
+        let Some(delivery) = &runtime.config_delivery else {
+            return Ok(false);
+        };
+        let parked = delivery
+            .0
+            .with_recorded_admission_hold(&spec.module_id, program_base, |refusal| {
+                park_config_spawn(spec, runtime, snapshot, failure, refusal)
+            })
+            .map_err(|error| config_delivery::gate_hold_error(spec, error, Some(delivery)))?;
+        if let Some(result) = parked {
+            result?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    })();
+    if result.is_err() {
+        // A failed park still belongs to the attempt that tried to park. Mark it
+        // Failed here, before the monitor can use a daemon/operator origin saved
+        // for a different attempt to decide whether to schedule a slow retry.
+        fail_snapshot(snapshot, Some(&spec.module_id), None, failure);
     }
-    #[cfg(test)]
-    if let Some(delivery) = &runtime.config_delivery {
-        delivery.0.pause_before_config_park_for_test();
-    }
-    let Some(delivery) = &runtime.config_delivery else {
-        return Ok(false);
-    };
-    let parked = delivery
-        .0
-        .with_recorded_admission_hold(&spec.module_id, program_base, |refusal| {
-            park_config_spawn(spec, runtime, snapshot, failure, refusal)
-        })
-        .map_err(|error| config_delivery::gate_hold_error(spec, error, Some(delivery)))?;
-    if let Some(result) = parked {
-        result?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    result
 }
 
 fn hold_config_spawn(
@@ -10368,10 +10377,6 @@ async fn set_child_enabled_with_budget_policy(
             }
             Err(error @ SuperviseError::ConfigHeld { .. }) => {
                 if let Err(parking_error) = hold_config_spawn(spec, runtime, snapshot, failure) {
-                    // Finalize with this operation's initiator. The monitor's
-                    // later fallback for a childless Starting actor only knows
-                    // the attribution retained from earlier recovery work.
-                    fail_snapshot(snapshot, Some(&spec.module_id), None, failure);
                     process_liveness.untrack_if_current(&spec.module_id, snapshot);
                     return Err(parking_error);
                 }

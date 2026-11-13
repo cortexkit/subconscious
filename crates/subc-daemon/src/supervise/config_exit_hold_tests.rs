@@ -812,6 +812,91 @@ async fn operator_enable_park_error_does_not_inherit_daemon_retry_attribution() 
 }
 
 #[tokio::test]
+async fn staged_unstamp_park_error_uses_the_operator_attempts_attribution() {
+    let (_scratch, owner, supervisor, _, spec) =
+        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+    let RegisteredConfiguredModule {
+        spec,
+        mut runtime,
+        module,
+        commands,
+    } = supervisor
+        .register_configured_with_health(
+            spec,
+            false,
+            Default::default(),
+            None,
+            Default::default(),
+            DEFAULT_REGISTER_TIMEOUT,
+        )
+        .unwrap();
+    runtime.recovery_is_daemon = true;
+    std::fs::write(
+        spec.program
+            .parent()
+            .unwrap()
+            .join("store")
+            .join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(owner.check_recovery().unwrap());
+    let plan = owner
+        .finish_plan(
+            owner
+                .prepare(crate::config_gate::PlanKind::Unstamp)
+                .unwrap(),
+            crate::config_gate::runtime::daemon_review,
+        )
+        .unwrap();
+    let facts = crate::config_gate::ApprovalFacts {
+        connection: 7,
+        owner_uid: true,
+        desktop_app: true,
+        attested_operator_app: true,
+        os_prompt_available: true,
+        phone: None,
+        caller: Default::default(),
+    };
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let approval = owner.begin_approval(&plan.digest, &facts).unwrap();
+    owner
+        .finish_approval(
+            approval.attempt(),
+            &facts,
+            crate::config_gate::ApprovalReply::Presence(
+                crate::config_gate::PresenceDecision::InteractiveApproval,
+            ),
+            2,
+        )
+        .unwrap();
+    assert!(owner.can_stage_unstamp_enable());
+    assert!(owner.has_recorded_admission_hold("a"));
+    owner.poison_config_owner_at_park_for_test();
+    supervisor.start_monitor(spec, runtime, &module, None, commands);
+    let error = module.set_enabled(true).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("configuration owner is poisoned"),
+        "{error}"
+    );
+    module.config_exit_hold().await.unwrap();
+    let status = module.status().unwrap();
+    let deadline = module.retry_deadline_for_test();
+    module.stop().await.unwrap();
+    assert!(status.enabled);
+    assert_eq!(status.state, ModuleState::Failed);
+    assert!(!status.process_alive);
+    assert_eq!(
+        deadline, None,
+        "a staged operator enable is not daemon work"
+    );
+}
+
+#[tokio::test]
 async fn disabled_config_spawn_hold_leaves_snapshot_and_pending_work_unchanged() {
     let (_scratch, _, supervisor, _, spec) =
         crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();

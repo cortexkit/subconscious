@@ -563,9 +563,9 @@ pub(crate) struct ApprovedDaemonConfiguration {
 pub(crate) struct ApprovalIdentity {
     generation: u64,
     approval_digest: Digest,
-    // An unchanged recovery stamp can repeat both the generation and plan digest.
-    // Keep an owner-local authority token alive in every witness and failure latch
-    // so rebuilding authority cannot alias the previous store's numbering.
+    // Rebuilding rejected store authority from unchanged files can repeat both
+    // generation and digest. Retain this token in ApprovedDaemonConfiguration and
+    // each actor's approved_start_failure so old failures cannot alias new authority.
     authority_incarnation: std::sync::Arc<()>,
 }
 

@@ -614,8 +614,8 @@ impl RuntimeOwner {
             .map(|error| error.code);
         // Pin the current recorded hold through the park. A child's content
         // refusal is eligible only while that same program remains approved.
-        // A pending delivery exit blocks new starts until its failure is recorded;
-        // completing that record queues release for actors parked under its fence.
+        // A child's exit blocks replacement starts until the worker records which
+        // configuration generation failed; completing that record queues release.
         Ok(Some(park(refusal)))
     }
 

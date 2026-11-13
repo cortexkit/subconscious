@@ -4,8 +4,11 @@
 //! means the bytes committed but their sealed anchor has not caught up yet.
 //! While unstamped, retained bytes are history, not authority. In digest-only
 //! mode the committed in-memory stamp rules during the run: editing the file's
-//! stamped bit cannot re-enable the gate. A restart reads the file as found;
-//! stopped-daemon edits and replay are the documented digest-only limitation.
+//! stamped bit cannot re-enable the gate. A restart reads the file as found: a
+//! present file that does not parse as a store opens in recovery on every
+//! platform, never as "never stamped". Deleting the file, or rewriting it into
+//! another well-formed store, while the daemon is stopped, and replaying an
+//! older store file, remain the documented digest-only limitation.
 
 mod disk;
 mod writer_lock;
@@ -324,6 +327,8 @@ pub struct ConfigStore {
     // but that ACK is not activation authority until the keychain anchor commits.
     // Readers and a competing NACK use the previous pending/active vector.
     unanchored_ack: Option<UnanchoredAck>,
+    /// The generation this daemon booted its approved configuration from.
+    booted_generation: Option<u64>,
     #[cfg(test)]
     byte_limit: usize,
     #[cfg(test)]
@@ -412,6 +417,7 @@ impl ConfigStore {
             activities: Vec::new(),
             deferred_failure: None,
             unanchored_ack: None,
+            booted_generation: None,
             #[cfg(test)]
             byte_limit: STORE_BYTE_LIMIT,
             #[cfg(test)]
@@ -486,20 +492,15 @@ impl ConfigStore {
                 "unsupported store format",
             ));
         }
+        // Every writer publishes revision 1 or later. A present file that is
+        // not a well-formed store is corruption, never evidence of an install
+        // that was never stamped, with or without a sealed anchor.
         let envelope = match serde_json::from_slice::<Envelope>(&bytes) {
             Ok(envelope) if envelope.revision > 0 => envelope,
-            _ if key.as_ref().is_none_or(|k| k.anchor.current.is_none()) => {
-                self.tamper_activity("Store unparseable; gate is off");
-                self.warnings.push(
-                    "Store unparseable; gate is off; generation-id continuity is not guaranteed"
-                        .into(),
-                );
-                return Ok(());
-            }
             _ => {
                 return Err(StoreError::new(
                     StoreErrorCode::StoreUnverified,
-                    "anchored store is unparseable",
+                    "approved store is present but unparseable",
                 ))
             }
         };
@@ -654,7 +655,7 @@ impl ConfigStore {
             warnings: {
                 let mut warnings = self.warnings.clone();
                 if self.envelope.integrity == IntegrityMode::DigestOnly {
-                    warnings.push("Digest-only: stopped-daemon edits, replay, corruption, deletion and data-home relocation are not detected".into());
+                    warnings.push("Digest-only: while the daemon is stopped, rewriting the store into another well-formed store, replay, deletion and data-home relocation are not detected".into());
                 }
                 warnings.push("Deleting the sealed key and rewriting the store as digest-only bypasses sealing; pre-gate binaries ignore the store".into());
                 warnings
@@ -986,6 +987,19 @@ impl ConfigStore {
             kind == CommitKind::Stamp,
         )?;
         body.stamped = kind != CommitKind::Unstamp;
+        // A stamp is the first approved generation, so it is also the daemon's
+        // activation point. An unstamp makes files authoritative again.
+        if matches!(kind, CommitKind::Stamp | CommitKind::Unstamp) {
+            body.daemon = DaemonPointers {
+                active: id,
+                awaiting_restart: None,
+                restart: None,
+            };
+        } else if matches!(kind, CommitKind::Approved | CommitKind::Rollback)
+            && body.awaits_restart(&entry)
+        {
+            body.daemon.awaiting_restart = Some(id);
+        }
         // Development generations describe program placement, not a new active
         // configuration vector. Their tuple pointers remain untouched.
         if kind != CommitKind::Development {
@@ -1071,6 +1085,11 @@ impl ConfigStore {
             base_revision: revision,
             last_generation: 1,
             approved: snapshot,
+            daemon: DaemonPointers {
+                active: 1,
+                awaiting_restart: None,
+                restart: None,
+            },
             ..StoreBody::default()
         };
         for tuple in &entry.tuples {
@@ -1236,5 +1255,133 @@ impl ConfigStore {
         entry.outcome = "resumed".into();
         self.publish(body, false, wall_time_ms())?;
         Ok(true)
+    }
+}
+
+fn mark_daemon_failed(entry: &mut HistoryEntry) {
+    entry
+        .generation
+        .module_states
+        .insert(DAEMON_MODULE.into(), subc_config::GenerationState::Failed);
+    if !entry
+        .generation
+        .never_redeliver
+        .iter()
+        .any(|module| module == DAEMON_MODULE)
+    {
+        entry.generation.never_redeliver.push(DAEMON_MODULE.into());
+    }
+    entry.outcome = "failed".into();
+}
+
+/// Daemon generation selection: an ordinary start boots the last active daemon
+/// generation, and only a durable restart intent may warm up a newer one.
+impl ConfigStore {
+    /// Bootstrap found no usable approved daemon configuration. This run serves
+    /// recovery; the next start verifies the store again from the start.
+    pub(crate) fn enter_recovery(&mut self, detail: &str) {
+        self.state = StoreState::StoreUnverified;
+        self.warnings
+            .push(format!("Recovery required at daemon start: {detail}"));
+    }
+
+    /// The generation this daemon booted from, once bootstrap selected one.
+    pub(crate) fn booted_generation(&self) -> Option<u64> {
+        self.booted_generation
+    }
+
+    /// Choose the generation a stamped daemon boots. A restart intent is marked
+    /// attempted durably before its generation boots, so a start that finds an
+    /// attempted intent knows the warm-up never became ready: that generation
+    /// is marked failed and the last active one boots instead.
+    pub(crate) fn select_boot_generation(&mut self) -> Result<u64, StoreError> {
+        self.delivery_ready()?;
+        let mut body = self.envelope.body.clone();
+        let mut warm_up = None;
+        let changed = match body.daemon.restart {
+            None => false,
+            Some(intent) if intent.attempted => {
+                if let Some(entry) = body.generations.get_mut(&intent.generation) {
+                    mark_daemon_failed(entry);
+                }
+                self.warnings.push(format!(
+                    "Daemon restart into generation {} never became ready; it is marked failed",
+                    intent.generation
+                ));
+                body.daemon.restart = None;
+                true
+            }
+            Some(intent) => {
+                if body.bootable_generation(intent.generation)
+                    && Some(intent.generation) > body.active_daemon_generation()
+                {
+                    warm_up = Some(intent.generation);
+                    body.daemon.restart = Some(RestartIntent {
+                        attempted: true,
+                        ..intent
+                    });
+                } else {
+                    body.daemon.restart = None;
+                }
+                true
+            }
+        };
+        let selected = warm_up.or_else(|| body.active_daemon_generation());
+        if changed {
+            self.publish(body, false, wall_time_ms())?;
+        }
+        let selected = selected.ok_or_else(|| {
+            StoreError::new(
+                StoreErrorCode::GenerationMissing,
+                "no bootable approved daemon generation",
+            )
+        })?;
+        self.booted_generation = Some(selected);
+        Ok(selected)
+    }
+
+    /// The daemon booted from a restart intent is serving: its generation
+    /// becomes the daemon's active generation and the intent is spent.
+    pub(crate) fn record_daemon_ready(&mut self) -> Result<(), StoreError> {
+        let Some(booted) = self.booted_generation else {
+            return Ok(());
+        };
+        let attempted = RestartIntent {
+            generation: booted,
+            attempted: true,
+        };
+        if self.state != StoreState::Stamped || self.envelope.body.daemon.restart != Some(attempted)
+        {
+            return Ok(());
+        }
+        let mut body = self.envelope.body.clone();
+        body.daemon = DaemonPointers {
+            active: booted,
+            awaiting_restart: body.first_awaiting_restart_after(booted),
+            restart: None,
+        };
+        self.publish(body, false, wall_time_ms())
+    }
+
+    /// The operator is restarting the daemon. Name the newest approved
+    /// generation still waiting for that restart, durably, before it exits.
+    pub(crate) fn assign_daemon_restart(&mut self) -> Result<Option<u64>, StoreError> {
+        self.delivery_ready()?;
+        if self.state != StoreState::Stamped {
+            return Ok(None);
+        }
+        let Some(generation) = self.envelope.body.restart_candidate() else {
+            return Ok(None);
+        };
+        let intent = RestartIntent {
+            generation,
+            attempted: false,
+        };
+        if self.envelope.body.daemon.restart != Some(intent) {
+            let mut body = self.envelope.body.clone();
+            body.daemon.restart = Some(intent);
+            self.publish(body, false, wall_time_ms())?;
+        }
+        Ok(Some(generation))
     }
 }

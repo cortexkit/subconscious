@@ -698,7 +698,11 @@ impl RuntimeOwner {
         Ok(())
     }
     pub fn new(incarnation: String, mut store: ConfigStore, capturer: ConfigCapturer) -> Self {
-        let initial_generation = store.body().map(|body| body.last_generation).unwrap_or(0);
+        // Daemon-restart generations newer than the booted one stay deferred.
+        let initial_generation = match store.booted_generation() {
+            Some(booted) => booted,
+            None => store.body().map(|body| body.last_generation).unwrap_or(0),
+        };
         let admission = admission::AdmissionCache::from_store(&store);
         let approved_daemon =
             ApprovedDaemonView::from_store(&store, false, &ApprovedDaemonView::Unavailable);

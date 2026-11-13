@@ -556,7 +556,7 @@ fn config_store_start_format_corruption_missing_key_denial_and_modes() {
     assert_eq!(rig.open(false).status().state, StoreState::StoreUnverified);
     rig.replace(b"truncated");
     let mut corrupted = rig.open(false);
-    assert_eq!(corrupted.status().state, StoreState::Unstamped);
+    assert_eq!(corrupted.status().state, StoreState::StoreUnverified);
     assert_eq!(corrupted.take_activities()[0].event, "config.tamper");
     fs::remove_file(rig.path.join(STORE_FILE)).unwrap();
     assert_eq!(rig.open(false).status().state, StoreState::Unstamped);
@@ -1240,3 +1240,6 @@ fn registration_declaration_loaded_status_matches_checked_status_without_io() {
         .iter()
         .any(|(operation, _)| *operation == "store_hash"));
 }
+
+#[path = "boot_tests.rs"]
+mod boot;

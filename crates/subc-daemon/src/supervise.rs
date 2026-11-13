@@ -5702,7 +5702,7 @@ impl SwapFailureArm {
 impl SuperviseError {
     pub(crate) fn is_config_gate_error(&self) -> bool {
         match self {
-            Self::ConfigHeld { .. } | Self::ConfigDeliveryDeferred { .. } => true,
+            Self::ConfigHeld { .. } => true,
             Self::Spawn { source, .. } => source
                 .get_ref()
                 .is_some_and(|cause| cause.is::<crate::config_gate::GateError>()),

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.24.5
+
+- When a request's deadline passes while the computer is asleep, wait up to
+  15 more seconds for its reply after waking instead of immediately reporting a
+  timeout. The original call can still finish normally, without sending the
+  command again. This grace is granted at most once per request when the wall
+  clock advances more than the awake clock; on platforms where both clocks count
+  sleep, deadlines are unchanged. Set `sleepGraceMs` on the client or an individual
+  request to change the window, or to `0` to disable it. Subscriptions are unchanged.
+
 ## 0.24.4
 
 - Expose optional CatalogEntry.operation_deferral metadata mirrored from provider manifests.

@@ -285,6 +285,11 @@ impl ControlHandler {
                             | crate::supervise::ModuleState::Disabled
                     );
                 if !(parked || (status.process_alive && !status.legacy_registration_spawn)) {
+                    // Cutover may finish asynchronously, but a known launch
+                    // failure must still reach the approval caller now.
+                    if !failed_modules.is_empty() {
+                        return Err(GateError::new("rescan_failed", failed_modules.join("; ")));
+                    }
                     return Ok(());
                 }
             }

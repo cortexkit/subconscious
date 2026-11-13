@@ -256,3 +256,47 @@ async fn approval_reconcile_latched_module_does_not_withhold_generation_completi
     a.stop().await.unwrap();
     b.stop().await.unwrap();
 }
+
+#[tokio::test]
+async fn approval_latched_failure_is_reported_while_another_cutover_is_pending() {
+    let fixture = legacy().await;
+    let path = fixture.rig.path.join("subc.jsonc");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["modules"]["b"] =
+        json!({"program":"/bin/sleep", "args":["600"], "protocol":"none", "enabled":true});
+    std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let generation = fixture.rig.stamp(&fixture.owner);
+    let identity = fixture
+        .owner
+        .authority_exit_configuration(generation)
+        .unwrap()
+        .unwrap()
+        .3
+        .identity();
+    fixture.owner.fail_delivery_spawns_for_module_for_test("b");
+    let gate = fixture.owner.module_gate("a").unwrap();
+    let held = gate.lock_owned().await;
+    let result = fixture
+        .handler
+        .reconcile_exit_for_test(fixture.owner.clone(), generation)
+        .await;
+    let b = fixture.handle.get("b").unwrap();
+    let b_state = b.state().unwrap();
+    let latched = b.has_approved_start_failure(&identity);
+    let a_state = fixture.module.state().unwrap();
+    let cutover_pending = fixture.owner.stamp_channel_cutover_pending();
+    let exit = fixture.owner.pending_authority_exit().unwrap();
+    drop(held);
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+    b.stop().await.unwrap();
+    assert_eq!(a_state, ModuleState::Restarting);
+    assert!(cutover_pending);
+    assert_eq!(exit, Some(generation));
+    assert_eq!(b_state, ModuleState::Failed);
+    assert!(latched);
+    let error = result.expect_err("a pending cutover cannot hide b's known launch failure");
+    assert_eq!(error.code, "rescan_failed");
+    assert!(error.detail.starts_with("b: "), "{error}");
+}

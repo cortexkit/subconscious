@@ -313,6 +313,27 @@
 
 - Explicitly accept subc-presence's non-interactive policy authorization for legacy privileged-operation prompts and module `operator.confirm` requests, preserving their existing behavior.
 
+## 0.44.15
+
+- Agent-command declarations and the resource sampler walk only the processes
+  accounting can ask about: supervised module processes and container members,
+  declared roots, and every pid held in module state (command roots, members,
+  pending, omitted and lost roots, CPU-ledger and credit identities). A table
+  that turns out not to cover state committed during the walk is not used:
+  validation retries with a fresh walk, and the sampler pass stays incomplete.
+  On macOS a declaration's walk drops from hundreds of milliseconds to about
+  10 ms.
+- Declarations arriving while a validation walk runs share the next walk
+  instead of each starting one. A declaration still uses only a walk that
+  began after it arrived.
+- A declaration retry after busy accounting state reuses the walk it already
+  took. After a commit conflict it walks again.
+- Stop retrying a declaration once its validation has timed out or been
+  cancelled, so abandoned validations no longer hold the reader slots with
+  further walks.
+- Log each validated declaration's arrival-to-validation latency at debug
+  level.
+
 ## 0.44.14
 
 - Satisfy Rust 1.100 clippy (`needless_bool` in the running-image match,

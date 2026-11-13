@@ -39,6 +39,11 @@ impl Losses {
             ..Self::default()
         }
     }
+    /// Pids of lost roots whose exit a walk may still confirm.
+    pub(super) fn root_pids(&self, pids: &mut BTreeSet<u32>) {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        pids.extend(state.roots.keys().map(|root| root.pid));
+    }
     pub(crate) fn mark(&self, roots: &[AgentCommandRoot]) {
         if roots.is_empty() {
             return;

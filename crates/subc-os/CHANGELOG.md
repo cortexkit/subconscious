@@ -41,6 +41,24 @@
   disconnects, including before acceptance begins. Foreign disconnect errors
   cannot cancel the child's registration opportunity before its deadline.
 
+## 0.1.34
+
+- Add `ProcessTable::read_for`, a walk narrowed to an interest set of pids, and
+  `ProcessTable::covers`. One listing supplies every process's parent and start
+  (on macOS a single `sysctl(KERN_PROC_ALL)` instead of a pid list plus a
+  parent query per process). The per-process identity, session, name, resource
+  and final identity re-check reads (which drop processes that exited during
+  the walk) then run only for the interest pids, every process in a
+  session one of them leads, every process with an unknown session or parent,
+  all their descendants, and every ancestor of those. For every covered pid
+  the answers, including trees rooted at interest pids and their reported
+  uncertainty, equal a full walk's. Windows still reads the full table.
+- macOS walks compare each process's identity with the listing's start time,
+  so a pid reused between the listing and its identity read is uncertainty
+  rather than a new process paired with the old one's parent.
+- `ProcessTable::read` keeps reading every process, now from the same single
+  listing on macOS.
+
 ## 0.1.33
 
 - Tests find the admission fixture with `cortexkit_test_support::cargo_profile_bin`,

@@ -232,6 +232,11 @@ impl ControlHandler {
         };
         let mut receipt = crate::resource_totals::Receipt::default();
         for attempt in 0..4 {
+            // Once the caller has timed out, no attempt can commit. Stop
+            // instead of walking the process table for a reply nobody reads.
+            if validation.fence.cancelled() {
+                break;
+            }
             let prepared = self.resource_tracker.prepare(
                 &id,
                 launch.generation(),
@@ -280,6 +285,12 @@ impl ControlHandler {
                 break;
             };
             let roots_full = rejected.roots_full;
+            tracing::debug!(
+                module_id = id,
+                attempts = attempt + 1,
+                latency_ms = validation.arrival.elapsed().as_millis() as u64,
+                "agent command declaration validated"
+            );
             for root in rejected.rejected {
                 tracing::warn!(
                     module_id = id,

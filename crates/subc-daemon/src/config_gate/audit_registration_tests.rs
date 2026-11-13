@@ -306,6 +306,17 @@ async fn audit_registration_recovery_restamp_reports_commit_while_actor_reconcil
 #[cfg(all(feature = "test-support", feature = "dev-desktop-approval"))]
 #[tokio::test]
 async fn audit_registration_committed_stamp_enable_program_refusal_still_replies_success() {
+    committed_enable_reply(false).await;
+}
+
+#[cfg(all(feature = "test-support", feature = "dev-desktop-approval"))]
+#[tokio::test]
+async fn audit_registration_non_hold_enable_error_returns_rescan_failed_from_apply() {
+    committed_enable_reply(true).await;
+}
+
+#[cfg(all(feature = "test-support", feature = "dev-desktop-approval"))]
+async fn committed_enable_reply(non_hold_error: bool) {
     struct Presence;
     impl crate::operator_confirm::OperatorProvider for Presence {
         fn config_gate_ready(&self) -> bool {
@@ -355,12 +366,16 @@ async fn audit_registration_committed_stamp_enable_program_refusal_still_replies
         .owner
         .desktop_view_delivered(ConnectionId::new(50), &plan)
         .unwrap();
-    let program = fixture.rig.path.join("program");
-    fixture.owner.lock().unwrap().publication_hook = Some(Box::new(move || {
-        let mut bytes = std::fs::read(&program).unwrap();
-        bytes.extend_from_slice(b"post-approval change");
-        std::fs::write(program, bytes).unwrap();
-    }));
+    if non_hold_error {
+        fixture.owner.exhaust_delivery_spawns_for_test();
+    } else {
+        let program = fixture.rig.path.join("program");
+        fixture.owner.lock().unwrap().publication_hook = Some(Box::new(move || {
+            let mut bytes = std::fs::read(&program).unwrap();
+            bytes.extend_from_slice(b"post-approval change");
+            std::fs::write(program, bytes).unwrap();
+        }));
+    }
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     let ctx = crate::RouteCtx {
         connection_id: ConnectionId::new(50),
@@ -384,13 +399,32 @@ async fn audit_registration_committed_stamp_enable_program_refusal_still_replies
     let parked = fixture.module.status().unwrap();
     drop(fixture.primary);
     fixture.module.stop().await.unwrap();
-    assert_eq!(reply["op"], "config.apply", "{reply}");
-    assert_eq!(reply["generation"], 1, "{reply}");
     assert!(parked.enabled);
     assert!(!parked.process_alive);
-    assert_eq!(parked.state, ModuleState::Stopped);
     assert_eq!(parked.restart_count, 0);
-    assert!(fixture.owner.check_module_hold("a").is_err());
+    if non_hold_error {
+        assert_eq!(reply["code"], "rescan_failed", "{reply}");
+        assert!(
+            reply["message"]
+                .as_str()
+                .unwrap()
+                .contains("delivery_spawn_exhausted"),
+            "{reply}"
+        );
+        assert_eq!(parked.state, ModuleState::Failed);
+        assert!(fixture.owner.check_module_hold("a").is_ok());
+        assert!(fixture
+            .owner
+            .polled_status()
+            .unwrap()
+            .gated_modules
+            .is_empty());
+    } else {
+        assert_eq!(reply["op"], "config.apply", "{reply}");
+        assert_eq!(reply["generation"], 1, "{reply}");
+        assert_eq!(parked.state, ModuleState::Stopped);
+        assert!(fixture.owner.check_module_hold("a").is_err());
+    }
 }
 
 #[tokio::test]

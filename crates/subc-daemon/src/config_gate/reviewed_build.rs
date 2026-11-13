@@ -33,29 +33,19 @@ pub(super) fn identity(snapshot: &GateSnapshot, module: &str) -> String {
 }
 
 /// Program identities recorded by the newest approved generation. A generation
-/// planned before this record existed counts each of its modules as reviewed
-/// by the programs that generation approved.
+/// without the record vouches for no review: every module it approved counts
+/// as needing re-review rather than as reviewed by the programs it approved.
 pub(super) fn recorded(body: &StoreBody) -> Result<BTreeMap<String, String>> {
-    let Some(entry) = body
+    let Some(record) = body
         .generations
         .values()
         .rev()
         .find(|entry| entry.kind != CommitKind::Development)
+        .and_then(|entry| entry.generation.changeset.apply_plan.get(REVIEWED_PROGRAMS))
     else {
         return Ok(BTreeMap::new());
     };
-    if let Some(record) = entry.generation.changeset.apply_plan.get(REVIEWED_PROGRAMS) {
-        return serde_json::from_value(record.clone()).map_err(GateError::invalid);
-    }
-    let snapshot = GateSnapshot::from_store(&entry.configuration)?;
-    Ok(snapshot
-        .modules()
-        .into_iter()
-        .map(|module| {
-            let program = identity(&snapshot, &module);
-            (module, program)
-        })
-        .collect())
+    serde_json::from_value(record.clone()).map_err(GateError::invalid)
 }
 
 /// Program identity of the module's active generation. Program changes become

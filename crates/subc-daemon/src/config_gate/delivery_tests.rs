@@ -1035,6 +1035,40 @@ async fn config_delivery_mixed_module_restart_and_next_supervision_wait_for_spaw
     .await;
 }
 
+/// A generation without a reviewed-program record vouches for no review: each
+/// module it approved needs re-review, never counts as reviewed by the program
+/// that generation approved.
+#[test]
+fn config_delivery_generation_without_a_reviewed_program_record_needs_rereview() {
+    let (_rig, owner) = rig();
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    let mut body = owner.lock().unwrap().store.body().unwrap().clone();
+    let modules = vec!["a".to_owned()];
+    assert!(
+        super::super::super::reviewed_build::pending(&body, &modules)
+            .unwrap()
+            .is_empty(),
+        "the stamp recorded the program that reviewed it"
+    );
+    body.generations
+        .get_mut(&1)
+        .unwrap()
+        .generation
+        .changeset
+        .apply_plan
+        .as_object_mut()
+        .unwrap()
+        .remove(super::super::super::reviewed_build::REVIEWED_PROGRAMS)
+        .unwrap();
+    assert_eq!(
+        super::super::super::reviewed_build::pending(&body, &modules).unwrap(),
+        std::collections::BTreeMap::from([(
+            "a".to_owned(),
+            super::super::super::reviewed_build::Rereview::Ready
+        )])
+    );
+}
+
 /// Replacing a module's program under the same path, with its layers and
 /// declaration unchanged, yields a plan whose changeset has no field changes
 /// from module review, so field apply kinds alone would call it live. The process

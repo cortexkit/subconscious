@@ -3482,6 +3482,23 @@ impl ControlHandler {
                 ),
             )?]);
         }
+        if swap_admission == SwapHelloAdmission::ChannelRequired {
+            warn!(
+                module_id = %hello.manifest.module_id,
+                connection_id = connection_id.get(),
+                "HELLO refused: the module_id is gated and the HELLO did not arrive over its registration channel"
+            );
+            // The code stays `swap_token_invalid` for existing callers; only the
+            // explanation names the actual reason.
+            return Ok(vec![control_error_frame(
+                &frame,
+                "swap_token_invalid",
+                format!(
+                    "module_id '{}' is gated; it must register over its supervised registration channel",
+                    hello.manifest.module_id
+                ),
+            )?]);
+        }
         if swap_admission == SwapHelloAdmission::Refused {
             warn!(
                 module_id = %hello.manifest.module_id,

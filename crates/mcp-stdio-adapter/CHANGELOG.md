@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1
+
+- Use SDK self-attestation for vault credential reads instead of an explicit
+  legacy identity that conflicts with registration-channel claims. Keep the
+  credential-resolver constructor's identity argument for source compatibility.
+- Require client 0.39.1 and test channel-bound credential resolution with the
+  current daemon's test-support feature.
+
 ## 0.7.0
 
 - Adopt client 0.39 and protocol 0.37. This is a breaking Rust dependency

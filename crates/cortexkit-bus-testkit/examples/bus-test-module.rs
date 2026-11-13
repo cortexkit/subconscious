@@ -8,8 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 use subc_client_rs::{
-    CallOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandler, RequestCtx,
-    SubcConsumer,
+    CallOptions, ConsumerOptions, HandlerOutcome, ModuleHandler, RequestCtx, SubcConsumer,
 };
 use subc_protocol::{manifest::ModuleManifest, BindIdentity, RouteTarget};
 
@@ -41,13 +40,7 @@ impl ModuleHandler for Idle {
     }
 }
 
-async fn ckbus_call(
-    consumer: &SubcConsumer,
-    identity: &ConsumerIdentity,
-    _connection: &Path,
-    method: &str,
-    params: Value,
-) -> Result<Value, String> {
+async fn ckbus_call(consumer: &SubcConsumer, method: &str, params: Value) -> Result<Value, String> {
     let body = consumer
         .call(
             RouteTarget::ManagementSurface {
@@ -57,7 +50,6 @@ async fn ckbus_call(
             serde_json::to_vec(&json!({"method": method, "params": params})).unwrap(),
             CallOptions {
                 timeout: Duration::from_secs(5),
-                consumer_identity: Some(identity.clone()),
                 ..Default::default()
             },
         )
@@ -76,18 +68,11 @@ fn main() {
             None => panic!("the daemon passes --subc to its modules"),
         }
     };
-    let identity = ConsumerIdentity {
-        module_id: std::env::var("SUBC_MODULE_ID").unwrap(),
-        launch_nonce: subc_client_rs::launch_nonce()
-            .unwrap()
-            .unwrap()
-            .value()
-            .to_string(),
-    };
+    let module_id = std::env::var("SUBC_MODULE_ID").unwrap();
+    subc_client_rs::launch_nonce().unwrap();
     tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap().block_on(async move {
-        let consumer = Arc::new(SubcConsumer::connect(&connection, ConsumerOptions::default()).await.unwrap());
         let (_handle, serving) = subc_client_rs::serve_with_handle(&connection,
-            ModuleManifest::builder(identity.module_id.clone(), "0.0.0-test")
+            ModuleManifest::builder(module_id, "0.0.0-test")
                     .provides(vec![subc_protocol::manifest::ProviderRole::ManagementSurface {
                         operations: vec![subc_protocol::manifest::ManagementOperation {
                             name: "probe.ping".into(),
@@ -97,6 +82,8 @@ fn main() {
                         config_schema: json!({}), observability: vec![], identity_scope: vec![],
                         concurrency: subc_protocol::manifest::Concurrency::ModuleManaged,
                     }]).build(), Idle).await.unwrap();
+        let serving = tokio::spawn(serving);
+        let consumer = Arc::new(SubcConsumer::connect(&connection, ConsumerOptions::default()).await.unwrap());
         let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
         std::fs::write(runtime.join("module-homes.json"), serde_json::to_vec(&json!({
                 "data": std::env::var("XDG_DATA_HOME").unwrap(),
@@ -106,7 +93,7 @@ fn main() {
         if let Some(result) = std::env::var_os("TESTKIT_RESULT").map(PathBuf::from) {
             let deadline = Instant::now() + LIMIT;
             let credential = loop {
-                if let Ok(answer) = ckbus_call(&consumer, &identity, &connection, "ckbus.credential", json!({})).await {
+                if let Ok(answer) = ckbus_call(&consumer, "ckbus.credential", json!({})).await {
                     if answer["jwt"].is_string() { break answer; }
                 }
                 assert!(Instant::now() < deadline, "ckbus never issued a credential");
@@ -116,9 +103,9 @@ fn main() {
             wait_file(&result.join("publish-now")).await;
             let public = credential["credential_public"].as_str().unwrap().to_string();
             let client = async_nats::ConnectOptions::with_jwt(credential["jwt"].as_str().unwrap().to_string(), move |nonce| {
-                let consumer = consumer.clone(); let identity = identity.clone(); let connection = connection.clone(); let public = public.clone();
+                let consumer = consumer.clone(); let public = public.clone();
                 let task = tokio::spawn(async move {
-                    let answer = ckbus_call(&consumer, &identity, &connection, "ckbus.nonce_sign",
+                    let answer = ckbus_call(&consumer, "ckbus.nonce_sign",
                         json!({"nonce_b64": STANDARD.encode(nonce), "credential_public": public})).await?;
                     STANDARD.decode(answer["signature_b64"].as_str().unwrap()).map_err(|error| error.to_string())
                 });
@@ -128,6 +115,6 @@ fn main() {
             client.publish(format!("ck.{}.event.testkit_probe.smoke.v1", credential["acct"].as_str().unwrap()), "private smoke".into()).await.unwrap();
             client.flush().await.unwrap();
         }
-        serving.await.unwrap();
+        serving.await.unwrap().unwrap();
     });
 }

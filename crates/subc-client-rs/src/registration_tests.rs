@@ -63,9 +63,12 @@ async fn child_case(scenario: &str, test: &str, path: &Path) {
         query(&client).await;
         std::process::exit(0);
     }
-    let manifest = ModuleManifest::builder("channel-worker", "1.0.0")
+    let mut manifest = ModuleManifest::builder("channel-worker", "1.0.0")
         .registration_channel(true)
         .build();
+    if scenario == "provenance" {
+        manifest.provenance = Some(build_provenance(None, None, None).unwrap());
+    }
     if scenario == "lazy" {
         assert!(
             take_stream().unwrap().is_none(),
@@ -85,7 +88,7 @@ async fn child_case(scenario: &str, test: &str, path: &Path) {
         serving.await.unwrap();
         panic!("adopted channel EOF returned instead of ending the process");
     }
-    if scenario == "close" {
+    if scenario == "close" || scenario == "provenance" {
         stop.stop();
         serving.await.unwrap();
         println!("LOCAL_CLOSE_RETURNED");
@@ -352,6 +355,9 @@ async fn run(scenario: &'static str, test: &str) {
     connection_file::write_atomic(&path, &info).unwrap();
     let mut command = command(test, "module", &path);
     command.env(os::DAEMON_PID_ENV, std::process::id().to_string());
+    if scenario == "provenance" {
+        command.env("SUBC_LAUNCH_NONCE", "legacy-diagnostic-nonce");
+    }
     #[cfg(unix)]
     let (mut registration, mut child) = inherited_channel(&mut command);
     #[cfg(windows)]
@@ -362,6 +368,12 @@ async fn run(scenario: &'static str, test: &str) {
     let hello: ModuleHelloBody = serde_json::from_slice(&hello.body).unwrap();
     assert!(hello.launch_nonce.is_none());
     assert_eq!(hello.manifest.registration_channel, Some(true));
+    if scenario == "provenance" {
+        assert_eq!(
+            hello.manifest.provenance.unwrap().launch_nonce_source,
+            Some(LaunchNonceSource::Env)
+        );
+    }
     send(
         &mut registration,
         FrameType::HelloAck,
@@ -386,7 +398,7 @@ async fn run(scenario: &'static str, test: &str) {
 
         return;
     }
-    if scenario == "close" {
+    if scenario == "close" || scenario == "provenance" {
         while read_frame(&mut registration).await.unwrap().is_some() {}
         let output = assert_child(&mut child).await;
         assert!(
@@ -571,3 +583,7 @@ contract_test!(only_explicit_helper_handoff_delegates_claim, "helper");
 contract_test!(registration_is_never_reconnected, "second_take");
 contract_test!(consumer_lookup_does_not_adopt_before_serving, "lazy");
 contract_test!(local_stop_returns_without_exiting, "close");
+contract_test!(
+    channel_hello_reports_legacy_nonce_source_without_sending_nonce,
+    "provenance"
+);

@@ -3707,9 +3707,7 @@ async fn send_hello(
                 .map(|nonce| nonce.value().to_string()),
         }
     };
-    if !registration::supervised() {
-        stamp_launch_nonce_source(&mut manifest, launch_nonce.as_deref());
-    }
+    stamp_launch_nonce_source(&mut manifest, launch_nonce.as_deref());
     let mut control_ops = vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()];
     if config_gate {
         control_ops.push(config::CONFIG_REVIEW_OP.to_owned());
@@ -6455,9 +6453,10 @@ pub fn launch_nonce_source() -> Option<LaunchNonceSource> {
 /// Fill in `launch_nonce_source` on a module's declared provenance, so
 /// `ck provenance` can tell a module reading the pipe from one still reading
 /// the environment variable. Only when the module declared provenance and left the field
-/// unset, and only when the nonce HELLO carries is the one the accessor read:
-/// a nonce retained by the module itself came from somewhere this SDK cannot
-/// vouch for.
+/// unset. A registration channel supplies authority without sending a nonce,
+/// but an unstamped launch may still supply a legacy nonce whose source is
+/// diagnostic. Otherwise the nonce HELLO carries must be the one the accessor
+/// read: a module-retained nonce may have come from somewhere else.
 fn stamp_launch_nonce_source(manifest: &mut ModuleManifest, sent: Option<&str>) {
     let Some(provenance) = manifest.provenance.as_mut() else {
         return;
@@ -6466,7 +6465,7 @@ fn stamp_launch_nonce_source(manifest: &mut ModuleManifest, sent: Option<&str>) 
         return;
     }
     if let Ok(Some(nonce)) = launch_nonce() {
-        if sent == Some(nonce.value()) {
+        if registration::supervised() || sent == Some(nonce.value()) {
             provenance.launch_nonce_source =
                 Some(LaunchNonceSource::from_wire_name(nonce.source().as_str()));
         }

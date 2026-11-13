@@ -346,6 +346,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -363,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "subc-client-rs"
-version = "0.34.3"
+version = "0.39.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -392,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.35.1"
+version = "0.39.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -402,17 +412,18 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.33"
+version = "0.1.35"
 dependencies = [
  "libc",
  "rustix",
+ "tokio",
  "windows-sys",
  "zeroize",
 ]
 
 [[package]]
 name = "subc-protocol"
-version = "0.34.5"
+version = "0.37.0"
 dependencies = [
  "base64",
  "serde",
@@ -422,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "subc-transport"
-version = "0.15.0"
+version = "0.18.0"
 dependencies = [
  "getrandom",
  "hmac",
@@ -474,6 +485,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys",

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.45.1
+
+- Declare registration-channel support in Windows configuration-admission test
+  fixtures so they exercise file-handle retention and nonce withholding after
+  stamping the configuration gate. Production admission rules are unchanged.
+
 ## 0.45.0
 
 - Add an opt-in configuration gate backed by a separately approved store. The

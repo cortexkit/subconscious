@@ -125,15 +125,13 @@ impl CredentialResolver for RejectingCredentialResolver {
 /// value to be reused by its replacement.
 pub struct ClaustrumCredentialResolver {
     connection_file: PathBuf,
-    consumer_identity: ConsumerIdentity,
 }
 
 impl ClaustrumCredentialResolver {
-    pub fn new(connection_file: PathBuf, consumer_identity: ConsumerIdentity) -> Self {
-        Self {
-            connection_file,
-            consumer_identity,
-        }
+    /// The legacy identity argument is retained for source compatibility. The
+    /// SDK attests the current process using its connection claim or launch nonce.
+    pub fn new(connection_file: PathBuf, _consumer_identity: ConsumerIdentity) -> Self {
+        Self { connection_file }
     }
 }
 
@@ -159,10 +157,7 @@ impl CredentialResolver for ClaustrumCredentialResolver {
                 },
                 identity,
                 body,
-                CallOptions {
-                    consumer_identity: Some(self.consumer_identity.clone()),
-                    ..CallOptions::default()
-                },
+                CallOptions::default(),
             )
             .await
             .map_err(|_| CredentialResolutionError)?;

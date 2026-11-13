@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.39.1
+
+- Preserve legacy launch-nonce source diagnostics in HELLO provenance when an
+  supervised module registers over its private channel with the configuration
+  gate unstamped. The nonce
+  itself remains absent from channel HELLOs; channel authority is unchanged.
+
 ## 0.39.0
 
 - **Rust migration:** `RouteCloseReason` adds `AuthorityChanged` and is now

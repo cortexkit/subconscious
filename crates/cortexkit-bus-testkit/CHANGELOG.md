@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.1
+
+- Use implicit SDK identity in the supervised publisher example and connect its
+  consumer after serving starts, so credential delivery and nonce signing also
+  exercise registration-channel claims. Require client 0.39.1.
+
 ## 0.8.0
 
 - Adopt client/control 0.39, protocol 0.37 and transport 0.18 types exposed

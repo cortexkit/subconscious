@@ -95,8 +95,9 @@ pub trait VaultSigning: Send + Sync {
 
 /// `credential.sign` and `credential.public_key` over a subc route to `claustrum`.
 ///
-/// Every route carries `ConsumerIdentity { module_id, launch_nonce }` when both are
-/// known, which is what makes the daemon stamp `Principal::Reserved`. The consumer
+/// Supervised routes use the SDK's implicit identity: a connection claim when
+/// registration is channel-bound, or a launch nonce on a legacy connection.
+/// An explicit identity can be supplied for standalone callers. The consumer
 /// connects on first use, so constructing this does no I/O.
 pub struct ClaustrumRoute {
     connection_file: PathBuf,
@@ -116,18 +117,16 @@ impl ClaustrumRoute {
         }
     }
 
-    /// The route a supervised ck-bus uses: the daemon's connection file from `--subc`,
-    /// and the identity from `SUBC_MODULE_ID` and the launch nonce the daemon handed
-    /// over, read through the process's one launch-nonce accessor. A missing nonce is
-    /// not synthesised; the route then carries no identity and the vault's `not_found`
-    /// names that cause. A nonce descriptor that is named but unreadable is an error,
-    /// never a fallback to the environment copy.
+    /// Use the daemon's connection file from `--subc` and let the SDK attest this
+    /// process. An explicit legacy identity would conflict with a claim-bound
+    /// connection, even if it names the same module. Check the legacy nonce here
+    /// to retain the startup error for an unreadable handoff.
     pub fn supervised() -> Result<Self, String> {
         let connection_file = subc_arg(env::args_os()).ok_or_else(|| {
             "ck-bus needs --subc <connection file> to reach the vault".to_string()
         })?;
-        let identity = super::identity::supervised_identity()?;
-        Ok(Self::new(connection_file, identity))
+        let _ = super::identity::supervised_identity()?;
+        Ok(Self::new(connection_file, None))
     }
 
     async fn call(&self, body: Vec<u8>) -> Result<Vec<u8>, VaultError> {

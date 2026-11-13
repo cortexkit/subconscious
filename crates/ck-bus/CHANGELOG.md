@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.6
+
+- Let the SDK attest supervised vault calls implicitly, using a connection
+  claim or the legacy launch nonce instead of a conflicting explicit identity.
+  This restores bootstrap when the configuration gate is not stamped but the
+  module uses the private registration channel.
+- Require client 0.39.1 for launch-nonce provenance diagnostics and daemon
+  0.45.1 for the native Windows admission fixtures.
+
 ## 0.6.5
 
 - Raise SDK and test-helper requirements to client/control 0.39, protocol

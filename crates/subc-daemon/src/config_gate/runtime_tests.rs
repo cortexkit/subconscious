@@ -187,7 +187,7 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     .unwrap();
     let covered = rig.path.join("covered.txt");
     std::fs::write(&covered, b"approved").unwrap();
-    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":program,"args":["-t","127.0.0.1"],"protocol":"subc","overlap":"safe","program_files":[covered]}}})).unwrap()).unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":program,"args":["-t","127.0.0.1"],"protocol":"subc","registration_channel":true,"overlap":"safe","program_files":[covered]}}})).unwrap()).unwrap();
     let owner = Arc::new(rig.owner("windows-handle-lifetime"));
     rig.stamp(&owner);
     let registry = Arc::new(crate::Registry::default());
@@ -1548,7 +1548,7 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
     .unwrap();
     let covered = rig.path.join("covered.txt");
     std::fs::write(&covered, b"approved").unwrap();
-    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":program,"args":["-t","127.0.0.1"],"protocol":"subc","overlap":"safe","program_files":[covered]}}})).unwrap()).unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":program,"args":["-t","127.0.0.1"],"protocol":"subc","registration_channel":true,"overlap":"safe","program_files":[covered]}}})).unwrap()).unwrap();
     let owner = Arc::new(rig.owner("removed-registration"));
     rig.stamp(&owner);
     let registry = Arc::new(crate::Registry::default());

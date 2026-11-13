@@ -276,6 +276,20 @@ async fn superseded_program_exit(release_before_park: bool) {
 #[tokio::test]
 async fn delivery_failure_park_saves_the_daemon_attempt_before_release() {
     let fixture = gated_claim_fixture().await;
+    entry(&fixture.rig, "drain_timeout_ms", json!(0));
+    let configured = approve(&fixture.rig, &fixture.owner, PlanKind::Change);
+    let approved = fixture
+        .owner
+        .authority_exit_configuration(configured)
+        .unwrap()
+        .unwrap()
+        .3;
+    fixture
+        .module
+        .reconcile_approved_configuration(approved)
+        .await
+        .unwrap();
+    fixture.owner.complete_authority_exit(configured).unwrap();
     let connection = fixture.primary.connection_id(&fixture.handler);
     std::fs::write(
         fixture

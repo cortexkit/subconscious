@@ -1628,6 +1628,8 @@ struct SupervisorSnapshot {
     admission_refused: Option<String>,
     /// Distinguishes an admission-parked actor from an unrelated terminal exit.
     config_hold_parked: bool,
+    /// Retain an approved launch failure across competing reconciliation passes.
+    approved_start_failure: Option<(u64, String)>,
     legacy_registration_spawn: bool,
     registration_declaration: Option<String>,
     stop_reason: Option<ModuleStopReason>,
@@ -1789,6 +1791,7 @@ impl SupervisorSnapshot {
         Self {
             admission_refused: None,
             config_hold_parked: false,
+            approved_start_failure: None,
             legacy_registration_spawn: false,
             registration_declaration: None,
             stop_reason: None,
@@ -4340,7 +4343,7 @@ impl Supervisor {
         requester: Option<Principal>,
         daemon_initiated: bool,
     ) -> Result<SupervisedModule, SuperviseError> {
-        self.start_registered_with_failure_policy(registered, requester, daemon_initiated, false)
+        self.start_registered_with_failure_policy(registered, requester, daemon_initiated, None)
             .await
     }
 
@@ -4348,9 +4351,15 @@ impl Supervisor {
         &self,
         registered: RegisteredConfiguredModule,
         requester: Principal,
+        generation: u64,
     ) -> Result<SupervisedModule, SuperviseError> {
-        self.start_registered_with_failure_policy(registered, Some(requester), false, true)
-            .await
+        self.start_registered_with_failure_policy(
+            registered,
+            Some(requester),
+            false,
+            Some(generation),
+        )
+        .await
     }
 
     async fn start_registered_with_failure_policy(
@@ -4358,7 +4367,7 @@ impl Supervisor {
         registered: RegisteredConfiguredModule,
         requester: Option<Principal>,
         daemon_initiated: bool,
-        propagate_spawn_failure: bool,
+        approved_generation: Option<u64>,
     ) -> Result<SupervisedModule, SuperviseError> {
         let RegisteredConfiguredModule {
             spec,
@@ -4425,7 +4434,10 @@ impl Supervisor {
                         None,
                         &runtime.failure_context(daemon_initiated),
                     );
-                    if propagate_spawn_failure {
+                    if let Some(generation) = approved_generation {
+                        let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                            state.approved_start_failure = Some((generation, err.to_string()));
+                        });
                         startup_error = Some(err);
                     }
                     None
@@ -4601,6 +4613,22 @@ impl fmt::Debug for SupervisedModule {
 }
 
 impl SupervisedModule {
+    pub(crate) fn check_approved_start_failure(
+        &self,
+        generation: u64,
+    ) -> Result<(), SuperviseError> {
+        let state = lock_snapshot(&self.inner.snapshot)?;
+        if let Some((failed_generation, detail)) = &state.approved_start_failure {
+            if state.enabled && *failed_generation == generation {
+                return Err(SuperviseError::ReloadFailed {
+                    module_id: self.inner.module_id.clone(),
+                    reason: detail.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn config_policy_probe(
         &self,
         connection: crate::ConnectionId,
@@ -9138,7 +9166,8 @@ async fn handle_supervisor_command(
             | SupervisorCommand::Restart { .. }
     ) {
         let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-            state.failed_retry.cancel()
+            state.failed_retry.cancel();
+            state.approved_start_failure = None;
         });
     }
     match command {
@@ -9147,6 +9176,19 @@ async fn handle_supervisor_command(
                 let next = approved.module_entry(&spec.module_id).map_err(|error| {
                     SuperviseError::InvalidSpec { reason: error.to_string() }
                 })?;
+                {
+                    let mut state = lock_snapshot(snapshot)?;
+                    if let Some((generation, detail)) = &state.approved_start_failure {
+                        if *generation == approved.generation() && next.enabled {
+                            return Err(SuperviseError::Spawn {
+                                program: spec.program.clone(),
+                                source: std::io::Error::other(detail.clone()),
+                                cgroup_path: None,
+                            });
+                        }
+                    }
+                    state.approved_start_failure = None;
+                }
                 stage_supervisor_configuration(
                     spec, runtime, snapshot, next.module_spec(), next.health,
                     next.drain_timeout_ms,
@@ -9217,6 +9259,20 @@ async fn handle_supervisor_command(
                 Ok(())
             }
             .await;
+            if let Err(error) = &result {
+                let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                    if state.enabled
+                        && state.state == ModuleState::Failed
+                        && state
+                            .approved_start_failure
+                            .as_ref()
+                            .is_none_or(|(generation, _)| *generation != approved.generation())
+                    {
+                        state.approved_start_failure =
+                            Some((approved.generation(), error.to_string()));
+                    }
+                });
+            }
             let _ = reply.send(result);
             true
         }

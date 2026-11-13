@@ -129,7 +129,7 @@ async fn parking_poison_startup(strict: bool, synchronous: bool) {
     }));
     let result = if strict {
         supervisor
-            .start_registered_approved_async(registered, subc_protocol::Principal::Direct)
+            .start_registered_approved_async(registered, subc_protocol::Principal::Direct, 1)
             .await
     } else if synchronous {
         supervisor.start_registered_configured(registered, None, true)

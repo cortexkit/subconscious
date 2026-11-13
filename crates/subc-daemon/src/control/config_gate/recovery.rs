@@ -159,6 +159,9 @@ impl ControlHandler {
             }
             for (index, module) in config.modules.into_iter().enumerate() {
                 if let Some(existing) = self.supervisor.get(&module.module_id) {
+                    existing
+                        .check_approved_start_failure(approved.generation())
+                        .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
                     if approved.changes_entry(&module.module_id) {
                         existing
                             .reconcile_approved_configuration(approved.clone())
@@ -179,7 +182,11 @@ impl ControlHandler {
                         .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
                     context
                         .supervisor
-                        .start_registered_approved_async(registered, Principal::Direct)
+                        .start_registered_approved_async(
+                            registered,
+                            Principal::Direct,
+                            approved.generation(),
+                        )
                         .await
                         .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
                 }

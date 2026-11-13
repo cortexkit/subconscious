@@ -243,6 +243,29 @@ async fn generation(rx: &mut mpsc::Receiver<crate::router::OutboundFrame>) -> u6
 }
 
 #[tokio::test]
+async fn relay_seams_catalog_watch_advances_for_authority_without_routes_or_egress_space() {
+    let handler = ControlHandler::new(Arc::new(Registry::default()));
+    let record = crate::spawn_authority::SpawnAuthorityRecord::new("watch", 1, "watched");
+    let (tx, mut rx) = mpsc::channel(1);
+    let ctx = RouteCtx {
+        connection_id: ConnectionId::new(90),
+        egress: crate::FrameSink::new(tx),
+    };
+    watch(&handler, &ctx).await;
+    assert_eq!(generation(&mut rx).await, 0);
+    ctx.egress.try_send(Frame::build(FrameType::Pong, control_flags(), 0, 0, 0, vec![]).unwrap()).unwrap();
+    for _ in 0..20 {
+        handler.change_spawn_authority(&record);
+    }
+    assert_eq!(record.epoch_for_test(), 20);
+    assert_eq!(handler.registry.generation().unwrap(), 20);
+    assert!(handler.forwarding.module_endpoint_for_connection(ctx.connection_id).unwrap().is_none());
+    assert_eq!(rx.recv().await.unwrap().header.ty, FrameType::Pong);
+    assert_eq!(generation(&mut rx).await, 20);
+    handler.cleanup_connection(ctx.connection_id).unwrap();
+}
+
+#[tokio::test]
 async fn catalog_watch_current_appear_leave_promote_and_authority_changes() {
     let registry = Arc::new(Registry::default());
     let handler = ControlHandler::new(registry.clone());

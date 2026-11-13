@@ -5,11 +5,10 @@
 //! their own tasks: neither registry nor forwarding locks span those awaits.
 
 use super::*;
-use sha2::{Digest, Sha256};
+pub(crate) use crate::spawn_authority::declarations_digest;
+use crate::spawn_authority::{ApprovedDeclarations, AuthorityCapture};
 use subc_control::{CatalogOrigin, CatalogWatchRequest, CatalogWatchResponse};
-use subc_protocol::provider_declarations::{
-    validate_hello_provider_declarations, ProviderDeclarations,
-};
+use subc_protocol::provider_declarations::validate_hello_provider_declarations;
 
 /// The config canonicalizer is the single numeric rule for declarations and
 /// their digests. Refuse at HELLO so every accepted entry can be digested later.
@@ -25,35 +24,17 @@ pub(super) fn validate_hello_declarations(hello: &serde_json::Value) -> Result<(
     Ok(())
 }
 
-/// SHA-256 over the JSON Canonicalization Scheme (JCS) encoding of
-/// {provider, entry}, then JCS({provider: entry_digest}).
-/// Unlike config digests these wire digests have no domain envelope or prefix.
-pub(crate) fn declarations_digest(entries: &ProviderDeclarations) -> Result<String, String> {
-    let mut digests = serde_json::Map::new();
-    for (provider, entry) in entries {
-        let value = serde_json::json!({"provider": provider, "entry": entry});
-        digests.insert(
-            provider.clone(),
-            serde_json::Value::String(jcs_digest(&value)?),
-        );
-    }
-    jcs_digest(&serde_json::Value::Object(digests))
-}
-
-fn jcs_digest(value: &serde_json::Value) -> Result<String, String> {
-    let bytes = subc_config::canonical_json(value).map_err(|err| err.to_string())?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
-}
-
 impl ControlHandler {
     /// Until first-party authority is enabled, no spawn approves declarations.
-    /// The spawn authority record is the only future source of approvals;
+    /// The spawn authority record is the only source of approvals;
     /// requested bytes alone never grant approval.
     fn catalog_approved_declarations(
         &self,
-        _registration: &crate::registry::ModuleRegistration,
-    ) -> ProviderDeclarations {
-        ProviderDeclarations::new()
+        authority: Option<&AuthorityCapture>,
+    ) -> ApprovedDeclarations {
+        authority
+            .map(|capture| capture.approved.clone())
+            .unwrap_or_else(ApprovedDeclarations::none_approved)
     }
 
     pub(super) fn catalog_discovery_entry(
@@ -66,20 +47,28 @@ impl ControlHandler {
             .provider_declarations
             .clone()
             .unwrap_or_default();
-        let approved = self.catalog_approved_declarations(registration);
+        // Release the forwarding read lock before capturing authority state.
+        // Connection identity distinguishes registrations even when their
+        // module ids match during a process replacement.
+        let authority = self
+            .forwarding
+            .target_authority_for_connection(registration.connection_id)
+            .map_err(|err| err.to_string())?
+            .and_then(|record| record.capture());
+        let approved = self.catalog_approved_declarations(authority.as_ref());
         let mut entry = CatalogEntry::new(&registration.manifest.module_id, vec![], vec![]);
-        entry.incarnation = Some(self.supervisor.spawn_snapshot().cursor.daemon_incarnation);
-        // The authority integration supplies this registration's spawn record,
-        // keyed by its connection: a module-id lookup during a blue/green swap
-        // could name the replacement rather than this registration's process.
-        // Leave spawn absent until that exact record is available.
+        entry.incarnation = Some(authority.as_ref().map_or_else(
+            || self.supervisor.spawn_snapshot().cursor.daemon_incarnation,
+            |capture| capture.incarnation.clone(),
+        ));
+        entry.spawn = authority.as_ref().map(|capture| capture.key.spawn);
         entry.first_party = Some(false);
         entry.origin = Some(CatalogOrigin::Other);
         entry.requested_declarations_digest = Some(declarations_digest(&requested)?);
-        entry.approved_declarations_digest = Some(declarations_digest(&approved)?);
+        entry.approved_declarations_digest = Some(approved.digest);
         if filtered {
             entry.requested_declarations = Some(requested);
-            entry.approved_declarations = Some(approved);
+            entry.approved_declarations = Some(approved.entries);
         }
         Ok(entry)
     }

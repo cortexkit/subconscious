@@ -200,6 +200,121 @@ fn connection_of(rig: &Rig, net: &Net) -> ConnectionId {
     net.connection_id(&rig.handler)
 }
 
+async fn catalog_entry(rig: &Rig, module_id: &str) -> Value {
+    let mut reader = Net::new(rig.router.clone()).await;
+    let reply = reader
+        .call(request(
+            json!({"op": "catalog.list", "module_id": module_id}),
+        ))
+        .await;
+    assert_eq!(reply.header.ty, FrameType::Response, "{}", text(&reply));
+    let modules = body(&reply)["modules"].as_array().unwrap().clone();
+    assert_eq!(modules.len(), 1);
+    modules[0].clone()
+}
+
+#[tokio::test]
+async fn relay_seams_record_reply_and_catalog_share_approved_declarations() {
+    let rig = rig().await;
+    let (mut target, spawn, _module, _) =
+        network_primary_with_hello(&rig, "declaration-target", false).await;
+    let mut manifest = tool_manifest("declaration-target", &[], &[]);
+    manifest.provider_declarations =
+        Some(serde_json::from_value(json!({"provider": {"version": 1}})).unwrap());
+    hello(&mut target, manifest).await;
+    let record = spawn.authority.capture().unwrap();
+    let empty_digest = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+    assert!(record.approved.entries.is_empty());
+    assert_eq!(record.approved.digest, empty_digest);
+    let entry = catalog_entry(&rig, "declaration-target").await;
+    assert_eq!(entry["approved_declarations"], json!({}));
+    assert_eq!(
+        entry["requested_declarations"],
+        json!({"provider": {"version": 1}})
+    );
+    assert_eq!(
+        entry["approved_declarations_digest"],
+        record.approved.digest
+    );
+    assert_eq!(entry["incarnation"], record.incarnation);
+    assert_eq!(entry["spawn"], record.key.spawn);
+    assert_eq!(entry["first_party"], false);
+    let mut opener = Net::new(rig.router.clone()).await;
+    for busy_refusals in [false, true] {
+        let (_, reply) = open(
+            &mut opener,
+            &mut target,
+            "declaration-target",
+            busy_refusals,
+        )
+        .await;
+        assert_eq!(reply.header.ty, FrameType::Response, "{}", text(&reply));
+        let target = &body(&reply)["target"];
+        assert_eq!(
+            target["approved_declarations_digest"],
+            entry["approved_declarations_digest"]
+        );
+        assert_eq!(target["spawn"], entry["spawn"]);
+        assert_eq!(target["incarnation"], entry["incarnation"]);
+        assert_eq!(target["first_party"], false);
+    }
+}
+
+#[tokio::test]
+async fn relay_seams_authority_change_preserves_each_openers_close_reasons() {
+    let mut rig = rig().await;
+    let (mut target, spawn, _module) = supervised_target(&rig, "close-target", &[]).await;
+    let mut modern = claimed(&mut rig, ClaimPurpose::SelfConnection).await;
+    let mut legacy = claimed(&mut rig, ClaimPurpose::Helper).await;
+    for (opener, accepts) in [(&mut modern, true), (&mut legacy, false)] {
+        let frame = open_frame("close-target", false, None);
+        let mut value = body(&frame);
+        subc_control::RouteOpenRequestExt::new()
+            .with_accepts_close_reasons(accepts.then(|| vec!["authority_changed".into()]))
+            .write_to(&mut value)
+            .unwrap();
+        let frame = Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            OPEN_CORR,
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        opener.send(frame).await;
+        let bind = next_bind(&mut target).await;
+        ack(&mut target, &bind).await;
+        let reply = open_reply(opener).await;
+        assert_eq!(reply.header.ty, FrameType::Response, "{}", text(&reply));
+    }
+    rig.handler.change_spawn_authority(&spawn.authority);
+    assert!(
+        spawn.authority.alive(),
+        "a live authority change, not an exit"
+    );
+    for (opener, expected) in [
+        (&mut modern, RouteCloseReason::AuthorityChanged),
+        (&mut legacy, RouteCloseReason::Reload),
+    ] {
+        let closed = loop {
+            let frame = opener.recv().await.expect("route.closed push");
+            if frame.header.ty == FrameType::Push && body(&frame)["op"] == "route.closed" {
+                break body(&frame);
+            }
+        };
+        let reason: RouteCloseReason = serde_json::from_value(closed["reason"].clone()).unwrap();
+        assert_eq!(reason, expected, "{closed}");
+        assert!(reason.may_reopen());
+        assert_eq!(closed["terminal"], false);
+        assert!(rig
+            .handler
+            .forwarding
+            .route_authority_for_test(connection_of(&rig, opener))
+            .is_empty());
+    }
+}
+
 #[tokio::test]
 async fn caller_attestation_claim_bound_openers_attest_their_spawn_and_claim() {
     let mut rig = rig().await;
@@ -228,7 +343,10 @@ async fn caller_attestation_claim_bound_openers_attest_their_spawn_and_claim() {
             rig.handler.supervisor.daemon_incarnation()
         );
         assert_eq!(caller["origin"], "other");
-        assert_eq!(caller["approved_declarations_digest"], "");
+        assert_eq!(
+            caller["approved_declarations_digest"],
+            "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        );
         // No spawn is first-party yet: the daemon never raises the mark.
         assert_eq!(caller["first_party"], false, "{bind}");
         assert!(caller.get("declaration").is_none(), "{bind}");
@@ -339,7 +457,8 @@ async fn caller_attestation_reply_target_reports_the_reserved_endpoint() {
                 "spawn": spawn.authority.spawn(),
                 "authority_epoch": 0,
                 "first_party": false,
-                "approved_declarations_digest": "",
+                "approved_declarations_digest":
+                    "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
             }),
             "busy_refusals {busy_refusals}: {}",
             text(&reply)
@@ -642,6 +761,24 @@ async fn spawn_authority_promoted_candidate_keeps_its_launch_generation() {
         .unwrap();
     assert!(candidate.is_candidate());
     let generation = candidate.authority.spawn();
+    let incarnation = candidate.authority.capture().unwrap().incarnation;
+    let incumbent = catalog_entry(&rig, "promoted-module").await;
+    assert_ne!(incumbent["spawn"], generation);
+    let candidate_registration = rig
+        .handler
+        .registry
+        .get_module_by_connection(swap.candidate_id)
+        .unwrap()
+        .unwrap();
+    let candidate_entry = rig
+        .handler
+        .catalog_discovery_entry(&candidate_registration, true)
+        .unwrap();
+    assert_eq!(candidate_entry.spawn, Some(generation));
+    assert_eq!(
+        candidate_entry.incarnation.as_deref(),
+        Some(incarnation.as_str())
+    );
     let ready = swap
         .candidate
         .call(request(
@@ -658,6 +795,14 @@ async fn spawn_authority_promoted_candidate_keeps_its_launch_generation() {
         crate::supervise::SwapOutcome::Cutover
     );
     assert_eq!(swap.module.status().unwrap().spawn_generation, generation);
+    let promoted = catalog_entry(&rig, "promoted-module").await;
+    assert_eq!(promoted["incarnation"], incarnation);
+    assert_eq!(promoted["spawn"], generation);
+    assert_eq!(promoted["first_party"], false);
+    assert_eq!(
+        promoted["approved_declarations_digest"],
+        candidate_entry.approved_declarations_digest.unwrap()
+    );
 }
 
 #[test]

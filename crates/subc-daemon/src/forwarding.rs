@@ -137,29 +137,28 @@ pub(crate) enum TargetAuthority {
     Unsupervised,
     /// A supervised spawn's own registration, at the epoch the forwarding
     /// table had published when the endpoint was reserved.
-    Spawn(AuthorityPair),
+    Spawn(AuthorityPair, crate::spawn_authority::ApprovedDeclarations),
 }
 
 impl TargetAuthority {
     fn pair(&self) -> Option<&AuthorityPair> {
         match self {
-            Self::Spawn(pair) => Some(pair),
+            Self::Spawn(pair, _) => Some(pair),
             Self::Prefix | Self::Unsupervised => None,
         }
     }
 
-    /// The `target` key of the `route.open` reply. `first_party` is false and
-    /// the approved digest empty until the mark and provider declarations
-    /// reach the forwarding table.
+    /// The `target` key of the `route.open` reply. The approved set is the
+    /// serving spawn record's value; the mark remains forced off.
     fn reply_target(&self, incarnation: &str) -> Result<RouteOpenTarget, ForwardingError> {
         let (kind, spawn, epoch, digest) = match self {
             Self::Prefix => (RouteOpenTargetKind::Prefix, None, None, None),
             Self::Unsupervised => (RouteOpenTargetKind::Unsupervised, None, None, None),
-            Self::Spawn(pair) => (
+            Self::Spawn(pair, approved) => (
                 RouteOpenTargetKind::Spawn,
                 Some(pair.key.spawn),
                 Some(pair.epoch),
-                Some(crate::spawn_authority::ApprovedDeclarations::none_approved().digest),
+                Some(approved.digest.clone()),
             ),
         };
         RouteOpenTarget::new(incarnation, kind, spawn, epoch, false, digest)
@@ -4096,10 +4095,13 @@ fn target_authority_locked(inner: &ForwardingInner, module: &ModuleConnection) -
     {
         Some(record) => {
             let key = record.key();
-            TargetAuthority::Spawn(AuthorityPair {
-                epoch: published_epoch_locked(inner, &key),
-                key,
-            })
+            TargetAuthority::Spawn(
+                AuthorityPair {
+                    epoch: published_epoch_locked(inner, &key),
+                    key,
+                },
+                record.approved().clone(),
+            )
         }
         None => TargetAuthority::Unsupervised,
     }

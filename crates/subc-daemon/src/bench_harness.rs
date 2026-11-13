@@ -166,6 +166,7 @@ pub async fn build_bench_forwarding_setup(
                     Default::default(),
                     tokio::time::Instant::now() + std::time::Duration::from_secs(30),
                     false,
+                    None,
                 )
                 .await
                 .expect("begin route bind");

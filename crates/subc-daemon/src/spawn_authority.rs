@@ -39,12 +39,14 @@
 //! Until program origins are derived from release and placement evidence,
 //! every record's origin is [`unproven_origin`]. Until provider declarations
 //! are approved, every record's approved set is
-//! [`ApprovedDeclarations::none_approved`], with an empty digest. The mark
+//! [`ApprovedDeclarations::none_approved`], with the digest of the empty set. The mark
 //! itself is never raised here: `first_party` is false on every record.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use sha2::{Digest, Sha256};
 use subc_protocol::peer::{CallerAttestation, CallerClaim, CallerOrigin};
+use subc_protocol::provider_declarations::ProviderDeclarations;
 
 /// The epoch every record starts at. Only a change of authority advances it.
 pub(crate) const INITIAL_AUTHORITY_EPOCH: u64 = 0;
@@ -66,21 +68,43 @@ pub(crate) struct AuthorityPair {
 }
 
 /// The provider declarations a spawn may grant from, and their set digest.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ApprovedDeclarations {
     /// Approved entries keyed by provider module id.
-    pub(crate) entries: serde_json::Map<String, serde_json::Value>,
+    pub(crate) entries: ProviderDeclarations,
     /// The digest of the whole approved set, lowercase hex.
     pub(crate) digest: String,
 }
 
 impl ApprovedDeclarations {
-    /// The approved set of every spawn until provider declarations are wired
-    /// in: nothing approved, and an empty digest. Readers treat a spawn with
-    /// nothing approved as having no automatic grants.
+    /// No origin currently qualifies for approvals. Hash the empty set with
+    /// the same algorithm used for requested declarations, never an empty string.
     pub(crate) fn none_approved() -> Self {
-        Self::default()
+        let entries = ProviderDeclarations::new();
+        let digest = declarations_digest(&entries).expect("the empty set is canonical JSON");
+        Self { entries, digest }
     }
+}
+
+/// SHA-256 over the JSON Canonicalization Scheme (JCS) encoding of
+/// {provider, entry}, then JCS({provider: entry_digest}).
+/// Unlike config digests, these add no extra wrapping structure or prefix
+/// beyond the JCS objects shown above.
+pub(crate) fn declarations_digest(entries: &ProviderDeclarations) -> Result<String, String> {
+    let mut digests = serde_json::Map::new();
+    for (provider, entry) in entries {
+        let value = serde_json::json!({"provider": provider, "entry": entry});
+        digests.insert(
+            provider.clone(),
+            serde_json::Value::String(jcs_digest(&value)?),
+        );
+    }
+    jcs_digest(&serde_json::Value::Object(digests))
+}
+
+fn jcs_digest(value: &serde_json::Value) -> Result<String, String> {
+    let bytes = subc_config::canonical_json(value).map_err(|err| err.to_string())?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 /// The origin of every spawn until program origins are derived from release
@@ -93,7 +117,6 @@ pub(crate) fn unproven_origin() -> CallerOrigin {
 struct AuthorityState {
     origin: CallerOrigin,
     first_party: bool,
-    approved: ApprovedDeclarations,
     epoch: u64,
     alive: bool,
 }
@@ -104,6 +127,10 @@ pub(crate) struct SpawnAuthorityRecord {
     incarnation: String,
     spawn: u64,
     module_id: String,
+    // Approvals are fixed empty until origins exist. Keep the record's one
+    // value immutable so forwarding can project it without taking state under
+    // its own lock. Mutable approvals will need publication with the epoch.
+    approved: ApprovedDeclarations,
     state: Mutex<AuthorityState>,
 }
 
@@ -171,10 +198,10 @@ impl SpawnAuthorityRecord {
             incarnation: incarnation.into(),
             spawn,
             module_id: module_id.to_owned(),
+            approved: ApprovedDeclarations::none_approved(),
             state: Mutex::new(AuthorityState {
                 origin: unproven_origin(),
                 first_party: false,
-                approved: ApprovedDeclarations::none_approved(),
                 epoch: INITIAL_AUTHORITY_EPOCH,
                 alive: true,
             }),
@@ -187,6 +214,10 @@ impl SpawnAuthorityRecord {
 
     pub(crate) fn module_id(&self) -> &str {
         &self.module_id
+    }
+
+    pub(crate) fn approved(&self) -> &ApprovedDeclarations {
+        &self.approved
     }
 
     pub(crate) fn key(&self) -> SpawnKey {
@@ -210,7 +241,7 @@ impl SpawnAuthorityRecord {
             epoch: state.epoch,
             first_party: state.first_party,
             origin: state.origin,
-            approved: state.approved.clone(),
+            approved: self.approved.clone(),
         })
     }
 
@@ -276,7 +307,10 @@ mod tests {
         assert!(!capture.first_party);
         assert_eq!(capture.origin, CallerOrigin::Other);
         assert!(capture.approved.entries.is_empty());
-        assert_eq!(capture.approved.digest, "");
+        assert_eq!(
+            capture.approved.digest,
+            "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        );
     }
 
     #[test]

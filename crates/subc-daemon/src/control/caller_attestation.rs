@@ -176,6 +176,12 @@ impl ControlHandler {
                 return;
             }
         };
+        // Authority and forwarding locks have been released. Separate watch
+        // tasks send the notifications, so a slow client cannot hold up fencing.
+        if let Err(err) = self.registry.catalog_authority_changed() {
+            warn!(module_id = record.module_id(), spawn = record.spawn(), error = %err,
+                "failed to advance the catalog after a spawn authority change");
+        }
         if closed.is_empty() {
             return;
         }
@@ -200,6 +206,7 @@ impl ControlHandler {
                     bound_at: closed.route.bound_at,
                     draining: false,
                     drain_reason: None,
+                    accepts_close_reasons: closed.route.accepts_close_reasons.clone(),
                 });
             goodbyes.push(closed.module);
             goodbyes.push(closed.client);

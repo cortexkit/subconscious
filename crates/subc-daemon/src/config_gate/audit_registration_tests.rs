@@ -149,31 +149,52 @@ async fn audit_registration_wire_restart_keeps_unrecorded_gate_error_code() {
 }
 
 async fn operator_gate_error_reply(operation: &str) {
-    let fixture = legacy().await;
-    match operation {
-        "start" => fixture.module.drain().await.unwrap(),
-        "enable" => {
-            fixture.module.set_enabled(false).await.unwrap();
+    let rig = rig();
+    let owner = Arc::new(rig.owner("operator-error-code"));
+    rig.stamp(&owner);
+    let handle = channel_handle();
+    let registry = Arc::new(crate::Registry::default());
+    let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
+        .with_handle(handle.clone())
+        .with_config_runtime(owner.clone());
+    let mut unapproved = spec(&rig);
+    unapproved.module_id = "not-approved".into();
+    let module = supervisor
+        .supervise_configured_requested_async(
+            unapproved,
+            operation != "enable",
+            Default::default(),
+            None,
+            Default::default(),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        module.state().unwrap(),
+        if operation == "enable" {
+            ModuleState::Disabled
+        } else {
+            ModuleState::Failed
         }
-        "restart" => {}
-        _ => unreachable!(),
-    }
-    assert!(fixture.owner.check_module_hold("a").is_ok());
-    assert!(!fixture.owner.has_recorded_admission_hold("a"));
-    fixture.owner.exhaust_delivery_spawns_for_test();
-    registration_declaration_poll(fixture.handler.clone(), "config.status").await;
+    );
+    assert!(!owner.has_recorded_admission_hold("not-approved"));
+    // Exercise the actor's error-to-wire boundary, not the control handler's
+    // earlier admission preflight. The supervisor still has the real gate.
+    let handler = Arc::new(crate::ControlHandler::new(registry).with_supervisor(handle));
+    registration_declaration_poll(handler.clone(), "supervisor.list").await;
     let request = if operation == "restart" {
-        json!({"op":"supervisor.restart","module_id":"a"})
+        json!({"op":"supervisor.restart","module_id":"not-approved"})
     } else {
-        json!({"op":"supervisor.set_enabled","module_id":"a","enabled":true})
+        json!({"op":"supervisor.set_enabled","module_id":"not-approved","enabled":true})
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     let ctx = crate::RouteCtx {
         connection_id: ConnectionId::new(50),
         egress: crate::FrameSink::new(tx),
     };
-    let frames = fixture
-        .handler
+    let frames = handler
         .handle_control_frame(&ctx, crate::control::claims::tests::request(request))
         .await
         .unwrap();
@@ -183,17 +204,16 @@ async fn operator_gate_error_reply(operation: &str) {
         frames[0].clone()
     };
     let reply: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
-    drop(fixture.primary);
-    fixture.module.stop().await.unwrap();
+    module.stop().await.unwrap();
     assert_eq!(reply["code"], "config_gated", "{operation}: {reply}");
     assert!(
         reply["message"]
             .as_str()
             .unwrap()
-            .contains("delivery_spawn_exhausted"),
+            .contains("module is not approved"),
         "{reply}"
     );
-    assert!(!fixture.owner.has_recorded_admission_hold("a"));
+    assert!(!owner.has_recorded_admission_hold("not-approved"));
 }
 
 #[tokio::test]

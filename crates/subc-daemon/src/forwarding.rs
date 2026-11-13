@@ -5,6 +5,11 @@
 //! HELLO publication holds Registry before ForwardingTable::inner so an ACK
 //! cannot be observed before registry publication. Code holding inner must not
 //! take the registry lock, including through a callback.
+//!
+//! Spawn authority: an authority change takes the spawn's authority record
+//! state, then `inner` (see `crate::spawn_authority`). Code holding `inner`
+//! never takes a record's authority state; it reads only the record's
+//! immutable identity and the epochs published into `spawn_epochs`.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -14,7 +19,10 @@ use std::{
     time::Duration,
 };
 
-use subc_control::{ClientControlResponse, RouteCloseReason};
+use subc_control::{
+    ClientControlResponse, RouteCloseReason, RouteOpenReplyExt, RouteOpenTarget,
+    RouteOpenTargetKind,
+};
 use subc_protocol::{
     manifest::Concurrency,
     session::{LiveRoot, ModuleControlResponse, ModuleControlResponseToModule},
@@ -30,6 +38,7 @@ use crate::{
     registry::ConnectionId,
     router::FrameSink,
     scopes::{BoundScope, ScopeDrain, ScopeTag, ScopeTagChange},
+    spawn_authority::{AuthorityPair, SpawnAuthorityRecord, SpawnKey},
     Frame, ProjectRootId,
 };
 
@@ -100,6 +109,77 @@ pub(crate) struct RouteBinding {
     /// The scope the route was admitted under, with the tag its bind was
     /// stamped at. A scope change finds the routes to close by it.
     pub scope: Option<BoundScope>,
+    /// The opener's spawn and authority epoch when the open was attested;
+    /// `None` for an opener with no supervised spawn.
+    pub caller_authority: Option<AuthorityPair>,
+    /// The serving spawn and its authority epoch when the route was reserved;
+    /// `None` for a prefix or unsupervised target.
+    pub target_authority: Option<AuthorityPair>,
+}
+
+/// The spawn authority facts `route.open` hands to the relay reservation.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RouteAuthority {
+    /// The daemon incarnation reported in the reply's `target`.
+    pub(crate) incarnation: String,
+    /// The opener's spawn and epoch, captured once at admission.
+    pub(crate) caller: Option<AuthorityPair>,
+}
+
+/// What the reservation found serving the route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TargetAuthority {
+    /// A reserved-prefix child, which never reports its owner's mark.
+    Prefix,
+    /// A registration with no supervised spawn behind it.
+    Unsupervised,
+    /// A supervised spawn's own registration, at the epoch the forwarding
+    /// table had published when the endpoint was reserved.
+    Spawn(AuthorityPair),
+}
+
+impl TargetAuthority {
+    fn pair(&self) -> Option<&AuthorityPair> {
+        match self {
+            Self::Spawn(pair) => Some(pair),
+            Self::Prefix | Self::Unsupervised => None,
+        }
+    }
+
+    /// The `target` key of the `route.open` reply. `first_party` is false and
+    /// the approved digest empty until the mark and provider declarations
+    /// reach the forwarding table.
+    fn reply_target(&self, incarnation: &str) -> Result<RouteOpenTarget, ForwardingError> {
+        let (kind, spawn, epoch, digest) = match self {
+            Self::Prefix => (RouteOpenTargetKind::Prefix, None, None, None),
+            Self::Unsupervised => (RouteOpenTargetKind::Unsupervised, None, None, None),
+            Self::Spawn(pair) => (
+                RouteOpenTargetKind::Spawn,
+                Some(pair.key.spawn),
+                Some(pair.epoch),
+                Some(
+                    crate::spawn_authority::ApprovedDeclarations::none_approved().digest,
+                ),
+            ),
+        };
+        RouteOpenTarget::new(incarnation, kind, spawn, epoch, false, digest)
+            .map_err(|err| ForwardingError::RouteOpenBuild(err.to_string()))
+    }
+}
+
+/// Serialize a successful `route.open` reply with its `target` key.
+fn route_open_reply_body(
+    reply: &ClientControlResponse,
+    target: &TargetAuthority,
+    incarnation: &str,
+) -> Result<Vec<u8>, ForwardingError> {
+    let build = |err: serde_json::Error| ForwardingError::RouteOpenBuild(err.to_string());
+    let mut body = serde_json::to_value(reply).map_err(build)?;
+    RouteOpenReplyExt::new()
+        .with_target(Some(target.reply_target(incarnation)?))
+        .write_to(&mut body)
+        .map_err(build)?;
+    serde_json::to_vec(&body).map_err(build)
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +411,15 @@ pub(crate) struct ScopeDrainedRoute {
     pub module: GoodbyeTarget,
 }
 
+/// One live route an authority change closed: both ends to send GOODBYE to,
+/// and the route as it was recorded, for the client's `route.closed`.
+#[derive(Debug, Clone)]
+pub(crate) struct AuthorityClosedRoute {
+    pub route: Arc<RouteBinding>,
+    pub client: GoodbyeTarget,
+    pub module: GoodbyeTarget,
+}
+
 #[derive(Debug)]
 pub(crate) struct PendingRouteBindRelay {
     pub endpoint: ModuleEndpointId,
@@ -480,6 +569,14 @@ struct PendingRouteBindRelayEntry {
     harness: String,
     build_class: Option<String>,
     operator_app: Option<crate::operator_apps::OperatorAppStamp>,
+    /// The opener's spawn and epoch, captured once at `route.open` admission
+    /// and never re-read; commit compares it with `spawn_epochs`.
+    caller_authority: Option<AuthorityPair>,
+    /// What served the reserved endpoint, read under the write lock that
+    /// reserved it; commit compares a spawn's epoch with `spawn_epochs`.
+    target_authority: TargetAuthority,
+    /// The daemon incarnation for the reply's `target` if commit rebuilds it.
+    incarnation: String,
     deadline: Instant,
     /// Set once `route.open` has finished putting the route.bind on the
     /// module's egress queue. A path that drops this entry WITHOUT a module
@@ -576,6 +673,13 @@ struct ForwardingInner {
     closing_connections: HashSet<ConnectionId>,
     /// Pending binds check spawn liveness without keeping the spawn alive.
     spawn_connections: HashMap<ConnectionId, std::sync::Weak<crate::supervise::RegistrationSpawn>>,
+    /// The spawn whose own registration each module connection is, for the
+    /// reply's `target`. A prefix child's connection never has an entry.
+    target_authority_by_connection: HashMap<ConnectionId, Arc<SpawnAuthorityRecord>>,
+    /// The authority epoch each spawn's last authority change published. A
+    /// spawn with no entry is at the initial epoch. A bind whose captured
+    /// caller or target epoch is older than this is refused at commit.
+    spawn_epochs: HashMap<SpawnKey, u64>,
     next_generation: u64,
     reserved_client: HashMap<ClientRouteKey, ModuleRouteKey>,
     reserved_module: HashMap<ModuleRouteKey, ClientRouteKey>,
@@ -722,6 +826,44 @@ impl ForwardingTable {
             .insert(connection, Arc::downgrade(spawn));
         Ok(())
     }
+
+    /// Record that `connection` is `record`'s spawn's own module registration,
+    /// so a route reserved on it reports `target.kind: spawn`.
+    pub(crate) fn bind_target_authority(
+        &self,
+        connection: ConnectionId,
+        record: Arc<SpawnAuthorityRecord>,
+    ) -> Result<(), ForwardingError> {
+        self.write_inner()?
+            .target_authority_by_connection
+            .insert(connection, record);
+        Ok(())
+    }
+    /// The spawn whose own module registration `connection` is, if any.
+    pub(crate) fn target_authority_for_connection(
+        &self,
+        connection: ConnectionId,
+    ) -> Result<Option<Arc<SpawnAuthorityRecord>>, ForwardingError> {
+        Ok(self
+            .read_inner()?
+            .target_authority_by_connection
+            .get(&connection)
+            .cloned())
+    }
+
+    /// The module connection that is `key`'s spawn's own registration.
+    pub(crate) fn connection_for_spawn(
+        &self,
+        key: &SpawnKey,
+    ) -> Result<Option<ConnectionId>, ForwardingError> {
+        Ok(self
+            .read_inner()?
+            .target_authority_by_connection
+            .iter()
+            .find(|(_, record)| record.key() == *key)
+            .map(|(connection, _)| *connection))
+    }
+
     pub(crate) fn active_module_endpoint(
         &self,
         module_id: &str,
@@ -998,6 +1140,7 @@ impl ForwardingTable {
         // until that cleanup.
         if let Ok(mut inner) = self.write_inner() {
             inner.spawn_connections.remove(&connection_id);
+            inner.target_authority_by_connection.remove(&connection_id);
         }
     }
 
@@ -1366,6 +1509,7 @@ impl ForwardingTable {
         harness: String,
         build_class: Option<String>,
         operator_app: Option<crate::operator_apps::OperatorAppStamp>,
+        authority: RouteAuthority,
         deadline: Instant,
         busy_refusals: bool,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
@@ -1391,6 +1535,7 @@ impl ForwardingTable {
             harness,
             build_class,
             operator_app,
+            authority,
             deadline,
             client_permit,
             busy_refusals,
@@ -1441,6 +1586,7 @@ impl ForwardingTable {
             String::new(),
             None,
             None,
+            RouteAuthority::default(),
             Instant::now() + std::time::Duration::from_secs(60),
             permit,
             busy_refusals,
@@ -1629,6 +1775,7 @@ impl ForwardingTable {
         harness: String,
         build_class: Option<String>,
         operator_app: Option<crate::operator_apps::OperatorAppStamp>,
+        authority: RouteAuthority,
         deadline: Instant,
         client_permit: crate::router::EgressPermit,
         busy_refusals: bool,
@@ -1700,13 +1847,19 @@ impl ForwardingTable {
             module_epoch,
             project_root,
         };
-        let response_body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
-            request_window: None,
-            watch_window: None,
-            route_channel: client_channel,
-            route_epoch: client_epoch,
-        })
-        .map_err(|err| ForwardingError::RouteOpenBuild(err.to_string()))?;
+        // The target is the endpoint reserved under this lock, never the
+        // by-id registration route.open read before it waited for egress.
+        let target_authority = target_authority_locked(&inner, &module);
+        let response_body = route_open_reply_body(
+            &ClientControlResponse::RouteOpen {
+                request_window: None,
+                watch_window: None,
+                route_channel: client_channel,
+                route_epoch: client_epoch,
+            },
+            &target_authority,
+            &authority.incarnation,
+        )?;
         let route_open_frame = Frame::build_with_version(
             client_negotiated_ver,
             FrameType::Response,
@@ -1737,6 +1890,9 @@ impl ForwardingTable {
                 harness,
                 build_class,
                 operator_app,
+                caller_authority: authority.caller,
+                target_authority,
+                incarnation: authority.incarnation,
                 deadline,
                 relay_enqueued: false,
                 sender,
@@ -2109,6 +2265,33 @@ impl ForwardingTable {
                 let _ = pending
                     .sender
                     .send(RouteBindRelayOutcome::DaemonRejected(refusal));
+                return Ok(PendingRelayCompletion {
+                    settled: true,
+                    abandoned,
+                });
+            }
+            // The caller's or the target's authority changed after the open
+            // was attested, so the attestation the module bound on is no
+            // longer true. Settled like the scope arm, never as an error from
+            // `commit_route_locked`, which would close the module's shared
+            // connection: release the pair, refuse the open by name, and hand
+            // back the module-side channel for one channel-scoped GOODBYE.
+            RouteBindRelayOutcome::Accepted
+                if authority_stale_locked(&inner, pending.caller_authority.as_ref())
+                    || authority_stale_locked(&inner, pending.target_authority.pair()) =>
+            {
+                release_reserved_route_locked(
+                    &mut inner,
+                    pending.reservation.client_key,
+                    pending.reservation.module_key,
+                );
+                let abandoned = abandoned_route_target(&inner, &pending.reservation);
+                let _ = pending
+                    .sender
+                    .send(RouteBindRelayOutcome::DaemonRejected(ErrorBody::new(
+                        subc_protocol::error_codes::STALE_AUTHORITY_EPOCH,
+                        "the caller's or target's authority changed while the route was binding",
+                    )));
                 return Ok(PendingRelayCompletion {
                     settled: true,
                     abandoned,
@@ -3343,6 +3526,74 @@ impl ForwardingTable {
         Ok(drained)
     }
 
+    /// Publish a spawn's new authority epoch and release every live route
+    /// whose recorded caller or target is that spawn at an older epoch, in one
+    /// critical section.
+    ///
+    /// The caller holds the spawn's authority record state (record, then this
+    /// table, always; see `SpawnAuthorityRecord::change_authority`). A bind
+    /// that commits before this is selected here like any other route; one
+    /// that commits after it sees the new epoch and is refused as stale.
+    ///
+    /// Unlike [`Self::publish_scope_changes`], every client route is scanned,
+    /// scoped or not. Once a spawn is dead (`alive` false), the epochs of its
+    /// module's older spawns are dropped: their connections are gone and the
+    /// liveness checks at commit refuse any bind still naming them.
+    pub(crate) fn publish_authority_change(
+        &self,
+        key: &SpawnKey,
+        epoch: u64,
+        alive: bool,
+    ) -> Result<Vec<AuthorityClosedRoute>, ForwardingError> {
+        let mut inner = self.write_inner()?;
+        if !alive {
+            inner
+                .spawn_epochs
+                .retain(|other, _| other.module_id != key.module_id || other.spawn >= key.spawn);
+        }
+        inner.spawn_epochs.insert(key.clone(), epoch);
+        let older = |pair: &Option<AuthorityPair>| {
+            pair.as_ref()
+                .is_some_and(|pair| pair.key == *key && pair.epoch < epoch)
+        };
+        let selected = inner
+            .client_to_module
+            .iter()
+            .filter(|(_, route)| older(&route.caller_authority) || older(&route.target_authority))
+            .map(|(client_key, route)| (*client_key, route.client_epoch))
+            .collect::<Vec<_>>();
+        let mut closed = Vec::new();
+        for (client_key, client_epoch) in selected {
+            let Some(route) = inner.client_to_module.get(&client_key).cloned() else {
+                continue;
+            };
+            let release = release_client_route_locked(&mut inner, client_key, client_epoch);
+            self.record_route_release(&release);
+            if let RouteRelease::Removed(module) = release {
+                closed.push(AuthorityClosedRoute {
+                    client: GoodbyeTarget {
+                        connection_id: route.client_connection_id,
+                        sink: route.client_sink.clone(),
+                        negotiated_ver: route.client_negotiated_ver,
+                        channel: route.client_channel,
+                        epoch: route.client_epoch,
+                        kind: GoodbyeTargetKind::Client,
+                        module_id: Some(route.module_id.clone()),
+                    },
+                    module,
+                    route,
+                });
+            }
+        }
+        Ok(closed)
+    }
+
+    /// The epoch published for a spawn, for tests of the commit re-check.
+    #[cfg(test)]
+    pub(crate) fn published_spawn_epoch(&self, key: &SpawnKey) -> u64 {
+        published_epoch_locked(&self.read_inner().unwrap(), key)
+    }
+
     /// The published tag of one scope, for tests of the commit re-check.
     #[cfg(test)]
     pub(crate) fn published_scope_tag(&self, owner: &str, scope_ref: &str) -> Option<ScopeTag> {
@@ -3682,13 +3933,16 @@ fn commit_route_locked(
         return Err(ForwardingError::ModuleReloading { module_id });
     }
     if pending.busy_refusals {
-        let body = serde_json::to_vec(&ClientControlResponse::RouteOpen {
-            route_channel: reservation.client_key.channel,
-            route_epoch: reservation.client_epoch,
-            request_window: Some(pending.request_window),
-            watch_window: pending.watch_window,
-        })
-        .map_err(|err| ForwardingError::RouteOpenBuild(err.to_string()))?;
+        let body = route_open_reply_body(
+            &ClientControlResponse::RouteOpen {
+                route_channel: reservation.client_key.channel,
+                route_epoch: reservation.client_epoch,
+                request_window: Some(pending.request_window),
+                watch_window: pending.watch_window,
+            },
+            &pending.target_authority,
+            &pending.incarnation,
+        )?;
         pending.route_open_frame = Frame::build_with_version(
             pending.client_negotiated_ver,
             FrameType::Response,
@@ -3738,6 +3992,8 @@ fn commit_route_locked(
             ChannelFlow::new(pending.request_window)
         }),
         scope: pending.scope,
+        caller_authority: pending.caller_authority,
+        target_authority: pending.target_authority.pair().cloned(),
     });
     inner
         .client_to_module
@@ -3794,6 +4050,39 @@ fn commit_route_locked(
     }
     let _ = pending.sender.send(RouteBindRelayOutcome::Accepted);
     Ok(None)
+}
+
+/// What serves `module`'s endpoint: a prefix child, a supervised spawn's own
+/// registration at its published epoch, or an unsupervised registration.
+fn target_authority_locked(inner: &ForwardingInner, module: &ModuleConnection) -> TargetAuthority {
+    if module.verified_prefix_owner.is_some() {
+        return TargetAuthority::Prefix;
+    }
+    match inner
+        .target_authority_by_connection
+        .get(&module.endpoint.connection_id)
+    {
+        Some(record) => {
+            let key = record.key();
+            TargetAuthority::Spawn(AuthorityPair {
+                epoch: published_epoch_locked(inner, &key),
+                key,
+            })
+        }
+        None => TargetAuthority::Unsupervised,
+    }
+}
+
+fn published_epoch_locked(inner: &ForwardingInner, key: &SpawnKey) -> u64 {
+    inner
+        .spawn_epochs
+        .get(key)
+        .copied()
+        .unwrap_or(crate::spawn_authority::INITIAL_AUTHORITY_EPOCH)
+}
+
+fn authority_stale_locked(inner: &ForwardingInner, pair: Option<&AuthorityPair>) -> bool {
+    pair.is_some_and(|pair| published_epoch_locked(inner, &pair.key) > pair.epoch)
 }
 
 fn spawn_connection_dead(inner: &ForwardingInner, connection: ConnectionId) -> bool {
@@ -5058,6 +5347,7 @@ mod tests {
                 "fixture".into(),
                 None,
                 None,
+                RouteAuthority::default(),
                 Instant::now() + Duration::from_secs(60),
                 false,
             ),

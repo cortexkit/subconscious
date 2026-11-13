@@ -1932,8 +1932,7 @@ impl SpawnEventFeed {
         }
     }
 
-    fn emit_spawned(&self, module_id: &str, pid: u32, spawned_at_ms: u64) -> u64 {
-        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+    fn allocate_generation_locked(state: &mut SpawnEventState, module_id: &str) -> u64 {
         let generation = state
             .generations
             .get(module_id)
@@ -1942,6 +1941,34 @@ impl SpawnEventFeed {
             .checked_add(1)
             .expect("spawn generation exhausted");
         state.generations.insert(module_id.to_string(), generation);
+        generation
+    }
+
+    /// Allocate the spawn generation of a launch that is about to start, with
+    /// the daemon incarnation it belongs to. The number names the launch from
+    /// this moment, before its process runs; a launch that never runs keeps
+    /// its number, so the generations a subscriber sees may skip.
+    fn allocate_generation(&self, module_id: &str) -> (String, u64) {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let generation = Self::allocate_generation_locked(&mut state, module_id);
+        (state.daemon_incarnation.clone(), generation)
+    }
+
+    /// Publish a running process. `allocated` is the generation its launch
+    /// was given before it started; a launch without one (a process with no
+    /// registration channel) is numbered here.
+    fn emit_spawned(
+        &self,
+        module_id: &str,
+        allocated: Option<u64>,
+        pid: u32,
+        spawned_at_ms: u64,
+    ) -> u64 {
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let generation = match allocated {
+            Some(generation) => generation,
+            None => Self::allocate_generation_locked(&mut state, module_id),
+        };
         let live = LiveSpawn {
             module_id: module_id.to_string(),
             spawn_generation: generation,
@@ -2502,6 +2529,9 @@ pub struct SupervisorHandle {
     /// reserved_nonces because consumer route.open attestation applies to all spawned
     /// modules, while HELLO id-squatting protection remains opt-in via `reserved`.
     spawn_nonces: Arc<Mutex<HashMap<String, String>>>,
+    /// The launch each live launch nonce was minted for, so a nonce-attested
+    /// consumer or registration resolves to that launch's authority record.
+    nonce_launches: Arc<Mutex<HashMap<String, std::sync::Weak<RegistrationSpawn>>>>,
     /// Reserved namespace prefixes mapped to the supervised owner module whose
     /// current spawn nonce authorizes HELLO claims below the prefix.
     ///
@@ -12037,7 +12067,7 @@ fn prepare_child_in_slot(
     let registration_spawn = (spec.protocol == ModuleProtocol::Subc)
         .then(|| {
             handle.map(|handle| {
-                RegistrationSpawn::new_with_binding_requirement(
+                let spawn = RegistrationSpawn::new_with_binding_requirement(
                     handle,
                     &spec.module_id,
                     role,
@@ -12045,7 +12075,9 @@ fn prepare_child_in_slot(
                     spawn_admission
                         .as_ref()
                         .is_some_and(|admission| admission.launch.is_some()),
-                )
+                );
+                handle.record_nonce_launch(&spawn);
+                spawn
             })
         })
         .flatten();
@@ -15644,7 +15676,15 @@ fn set_running(
     let mut state = snapshot.lock().map_err(|_| SuperviseError::StatePoisoned {
         module_id: Some(module_id.to_string()),
     })?;
-    state.spawn_generation = spawn_events.emit_spawned(module_id, child.pid, child.spawned_at_ms);
+    state.spawn_generation = spawn_events.emit_spawned(
+        module_id,
+        child
+            .registration_spawn
+            .as_ref()
+            .map(|spawn| spawn.authority.spawn()),
+        child.pid,
+        child.spawned_at_ms,
+    );
     if std::mem::take(&mut state.coalesced_restart_pending) {
         let generation = state.spawn_generation;
         info!(module_id, "restart already satisfied by generation {generation}; coalesced pending request completed");
@@ -16995,7 +17035,7 @@ mod terminal_history_tests {
         let runtime = supervisor.runtime_config();
         let spec = windowed_crash_spec("budget-recording-panic");
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        runtime.spawn_events.emit_spawned(&spec.module_id, 1, 1);
+        runtime.spawn_events.emit_spawned(&spec.module_id, None, 1, 1);
         // Exhausting the event sequence makes emit_exited panic before the
         // terminal write, exercising publication on the recording unwind.
         runtime.spawn_events.0.lock().unwrap().seq = u64::MAX;
@@ -17834,14 +17874,14 @@ mod terminal_history_tests {
     fn wait_error_exit_path_preserves_spawn_event_density() {
         let feed = super::SpawnEventFeed::default();
         feed.configure_incarnation("wait-error-density".to_string());
-        feed.emit_spawned("wait-error", 41, 1);
+        feed.emit_spawned("wait-error", None, 41, 1);
         let ring = Arc::new(Mutex::new(TerminalRing::new(
             TerminalRingConfig::default(),
             0,
         )));
 
         record_wait_error_terminal("wait-error", &ring, &feed);
-        feed.emit_spawned("after-wait-error", 42, 2);
+        feed.emit_spawned("after-wait-error", None, 42, 2);
 
         let state = feed.0.lock().unwrap();
         let sequences = state
@@ -20521,7 +20561,7 @@ mod spawn_subscriber_lag_tests {
             .expect("subscribe");
         let emitted = SPAWN_SUBSCRIBER_BUFFER + 16;
         for index in 0..emitted {
-            feed.emit_spawned(&format!("lag-module-{index}"), 1000, 0);
+            feed.emit_spawned(&format!("lag-module-{index}"), None, 1000, 0);
             // Let the forwarder take what it can so the fill point is the
             // subscriber channel, not a scheduling accident.
             tokio::task::yield_now().await;

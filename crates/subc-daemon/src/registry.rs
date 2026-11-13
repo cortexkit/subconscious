@@ -680,6 +680,21 @@ impl Registry {
             {
                 return Err(RegistryError::FederatedCapabilityChanged);
             }
+            // Pending binds also decide from this declaration whether to
+            // carry `caller`, so routes bound before and after an update
+            // could otherwise attest differently.
+            let declares_caller = |caps: Option<&CapabilityDeclarations>| {
+                caps.is_some_and(|caps| {
+                    caps.provides.iter().any(|cap| {
+                        cap == subc_protocol::peer::CALLER_ATTESTATION_CAPABILITY
+                    })
+                })
+            };
+            if declares_caller(registration.manifest.capabilities.as_ref())
+                != declares_caller(Some(capabilities))
+            {
+                return Err(RegistryError::CallerAttestationCapabilityChanged);
+            }
         }
         registration.manifest.provides = provides;
         if let Some(capabilities) = capabilities {
@@ -902,6 +917,9 @@ impl RegistryInner {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistryError {
     FederatedCapabilityChanged,
+    /// A `catalog.update` tried to add or drop `caller-attestation/v1`, which
+    /// decides whether binds carry `caller` and so is fixed at HELLO.
+    CallerAttestationCapabilityChanged,
     DuplicateModuleId {
         module_id: String,
     },
@@ -926,6 +944,10 @@ impl fmt::Display for RegistryError {
             Self::FederatedCapabilityChanged => write!(
                 f,
                 "scope-federated/v1 is fixed at HELLO; restart the module to change it"
+            ),
+            Self::CallerAttestationCapabilityChanged => write!(
+                f,
+                "caller-attestation/v1 is fixed at HELLO; restart the module to change it"
             ),
             Self::DuplicateModuleId { module_id } => {
                 write!(f, "module_id '{module_id}' is already registered")

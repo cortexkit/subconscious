@@ -163,6 +163,7 @@ pub async fn build_bench_forwarding_setup(
                     "bench".into(),
                     None,
                     None,
+                    Default::default(),
                     tokio::time::Instant::now() + std::time::Duration::from_secs(30),
                     false,
                 )

@@ -41,6 +41,9 @@ pub(crate) struct RegistrationSpawn {
     pub(super) binding_key: program_binding::ProgramBindingKey,
     pub(crate) claims: std::sync::OnceLock<Arc<crate::control::claims::LaunchClaims>>,
     pub(crate) module_id: String,
+    /// This launch's authority record, created with it. It dies in the same
+    /// retirement step that ends the channel and voids the claims.
+    pub(crate) authority: Arc<crate::spawn_authority::SpawnAuthorityRecord>,
     pub(super) role: SpawnRole,
     hello_seen: AtomicBool,
     registered: AtomicBool,
@@ -98,11 +101,20 @@ impl RegistrationSpawn {
             .as_ref()
             .map(|binding| binding.channel_key())
             .unwrap_or_else(|| program_binding::ProgramBindingKey::new(handle));
+        // The spawn generation names this launch from now on, so a candidate
+        // that registers and opens routes before cutover attests the same
+        // number it keeps after promotion.
+        let (incarnation, generation) = handle.spawn_events.allocate_generation(module);
         let spawn = Arc::new(Self {
             incarnation: binding_key.incarnation.clone(),
             binding_key,
             claims: std::sync::OnceLock::new(),
             module_id: module.into(),
+            authority: crate::spawn_authority::SpawnAuthorityRecord::new(
+                incarnation,
+                generation,
+                module,
+            ),
             role,
             hello_seen: AtomicBool::new(false),
             registered: AtomicBool::new(false),
@@ -154,8 +166,15 @@ impl RegistrationSpawn {
     pub(super) fn refuse(&self) {
         self.retire();
     }
+    /// The one retirement step, run at the first exit observation (and when
+    /// the launch is refused or its primary registration ends): the authority
+    /// record dies, the claims are voided, the channel is shut and the epoch
+    /// is bumped, synchronously and before the caller's next await.
     pub(crate) fn retire(&self) {
-        self.retire_transition(self.transition.lock().unwrap_or_else(|p| p.into_inner()));
+        self.retire_transition(
+            self.transition.lock().unwrap_or_else(|p| p.into_inner()),
+            true,
+        );
     }
 
     // HELLO publication holds the transition guard, so retirement cannot miss
@@ -175,12 +194,19 @@ impl RegistrationSpawn {
         let transition = self.transition.lock().unwrap_or_else(|p| p.into_inner());
         if !self.registered() {
             self.nonce_registered.store(true, Ordering::Release);
-            self.retire_transition(transition);
+            // The spawn registered by nonce instead: only its unused channel
+            // ends. Its authority record stays live for its nonce consumers.
+            self.retire_transition(transition, false);
         }
     }
 
-    fn retire_transition(&self, transition: std::sync::MutexGuard<'_, ()>) {
+    fn retire_transition(&self, transition: std::sync::MutexGuard<'_, ()>, ends_authority: bool) {
         let revoked;
+        // Marking the record dead comes first; dropping the fence at the end
+        // of this block bumps its epoch after the claims and channel ended.
+        let authority_fence = ends_authority
+            .then(|| self.authority.begin_retirement())
+            .flatten();
         {
             if *self.launch.borrow() == LaunchState::Dead {
                 return;
@@ -209,6 +235,7 @@ impl RegistrationSpawn {
                 endpoint.shutdown();
             }
         }
+        drop(authority_fence);
         drop(transition);
         #[cfg(test)]
         if let Some(pause) = self.retirement_pause.lock().unwrap().take() {
@@ -359,6 +386,65 @@ pub(crate) struct RegistrationService {
 }
 
 impl SupervisorHandle {
+    /// The daemon incarnation spawn generations and authority records belong to.
+    pub(crate) fn daemon_incarnation(&self) -> String {
+        self.spawn_events
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .daemon_incarnation
+            .clone()
+    }
+
+    /// Remember which launch the nonce just minted for `spawn` belongs to. A
+    /// launch that received no nonce (a gated, channel-only launch) records
+    /// nothing.
+    pub(super) fn record_nonce_launch(&self, spawn: &Arc<RegistrationSpawn>) {
+        let nonce = match spawn.role {
+            SpawnRole::Plain => self
+                .spawn_nonces
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&spawn.module_id)
+                .cloned(),
+            SpawnRole::SwapCandidate => self
+                .swaps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&spawn.module_id)
+                .map(|swap| swap.candidate_nonce.clone()),
+        };
+        let Some(nonce) = nonce.filter(|nonce| !nonce.is_empty()) else {
+            return;
+        };
+        let mut launches = self
+            .nonce_launches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        launches.retain(|_, launch| launch.strong_count() != 0);
+        launches.insert(nonce, Arc::downgrade(spawn));
+    }
+
+    /// The authority record of the launch whose nonce `presented` is, when it
+    /// still attests `module_id` exactly as `spawned_consumer_authorized`
+    /// decides. `None` for an unknown, superseded or gated nonce.
+    pub(crate) fn spawned_consumer_record(
+        &self,
+        module_id: &str,
+        presented: &str,
+    ) -> Option<Arc<crate::spawn_authority::SpawnAuthorityRecord>> {
+        if !self.spawned_consumer_authorized(module_id, presented) {
+            return None;
+        }
+        self.nonce_launches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(presented)
+            .and_then(Weak::upgrade)
+            .filter(|spawn| spawn.module_id == module_id)
+            .map(|spawn| spawn.authority.clone())
+    }
+
     pub(crate) fn retire_unused_registration_channel(&self, module: &str, candidate: bool) {
         // Successful registration claims the id even when legacy policy did
         // not require a nonce. Resolve its unused endpoint from our launch

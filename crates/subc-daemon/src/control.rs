@@ -152,6 +152,11 @@ pub(crate) mod claims;
 #[path = "control/config_advertisement_tests.rs"]
 mod config_advertisement_tests;
 mod config_gate;
+mod caller_attestation;
+use caller_attestation::{caller_for_target, scope_acts_for_another};
+#[cfg(all(test, unix, feature = "test-support"))]
+#[path = "control/caller_attestation_tests.rs"]
+mod caller_attestation_tests;
 mod scope_expiry;
 
 mod agent_commands;
@@ -1145,6 +1150,7 @@ impl ControlHandler {
                 CAP_ADMISSION_FACTS_RELAY.to_string(),
                 CAP_SCOPES_V1.to_string(),
                 subc_protocol::scope::SCOPE_FEDERATED_CAPABILITY.to_string(),
+                subc_protocol::peer::CALLER_ATTESTATION_CAPABILITY.to_string(),
                 CAP_ROUTE_ROLE_VERSIONS_V1.to_string(),
                 subc_protocol::manifest::CAP_CATALOG_EVENTS_V1.to_string(),
                 subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1.to_string(),
@@ -1937,7 +1943,7 @@ impl ControlHandler {
     ) -> Result<Frame, RouterError> {
         // Sent before the request reaches `handle_route_open`, so the caller
         // fields come from the raw frame here.
-        let caller = self.route_open_caller_from_frame(frame);
+        let caller = self.route_open_caller_from_frame(ctx, frame);
         self.route_open_admission_refusal_frame(
             ctx,
             &caller,
@@ -2873,6 +2879,13 @@ impl ControlHandler {
             (module_id, routes, reason, drained, terminal)
         });
         let registrations = self.deregister_connection(connection_id, end_reason);
+        // Read before teardown: the spawn whose registration this connection
+        // was. Its registration ending is an authority change for it.
+        let ended_authority = self
+            .forwarding
+            .target_authority_for_connection(connection_id)
+            .ok()
+            .flatten();
         let cleanup = if crash_closed.is_some() {
             self.forwarding.cleanup_connection_counted(connection_id)
         } else {
@@ -2912,6 +2925,9 @@ impl ControlHandler {
         }
         if let Ok(cleanup) = cleanup {
             self.emit_route_goodbyes(cleanup.released);
+        }
+        if let Some(record) = ended_authority {
+            self.change_spawn_authority(&record);
         }
         // Signal the registration-release watch only now that BOTH registry and
         // forwarding teardown are done, so a supervisor waiting to spawn a
@@ -3650,6 +3666,22 @@ impl ControlHandler {
         if let Some(spawn) = publication_spawn {
             self.forwarding
                 .bind_spawn(connection_id, spawn)
+                .map_err(RouterError::Forwarding)?;
+        }
+        // The spawn whose own registration this HELLO is, for `target` on
+        // the route.open reply: its channel, or the launch its nonce was
+        // minted for. A prefix child's HELLO names no spawn of its own.
+        let target_authority = match (&channel_spawn, &prefix_binding) {
+            (Some(spawn), _) => Some(spawn.authority.clone()),
+            (None, None) => hello.launch_nonce.as_deref().and_then(|nonce| {
+                self.supervisor
+                    .spawned_consumer_record(&hello.manifest.module_id, nonce)
+            }),
+            (None, Some(_)) => None,
+        };
+        if let Some(record) = target_authority {
+            self.forwarding
+                .bind_target_authority(connection_id, record)
                 .map_err(RouterError::Forwarding)?;
         }
         #[cfg(test)]
@@ -5128,6 +5160,13 @@ impl ControlHandler {
                     "scope-federated/v1 is fixed at HELLO; restart the module to change it",
                 )?])
             }
+            Err(crate::registry::RegistryError::CallerAttestationCapabilityChanged) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    error_codes::CATALOG_UPDATE_FROZEN_CAPABILITY,
+                    "caller-attestation/v1 is fixed at HELLO; restart the module to change it",
+                )?])
+            }
             result => {
                 result.map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
             }
@@ -5680,11 +5719,13 @@ impl ControlHandler {
         )?])
     }
 
-    /// The principal a route.open's `consumer_identity` attests: `Direct`
-    /// when it presents none, `Reserved` when its launch nonce verifies, and
-    /// `None` when it does not. Only a read of the supervisor's nonces, so it
-    /// can run before any refusal check without changing which check refuses.
-    fn attest_route_open_consumer(
+    /// The principal a `consumer_identity` attests by launch nonce alone:
+    /// `Direct` when it presents none, `Reserved` when its launch nonce
+    /// verifies, and `None` when it does not. Only a read of the supervisor's
+    /// nonces, so it can run before any refusal check without changing which
+    /// check refuses. `route.open` attests through
+    /// [`Self::attest_route_open_consumer`], which reads a claim binding first.
+    fn attest_nonce_consumer(
         &self,
         consumer_identity: Option<&ConsumerIdentity>,
     ) -> Option<Principal> {
@@ -5704,7 +5745,7 @@ impl ControlHandler {
     /// The caller fields for a refusal that only has the raw request frame,
     /// such as the connection-level admission refusal sent before the request
     /// reaches [`Self::handle_route_open`].
-    fn route_open_caller_from_frame(&self, frame: &Frame) -> RouteOpenCaller {
+    fn route_open_caller_from_frame(&self, ctx: &RouteCtx, frame: &Frame) -> RouteOpenCaller {
         let Ok(ClientControlRequest::RouteOpen {
             identity,
             consumer_identity,
@@ -5714,7 +5755,9 @@ impl ControlHandler {
         else {
             return RouteOpenCaller::unknown();
         };
-        let principal = self.attest_route_open_consumer(consumer_identity.as_ref());
+        let principal = self
+            .attest_route_open_consumer(ctx.connection_id, consumer_identity.as_ref())
+            .map(|attested| attested.principal);
         RouteOpenCaller::new(principal.as_ref(), scope.as_ref(), &identity)
     }
 
@@ -5723,13 +5766,12 @@ impl ControlHandler {
         frame: &Frame,
         consumer_identity: Option<ConsumerIdentity>,
     ) -> Result<Result<Principal, Frame>, RouterError> {
-        let attested = self.attest_route_open_consumer(consumer_identity.as_ref());
+        let attested = self.attest_nonce_consumer(consumer_identity.as_ref());
         self.route_open_principal_attested(frame, consumer_identity, attested)
     }
 
-    /// [`Self::route_open_principal`] with `attested` already taken by
-    /// [`Self::attest_route_open_consumer`] for `consumer_identity`, so one
-    /// open checks the launch nonce once.
+    /// [`Self::route_open_principal`] with `attested` already taken for
+    /// `consumer_identity`, so one open checks the launch nonce once.
     fn route_open_principal_attested(
         &self,
         frame: &Frame,
@@ -6080,11 +6122,16 @@ impl ControlHandler {
         );
 
         // The caller's attested principal, requested scope and harness, for
-        // every `route.open refused` line below. The launch nonce is checked
-        // here, once, and the answer is reused where the principal is
-        // enforced further down, so the order of refusals is unchanged.
-        let attested = self.attest_route_open_consumer(consumer_identity.as_ref());
-        let mut caller = RouteOpenCaller::new(attested.as_ref(), scope.as_ref(), &identity);
+        // every `route.open refused` line below. The connection's claim
+        // binding or launch nonce is checked here, once, and the answer is
+        // reused where the principal is enforced further down, so the order
+        // of refusals is unchanged.
+        let attested = self.attest_route_open_consumer(ctx.connection_id, consumer_identity.as_ref());
+        let mut caller = RouteOpenCaller::new(
+            attested.as_ref().map(|attested| &attested.principal),
+            scope.as_ref(),
+            &identity,
+        );
 
         // A malformed declaration is refused first, before anything about the
         // target is looked up: the same body would be refused against any
@@ -6395,8 +6442,28 @@ impl ControlHandler {
             return Ok(vec![error]);
         }
 
-        let principal =
-            match self.route_open_principal_attested(&frame, consumer_identity, attested)? {
+        let principal = match (&attested, consumer_identity.is_some()) {
+            // A claim-bound connection whose launch ended attests nothing,
+            // and it must never fall back to opening as `direct`.
+            (None, false) => {
+                self.observe_route_open_refusal(
+                    ctx,
+                    &caller,
+                    &target_module_id,
+                    "registration_channel_closed",
+                    crate::supervise::REGISTRATION_CHANNEL_CLOSED,
+                );
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    crate::supervise::REGISTRATION_CHANNEL_CLOSED,
+                    "the claim binding's launch has ended",
+                )?]);
+            }
+            _ => match self.route_open_principal_attested(
+                &frame,
+                consumer_identity,
+                attested.as_ref().map(|attested| attested.principal.clone()),
+            )? {
                 Ok(principal) => principal,
                 Err(error) => {
                     self.observe_route_open_refusal(
@@ -6408,13 +6475,42 @@ impl ControlHandler {
                     );
                     return Ok(vec![error]);
                 }
-            };
+            },
+        };
+        let attested = attested.expect("an attested principal was resolved above");
         timings.principal = principal_label(&principal);
+
+        // The opener's spawn authority, read once here and carried with the
+        // relay; nothing below reads its record again.
+        let Ok(mut caller_capture) = attested.capture() else {
+            self.observe_route_open_refusal(
+                ctx,
+                &caller,
+                &target_module_id,
+                "registration_channel_closed",
+                crate::supervise::REGISTRATION_CHANNEL_CLOSED,
+            );
+            return Ok(vec![control_error_frame(
+                &frame,
+                crate::supervise::REGISTRATION_CHANNEL_CLOSED,
+                "the opener's launch has ended",
+            )?]);
+        };
+        // The caller-side checks below read the opener's own spawn: its
+        // module from its record and its manifest from its own registration,
+        // never another launch's active registration under the same id.
+        let caller_module_id = match &attested.spawn {
+            Some((record, _)) => Some(record.module_id().to_owned()),
+            None => match &principal {
+                Principal::Reserved { module_id } => Some(module_id.clone()),
+                _ => None,
+            },
+        };
 
         // Only Callosum can attest a production phone build. Consume the claim
         // here so it can be kept on the route without reaching any module.
         let build_class = identity.build_class.take().filter(|build_class| {
-            if matches!(&principal, Principal::Reserved { module_id } if module_id == "callosum") {
+            if caller_module_id.as_deref() == Some("callosum") {
                 build_class == subc_protocol::BUILD_CLASS_PRODUCTION
             } else {
                 if self
@@ -6433,42 +6529,35 @@ impl ControlHandler {
         // This is attested, control-plane policy for supervised module origins.
         // Keep it before route reservation and out of the opaque forwarding hot
         // path: data frames must never acquire a per-frame capability check.
-        if let Principal::Reserved {
-            module_id: opening_module_id,
-        } = &principal
+        if let Some(opening_registration) =
+            self.caller_registration(&attested, &admission_registry)
         {
-            if let Some(opening_registration) = admission_registry
-                .iter()
-                .find(|r| r.manifest.module_id == *opening_module_id)
+            let opening_module_id = opening_registration.manifest.module_id.as_str();
+            if let Some(capability) =
+                denied_capability(&opening_registration.manifest, &registration.manifest)
             {
-                if let Some(capability) =
-                    denied_capability(&opening_registration.manifest, &registration.manifest)
-                {
-                    warn!(
-                        opening_module_id,
-                        target_module_id,
-                        capability,
-                        "refusing route.open because an attested capability deny edge matches"
-                    );
-                    return Ok(vec![self.route_open_refusal_frame(ctx, &caller,
-                        &frame,
-                        &target_module_id,
-                        "capability_deny_edge",
-                        "capability_forbidden",
-                        format!(
-                            "module_id '{opening_module_id}' must never reach capability '{capability}' provided by '{target_module_id}'"
-                        ),
-                    )?]);
-                }
+                warn!(
+                    opening_module_id,
+                    target_module_id,
+                    capability,
+                    "refusing route.open because an attested capability deny edge matches"
+                );
+                return Ok(vec![self.route_open_refusal_frame(ctx, &caller,
+                    &frame,
+                    &target_module_id,
+                    "capability_deny_edge",
+                    "capability_forbidden",
+                    format!(
+                        "module_id '{opening_module_id}' must never reach capability '{capability}' provided by '{target_module_id}'"
+                    ),
+                )?]);
             }
         }
 
         if admission_facts.is_some() {
-            let carrier_matches = matches!(
-                &principal,
-                Principal::Reserved { module_id }
-                    if self.admission_facts_carrier_module_id.as_deref() == Some(module_id)
-            );
+            let carrier_matches = caller_module_id.is_some()
+                && self.admission_facts_carrier_module_id.as_deref()
+                    == caller_module_id.as_deref();
             if !carrier_matches {
                 return Ok(vec![self.route_open_refusal_frame(
                     ctx,
@@ -6564,6 +6653,11 @@ impl ControlHandler {
         // issued, exactly as the `route.open accepted` line does.
         if let Some(stamp) = &scope_stamp {
             caller.scope = route_open_scope_label(stamp);
+        }
+        // Decided from the admitted stamp, before any field of it is stripped
+        // for a target that lacks the capability to read it.
+        if scope_stamp.as_ref().is_some_and(scope_acts_for_another) {
+            caller_capture = caller_capture.map(crate::spawn_authority::CallerCapture::relayed);
         }
 
         // Allow resolvable missing-tail paths so a vanished directory does not
@@ -6679,6 +6773,12 @@ impl ControlHandler {
                 identity.harness.clone(),
                 build_class,
                 operator_app.clone(),
+                crate::forwarding::RouteAuthority {
+                    incarnation: self.supervisor.daemon_incarnation(),
+                    caller: caller_capture
+                        .as_ref()
+                        .map(|caller| caller.authority.pair()),
+                },
                 relay_deadline,
                 busy_refusals == Some(true),
             )
@@ -6892,7 +6992,11 @@ impl ControlHandler {
                                 .any(|cap| cap == OPERATOR_APP_CAPABILITY)
                         })
                     }),
-            );
+            )
+            .with_caller(caller_for_target(
+                caller_capture.as_ref(),
+                relay_capabilities,
+            ));
         let relay_body = crate::bind_compat::encode_bind(
             &relay,
             &peer,

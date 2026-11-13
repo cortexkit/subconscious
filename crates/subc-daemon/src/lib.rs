@@ -48,6 +48,7 @@ pub mod router;
 mod run_dir_lock;
 mod scopes;
 pub mod server;
+pub(crate) mod spawn_authority;
 pub mod stderr_tail;
 mod subtree_resources;
 pub mod supervise;

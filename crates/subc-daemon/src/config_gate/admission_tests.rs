@@ -4188,7 +4188,7 @@ async fn config_recovery_stamped_unapproved_actor_enable_is_refused() {
         Arc::new(crate::Registry::default()),
         RestartPolicy::default(),
     )
-    .with_config_runtime(owner);
+    .with_config_runtime(owner.clone());
     let module = supervisor
         .supervise_configured_requested_async(
             unapproved,
@@ -4205,11 +4205,13 @@ async fn config_recovery_stamped_unapproved_actor_enable_is_refused() {
     let state = module.status().unwrap();
     module.stop().await.unwrap();
     assert!(
-        matches!(result, Err(crate::SuperviseError::ConfigHeld { ref code, .. }) if code == "config_gated"),
+        matches!(result, Err(crate::SuperviseError::Spawn { ref source, .. }) if source.to_string().contains("config_gated: module is not approved")),
         "stamped-unapproved enable must refuse, not stage: {result:?}"
     );
     assert!(!state.enabled);
     assert!(!state.process_alive);
+    assert_eq!(state.state, ModuleState::Disabled);
+    assert!(!owner.has_recorded_admission_hold("not-approved"));
 }
 
 #[cfg(target_os = "linux")]

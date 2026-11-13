@@ -13,14 +13,11 @@ pub(crate) const CONFIG_WARMUP_SLACK: Duration = Duration::from_secs(10);
 fn allocate_spawn(
     state: &mut OwnerState,
     module: &str,
+    generation: u64,
     at: tokio::time::Instant,
     register: Duration,
     health: Duration,
 ) -> Result<DeliverySpawn> {
-    let generation = state
-        .store
-        .loaded_module_generation(module)
-        .ok_or_else(|| GateError::new("config_gated", "configuration store is in recovery"))?;
     state.delivery.next_spawn = state.delivery.next_spawn.checked_add(1).ok_or_else(|| {
         GateError::new(
             "delivery_spawn_exhausted",
@@ -833,7 +830,9 @@ impl RuntimeOwner {
             }
         };
         Ok(Some(
-            state.store.loaded_module_generation(&spawn.module) == Some(spawn.generation)
+            super::admission::AdmissionCache::from_state(&state)
+                .spawn_generation(&spawn.module)
+                .is_ok_and(|generation| generation == spawn.generation)
                 && state
                     .delivery
                     .unregistered_children
@@ -849,7 +848,7 @@ impl RuntimeOwner {
             hook();
         }
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn exhaust_delivery_spawns_for_test(&self) {
         self.lock().unwrap().delivery.next_spawn = u64::MAX;
     }
@@ -861,16 +860,20 @@ impl RuntimeOwner {
     pub(crate) fn unregistered_spawn_count_for_test(&self) -> usize {
         self.lock().unwrap().delivery.unregistered_children.len()
     }
-    pub(crate) fn delivery_spawned_in_slot(
+    pub(crate) fn delivery_spawned_for_admission_in_slot(
         &self,
         module: &str,
+        admission: &super::admission::SpawnAdmission,
         at: tokio::time::Instant,
         register: Duration,
         health: Duration,
         active: bool,
     ) -> Result<Option<DeliverySpawn>> {
         let mut state = OwnerGuard(
-            self.inner.try_lock().map_err(|_| {
+            self.inner.try_lock().map_err(|error| {
+                if matches!(error, std::sync::TryLockError::Poisoned(_)) {
+                    return GateError::new("config_unavailable", "configuration owner is poisoned");
+                }
                 GateError::new(
                     "config_delivery_deferred",
                     "configuration publication is busy",
@@ -882,12 +885,38 @@ impl RuntimeOwner {
             self,
         );
         state.store.check()?;
-        let spawn = allocate_spawn(&mut state, module, at, register, health)?;
+        let spawn = allocate_spawn(
+            &mut state,
+            module,
+            admission.generation(),
+            at,
+            register,
+            health,
+        )?;
         state
             .delivery
             .unregistered_children
             .insert((module.into(), active), spawn.clone());
         Ok(Some(spawn))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delivery_spawned_in_slot(
+        &self,
+        module: &str,
+        at: tokio::time::Instant,
+        register: Duration,
+        health: Duration,
+        active: bool,
+    ) -> Result<Option<DeliverySpawn>> {
+        let spawn = self.delivery_spawned(module, at, register, health)?;
+        if let Some(spawn) = &spawn {
+            self.lock()?
+                .delivery
+                .unregistered_children
+                .insert((module.into(), active), spawn.clone());
+        }
+        Ok(spawn)
     }
     pub(crate) fn delivery_take_recoveries(
         &self,
@@ -966,9 +995,12 @@ impl RuntimeOwner {
     ) -> Result<Option<DeliverySpawn>> {
         let mut state = self.lock()?;
         state.store.check()?;
+        let generation =
+            super::admission::AdmissionCache::from_state(&state).spawn_generation(module)?;
         allocate_spawn(
             &mut state,
             module,
+            generation,
             spawned_at,
             register_timeout,
             first_health_budget,

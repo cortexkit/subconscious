@@ -40,7 +40,7 @@ impl<'a> SpawnDelivery<'a> {
         spec: &ModuleSpec,
         base: &subc_config::Digest,
         detail: &str,
-    ) -> bool {
+    ) -> Result<bool, SuperviseError> {
         self.runtime
             .0
             .record_program_refusal(
@@ -48,7 +48,7 @@ impl<'a> SpawnDelivery<'a> {
                 base,
                 subc_config::raw_digest(detail.as_bytes()),
             )
-            .unwrap_or(true)
+            .map_err(|error| gate_hold_error(spec, error, Some(self.runtime)))
     }
     pub(super) fn runtime(&self) -> ConfigDelivery {
         self.runtime.clone()
@@ -60,7 +60,7 @@ impl<'a> SpawnDelivery<'a> {
         self.runtime
             .0
             .prepare_spawn(spec)
-            .map_err(|error| gate_hold_error(spec, error))
+            .map_err(|error| gate_hold_error(spec, error, Some(self.runtime)))
     }
     pub(super) fn check(
         &self,
@@ -70,7 +70,7 @@ impl<'a> SpawnDelivery<'a> {
         self.runtime
             .0
             .check_spawn(&spec.module_id, admission)
-            .map_err(|error| gate_hold_error(spec, error))
+            .map_err(|error| gate_hold_error(spec, error, Some(self.runtime)))
     }
     pub(super) fn module_gate(
         &self,
@@ -79,7 +79,7 @@ impl<'a> SpawnDelivery<'a> {
         self.runtime
             .0
             .module_gate(&spec.module_id)
-            .map_err(|error| gate_hold_error(spec, error))
+            .map_err(|error| gate_hold_error(spec, error, Some(self.runtime)))
     }
     #[cfg(test)]
     pub(super) fn pause_preflight_for_test(&self) {
@@ -101,35 +101,49 @@ impl<'a> SpawnDelivery<'a> {
     pub(super) fn spawned(
         &self,
         spec: &ModuleSpec,
+        admission: &crate::config_gate::runtime::SpawnAdmission,
         at: Instant,
         role: SpawnRole,
     ) -> Result<Option<DeliverySpawn>, SuperviseError> {
         self.runtime
             .0
-            .delivery_spawned_in_slot(
+            .delivery_spawned_for_admission_in_slot(
                 &spec.module_id,
+                admission,
                 at,
                 self.register_timeout,
                 self.health_budget,
                 !matches!(role, SpawnRole::SwapCandidate),
             )
-            .map_err(|error| gate_hold_error(spec, error))
+            .map_err(|error| gate_hold_error(spec, error, Some(self.runtime)))
     }
 }
 
 pub(super) fn gate_hold_error(
     spec: &ModuleSpec,
     error: crate::config_gate::GateError,
+    delivery: Option<&ConfigDelivery>,
 ) -> SuperviseError {
     if error.code == "config_delivery_deferred" {
         SuperviseError::ConfigDeliveryDeferred {
             module_id: spec.module_id.clone(),
         }
-    } else {
+    } else if matches!(
+        error.code.as_str(),
+        "config_gated" | "program_refused" | subc_control::REGISTRATION_CHANNEL_UNSUPPORTED
+    ) && delivery
+        .is_some_and(|delivery| delivery.0.has_recorded_admission_hold(&spec.module_id))
+    {
         SuperviseError::ConfigHeld {
             module_id: spec.module_id.clone(),
             code: error.code,
             detail: error.detail,
+        }
+    } else {
+        SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source: std::io::Error::other(error.to_string()),
+            cgroup_path: None,
         }
     }
 }

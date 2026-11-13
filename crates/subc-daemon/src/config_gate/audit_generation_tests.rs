@@ -56,8 +56,8 @@ async fn terminal_fence_release(crash: bool) {
         .admission_releases
         .iter()
         .any(|module| module == "a"));
-    // Exercise the exact actor command used by the worker, with its reply as
-    // the barrier: an unrelated terminal actor must reject this release.
+    // Await the worker's actor command, not a timer: a module that exited on
+    // its own must ignore the release.
     let released = module.release_config_hold().await.unwrap();
     let after = module.status().unwrap();
     let after_retry = module.retry_deadline_for_test();
@@ -230,7 +230,11 @@ async fn audit_registration_deferred_generation_survives_two_active_child_exits(
     restarted.registered(INCUMBENT, &spawn).unwrap();
     let view = pending(&restarted, INCUMBENT);
     assert_eq!(view.generation, 2);
-    applied(&restarted, INCUMBENT, &view, true).unwrap();
+    restarted.ready(INCUMBENT, "a", 2).unwrap();
+    assert_eq!(
+        applied(&restarted, INCUMBENT, &view, true).unwrap(),
+        AppliedDisposition::Active
+    );
     assert_active(&restarted, INCUMBENT, 2);
 }
 

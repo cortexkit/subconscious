@@ -1626,6 +1626,8 @@ struct ActorSelectCheckpoint {
 #[derive(Debug, Clone, PartialEq)]
 struct SupervisorSnapshot {
     admission_refused: Option<String>,
+    /// Distinguishes an admission-parked actor from an unrelated terminal exit.
+    config_hold_parked: bool,
     legacy_registration_spawn: bool,
     registration_declaration: Option<String>,
     stop_reason: Option<ModuleStopReason>,
@@ -1786,6 +1788,7 @@ impl SupervisorSnapshot {
     fn new(state: ModuleState, enabled: bool) -> Self {
         Self {
             admission_refused: None,
+            config_hold_parked: false,
             legacy_registration_spawn: false,
             registration_declaration: None,
             stop_reason: None,
@@ -4722,7 +4725,7 @@ impl SupervisedModule {
             }))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn retry_deadline_for_test(&self) -> Option<Instant> {
         lock_snapshot(&self.inner.snapshot)
             .unwrap()
@@ -6784,7 +6787,11 @@ async fn budgeted_restart_child(
         .and_then(|delivery| delivery.0.check_module_hold(&spec.module_id).err())
         .filter(|error| error.code != "config_delivery_deferred")
     {
-        return Err(config_delivery::gate_hold_error(spec, error));
+        return Err(config_delivery::gate_hold_error(
+            spec,
+            error,
+            runtime.config_delivery.as_ref(),
+        ));
     }
     let recovery_reason = if health_failure {
         "health_check"
@@ -6936,6 +6943,18 @@ fn hold_config_spawn(
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
 ) -> Result<(), SuperviseError> {
+    {
+        let state = lock_snapshot(snapshot)?;
+        if !state.enabled
+            || (!state.config_hold_parked
+                && matches!(
+                    state.state,
+                    ModuleState::Failed | ModuleState::Stopped | ModuleState::Disabled
+                ))
+        {
+            return Ok(());
+        }
+    }
     let admission_refused = runtime
         .config_delivery
         .as_ref()
@@ -6960,6 +6979,7 @@ fn hold_config_spawn(
     }
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
         state.admission_refused = admission_refused;
+        state.config_hold_parked = true;
         state.state = ModuleState::Stopped;
         state.respawn_pending = false;
         state.failed_retry.pending = None;
@@ -8914,6 +8934,42 @@ async fn handle_supervisor_command(
     commands: &mut mpsc::Receiver<SupervisorCommand>,
     requeued: &mut VecDeque<SupervisorCommand>,
 ) -> bool {
+    if let SupervisorCommand::SetEnabled {
+        enabled: true,
+        reset_budget: false,
+        reply,
+        ..
+    } = command
+    {
+        let parked = lock_snapshot(snapshot).is_ok_and(|state| {
+            state.config_hold_parked
+                && state.enabled
+                && !state.process_alive
+                && child.is_none()
+                && state.state == ModuleState::Stopped
+        });
+        // Clearing a configuration-delivery block must not restart a child that
+        // exited on its own or exhausted its crash budget. Resume only an actor
+        // stopped by a configuration hold; otherwise leave its slow retry alone.
+        let result = if parked {
+            set_child_enabled_with_budget_policy(
+                spec,
+                runtime,
+                registry,
+                process_liveness,
+                snapshot,
+                child,
+                true,
+                &runtime.failure_context(false),
+                false,
+            )
+            .await
+        } else {
+            Ok(false)
+        };
+        let _ = reply.send(result);
+        return true;
+    }
     if !matches!(
         command,
         SupervisorCommand::UpdateConfiguration { .. }
@@ -8938,7 +8994,9 @@ async fn handle_supervisor_command(
         .as_ref()
         .and_then(|delivery| delivery.0.check_module_hold(&spec.module_id).err())
         .filter(|error| error.code != "config_delivery_deferred")
-        .map(|error| config_delivery::gate_hold_error(spec, error))
+        .map(|error| {
+            config_delivery::gate_hold_error(spec, error, runtime.config_delivery.as_ref())
+        })
         .or_else(|| recovery_block_error(spec, &runtime.child_roster))
         .or_else(|| {
             runtime
@@ -8979,6 +9037,8 @@ async fn handle_supervisor_command(
                     let result = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                         changed = !state.enabled;
                         state.enabled = true;
+                        state.config_hold_parked = true;
+                        state.state = ModuleState::Stopped;
                     })
                     .map(|_| changed);
                     if result.is_ok() && changed {
@@ -9015,15 +9075,21 @@ async fn handle_supervisor_command(
                 let enabled = lock_snapshot(snapshot)?.enabled;
                 if enabled != next.enabled {
                     let held = next.enabled && runtime.config_delivery.as_ref()
-                        .is_some_and(|delivery| delivery.0.check_module_hold(&spec.module_id).is_err());
+                        .is_some_and(|delivery| delivery.0.has_recorded_admission_hold(&spec.module_id)
+                            || delivery.0.check_module_hold(&spec.module_id).is_err_and(|error| error.code == "config_delivery_deferred"));
                     if held {
                         // Preserve module-delivery failure/recovery holds. The
                         // admission release starts the actor when its own hold ends.
-                        update_snapshot(snapshot, Some(&spec.module_id), |state| state.enabled = true)?;
+                        reset_restart_count(snapshot, &spec.module_id)?;
+                        update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                            state.enabled = true;
+                            state.config_hold_parked = true;
+                            state.state = ModuleState::Stopped;
+                        })?;
                     } else {
                         match set_child_enabled_with_budget_policy(
                             spec, runtime, registry, process_liveness, snapshot, child,
-                            next.enabled, &runtime.failure_context(false), false,
+                            next.enabled, &runtime.failure_context(false), true,
                         ).await {
                             Ok(_) => {},
                             Err(SuperviseError::ConfigHeld { .. }) if next.enabled => {},
@@ -9057,7 +9123,7 @@ async fn handle_supervisor_command(
                         Err(SuperviseError::ConfigHeld { .. }) => hold_config_spawn(spec, runtime, snapshot)?,
                         Err(error) => {
                             fail_snapshot(snapshot, Some(&spec.module_id), None, &runtime.failure_context(false));
-                            error!(module_id=%spec.module_id, %error, "committed stamp replacement is parked");
+                            return Err(error);
                         }
                     }
                 }
@@ -9159,7 +9225,7 @@ async fn handle_supervisor_command(
             let held = runtime
                 .config_delivery
                 .as_ref()
-                .is_some_and(|delivery| delivery.0.check_module_hold(&spec.module_id).is_err());
+                .is_some_and(|delivery| delivery.0.has_recorded_admission_hold(&spec.module_id));
             let result = if held {
                 cancel_deferred_reload(
                     runtime,
@@ -9171,8 +9237,15 @@ async fn handle_supervisor_command(
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) = None;
                 update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                    if child.is_none() {
+                    if !state.enabled {
+                        return;
+                    }
+                    if child.is_none()
+                        && (state.config_hold_parked
+                            || !matches!(state.state, ModuleState::Stopped | ModuleState::Failed))
+                    {
                         state.state = ModuleState::Stopped;
+                        state.config_hold_parked = true;
                     }
                     state.respawn_pending = false;
                     state.failed_retry.pending = None;
@@ -9210,7 +9283,7 @@ async fn handle_supervisor_command(
                 )
                 .await;
                 if let Ok(notice) = notice {
-                    let _ = drain_optional_child(
+                    let drained = drain_optional_child(
                         &spec.module_id,
                         spec.protocol,
                         notice,
@@ -9226,6 +9299,17 @@ async fn handle_supervisor_command(
                         &runtime.failure_context(true),
                     )
                     .await;
+                    if drained.is_ok()
+                        && runtime.config_delivery.as_ref().is_some_and(|delivery| {
+                            delivery.0.has_recorded_admission_hold(&spec.module_id)
+                        })
+                    {
+                        let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                            state.state = ModuleState::Stopped;
+                            state.config_hold_parked = state.enabled;
+                            state.failed_retry.pending = None;
+                        });
+                    }
                 }
             } else if let Err(error) = budgeted_restart_child(
                 spec,
@@ -10029,6 +10113,9 @@ async fn set_child_enabled_with_budget_policy(
         debug!(module_id = %spec.module_id, "supervised module enabled");
         Ok(true)
     } else {
+        update_snapshot(snapshot, Some(&spec.module_id), |state| {
+            state.config_hold_parked = false
+        })?;
         let stop_notice = begin_forwarding_drain_if_configured(
             spec,
             runtime,
@@ -10975,7 +11062,7 @@ fn spawn_child_in_slot(
         (config_delivery, &result)
     {
         if let Some(base) = checked_base.as_ref().filter(|_| code == "program_refused") {
-            if !delivery.record_refusal(spec, base, detail) {
+            if !delivery.record_refusal(spec, base, detail)? {
                 result = Err(spawn_plan_stale(spec));
             }
         }
@@ -11314,8 +11401,16 @@ async fn spawn_child_in_slot_async(
                 .0
                 .on_blocking(move |owner| owner.record_program_refusal(&module, &base, identity))
                 .await;
-            if matches!(recorded, Ok(false)) {
-                result = Err(spawn_plan_stale(spec));
+            match recorded {
+                Ok(true) => {}
+                Ok(false) => result = Err(spawn_plan_stale(spec)),
+                Err(error) => {
+                    result = Err(config_delivery::gate_hold_error(
+                        spec,
+                        error,
+                        Some(delivery),
+                    ))
+                }
             }
         }
     }
@@ -11335,12 +11430,16 @@ fn validate_spawn_program(
                 // the operator as a changed or unapprovable program.
                 if let (Some(context), Some(base)) = (delivery, admission.approved_base()) {
                     if error.code == "program_refused"
-                        && !context.record_refusal(spec, base, &error.detail)
+                        && !context.record_refusal(spec, base, &error.detail)?
                     {
                         return Err(spawn_plan_stale(spec));
                     }
                 }
-                return Err(config_delivery::gate_hold_error(spec, error));
+                return Err(config_delivery::gate_hold_error(
+                    spec,
+                    error,
+                    delivery.map(|context| context.runtime()).as_ref(),
+                ));
             }
         }
     }
@@ -11738,7 +11837,16 @@ fn prepare_child_in_slot(
     let spawned_at = Instant::now();
     let delivery_context = config_delivery;
     let config_delivery = config_delivery
-        .map(|delivery| delivery.spawned(spec, spawned_at, role))
+        .map(|delivery| {
+            delivery.spawned(
+                spec,
+                spawn_admission
+                    .as_ref()
+                    .expect("delivery prepares spawn admission"),
+                spawned_at,
+                role,
+            )
+        })
         .transpose()?
         .flatten();
     let mut delivery_registration =
@@ -11832,7 +11940,7 @@ fn launch_child_in_slot(
         context
             .0
             .pause_spawn_before_exec()
-            .map_err(|error| config_delivery::gate_hold_error(spec, error))?;
+            .map_err(|error| config_delivery::gate_hold_error(spec, error, Some(context)))?;
     }
     let mut command = prepared.command;
     let carrying = prepared.carrying;
@@ -15181,6 +15289,7 @@ fn set_running(
     state.drain_disposition_detail = None;
     state.spawn_failure = None;
     state.admission_refused = None;
+    state.config_hold_parked = false;
     state.legacy_registration_spawn =
         child.registration_spawn.is_some() && child.admission_base.is_none();
     state.registration_declaration = child.registration_declaration.clone();
@@ -15306,6 +15415,7 @@ fn fail_snapshot(
 ) {
     if let Err(err) = update_snapshot(snapshot, module_id, |state| {
         state.state = ModuleState::Failed;
+        state.config_hold_parked = false;
         clear_current_process_facts(state);
         if failure.may_retry() && state.enabled {
             state.failed_retry.schedule(module_id.unwrap_or("unknown"));

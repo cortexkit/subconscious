@@ -32,6 +32,10 @@ struct ModuleAdmission {
 }
 
 impl AdmissionCache {
+    pub(super) fn spawn_generation(&self, module: &str) -> Result<u64> {
+        self.decision(module)
+            .map(|authority| authority.map_or(0, |authority| authority.generation))
+    }
     pub(super) fn registration_declarations(&self) -> Option<BTreeMap<String, String>> {
         (self.state == StoreState::Stamped).then(|| {
             self.modules
@@ -253,6 +257,11 @@ pub(crate) struct SpawnAdmission {
 }
 
 impl SpawnAdmission {
+    pub(crate) fn generation(&self) -> u64 {
+        self.authority
+            .as_ref()
+            .map_or(0, |authority| authority.generation)
+    }
     pub(crate) fn registration_declaration(&self, module: &str) -> Option<String> {
         self.authority.as_ref().map(|authority| {
             super::super::registration::declaration(&authority.snapshot, module).into()
@@ -432,7 +441,13 @@ impl RuntimeOwner {
     pub(crate) fn prepare_spawn(&self, spec: &ModuleSpec) -> Result<SpawnAdmission> {
         let authority = {
             let mut state = OwnerGuard(
-                self.inner.try_lock().map_err(|_| {
+                self.inner.try_lock().map_err(|error| {
+                    if matches!(error, std::sync::TryLockError::Poisoned(_)) {
+                        return GateError::new(
+                            "config_unavailable",
+                            "configuration owner is poisoned",
+                        );
+                    }
                     GateError::new(
                         "config_delivery_deferred",
                         "configuration publication is busy",
@@ -443,7 +458,14 @@ impl RuntimeOwner {
                 &self.module_gates,
                 self,
             );
-            Self::check_authority(&mut state, false)?;
+            // Store recovery is a launch hold released by the recovery worker.
+            // A failed program capture or refusal write is not such a hold.
+            if let Err(error) = Self::check_authority(&mut state, false) {
+                if AdmissionCache::from_state(&state).is_recovering() {
+                    return Err(GateError::new("config_gated", error.detail));
+                }
+                return Err(error);
+            }
             AdmissionCache::from_state(&state)
                 .decision(&spec.module_id)?
                 .cloned()
@@ -535,6 +557,18 @@ impl RuntimeOwner {
             .map_err(|_| GateError::new("config_gated", "admission authority is unavailable"))?
             .decision(module)
             .map(|_| ())
+    }
+
+    pub(crate) fn has_recorded_admission_hold(&self, module: &str) -> bool {
+        !self.inner.is_poisoned()
+            && self.published.read().is_ok_and(|view| {
+                view.admission.is_recovering()
+                    || view
+                        .admission
+                        .held_modules()
+                        .iter()
+                        .any(|held| held == module)
+            })
     }
 
     pub(crate) fn check_rescan_hold(&self) -> Result<()> {

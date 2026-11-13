@@ -169,9 +169,30 @@ struct RegistryInner {
     /// the new generation together.
     unpublished: HashSet<ConnectionId>,
     generation: u64,
+    catalog_changes: Option<watch::Sender<u64>>,
 }
 
 impl Registry {
+    /// Capture the current catalog generation and subscribe atomically. Writers
+    /// replace one value; they never wait for discovery clients to receive it.
+    pub(crate) fn subscribe_catalog_changes(&self) -> Result<watch::Receiver<u64>, RegistryError> {
+        let mut inner = self.lock_inner()?;
+        let generation = inner.generation;
+        Ok(inner
+            .catalog_changes
+            .get_or_insert_with(|| watch::channel(generation).0)
+            .subscribe())
+    }
+
+    /// Notify discovery after an approved declaration-set change or a change to
+    /// the spawn's first-party mark (whether it may receive automatic grants).
+    /// The authority owner calls this only after publishing the new state; it
+    /// must not hold a spawn or forwarding lock while taking the registry lock.
+    pub fn catalog_authority_changed(&self) -> Result<(), RegistryError> {
+        self.lock_inner()?.bump_generation();
+        Ok(())
+    }
+
     /// Subscribe before reading a registration so a change between the read
     /// and the supervisor's wait remains pending on this receiver.
     pub(crate) fn subscribe_module_changes(
@@ -896,6 +917,9 @@ impl RegistryInner {
 
     fn bump_generation(&mut self) {
         self.generation = self.generation.wrapping_add(1);
+        if let Some(sender) = &self.catalog_changes {
+            sender.send_replace(self.generation);
+        }
     }
 }
 

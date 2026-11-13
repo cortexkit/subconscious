@@ -105,6 +105,7 @@ const SUBC_CONTROL_OPS: &[&str] = &[
     ops::ACTIVITY_SUBSCRIBE,
     ops::SERVER_DESCRIBE,
     ops::CATALOG_LIST,
+    ops::CATALOG_WATCH,
     ops::ROUTE_OPEN,
     ops::ROUTE_POLL,
     ops::ROUTE_CLOSING,
@@ -155,6 +156,7 @@ mod config_gate;
 mod scope_expiry;
 
 mod agent_commands;
+pub(crate) mod catalog;
 mod rescan_checked;
 use rescan_checked::{RescanMode, RescanPlan};
 
@@ -442,6 +444,7 @@ pub struct ControlHandler {
     config_review_admission_is_default: bool,
     activity: Option<crate::activity::ActivityLedger>,
     activity_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
+    catalog_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
     forwarding: Arc<ForwardingTable>,
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
     supervisor: SupervisorHandle,
@@ -1129,6 +1132,7 @@ impl ControlHandler {
             config_review_admission_is_default: true,
             activity: None,
             activity_streams: Arc::new(Mutex::new(HashMap::new())),
+            catalog_streams: Arc::new(Mutex::new(HashMap::new())),
             forwarding,
             process_liveness: None,
             supervisor: SupervisorHandle::new(),
@@ -2455,6 +2459,7 @@ impl ControlHandler {
                         .supervisor
                         .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)
                     || self.cancel_activity_subscription(ctx, &frame)?
+                    || self.cancel_catalog_subscription(ctx.connection_id, frame.header.corr)
                 {
                     Ok(Vec::new())
                 } else {
@@ -2498,6 +2503,24 @@ impl ControlHandler {
                     op.as_ref().map(|probe| probe.op.as_str()),
                 )? {
                     return Ok(vec![refusal]);
+                }
+                if op
+                    .as_ref()
+                    .is_some_and(|probe| probe.op == ops::CATALOG_WATCH)
+                {
+                    return self.handle_catalog_watch(ctx, frame);
+                }
+                if op
+                    .as_ref()
+                    .is_some_and(|probe| probe.op == MODULE_TO_SUBC_OP_CATALOG_UPDATE)
+                    && subc_protocol::provider_declarations::catalog_update_has_provider_declarations(&frame.body)
+                        .unwrap_or(false)
+                {
+                    return Ok(vec![control_error_frame(
+                        &frame,
+                        error_codes::CATALOG_UPDATE_FROZEN_DECLARATIONS,
+                        "provider_declarations are fixed at HELLO; restart the module to change them",
+                    )?]);
                 }
                 if let Some(probe) = op
                     .as_ref()
@@ -2750,6 +2773,7 @@ impl ControlHandler {
         // never records a launch nonce, so it cannot leave this connection any
         // nonce authority.
         self.agent_declarations.close(connection_id);
+        self.close_catalog_subscriptions(connection_id);
         #[cfg(test)]
         self.pause_cleanup_for_test(0);
         if let Some(spawn) = self.supervisor.registration_spawn(connection_id) {
@@ -3138,6 +3162,13 @@ impl ControlHandler {
                 )?])
             }
         };
+        if let Err(detail) = catalog::validate_hello_declarations(&hello_value) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                error_codes::INVALID_PROVIDER_DECLARATIONS,
+                detail,
+            )?]);
+        }
         if let Some(module) = hello_value
             .get("manifest")
             .and_then(|value| value.get("module_id"))
@@ -5643,31 +5674,32 @@ impl ControlHandler {
                     .unwrap_or(true)
             })
             .map(|(registration, nonce_verified)| {
+                let entry = self
+                    .catalog_discovery_entry(&registration, module_id.is_some())
+                    .map_err(|err| RouterError::backend(0, frame.header.corr, err))?;
                 let not_ready = self.not_ready_reason(&registration);
-                let roles = registration.manifest.provides;
-                CatalogEntry::new(
-                    registration.manifest.module_id,
-                    roles,
-                    registration.control_ops,
-                )
-                .with_ready(not_ready.is_none())
-                .with_display_name(registration.manifest.display_name)
-                .with_not_ready(not_ready)
-                .with_module_version(Some(registration.manifest.module_version))
-                .with_provenance(registration.manifest.provenance)
-                .with_capabilities(registration.manifest.capabilities)
-                .with_self_signals(registration.manifest.self_signals)
-                .with_events(registration.manifest.events)
-                .with_operation_delivery(registration.manifest.operation_delivery)
-                .with_operation_payload(registration.manifest.operation_payload)
-                .with_flow_operations(registration.manifest.flow_operations)
-                .with_operation_deferral(registration.manifest.operation_deferral)
-                .with_confirm_operations(registration.manifest.confirm_operations)
-                .with_rich_ui(registration.manifest.rich_ui)
-                .with_role_declarations(registration.manifest.role_declarations)
-                .with_nonce_verified(nonce_verified)
+                let mut entry = entry;
+                entry.roles = registration.manifest.provides;
+                entry.control_ops = registration.control_ops;
+                Ok(entry
+                    .with_ready(not_ready.is_none())
+                    .with_display_name(registration.manifest.display_name)
+                    .with_not_ready(not_ready)
+                    .with_module_version(Some(registration.manifest.module_version))
+                    .with_provenance(registration.manifest.provenance)
+                    .with_capabilities(registration.manifest.capabilities)
+                    .with_self_signals(registration.manifest.self_signals)
+                    .with_events(registration.manifest.events)
+                    .with_operation_delivery(registration.manifest.operation_delivery)
+                    .with_operation_payload(registration.manifest.operation_payload)
+                    .with_flow_operations(registration.manifest.flow_operations)
+                    .with_operation_deferral(registration.manifest.operation_deferral)
+                    .with_confirm_operations(registration.manifest.confirm_operations)
+                    .with_rich_ui(registration.manifest.rich_ui)
+                    .with_role_declarations(registration.manifest.role_declarations)
+                    .with_nonce_verified(nonce_verified))
             })
-            .collect();
+            .collect::<Result<Vec<_>, RouterError>>()?;
         let response = ClientControlResponse::CatalogList {
             generation,
             modules: entries,
@@ -10238,6 +10270,9 @@ mod tests {
     mod peer_manifest {
         include!("peer_manifest_tests.rs");
     }
+    mod catalog_declarations {
+        include!("control/catalog_tests.rs");
+    }
     mod activity_read {
         include!("activity_read_tests.rs");
     }
@@ -12267,7 +12302,7 @@ mod tests {
             };
             assert_eq!(modules.len(), 1);
             assert_eq!(
-                serde_json::to_vec(&modules[0]).unwrap(),
+                serde_json::to_vec(&catalog_legacy_projection(modules[0].clone())).unwrap(),
                 format!(
                     r#"{{"module_id":"built","ready":true,"module_version":"0.1.0","provenance":{provenance_json},"roles":[],"control_ops":["route.bind","route.status"]}}"#
                 )
@@ -12321,11 +12356,23 @@ mod tests {
             panic!("expected catalog.list");
         };
         assert_eq!(
-            serde_json::to_vec(&modules[0]).unwrap(),
+            serde_json::to_vec(&catalog_legacy_projection(modules[0].clone())).unwrap(),
             br#"{"module_id":"plain","ready":true,"module_version":"0.1.0","roles":[],"control_ops":["route.bind","route.status"]}"#
         );
         assert!(!modules[0].nonce_verified);
         assert!(modules[0].provenance.is_none());
+    }
+
+    // Preserve the legacy-field byte pins while discovery adds optional facts.
+    fn catalog_legacy_projection(mut entry: CatalogEntry) -> CatalogEntry {
+        assert_eq!(entry.first_party, Some(false));
+        entry.incarnation = None;
+        entry.spawn = None;
+        entry.first_party = None;
+        entry.origin = None;
+        entry.requested_declarations_digest = None;
+        entry.approved_declarations_digest = None;
+        entry
     }
 
     #[test]

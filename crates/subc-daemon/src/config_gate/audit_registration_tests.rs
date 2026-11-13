@@ -77,6 +77,87 @@ struct Legacy {
     nonce: String,
 }
 
+#[tokio::test]
+async fn parking_poison_keeps_bootstrap_async_failed_module_monitored() {
+    parking_poison_startup(false, false).await;
+}
+
+#[tokio::test]
+async fn parking_poison_keeps_bootstrap_sync_failed_module_monitored() {
+    parking_poison_startup(false, true).await;
+}
+
+#[tokio::test]
+async fn parking_poison_keeps_approved_failed_module_monitored() {
+    parking_poison_startup(true, false).await;
+}
+
+async fn parking_poison_startup(strict: bool, synchronous: bool) {
+    let rig = rig();
+    let owner = Arc::new(rig.owner("poison-during-startup-park"));
+    rig.stamp(&owner);
+    assert!(owner.has_recorded_admission_hold("a"));
+    let handle = channel_handle();
+    let supervisor =
+        Supervisor::new_for_test(Arc::new(crate::Registry::default()), Default::default())
+            .with_handle(handle.clone())
+            .with_config_runtime(owner.clone());
+    let registered = supervisor
+        .register_configured_with_health(
+            spec(&rig),
+            true,
+            Default::default(),
+            None,
+            Default::default(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let module = handle.get("a").unwrap();
+    let poison = owner.clone();
+    *owner.config_park_hook.lock().unwrap() = Some(Box::new(move || {
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poison.inner.lock().unwrap();
+            panic!("injected owner poison between hold classification and parking");
+        }))
+        .is_err());
+    }));
+    let result = if strict {
+        supervisor
+            .start_registered_approved_async(registered, subc_protocol::Principal::Direct)
+            .await
+    } else if synchronous {
+        supervisor.start_registered_configured(registered, None, true)
+    } else {
+        supervisor
+            .start_registered_configured_async(registered, None, true)
+            .await
+    };
+    let state = module.status().unwrap();
+    // This command must traverse the monitor even for a terminal Failed module;
+    // stop() would return early without demonstrating a live command receiver.
+    let monitored = module.config_exit_hold().await;
+    let _ = module.stop().await;
+    assert_eq!(
+        state.state,
+        ModuleState::Failed,
+        "parking failure must finalize startup"
+    );
+    assert!(
+        monitored.is_ok(),
+        "the retained module must have its monitor: {monitored:?}"
+    );
+    if strict {
+        assert!(result
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("config_unavailable")));
+    } else {
+        assert!(
+            result.is_ok(),
+            "bootstrap must tolerate the finalized failure"
+        );
+    }
+}
+
 async fn legacy() -> Legacy {
     use crate::control::claims::tests::Net;
     let rig = rig();
@@ -499,6 +580,7 @@ async fn committed_enable_reply(non_hold_error: bool, absent_from_roster: bool) 
         .handle
         .get("a")
         .expect("even a failed new actor must stay in the roster");
+    reconciled.config_exit_hold().await.unwrap();
     let parked = reconciled.status().unwrap();
     drop(fixture.primary);
     reconciled.stop().await.unwrap();

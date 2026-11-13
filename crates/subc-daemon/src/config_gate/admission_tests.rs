@@ -1630,13 +1630,52 @@ fn config_admission_refusal_from_an_old_base_cannot_hold_the_new_approval() {
         .is_empty());
 }
 
+/// A program change is approved launch-only, because neither the new program
+/// (refused to start until approved) nor the old one can review for it. Once a child of the new program
+/// has made that generation active, the next plan re-reviews the approved
+/// layers with it and records that build; status names the module until then.
 #[test]
-fn config_admission_program_only_approval_of_a_held_module_needs_no_live_reviewer() {
+fn config_admission_program_change_is_approved_launch_only_then_rereviewed_by_the_new_program() {
+    use crate::config_gate::runtime::{AppliedDisposition, DeliveryObserver};
     use std::io::Write;
+    fn acknowledge(owner: &RuntimeOwner, connection: ConnectionId) -> AppliedDisposition {
+        let reply = owner
+            .module_get(connection, "a", ConfigGetRequest::new())
+            .unwrap();
+        owner
+            .module_view_delivered(connection, "a", &reply, tokio::time::Instant::now(), true)
+            .unwrap();
+        let view = reply.pending.unwrap();
+        owner
+            .module_applied(
+                connection,
+                "a",
+                subc_protocol::config::ConfigAppliedRequest::new(
+                    view.generation,
+                    view.attempt.unwrap(),
+                    subc_protocol::config::ConfigApplyResult::Ack,
+                    vec![],
+                ),
+            )
+            .unwrap()
+    }
+    fn rereview_warning(owner: &RuntimeOwner) -> Option<String> {
+        owner
+            .status()
+            .unwrap()
+            .warnings
+            .into_iter()
+            .find(|warning| warning.starts_with("module a: needs configuration re-review"))
+    }
     let rig = rig();
     let owner = rig.owner("held-program-review");
     rig.declare(&owner, 10);
     rig.stamp(&owner);
+    assert_eq!(
+        acknowledge(&owner, ConnectionId::new(10)),
+        AppliedDisposition::Active
+    );
+    assert_eq!(rereview_warning(&owner), None);
     std::fs::OpenOptions::new()
         .append(true)
         .open(rig.path.join("program"))
@@ -1650,8 +1689,78 @@ fn config_admission_program_only_approval_of_a_held_module_needs_no_live_reviewe
     let prepared = owner.prepare(PlanKind::Change).unwrap();
     assert!(
         !prepared.review_modules.contains("a"),
-        "a stopped program-only hold cannot answer its own review RPC"
+        "the program change is approved launch-only: no running build can review for it"
     );
+    assert_eq!(approve(&rig, &owner, PlanKind::Change), 2);
+    let waiting = rereview_warning(&owner).expect("status names the module awaiting re-review");
+    assert!(
+        waiting.contains("waits until that program is running"),
+        "{waiting}"
+    );
+    assert!(
+        !owner
+            .prepare(PlanKind::Change)
+            .unwrap()
+            .review_modules
+            .contains("a"),
+        "the old program still running cannot re-review for the new one"
+    );
+    let spawn = owner
+        .spawned(
+            "a",
+            tokio::time::Instant::now(),
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .unwrap();
+    let replacement = ConnectionId::new(30);
+    rig.declare(&owner, replacement.get());
+    owner.registered(replacement, &spawn).unwrap();
+    assert_eq!(
+        acknowledge(&owner, replacement),
+        AppliedDisposition::WaitingForReadiness
+    );
+    assert_eq!(
+        owner.ready(replacement, "a", 2).unwrap(),
+        Some(AppliedDisposition::Active)
+    );
+    let ready = rereview_warning(&owner).expect("re-review is still owed");
+    assert!(
+        ready.contains("the next configuration plan re-reviews"),
+        "{ready}"
+    );
+    let prepared = owner.prepare(PlanKind::Change).unwrap();
+    assert!(prepared.review_modules.contains("a"));
+    assert!(prepared.rereview_modules.contains("a"));
+    let plan = owner.finish_plan(prepared, daemon_review).unwrap();
+    let entry = plan
+        .plan
+        .changeset
+        .policy_changes
+        .iter()
+        .find(|change| change["path"] == "reviewed_program")
+        .expect("the plan shows the re-review it binds");
+    assert_eq!(entry["module_id"], "a");
+    assert_ne!(entry["old"], entry["new"]);
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let challenge = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
+    owner
+        .finish_approval(
+            challenge.attempt(),
+            &Rig::facts(),
+            ApprovalReply::Presence(super::super::super::PresenceDecision::InteractiveApproval),
+            3,
+        )
+        .unwrap();
+    assert_eq!(rereview_warning(&owner), None);
+    assert!(!owner
+        .prepare(PlanKind::Change)
+        .unwrap()
+        .review_modules
+        .contains("a"));
 }
 
 #[test]

@@ -3465,6 +3465,40 @@ impl ControlHandler {
                 .supervisor
                 .swap_hello_admission(&hello.manifest.module_id, hello.launch_nonce.as_deref()),
         };
+        if swap_admission == SwapHelloAdmission::ProtocolNone {
+            warn!(
+                module_id = %hello.manifest.module_id,
+                connection_id = connection_id.get(),
+                "HELLO refused: the module_id belongs to a protocol:none module, which never registers"
+            );
+            // The code stays `swap_token_invalid` for existing callers; only the
+            // explanation names the actual reason.
+            return Ok(vec![control_error_frame(
+                &frame,
+                "swap_token_invalid",
+                format!(
+                    "module_id '{}' is a protocol:none module; a protocol:none module may not register",
+                    hello.manifest.module_id
+                ),
+            )?]);
+        }
+        if swap_admission == SwapHelloAdmission::ChannelRequired {
+            warn!(
+                module_id = %hello.manifest.module_id,
+                connection_id = connection_id.get(),
+                "HELLO refused: the module_id is gated and the HELLO did not arrive over its registration channel"
+            );
+            // The code stays `swap_token_invalid` for existing callers; only the
+            // explanation names the actual reason.
+            return Ok(vec![control_error_frame(
+                &frame,
+                "swap_token_invalid",
+                format!(
+                    "module_id '{}' is gated; it must register over its supervised registration channel",
+                    hello.manifest.module_id
+                ),
+            )?]);
+        }
         if swap_admission == SwapHelloAdmission::Refused {
             warn!(
                 module_id = %hello.manifest.module_id,

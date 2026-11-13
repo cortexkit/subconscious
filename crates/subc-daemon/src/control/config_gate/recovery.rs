@@ -1,6 +1,14 @@
 use super::*;
 
 impl ControlHandler {
+    #[cfg(all(test, unix))]
+    pub(crate) async fn reconcile_exit_for_test(
+        &self,
+        owner: Arc<crate::config_gate::runtime::RuntimeOwner>,
+        generation: u64,
+    ) -> std::result::Result<(), GateError> {
+        self.reconcile_authority_exit(owner, generation).await
+    }
     #[cfg(all(test, unix, feature = "test-support", feature = "dev-desktop-approval"))]
     pub(crate) fn pause_apply_reconcile_for_test(
         &self,

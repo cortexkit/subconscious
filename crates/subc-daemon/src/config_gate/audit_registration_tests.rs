@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "audit_invariant_tests.rs"]
+mod invariant_tests;
+
 #[tokio::test]
 async fn audit_registration_non_hold_enable_error_fails_reconciliation() {
     let fixture = legacy().await;

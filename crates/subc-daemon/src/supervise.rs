@@ -4667,6 +4667,18 @@ impl SupervisedModule {
         Ok(state.approved_start_failure.is_some())
     }
 
+    pub(crate) fn has_approved_start_failure(
+        &self,
+        identity: &crate::config_gate::runtime::ApprovalIdentity,
+    ) -> bool {
+        lock_snapshot(&self.inner.snapshot).is_ok_and(|state| {
+            state
+                .approved_start_failure
+                .as_ref()
+                .is_some_and(|(failed, _)| failed == identity)
+        })
+    }
+
     pub(crate) async fn config_policy_probe(
         &self,
         connection: crate::ConnectionId,

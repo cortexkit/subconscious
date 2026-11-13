@@ -27,13 +27,20 @@ async fn approval_reconcile_changed_enabled_failed_entry_attempts_start() {
 async fn approval_reconcile_old_identity_failure_retries_unchanged_entry() {
     let fixture = failed_approved_actor(false).await;
     fixture.owner.restore_unused_delivery_spawns_for_test();
-    let old = fixture
+    // The fixture retains the approval captured before its failed reconciliation
+    // completes the global exit. Its failed start did not change the actor's entry.
+    let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Change);
+    let effective = fixture
         .owner
-        .authority_exit_configuration(1)
+        .authority_exit_configuration(generation)
         .unwrap()
         .unwrap()
         .3;
-    fixture.owner.daemon_entry_reconciled(&old, "a").unwrap();
+    fixture
+        .owner
+        .daemon_entry_reconciled(&effective, "a")
+        .unwrap();
+    fixture.owner.complete_authority_exit(&effective).unwrap();
     let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Change);
     let approved = fixture
         .owner
@@ -115,4 +122,60 @@ async fn approval_reconcile_unchanged_crash_failed_actor_is_not_revived_or_latch
         !has_older_failure.unwrap(),
         "an unrelated crash cannot acquire an approval failure"
     );
+}
+
+#[tokio::test]
+async fn approval_reconcile_latched_module_does_not_withhold_generation_completion() {
+    let fixture = failed_approved_actor(false).await;
+    let path = fixture.rig.path.join("subc.jsonc");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config["modules"]["b"] =
+        json!({"program":"/bin/sleep", "args":["600"], "protocol":"none", "enabled":true});
+    std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Change);
+    let identity = fixture
+        .owner
+        .authority_exit_configuration(generation)
+        .unwrap()
+        .unwrap()
+        .3
+        .identity();
+    fixture.owner.restore_unused_delivery_spawns_for_test();
+    fixture.owner.fail_delivery_spawns_for_module_for_test("a");
+    let error = fixture
+        .handler
+        .reconcile_exit_for_test(fixture.owner.clone(), generation)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "rescan_failed");
+    assert!(error.detail.starts_with("a: "), "{error}");
+    assert!(!error.detail.contains("b:"), "{error}");
+    let a = fixture.handle.get("a").unwrap();
+    let b = fixture.handle.get("b").unwrap();
+    let b_before = b.status().unwrap();
+    assert_eq!(a.state().unwrap(), ModuleState::Failed);
+    assert!(a.has_approved_start_failure(&identity));
+    assert!(b_before.process_alive);
+    assert_eq!(
+        fixture.owner.pending_authority_exit().unwrap(),
+        None,
+        "a current module-local failure must not retain the generation's exit"
+    );
+    assert!(fixture.owner.check_module_hold("b").is_ok());
+    let repeated = fixture
+        .handler
+        .reconcile_exit_for_test(fixture.owner.clone(), generation)
+        .await
+        .unwrap_err();
+    assert_eq!(repeated.code, "rescan_failed");
+    assert!(repeated.detail.starts_with("a: "), "{repeated}");
+    assert_eq!(
+        b.status().unwrap().spawn_generation,
+        b_before.spawn_generation
+    );
+    assert!(!a.release_config_hold().await.unwrap());
+    drop(fixture.primary);
+    a.stop().await.unwrap();
+    b.stop().await.unwrap();
 }

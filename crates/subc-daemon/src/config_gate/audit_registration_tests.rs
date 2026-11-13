@@ -69,6 +69,7 @@ async fn until(mut condition: impl FnMut() -> bool) {
 }
 
 struct Legacy {
+    approved: Option<crate::config_gate::runtime::ApprovedDaemonConfiguration>,
     rig: Rig,
     owner: Arc<RuntimeOwner>,
     handle: SupervisorHandle,
@@ -217,6 +218,7 @@ async fn legacy() -> Legacy {
         subc_protocol::FrameType::HelloAck
     );
     Legacy {
+        approved: None,
         rig,
         owner,
         handle,

@@ -210,6 +210,23 @@ impl RuntimeOwner {
                 .is_some_and(|entry| entry.generation.plan_digest == approved.approval_digest)
     }
 
+    pub(crate) fn current_approval_identity(
+        &self,
+        generation: u64,
+    ) -> Result<Option<ApprovalIdentity>> {
+        let mut state = self.lock()?;
+        let authority_incarnation = state.authority_incarnation.clone();
+        let body = state.store.body()?;
+        Ok((body.stamped && body.last_generation == generation)
+            .then(|| body.generations.get(&generation))
+            .flatten()
+            .map(|entry| ApprovalIdentity {
+                generation,
+                approval_digest: entry.generation.plan_digest.clone(),
+                authority_incarnation,
+            }))
+    }
+
     /// Test helper that loads the current approved configuration before completing
     /// its exit. Production callers must carry their original approved configuration.
     #[cfg(test)]

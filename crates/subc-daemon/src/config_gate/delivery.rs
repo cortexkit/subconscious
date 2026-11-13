@@ -18,6 +18,13 @@ fn allocate_spawn(
     register: Duration,
     health: Duration,
 ) -> Result<DeliverySpawn> {
+    #[cfg(test)]
+    if state.delivery.failed_spawn_module.as_deref() == Some(module) {
+        return Err(GateError::new(
+            "delivery_spawn_exhausted",
+            "delivery spawn identifiers exhausted",
+        ));
+    }
     state.delivery.next_spawn = state.delivery.next_spawn.checked_add(1).ok_or_else(|| {
         GateError::new(
             "delivery_spawn_exhausted",
@@ -68,6 +75,8 @@ impl DeliverySpawn {
 
 #[derive(Default)]
 pub(super) struct DeliveryState {
+    #[cfg(test)]
+    failed_spawn_module: Option<String>,
     next_spawn: u64,
     next_attempt: u64,
     policy_epochs: HashMap<String, u64>,
@@ -855,6 +864,10 @@ impl RuntimeOwner {
     #[cfg(all(test, unix))]
     pub(crate) fn restore_unused_delivery_spawns_for_test(&self) {
         self.lock().unwrap().delivery.next_spawn = 1000;
+    }
+    #[cfg(all(test, unix))]
+    pub(crate) fn fail_delivery_spawns_for_module_for_test(&self, module: &str) {
+        self.lock().unwrap().delivery.failed_spawn_module = Some(module.into());
     }
     #[cfg(all(test, unix))]
     pub(crate) fn set_spawn_preflight_hook_for_test(&self, hook: impl FnOnce() + Send + 'static) {

@@ -117,6 +117,25 @@ impl ControlHandler {
             .on_blocking(move |owner| owner.authority_exit_configuration(generation))
             .await?
         else {
+            let identity = owner
+                .on_blocking(move |owner| owner.current_approval_identity(generation))
+                .await?;
+            if let Some(identity) = identity {
+                let failures = self
+                    .supervisor
+                    .list()
+                    .into_iter()
+                    .filter_map(|module| {
+                        module
+                            .check_approved_start_failure(&identity)
+                            .err()
+                            .map(|error| format!("{}: {error}", module.module_id()))
+                    })
+                    .collect::<Vec<_>>();
+                if !failures.is_empty() {
+                    return Err(GateError::new("rescan_failed", failures.join("; ")));
+                }
+            }
             return Ok(());
         };
         let context = self.rescan.as_ref().ok_or_else(|| {
@@ -141,6 +160,8 @@ impl ControlHandler {
         self.configure_activity(activity)
             .await
             .map_err(|error| GateError::new("activity_config_failed", error))?;
+        let mut failed_modules = Vec::new();
+        let mut all_failures_latched = true;
         if stamped {
             // Daemon entries and module-layer activation have separate state.
             // Only the former is reconciled here; listeners wait for startup.
@@ -165,7 +186,6 @@ impl ControlHandler {
                     .on_blocking(move |owner| owner.daemon_entry_reconciled(&witness, &id))
                     .await?;
             }
-            let mut failed_modules = Vec::new();
             for (index, module) in config.modules.into_iter().enumerate() {
                 let module_id = module.module_id.clone();
                 let result = async {
@@ -217,6 +237,9 @@ impl ControlHandler {
                         return Err(error);
                     }
                     failed_modules.push(format!("{module_id}: {}", error.detail));
+                    all_failures_latched &= self.supervisor.get(&module_id).is_some_and(|actor| {
+                        actor.has_approved_start_failure(&approved.identity())
+                    });
                     continue;
                 }
                 #[cfg(test)]
@@ -226,7 +249,7 @@ impl ControlHandler {
                 #[cfg(not(test))]
                 let _ = index;
             }
-            if !failed_modules.is_empty() {
+            if !all_failures_latched {
                 return Err(GateError::new("rescan_failed", failed_modules.join("; ")));
             }
         } else {
@@ -261,10 +284,14 @@ impl ControlHandler {
                 }
             }
         }
-        // complete_authority_exit releases admission and clears the pending
-        // recovery-exit marker. Earlier failure leaves both the hold and marker
-        // intact for the configuration-delivery coordinator to retry.
+        // A current-approval start failure belongs to that actor alone. Once all
+        // other entries are effective, release the global exit hold; Failed actors
+        // are not parked and cannot be revived by that release. Unlatched errors
+        // above retain the exit for a later reconciliation attempt.
         config_work(owner, move |owner| owner.complete_authority_exit(&approved)).await?;
+        if !failed_modules.is_empty() {
+            return Err(GateError::new("rescan_failed", failed_modules.join("; ")));
+        }
         Ok(())
     }
 }

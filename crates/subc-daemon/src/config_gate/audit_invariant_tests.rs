@@ -28,7 +28,7 @@ async fn current_program_refusal_parks_only_under_its_recorded_hold() {
 }
 
 async fn failed_approved_actor(with_later_entries: bool) -> Legacy {
-    let fixture = legacy().await;
+    let mut fixture = legacy().await;
     fixture.module.set_enabled(false).await.unwrap();
     fixture.module.stop().await.unwrap();
     fixture.handle.retire("a").unwrap();
@@ -43,6 +43,14 @@ async fn failed_approved_actor(with_later_entries: bool) -> Legacy {
         std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
     }
     assert_eq!(fixture.rig.stamp(&fixture.owner), 1);
+    fixture.approved = Some(
+        fixture
+            .owner
+            .authority_exit_configuration(1)
+            .unwrap()
+            .unwrap()
+            .3,
+    );
     fixture.owner.exhaust_delivery_spawns_for_test();
     let error = fixture
         .handler
@@ -150,12 +158,7 @@ async fn approval_latch_does_not_block_later_modules_in_the_same_reconcile() {
 #[tokio::test]
 async fn approval_latch_does_not_alias_an_identical_recovery_stamp() {
     let fixture = failed_approved_actor(false).await;
-    let old = fixture
-        .owner
-        .authority_exit_configuration(1)
-        .unwrap()
-        .unwrap()
-        .3;
+    let old = fixture.approved.clone().unwrap();
     std::fs::write(
         fixture
             .rig

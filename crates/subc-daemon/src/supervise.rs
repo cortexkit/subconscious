@@ -7104,6 +7104,9 @@ fn park_config_spawn(
         state.state = ModuleState::Stopped;
         state.respawn_pending = false;
         state.failed_retry.pending = None;
+        // Parking ends this attempt and discards its failure timestamp. If a
+        // later release fails, its retry delay starts at that new failure.
+        state.failed_retry.failed_at = None;
         clear_current_process_facts(state);
     })
 }

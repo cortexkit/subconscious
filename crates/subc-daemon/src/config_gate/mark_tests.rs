@@ -10,6 +10,56 @@ use subc_protocol::peer::CallerOrigin;
 
 const RESTARTED: ConnectionId = ConnectionId::new(30);
 
+/// Makes a connection the active delivery target for a spawn and
+/// acknowledges the active generation for it, as the spawn's SDK would.
+#[cfg(unix)]
+pub(crate) type AcknowledgeActive = Box<dyn Fn(ConnectionId, &DeliverySpawn)>;
+
+#[cfg(unix)]
+impl RuntimeOwner {
+    /// A supervised, stamped gate whose module `a` has an active generation
+    /// and no pending change, with no running incumbent: the setting of a
+    /// crash restart. For supervisor tests of the first-party mark.
+    pub(crate) fn mark_supervisor_fixture_for_test() -> (
+        impl Drop,
+        std::sync::Arc<Self>,
+        crate::supervise::Supervisor,
+        crate::supervise::ModuleSpec,
+        AcknowledgeActive,
+    ) {
+        let (rig, owner, supervisor, _handler) = supervised_fixture_with_carry(false, false);
+        applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+        owner.disconnected(INCUMBENT);
+        let path = rig.path.join("subc.jsonc");
+        let (config, _) = crate::daemon_config::parse_with_activity(
+            &std::fs::read_to_string(&path).unwrap(),
+            &path,
+        )
+        .unwrap();
+        let spec = config
+            .modules
+            .into_iter()
+            .find(|entry| entry.module_id == "a")
+            .unwrap()
+            .module_spec();
+        let declaration = rig.declaration.clone();
+        let acknowledging = owner.clone();
+        let acknowledge: AcknowledgeActive =
+            Box::new(move |connection: ConnectionId, spawn: &DeliverySpawn| {
+                acknowledging
+                    .declare(connection, "a", declaration.clone(), true)
+                    .unwrap();
+                acknowledging.registered(connection, spawn).unwrap();
+                let view = pending(&acknowledging, connection);
+                assert_eq!(
+                    applied(&acknowledging, connection, &view, true).unwrap(),
+                    AppliedDisposition::CatchupComplete
+                );
+            });
+        (rig, owner, supervisor, spec, acknowledge)
+    }
+}
+
 fn released(spawn: u64) -> std::sync::Arc<SpawnAuthorityRecord> {
     let record = SpawnAuthorityRecord::new("incarnation", spawn, "a");
     record.set_origin_for_test(CallerOrigin::Release);

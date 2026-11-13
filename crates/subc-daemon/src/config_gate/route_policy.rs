@@ -200,6 +200,11 @@ pub(super) fn ready_loaded(state: &OwnerState, module: &str, generation: u64) ->
 
 impl RuntimeOwner {
     pub(crate) fn route_policy_authorized(&self, policy: &ApprovedRoutePolicy) -> Result<bool> {
+        // Runs under the forwarding write lock, as the authorization callback of
+        // `ForwardingTable::rebind_module_policy`. The owner's state is taken
+        // before the forwarding lock elsewhere (lowering a first-party mark), so
+        // this only ever try-locks it: a busy owner defers the install for a
+        // retry instead of waiting, and the two can never deadlock.
         let Some((connection, attempt, deadline)) = policy.authorization else {
             return Ok(true);
         };

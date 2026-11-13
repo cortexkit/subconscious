@@ -107,6 +107,8 @@ mod slow_retry;
 use slow_retry::{FailedRetry, FailureContext};
 
 #[cfg(all(test, unix))]
+mod mark_readiness_tests;
+#[cfg(all(test, unix))]
 mod slow_retry_tests;
 
 /// Command-line flag used by supervised modules to find subc.

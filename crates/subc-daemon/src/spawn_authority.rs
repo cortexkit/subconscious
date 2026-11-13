@@ -36,7 +36,11 @@
 //! Code that holds the forwarding lock never takes a record's authority state:
 //! it reads only the record's immutable identity and the epochs and marks the
 //! forwarding table itself has published. Nothing here is held across an
-//! await.
+//! await. Debug builds check both rules where the owner's state and a
+//! record's state are locked (`forwarding::assert_forwarding_unlocked`). The
+//! one piece of code that runs under the forwarding lock and touches the
+//! owner's state, route-policy authorization, only try-locks it, so it can
+//! never wait against an owner that holds its state while lowering a mark.
 //!
 //! # The first-party mark
 //!
@@ -368,6 +372,7 @@ impl SpawnAuthorityRecord {
     }
 
     fn lock(&self) -> MutexGuard<'_, AuthorityState> {
+        crate::forwarding::assert_forwarding_unlocked("a spawn authority record's state");
         self.state.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -614,6 +619,17 @@ mod tests {
             assert!(caller.declaration.is_none());
             assert!(caller.declaration_digest.is_none());
         }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "while this thread holds the forwarding lock")]
+    fn spawn_authority_record_state_is_never_taken_under_the_forwarding_lock() {
+        let forwarding = crate::forwarding::ForwardingTable::default();
+        let record = SpawnAuthorityRecord::new("incarnation", 1, "module");
+        forwarding.with_forwarding_write_lock_for_test(|| {
+            let _ = record.capture();
+        });
     }
 
     fn released(spawn: u64) -> Arc<SpawnAuthorityRecord> {

@@ -120,6 +120,62 @@ pub(crate) struct RouteBinding {
     pub target_authority: Option<AuthorityPair>,
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    /// Forwarding guards this thread holds, counted in debug builds.
+    static FORWARDING_GUARDS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A guard on the forwarding table's state. Debug builds count the guards
+/// each thread holds, so code that must never wait while the forwarding lock
+/// is held can check it with [`assert_forwarding_unlocked`].
+struct InnerGuard<G>(G);
+
+impl<G> InnerGuard<G> {
+    fn new(guard: G) -> Self {
+        #[cfg(debug_assertions)]
+        FORWARDING_GUARDS_HELD.with(|held| held.set(held.get() + 1));
+        Self(guard)
+    }
+}
+
+impl<G> Drop for InnerGuard<G> {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        FORWARDING_GUARDS_HELD.with(|held| held.set(held.get().saturating_sub(1)));
+    }
+}
+
+impl<G: std::ops::Deref> std::ops::Deref for InnerGuard<G> {
+    type Target = G::Target;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<G: std::ops::DerefMut> std::ops::DerefMut for InnerGuard<G> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+/// Panic in a debug build when this thread holds the forwarding lock. The
+/// configuration owner's state and a spawn authority record's state are taken
+/// before the forwarding lock, never under it; their lock functions call this
+/// so a path that inverts the order fails in tests instead of deadlocking.
+pub(crate) fn assert_forwarding_unlocked(what: &str) {
+    #[cfg(debug_assertions)]
+    FORWARDING_GUARDS_HELD.with(|held| {
+        assert_eq!(
+            held.get(),
+            0,
+            "{what} must not be taken while this thread holds the forwarding lock"
+        );
+    });
+    #[cfg(not(debug_assertions))]
+    let _ = what;
+}
+
 /// The spawn authority facts `route.open` hands to the relay reservation.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RouteAuthority {
@@ -1712,7 +1768,7 @@ impl ForwardingTable {
     #[allow(clippy::too_many_arguments)]
     fn begin_control_rpc_locked(
         &self,
-        mut inner: RwLockWriteGuard<'_, ForwardingInner>,
+        mut inner: InnerGuard<RwLockWriteGuard<'_, ForwardingInner>>,
         module_id: &str,
         module: ModuleConnection,
         expected_op: &str,
@@ -3671,12 +3727,22 @@ impl ForwardingTable {
         }
     }
 
-    fn read_inner(&self) -> Result<RwLockReadGuard<'_, ForwardingInner>, ForwardingError> {
-        self.inner.read().map_err(|_| ForwardingError::Poisoned)
+    fn read_inner(
+        &self,
+    ) -> Result<InnerGuard<RwLockReadGuard<'_, ForwardingInner>>, ForwardingError> {
+        self.inner
+            .read()
+            .map(InnerGuard::new)
+            .map_err(|_| ForwardingError::Poisoned)
     }
 
-    fn write_inner(&self) -> Result<RwLockWriteGuard<'_, ForwardingInner>, ForwardingError> {
-        self.inner.write().map_err(|_| ForwardingError::Poisoned)
+    fn write_inner(
+        &self,
+    ) -> Result<InnerGuard<RwLockWriteGuard<'_, ForwardingInner>>, ForwardingError> {
+        self.inner
+            .write()
+            .map(InnerGuard::new)
+            .map_err(|_| ForwardingError::Poisoned)
     }
 
     fn lock_close_registry(

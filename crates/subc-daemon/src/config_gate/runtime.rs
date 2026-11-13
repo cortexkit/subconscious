@@ -870,6 +870,9 @@ impl RuntimeOwner {
     }
 
     fn lock(&self) -> Result<OwnerGuard<'_>> {
+        // The owner's state comes before the forwarding lock: lowering a
+        // first-party mark takes the forwarding lock under it.
+        crate::forwarding::assert_forwarding_unlocked("the configuration owner's state");
         let mut guard = self
             .inner
             .lock()

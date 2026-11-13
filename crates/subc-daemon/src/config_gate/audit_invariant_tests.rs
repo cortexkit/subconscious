@@ -1,5 +1,32 @@
 use super::*;
 
+#[tokio::test]
+async fn current_program_refusal_parks_only_under_its_recorded_hold() {
+    let fixture = gated_claim_fixture().await;
+    let before = fixture.module.status().unwrap();
+    fixture.spawn.set_content_probe_for_test(Arc::new(|| {
+        Err(GateError::new(
+            "program_refused",
+            "current approved program was refused",
+        ))
+    }));
+    assert_eq!(fixture.spawn.check().unwrap_err(), "program_refused");
+    assert!(fixture.owner.has_recorded_admission_hold("a"));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.module.status().unwrap().state != ModuleState::Stopped {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let parked = fixture.module.status().unwrap();
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+    assert!(!parked.process_alive);
+    assert_eq!(parked.restart_count, before.restart_count);
+    assert_eq!(parked.spawn_generation, before.spawn_generation);
+}
+
 async fn failed_approved_actor(with_later_entries: bool) -> Legacy {
     let fixture = legacy().await;
     fixture.module.set_enabled(false).await.unwrap();

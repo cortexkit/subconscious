@@ -28,7 +28,7 @@ async fn gated_claim_fixture() -> GatedClaimFixture {
 }
 
 #[tokio::test]
-async fn refused_live_binding_without_a_current_approval_parks_instead_of_respawning() {
+async fn refused_live_binding_without_a_current_approval_uses_ordinary_exit_accounting() {
     let fixture = gated_claim_fixture().await;
     let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Unstamp);
     fixture.owner.complete_authority_exit(generation).unwrap();
@@ -59,13 +59,13 @@ async fn refused_live_binding_without_a_current_approval_parks_instead_of_respaw
     drop(fixture.primary);
     fixture.module.set_enabled(false).await.unwrap();
     fixture.module.stop().await.unwrap();
-    assert_eq!(
+    assert_ne!(
         after.state,
         ModuleState::Stopped,
-        "an irreversibly refused child must not enter the budget-free spawn loop"
+        "a removed approval has no current hold under which this exit can park"
     );
-    assert_eq!(after.spawn_generation, before.spawn_generation);
-    assert_eq!(after.restart_count, before.restart_count);
+    assert_eq!(after.restart_count, before.restart_count + 1,
+        "a superseded refusal follows normal crash accounting rather than the budget-free admission retry");
 }
 
 async fn gated_claim_fixture_with_support(support: Option<bool>) -> GatedClaimFixture {

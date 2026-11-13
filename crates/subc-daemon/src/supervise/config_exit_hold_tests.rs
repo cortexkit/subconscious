@@ -25,6 +25,7 @@ async fn staged_unstamp_enable_preserves_a_live_child_instead_of_parking_it() {
             .await
             .unwrap(),
     );
+    child.as_mut().unwrap().confirm_privacy_exec().await;
     let before = module.status().unwrap();
     // Model the desired-state update before reaping: the actor still owns a
     // live child even though its desired enabled flag has already been cleared.
@@ -110,9 +111,9 @@ async fn staged_unstamp_enable_preserves_a_live_child_instead_of_parking_it() {
     );
     rx.await.unwrap().unwrap();
     assert!(staged.enabled && staged.process_alive);
+    assert_eq!(staged.state, ModuleState::Running);
     assert_eq!(staged.pid, before.pid);
     assert_eq!(staged.spawn_generation, before.spawn_generation);
-    assert_eq!(staged.state, ModuleState::Running);
     assert!(
         !parked,
         "an actor with its live child is not parked for release"

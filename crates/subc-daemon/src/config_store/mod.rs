@@ -7,8 +7,8 @@
 //! stamped bit cannot re-enable the gate. A restart reads the file as found: a
 //! present file that does not parse as a store opens in recovery on every
 //! platform, never as "never stamped". Deleting the file, or rewriting it into
-//! another well-formed store, while the daemon is stopped, and replay, remain
-//! the documented digest-only limitation.
+//! another well-formed store, while the daemon is stopped, and replaying an
+//! older store file, remain the documented digest-only limitation.
 
 mod disk;
 mod writer_lock;

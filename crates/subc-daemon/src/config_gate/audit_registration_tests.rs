@@ -306,17 +306,23 @@ async fn audit_registration_recovery_restamp_reports_commit_while_actor_reconcil
 #[cfg(all(feature = "test-support", feature = "dev-desktop-approval"))]
 #[tokio::test]
 async fn audit_registration_committed_stamp_enable_program_refusal_still_replies_success() {
-    committed_enable_reply(false).await;
+    committed_enable_reply(false, false).await;
 }
 
 #[cfg(all(feature = "test-support", feature = "dev-desktop-approval"))]
 #[tokio::test]
 async fn audit_registration_non_hold_enable_error_returns_rescan_failed_from_apply() {
-    committed_enable_reply(true).await;
+    committed_enable_reply(true, false).await;
 }
 
 #[cfg(all(feature = "test-support", feature = "dev-desktop-approval"))]
-async fn committed_enable_reply(non_hold_error: bool) {
+#[tokio::test]
+async fn audit_registration_new_module_spawn_error_returns_rescan_failed_from_apply() {
+    committed_enable_reply(true, true).await;
+}
+
+#[cfg(all(feature = "test-support", feature = "dev-desktop-approval"))]
+async fn committed_enable_reply(non_hold_error: bool, absent_from_roster: bool) {
     struct Presence;
     impl crate::operator_confirm::OperatorProvider for Presence {
         fn config_gate_ready(&self) -> bool {
@@ -339,6 +345,11 @@ async fn committed_enable_reply(non_hold_error: bool) {
     }
     let fixture = legacy().await;
     fixture.module.set_enabled(false).await.unwrap();
+    if absent_from_roster {
+        fixture.module.stop().await.unwrap();
+        fixture.handle.retire("a").unwrap();
+        assert!(fixture.handle.get("a").is_none());
+    }
     let handler = Arc::new(
         (*fixture.handler)
             .clone()
@@ -396,9 +407,13 @@ async fn committed_enable_reply(non_hold_error: bool) {
         frames[0].clone()
     };
     let reply: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
-    let parked = fixture.module.status().unwrap();
+    let reconciled = fixture
+        .handle
+        .get("a")
+        .expect("even a failed new actor must stay in the roster");
+    let parked = reconciled.status().unwrap();
     drop(fixture.primary);
-    fixture.module.stop().await.unwrap();
+    reconciled.stop().await.unwrap();
     assert!(parked.enabled);
     assert!(!parked.process_alive);
     assert_eq!(parked.restart_count, 0);

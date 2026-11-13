@@ -125,10 +125,6 @@ pub(super) fn gate_hold_error(
     delivery: Option<&ConfigDelivery>,
 ) -> SuperviseError {
     if error.code == "config_delivery_deferred" {
-        #[cfg(test)]
-        if spec.module_id == "slow-retry-child" {
-            eprintln!("slow retry admission deferred: {}", error.detail);
-        }
         SuperviseError::ConfigDeliveryDeferred {
             module_id: spec.module_id.clone(),
         }

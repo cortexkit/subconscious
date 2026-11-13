@@ -535,6 +535,9 @@ pub struct ControlHandler {
     #[cfg(test)]
     config_delivery_test_wakes:
         Option<tokio::sync::mpsc::UnboundedSender<(&'static str, tokio::time::Instant)>>,
+    #[cfg(all(test, unix))]
+    config_delivery_test_idle:
+        Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>,
     /// Test-only Windows signature and flash hooks. Production builds carry
     /// neither: with the publisher unset, the production table never reaches
     /// verification, and the default attention hook only logs.
@@ -1195,6 +1198,8 @@ impl ControlHandler {
             recovery_exit_test_retry_pause: None,
             #[cfg(test)]
             config_delivery_test_wakes: None,
+            #[cfg(all(test, unix))]
+            config_delivery_test_idle: None,
             #[cfg(windows)]
             windows_verify: None,
             #[cfg(windows)]

@@ -42,6 +42,16 @@ impl ControlHandler {
         self.config_delivery_test_wakes = Some(wakes);
         self
     }
+    /// Pause after the owner checks and all coordinator tasks finish. Use only
+    /// without registered config-review workers, whose tasks intentionally stay live.
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_delivery_idle_for_test(
+        mut self,
+        idle: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
+    ) -> Self {
+        self.config_delivery_test_idle = Some(idle);
+        self
+    }
     #[cfg(all(test, unix))]
     pub(crate) async fn record_config_exit_for_test(
         self: &Arc<Self>,
@@ -288,6 +298,23 @@ impl ControlHandler {
                     let next = next.into_iter().chain(exit_retry.next).min();
                     (next, listen_for_changes)
                 };
+                #[cfg(all(test, unix))]
+                if let Some(idle) = handler
+                    .upgrade()
+                    .and_then(|control| control.config_delivery_test_idle.clone())
+                {
+                    // Unlike a wake notification, this acknowledges completion
+                    // of owner I/O and the supervisor's recovery-hold replies.
+                    while let Some(result) = tasks.join_next().await {
+                        if let Err(error) = result {
+                            warn!(%error, "configuration delivery task stopped");
+                        }
+                    }
+                    let (resume, released) = tokio::sync::oneshot::channel();
+                    if idle.send(resume).is_ok() {
+                        let _ = released.await;
+                    }
+                }
                 tokio::select! {
                     _ = changed.notified(), if listen_for_changes => {
                         #[cfg(test)]

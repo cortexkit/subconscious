@@ -75,7 +75,7 @@ impl RuntimeOwner {
     pub(crate) fn set_desktop_receipt_hook(&self, hook: impl FnOnce() + Send + 'static) {
         *self.desktop_receipt_hook.lock().unwrap() = Some(Box::new(hook));
     }
-    #[cfg(all(test, feature = "dev-desktop-approval"))]
+    #[cfg(all(test, any(unix, feature = "dev-desktop-approval")))]
     pub(crate) fn with_owner_lock_for_test(&self, work: impl FnOnce()) {
         let _state = self.lock().unwrap();
         work();

@@ -37,20 +37,29 @@ async fn failed_module() -> SupervisedModule {
 
 #[tokio::test(start_paused = true)]
 async fn config_recovery_preserves_slow_retry_until_it_parks_without_spawning() {
-    recovery_slow_retry_roundtrip(false, false).await;
+    recovery_slow_retry_roundtrip(false, false, false).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn config_recovery_release_after_retry_park_preserves_daemon_retry_chain() {
-    recovery_slow_retry_roundtrip(true, false).await;
+    recovery_slow_retry_roundtrip(true, false, false).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn config_recovery_refused_restart_before_retry_park_keeps_daemon_chain() {
-    recovery_slow_retry_roundtrip(true, true).await;
+    recovery_slow_retry_roundtrip(true, true, false).await;
 }
 
-async fn recovery_slow_retry_roundtrip(release_after_park: bool, refused_before_retry: bool) {
+#[tokio::test(start_paused = true)]
+async fn config_recovery_busy_publication_defers_retry_then_parks_with_daemon_attribution() {
+    recovery_slow_retry_roundtrip(true, false, true).await;
+}
+
+async fn recovery_slow_retry_roundtrip(
+    release_after_park: bool,
+    refused_before_retry: bool,
+    publication_busy: bool,
+) {
     let dir = cortexkit_test_support::ScratchDir::new("recovery-slow-retry");
     let path = dir.join("subc.jsonc");
     std::fs::write(
@@ -134,12 +143,24 @@ async fn recovery_slow_retry_roundtrip(release_after_park: bool, refused_before_
     assert!(owner.check_recovery().unwrap());
     let before = module.status().unwrap();
     let deadline = module.retry_deadline_for_test();
+    let (idle, mut idles) = tokio::sync::mpsc::unbounded_channel();
     let handler = Arc::new(
         crate::ControlHandler::with_forwarding(registry, forwarding)
             .with_supervisor(handle)
-            .with_config_runtime(owner.clone()),
+            .with_config_runtime(owner.clone())
+            .with_delivery_idle_for_test(idle),
     );
     let worker = handler.spawn_config_delivery_worker().unwrap();
+    let mut resume_worker = None;
+    wait_for("recovery worker completed its owner check and hold", || {
+        resume_worker = idles.try_recv().ok();
+        resume_worker.is_some()
+    })
+    .await;
+    // A wake is not an idle boundary: a blocking owner check can still be in
+    // flight. Keep the worker paused after its real recovery hold has replied.
+    // Otherwise the retry may legitimately defer for 100 ms while this fixture
+    // freezes the clock waiting for a direct park.
     module.config_exit_hold().await.unwrap();
     if refused_before_retry {
         assert!(matches!(
@@ -149,19 +170,61 @@ async fn recovery_slow_retry_roundtrip(release_after_park: bool, refused_before_
     }
     assert_eq!(module.status().unwrap().restart_count, before.restart_count);
     assert_eq!(module.retry_deadline_for_test(), deadline);
+    let blocked_publication = if publication_busy {
+        let (entered, mut entering) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let publisher_owner = owner.clone();
+        let publisher = tokio::task::spawn_blocking(move || {
+            publisher_owner.with_owner_lock_for_test(move || {
+                let _ = entered.send(());
+                let _ = released.recv();
+            });
+        });
+        wait_for("owner check holds publication busy", || {
+            entering.try_recv().is_ok()
+        })
+        .await;
+        let error = owner.prepare_spawn(&crashing_spec()).err().unwrap();
+        assert_eq!(error.code, "config_delivery_deferred");
+        assert_eq!(error.detail, "configuration publication is busy");
+        Some((publisher, release))
+    } else {
+        None
+    };
     // Recovery does not consume a Failed actor's retry. When the existing
     // deadline fires, launch admission parks it instead of starting a child.
     tokio::time::advance(Duration::from_secs(600)).await;
-    let observed_at = std::time::Instant::now();
-    let mut reported = false;
+    if let Some((publisher, release)) = blocked_publication {
+        wait_for("busy publication defers the consumed retry", || {
+            let state = module.inner.snapshot.lock().unwrap();
+            state.state == ModuleState::Restarting
+                && state.respawn_pending
+                && state.failed_retry.pending.is_none()
+        })
+        .await;
+        let deferred = module.inner.snapshot.lock().unwrap().clone();
+        assert!(!deferred.process_alive);
+        assert!(!deferred.config_hold_parked);
+        assert_eq!(deferred.spawn_generation, before.spawn_generation);
+        assert_eq!(deferred.lifetime_restarts, before.lifetime_restarts);
+        assert_eq!(Some(Instant::now()), deadline);
+        release.send(()).unwrap();
+        wait_for("blocking owner check finished", || publisher.is_finished()).await;
+        publisher.await.unwrap();
+        // Advance only the retry's publication-busy deferral timer, not another
+        // slow retry or a polling loop that silently advances the clock.
+        assert_eq!(CONFIG_ADMISSION_RETRY_DELAY, Duration::from_millis(100));
+        tokio::time::advance(Duration::from_millis(100)).await;
+    }
     wait_for("scheduled retry parks under recovery", || {
-        if !reported && observed_at.elapsed() >= Duration::from_secs(9) {
-            reported = true;
-            eprintln!("retry park still waiting: now={:?}, deadline={deadline:?}, recorded_hold={}, snapshot={:?}", Instant::now(), owner.has_recorded_admission_hold("slow-retry-child"), module.inner.snapshot.lock().unwrap());
-        }
         module.state().unwrap() == ModuleState::Stopped
     })
     .await;
+    let parked = module.inner.snapshot.lock().unwrap().clone();
+    assert!(parked.config_hold_parked);
+    assert!(parked.config_hold_daemon_initiated);
+    assert!(!parked.process_alive);
+    assert_eq!(parked.spawn_generation, before.spawn_generation);
     tokio::time::advance(Duration::from_secs(7200)).await;
     tokio::task::yield_now().await;
     let after = module.status().unwrap();
@@ -171,6 +234,7 @@ async fn recovery_slow_retry_roundtrip(release_after_park: bool, refused_before_
     assert!(module.next_retry_at_ms().unwrap().is_none());
     worker.abort();
     let _ = worker.await;
+    drop(resume_worker);
     if release_after_park {
         // A hold notification from the daemon must not make this parked retry
         // count as a new attempt requested by the operator.

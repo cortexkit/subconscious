@@ -4623,7 +4623,7 @@ impl SupervisedModule {
     ) -> Result<(), SuperviseError> {
         let state = lock_snapshot(&self.inner.snapshot)?;
         if let Some((failed_generation, detail)) = &state.approved_start_failure {
-            if state.enabled && *failed_generation == generation {
+            if *failed_generation == generation {
                 return Err(SuperviseError::ReloadFailed {
                     module_id: self.inner.module_id.clone(),
                     reason: detail.clone(),

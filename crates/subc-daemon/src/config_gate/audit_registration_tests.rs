@@ -163,6 +163,78 @@ async fn audit_registration_stamp_protocol_none_stops_the_running_nonce_child() 
 }
 
 #[tokio::test]
+async fn audit_registration_recovery_restamp_reports_commit_while_actor_reconciles() {
+    let fixture = legacy().await;
+    let connection = ConnectionId::new(500);
+    fixture.handler.record_local_connection(connection);
+    fixture.handler.record_captured_peer(
+        connection,
+        subc_os::local_peer::ObservedPeer::Unobserved.into(),
+    );
+    fixture.handler.record_observed_peer(
+        connection,
+        subc_os::local_peer::ObservedPeer::Observed(subc_os::local_peer::PeerObservation {
+            user: subc_os::local_peer::PeerUser::Uid(subc_os::effective_uid()),
+            pid: std::process::id(),
+            exe: None,
+            signing_id: None,
+        }),
+    );
+    fixture.rig.stamp(&fixture.owner);
+    std::fs::write(
+        fixture
+            .rig
+            .path
+            .join("store")
+            .join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(fixture.owner.check_recovery().unwrap());
+    assert_eq!(
+        fixture.owner.polled_status().unwrap().state,
+        "store_unverified"
+    );
+    let gate = fixture.owner.module_gate("a").unwrap();
+    let held = gate.lock_owned().await;
+    let generation = fixture.rig.stamp(&fixture.owner);
+    assert_eq!(generation, 1);
+    assert_eq!(
+        fixture.owner.lock().unwrap().store.loaded_status().state,
+        crate::config_store::StoreState::Stamped
+    );
+
+    // Keep the replacement behind its module gate so reconciliation must
+    // acknowledge the committed stamp with the actor still waiting to start.
+    fixture
+        .handler
+        .reconcile_cutover_for_test(fixture.owner.clone(), generation)
+        .await
+        .unwrap();
+    let actor = fixture.module.status().unwrap();
+    let pending = fixture.owner.stamp_channel_cutover_pending();
+    let status = registration_declaration_diagnostic(&fixture.handler, "config.status").await;
+    drop(held);
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+
+    assert_eq!(actor.state, ModuleState::Restarting);
+    assert!(!actor.process_alive);
+    assert!(pending);
+    assert_eq!(status["status"]["state"], "stamped", "{status}");
+    assert!(
+        status["status"]["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().is_some_and(
+                |warning| warning.contains("waiting for registration channel cutover")
+            )),
+        "{status}"
+    );
+}
+
+#[tokio::test]
 async fn audit_registration_candidate_promotion_after_stamp_cannot_restore_a_nonce() {
     use crate::control::claims::tests::Net;
     let fixture = legacy().await;

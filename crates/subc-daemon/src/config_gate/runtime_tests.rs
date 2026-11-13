@@ -397,6 +397,8 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
 #[cfg(unix)]
 #[path = "admission_tests.rs"]
 mod admission_tests;
+#[path = "audit_authority_tests.rs"]
+mod authority_tests;
 #[path = "delivery_tests.rs"]
 mod delivery_tests;
 

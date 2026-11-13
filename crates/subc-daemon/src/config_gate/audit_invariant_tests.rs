@@ -137,7 +137,7 @@ async fn approval_latch_does_not_block_later_modules_in_the_same_reconcile() {
     }
     let error = result.unwrap_err();
     assert_eq!(error.code, "rescan_failed");
-    assert!(error.detail.contains('a'), "{error}");
+    assert_eq!(error.detail, format!("a: reload failed for module 'a': failed to spawn module '{}': delivery_spawn_exhausted: delivery spawn identifiers exhausted", fixture.rig.path.join("program").display()));
     for (id, state) in ["b", "c"].into_iter().zip(later) {
         assert!(
             state.is_some(),
@@ -173,6 +173,12 @@ async fn approval_latch_does_not_alias_an_identical_recovery_stamp() {
         .unwrap()
         .unwrap()
         .3;
+    assert_eq!(old.generation, fresh.generation);
+    assert_eq!(old.approval_digest, fresh.approval_digest);
+    assert!(!Arc::ptr_eq(
+        &old.authority_incarnation,
+        &fresh.authority_incarnation
+    ));
     let actor = fixture.handle.get("a").unwrap();
     let result = actor.check_approved_start_failure(&fresh.identity());
     drop(fixture.primary);

@@ -1619,6 +1619,7 @@ impl RuntimeOwner {
         let publication_hook = state.publication_hook.take();
         #[cfg(test)]
         let prepublication_hook = state.prepublication_hook.take();
+        let publication_before = state.store.publication_sequence();
         let OwnerState {
             gate,
             store,
@@ -1666,7 +1667,9 @@ impl RuntimeOwner {
                 Ok(())
             },
         );
-        let stamped_files = (was_unstamped || was_recovery)
+        let committed_this_call = state.store.publication_sequence() != publication_before;
+        let stamped_files = committed_this_call
+            && (was_unstamped || was_recovery)
             && state.store.body().is_ok_and(|body| {
                 body.generations
                     .get(&body.last_generation)
@@ -1689,7 +1692,8 @@ impl RuntimeOwner {
             .iter()
             .next_back()
             .filter(|(_, entry)| {
-                entry.generation.plan_digest == digest
+                committed_this_call
+                    && entry.generation.plan_digest == digest
                     && (was_recovery
                         || state.store.loaded_admission_state().1.stamped
                         || entry.kind == crate::config_store::CommitKind::Unstamp)
@@ -1700,10 +1704,10 @@ impl RuntimeOwner {
                     entry.kind == crate::config_store::CommitKind::Unstamp,
                 )
             });
+        if committed_this_call && was_recovery {
+            state.authority_incarnation = std::sync::Arc::new(());
+        }
         if let Some((generation, unstamp)) = committed_exit {
-            if was_recovery {
-                state.authority_incarnation = std::sync::Arc::new(());
-            }
             state.authority_exit = Some(generation);
             state.recovery_exit_hold = was_recovery;
             if was_recovery || unstamp {
@@ -1716,7 +1720,7 @@ impl RuntimeOwner {
                 state.reconciled_entries.clear();
                 state.unstamp_hints.extend(unstamp_hints);
             }
-        } else if result.is_ok() {
+        } else if committed_this_call {
             state.authority_exit = None;
         }
         if stamped_files {

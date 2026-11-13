@@ -109,6 +109,55 @@ fn tuple() -> Tuple {
         project: Some("project".into()),
     }
 }
+
+#[test]
+fn publication_sequence_survives_repeated_counters_and_anchor_error() {
+    let rig = Rig::new();
+    let mut store = rig.open(false);
+    assert_eq!(store.publication_sequence(), 0);
+    store
+        .commit_generation(entry(CommitKind::Stamp), snapshot(1, 1), snapshot(1, 1), 1)
+        .unwrap();
+    assert_eq!(store.publication_sequence(), 1);
+    let revision = store.loaded_status().revision;
+    rig.replace(b"tampered");
+    assert!(store.check().is_err());
+    store
+        .recovery_exit(entry(CommitKind::Stamp), snapshot(1, 1), 2)
+        .unwrap();
+    assert_eq!(store.loaded_status().revision, revision);
+    assert_eq!(store.loaded_admission_state().1.last_generation, 1);
+    assert_eq!(store.publication_sequence(), 2);
+
+    let sealed = Rig::new();
+    let mut store = sealed.open(true);
+    store
+        .commit_generation(entry(CommitKind::Stamp), snapshot(1, 1), snapshot(1, 1), 1)
+        .unwrap();
+    sealed.key.lock().unwrap().set_anchor_failure(true);
+    assert_eq!(
+        store
+            .commit_generation(
+                entry(CommitKind::Approved),
+                snapshot(2, 1),
+                snapshot(2, 1),
+                2
+            )
+            .unwrap_err()
+            .code,
+        StoreErrorCode::AnchorPending
+    );
+    assert_eq!(store.publication_sequence(), 2);
+    assert!(store.retry_anchor().is_err());
+    assert_eq!(store.publication_sequence(), 2);
+    sealed.key.lock().unwrap().set_anchor_failure(false);
+    store.retry_anchor().unwrap();
+    assert_eq!(
+        store.publication_sequence(),
+        2,
+        "anchor retry is not a new publication"
+    );
+}
 fn entry(kind: CommitKind) -> HistoryEntry {
     HistoryEntry {
         delivery: None,

@@ -313,6 +313,7 @@ pub struct ConfigStore {
     backend: Backend,
     envelope: Envelope,
     state: StoreState,
+    publication_sequence: u64,
     expected_digest: Option<[u8; 32]>,
     pending_anchor: Option<(StoreAnchor, bool)>,
     pending_prior_anchor: Option<AnchorState>,
@@ -331,6 +332,12 @@ pub struct ConfigStore {
     hooks: Option<testing::TestSupport>,
 }
 impl ConfigStore {
+    /// A process-local witness of atomic publication. Recovery can repeat the
+    /// persisted revision and generation, but never resets this sequence.
+    pub(crate) fn publication_sequence(&self) -> u64 {
+        self.publication_sequence
+    }
+
     #[cfg(all(test, unix))]
     pub(crate) fn clear_delivery_snapshot_for_test(&mut self, generation: u64) {
         let mut body = self.envelope.body.clone();
@@ -397,6 +404,7 @@ impl ConfigStore {
                 mac: None,
             },
             state: StoreState::Unstamped,
+            publication_sequence: 0,
             expected_digest: None,
             pending_anchor: None,
             pending_prior_anchor: None,
@@ -879,7 +887,20 @@ impl ConfigStore {
                     format!("candidate exceeds STORE_BYTE_LIMIT ({limit} bytes); active, recovery and pending versions cannot be pruned")));
             }
         };
-        if let Err(error) = disk::publish(&self.path(), &bytes, |point| {
+        let next_publication = self.publication_sequence.checked_add(1).ok_or_else(|| {
+            StoreError::new(
+                StoreErrorCode::RevisionExhausted,
+                "publication sequence exhausted",
+            )
+        })?;
+        let path = self.path();
+        let publication_sequence = &mut self.publication_sequence;
+        if let Err(error) = disk::publish(&path, &bytes, |point| {
+            // Atomic replacement is the publication boundary, even when a
+            // later hook or keychain-anchor update reports an error.
+            if point == disk::PausePoint::AfterRename {
+                *publication_sequence = next_publication;
+            }
             #[cfg(feature = "test-support")]
             if let Some(hooks) = &self.hooks {
                 hooks.pause(point)?;

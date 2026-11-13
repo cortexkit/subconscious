@@ -7138,10 +7138,13 @@ impl ControlHandler {
 
     async fn handle_supervisor_list_inner(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
         use crate::config_gate::runtime::ApprovedDaemonView;
-        let approved = self
+        let publication = self
             .config_runtime
             .as_ref()
-            .map(|owner| owner.approved_daemon_view())
+            .and_then(|owner| owner.polled_snapshot().ok());
+        let approved = publication
+            .as_ref()
+            .map(|view| view.approved_daemon.clone())
             .unwrap_or(ApprovedDaemonView::NotStamped);
         let generation = self
             .registry
@@ -7231,9 +7234,9 @@ impl ControlHandler {
                 .clone()
                 .filter(|_| status.enabled && !status.process_alive)
                 .filter(|_| {
-                    self.config_runtime
+                    publication
                         .as_ref()
-                        .and_then(|owner| owner.registration_declaration(&status.module_id))
+                        .and_then(|view| view.registration_declaration(&status.module_id))
                         .as_deref()
                         == Some("undeclared")
                 });
@@ -7599,6 +7602,9 @@ impl ControlHandler {
                     .as_ref()
                     .and_then(|entries| entries.get(&status.module_id))
                     .cloned();
+                if status.process_alive && status.registration_declaration.is_some() {
+                    extension.registration_declaration = status.registration_declaration.clone();
+                }
                 extensions.push(extension);
                 modules.push(SupervisorModuleProvenance {
                     module_id: status.module_id,
@@ -7657,6 +7663,10 @@ impl ControlHandler {
 
     fn handle_supervisor_health(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
         self.refresh_capability_requirements();
+        let publication = self
+            .config_runtime
+            .as_ref()
+            .and_then(|owner| owner.polled_snapshot().ok());
         let generation = self
             .registry
             .generation()
@@ -7679,8 +7689,8 @@ impl ControlHandler {
                     .required_problem_detail(&module_id);
                 let declaration_warning = self.registry.get_module(&module_id).ok().flatten()
                     .filter(|registration| registration.manifest.registration_channel == Some(false))
-                    .filter(|_| self.supervisor.module_is_gated(&module_id))
-                    .filter(|_| self.config_runtime.as_ref().and_then(|owner| owner.registration_declaration(&module_id)).as_deref() == Some("declared"))
+                    .filter(|_| publication.as_ref().and_then(|view| view.registration_declaration(&module_id))
+                        .as_deref().map(|next| if status.process_alive { status.registration_declaration.as_deref().unwrap_or(next) } else { next }) == Some("declared"))
                     .map(|_| format!("{module_id}: HELLO registration_channel is false despite the approved channel declaration"));
                 let capability_detail = append_capability_problem_detail(capability_detail, declaration_warning);
                 Ok(SupervisorHealthEntry {

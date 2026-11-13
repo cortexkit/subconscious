@@ -383,6 +383,7 @@ struct SupervisedChild {
     live_program_binding: Option<Arc<content_binding::LiveProgramBinding>>,
     registered_config_connection: Option<ConnectionId>,
     admission_base: Option<subc_config::Digest>,
+    registration_declaration: Option<String>,
     _program_binding: Option<ProgramBindingPublication>,
     subtree_target: crate::subtree_resources::Target,
     child: containment::ProcessChild,
@@ -1539,6 +1540,7 @@ pub struct ExitReport {
 pub struct ModuleStatus {
     pub(crate) admission_refused: Option<String>,
     pub(crate) legacy_registration_spawn: bool,
+    pub(crate) registration_declaration: Option<String>,
     pub module_id: String,
     /// Retained configuration-exit infrastructure failure. Cleared only after a
     /// successful launch; an ordinary stop has no infrastructure stop reason.
@@ -1625,6 +1627,7 @@ struct ActorSelectCheckpoint {
 struct SupervisorSnapshot {
     admission_refused: Option<String>,
     legacy_registration_spawn: bool,
+    registration_declaration: Option<String>,
     stop_reason: Option<ModuleStopReason>,
     subtree_target: crate::subtree_resources::Target,
     failed_retry: FailedRetry,
@@ -1784,6 +1787,7 @@ impl SupervisorSnapshot {
         Self {
             admission_refused: None,
             legacy_registration_spawn: false,
+            registration_declaration: None,
             stop_reason: None,
             subtree_target: crate::subtree_resources::Target::Unavailable("not_running"),
             failed_retry: FailedRetry::default(),
@@ -2755,7 +2759,7 @@ impl SupervisorHandle {
             .cloned()
     }
 
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, unix))]
     pub(crate) fn legacy_nonce_present_for_test(&self, module: &str) -> bool {
         self.spawn_nonces.lock().unwrap().contains_key(module)
     }
@@ -4828,6 +4832,7 @@ impl SupervisedModule {
             ModuleStatus {
                 admission_refused: snapshot.admission_refused,
                 legacy_registration_spawn: snapshot.legacy_registration_spawn,
+                registration_declaration: snapshot.registration_declaration.clone(),
                 stop_reason: snapshot.stop_reason,
                 waiting_for_previous_pid: retained
                     .as_ref()
@@ -5208,12 +5213,36 @@ impl SupervisedModule {
         enabled: bool,
         requester: Option<Principal>,
     ) -> Result<bool, SuperviseError> {
+        self.set_enabled_with_budget_policy(enabled, requester, true)
+            .await
+    }
+
+    pub(crate) async fn release_config_hold(&self) -> Result<bool, SuperviseError> {
+        self.set_enabled_with_budget_policy(true, None, false).await
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn seed_crash_budget_for_test(&self, count: u32) {
+        let policy = self.inner.configuration.lock().unwrap().restart_policy;
+        let mut state = self.inner.snapshot.lock().unwrap();
+        for _ in 0..count {
+            state.record_crash_restart(&policy, Instant::now());
+        }
+    }
+
+    async fn set_enabled_with_budget_policy(
+        &self,
+        enabled: bool,
+        requester: Option<Principal>,
+        reset_budget: bool,
+    ) -> Result<bool, SuperviseError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
             .send(SupervisorCommand::SetEnabled {
                 requester,
                 enabled,
+                reset_budget,
                 reply: reply_tx,
             })
             .await
@@ -5435,6 +5464,7 @@ enum SupervisorCommand {
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     SetEnabled {
+        reset_budget: bool,
         requester: Option<Principal>,
         enabled: bool,
         reply: oneshot::Sender<Result<bool, SuperviseError>>,
@@ -8925,6 +8955,7 @@ async fn handle_supervisor_command(
                 enabled: true,
                 requester,
                 reply,
+                ..
             } => {
                 if matches!(error, SuperviseError::ConfigHeld { .. })
                     && runtime
@@ -8981,10 +9012,14 @@ async fn handle_supervisor_command(
                         // admission release starts the actor when its own hold ends.
                         update_snapshot(snapshot, Some(&spec.module_id), |state| state.enabled = true)?;
                     } else {
-                        set_child_enabled(
+                        match set_child_enabled_with_budget_policy(
                             spec, runtime, registry, process_liveness, snapshot, child,
-                            next.enabled, &runtime.failure_context(false),
-                        ).await?;
+                            next.enabled, &runtime.failure_context(false), false,
+                        ).await {
+                            Ok(_) => {},
+                            Err(SuperviseError::ConfigHeld { .. }) if next.enabled => {},
+                            Err(error) => return Err(error),
+                        }
                         if !next.enabled {
                             containment::terminate(&runtime.child_roster.containment).await;
                         }
@@ -9419,12 +9454,13 @@ async fn handle_supervisor_command(
             enabled,
             requester,
             reply,
+            reset_budget,
         } => {
             let previous_requester = runtime.start_requester.clone();
             if enabled {
                 runtime.start_requester = requester.clone();
             }
-            let result = set_child_enabled(
+            let result = set_child_enabled_with_budget_policy(
                 spec,
                 runtime,
                 registry,
@@ -9433,6 +9469,7 @@ async fn handle_supervisor_command(
                 child,
                 enabled,
                 &runtime.failure_context(false),
+                reset_budget,
             )
             .await;
             if !enabled {
@@ -9884,6 +9921,32 @@ async fn set_child_enabled(
     enabled: bool,
     failure: &FailureContext,
 ) -> Result<bool, SuperviseError> {
+    set_child_enabled_with_budget_policy(
+        spec,
+        runtime,
+        registry,
+        process_liveness,
+        snapshot,
+        child,
+        enabled,
+        failure,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn set_child_enabled_with_budget_policy(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    registry: &Registry,
+    process_liveness: &SupervisorProcessLiveness,
+    snapshot: &SharedSnapshot,
+    child: &mut Option<SupervisedChild>,
+    enabled: bool,
+    failure: &FailureContext,
+    reset_budget: bool,
+) -> Result<bool, SuperviseError> {
     let (current_enabled, current_state, respawn_pending) = {
         let state = lock_snapshot(snapshot)?;
         (state.enabled, state.state, state.respawn_pending)
@@ -9933,7 +9996,9 @@ async fn set_child_enabled(
             failure,
         )
         .await?;
-        reset_restart_count(snapshot, &spec.module_id)?;
+        if reset_budget {
+            reset_restart_count(snapshot, &spec.module_id)?;
+        }
         process_liveness.track(spec.module_id.clone(), Arc::clone(snapshot));
         let next_child = match spawn_and_mark_running_async(spec, runtime, snapshot).await {
             Ok(next_child) => next_child,
@@ -11726,6 +11791,10 @@ fn launch_child_in_slot(
     register_timeout: Duration,
 ) -> Result<SupervisedChild, SuperviseError> {
     let launch_spec = prepared.launch_spec.clone();
+    let registration_declaration = prepared
+        .spawn_admission
+        .as_ref()
+        .and_then(|admission| admission.registration_declaration(&launch_spec.module_id));
     let admission_base = prepared
         .spawn_admission
         .as_ref()
@@ -12195,6 +12264,7 @@ fn launch_child_in_slot(
         live_program_binding: None,
         registered_config_connection: None,
         admission_base,
+        registration_declaration,
         _program_binding: binding_publication,
         subtree_target,
         child: containment::ProcessChild::plain(child, pid),
@@ -15104,6 +15174,7 @@ fn set_running(
     state.admission_refused = None;
     state.legacy_registration_spawn =
         child.registration_spawn.is_some() && child.admission_base.is_none();
+    state.registration_declaration = child.registration_declaration.clone();
     state.stop_reason = None;
     state.waiting_for_previous_pid = None;
     state.waiting_for_previous_detail = None;
@@ -15149,6 +15220,7 @@ fn set_running(
 
 fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
     state.legacy_registration_spawn = false;
+    state.registration_declaration = None;
     state.subtree_target = crate::subtree_resources::Target::Unavailable("not_running");
     state.failed_retry.healthy_since = None;
     state.failed_retry.running_since = None;
@@ -19859,6 +19931,7 @@ mod cgroup_placement_tests {
             live_program_binding: None,
             registered_config_connection: None,
             admission_base: None,
+            registration_declaration: None,
             _program_binding: None,
             subtree_target: crate::subtree_resources::Target::Unavailable("not_running"),
             child: crate::supervise::containment::ProcessChild::plain(child, pid),

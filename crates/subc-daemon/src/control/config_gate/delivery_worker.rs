@@ -35,6 +35,14 @@ impl AuthorityExitRetry {
 
 impl ControlHandler {
     #[cfg(all(test, unix))]
+    pub(crate) fn with_delivery_wakes_for_test(
+        mut self,
+        wakes: tokio::sync::mpsc::UnboundedSender<(&'static str, Instant)>,
+    ) -> Self {
+        self.config_delivery_test_wakes = Some(wakes);
+        self
+    }
+    #[cfg(all(test, unix))]
     pub(crate) async fn record_config_exit_for_test(
         self: &Arc<Self>,
         exited: crate::config_gate::runtime::delivery::ExitedDelivery,
@@ -167,7 +175,7 @@ impl ControlHandler {
                             })
                         {
                             tasks.spawn(async move {
-                                let _ = supervised.set_enabled(true).await;
+                                let _ = supervised.release_config_hold().await;
                             });
                         }
                     }

@@ -1,7 +1,7 @@
 use super::*;
 
 impl ControlHandler {
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(test, unix))]
     pub(crate) async fn reconcile_cutover_for_test(
         &self,
         owner: Arc<crate::config_gate::runtime::RuntimeOwner>,
@@ -136,10 +136,9 @@ impl ControlHandler {
                 self.supervisor.retire(&id);
                 self.route_outages.forget(&id);
                 let witness = approved.clone();
-                config_work(owner.clone(), move |owner| {
-                    owner.daemon_entry_reconciled(&witness, &id)
-                })
-                .await?;
+                owner
+                    .on_blocking(move |owner| owner.daemon_entry_reconciled(&witness, &id))
+                    .await?;
             }
             for (index, module) in config.modules.into_iter().enumerate() {
                 if let Some(existing) = self.supervisor.get(&module.module_id) {
@@ -165,10 +164,11 @@ impl ControlHandler {
                         .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
                 }
                 let witness = approved.clone();
-                config_work(owner.clone(), move |owner| {
-                    owner.daemon_entry_reconciled(&witness, &module.module_id)
-                })
-                .await?;
+                owner
+                    .on_blocking(move |owner| {
+                        owner.daemon_entry_reconciled(&witness, &module.module_id)
+                    })
+                    .await?;
                 #[cfg(test)]
                 if let Some(hook) = self.recovery_exit_test_after_step {
                     hook(index + 1)?;

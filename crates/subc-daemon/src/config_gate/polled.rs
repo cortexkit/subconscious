@@ -56,10 +56,7 @@ impl RuntimeOwner {
     pub(crate) fn registration_declaration(&self, module: &str) -> Option<String> {
         self.polled_snapshot()
             .ok()?
-            .admission
-            .registration_declarations()?
-            .get(module)
-            .cloned()
+            .registration_declaration(module)
     }
 
     /// A census reads one bounded regular file only when no approved store is in

@@ -135,16 +135,23 @@ impl RuntimeOwner {
         if state.authority_exit != Some(approved.generation) {
             return Err(GateError::stale());
         }
-        if let Some(entry) = approved
+        let changed = if let Some(entry) = approved
             .configuration()?
             .0
             .modules
             .into_iter()
             .find(|entry| entry.module_id == module)
         {
-            state.reconciled_entries.insert(module.to_owned(), entry);
+            state
+                .reconciled_entries
+                .insert(module.to_owned(), entry.clone())
+                != Some(entry)
         } else {
-            state.reconciled_entries.remove(module);
+            state.reconciled_entries.remove(module).is_some()
+        };
+        drop(state);
+        if changed {
+            self.notify_delivery_changed();
         }
         Ok(())
     }

@@ -770,6 +770,10 @@ impl RuntimeOwner {
         {
             if let Some(entry) = state.delivery.exited.remove(&exited.module) {
                 entry.changed.send_replace(false);
+                // A prior release may have reached the worker while this fence
+                // still blocked admission. Recheck it after the fence is gone;
+                // the worker starts only enabled modules with no remaining hold.
+                state.admission_releases.push(exited.module.clone());
             }
         }
         self.notify_delivery_changed();

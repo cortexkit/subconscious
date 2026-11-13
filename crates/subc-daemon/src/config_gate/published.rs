@@ -8,6 +8,12 @@ pub(crate) struct Published {
 }
 
 impl Published {
+    pub(crate) fn registration_declaration(&self, module: &str) -> Option<String> {
+        self.admission
+            .registration_declarations()?
+            .get(module)
+            .cloned()
+    }
     pub(crate) fn is_recovering(&self) -> bool {
         self.admission.is_recovering()
     }
@@ -22,6 +28,9 @@ impl std::ops::Deref for Published {
 
 impl RuntimeOwner {
     pub(crate) fn polled_snapshot(&self) -> Result<std::sync::Arc<Published>> {
+        #[cfg(test)]
+        self.polled_capture_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.inner.is_poisoned() {
             return Err(GateError::new(
                 "config_unavailable",

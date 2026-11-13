@@ -25,6 +25,8 @@ pub struct RuntimeOwner {
     #[cfg(test)]
     polled_capture_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    polled_capture_count: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
     census_probe: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     agent_validation_window: Mutex<Option<Duration>>,
@@ -690,6 +692,8 @@ impl RuntimeOwner {
         let owner = Self {
             #[cfg(test)]
             polled_capture_hook: Mutex::new(None),
+            #[cfg(test)]
+            polled_capture_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             census_probe: Mutex::new(None),
             #[cfg(test)]

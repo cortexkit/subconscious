@@ -253,6 +253,11 @@ pub(crate) struct SpawnAdmission {
 }
 
 impl SpawnAdmission {
+    pub(crate) fn registration_declaration(&self, module: &str) -> Option<String> {
+        self.authority.as_ref().map(|authority| {
+            super::super::registration::declaration(&authority.snapshot, module).into()
+        })
+    }
     pub(crate) fn approved_base(&self) -> Option<&Digest> {
         self.authority
             .as_ref()

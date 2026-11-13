@@ -7030,6 +7030,38 @@ enum EndedConfigHold {
     RetrySpawn,
 }
 
+fn park_config_spawn(
+    spec: &ModuleSpec,
+    runtime: &SupervisorRuntimeConfig,
+    snapshot: &SharedSnapshot,
+    admission_refused: Option<String>,
+) -> Result<(), SuperviseError> {
+    *runtime
+        .scheduled_respawn
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    if let Some(reply) = runtime
+        .deferred_reload_reply
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    {
+        let _ = reply.send(Err(SuperviseError::ConfigHeld {
+            module_id: spec.module_id.clone(),
+            code: "config_gated".into(),
+            detail: "module is held by configuration admission".into(),
+        }));
+    }
+    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.admission_refused = admission_refused;
+        state.config_hold_parked = true;
+        state.state = ModuleState::Stopped;
+        state.respawn_pending = false;
+        state.failed_retry.pending = None;
+        clear_current_process_facts(state);
+    })
+}
+
 fn hold_config_spawn(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
@@ -7056,30 +7088,7 @@ fn hold_config_spawn(
         let parked = delivery
             .0
             .with_recorded_admission_hold(&spec.module_id, |admission_refused| {
-                *runtime
-                    .scheduled_respawn
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-                if let Some(reply) = runtime
-                    .deferred_reload_reply
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take()
-                {
-                    let _ = reply.send(Err(SuperviseError::ConfigHeld {
-                        module_id: spec.module_id.clone(),
-                        code: "config_gated".into(),
-                        detail: "module is held by configuration admission".into(),
-                    }));
-                }
-                update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                    state.admission_refused = admission_refused;
-                    state.config_hold_parked = true;
-                    state.state = ModuleState::Stopped;
-                    state.respawn_pending = false;
-                    state.failed_retry.pending = None;
-                    clear_current_process_facts(state);
-                })
+                park_config_spawn(spec, runtime, snapshot, admission_refused)
             })
             .map_err(|error| config_delivery::gate_hold_error(spec, error, Some(delivery)))?;
         if let Some(result) = parked {
@@ -8652,7 +8661,14 @@ async fn supervise_loop(
                         NextAction::Restart {schedule:None}
                     } else if active_child.live_program_binding.as_ref().is_some_and(|binding|binding.is_refused()) || runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.exit_is_held(&spec.module_id)) {
                         record_terminal_with_detail(&spec.module_id, &runtime.terminal_ring, &runtime.spawn_events, &exit_report, TerminalDisposition::Stopped, active_child.spawn_failure.clone().or_else(|| Some("config_gated".into())));
-                        let _ = hold_config_spawn(&spec, &runtime, &snapshot, EndedConfigHold::RetrySpawn);
+                        if active_child.live_program_binding.as_ref().is_some_and(|binding| binding.is_refused()) {
+                            // This child's content refusal is permanent even when
+                            // approval changed or was removed, so recording a
+                            // refusal against its original program digest fails.
+                            let _ = park_config_spawn(&spec, &runtime, &snapshot, None);
+                        } else {
+                            let _ = hold_config_spawn(&spec, &runtime, &snapshot, EndedConfigHold::RetrySpawn);
+                        }
                         NextAction::Stop { registration_released: registry.get_module(&spec.module_id).ok().flatten().is_none() }
                     } else { on_child_exit(
                         &spec,

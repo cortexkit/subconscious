@@ -61,6 +61,10 @@ pub struct TreeUsage {
 }
 
 /// One process-table walk, reusable for any number of roots.
+///
+/// A table read with [`ProcessTable::read_for`] is narrowed: only the
+/// processes its interest set can reach were examined, and [`Self::covers`]
+/// says which pids it answers for exactly as a full walk would.
 #[derive(Debug, Clone, Default)]
 pub struct ProcessTable {
     members: BTreeMap<u32, ProcessMember>,
@@ -68,6 +72,15 @@ pub struct ProcessTable {
     revision: u64,
     observed_at_ms: u64,
     started_at: Option<std::time::Instant>,
+    focus: Option<std::sync::Arc<Focus>>,
+}
+
+/// The pids a narrowed walk examined, and every pid its listing contained.
+/// A pid the listing did not contain is absent from a full walk too.
+#[derive(Debug, Default)]
+struct Focus {
+    selected: BTreeSet<u32>,
+    listed: BTreeSet<u32>,
 }
 
 impl ProcessTable {
@@ -108,6 +121,7 @@ impl ProcessTable {
             revision,
             observed_at_ms,
             started_at: Some(std::time::Instant::now()),
+            focus: None,
         }
     }
     /// Read all visible processes once. Unreadable identities are retained as
@@ -116,7 +130,44 @@ impl ProcessTable {
         Self::read_entries(entries)
     }
 
-    fn read_entries(enumerate: impl FnOnce() -> io::Result<Vec<Entry>>) -> io::Result<Self> {
+    /// Read only what `interest` can reach, answering exactly as [`Self::read`]
+    /// would for every pid [`Self::covers`] accepts.
+    ///
+    /// One listing supplies every process's parent and start. The per-process
+    /// reads (identity, session, resources and the exit fence) then cover only:
+    /// the interest pids; every listed process whose session is led by an
+    /// interest pid, or whose session or parent is unknown; all their
+    /// descendants; and every ancestor of all of those. That is every process
+    /// a tree rooted at an interest pid can select or be made uncertain by,
+    /// with or without its session, and every parent an ancestry walk from a
+    /// covered process can visit. Windows reads the full table.
+    pub fn read_for(interest: &BTreeSet<u32>) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Self::read_probed(entries, &Native, Some(interest))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = interest;
+            Self::read()
+        }
+    }
+
+    /// Whether queries about `pid` match a full walk. Always true for a full
+    /// table; for a narrowed one, true for examined pids and for pids the
+    /// walk's listing did not contain at all.
+    pub fn covers(&self, pid: u32) -> bool {
+        self.focus
+            .as_ref()
+            .is_none_or(|focus| focus.selected.contains(&pid) || !focus.listed.contains(&pid))
+    }
+
+    /// Whether this table examined only part of the host's processes.
+    pub fn is_narrowed(&self) -> bool {
+        self.focus.is_some()
+    }
+
+    fn begin() -> (u64, u64, std::time::Instant) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let revision = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let observed_at_ms = wall_clock_now()
@@ -124,33 +175,148 @@ impl ProcessTable {
             .ok()
             .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok())
             .unwrap_or(0);
-        let started_at = std::time::Instant::now();
+        (revision, observed_at_ms, std::time::Instant::now())
+    }
+
+    fn read_entries(enumerate: impl FnOnce() -> io::Result<Vec<Entry>>) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Self::read_probed(enumerate, &Native, None)
+        }
+        #[cfg(windows)]
+        {
+            Self::read_windows(enumerate)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = enumerate;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "process tables unavailable",
+            ))
+        }
+    }
+
+    /// The walk itself. With `interest`, only the processes [`focus`] selects
+    /// get the per-process reads; each of those gets exactly the reads, in the
+    /// order, that a full walk gives it.
+    #[cfg(unix)]
+    fn read_probed(
+        enumerate: impl FnOnce() -> io::Result<Vec<Entry>>,
+        probe: &impl Probe,
+        interest: Option<&BTreeSet<u32>>,
+    ) -> io::Result<Self> {
+        let (revision, observed_at_ms, started_at) = Self::begin();
+        let entries = enumerate()?;
+        let mut known = Known::default();
+        let focus = interest.map(|interest| focus(&entries, interest, probe, &mut known));
         let mut members = BTreeMap::new();
         let mut unreadable = BTreeMap::new();
-        for (pid, parent, name, expected_start) in enumerate()? {
-            let parent = parent.or_else(|| crate::parent_pid(pid));
-            #[cfg(unix)]
-            let session_id = {
-                // SAFETY: getsid is a read-only query of a numeric process.
-                #[allow(unsafe_code)]
-                let session = unsafe { libc::getsid(pid as libc::pid_t) };
-                u32::try_from(session).ok()
-            };
-            #[cfg(not(unix))]
-            let session_id = None;
-            #[cfg(windows)]
-            let Some(process) = crate::Process::open(pid).ok().flatten() else {
-                unreadable.insert(pid, (parent, session_id));
+        for (pid, parent, name, expected_start) in entries {
+            if focus
+                .as_ref()
+                .is_some_and(|focus| !focus.selected.contains(&pid))
+            {
                 continue;
-            };
-            #[cfg(windows)]
-            let start = process.observe().map(|observation| observation.start_time);
-            #[cfg(not(windows))]
-            let start = match crate::read_identity(pid) {
+            }
+            let parent = parent.or_else(|| {
+                known
+                    .parents
+                    .remove(&pid)
+                    .unwrap_or_else(|| probe.parent(pid))
+            });
+            let session_id = known
+                .sessions
+                .remove(&pid)
+                .unwrap_or_else(|| probe.session(pid));
+            let start = match probe.identity(pid) {
                 crate::IdentityRead::Alive(start) => Some(start),
                 crate::IdentityRead::Gone => continue,
                 crate::IdentityRead::Unknown => None,
             };
+            let Some(start_time) =
+                start.filter(|start| expected_start.is_none_or(|expected| expected == *start))
+            else {
+                if probe.possibly_live(pid) {
+                    unreadable.insert(pid, (parent, session_id));
+                }
+                continue;
+            };
+            let Some(start_time_ms) = crate::start_time_ms_from_native(start_time) else {
+                unreadable.insert(pid, (parent, session_id));
+                continue;
+            };
+            let Some(parent_pid) = parent else {
+                unreadable.insert(pid, (None, session_id));
+                continue;
+            };
+            let name = name.unwrap_or_else(|| probe.name(pid));
+            let (resources, own_cpu_ms, reaped_cpu_ms) = probe.usage(pid).map_or(
+                (None, None, None),
+                |(mut usage, child_user, child_system)| {
+                    let millis = |duration: std::time::Duration| {
+                        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+                    };
+                    let own = millis(usage.cpu_user + usage.cpu_system);
+                    let reaped = millis(child_user + child_system);
+                    usage.cpu_user += child_user;
+                    usage.cpu_system += child_system;
+                    (Some(usage), Some(own), Some(reaped))
+                },
+            );
+            if !Self::same_identity(
+                pid,
+                start_time,
+                (Some(parent_pid), session_id),
+                probe.identity(pid),
+                &mut unreadable,
+            ) {
+                continue;
+            }
+            members.insert(
+                pid,
+                ProcessMember {
+                    pid,
+                    parent_pid,
+                    session_id,
+                    start_time,
+                    start_time_ms,
+                    name,
+                    resources,
+                    own_cpu_ms,
+                    reaped_cpu_ms,
+                },
+            );
+        }
+        // A reaped child's earlier sample can overlap a later parent's reaped
+        // counter. Drop confirmed exits, leaving recovery to that counter, but
+        // reject unknown identities rather than publishing a partial live sum.
+        Self::fence(&mut members, &mut unreadable, |member| {
+            probe.identity(member.pid)
+        });
+        Ok(Self {
+            members,
+            unreadable,
+            revision,
+            observed_at_ms,
+            started_at: Some(started_at),
+            focus: focus.map(std::sync::Arc::new),
+        })
+    }
+
+    #[cfg(windows)]
+    fn read_windows(enumerate: impl FnOnce() -> io::Result<Vec<Entry>>) -> io::Result<Self> {
+        let (revision, observed_at_ms, started_at) = Self::begin();
+        let mut members = BTreeMap::new();
+        let mut unreadable = BTreeMap::new();
+        for (pid, parent, name, expected_start) in enumerate()? {
+            let parent = parent.or_else(|| crate::parent_pid(pid));
+            let session_id = None;
+            let Some(process) = crate::Process::open(pid).ok().flatten() else {
+                unreadable.insert(pid, (parent, session_id));
+                continue;
+            };
+            let start = process.observe().map(|observation| observation.start_time);
             let Some(start_time) =
                 start.filter(|start| expected_start.is_none_or(|expected| expected == *start))
             else {
@@ -170,42 +336,16 @@ impl ProcessTable {
                     continue;
                 }
             };
-            #[cfg(target_os = "linux")]
-            let parts = crate::linux::resource_usage_parts(pid);
-            #[cfg(target_os = "macos")]
-            let parts = crate::macos::resource_usage_parts(pid);
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            let (resources, own_cpu_ms, reaped_cpu_ms) = parts.map_or(
-                (None, None, None),
-                |(mut usage, child_user, child_system)| {
-                    let millis = |duration: std::time::Duration| {
-                        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-                    };
-                    let own = millis(usage.cpu_user + usage.cpu_system);
-                    let reaped = millis(child_user + child_system);
-                    usage.cpu_user += child_user;
-                    usage.cpu_system += child_system;
-                    (Some(usage), Some(own), Some(reaped))
-                },
-            );
-            #[cfg(windows)]
             let resources = process.resource_usage();
-            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-            let resources = crate::resource_usage(pid);
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let own_cpu_ms = resources.map(|usage| {
                 u64::try_from((usage.cpu_user + usage.cpu_system).as_millis()).unwrap_or(u64::MAX)
             });
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let reaped_cpu_ms = resources.map(|_| 0);
-            #[cfg(windows)]
             let current_start = process
                 .observe()
                 .map_or(crate::IdentityRead::Unknown, |observation| {
                     crate::IdentityRead::Alive(observation.start_time)
                 });
-            #[cfg(not(windows))]
-            let current_start = crate::read_identity(pid);
             if !Self::same_identity(
                 pid,
                 start_time,
@@ -223,11 +363,10 @@ impl ProcessTable {
                     session_id,
                     start_time,
                     start_time_ms,
-                    name,
+                    name: name.unwrap_or_default(),
                     resources,
                     own_cpu_ms,
                     reaped_cpu_ms,
-                    #[cfg(windows)]
                     process: std::sync::Arc::new(process),
                 },
             );
@@ -236,16 +375,12 @@ impl ProcessTable {
         // counter. Drop confirmed exits, leaving recovery to that counter, but
         // reject unknown identities rather than publishing a partial live sum.
         Self::fence(&mut members, &mut unreadable, |member| {
-            #[cfg(windows)]
-            let current = member
+            member
                 .process
                 .observe()
                 .map_or(crate::IdentityRead::Unknown, |observation| {
                     crate::IdentityRead::Alive(observation.start_time)
-                });
-            #[cfg(not(windows))]
-            let current = crate::read_identity(member.pid);
-            current
+                })
         });
         Ok(Self {
             members,
@@ -253,6 +388,7 @@ impl ProcessTable {
             revision,
             observed_at_ms,
             started_at: Some(started_at),
+            focus: None,
         })
     }
 
@@ -461,12 +597,179 @@ fn possibly_live(pid: u32) -> bool {
     session >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn possibly_live(_pid: u32) -> bool {
     true
 }
 
-type Entry = (u32, Option<u32>, String, Option<u64>);
+/// One listed process: pid, parent, program name and native start, each
+/// `None` when the listing did not supply it. A missing parent or name is
+/// read per process; a missing start is not compared against.
+type Entry = (u32, Option<u32>, Option<String>, Option<u64>);
+
+/// Own CPU and memory, then reaped-child user and system CPU.
+#[cfg(unix)]
+type Usage = (ResourceUsage, std::time::Duration, std::time::Duration);
+
+/// The per-process reads of a Unix walk. Tests substitute scripted answers
+/// to compare a narrowed walk with a full one over the same process table.
+#[cfg(unix)]
+trait Probe {
+    fn parent(&self, pid: u32) -> Option<u32>;
+    fn session(&self, pid: u32) -> Option<u32>;
+    fn name(&self, pid: u32) -> String;
+    fn identity(&self, pid: u32) -> crate::IdentityRead;
+    fn possibly_live(&self, pid: u32) -> bool;
+    fn usage(&self, pid: u32) -> Option<Usage>;
+}
+
+#[cfg(unix)]
+struct Native;
+
+#[cfg(unix)]
+impl Probe for Native {
+    fn parent(&self, pid: u32) -> Option<u32> {
+        crate::parent_pid(pid)
+    }
+
+    fn session(&self, pid: u32) -> Option<u32> {
+        // SAFETY: getsid is a read-only query of a numeric process.
+        #[allow(unsafe_code)]
+        let session = unsafe { libc::getsid(pid as libc::pid_t) };
+        u32::try_from(session).ok()
+    }
+
+    fn name(&self, pid: u32) -> String {
+        #[cfg(target_os = "macos")]
+        {
+            program_name(pid)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = pid;
+            String::new()
+        }
+    }
+
+    fn identity(&self, pid: u32) -> crate::IdentityRead {
+        crate::read_identity(pid)
+    }
+
+    fn possibly_live(&self, pid: u32) -> bool {
+        possibly_live(pid)
+    }
+
+    fn usage(&self, pid: u32) -> Option<Usage> {
+        #[cfg(target_os = "linux")]
+        {
+            crate::linux::resource_usage_parts(pid)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            crate::macos::resource_usage_parts(pid)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            // Without separate reaped-child counters, all CPU is the process's own.
+            crate::resource_usage(pid)
+                .map(|usage| (usage, std::time::Duration::ZERO, std::time::Duration::ZERO))
+        }
+    }
+}
+
+/// Parents and sessions a narrowed walk read while choosing its focus. The
+/// walk itself uses these answers instead of asking again, so each examined
+/// process gets one parent and one session read, as in a full walk.
+#[cfg(unix)]
+#[derive(Default)]
+struct Known {
+    parents: BTreeMap<u32, Option<u32>>,
+    sessions: BTreeMap<u32, Option<u32>>,
+}
+
+/// Choose the processes a narrowed walk examines; see [`ProcessTable::read_for`].
+///
+/// A tree query rooted at `root` selects `root`, then repeatedly every member
+/// whose parent is selected or, with its session, whose session id is
+/// `root` when `root` leads its own session. It is made uncertain by an
+/// unreadable process that is selected, whose parent is selected or unknown,
+/// or, with the session, whose session is `root` or unknown. Every such
+/// process is an interest pid, a session member of an interest pid that
+/// leads its session, a process with an unknown session or parent, or a
+/// descendant of one of those, so that set is examined. Adding all of their
+/// ancestors keeps every parent lookup and ancestry walk from an examined
+/// process exact too.
+#[cfg(unix)]
+fn focus(
+    entries: &[Entry],
+    interest: &BTreeSet<u32>,
+    probe: &impl Probe,
+    known: &mut Known,
+) -> Focus {
+    let mut parents = BTreeMap::new();
+    for (pid, parent, ..) in entries {
+        let parent = match parent {
+            Some(parent) => Some(*parent),
+            None => *known
+                .parents
+                .entry(*pid)
+                .or_insert_with(|| probe.parent(*pid)),
+        };
+        parents.insert(*pid, parent);
+    }
+    let mut children = BTreeMap::<u32, Vec<u32>>::new();
+    for (pid, parent) in &parents {
+        if let Some(parent) = parent {
+            children.entry(*parent).or_default().push(*pid);
+        }
+    }
+    let mut seeds: Vec<u32> = interest.iter().copied().collect();
+    seeds.extend(
+        parents
+            .iter()
+            .filter(|(_, parent)| parent.is_none())
+            .map(|(pid, _)| *pid),
+    );
+    let mut session = |pid: u32| {
+        *known
+            .sessions
+            .entry(pid)
+            .or_insert_with(|| probe.session(pid))
+    };
+    let leaders: BTreeSet<u32> = interest
+        .iter()
+        .copied()
+        .filter(|pid| parents.contains_key(pid))
+        .filter(|pid| session(*pid) == Some(*pid))
+        .collect();
+    if !leaders.is_empty() {
+        for pid in parents.keys() {
+            if session(*pid).is_none_or(|session| leaders.contains(&session)) {
+                seeds.push(*pid);
+            }
+        }
+    }
+    let mut selected = BTreeSet::new();
+    while let Some(pid) = seeds.pop() {
+        if selected.insert(pid) {
+            seeds.extend(children.get(&pid).into_iter().flatten().copied());
+        }
+    }
+    let reached: Vec<u32> = selected.iter().copied().collect();
+    for pid in reached {
+        let mut current = parents.get(&pid).copied().flatten();
+        while let Some(parent) = current.filter(|parent| parents.contains_key(parent)) {
+            if !selected.insert(parent) {
+                break;
+            }
+            current = parents.get(&parent).copied().flatten();
+        }
+    }
+    Focus {
+        selected,
+        listed: parents.into_keys().collect(),
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn entries() -> io::Result<Vec<Entry>> {
@@ -481,14 +784,14 @@ fn entries() -> io::Result<Vec<Entry>> {
             continue;
         };
         let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            entries.push((pid, None, String::new(), None));
+            entries.push((pid, None, Some(String::new()), None));
             continue;
         };
         let Some((name, rest)) = stat
             .split_once('(')
             .and_then(|(_, tail)| tail.rsplit_once(')'))
         else {
-            entries.push((pid, None, String::new(), None));
+            entries.push((pid, None, Some(String::new()), None));
             continue;
         };
         let parent = rest.split_whitespace().nth(1).and_then(|s| s.parse().ok());
@@ -496,17 +799,52 @@ fn entries() -> io::Result<Vec<Entry>> {
             .split_whitespace()
             .nth(19)
             .and_then(|value| value.parse().ok());
-        entries.push((pid, parent, name.to_owned(), start));
+        entries.push((pid, parent, Some(name.to_owned()), start));
     }
     Ok(entries)
 }
 
+/// One `sysctl(KERN_PROC_ALL)` lists every process with its parent and
+/// start. Names come from `proc_name` later, and only for processes a walk
+/// keeps, because the listing's 16-byte command name is shorter.
 #[cfg(target_os = "macos")]
 fn entries() -> io::Result<Vec<Entry>> {
+    Ok(crate::macos::process_list()?
+        .into_iter()
+        .map(|(pid, parent, start)| (pid, parent, None, start))
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn program_name(pid: u32) -> String {
+    #[allow(unsafe_code)]
+    unsafe extern "C" {
+        fn proc_name(pid: libc::c_int, buffer: *mut std::ffi::c_void, size: u32) -> libc::c_int;
+    }
+    let mut name = [0_u8; 1024];
+    // SAFETY: name is initialized, writable and its length is correct.
+    #[allow(unsafe_code)]
+    let length = unsafe {
+        proc_name(
+            pid as libc::c_int,
+            name.as_mut_ptr().cast(),
+            name.len() as u32,
+        )
+    };
+    let length = usize::try_from(length).unwrap_or(0).min(name.len());
+    String::from_utf8_lossy(&name[..length])
+        .trim_end_matches('\0')
+        .to_owned()
+}
+
+/// The listing a walk used before `KERN_PROC_ALL`: every pid from
+/// `proc_listallpids` with its `proc_name`, and the parent and start left to
+/// the per-process reads. Kept to measure the old walk's cost.
+#[cfg(all(test, target_os = "macos"))]
+fn legacy_entries() -> io::Result<Vec<Entry>> {
     #[allow(unsafe_code)]
     unsafe extern "C" {
         fn proc_listallpids(buffer: *mut std::ffi::c_void, size: libc::c_int) -> libc::c_int;
-        fn proc_name(pid: libc::c_int, buffer: *mut std::ffi::c_void, size: u32) -> libc::c_int;
     }
     // SAFETY: a null buffer asks only for the number of PIDs.
     #[allow(unsafe_code)]
@@ -523,28 +861,15 @@ fn entries() -> io::Result<Vec<Entry>> {
             (pids.len() * size_of::<i32>()) as i32,
         )
     };
-    if count <= 0 {
+    if count <= 0 || count as usize >= pids.len() {
         return Err(io::Error::last_os_error());
     }
-    if count as usize >= pids.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "process table outgrew its snapshot buffer",
-        ));
-    }
-    let mut entries = Vec::new();
-    for pid in pids.into_iter().take(count as usize).filter(|pid| *pid > 0) {
-        let mut name = [0_u8; 1024];
-        // SAFETY: name is initialized, writable and its length is correct.
-        #[allow(unsafe_code)]
-        let length = unsafe { proc_name(pid, name.as_mut_ptr().cast(), name.len() as u32) };
-        let length = usize::try_from(length).unwrap_or(0).min(name.len());
-        let name = String::from_utf8_lossy(&name[..length])
-            .trim_end_matches('\0')
-            .to_owned();
-        entries.push((pid as u32, None, name, None));
-    }
-    Ok(entries)
+    Ok(pids
+        .into_iter()
+        .take(count as usize)
+        .filter(|pid| *pid > 0)
+        .map(|pid| (pid as u32, None, Some(program_name(pid as u32)), None))
+        .collect())
 }
 
 #[cfg(windows)]
@@ -552,7 +877,7 @@ fn entries() -> io::Result<Vec<Entry>> {
     crate::windows::process_entries().map(|entries| {
         entries
             .into_iter()
-            .map(|(pid, parent, name, start)| (pid, parent, name, Some(start)))
+            .map(|(pid, parent, name, start)| (pid, parent, Some(name), Some(start)))
             .collect()
     })
 }
@@ -564,6 +889,9 @@ fn entries() -> io::Result<Vec<Entry>> {
         "process tables unavailable",
     ))
 }
+
+#[cfg(all(test, unix))]
+mod narrowing_tests;
 
 #[cfg(test)]
 mod tests {
@@ -657,6 +985,7 @@ mod tests {
             revision: 1,
             observed_at_ms: 0,
             started_at: None,
+            focus: None,
         };
         assert!(table.tree(1, 11, true).is_none());
         let tree = table.tree(1, 10, false).unwrap();

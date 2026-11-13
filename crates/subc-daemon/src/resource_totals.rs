@@ -9,12 +9,15 @@ mod finish_cpu;
 mod funded_groups;
 mod overlap;
 mod pending;
+mod shared_reads;
 pub(crate) use commit_fence::CommitFence;
 #[cfg(test)]
 mod audit_tests;
 #[cfg(test)]
 mod committed_tests;
 mod cpu_ledger;
+#[cfg(test)]
+mod latency_bench;
 mod prospective;
 mod time;
 use self::time::{Clock, RecentLoss};
@@ -51,6 +54,7 @@ pub(crate) struct Tracker {
     state: Mutex<State>,
     committed: Mutex<committed::View>,
     walk: tokio::sync::Mutex<()>,
+    declaration_reads: shared_reads::SharedReads<Option<Arc<ProcessTable>>>,
     view_refreshing: Arc<AtomicBool>,
     #[cfg(test)]
     view_refreshes: std::sync::atomic::AtomicUsize,
@@ -92,6 +96,9 @@ pub(crate) struct Declaration {
 #[derive(Default)]
 pub(crate) struct Receipt {
     finish_until: Option<u64>,
+    /// A paired counter and table that an attempt read but could not use
+    /// because the state was busy, kept for the next attempt.
+    snapshot: Option<validation::Snapshot>,
     loss_epoch: Option<u64>,
     #[cfg(windows)]
     windows_stop_cpu: windows::StopBoundary,
@@ -270,6 +277,13 @@ struct OmittedRoot {
     accepted_at: Instant,
 }
 
+impl DeclarationArrival {
+    /// Time since the declaration arrived.
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.declared_at.elapsed()
+    }
+}
+
 impl Tracker {
     pub(crate) fn declaration_arrival(&self) -> DeclarationArrival {
         DeclarationArrival {
@@ -407,7 +421,7 @@ impl Tracker {
         self.read(modules, sample, caller).await
     }
 
-    fn validation_table(&self) -> Option<ProcessTable> {
+    fn validation_table(&self, interest: Option<BTreeSet<u32>>) -> Option<ProcessTable> {
         #[cfg(test)]
         {
             let injected = self.validation_table.lock().unwrap().as_mut().map(|read| {
@@ -421,7 +435,18 @@ impl Tracker {
                 return Some(table);
             }
         }
-        ProcessTable::read().ok()
+        // Declarations arriving during a walk share the next one instead of
+        // each starting its own.
+        self.declaration_reads
+            .read(interest, |interest| {
+                match interest {
+                    Some(interest) => ProcessTable::read_for(&interest),
+                    None => ProcessTable::read(),
+                }
+                .ok()
+                .map(Arc::new)
+            })
+            .map(|table| ProcessTable::clone(&table))
     }
     #[cfg(all(test, windows))]
     pub(crate) fn command_process(
@@ -509,7 +534,20 @@ impl Tracker {
         // can cause a retry. Even a failed first read closes the finish window;
         // a later attempt cannot borrow subsequently observed CPU.
         let first_pass = receipt.finish_until.is_none();
-        let snapshot = validation::Snapshot::read_with(&target, || self.validation_table());
+        let mut request = BTreeSet::new();
+        shared_reads::declaration_pids(module_pid, &batch, &mut request);
+        // A retry after this method found the state busy reuses that
+        // attempt's snapshot: nothing was applied from it, its walk still
+        // began after this declaration arrived, and its counter was still
+        // read before that walk. A retry after a commit conflict reads again.
+        let snapshot = receipt.snapshot.take().or_else(|| {
+            let interest = self.interest().map(|mut interest| {
+                interest.extend(request.iter().copied());
+                shared_reads::container_pids(&target, &mut interest);
+                interest
+            });
+            validation::Snapshot::read_with(&target, || self.validation_table(interest))
+        });
         let finish_until = *receipt.finish_until.get_or_insert_with(|| {
             snapshot
                 .as_ref()
@@ -521,12 +559,27 @@ impl Tracker {
             .then(|| target.counter_identity())
             .flatten();
         let (expected_revision, mut module) = {
-            let state = self.state.try_lock().ok()?;
+            let Ok(state) = self.state.try_lock() else {
+                receipt.snapshot = Some(snapshot);
+                return None;
+            };
             (
                 state.revision,
                 state.modules.get(module_id).cloned().unwrap_or_default(),
             )
         };
+        // State committed during the walk can name a pid the walk did not
+        // examine. Retry with a walk that does, rather than answer from a
+        // table that cannot speak for that pid.
+        module.interest(&mut request);
+        if !shared_reads::covers(&snapshot.table, &request) {
+            tracing::debug!(
+                cause = "interest",
+                phase = "declaration_table",
+                "resource pass incomplete"
+            );
+            return None;
+        }
         let trusted = {
             let carried = counter.is_some_and(|counter| module.counter == Some(counter));
             let mut trusted: BTreeMap<_, _> = module
@@ -925,7 +978,18 @@ impl Tracker {
             .is_none_or(|declared| table.started_at().is_some_and(|began| began > declared))
     }
 
+    #[cfg(test)]
     async fn table(&self) -> Option<Arc<ProcessTable>> {
+        self.table_for(None, Vec::new()).await
+    }
+
+    /// The sampler's walk, narrowed to `interest` plus the members of the
+    /// container `targets`, or a full walk when `interest` is `None`.
+    async fn table_for(
+        &self,
+        interest: Option<BTreeSet<u32>>,
+        targets: Vec<crate::subtree_resources::Target>,
+    ) -> Option<Arc<ProcessTable>> {
         {
             let Ok(cache) = self.cache.try_lock() else {
                 tracing::debug!(
@@ -936,7 +1000,11 @@ impl Tracker {
                 return None;
             };
             if let Some((at, table)) = cache.as_ref() {
-                if at.elapsed() < Duration::from_secs(1) && self.cached_table_covers_pending(table)
+                if at.elapsed() < Duration::from_secs(1)
+                    && self.cached_table_covers_pending(table)
+                    && interest
+                        .as_ref()
+                        .is_none_or(|interest| shared_reads::covers(table, interest))
                 {
                     return Some(Arc::clone(table));
                 }
@@ -966,16 +1034,26 @@ impl Tracker {
             read_deadline(),
             move |_| {
                 let _refresh = refresh;
+                let interest = interest.map(|mut interest| {
+                    for target in &targets {
+                        shared_reads::container_pids(target, &mut interest);
+                    }
+                    interest
+                });
+                let walk = move || match interest {
+                    Some(interest) => ProcessTable::read_for(&interest),
+                    None => ProcessTable::read(),
+                };
                 // Publish even a late result. No cache or attribution lock is
                 // held while walking the host's process table.
                 #[cfg(test)]
                 let table = {
                     reads.fetch_add(1, Ordering::SeqCst);
                     let table = supplied.lock().unwrap().pop_front();
-                    table.map_or_else(ProcessTable::read, Ok)
+                    table.map_or_else(walk, Ok)
                 };
                 #[cfg(not(test))]
-                let table = ProcessTable::read();
+                let table = walk();
                 let table = Arc::new(table.map_err(|error| {
                     tracing::debug!(cause = "unreadable", phase = "process_table", %error, "resource pass incomplete");
                 }).ok()?);
@@ -1059,7 +1137,16 @@ impl Tracker {
             |_| BTreeMap::new(),
         )
         .await;
-        let Some(table) = self.table().await else {
+        let interest = self.interest().map(|mut interest| {
+            interest.extend(launches.values().flatten().filter_map(|launch| launch.pid));
+            interest
+        });
+        let containers = launches
+            .values()
+            .flatten()
+            .map(|launch| launch.target.clone())
+            .collect();
+        let Some(table) = self.table_for(interest, containers).await else {
             return Readings::default();
         };
         let tracker = Arc::clone(self);
@@ -1245,6 +1332,18 @@ impl Tracker {
         }
         let mut candidate = state.clone();
         drop(state);
+        // State committed during the walk can name a pid the walk did not
+        // examine; leave this pass incomplete rather than answer for it.
+        let mut required = self.state_interest(&candidate);
+        required.extend(observed.values().filter_map(|observed| observed.4));
+        if !shared_reads::covers(&table, &required) {
+            tracing::debug!(
+                cause = "interest",
+                phase = "observation_table",
+                "resource pass incomplete"
+            );
+            return None;
+        }
         let state = &mut candidate;
         state.revision = state.revision.wrapping_add(1);
         #[cfg(windows)]

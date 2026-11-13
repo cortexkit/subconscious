@@ -40,6 +40,10 @@ pub(super) struct Model {
 }
 
 impl Model {
+    /// Process identities whose exit this model still waits to learn.
+    pub(super) fn identities(&self) -> impl Iterator<Item = Identity> + '_ {
+        self.pending.iter().filter_map(|(identity, _, _)| *identity)
+    }
     pub(super) fn set_clock(&mut self, clock: super::Clock) {
         self.clock = clock;
     }

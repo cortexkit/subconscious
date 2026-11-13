@@ -15,6 +15,14 @@ pub(super) struct Credits {
 }
 
 impl Credits {
+    /// Identities whose credit lasts until a walk confirms their exit.
+    pub(super) fn identities(&self) -> impl Iterator<Item = Identity> + '_ {
+        self.module
+            .keys()
+            .chain(self.agents.keys())
+            .chain(self.own.keys())
+            .copied()
+    }
     pub(super) fn module_credit(&self) -> u64 {
         self.module.values().copied().sum()
     }

@@ -29,6 +29,14 @@ impl Module {
         })
     }
 
+    /// Pending roots and the module processes that declared them.
+    pub(super) fn pending_pids(&self, pids: &mut BTreeSet<u32>) {
+        for (root, pending) in &self.pending {
+            pids.insert(root.pid);
+            pids.insert(pending.module_pid);
+        }
+    }
+
     pub(super) fn root_capacity_full(&self) -> bool {
         self.roots.len() + self.finished_live.len() + self.pending.len() >= ROOT_LIMIT
     }

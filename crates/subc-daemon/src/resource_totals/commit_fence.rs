@@ -14,6 +14,10 @@ impl CommitFence {
     pub(crate) fn committed(&self) -> bool {
         self.0.load(Ordering::Acquire) == COMMITTING
     }
+    /// A timeout or explicit cancellation won: no commit can follow.
+    pub(crate) fn cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire) == CANCELLED
+    }
     pub(crate) fn cancel(&self) -> bool {
         match self
             .0
@@ -59,6 +63,17 @@ mod tests {
         let committed = CommitFence::default();
         assert!(committed.claim_commit());
         assert!(!committed.cancel_for_retention());
+    }
+
+    #[test]
+    fn only_a_won_cancellation_reports_cancelled() {
+        let open = CommitFence::default();
+        assert!(!open.cancelled());
+        assert!(open.claim_commit());
+        assert!(!open.cancelled(), "a committing fence is not cancelled");
+        let timed_out = CommitFence::default();
+        assert!(timed_out.cancel_for_retention());
+        assert!(timed_out.cancelled());
     }
 
     #[test]

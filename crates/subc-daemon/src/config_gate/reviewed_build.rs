@@ -44,12 +44,7 @@ pub(super) fn recorded(body: &StoreBody) -> Result<BTreeMap<String, String>> {
     else {
         return Ok(BTreeMap::new());
     };
-    if let Some(record) = entry
-        .generation
-        .changeset
-        .apply_plan
-        .get(REVIEWED_PROGRAMS)
-    {
+    if let Some(record) = entry.generation.changeset.apply_plan.get(REVIEWED_PROGRAMS) {
         return serde_json::from_value(record.clone()).map_err(GateError::invalid);
     }
     let snapshot = GateSnapshot::from_store(&entry.configuration)?;

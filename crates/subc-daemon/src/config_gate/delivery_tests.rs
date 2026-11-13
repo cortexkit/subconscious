@@ -1068,9 +1068,7 @@ async fn config_delivery_program_only_change_waits_for_a_child_started_from_the_
             .finish_approval(
                 challenge.attempt(),
                 &Rig::facts(),
-                ApprovalReply::Presence(
-                    super::super::super::PresenceDecision::InteractiveApproval
-                ),
+                ApprovalReply::Presence(super::super::super::PresenceDecision::InteractiveApproval),
                 2,
             )
             .unwrap(),

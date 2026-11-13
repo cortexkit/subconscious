@@ -1693,7 +1693,10 @@ fn config_admission_program_change_is_approved_launch_only_then_rereviewed_by_th
     );
     assert_eq!(approve(&rig, &owner, PlanKind::Change), 2);
     let waiting = rereview_warning(&owner).expect("status names the module awaiting re-review");
-    assert!(waiting.contains("waits until that program is running"), "{waiting}");
+    assert!(
+        waiting.contains("waits until that program is running"),
+        "{waiting}"
+    );
     assert!(
         !owner
             .prepare(PlanKind::Change)
@@ -1723,7 +1726,10 @@ fn config_admission_program_change_is_approved_launch_only_then_rereviewed_by_th
         Some(AppliedDisposition::Active)
     );
     let ready = rereview_warning(&owner).expect("re-review is still owed");
-    assert!(ready.contains("the next configuration plan re-reviews"), "{ready}");
+    assert!(
+        ready.contains("the next configuration plan re-reviews"),
+        "{ready}"
+    );
     let prepared = owner.prepare(PlanKind::Change).unwrap();
     assert!(prepared.review_modules.contains("a"));
     assert!(prepared.rereview_modules.contains("a"));

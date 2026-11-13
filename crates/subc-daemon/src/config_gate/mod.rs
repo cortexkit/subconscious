@@ -312,7 +312,8 @@ impl ConfigGate {
         if matches!(kind, PlanKind::Rollback(_)) {
             changeset.apply_plan["rollback_programs"] = serde_json::Value::Array(rollback_programs);
         }
-        let replaces_programs = !recovery && matches!(kind, PlanKind::Change | PlanKind::Rollback(_));
+        let replaces_programs =
+            !recovery && matches!(kind, PlanKind::Change | PlanKind::Rollback(_));
         if replaces_programs {
             // A module whose active generation ran an older program than this
             // plan's (an earlier program change not yet active, say) still has
@@ -330,7 +331,10 @@ impl ConfigGate {
                         .or_insert_with(|| serde_json::json!({}))
                         .as_object_mut()
                         .ok_or_else(|| GateError::invalid("launch manifest must be an object"))?
-                        .insert("program_changed_since_active".into(), serde_json::Value::Bool(true));
+                        .insert(
+                            "program_changed_since_active".into(),
+                            serde_json::Value::Bool(true),
+                        );
                 }
             }
         }
@@ -355,7 +359,8 @@ impl ConfigGate {
                 } else {
                     reviewed_build::identity(&candidate, module)
                 };
-                if let Some(previous) = record.get(module).filter(|previous| **previous != program) {
+                if let Some(previous) = record.get(module).filter(|previous| **previous != program)
+                {
                     changeset.policy_changes.push(serde_json::json!({
                         "module_id": module,
                         "path": "reviewed_program",

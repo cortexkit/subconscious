@@ -534,7 +534,8 @@ mod dual_path_tests {
         assert_eq!(error["code"], "swap_token_invalid");
         let message = error["message"].as_str().unwrap();
         assert!(
-            message.contains("a protocol:none module may not register") && !message.contains("swap"),
+            message.contains("a protocol:none module may not register")
+                && !message.contains("swap"),
             "the refusal names the protocol:none reason, not a swap: {message}"
         );
         f.stop().await;

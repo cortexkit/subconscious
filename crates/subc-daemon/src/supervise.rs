@@ -9076,8 +9076,11 @@ async fn handle_supervisor_command(
                     let result = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                         changed = !state.enabled;
                         state.enabled = true;
-                        state.config_hold_parked = true;
-                        state.state = ModuleState::Stopped;
+                        if child.is_none() {
+                            state.config_hold_parked = true;
+                            state.state = ModuleState::Stopped;
+                            state.failed_retry.cancel();
+                        }
                     })
                     .map(|_| changed);
                     if result.is_ok() && changed {

@@ -185,8 +185,8 @@ async fn operator_gate_error_reply(operation: &str) {
         }
     );
     assert!(!owner.has_recorded_admission_hold("not-approved"));
-    // Exercise the actor's error-to-wire boundary, not the control handler's
-    // earlier admission preflight. The supervisor still has the real gate.
+    // Exercise conversion of a supervisor error into a control-protocol reply,
+    // not the handler's earlier preflight. The supervisor has the real gate.
     let handler = Arc::new(crate::ControlHandler::new(registry).with_supervisor(handle));
     registration_declaration_poll(handler.clone(), "supervisor.list").await;
     let request = if matches!(operation, "restart" | "reload") {

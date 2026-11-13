@@ -109,6 +109,62 @@ async fn audit_registration_hold_keeps_disabled_actor_disabled() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn audit_registration_fence_only_approved_enable_releases_its_parked_actor() {
+    use crate::supervise::ModuleState;
+    let (rig, owner, supervisor, _) = supervised_fixture(false);
+    std::fs::write(rig.path.join("a.seen"), b"keep running").unwrap();
+    let module = supervisor
+        .supervise_configured_requested_async(
+            supervised_spec(&rig, "a"),
+            false,
+            Default::default(),
+            None,
+            Default::default(),
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .unwrap();
+    let spawn = owner
+        .spawned(
+            "a",
+            tokio::time::Instant::now(),
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .unwrap();
+    owner.delivery_child_exited(&spawn).unwrap();
+    let approved = owner.authority_exit_configuration(1).unwrap().unwrap().3;
+    module
+        .reconcile_approved_configuration(approved)
+        .await
+        .unwrap();
+    let staged = module.status().unwrap();
+    let exited = owner
+        .delivery_exits()
+        .unwrap()
+        .into_iter()
+        .find(|exit| exit.module == "a")
+        .unwrap();
+    owner.delivery_release_exit(&exited).unwrap();
+    let released = module.release_config_hold().await.unwrap();
+    let after = module.status().unwrap();
+    module.stop().await.unwrap();
+    assert!(staged.enabled && !staged.process_alive);
+    assert_eq!(
+        staged.state,
+        ModuleState::Stopped,
+        "an accepted enable must be parked, not stranded Disabled"
+    );
+    assert!(
+        released && after.process_alive,
+        "clearing its only fence must resume the staged enable"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn audit_registration_deferred_generation_survives_two_active_child_exits() {
     use std::sync::Arc;
     let (rig, owner, supervisor, handler) = supervised_fixture(false);
@@ -462,12 +518,6 @@ async fn audit_registration_release_consumed_behind_exit_fence_is_retried_after_
         .await
         .unwrap();
     let before = module.status().unwrap();
-    let path = rig.path.join("subc.jsonc");
-    let mut doc: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    doc["modules"]["a"]["registration_channel"] = json!(false);
-    std::fs::write(&path, doc.to_string()).unwrap();
-    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::Live]);
     let fenced_spawn = owner
         .spawned(
             "a",
@@ -478,6 +528,12 @@ async fn audit_registration_release_consumed_behind_exit_fence_is_retried_after_
         .unwrap()
         .unwrap();
     owner.delivery_child_exited(&fenced_spawn).unwrap();
+    let path = rig.path.join("subc.jsonc");
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    doc["modules"]["a"]["registration_channel"] = json!(false);
+    std::fs::write(&path, doc.to_string()).unwrap();
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::Live]);
     rustix::process::kill_process(
         rustix::process::Pid::from_raw(before.pid.unwrap() as i32).unwrap(),
         rustix::process::Signal::KILL,

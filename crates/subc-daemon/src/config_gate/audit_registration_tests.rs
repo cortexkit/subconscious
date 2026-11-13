@@ -96,6 +96,12 @@ async fn parking_poison_startup(strict: bool, synchronous: bool) {
     let rig = rig();
     let owner = Arc::new(rig.owner("poison-during-startup-park"));
     rig.stamp(&owner);
+    std::fs::write(
+        rig.path.join("store").join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(owner.check_recovery().unwrap());
     assert!(owner.has_recorded_admission_hold("a"));
     let handle = channel_handle();
     let supervisor =

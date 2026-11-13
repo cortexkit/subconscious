@@ -31,6 +31,11 @@ async fn route_authorize_permission_and_reply_are_connection_bound_and_side_effe
             assert_eq!(body["outcome"], "authorized");
             assert_eq!(body["content_version"].as_str().unwrap().len(), 71);
             assert!(body.get("route_open_code").is_none());
+            // The authorized principal carries no spawn or epoch, so the
+            // reply never conveys an attestation or the first-party mark.
+            for key in ["caller", "target", "first_party"] {
+                assert!(body.get(key).is_none(), "{key}: {body}");
+            }
             let (direct, _rx) = wide_ctx(31);
             let denied = call(&rig.handler, &direct, &request).await;
             assert_eq!(parse_error(&denied)["code"], error_codes::ROUTE_AUTHORIZE_NOT_PERMITTED);

@@ -4901,6 +4901,11 @@ impl ControlHandler {
         scope_expiry::ScopeExpiryContext::new(self).close_scope_drained_routes(drained);
     }
 
+    /// Re-authorize a stored source on a principal the module supplies.
+    ///
+    /// That principal carries no spawn or authority epoch, so this reply never
+    /// conveys a caller attestation or a first-party mark, and a provider must
+    /// not apply automatic grants on anything it authorizes.
     fn handle_route_authorize(
         &self,
         connection_id: ConnectionId,

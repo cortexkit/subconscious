@@ -322,6 +322,29 @@ async fn caller_attestation_reply_target_reports_the_reserved_endpoint() {
 }
 
 #[tokio::test]
+async fn caller_attestation_reply_target_never_reports_a_prefix_childs_owner() {
+    let mut rig = rig().await;
+    let mut child = super::claims::tests::prefix_connection(&mut rig, "claims:worker").await;
+    // The prefix child registers over a claim bound to its owner's spawn,
+    // but it is never that spawn's own registration.
+    hello(&mut child, tool_manifest("claims:worker", &[], &[])).await;
+    let mut opener = Net::new(rig.router.clone()).await;
+    for busy_refusals in [false, true] {
+        let (_, reply) = open(&mut opener, &mut child, "claims:worker", busy_refusals).await;
+        assert_eq!(
+            body(&reply)["target"],
+            json!({
+                "incarnation": rig.handler.supervisor.daemon_incarnation(),
+                "kind": "prefix",
+                "first_party": false,
+            }),
+            "{}",
+            text(&reply)
+        );
+    }
+}
+
+#[tokio::test]
 async fn caller_attestation_stale_caller_epoch_settles_as_a_refusal() {
     let mut rig = rig().await;
     let mut target =

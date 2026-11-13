@@ -3293,7 +3293,9 @@ async fn config_delivery_swap_superseded_by_approval_keeps_the_incumbent_then_st
             .count(),
         1
     );
-    assert_eq!(module.status().unwrap().spawn_generation, 2);
+    // The superseded swap candidate's launch was numbered 2 before it
+    // started, so the next command's launch is 3.
+    assert_eq!(module.status().unwrap().spawn_generation, 3);
     assert_eq!(module.status().unwrap().restart_count, 0);
     assert_eq!(
         std::fs::read_to_string(rig.path.join("a.launches"))
@@ -3849,6 +3851,8 @@ async fn restart_after_busy_swap_warmup(candidate_exits_first: bool) {
         "candidate exit lost the worker's one approved restart"
     );
     assert_eq!(launches, 1);
-    assert_eq!(status.spawn_generation, 2);
+    // The candidate's launch was numbered 2 before it started, so the one
+    // approved restart after it exited runs as launch 3.
+    assert_eq!(status.spawn_generation, 3);
     assert_eq!(status.restart_count, 0);
 }

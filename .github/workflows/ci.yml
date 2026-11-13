@@ -388,7 +388,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y polkitd pkexec policykit-1 python3-dbus
+          sudo apt-get install -y polkitd pkexec python3-dbus
           sudo useradd --create-home --shell /bin/sh subc-polkit-test
           trap 'sudo userdel --remove subc-polkit-test' EXIT
           echo 'subc-polkit-test:polkit-fixture-password' | sudo chpasswd

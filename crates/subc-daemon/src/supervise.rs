@@ -3980,7 +3980,7 @@ impl Supervisor {
                 return Ok(self.supervised_module(spec, runtime, snapshot, None));
             }
             Err(SuperviseError::ConfigHeld { .. }) => {
-                hold_config_spawn(&spec, &runtime, &snapshot)?;
+                hold_config_spawn(&spec, &runtime, &snapshot, EndedConfigHold::RetrySpawn)?;
                 return Ok(self.supervised_module(spec, runtime, snapshot, None));
             }
             Err(err) => {
@@ -4024,7 +4024,7 @@ impl Supervisor {
                 return Ok(self.supervised_module(spec, runtime, snapshot, None));
             }
             Err(SuperviseError::ConfigHeld { .. }) => {
-                hold_config_spawn(&spec, &runtime, &snapshot)?;
+                hold_config_spawn(&spec, &runtime, &snapshot, EndedConfigHold::RetrySpawn)?;
                 identity.committed = true;
                 return Ok(self.supervised_module(spec, runtime, snapshot, None));
             }
@@ -4289,7 +4289,7 @@ impl Supervisor {
                     None
                 }
                 Err(SuperviseError::ConfigHeld { .. }) => {
-                    hold_config_spawn(&spec, &runtime, snapshot)?;
+                    hold_config_spawn(&spec, &runtime, snapshot, EndedConfigHold::RetrySpawn)?;
                     None
                 }
                 Err(err) => {
@@ -4389,7 +4389,7 @@ impl Supervisor {
                 }
                 Err(err) => {
                     if matches!(err, SuperviseError::ConfigHeld { .. }) {
-                        hold_config_spawn(&spec, &runtime, snapshot)?;
+                        hold_config_spawn(&spec, &runtime, snapshot, EndedConfigHold::RetrySpawn)?;
                         self.start_monitor(spec, runtime, &module, None, commands);
                         return Ok(module);
                     }
@@ -6977,10 +6977,17 @@ fn cancel_deferred_reload(runtime: &SupervisorRuntimeConfig, module_id: &str, re
     }
 }
 
+#[derive(Clone, Copy)]
+enum EndedConfigHold {
+    PreserveWork,
+    RetrySpawn,
+}
+
 fn hold_config_spawn(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
+    ended: EndedConfigHold,
 ) -> Result<(), SuperviseError> {
     {
         let state = lock_snapshot(snapshot)?;
@@ -7032,9 +7039,14 @@ fn hold_config_spawn(
             return result;
         }
     }
-    // The observed hold ended before parking; its release may already be gone.
-    // Keep ordinary spawn work scheduled instead of waiting for another release.
-    defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn)
+    match ended {
+        EndedConfigHold::PreserveWork => Ok(()),
+        // Only a caller that already abandoned its spawn work needs a new
+        // attempt when the hold ends before parking and its release is gone.
+        EndedConfigHold::RetrySpawn => {
+            defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn)
+        }
+    }
 }
 
 fn schedule_respawn(
@@ -8593,7 +8605,7 @@ async fn supervise_loop(
                         NextAction::Restart {schedule:None}
                     } else if active_child.live_program_binding.as_ref().is_some_and(|binding|binding.is_refused()) || runtime.config_delivery.as_ref().is_some_and(|delivery| delivery.0.exit_is_held(&spec.module_id)) {
                         record_terminal_with_detail(&spec.module_id, &runtime.terminal_ring, &runtime.spawn_events, &exit_report, TerminalDisposition::Stopped, active_child.spawn_failure.clone().or_else(|| Some("config_gated".into())));
-                        let _ = hold_config_spawn(&spec, &runtime, &snapshot);
+                        let _ = hold_config_spawn(&spec, &runtime, &snapshot, EndedConfigHold::RetrySpawn);
                         NextAction::Stop { registration_released: registry.get_module(&spec.module_id).ok().flatten().is_none() }
                     } else { on_child_exit(
                         &spec,
@@ -8801,7 +8813,7 @@ async fn supervise_loop(
                             let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| state.respawn_pending = true);
                         }
                         Err(SuperviseError::ConfigHeld { .. }) => {
-                            let _ = hold_config_spawn(&spec, &runtime, &snapshot);
+                            let _ = hold_config_spawn(&spec, &runtime, &snapshot, EndedConfigHold::RetrySpawn);
                             runtime.pending_activity_restart = false;
                             process_liveness.untrack_if_current(&spec.module_id, &snapshot);
                         }
@@ -8863,7 +8875,7 @@ async fn supervise_loop(
                                         let _ = defer_config_spawn(&spec, &runtime, &snapshot, RespawnKind::Spawn);
                                     }
                                     Err(SuperviseError::ConfigHeld { .. }) => {
-                                        let _ = hold_config_spawn(&spec, &runtime, &snapshot);
+                                        let _ = hold_config_spawn(&spec, &runtime, &snapshot, EndedConfigHold::RetrySpawn);
                                     }
                                     Err(error) => {
                                         fail_snapshot(&snapshot, Some(&spec.module_id), None, &runtime.failure_context(true));
@@ -9045,7 +9057,7 @@ async fn handle_supervisor_command(
         });
     let command = if let Some(error) = blocked {
         if matches!(error, SuperviseError::ConfigHeld { .. }) && child.is_none() {
-            let _ = hold_config_spawn(spec, runtime, snapshot);
+            let _ = hold_config_spawn(spec, runtime, snapshot, EndedConfigHold::PreserveWork);
         }
         match command {
             SupervisorCommand::Restart { reply, .. } | SupervisorCommand::Reload { reply, .. } => {
@@ -9175,7 +9187,7 @@ async fn handle_supervisor_command(
                         Err(SuperviseError::ConfigDeliveryDeferred { .. }) => {
                             defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn)?;
                         }
-                        Err(SuperviseError::ConfigHeld { .. }) => hold_config_spawn(spec, runtime, snapshot)?,
+                        Err(SuperviseError::ConfigHeld { .. }) => hold_config_spawn(spec, runtime, snapshot, EndedConfigHold::RetrySpawn)?,
                         Err(error) => {
                             fail_snapshot(snapshot, Some(&spec.module_id), None, &runtime.failure_context(false));
                             return Err(error);
@@ -9278,7 +9290,7 @@ async fn handle_supervisor_command(
         }
         SupervisorCommand::ConfigExitHold { reply } => {
             let result = if child.is_none() {
-                hold_config_spawn(spec, runtime, snapshot)
+                hold_config_spawn(spec, runtime, snapshot, EndedConfigHold::PreserveWork)
             } else if runtime
                 .config_delivery
                 .as_ref()
@@ -9919,7 +9931,7 @@ async fn finish_reload_child(
             return Err(error);
         }
         Err(error @ SuperviseError::ConfigHeld { .. }) => {
-            hold_config_spawn(spec, runtime, snapshot)?;
+            hold_config_spawn(spec, runtime, snapshot, EndedConfigHold::RetrySpawn)?;
             return Err(error);
         }
         Err(err) => {
@@ -10141,7 +10153,7 @@ async fn set_child_enabled_with_budget_policy(
                 return Ok(true);
             }
             Err(error @ SuperviseError::ConfigHeld { .. }) => {
-                hold_config_spawn(spec, runtime, snapshot)?;
+                hold_config_spawn(spec, runtime, snapshot, EndedConfigHold::RetrySpawn)?;
                 return Err(error);
             }
             Err(err) => {

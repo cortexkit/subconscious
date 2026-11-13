@@ -1,6 +1,184 @@
 use super::*;
 
 #[tokio::test]
+async fn stale_config_exit_hold_keeps_reload_work_and_answers_its_caller() {
+    let (_scratch, owner, supervisor, _, spec) =
+        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+    assert!(!owner.has_recorded_admission_hold("a"));
+    std::fs::write(&spec.args[0], b"keep running").unwrap();
+    let RegisteredConfiguredModule {
+        mut spec,
+        mut runtime,
+        module,
+        mut commands,
+    } = supervisor
+        .register_configured_with_health(
+            spec,
+            true,
+            Default::default(),
+            None,
+            Default::default(),
+            DEFAULT_REGISTER_TIMEOUT,
+        )
+        .unwrap();
+    update_snapshot(&module.inner.snapshot, Some("a"), |state| {
+        state.state = ModuleState::Restarting;
+        state.respawn_pending = true;
+    })
+    .unwrap();
+    let (reply, result) = oneshot::channel();
+    *runtime.deferred_reload_reply.lock().unwrap() = Some(reply);
+    *runtime.scheduled_respawn.lock().unwrap() = Some(PendingRespawn {
+        deadline: Instant::now() + Duration::from_millis(20),
+        kind: RespawnKind::Reload,
+        daemon_initiated: false,
+    });
+    let (reply, held) = oneshot::channel();
+    let mut child = None;
+    assert!(
+        handle_supervisor_command(
+            SupervisorCommand::ConfigExitHold { reply },
+            &mut spec,
+            &mut runtime,
+            &supervisor.registry,
+            &supervisor.process_liveness,
+            &module.inner.snapshot,
+            &mut child,
+            &mut commands,
+            &mut VecDeque::new()
+        )
+        .await
+    );
+    held.await.unwrap().unwrap();
+    let reload_retained = matches!(
+        runtime
+            .scheduled_respawn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .kind,
+        RespawnKind::Reload
+    );
+    supervisor.start_monitor(spec, runtime, &module, None, commands);
+    let answer = tokio::time::timeout(Duration::from_secs(3), result).await;
+    module.set_enabled(false).await.unwrap();
+    module.stop().await.unwrap();
+    assert!(reload_retained, "a stale hold replaced Reload with Spawn");
+    assert!(
+        matches!(answer, Ok(Ok(Ok(())))),
+        "the original reload caller must receive completion: {answer:?}"
+    );
+}
+
+#[tokio::test]
+async fn stale_config_exit_hold_preserves_crash_backoff_deadline() {
+    let (_scratch, owner, supervisor, _, spec) =
+        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+    assert!(!owner.has_recorded_admission_hold("a"));
+    let RegisteredConfiguredModule {
+        mut spec,
+        mut runtime,
+        module,
+        mut commands,
+    } = supervisor
+        .register_configured_with_health(
+            spec,
+            true,
+            Default::default(),
+            None,
+            Default::default(),
+            DEFAULT_REGISTER_TIMEOUT,
+        )
+        .unwrap();
+    update_snapshot(&module.inner.snapshot, Some("a"), |state| {
+        state.state = ModuleState::Restarting;
+        state.respawn_pending = true;
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    *runtime.scheduled_respawn.lock().unwrap() = Some(PendingRespawn {
+        deadline,
+        kind: RespawnKind::Spawn,
+        daemon_initiated: true,
+    });
+    let before = format!("{:?}", module.status().unwrap());
+    let (reply, held) = oneshot::channel();
+    assert!(
+        handle_supervisor_command(
+            SupervisorCommand::ConfigExitHold { reply },
+            &mut spec,
+            &mut runtime,
+            &supervisor.registry,
+            &supervisor.process_liveness,
+            &module.inner.snapshot,
+            &mut None,
+            &mut commands,
+            &mut VecDeque::new()
+        )
+        .await
+    );
+    held.await.unwrap().unwrap();
+    let pending = runtime.scheduled_respawn.lock().unwrap().unwrap();
+    assert_eq!(
+        pending.deadline, deadline,
+        "stale holds must not shorten crash backoff"
+    );
+    assert!(pending.daemon_initiated);
+    assert_eq!(format!("{:?}", module.status().unwrap()), before);
+}
+
+#[tokio::test]
+async fn stale_config_exit_hold_preserves_previous_instance_wait() {
+    let (_scratch, owner, supervisor, _, spec) =
+        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+    assert!(!owner.has_recorded_admission_hold("a"));
+    let RegisteredConfiguredModule {
+        mut spec,
+        mut runtime,
+        module,
+        mut commands,
+    } = supervisor
+        .register_configured_with_health(
+            spec,
+            true,
+            Default::default(),
+            None,
+            Default::default(),
+            DEFAULT_REGISTER_TIMEOUT,
+        )
+        .unwrap();
+    update_snapshot(&module.inner.snapshot, Some("a"), |state| {
+        state.waiting_for_previous_pid = Some(4242);
+        state.waiting_for_previous_detail = Some("previous instance is still alive".into());
+    })
+    .unwrap();
+    let before = format!("{:?}", module.status().unwrap());
+    let (reply, held) = oneshot::channel();
+    assert!(
+        handle_supervisor_command(
+            SupervisorCommand::ConfigExitHold { reply },
+            &mut spec,
+            &mut runtime,
+            &supervisor.registry,
+            &supervisor.process_liveness,
+            &module.inner.snapshot,
+            &mut None,
+            &mut commands,
+            &mut VecDeque::new()
+        )
+        .await
+    );
+    held.await.unwrap().unwrap();
+    assert_eq!(
+        module.status().unwrap().waiting_for_previous_pid,
+        Some(4242)
+    );
+    assert_eq!(format!("{:?}", module.status().unwrap()), before);
+    assert!(runtime.scheduled_respawn.lock().unwrap().is_none());
+}
+
+#[tokio::test]
 async fn staged_unstamp_enable_preserves_a_live_child_instead_of_parking_it() {
     let (_scratch, owner, supervisor, _, spec) =
         crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();

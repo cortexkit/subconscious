@@ -53,6 +53,15 @@ pub(crate) struct ClaimBinding {
 }
 
 impl ClaimBinding {
+    pub(super) fn consumer_live(&self, connection: ConnectionId) -> bool {
+        if matches!(self.purpose, ClaimPurpose::Prefix { .. }) || !self.registration.launch_ready()
+        {
+            return false;
+        }
+        let state = self.launch.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.active && state.connections.contains_key(&connection)
+    }
+
     pub(super) fn prefix_module_id(&self) -> Option<&str> {
         match &self.purpose {
             ClaimPurpose::Prefix { module_id } => Some(module_id),
@@ -2012,6 +2021,80 @@ pub(crate) mod tests {
                 purpose
             );
         }
+    }
+
+    async fn route_principal_case(purpose: ClaimPurpose, retired: bool, void: bool, nonce: bool) {
+        let mut rig = rig().await;
+        let claim = mint(&mut rig, purpose).await.claim;
+        let mut wire = Wire::new(&rig.router);
+        assert_eq!(
+            present(&rig, &mut wire, claim).await.header.ty,
+            FrameType::Response
+        );
+        if retired {
+            rig.spawn.retire();
+        }
+        if void {
+            let binding = rig.handler.claims.binding(wire.connection.id()).unwrap();
+            binding.launch.state.lock().unwrap().active = false;
+        }
+        let identity = nonce.then(|| ConsumerIdentity {
+            module_id: "claims-module".into(),
+            launch_nonce: rig
+                .handler
+                .supervisor
+                .spawn_launch_nonce_for("claims-module")
+                .unwrap(),
+        });
+        let frame = request(serde_json::json!({"op":"route.open"}));
+        let principal = rig
+            .handler
+            .route_open_principal(wire.connection.id(), &frame, identity)
+            .unwrap();
+        if retired || void || nonce {
+            error(
+                &principal
+                    .expect_err("a retired, void or conflicting binding must not become direct"),
+                "bad_consumer_identity",
+            );
+        } else {
+            assert_eq!(
+                principal.unwrap(),
+                Principal::Reserved {
+                    module_id: "claims-module".into()
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claims_route_principal_self() {
+        route_principal_case(ClaimPurpose::SelfConnection, false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn claims_route_principal_helper() {
+        route_principal_case(ClaimPurpose::Helper, false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn claims_route_principal_relay() {
+        route_principal_case(ClaimPurpose::Relay, false, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn claims_route_principal_retired_refused() {
+        route_principal_case(ClaimPurpose::SelfConnection, true, false, false).await;
+    }
+
+    #[tokio::test]
+    async fn claims_route_principal_void_refused() {
+        route_principal_case(ClaimPurpose::SelfConnection, false, true, false).await;
+    }
+
+    #[tokio::test]
+    async fn claims_route_principal_nonce_conflict_refused() {
+        route_principal_case(ClaimPurpose::SelfConnection, false, false, true).await;
     }
 
     #[tokio::test]

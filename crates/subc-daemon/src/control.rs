@@ -4191,6 +4191,28 @@ impl ControlHandler {
                         "intent must be 'restart'",
                     )?]);
                 }
+                // A stamped daemon boots a newer approved generation only from a
+                // durable restart intent, written here before the daemon exits.
+                // Failing to write it never blocks the restart: the next start
+                // then boots the last active generation and the newer one waits.
+                if let Some(owner) = &self.config_runtime {
+                    match owner
+                        .on_blocking(|owner| owner.assign_daemon_restart())
+                        .await
+                    {
+                        Ok(Some(generation)) => {
+                            info!(
+                                generation,
+                                "daemon restart will warm up approved generation"
+                            )
+                        }
+                        Ok(None) => {}
+                        Err(error) => warn!(
+                            %error,
+                            "daemon restart intent not recorded; the next start boots the last active generation"
+                        ),
+                    }
+                }
                 let response = ClientControlResponse::DaemonShutdownIntent {
                     intent: "restart".to_owned(),
                     expires_at_ms: self.supervisor.announce_daemon_restart(),

@@ -65,9 +65,12 @@ async fn stale_config_exit_hold_keeps_reload_work_and_answers_its_caller() {
     module.set_enabled(false).await.unwrap();
     module.stop().await.unwrap();
     assert!(reload_retained, "a stale hold replaced Reload with Spawn");
+    // The native fixture never registers, so completion is the normal explicit
+    // registration failure. A plain Spawn would leave this caller unanswered.
     assert!(
-        matches!(answer, Ok(Ok(Ok(())))),
-        "the original reload caller must receive completion: {answer:?}"
+        matches!(answer, Ok(Ok(Err(SuperviseError::ReloadFailed { ref reason, .. })))
+        if reason.contains("new child did not register")),
+        "the reload caller must receive its result: {answer:?}"
     );
 }
 

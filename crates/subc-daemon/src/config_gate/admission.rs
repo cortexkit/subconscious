@@ -571,6 +571,14 @@ impl RuntimeOwner {
             })
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_before_config_park_for_test(&self) {
+        let hook = self.config_park_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     pub(crate) fn check_rescan_hold(&self) -> Result<()> {
         let cache = self
             .published

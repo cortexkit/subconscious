@@ -23,6 +23,8 @@ use crate::{
 
 pub struct RuntimeOwner {
     #[cfg(test)]
+    config_park_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
     polled_capture_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     polled_capture_count: std::sync::atomic::AtomicUsize,
@@ -692,6 +694,8 @@ impl RuntimeOwner {
         let owner = Self {
             #[cfg(test)]
             polled_capture_hook: Mutex::new(None),
+            #[cfg(test)]
+            config_park_hook: Mutex::new(None),
             #[cfg(test)]
             polled_capture_count: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]

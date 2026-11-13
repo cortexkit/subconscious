@@ -1,6 +1,91 @@
 use super::*;
 
 #[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit_registration_release_before_park_does_not_strand_the_actor() {
+    use crate::supervise::ModuleState;
+    let (rig, owner, supervisor, handler) = supervised_fixture(true);
+    std::fs::write(rig.path.join("a.seen"), b"keep running").unwrap();
+    let module = supervisor
+        .spawn_async(supervised_spec(&rig, "a"))
+        .await
+        .unwrap();
+    let before = module.status().unwrap();
+    let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *owner.config_park_hook.lock().unwrap() = Some(Box::new(move || {
+        paused_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    }));
+    std::fs::write(
+        rig.path.join("store").join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(owner.check_recovery().unwrap());
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(before.pid.unwrap() as i32).unwrap(),
+        rustix::process::Signal::KILL,
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), paused_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        module.status().unwrap().process_alive,
+        "the old process projection must still be visible before parking"
+    );
+    let plan = owner
+        .finish_plan(owner.prepare(PlanKind::Unstamp).unwrap(), daemon_review)
+        .unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let facts = Rig::facts();
+    let approval = owner.begin_approval(&plan.digest, &facts).unwrap();
+    let generation = owner
+        .finish_approval(
+            approval.attempt(),
+            &facts,
+            ApprovalReply::Presence(crate::config_gate::PresenceDecision::InteractiveApproval),
+            3,
+        )
+        .unwrap();
+    owner.complete_authority_exit(generation).unwrap();
+    for exit in owner.delivery_exits().unwrap() {
+        owner.delivery_release_exit(&exit).unwrap();
+    }
+    let (wakes_tx, mut wakes_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handler = std::sync::Arc::new((*handler).clone().with_delivery_wakes_for_test(wakes_tx));
+    let worker = handler.spawn_config_delivery_worker().unwrap();
+    // This wake follows a full worker pass: the release has really been
+    // consumed while the actor still reports the exited process as alive.
+    tokio::time::timeout(Duration::from_secs(5), wakes_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(owner.lock().unwrap().admission_releases.is_empty());
+    assert!(owner.check_module_hold("a").is_ok());
+    assert!(module.status().unwrap().process_alive);
+    worker.abort();
+    let _ = worker.await;
+    resume_tx.send(()).unwrap();
+    module.config_exit_hold().await.unwrap();
+    let resumed = module.status().unwrap();
+    if resumed.state == ModuleState::Stopped {
+        module.stop().await.unwrap();
+        panic!("the hold ended before parking, but its only release was lost: {resumed:?}");
+    }
+    wait_for_supervised_stage(&module, "spawn after the ended hold", || {
+        let status = module.status().unwrap();
+        status.process_alive && status.spawn_generation > before.spawn_generation
+    })
+    .await;
+    module.stop().await.unwrap();
+}
+
+#[cfg(unix)]
 #[tokio::test]
 async fn audit_registration_failed_retry_survives_recovery_hold_and_release() {
     failed_retry_through_recovery(None).await;

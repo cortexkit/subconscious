@@ -6982,6 +6982,10 @@ fn hold_config_spawn(
             return Ok(());
         }
     }
+    #[cfg(test)]
+    if let Some(delivery) = &runtime.config_delivery {
+        delivery.0.pause_before_config_park_for_test();
+    }
     let admission_refused = runtime
         .config_delivery
         .as_ref()

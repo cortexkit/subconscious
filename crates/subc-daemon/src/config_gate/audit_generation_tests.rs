@@ -66,6 +66,7 @@ async fn capture_once_for_all_rows(operation: &str) {
             let mut next = config;
             for module in ["a", "b"] {
                 next["modules"][module]["registration_channel"] = json!(false);
+                next["modules"][module]["enabled"] = json!(true);
             }
             std::fs::write(during_rig.path.join("subc.jsonc"), next.to_string()).unwrap();
             approve(&during_rig, &during_owner, 2);
@@ -91,6 +92,10 @@ async fn capture_once_for_all_rows(operation: &str) {
                         .contains("HELLO registration_channel"),
                     "{response}"
                 );
+            }
+        } else {
+            for entry in response["modules"].as_array().unwrap() {
+                assert_eq!(entry["configured_enabled"], false, "{response}");
             }
         }
         for index in 0..2 {

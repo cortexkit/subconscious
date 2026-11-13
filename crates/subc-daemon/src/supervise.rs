@@ -10357,7 +10357,14 @@ async fn set_child_enabled_with_budget_policy(
                 return Ok(true);
             }
             Err(error @ SuperviseError::ConfigHeld { .. }) => {
-                hold_config_spawn(spec, runtime, snapshot, failure)?;
+                if let Err(parking_error) = hold_config_spawn(spec, runtime, snapshot, failure) {
+                    // Finalize with this operation's initiator. The monitor's
+                    // later fallback for a childless Starting actor only knows
+                    // the attribution retained from earlier recovery work.
+                    fail_snapshot(snapshot, Some(&spec.module_id), None, failure);
+                    process_liveness.untrack_if_current(&spec.module_id, snapshot);
+                    return Err(parking_error);
+                }
                 return Err(error);
             }
             Err(err) => {

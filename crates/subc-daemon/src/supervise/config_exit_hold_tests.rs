@@ -754,3 +754,59 @@ async fn assert_exit_reconciliation_failure(tamper_store: bool) {
     assert_eq!(activity["details"]["reason"], code);
     assert_eq!(activity["details"]["error_kind"], kind);
 }
+
+#[tokio::test]
+async fn operator_enable_park_error_does_not_inherit_daemon_retry_attribution() {
+    let (_scratch, owner, supervisor, _, spec) =
+        crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
+    let RegisteredConfiguredModule {
+        spec,
+        mut runtime,
+        module,
+        commands,
+    } = supervisor
+        .register_configured_with_health(
+            spec,
+            false,
+            Default::default(),
+            None,
+            Default::default(),
+            DEFAULT_REGISTER_TIMEOUT,
+        )
+        .unwrap();
+    runtime.recovery_is_daemon = true;
+    std::fs::write(
+        spec.program
+            .parent()
+            .unwrap()
+            .join("store")
+            .join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(
+        owner.check_module_hold("a").is_ok(),
+        "the cached projection must admit the operator's preflight"
+    );
+    owner.poison_config_owner_at_park_for_test();
+    supervisor.start_monitor(spec, runtime, &module, None, commands);
+    let error = module.set_enabled(true).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("configuration owner is poisoned"),
+        "{error}"
+    );
+    // The reply can precede the monitor's next loop iteration. This command must
+    // cross that loop before the snapshot and retry deadline are sampled.
+    module.config_exit_hold().await.unwrap();
+    let status = module.status().unwrap();
+    let deadline = module.retry_deadline_for_test();
+    module.stop().await.unwrap();
+    assert_eq!(status.state, ModuleState::Failed);
+    assert!(!status.process_alive);
+    assert_eq!(
+        deadline, None,
+        "a failed operator enable cannot arm the stale daemon work's retry"
+    );
+}

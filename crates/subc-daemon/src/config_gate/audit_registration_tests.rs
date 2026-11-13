@@ -1090,3 +1090,17 @@ async fn audit_registration_hello_warning_compares_the_running_spawn_entry() {
     drop(fixture.primary);
     fixture.module.stop().await.unwrap();
 }
+
+impl RuntimeOwner {
+    pub(crate) fn poison_config_owner_at_park_for_test(self: &Arc<Self>) {
+        let owner = self.clone();
+        *self.config_park_hook.lock().unwrap() = Some(Box::new(move || {
+            assert!(std::thread::spawn(move || {
+                let _guard = owner.inner.lock().unwrap();
+                panic!("injected configuration owner poison during parking");
+            })
+            .join()
+            .is_err());
+        }));
+    }
+}

@@ -460,6 +460,7 @@ mod tests {
             scope: None,
             caller_authority: None,
             target_authority: None,
+            accepts_close_reasons: None,
         };
         let frame = Frame::build(
             FrameType::Request,

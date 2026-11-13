@@ -92,6 +92,7 @@ impl ScopeExpiryContext {
                 .1
                 .push(EndpointRoute {
                     goodbye_target: route.client.clone(),
+                    accepts_close_reasons: route.accepts_close_reasons,
                     principal: Principal::Unverified,
                     bound_at: Instant::now(),
                     draining: false,

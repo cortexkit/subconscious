@@ -758,7 +758,7 @@ where
     impl Drop for RetireRegistration {
         fn drop(&mut self) {
             if let Some(spawn) = &self.0 {
-                spawn.retire();
+                spawn.retire_registration_channel();
             }
         }
     }
@@ -903,11 +903,12 @@ where
         ) => result,
     };
 
-    // EOF and errors revoke the launch before task withdrawal or writer drain
-    // can await. The TCP shutdown guard invalidates inherited endpoint copies
-    // after queued output has had its bounded drain.
+    // EOF and errors revoke an accepted or required registration before task
+    // withdrawal or writer drain can await. An unused legacy channel does not
+    // end its child's nonce authority. The TCP shutdown guard invalidates
+    // inherited endpoint copies after queued output has had its bounded drain.
     if let Some(spawn) = &channel_spawn {
-        spawn.retire();
+        spawn.retire_registration_channel();
     }
     drop(delivery_guard);
     // Every in-flight route.open must have FINISHED before `connection` drops,
@@ -1152,7 +1153,7 @@ where
             let hello = frame.header.ty == subc_protocol::FrameType::Hello;
             if (!spawn.registered() && !hello) || (spawn.registered() && hello) {
                 ctx.egress.terminate_ingress();
-                spawn.retire();
+                spawn.retire_registration_channel();
                 return Ok(ConnectionLoopExit::PeerClosed);
             }
         }

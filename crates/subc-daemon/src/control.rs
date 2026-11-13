@@ -2785,7 +2785,7 @@ impl ControlHandler {
         #[cfg(test)]
         self.pause_cleanup_for_test(0);
         if let Some(spawn) = self.supervisor.registration_spawn(connection_id) {
-            spawn.retire();
+            spawn.retire_registration_channel();
         }
         self.supervisor
             .forget_registration_connection(connection_id);
@@ -3127,7 +3127,7 @@ impl ControlHandler {
                         if let Some(sink) = &self.sink {
                             sink.terminate_ingress();
                         }
-                        spawn.retire();
+                        spawn.retire_registration_channel();
                     }
                 }
             }

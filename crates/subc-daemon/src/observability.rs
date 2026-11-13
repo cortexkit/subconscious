@@ -38,6 +38,7 @@ const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
     "module_reloading",
     "op_not_allowed",
     "bad_consumer_identity",
+    crate::supervise::REGISTRATION_CHANNEL_CLOSED,
     "capability_forbidden",
     "admission_facts_not_permitted",
     "admission_facts_target_not_allowed",
@@ -666,6 +667,16 @@ fn insert_nonempty_counts(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_channel_closed_route_refusal_is_counted() {
+        let counters = DaemonCounters::new();
+        counters.increment_route_open_refused(crate::supervise::REGISTRATION_CHANNEL_CLOSED);
+        assert_eq!(
+            counters.snapshot()["route_open_refused_by_code"],
+            serde_json::json!({"registration_channel_closed": 1})
+        );
+    }
 
     #[test]
     fn ready_reader_wait_needs_no_runtime_clock_or_labels() {

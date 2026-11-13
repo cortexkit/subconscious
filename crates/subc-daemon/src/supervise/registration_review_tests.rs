@@ -458,6 +458,50 @@ async fn registration_channel_nonce_registration_retires_unused_endpoint() {
     tcp_registration_retires_unused_endpoint(true).await;
 }
 
+#[test]
+fn registration_channel_legacy_cleanup_preserves_authority_until_child_exit() {
+    let handle = SupervisorHandle::new();
+    let spawn = RegistrationSpawn::new(&handle, "channel-module", SpawnRole::Plain, None);
+    spawn.ready();
+    let initial = spawn.authority.capture().unwrap();
+    spawn.retire_registration_channel();
+    assert_eq!(spawn.authority.capture(), Some(initial.clone()));
+    spawn.retire_unused();
+    assert!(!spawn.launch_ready(), "the inherited channel is closed");
+    for _ in 0..2 {
+        spawn.retire_registration_channel();
+        assert_eq!(spawn.authority.capture(), Some(initial.clone()));
+    }
+    spawn.retire();
+    assert!(
+        spawn.authority.capture().is_none(),
+        "child exit ends authority"
+    );
+    assert_eq!(spawn.authority.epoch_for_test(), initial.epoch + 1);
+    spawn.retire_registration_channel();
+    spawn.retire();
+    assert_eq!(spawn.authority.epoch_for_test(), initial.epoch + 1);
+    for (registered, requires_binding) in [(true, false), (false, true)] {
+        let spawn = RegistrationSpawn::new_with_binding_requirement(
+            &handle,
+            "channel-module",
+            SpawnRole::Plain,
+            None,
+            requires_binding,
+        );
+        spawn.ready();
+        if registered {
+            spawn.hello_accepted();
+        }
+        spawn.retire_registration_channel();
+        assert!(
+            spawn.authority.capture().is_none(),
+            "a primary or required channel cannot fall back to a nonce"
+        );
+        assert_eq!(spawn.authority.epoch_for_test(), 1);
+    }
+}
+
 #[tokio::test]
 async fn registration_channel_nonce_less_registration_retires_unused_endpoint() {
     tcp_registration_retires_unused_endpoint(false).await;

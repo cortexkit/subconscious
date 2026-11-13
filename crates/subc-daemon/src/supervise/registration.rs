@@ -177,6 +177,17 @@ impl RegistrationSpawn {
         );
     }
 
+    /// End the inherited transport without ending a legacy launch that may
+    /// still register by nonce. Once a child registers here, or the gate
+    /// requires this channel to bind registration to its admitted executable,
+    /// losing the transport ends its authority.
+    pub(crate) fn retire_registration_channel(&self) {
+        let transition = self.transition.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.nonce_registered.load(Ordering::Acquire) {
+            self.retire_transition(transition, self.registered() || self.requires_binding);
+        }
+    }
+
     // HELLO publication holds the transition guard, so retirement cannot miss
     // the primary sink or race a replacement into this slot after Dead.
     pub(crate) fn bind_primary_sink(&self, sink: crate::FrameSink) {
@@ -630,7 +641,7 @@ impl SupervisorHandle {
                 *spawn.endpoint.lock().unwrap_or_else(|p| p.into_inner()) = Some(endpoint);
             }
             Err(_) => {
-                spawn.refuse();
+                spawn.retire_registration_channel();
                 return;
             }
         }
@@ -653,9 +664,9 @@ impl SupervisorHandle {
         let Some((router, auth)) =
             service.and_then(|service| Some((service.router.upgrade()?, service.auth)))
         else {
-            // No router is available to authorize registration, so the spawn
-            // is refused and the channel is closed without trying TCP or a nonce.
-            spawn.refuse();
+            // This transport cannot authorize registration. A legacy launch
+            // may still use its nonce; a channel-only launch loses authority.
+            spawn.retire_registration_channel();
             #[cfg(unix)]
             let _ = channel.shutdown(std::net::Shutdown::Both);
             return;
@@ -689,15 +700,15 @@ impl SupervisorHandle {
                 Ok::<(), io::Error>(())
             };
             let _ = serve.await;
-            spawn.retire();
+            spawn.retire_registration_channel();
         });
     }
 }
 
-// Retire at the transport's first EOF, including during authentication or frame
-// decoding, rather than waiting for the connection loop to finish unwinding.
-// Interrupted skips only this transport-level revoke: frame and authentication
-// readers propagate it, so their connection cleanup still retires the launch.
+// End registration at the transport's first EOF, including during authentication
+// or frame decoding, without waiting for the connection loop to unwind. Legacy
+// nonce authority survives an unused channel's closure. An Interrupted I/O read
+// error skips only this revoke; connection cleanup still ends registration.
 struct RegistrationStream<S> {
     stream: S,
     spawn: Arc<RegistrationSpawn>,
@@ -719,7 +730,7 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for RegistrationStrea
             std::task::Poll::Pending => false,
         };
         if ended {
-            this.spawn.retire();
+            this.spawn.retire_registration_channel();
         }
         result
     }

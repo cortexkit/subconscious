@@ -3712,9 +3712,21 @@ impl ControlHandler {
             }),
             (None, Some(_)) => None,
         };
-        if let Some(record) = target_authority {
+        let differing_declarations = target_authority
+            .as_ref()
+            .map(|record| {
+                record.initialize_declarations(
+                    hello
+                        .manifest
+                        .provider_declarations
+                        .clone()
+                        .unwrap_or_default(),
+                )
+            })
+            .unwrap_or_default();
+        if let Some(record) = &target_authority {
             self.forwarding
-                .bind_target_authority(connection_id, record)
+                .bind_target_authority(connection_id, record.clone())
                 .map_err(RouterError::Forwarding)?;
         }
         #[cfg(test)]
@@ -3756,6 +3768,15 @@ impl ControlHandler {
             {
                 self.supervisor
                     .retire_unused_registration_channel(&module_id, true);
+            }
+            if self
+                .registry
+                .get_module_by_connection(connection_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                self.file_development_widening(target_authority, differing_declarations);
             }
             return Ok(reply);
         }
@@ -3936,6 +3957,7 @@ impl ControlHandler {
             self.supervisor
                 .retire_unused_registration_channel(&registration.manifest.module_id, false);
         }
+        self.file_development_widening(target_authority, differing_declarations);
         #[cfg(windows)]
         if let Some(nonce) = hello.launch_nonce.as_deref() {
             self.supervisor

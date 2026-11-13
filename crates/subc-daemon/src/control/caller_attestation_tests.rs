@@ -17,6 +17,66 @@ use subc_protocol::peer::CALLER_ATTESTATION_CAPABILITY;
 
 const OPEN_CORR: u64 = 41;
 
+#[tokio::test]
+async fn origins_widening_fences_routes_and_pending_binds() {
+    let rig = rig().await;
+    let (mut target, spawn, _module, _) =
+        network_primary_with_hello(&rig, "widening-target", false).await;
+    spawn.authority.initialize_origin(
+        subc_protocol::peer::CallerOrigin::Development,
+        Default::default(),
+        Some(false),
+    );
+    let entries = serde_json::from_value(json!({"provider":{"items":["one"]}})).unwrap();
+    let mut manifest = tool_manifest("widening-target", &[], &[]);
+    manifest.provider_declarations = Some(entries);
+    hello(&mut target, manifest).await;
+    let mut opener = Net::new(rig.router.clone()).await;
+    let (_, reply) = open(&mut opener, &mut target, "widening-target", false).await;
+    assert_eq!(reply.header.ty, FrameType::Response);
+    let mut pending_opener = Net::new(rig.router.clone()).await;
+    pending_opener
+        .send(open_frame("widening-target", false, None))
+        .await;
+    let pending_bind = next_bind(&mut target).await;
+    let entries = serde_json::from_value(json!({"provider":{"items":["one"]}})).unwrap();
+    rig.handler
+        .approve_spawn_declarations(&spawn.authority, &entries);
+    assert_eq!(spawn.authority.capture().unwrap().approved.entries, entries);
+    assert_eq!(
+        rig.handler
+            .forwarding
+            .published_spawn_epoch(&spawn.authority.key()),
+        1
+    );
+    assert!(rig
+        .handler
+        .forwarding
+        .route_authority_for_test(connection_of(&rig, &opener))
+        .is_empty());
+    let closed = loop {
+        let frame = opener.recv().await.expect("route.closed");
+        if frame.header.ty == FrameType::Push && body(&frame)["op"] == "route.closed" {
+            break body(&frame);
+        }
+    };
+    let reason: RouteCloseReason = serde_json::from_value(closed["reason"].clone()).unwrap();
+    assert!(reason.may_reopen());
+    ack(&mut target, &pending_bind).await;
+    let refused = open_reply(&mut pending_opener).await;
+    assert_eq!(
+        body(&refused)["code"],
+        subc_protocol::error_codes::STALE_AUTHORITY_EPOCH
+    );
+    let (_, reply) = open(&mut pending_opener, &mut target, "widening-target", false).await;
+    assert_eq!(body(&reply)["target"]["authority_epoch"], 1);
+    assert_eq!(
+        body(&reply)["target"]["approved_declarations_digest"],
+        spawn.authority.capture().unwrap().approved.digest
+    );
+    assert_eq!(body(&reply)["target"]["first_party"], false);
+}
+
 fn text(frame: &Frame) -> String {
     String::from_utf8_lossy(&frame.body).into_owned()
 }

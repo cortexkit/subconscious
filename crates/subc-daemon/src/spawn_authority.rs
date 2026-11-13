@@ -34,13 +34,9 @@
 //! it reads only the record's immutable identity and the epochs the forwarding
 //! table itself has published. Nothing here is held across an await.
 //!
-//! # Seams for later work
-//!
-//! Until program origins are derived from release and placement evidence,
-//! every record's origin is [`unproven_origin`]. Until provider declarations
-//! are approved, every record's approved set is
-//! [`ApprovedDeclarations::none_approved`], with the digest of the empty set. The mark
-//! itself is never raised here: `first_party` is false on every record.
+//! Program origins are initialized from admission evidence before launch.
+//! Requested declarations are frozen at HELLO; later approvals publish their
+//! new set and epoch together. The mark itself is never raised here.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -77,8 +73,7 @@ pub(crate) struct ApprovedDeclarations {
 }
 
 impl ApprovedDeclarations {
-    /// No origin currently qualifies for approvals. Hash the empty set with
-    /// the same algorithm used for requested declarations, never an empty string.
+    /// Hash the empty set with the same algorithm used for requested declarations.
     pub(crate) fn none_approved() -> Self {
         let entries = ProviderDeclarations::new();
         let digest = declarations_digest(&entries).expect("the empty set is canonical JSON");
@@ -90,13 +85,19 @@ impl ApprovedDeclarations {
 /// {provider, entry}, then JCS({provider: entry_digest}).
 /// Unlike config digests, these add no extra wrapping structure or prefix
 /// beyond the JCS objects shown above.
+pub(crate) fn entry_digest(
+    provider: &str,
+    entry: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, String> {
+    jcs_digest(&serde_json::json!({"provider": provider, "entry": entry}))
+}
+
 pub(crate) fn declarations_digest(entries: &ProviderDeclarations) -> Result<String, String> {
     let mut digests = serde_json::Map::new();
     for (provider, entry) in entries {
-        let value = serde_json::json!({"provider": provider, "entry": entry});
         digests.insert(
             provider.clone(),
-            serde_json::Value::String(jcs_digest(&value)?),
+            serde_json::Value::String(entry_digest(provider, entry)?),
         );
     }
     jcs_digest(&serde_json::Value::Object(digests))
@@ -107,18 +108,16 @@ fn jcs_digest(value: &serde_json::Value) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-/// The origin of every spawn until program origins are derived from release
-/// records and placement evidence. `other` never qualifies for the mark.
-pub(crate) fn unproven_origin() -> CallerOrigin {
-    CallerOrigin::Other
-}
-
 #[derive(Debug)]
 struct AuthorityState {
     origin: CallerOrigin,
+    hosts_third_party_code: bool,
     first_party: bool,
     epoch: u64,
     alive: bool,
+    approved: ApprovedDeclarations,
+    approved_digests: std::collections::BTreeMap<String, String>,
+    requested: Option<ProviderDeclarations>,
 }
 
 /// One supervised spawn's authority record. See the module docs.
@@ -127,10 +126,6 @@ pub(crate) struct SpawnAuthorityRecord {
     incarnation: String,
     spawn: u64,
     module_id: String,
-    // Approvals are fixed empty until origins exist. Keep the record's one
-    // value immutable so forwarding can project it without taking state under
-    // its own lock. Mutable approvals will need publication with the epoch.
-    approved: ApprovedDeclarations,
     state: Mutex<AuthorityState>,
 }
 
@@ -198,12 +193,15 @@ impl SpawnAuthorityRecord {
             incarnation: incarnation.into(),
             spawn,
             module_id: module_id.to_owned(),
-            approved: ApprovedDeclarations::none_approved(),
             state: Mutex::new(AuthorityState {
-                origin: unproven_origin(),
+                origin: CallerOrigin::Other,
+                hosts_third_party_code: true,
                 first_party: false,
                 epoch: INITIAL_AUTHORITY_EPOCH,
                 alive: true,
+                approved: ApprovedDeclarations::none_approved(),
+                approved_digests: Default::default(),
+                requested: None,
             }),
         })
     }
@@ -216,8 +214,103 @@ impl SpawnAuthorityRecord {
         &self.module_id
     }
 
-    pub(crate) fn approved(&self) -> &ApprovedDeclarations {
-        &self.approved
+    pub(crate) fn approved(&self) -> ApprovedDeclarations {
+        self.lock().approved.clone()
+    }
+
+    /// Called before the child starts, while no registration or route can read it.
+    pub(crate) fn initialize_origin(
+        &self,
+        origin: CallerOrigin,
+        digests: std::collections::BTreeMap<String, String>,
+        hosts_third_party_code: Option<bool>,
+    ) {
+        let mut state = self.lock();
+        state.origin = origin;
+        state.hosts_third_party_code = hosts_third_party_code != Some(false);
+        state.approved_digests = digests;
+    }
+
+    /// Program eligibility is distinct from readiness and stamping. Hosting
+    /// placements retain their origin, but cannot receive the first-party mark.
+    /// Missing hosting evidence is deliberately ineligible.
+    pub(crate) fn origin_qualifies_for_mark(&self) -> bool {
+        let state = self.lock();
+        state.alive
+            && matches!(
+                state.origin,
+                CallerOrigin::Development | CallerOrigin::Release
+            )
+            && !state.hosts_third_party_code
+    }
+
+    /// Freeze the spawn's request once. Matching saved digests approve only the
+    /// exact requested entries, never an entry left over from another process.
+    pub(crate) fn initialize_declarations(
+        &self,
+        requested: ProviderDeclarations,
+    ) -> ProviderDeclarations {
+        let mut state = self.lock();
+        if !state.alive || state.requested.is_some() {
+            return Default::default();
+        }
+        let mut differing = ProviderDeclarations::new();
+        let mut entries = ProviderDeclarations::new();
+        if state.origin == CallerOrigin::Development {
+            for (provider, entry) in &requested {
+                if entry_digest(provider, entry).ok().as_ref()
+                    == state.approved_digests.get(provider)
+                {
+                    entries.insert(provider.clone(), entry.clone());
+                } else {
+                    differing.insert(provider.clone(), entry.clone());
+                }
+            }
+        }
+        state.approved = ApprovedDeclarations {
+            digest: declarations_digest(&entries).expect("validated HELLO declarations"),
+            entries,
+        };
+        state.requested = Some(requested);
+        differing
+    }
+
+    /// Authority state precedes forwarding. Only entries
+    /// frozen at this spawn's HELLO can enter the new approved set.
+    pub(crate) fn approve_declarations<R>(
+        &self,
+        entries: &ProviderDeclarations,
+        publish: impl FnOnce(u64, bool, &ApprovedDeclarations) -> R,
+    ) -> Option<R> {
+        let mut state = self.lock();
+        if !state.alive || state.origin != CallerOrigin::Development {
+            return None;
+        }
+        for (provider, entry) in entries {
+            state.approved_digests.insert(
+                provider.clone(),
+                entry_digest(provider, entry).expect("validated declarations"),
+            );
+        }
+        let entries = state
+            .requested
+            .as_ref()
+            .into_iter()
+            .flat_map(|requested| requested.iter())
+            .filter(|(provider, entry)| {
+                entry_digest(provider, entry).ok().as_ref() == state.approved_digests.get(*provider)
+            })
+            .map(|(provider, entry)| (provider.clone(), entry.clone()))
+            .collect::<ProviderDeclarations>();
+        if entries == state.approved.entries {
+            return None;
+        }
+        state.approved = ApprovedDeclarations {
+            digest: declarations_digest(&entries).expect("validated declarations"),
+            entries,
+        };
+        state.epoch = state.epoch.saturating_add(1);
+        Some(publish(state.epoch, state.alive, &state.approved))
     }
 
     pub(crate) fn key(&self) -> SpawnKey {
@@ -241,7 +334,7 @@ impl SpawnAuthorityRecord {
             epoch: state.epoch,
             first_party: state.first_party,
             origin: state.origin,
-            approved: self.approved.clone(),
+            approved: state.approved.clone(),
         })
     }
 
@@ -348,5 +441,43 @@ mod tests {
             assert!(caller.declaration.is_none());
             assert!(caller.declaration_digest.is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod development_approval_tests {
+    use super::*;
+
+    #[test]
+    fn origins_widening_replaces_the_key_on_overlapping_and_unregistered_spawns() {
+        let old: ProviderDeclarations =
+            serde_json::from_value(serde_json::json!({"provider":{"item":"old"}})).unwrap();
+        let new: ProviderDeclarations =
+            serde_json::from_value(serde_json::json!({"provider":{"item":"new"}})).unwrap();
+        let digests = std::collections::BTreeMap::from([(
+            "provider".into(),
+            entry_digest("provider", &old["provider"]).unwrap(),
+        )]);
+        let incumbent = SpawnAuthorityRecord::new("incarnation", 1, "module");
+        incumbent.initialize_origin(CallerOrigin::Development, digests.clone(), Some(false));
+        assert!(incumbent.initialize_declarations(old).is_empty());
+        let candidate = SpawnAuthorityRecord::new("incarnation", 2, "module");
+        candidate.initialize_origin(CallerOrigin::Development, digests.clone(), Some(false));
+        assert_eq!(candidate.initialize_declarations(new.clone()), new);
+        let unregistered = SpawnAuthorityRecord::new("incarnation", 3, "module");
+        unregistered.initialize_origin(CallerOrigin::Development, digests, Some(false));
+        for record in [&incumbent, &candidate] {
+            assert_eq!(
+                record.approve_declarations(&new, |epoch, alive, _| (epoch, alive)),
+                Some((1, true))
+            );
+        }
+        assert!(incumbent.capture().unwrap().approved.entries.is_empty());
+        assert_eq!(candidate.capture().unwrap().approved.entries, new);
+        assert!(unregistered
+            .approve_declarations(&new, |_, _, _| ())
+            .is_none());
+        assert!(unregistered.initialize_declarations(new.clone()).is_empty());
+        assert_eq!(unregistered.capture().unwrap().approved.entries, new);
     }
 }

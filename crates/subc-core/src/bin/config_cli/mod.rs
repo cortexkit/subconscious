@@ -1,7 +1,7 @@
 use super::*;
 use subc_control::config::ConfigControlRequest as Request;
 
-pub(super) const HELP: &str = "ck config — configuration gate\n\nusage:\n  ck config status|plan|stamp|unstamp|history\n  ck config apply <digest>\n  ck config rollback <generation>\n  ck config place-program <module> <path> <sha256>\n\nPlans, stamps, unstamps and rollbacks only prepare a view. Apply its digest to\nrequest approval on a trusted surface; terminal output is not approval.\nplace-program is available only with the daemon's dev-placement feature.\n";
+pub(super) const HELP: &str = "ck config — configuration gate\n\nusage:\n  ck config status|plan|stamp|unstamp|history\n  ck config apply <digest>\n  ck config rollback <generation>\n  ck config place-program <module> <path> <sha256> [<manifest-json>]\n\nPlans, stamps, unstamps and rollbacks only prepare a view. Apply its digest to\nrequest approval on a trusted surface; terminal output is not approval.\nplace-program is available only with the daemon's dev-placement feature.\n";
 
 impl CkClient {
     pub(super) async fn connect_config_local(
@@ -72,16 +72,25 @@ pub(super) fn parse(tail: &[OsString]) -> Result<Command, CkError> {
                 .parse()
                 .map_err(|_| CkError::Usage(HELP.into()))?,
         },
-        [verb, module, path, digest] if *verb == "place-program" => Request::PlaceProgram {
-            module_id: module.to_string(),
-            path: path.to_string(),
-            sha256: serde_json::from_value(json!(if digest.starts_with("sha256:") {
-                digest.to_string()
-            } else {
-                format!("sha256:{digest}")
-            }))
-            .map_err(|error| CkError::Usage(format!("invalid sha256: {error}\n{HELP}")))?,
-        },
+        [verb, module, path, digest, rest @ ..] if *verb == "place-program" && rest.len() <= 1 => {
+            Request::PlaceProgram {
+                module_id: module.to_string(),
+                path: path.to_string(),
+                sha256: serde_json::from_value(json!(if digest.starts_with("sha256:") {
+                    digest.to_string()
+                } else {
+                    format!("sha256:{digest}")
+                }))
+                .map_err(|error| CkError::Usage(format!("invalid sha256: {error}\n{HELP}")))?,
+                manifest: rest
+                    .first()
+                    .map(|value| serde_json::from_str(value))
+                    .transpose()
+                    .map_err(|error| {
+                        CkError::Usage(format!("invalid manifest: {error}\n{HELP}"))
+                    })?,
+            }
+        }
         _ => return Err(CkError::Usage(HELP.into())),
     };
     Ok(Command::Config(request))
@@ -150,6 +159,29 @@ fn describe_channel(value: Option<&mut Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origins_placement_cli_carries_exact_manifest() {
+        let manifest = json!({"module_id":"demo", "hosts_third_party_code":false,
+            "provider_declarations":{"provider":{"items":["one","two"]}},
+            "provenance":{"build_git_sha":"a".repeat(40)}});
+        let args = [
+            "place-program".to_owned(),
+            "demo".into(),
+            "/a path/program".into(),
+            "b".repeat(64),
+            manifest.to_string(),
+        ];
+        let args = args.into_iter().map(OsString::from).collect::<Vec<_>>();
+        let Command::Config(Request::PlaceProgram {
+            manifest: Some(carried),
+            ..
+        }) = parse(&args).unwrap()
+        else {
+            panic!("missing placement manifest")
+        };
+        assert_eq!(carried, manifest);
+    }
 
     #[test]
     fn config_cli_parses_all_operations_strictly() {

@@ -11187,7 +11187,7 @@ fn apply_wire_spawn_args_for_admission(
     Ok(handoff)
 }
 
-fn apply_child_env(command: &mut Command, spec: &ModuleSpec) {
+pub(crate) fn apply_child_env(command: &mut Command, spec: &ModuleSpec) {
     command.env_remove(CK_LOG_ENV);
     // The spawn role is the supervisor's to set, and only on a swap candidate
     // (see `apply_spawn_role`). Removing it here, rather than just not setting
@@ -12018,6 +12018,13 @@ fn prepare_child_in_slot(
     // resolved CK_LOG into `spec.env`, which is applied below and therefore
     // wins over anything ambient.
     apply_child_env(&mut command, spec);
+    let origin_witness = crate::program_origin::LaunchWitness::capture_command(spec, &command)
+        .map_err(|source| SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source,
+            cgroup_path: None,
+        })?;
+    command.current_dir(&origin_witness.working_directory);
     apply_spawn_role(&mut command, role);
     let nonce_handoff = apply_wire_spawn_args_for_admission(
         &mut command,
@@ -12076,6 +12083,9 @@ fn prepare_child_in_slot(
                         .as_ref()
                         .is_some_and(|admission| admission.launch.is_some()),
                 );
+                if let Some(admission) = &spawn_admission {
+                    admission.initialize_origin(&spawn.authority, &origin_witness);
+                }
                 handle.record_nonce_launch(&spawn);
                 spawn
             })

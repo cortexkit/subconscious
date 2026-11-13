@@ -2,11 +2,38 @@ use super::*;
 use crate::config_gate::{GateSnapshot, InputKey};
 use crate::config_store::{CommitKind, StoreBody};
 
+pub(super) fn origin_evidence(
+    body: &StoreBody,
+    module: &str,
+) -> Option<crate::program_origin::ProgramOriginEvidence> {
+    if !cfg!(feature = "dev-placement") {
+        return None;
+    }
+    body.generations
+        .values()
+        .rev()
+        .take_while(|entry| {
+            matches!(
+                entry.kind,
+                CommitKind::Development | CommitKind::DeclarationApproval
+            )
+        })
+        .filter(|entry| entry.kind == CommitKind::Development)
+        .find_map(|entry| entry.generation.changeset.launch_manifests.get(module))
+        .and_then(|manifest| manifest.get("origin_evidence"))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
 pub(super) fn last_approved_generation(body: &StoreBody) -> u64 {
     body.generations
         .iter()
         .rev()
-        .find(|(_, entry)| entry.kind != CommitKind::Development)
+        .find(|(_, entry)| {
+            !matches!(
+                entry.kind,
+                CommitKind::Development | CommitKind::DeclarationApproval
+            )
+        })
         .map(|(id, _)| *id)
         .unwrap_or(0)
 }
@@ -14,12 +41,15 @@ pub(super) fn last_approved_generation(body: &StoreBody) -> u64 {
 /// Development admission overlays only programs. Configuration delivery keeps
 /// using its existing active and pending pointers, even across a daemon restart.
 pub(super) fn overlay_programs(body: &StoreBody, module: &str, snapshot: &mut GateSnapshot) {
-    for entry in body
-        .generations
-        .values()
-        .rev()
-        .take_while(|entry| entry.kind == CommitKind::Development)
-    {
+    for entry in body.generations.values().rev().take_while(|entry| {
+        matches!(
+            entry.kind,
+            CommitKind::Development | CommitKind::DeclarationApproval
+        )
+    }) {
+        if entry.kind != CommitKind::Development {
+            continue;
+        }
         if !entry
             .generation
             .changeset
@@ -44,11 +74,22 @@ pub(super) fn overlay_programs(body: &StoreBody, module: &str, snapshot: &mut Ga
 }
 
 impl RuntimeOwner {
+    #[cfg(all(test, unix))]
     pub(crate) fn place_program(
         &self,
         module: &str,
         path: &str,
         sha256: &Digest,
+    ) -> Result<Option<u64>> {
+        self.place_program_with_manifest(module, path, sha256, None)
+    }
+
+    pub(crate) fn place_program_with_manifest(
+        &self,
+        module: &str,
+        path: &str,
+        sha256: &Digest,
+        manifest: Option<&serde_json::Value>,
     ) -> Result<Option<u64>> {
         let mut state = self.lock()?;
         Self::check_authority(&mut state, false)?;
@@ -127,6 +168,39 @@ impl RuntimeOwner {
             .launch_manifests
             .entry(module.into())
             .or_insert_with(|| serde_json::json!({}));
+        if let Some(manifest) = manifest.filter(|manifest| manifest["module_id"] == module) {
+            subc_protocol::provider_declarations::validate_hello_provider_declarations(
+                &serde_json::json!({"manifest": manifest}),
+            )
+            .map_err(GateError::invalid)?;
+            if let Some(declarations) = manifest.get("provider_declarations") {
+                subc_config::canonical_json(declarations).map_err(GateError::invalid)?;
+            }
+            let evidence = crate::program_origin::ProgramOriginEvidence {
+                origin: subc_protocol::peer::CallerOrigin::Development,
+                module_id: module.into(),
+                published_commit: manifest["provenance"]["build_git_sha"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+                program_digest: super::super::program::approved_base(&placed, module),
+                launch: crate::program_origin::LaunchWitness::capture(&command.module_spec())
+                    .map_err(GateError::invalid)?,
+                hosts_third_party_code: manifest["hosts_third_party_code"].as_bool(),
+                declarations: serde_json::from_value(
+                    manifest
+                        .get("provider_declarations")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                )
+                .map_err(GateError::invalid)?,
+            };
+            changeset
+                .launch_manifests
+                .get_mut(module)
+                .expect("placement launch manifest")["origin_evidence"] =
+                serde_json::to_value(evidence).map_err(GateError::invalid)?;
+        }
         let observed = self.capture(&mut state)?.diagnostic.to_store()?;
         let vector = placed.read_set(&BTreeSet::from([module.into()]))?;
         let digest =

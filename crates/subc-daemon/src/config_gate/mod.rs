@@ -116,6 +116,7 @@ impl PlanKind {
 }
 
 struct PendingPlan {
+    development_approval: Option<crate::program_origin::DevelopmentApproval>,
     view: ConfigPlanView,
     kind: PlanKind,
     snapshot: GateSnapshot,
@@ -307,6 +308,7 @@ impl ConfigGate {
         self.plans.insert(
             view.digest.clone(),
             PendingPlan {
+                development_approval: None,
                 view: view.clone(),
                 kind,
                 snapshot: candidate,
@@ -419,8 +421,9 @@ impl ConfigGate {
             plan.view.plan.input_vector.clone(),
             plan.view.plan.changeset.clone(),
         );
+        let declarations_only = plan.development_approval.is_some();
         generation.active_generations = plan.view.plan.active_generations.clone();
-        for module in &plan.modules {
+        for module in plan.modules.iter().filter(|_| !declarations_only) {
             generation
                 .module_states
                 .insert(module.clone(), subc_config::GenerationState::Pending);
@@ -437,7 +440,7 @@ impl ConfigGate {
                     .insert(module.clone(), digest.clone());
             }
         }
-        let tuples: BTreeSet<Tuple> = plan
+        let mut tuples: BTreeSet<Tuple> = plan
             .modules
             .iter()
             .map(|module| Tuple {
@@ -460,10 +463,17 @@ impl ConfigGate {
                     })
             }))
             .collect();
+        if declarations_only {
+            tuples.clear();
+        }
         let snapshot = plan.snapshot.to_store()?;
         let entry = HistoryEntry {
             generation,
-            kind: plan.kind.commit_kind(),
+            kind: if declarations_only {
+                CommitKind::DeclarationApproval
+            } else {
+                plan.kind.commit_kind()
+            },
             approval_id: digest.to_string(),
             outcome: "approved".into(),
             tuples,

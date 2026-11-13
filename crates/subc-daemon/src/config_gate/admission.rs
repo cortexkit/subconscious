@@ -23,6 +23,8 @@ pub(crate) struct AdmissionCache {
 
 #[derive(Clone, Debug, PartialEq)]
 struct ModuleAdmission {
+    evidence: Option<crate::program_origin::ProgramOriginEvidence>,
+    approved_declarations: BTreeMap<String, String>,
     program_base: Digest,
     has_active: bool,
     generation: u64,
@@ -177,8 +179,14 @@ impl AdmissionCache {
             let channel_unsupported =
                 super::super::registration::declaration(&snapshot, &module) == "undeclared";
             cache.modules.insert(
-                module,
+                module.clone(),
                 ModuleAdmission {
+                    evidence: placement::origin_evidence(body, &module),
+                    approved_declarations: body
+                        .approved_declarations
+                        .get(&module)
+                        .cloned()
+                        .unwrap_or_default(),
                     program_base,
                     has_active: !config_gated
                         || versions.is_some_and(|versions| versions.active.is_some()),
@@ -257,6 +265,27 @@ pub(crate) struct SpawnAdmission {
 }
 
 impl SpawnAdmission {
+    pub(crate) fn initialize_origin(
+        &self,
+        record: &crate::spawn_authority::SpawnAuthorityRecord,
+        witness: &crate::program_origin::LaunchWitness,
+    ) {
+        if let Some(authority) = &self.authority {
+            record.initialize_origin(
+                crate::program_origin::derive_origin(
+                    authority.evidence.as_ref(),
+                    record.module_id(),
+                    &authority.program_base,
+                    witness,
+                ),
+                authority.approved_declarations.clone(),
+                authority
+                    .evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.hosts_third_party_code),
+            );
+        }
+    }
     pub(crate) fn generation(&self) -> u64 {
         self.authority
             .as_ref()
@@ -537,12 +566,15 @@ impl RuntimeOwner {
             .read()
             .map_err(|_| GateError::new("config_gated", "admission authority is unavailable"))?;
         let current = cache.decision(module)?;
-        if current.map(|authority| (&authority.program_base, authority.generation))
-            != admission
-                .authority
-                .as_ref()
-                .map(|authority| (&authority.program_base, authority.generation))
-        {
+        let witness = |authority: &ModuleAdmission| {
+            (
+                authority.program_base.clone(),
+                authority.generation,
+                authority.evidence.clone(),
+                authority.approved_declarations.clone(),
+            )
+        };
+        if current.map(witness) != admission.authority.as_ref().map(witness) {
             return Err(GateError::new(
                 "config_delivery_deferred",
                 "configuration changed during spawn preparation",

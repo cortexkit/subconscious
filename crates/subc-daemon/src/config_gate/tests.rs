@@ -5,6 +5,9 @@ use serde_json::{json, Value};
 use subc_config::{ApplyKind, FieldChange, InputState, RecordedValue};
 use subc_protocol::consent::{ConsentDecision, ConsentResponse};
 
+#[path = "origin_tests.rs"]
+mod origin_tests;
+
 fn captured(value: Value) -> CapturedInput {
     CapturedInput {
         state: InputState::Present {

@@ -8,6 +8,7 @@ mod delivery_worker;
 mod phone;
 mod recovery;
 mod route_policy;
+mod widening;
 
 /// Bound each immutable module review so an unanswered request cannot approve a plan.
 const CONFIG_REVIEW_TIMEOUT: Duration = Duration::from_secs(30);
@@ -599,11 +600,12 @@ impl ControlHandler {
                 module_id,
                 path,
                 sha256,
+                manifest,
             } => {
                 let gate = runtime.module_gate(&module_id)?;
                 let _guard = gate.lock().await;
                 let generation = config_work(runtime, move |owner| {
-                    owner.place_program(&module_id, &path, &sha256)
+                    owner.place_program_with_manifest(&module_id, &path, &sha256, manifest.as_ref())
                 })
                 .await?;
                 Ok(ConfigControlResponse::ProgramPlaced { generation })
@@ -750,6 +752,18 @@ impl ControlHandler {
                 } else {
                     work.await?
                 };
+                let approval_runtime = exit_runtime.clone();
+                if let Some(approval) = config_work(approval_runtime, move |owner| {
+                    owner.development_approval(generation)
+                })
+                .await?
+                {
+                    self.publish_development_approval(&approval);
+                    return Ok(ConfigControlResponse::Applied {
+                        generation,
+                        restart_required: false,
+                    });
+                }
                 #[cfg(test)]
                 self.pause_before_apply_reconcile_for_test().await;
                 self.reconcile_authority_exit(exit_runtime.clone(), generation)

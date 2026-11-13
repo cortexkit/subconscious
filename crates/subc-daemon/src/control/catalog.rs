@@ -25,7 +25,6 @@ pub(super) fn validate_hello_declarations(hello: &serde_json::Value) -> Result<(
 }
 
 impl ControlHandler {
-    /// Until first-party authority is enabled, no spawn approves declarations.
     /// The spawn authority record is the only source of approvals;
     /// requested bytes alone never grant approval.
     fn catalog_approved_declarations(
@@ -63,7 +62,11 @@ impl ControlHandler {
         ));
         entry.spawn = authority.as_ref().map(|capture| capture.key.spawn);
         entry.first_party = Some(false);
-        entry.origin = Some(CatalogOrigin::Other);
+        entry.origin = Some(match authority.as_ref().map(|capture| capture.origin) {
+            Some(subc_protocol::peer::CallerOrigin::Development) => CatalogOrigin::Development,
+            Some(subc_protocol::peer::CallerOrigin::Release) => CatalogOrigin::Release,
+            _ => CatalogOrigin::Other,
+        });
         entry.requested_declarations_digest = Some(declarations_digest(&requested)?);
         entry.approved_declarations_digest = Some(approved.digest);
         if filtered {

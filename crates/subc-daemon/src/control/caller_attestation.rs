@@ -168,6 +168,30 @@ impl ControlHandler {
                 .publish_authority_change(&key, epoch, alive)
                 .map(|closed| (closed, alive))
         });
+        self.finish_spawn_authority_change(record, published);
+    }
+
+    pub(super) fn approve_spawn_declarations(
+        &self,
+        record: &SpawnAuthorityRecord,
+        entries: &subc_protocol::provider_declarations::ProviderDeclarations,
+    ) {
+        let key = record.key();
+        let published = record.approve_declarations(entries, |epoch, alive, approved| {
+            self.forwarding
+                .publish_approved_authority_change(&key, epoch, alive, Some(approved))
+                .map(|closed| (closed, alive))
+        });
+        if let Some(published) = published {
+            self.finish_spawn_authority_change(record, published);
+        }
+    }
+
+    fn finish_spawn_authority_change(
+        &self,
+        record: &SpawnAuthorityRecord,
+        published: Result<(Vec<crate::forwarding::AuthorityClosedRoute>, bool), ForwardingError>,
+    ) {
         let (closed, alive) = match published {
             Ok(published) => published,
             Err(err) => {

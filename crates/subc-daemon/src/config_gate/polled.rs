@@ -184,12 +184,16 @@ impl RuntimeOwner {
             if body.stamped {
                 snapshot = super::super::GateSnapshot::from_store(&body.approved).ok();
             }
-            for entry in body
-                .generations
-                .values()
-                .rev()
-                .take_while(|entry| entry.kind == crate::config_store::CommitKind::Development)
-            {
+            for entry in body.generations.values().rev().take_while(|entry| {
+                matches!(
+                    entry.kind,
+                    crate::config_store::CommitKind::Development
+                        | crate::config_store::CommitKind::DeclarationApproval
+                )
+            }) {
+                if entry.kind != crate::config_store::CommitKind::Development {
+                    continue;
+                }
                 status.warnings.push(format!(
                     "development generation {}: development placement (no approval)",
                     entry.generation.id

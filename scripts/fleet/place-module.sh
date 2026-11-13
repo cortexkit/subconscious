@@ -340,7 +340,10 @@ print(state + " " + ("yes" if "dev-placement" in s["development_switches"] else 
 record_program_placement() {
   [ "$CONFIG_GATE_STATE" = stamped ] && [ "$INSTALL" -eq 0 ] || return 0
   local placement_out
-  if ! placement_out=$(ck config place-program "$MODULE" "$DEST" "$placed_digest" 2>&1); then
+  # Probe the placed image too: rollback must record the restored program's facts,
+  # never the manifest of the candidate that was just abandoned.
+  probe_cli_faces "$DEST"
+  if ! placement_out=$(ck config place-program "$MODULE" "$DEST" "$placed_digest" "${FACE_PROBE_JSON:-null}" 2>&1); then
     refuse "config.place_program refused after placement; the new bytes are on disk and no restart was requested: $placement_out"
   fi
   printf '%s\n' "$placement_out"

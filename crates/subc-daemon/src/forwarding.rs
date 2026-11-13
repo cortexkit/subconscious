@@ -32,6 +32,7 @@ use tokio::sync::{oneshot, Semaphore};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use crate::spawn_authority::ApprovedDeclarations;
 use crate::{
     control::{RouteBindBreakers, RouteBindConcurrency},
     observability::DaemonCounters,
@@ -678,6 +679,7 @@ struct ForwardingInner {
     /// The spawn whose own registration each module connection is, for the
     /// reply's `target`. A prefix child's connection never has an entry.
     target_authority_by_connection: HashMap<ConnectionId, Arc<SpawnAuthorityRecord>>,
+    spawn_approved: HashMap<SpawnKey, ApprovedDeclarations>,
     /// The authority epoch each spawn's last authority change published. A
     /// spawn with no entry is at the initial epoch. A bind whose captured
     /// caller or target epoch is older than this is refused at commit.
@@ -836,7 +838,10 @@ impl ForwardingTable {
         connection: ConnectionId,
         record: Arc<SpawnAuthorityRecord>,
     ) -> Result<(), ForwardingError> {
-        self.write_inner()?
+        let approved = record.approved();
+        let mut inner = self.write_inner()?;
+        inner.spawn_approved.insert(record.key(), approved);
+        inner
             .target_authority_by_connection
             .insert(connection, record);
         Ok(())
@@ -3553,8 +3558,24 @@ impl ForwardingTable {
         epoch: u64,
         alive: bool,
     ) -> Result<Vec<AuthorityClosedRoute>, ForwardingError> {
+        self.publish_approved_authority_change(key, epoch, alive, None)
+    }
+
+    pub(crate) fn publish_approved_authority_change(
+        &self,
+        key: &SpawnKey,
+        epoch: u64,
+        alive: bool,
+        approved: Option<&ApprovedDeclarations>,
+    ) -> Result<Vec<AuthorityClosedRoute>, ForwardingError> {
         let mut inner = self.write_inner()?;
+        if let Some(approved) = approved {
+            inner.spawn_approved.insert(key.clone(), approved.clone());
+        }
         if !alive {
+            inner
+                .spawn_approved
+                .retain(|other, _| other.module_id != key.module_id || other.spawn >= key.spawn);
             inner
                 .spawn_epochs
                 .retain(|other, _| other.module_id != key.module_id || other.spawn >= key.spawn);
@@ -4100,7 +4121,11 @@ fn target_authority_locked(inner: &ForwardingInner, module: &ModuleConnection) -
                     epoch: published_epoch_locked(inner, &key),
                     key,
                 },
-                record.approved().clone(),
+                inner
+                    .spawn_approved
+                    .get(&record.key())
+                    .cloned()
+                    .unwrap_or_else(ApprovedDeclarations::none_approved),
             )
         }
         None => TargetAuthority::Unsupervised,

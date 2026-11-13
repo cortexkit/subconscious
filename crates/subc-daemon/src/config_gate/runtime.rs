@@ -292,7 +292,7 @@ pub(crate) fn daemon_review(
                 let manifest = changeset
                     .launch_manifests
                     .entry(module.clone())
-                    .or_insert_with(|| serde_json::json!({}));
+                    .or_insert_with(|| serde_json::json!({"origin": "other"}));
                 manifest.as_object_mut().expect("launch manifest is an object").insert(field,serde_json::json!({"old":old.inputs.get(key).map(|v| &v.value),"new":new.inputs.get(key).map(|v| &v.value)}));
             }
             super::InputKey::Declaration(module) => {
@@ -618,6 +618,8 @@ mod placement;
 mod polled;
 #[path = "published.rs"]
 mod published;
+#[path = "widening.rs"]
+mod widening;
 pub(crate) use published::Published;
 #[path = "status_inputs.rs"]
 mod status_inputs;
@@ -1585,6 +1587,11 @@ impl RuntimeOwner {
         }
         let mut state = self.lock()?;
         let digest = state.gate.approval_digest(attempt)?;
+        let declarations_only = state
+            .gate
+            .plans
+            .get(&digest)
+            .is_some_and(|plan| plan.development_approval.is_some());
         state.reviewed(&digest, Instant::now());
         let modules = state.gate.approval_modules(attempt)?;
         let program_keys = state.gate.plan_program_keys(&digest)?;
@@ -1658,12 +1665,14 @@ impl RuntimeOwner {
                     })?;
                     cancellation.claim_publication()?;
                 }
-                route_policy::restore_superseded(
-                    route_policy_receipts,
-                    installed_route_policies,
-                    &modules,
-                    delivery,
-                );
+                if !declarations_only {
+                    route_policy::restore_superseded(
+                        route_policy_receipts,
+                        installed_route_policies,
+                        &modules,
+                        delivery,
+                    );
+                }
                 #[cfg(test)]
                 if let Some(hook) = publication_hook {
                     hook();
@@ -1698,6 +1707,7 @@ impl RuntimeOwner {
             .filter(|(_, entry)| {
                 committed_this_call
                     && entry.generation.plan_digest == digest
+                    && entry.kind != crate::config_store::CommitKind::DeclarationApproval
                     && (was_recovery
                         || state.store.loaded_admission_state().1.stamped
                         || entry.kind == crate::config_store::CommitKind::Unstamp)
@@ -1869,12 +1879,16 @@ impl RuntimeOwner {
             if body.stamped {
                 current_snapshot = super::GateSnapshot::from_store(&body.approved).ok();
             }
-            for entry in body
-                .generations
-                .values()
-                .rev()
-                .take_while(|entry| entry.kind == crate::config_store::CommitKind::Development)
-            {
+            for entry in body.generations.values().rev().take_while(|entry| {
+                matches!(
+                    entry.kind,
+                    crate::config_store::CommitKind::Development
+                        | crate::config_store::CommitKind::DeclarationApproval
+                )
+            }) {
+                if entry.kind != crate::config_store::CommitKind::Development {
+                    continue;
+                }
                 status.warnings.push(format!(
                     "development generation {}: development placement (no approval)",
                     entry.generation.id

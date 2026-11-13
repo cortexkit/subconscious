@@ -2,6 +2,99 @@ use super::*;
 
 #[cfg(unix)]
 #[tokio::test]
+async fn audit_registration_failed_retry_survives_recovery_hold_and_release() {
+    failed_retry_through_recovery(None).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn audit_registration_failed_retry_survives_refused_operator_start() {
+    failed_retry_through_recovery(Some(false)).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn audit_registration_failed_retry_survives_refused_operator_restart() {
+    failed_retry_through_recovery(Some(true)).await;
+}
+
+#[cfg(unix)]
+async fn failed_retry_through_recovery(operator_restart: Option<bool>) {
+    use crate::supervise::ModuleState;
+    let (rig, owner, supervisor, _) = supervised_fixture_with_program(
+        true,
+        false,
+        b"#!/bin/sh\nprintf 'started\\n' >> \"$2\"\nwhile :; do /bin/sleep 600; done\n",
+    );
+    let module = supervisor
+        .spawn_async(supervised_spec(&rig, "a"))
+        .await
+        .unwrap();
+    module.seed_crash_budget_for_test(3);
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(module.status().unwrap().pid.unwrap() as i32).unwrap(),
+        rustix::process::Signal::KILL,
+    )
+    .unwrap();
+    wait_for_supervised_stage(&module, "exhausted crash budget", || {
+        module.state().unwrap() == ModuleState::Failed && module.retry_deadline_for_test().is_some()
+    })
+    .await;
+    let before = module.status().unwrap();
+    let deadline = module.retry_deadline_for_test().unwrap();
+    std::fs::write(
+        rig.path.join("store").join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(owner.check_recovery().unwrap());
+    assert!(owner.has_recorded_admission_hold("a"));
+    if let Some(restart) = operator_restart {
+        let refused = if restart {
+            module.restart(None).await
+        } else {
+            module.set_enabled(true).await.map(|_| ())
+        };
+        assert!(refused.unwrap_err().to_string().contains("config_gated"));
+    } else {
+        module.config_exit_hold().await.unwrap();
+    }
+    assert_eq!(
+        module.retry_deadline_for_test(),
+        Some(deadline),
+        "a hold that did not park the Failed actor must preserve its exact retry deadline"
+    );
+    let plan = owner
+        .finish_plan(owner.prepare(PlanKind::Unstamp).unwrap(), daemon_review)
+        .unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let facts = Rig::facts();
+    let approval = owner.begin_approval(&plan.digest, &facts).unwrap();
+    let generation = owner
+        .finish_approval(
+            approval.attempt(),
+            &facts,
+            ApprovalReply::Presence(crate::config_gate::PresenceDecision::InteractiveApproval),
+            3,
+        )
+        .unwrap();
+    owner.complete_authority_exit(generation).unwrap();
+    assert!(owner.check_module_hold("a").is_ok());
+    assert!(!module.release_config_hold().await.unwrap());
+    let after = module.status().unwrap();
+    let after_deadline = module.retry_deadline_for_test();
+    module.stop().await.unwrap();
+    assert_eq!(after.state, ModuleState::Failed);
+    assert!(!after.process_alive);
+    assert_eq!(after.spawn_generation, before.spawn_generation);
+    assert_eq!(after.restart_count, before.restart_count);
+    assert_eq!(after_deadline, Some(deadline));
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn audit_registration_fence_release_preserves_exhausted_budget_and_slow_retry() {
     terminal_fence_release(true).await;
 }

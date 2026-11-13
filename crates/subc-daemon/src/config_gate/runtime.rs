@@ -1488,7 +1488,7 @@ impl RuntimeOwner {
             prepared.kind,
             prepared.candidate.diagnostic,
             &current.diagnostic,
-            Some(&prepared.review_modules),
+            super::ReviewRecord::Reviewed(&prepared.review_modules),
             review,
         )?;
         if let Err(error) = self.check_route_policy_authority(&view.plan.changeset) {

@@ -98,6 +98,21 @@ impl ReviewAdmission for MissingReviewAdmission {
     }
 }
 
+/// Which build each module's approved configuration was reviewed by, as a
+/// plan writes it into its generation.
+pub(crate) enum ReviewRecord<'a> {
+    /// Write no record. Later plans then treat every module this plan approves
+    /// as owing a re-review.
+    Absent,
+    /// These modules' admitted reviewers answered `config.review` for this
+    /// plan. Their builds are recorded; other modules keep their entries from
+    /// the newest approved generation.
+    Reviewed(&'a BTreeSet<String>),
+    /// Copy a record verbatim, for a rollback to a generation whose reviewers
+    /// are known. `None` (that generation had no record) writes none.
+    Copied(Option<serde_json::Value>),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanKind {
     Change,
@@ -170,12 +185,18 @@ impl ConfigGate {
         observed: &GateSnapshot,
         review: impl FnOnce(&GateSnapshot, &GateSnapshot) -> Result<Changeset>,
     ) -> Result<ConfigPlanView> {
-        self.plan_reviewed(store, kind, candidate, observed, None, review)
+        self.plan_reviewed(
+            store,
+            kind,
+            candidate,
+            observed,
+            ReviewRecord::Absent,
+            review,
+        )
     }
 
-    /// As [`Self::plan`], also recording which modules' admitted reviewers
-    /// answered `config.review` for this plan, and which build each module's
-    /// approved configuration now rests on. A generation planned without that
+    /// As [`Self::plan`], also writing the record of which build each module's
+    /// approved configuration was reviewed by. A generation planned without that
     /// record vouches for no review, so later plans treat each module it
     /// approved as needing re-review.
     pub(crate) fn plan_reviewed(
@@ -184,7 +205,7 @@ impl ConfigGate {
         kind: PlanKind,
         candidate: GateSnapshot,
         observed: &GateSnapshot,
-        reviewed: Option<&BTreeSet<String>>,
+        record: ReviewRecord<'_>,
         review: impl FnOnce(&GateSnapshot, &GateSnapshot) -> Result<Changeset>,
     ) -> Result<ConfigPlanView> {
         let status = store.status();
@@ -338,6 +359,14 @@ impl ConfigGate {
                 }
             }
         }
+        let reviewed = match record {
+            ReviewRecord::Absent | ReviewRecord::Copied(None) => None,
+            ReviewRecord::Copied(Some(copied)) => {
+                changeset.apply_plan[reviewed_build::REVIEWED_PROGRAMS] = copied;
+                None
+            }
+            ReviewRecord::Reviewed(reviewed) => Some(reviewed),
+        };
         if let Some(reviewed) = reviewed {
             let mut record = if replaces_programs {
                 reviewed_build::recorded(store.body()?)?
@@ -435,7 +464,9 @@ impl ConfigGate {
 
     /// Capture program identities for the reverse configuration's launch specs
     /// at the restored paths at plan time. No executable bytes or historical
-    /// identities are restored.
+    /// identities are restored. The restored generation's reviewed-program
+    /// record is copied: its reviewers are known. If that generation has no
+    /// record, the rollback has none either, so its modules owe re-review.
     pub fn rollback(
         &mut self,
         store: &mut ConfigStore,
@@ -446,11 +477,24 @@ impl ConfigGate {
     ) -> Result<ConfigPlanView> {
         let mut target = GateSnapshot::from_store(&store.rollback_configuration(generation)?)?;
         target.restore_programs_from(current_programs)?;
-        self.plan(
+        let copied = store
+            .body()?
+            .generations
+            .get(&generation)
+            .and_then(|entry| {
+                entry
+                    .generation
+                    .changeset
+                    .apply_plan
+                    .get(reviewed_build::REVIEWED_PROGRAMS)
+            })
+            .cloned();
+        self.plan_reviewed(
             store,
             PlanKind::Rollback(generation),
             target,
             observed,
+            ReviewRecord::Copied(copied),
             review,
         )
     }

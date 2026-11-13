@@ -158,12 +158,6 @@ async fn recovery_slow_retry_roundtrip(release_after_park: bool) {
         // A daemon-internal hold notification must not turn this already parked
         // daemon retry into an operator-owned attempt.
         module.config_exit_hold().await.unwrap();
-        let mut missing = crashing_spec();
-        missing.program = dir.join("missing-program");
-        module
-            .update_configuration(missing, HealthConfig::default(), None)
-            .await
-            .unwrap();
         let plan = owner
             .prepare(crate::config_gate::PlanKind::Unstamp)
             .unwrap();
@@ -186,6 +180,12 @@ async fn recovery_slow_retry_roundtrip(release_after_park: bool) {
             .unwrap();
         owner.complete_authority_exit(generation).unwrap();
         assert!(owner.check_module_hold("slow-retry-child").is_ok());
+        let mut missing = crashing_spec();
+        missing.program = dir.join("missing-program");
+        module
+            .update_configuration(missing, HealthConfig::default(), None)
+            .await
+            .unwrap();
         let attempt = module.inner.snapshot.lock().unwrap().failed_retry.attempt;
         let released_at = Instant::now();
         assert!(

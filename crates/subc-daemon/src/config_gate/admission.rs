@@ -571,6 +571,42 @@ impl RuntimeOwner {
             })
     }
 
+    pub(crate) fn with_recorded_admission_hold<T>(
+        &self,
+        module: &str,
+        park: impl FnOnce(Option<String>) -> T,
+    ) -> Result<Option<T>> {
+        if self.inner.is_poisoned() {
+            return Err(GateError::new(
+                "config_unavailable",
+                "configuration owner is poisoned",
+            ));
+        }
+        let view = self.published.read().map_err(|_| {
+            GateError::new(
+                "config_unavailable",
+                "configuration publication is poisoned",
+            )
+        })?;
+        if !view.admission.is_recovering()
+            && !view
+                .admission
+                .held_modules()
+                .iter()
+                .any(|held| held == module)
+        {
+            return Ok(None);
+        }
+        let refusal = view
+            .decision(module)
+            .err()
+            .filter(|error| error.code == subc_control::REGISTRATION_CHANNEL_UNSUPPORTED)
+            .map(|error| error.code);
+        // Keep publication pinned until the actor records its parked state.
+        // Clearing the hold must publish after that state, or before this check.
+        Ok(Some(park(refusal)))
+    }
+
     #[cfg(test)]
     pub(crate) fn pause_before_config_park_for_test(&self) {
         let hook = self.config_park_hook.lock().unwrap().take();

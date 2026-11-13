@@ -6986,36 +6986,43 @@ fn hold_config_spawn(
     if let Some(delivery) = &runtime.config_delivery {
         delivery.0.pause_before_config_park_for_test();
     }
-    let admission_refused = runtime
-        .config_delivery
-        .as_ref()
-        .and_then(|delivery| delivery.0.check_module_hold(&spec.module_id).err())
-        .filter(|error| error.code == subc_control::REGISTRATION_CHANNEL_UNSUPPORTED)
-        .map(|error| error.code);
-    *runtime
-        .scheduled_respawn
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
-    if let Some(reply) = runtime
-        .deferred_reload_reply
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-    {
-        let _ = reply.send(Err(SuperviseError::ConfigHeld {
-            module_id: spec.module_id.clone(),
-            code: "config_gated".into(),
-            detail: "module is held by configuration admission".into(),
-        }));
+    if let Some(delivery) = &runtime.config_delivery {
+        let parked = delivery
+            .0
+            .with_recorded_admission_hold(&spec.module_id, |admission_refused| {
+                *runtime
+                    .scheduled_respawn
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                if let Some(reply) = runtime
+                    .deferred_reload_reply
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+                {
+                    let _ = reply.send(Err(SuperviseError::ConfigHeld {
+                        module_id: spec.module_id.clone(),
+                        code: "config_gated".into(),
+                        detail: "module is held by configuration admission".into(),
+                    }));
+                }
+                update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                    state.admission_refused = admission_refused;
+                    state.config_hold_parked = true;
+                    state.state = ModuleState::Stopped;
+                    state.respawn_pending = false;
+                    state.failed_retry.pending = None;
+                    clear_current_process_facts(state);
+                })
+            })
+            .map_err(|error| config_delivery::gate_hold_error(spec, error, Some(delivery)))?;
+        if let Some(result) = parked {
+            return result;
+        }
     }
-    update_snapshot(snapshot, Some(&spec.module_id), |state| {
-        state.admission_refused = admission_refused;
-        state.config_hold_parked = true;
-        state.state = ModuleState::Stopped;
-        state.respawn_pending = false;
-        state.failed_retry.pending = None;
-        clear_current_process_facts(state);
-    })
+    // The observed hold ended before parking; its release may already be gone.
+    // Keep ordinary spawn work scheduled instead of waiting for another release.
+    defer_config_spawn(spec, runtime, snapshot, RespawnKind::Spawn)
 }
 
 fn schedule_respawn(
@@ -9255,11 +9262,13 @@ async fn handle_supervisor_command(
             true
         }
         SupervisorCommand::ConfigExitHold { reply } => {
-            let held = runtime
+            let result = if child.is_none() {
+                hold_config_spawn(spec, runtime, snapshot)
+            } else if runtime
                 .config_delivery
                 .as_ref()
-                .is_some_and(|delivery| delivery.0.has_recorded_admission_hold(&spec.module_id));
-            let result = if held {
+                .is_some_and(|delivery| delivery.0.has_recorded_admission_hold(&spec.module_id))
+            {
                 cancel_deferred_reload(
                     runtime,
                     &spec.module_id,
@@ -9269,21 +9278,7 @@ async fn handle_supervisor_command(
                     .scheduled_respawn
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) = None;
-                update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                    if !state.enabled {
-                        return;
-                    }
-                    if child.is_none()
-                        && (state.config_hold_parked
-                            || !matches!(state.state, ModuleState::Stopped | ModuleState::Failed))
-                    {
-                        state.state = ModuleState::Stopped;
-                        state.config_hold_parked = true;
-                        state.respawn_pending = false;
-                        state.failed_retry.pending = None;
-                        clear_current_process_facts(state);
-                    }
-                })
+                Ok(())
             } else {
                 Ok(())
             };

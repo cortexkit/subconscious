@@ -49,12 +49,13 @@ impl ConsumerAttestation {
     }
 }
 
-/// The `caller` key for a bind toward a target with `capabilities`: present
-/// only for a supervised opener and only toward a target declaring
-/// `caller-attestation/v1`.
+/// The `caller` key for a bind toward `target_module`, a target with
+/// `capabilities`: present only for a supervised opener and only toward a
+/// target declaring `caller-attestation/v1`.
 pub(super) fn caller_for_target(
     caller: Option<&CallerCapture>,
     capabilities: Option<&CapabilityDeclarations>,
+    target_module: &str,
 ) -> Option<CallerAttestation> {
     let declared = capabilities.is_some_and(|caps| {
         caps.provides
@@ -63,7 +64,7 @@ pub(super) fn caller_for_target(
     });
     caller
         .filter(|_| declared)
-        .and_then(CallerCapture::attestation)
+        .and_then(|caller| caller.attestation(target_module))
 }
 
 /// Whether a route admitted under `stamp` acts for someone other than the
@@ -72,6 +73,75 @@ pub(super) fn caller_for_target(
 /// field is stripped for an older target.
 pub(super) fn scope_acts_for_another(stamp: &subc_protocol::scope::ScopeStamp) -> bool {
     stamp.kind == subc_protocol::scope::ScopeKind::Federated || stamp.attributes.flow_id.is_some()
+}
+
+/// Publishes first-party mark changes the configuration gate decides. It runs
+/// while the gate holds its delivery state, takes the spawn's record state and
+/// then the forwarding write lock, and leaves the catalog notice and route
+/// closes to a task that runs once every one of those locks is released.
+pub(super) struct ControlMarkPublisher(pub(super) ControlHandler);
+
+impl ControlMarkPublisher {
+    fn after_locks(&self, work: impl FnOnce(&ControlHandler) + Send + 'static) {
+        let handler = self.0.clone();
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move { work(&handler) });
+            }
+            // Never run it inline: the caller still holds the gate's state.
+            Err(_) => {
+                std::thread::spawn(move || work(&handler));
+            }
+        }
+    }
+}
+
+impl crate::config_gate::runtime::mark::MarkPublisher for ControlMarkPublisher {
+    fn activate(&self, record: &Arc<SpawnAuthorityRecord>) -> bool {
+        let key = record.key();
+        match record.activate(|| self.0.forwarding.publish_spawn_mark(&key)) {
+            Ok(true) => {
+                let record = record.clone();
+                self.after_locks(move |handler| {
+                    if let Err(err) = handler.registry.catalog_authority_changed() {
+                        warn!(module_id = record.module_id(), spawn = record.spawn(), error = %err,
+                            "failed to advance the catalog after a first-party mark activation");
+                    }
+                });
+                true
+            }
+            Ok(false) => false,
+            Err(err) => {
+                warn!(module_id = record.module_id(), spawn = record.spawn(), error = %err,
+                    "failed to publish a first-party mark activation");
+                false
+            }
+        }
+    }
+
+    fn lower(&self, record: &Arc<SpawnAuthorityRecord>) {
+        let key = record.key();
+        let Some(published) = record.lower(|change| {
+            self.0
+                .forwarding
+                .publish_authority_change(&key, change.epoch, change.alive, change.first_party)
+                .map(|closed| (closed, change.alive))
+        }) else {
+            return;
+        };
+        match published {
+            Ok((closed, alive)) => {
+                let record = record.clone();
+                self.after_locks(move |handler| {
+                    handler.after_spawn_authority_published(&record, closed, alive);
+                });
+            }
+            Err(err) => {
+                warn!(module_id = record.module_id(), spawn = record.spawn(), error = %err,
+                    "failed to publish a first-party mark lowering");
+            }
+        }
+    }
 }
 
 impl ControlHandler {
@@ -163,10 +233,10 @@ impl ControlHandler {
     /// spawn's keep the crash reason, because its child exited.
     pub(super) fn change_spawn_authority(&self, record: &SpawnAuthorityRecord) {
         let key = record.key();
-        let published = record.change_authority(|epoch, alive| {
+        let published = record.change_authority(|change| {
             self.forwarding
-                .publish_authority_change(&key, epoch, alive)
-                .map(|closed| (closed, alive))
+                .publish_authority_change(&key, change.epoch, change.alive, change.first_party)
+                .map(|closed| (closed, change.alive))
         });
         self.finish_spawn_authority_change(record, published);
     }
@@ -179,7 +249,7 @@ impl ControlHandler {
         let key = record.key();
         let published = record.approve_declarations(entries, |epoch, alive, approved| {
             self.forwarding
-                .publish_approved_authority_change(&key, epoch, alive, Some(approved))
+                .publish_approved_authority_change(&key, epoch, alive, None, Some(approved))
                 .map(|closed| (closed, alive))
         });
         if let Some(published) = published {
@@ -202,6 +272,20 @@ impl ControlHandler {
         };
         // Authority and forwarding locks have been released. Separate watch
         // tasks send the notifications, so a slow client cannot hold up fencing.
+        self.after_spawn_authority_published(record, closed, alive);
+    }
+
+    /// The work that follows a published authority change once every
+    /// authority and forwarding lock is released: advance the catalog, then
+    /// close each selected route with its recipient's reason. A live spawn's
+    /// routes close with `authority_changed` where the opener declared it; a
+    /// dead spawn's keep the crash reason, because its child exited.
+    pub(super) fn after_spawn_authority_published(
+        &self,
+        record: &SpawnAuthorityRecord,
+        closed: Vec<crate::forwarding::AuthorityClosedRoute>,
+        alive: bool,
+    ) {
         if let Err(err) = self.registry.catalog_authority_changed() {
             warn!(module_id = record.module_id(), spawn = record.spawn(), error = %err,
                 "failed to advance the catalog after a spawn authority change");

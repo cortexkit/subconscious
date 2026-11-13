@@ -104,6 +104,7 @@ impl<'a> SpawnDelivery<'a> {
         admission: &crate::config_gate::runtime::SpawnAdmission,
         at: Instant,
         role: SpawnRole,
+        authority: Option<Arc<crate::spawn_authority::SpawnAuthorityRecord>>,
     ) -> Result<Option<DeliverySpawn>, SuperviseError> {
         self.runtime
             .0
@@ -114,6 +115,7 @@ impl<'a> SpawnDelivery<'a> {
                 self.register_timeout,
                 self.health_budget,
                 !matches!(role, SpawnRole::SwapCandidate),
+                authority,
             )
             .map_err(|error| gate_hold_error(spec, error, Some(self.runtime)))
     }
@@ -329,6 +331,52 @@ impl ConfigDelivery {
         };
         self.0.notify_delivery_changed();
         failed || owned_failure
+    }
+
+    /// A health probe of `module`'s registration answered: `ready` when it
+    /// reported ready. Counts toward `spawn`'s first-party mark only when the
+    /// probed registration is that spawn's own.
+    pub(super) async fn mark_readiness(
+        &self,
+        module: &str,
+        forwarding: Option<&ForwardingTable>,
+        registry: &Registry,
+        spawn: &DeliverySpawn,
+        ready: bool,
+    ) {
+        let Some(record) = spawn.authority() else {
+            return;
+        };
+        let own = forwarding.is_some_and(|forwarding| {
+            registry
+                .get_module(module)
+                .ok()
+                .flatten()
+                .and_then(|registration| {
+                    forwarding
+                        .target_authority_for_connection(registration.connection_id)
+                        .ok()
+                        .flatten()
+                })
+                .is_some_and(|probed| Arc::ptr_eq(&probed, record))
+        });
+        if !own {
+            return;
+        }
+        let spawn = spawn.clone();
+        let result = self
+            .0
+            .on_blocking(move |owner| {
+                if ready {
+                    owner.mark_ready(&spawn)
+                } else {
+                    owner.mark_not_ready(&spawn)
+                }
+            })
+            .await;
+        if let Err(error) = result {
+            warn!(module_id = module, %error, "first-party readiness observation failed");
+        }
     }
 }
 

@@ -33,7 +33,42 @@ struct ModuleAdmission {
     command: Option<ModuleSpec>,
 }
 
+/// A module as the first-party mark sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MarkView {
+    /// The store is in recovery: nothing about the mark changes now.
+    Undecided,
+    /// The store is unstamped, or the stamped store does not gate the module
+    /// (an approved ungated exception): no spawn of it may carry the mark.
+    NotGated,
+    /// The stamped store gates the module.
+    Gated {
+        /// The generation whose program record admits the module now.
+        generation: u64,
+        /// The module declares daemon-delivered configuration, so a spawn
+        /// must acknowledge the active generation to be marked.
+        delivers_config: bool,
+    },
+}
+
 impl AdmissionCache {
+    /// What the first-party mark reads about `module` from this view.
+    pub(super) fn mark_view(&self, module: &str) -> MarkView {
+        match self.state {
+            StoreState::Unstamped => MarkView::NotGated,
+            StoreState::Stamped => match self.modules.get(module) {
+                Some(admission) => MarkView::Gated {
+                    generation: admission.generation,
+                    delivers_config: admission
+                        .snapshot
+                        .inputs
+                        .contains_key(&InputKey::Declaration(module.to_owned())),
+                },
+                None => MarkView::NotGated,
+            },
+            _ => MarkView::Undecided,
+        }
+    }
     pub(super) fn spawn_generation(&self, module: &str) -> Result<u64> {
         self.decision(module)
             .map(|authority| authority.map_or(0, |authority| authority.generation))
@@ -290,6 +325,10 @@ impl SpawnAdmission {
         self.authority
             .as_ref()
             .map_or(0, |authority| authority.generation)
+    }
+    /// The stamped store gated this module at admission.
+    pub(crate) fn gated(&self) -> bool {
+        self.authority.is_some()
     }
     pub(crate) fn registration_declaration(&self, module: &str) -> Option<String> {
         self.authority.as_ref().map(|authority| {

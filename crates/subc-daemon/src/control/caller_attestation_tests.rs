@@ -2,7 +2,8 @@
 //! `route.open` attests about its opener (`caller` on `route.bind`) and its
 //! target (`target` on the reply), the epoch fence at bind commit, and the
 //! authority changes that close routes. The first-party mark is false on
-//! every wire here; each test pins that where it reads an attestation.
+//! every wire in this file's own tests, and each pins that where it reads an
+//! attestation; the nested `first_party_mark` tests raise and lower it.
 
 use super::claims::tests::{
     mint, network_primary, network_primary_with_hello, request, rig, swap_candidate, Net, Rig,
@@ -16,6 +17,9 @@ use subc_protocol::manifest::{
 use subc_protocol::peer::CALLER_ATTESTATION_CAPABILITY;
 
 const OPEN_CORR: u64 = 41;
+
+#[path = "first_party_mark_tests.rs"]
+mod first_party_mark;
 
 #[tokio::test]
 async fn origins_widening_fences_routes_and_pending_binds() {
@@ -881,7 +885,7 @@ fn caller_attestation_federated_and_flow_scopes_attest_relay() {
         authority: record.capture().unwrap(),
         claim: subc_protocol::peer::CallerClaim::Own,
     };
-    let relayed = own.relayed().attestation().unwrap();
+    let relayed = own.relayed().attestation("target").unwrap();
     assert_eq!(relayed.claim, subc_protocol::peer::CallerClaim::Relay);
     assert!(!relayed.first_party);
 }

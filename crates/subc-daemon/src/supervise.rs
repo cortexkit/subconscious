@@ -107,6 +107,8 @@ mod slow_retry;
 use slow_retry::{FailedRetry, FailureContext};
 
 #[cfg(all(test, unix))]
+mod mark_readiness_tests;
+#[cfg(all(test, unix))]
 mod slow_retry_tests;
 
 /// Command-line flag used by supervised modules to find subc.
@@ -6736,6 +6738,22 @@ async fn handle_health_report(
         }
         _ => false,
     };
+    if let (Some(delivery), Some(spawn)) = (
+        &runtime.config_delivery,
+        child
+            .as_ref()
+            .and_then(|child| child.config_delivery.as_ref()),
+    ) {
+        delivery
+            .mark_readiness(
+                &spec.module_id,
+                runtime.forwarding.as_deref(),
+                registry,
+                spawn,
+                report.status == HealthStatus::Ok,
+            )
+            .await;
+    }
     let status = supervisor_health_status(report.status);
     let detail = report.detail.clone();
     let metrics = truncate_health_metrics(report.metrics);
@@ -12250,6 +12268,9 @@ fn prepare_child_in_slot(
                     .expect("delivery prepares spawn admission"),
                 spawned_at,
                 role,
+                registration_spawn
+                    .as_ref()
+                    .map(|spawn| spawn.authority.clone()),
             )
         })
         .transpose()?

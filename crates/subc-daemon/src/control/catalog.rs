@@ -61,7 +61,12 @@ impl ControlHandler {
             |capture| capture.incarnation.clone(),
         ));
         entry.spawn = authority.as_ref().map(|capture| capture.key.spawn);
-        entry.first_party = Some(false);
+        // Discovery only: providers authorize on the bind's `caller`.
+        entry.first_party = Some(
+            authority
+                .as_ref()
+                .is_some_and(|capture| capture.first_party),
+        );
         entry.origin = Some(match authority.as_ref().map(|capture| capture.origin) {
             Some(subc_protocol::peer::CallerOrigin::Development) => CatalogOrigin::Development,
             Some(subc_protocol::peer::CallerOrigin::Release) => CatalogOrigin::Release,

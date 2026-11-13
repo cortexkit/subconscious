@@ -770,9 +770,12 @@ async fn wait_for_registration(server: &TestServer, module_id: &str, wait: Durat
 
 fn thin_core_ops() -> BTreeSet<&'static str> {
     BTreeSet::from([
+        "claim.mint",
+        "claim.present",
         ops::DAEMON_SHUTDOWN_INTENT,
         ops::SERVER_DESCRIBE,
         ops::CATALOG_LIST,
+        ops::CATALOG_WATCH,
         ops::ROUTE_OPEN,
         ops::ROUTE_POLL,
         ops::ROUTE_CLOSING,

@@ -8,7 +8,13 @@ import time
 
 env = dict(os.environ)
 env["SUBC_DAEMON_PID"] = str(os.getpid())
+mode = sys.argv[4]
+fallback = mode.startswith("fallback-")
 if os.name == "nt":
+    if fallback:
+        env["SUBC_LAUNCH_NONCE"] = "inherited-nonce"
+        env["SUBC_REGISTRATION_PIPE"] = "\\\\.\\pipe\\subc-test-absent"
+        sys.exit(subprocess.call(sys.argv[2:], env=env))
     import ctypes
     import uuid
     from ctypes import wintypes
@@ -61,8 +67,35 @@ if os.name == "nt":
 else:
     parent, child = socket.socketpair()
     env["SUBC_REGISTRATION_FD"] = f"{child.fileno()}:{os.fstat(child.fileno()).st_ino}"
-    process = subprocess.Popen(sys.argv[2:], env=env, pass_fds=(child.fileno(),))
+    args = sys.argv[2:]
+    inherited = [child.fileno()]
+    if fallback:
+        nonce_read, nonce_write = os.pipe()
+        os.write(nonce_write, b"inherited-nonce")
+        os.close(nonce_write)
+        env["SUBC_LAUNCH_NONCE_FD"] = f"{nonce_read}:{os.fstat(nonce_read).st_ino}"
+        inherited.append(nonce_read)
+        if mode in ("fallback-refused", "fallback-explicit", "fallback-consumer"):
+            env["SUBC_REGISTRATION_FD"] = "999:1"
+        if mode == "fallback-leaked":
+            # The old provider deliberately leaves slot 4 inheritable, then
+            # starts the new SDK only after nonce registration retired it.
+            assert child.fileno() == 4
+            args[1] = os.path.join(os.path.dirname(args[1]), "registration-legacy-parent.ts")
+    process = subprocess.Popen(args, env=env, pass_fds=inherited)
     child.close()
+    if fallback:
+        os.close(nonce_read)
+        if mode == "fallback-leaked":
+            parent.settimeout(8)
+            assert parent.recv(10) == b"REGISTERED"
+            parent.shutdown(socket.SHUT_RDWR)
+        try:
+            sys.exit(process.wait(timeout=8))
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            sys.exit(124)
 remote = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
 
 

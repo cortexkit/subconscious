@@ -37,7 +37,9 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
   const sockets: Socket[] = [];
   let sequence = 0;
   let directChildren = 0;
+  let routeRequests = 0;
   const minted = new Map<string, string>();
+  const fallback = mode.startsWith("fallback-");
   async function peer(socket: Socket): Promise<void> {
     const sock = SubcSocket.adopt(socket);
     await auth(sock);
@@ -54,8 +56,9 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
       }
       if (frame.header.ty === FrameType.Hello) {
         expect((body.manifest as {registration_channel: boolean}).registration_channel).toBe(true);
-        expect(body.launch_nonce).toBeUndefined();
+        expect(body.launch_nonce).toBe(fallback ? (mode === "fallback-explicit" ? "explicit-nonce" : "inherited-nonce") : undefined);
         registered = true;
+        if (mode === "before-hello") { socket.end(); return; }
         await reply(FrameType.HelloAck, {negotiated_ver: PROTOCOL_VERSION, subc_ops: ["claim.mint", "catalog.list"]});
         if (mode === "eof") {
           // A PONG proves the provider consumed HELLO_ACK and started serving.
@@ -66,6 +69,13 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
           expect(pong.header.corr).toBe(991n);
           socket.end(); return;
         }
+      } else if (fallback && op === "server.describe") {
+        await reply(FrameType.Response, {op, capabilities: []});
+      } else if (fallback && op === "route.open") {
+        const explicit = mode === "fallback-explicit" || (mode === "fallback-consumer" && routeRequests > 0);
+        routeRequests++;
+        expect(body.consumer_identity).toEqual({module_id: "test-channel", launch_nonce: explicit ? "route-nonce" : "inherited-nonce"});
+        await reply(FrameType.Error, {code: "target_not_found", message: "fixture target"});
       } else if (op === "claim.mint") {
         expect(registered).toBe(true);
         if (mode === "mint-refused") {
@@ -109,7 +119,13 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
   const port = (server.address() as AddressInfo).port;
   const connectionFile = join(dir, "connection.json");
   writeFileSync(connectionFile, JSON.stringify({schema: 1, daemon_id: [...id], key: [...key], pid: process.pid, endpoints: [{host: "127.0.0.1", port}]}), {mode: 0o600});
-  const args = [process.execPath, fixture, mode, connectionFile];
+  let childFixture = fixture;
+  if (mode === "fallback-missing") {
+    cpSync(fileURLToPath(new URL("../src", import.meta.url)), join(dir, "src"), {recursive: true});
+    cpSync(fileURLToPath(new URL("fixtures", import.meta.url)), join(dir, "tests/fixtures"), {recursive: true});
+    childFixture = join(dir, "tests/fixtures/registration-child.ts");
+  }
+  const args = [process.execPath, childFixture, mode, connectionFile];
   const command = mode === "direct" ? args : [process.platform === "win32" ? "python" : "python3", launcher, String(port), ...args];
   const child = Bun.spawn(command, {env: {...env, SUBC_MODULE_ID: "test-channel", ...(mode === "direct" ? {SUBC_REGISTRATION_FD: "999:1", SUBC_REGISTRATION_PIPE: "\\\\.\\pipe\\subc-test-absent", SUBC_DAEMON_PID: "1"} : {})}, stdout: "pipe", stderr: "pipe"});
   const timer = setTimeout(() => child.kill(), 10000);
@@ -130,13 +146,48 @@ test("without its native helper the SDK is not supervised; plain clients never l
   try {
     const file = join(dir, "src/registration-channel.ts");
     for (const named of [false, true]) {
-      const script = `const {registrationOwner}=await import(${JSON.stringify(file)}); const o=registrationOwner(); if(o.supervised||o.missing!==${named})process.exit(2); console.log('NOT_SUPERVISED'); if (${named}) {try {o.take()} catch {} setInterval(()=>{},1000);}`;
+      const script = `const {registrationOwner}=await import(${JSON.stringify(file)}); const o=registrationOwner(); o.adopt(); if(o.supervised||o.take()!==undefined)process.exit(2); await new Promise(r=>setTimeout(r,20)); console.log('NOT_SUPERVISED');`;
       const child = Bun.spawn([process.execPath, "-e", script], {env: {...env, ...(named ? {SUBC_REGISTRATION_FD: "999:1", SUBC_REGISTRATION_PIPE: "\\\\.\\pipe\\subc-test-absent", SUBC_DAEMON_PID: "1"} : {})}, stdout: "pipe", stderr: "pipe"});
-      expect(await child.exited).toBe(named ? 1 : 0);
+      expect(await child.exited).toBe(0);
       expect(await new Response(child.stdout).text()).toContain("NOT_SUPERVISED");
     }
   } finally { rmSync(dir, {recursive: true, force: true}); }
 });
+
+test("import neither loads the native helper nor validates inherited registration metadata", async () => {
+  const dir = mkdtempSync(resolve("target/scratch/lazy-registration-"));
+  cpSync(fileURLToPath(new URL("../src", import.meta.url)), join(dir, "src"), {recursive: true});
+  mkdirSync(join(dir, "native"));
+  writeFileSync(join(dir, "native/index.js"), `console.warn('NATIVE_LOADED'); module.exports = { supervised() { console.warn('VALIDATED'); return false; }, registrationRefusal() { return 'refused'; } };`);
+  try {
+    const script = `await import(${JSON.stringify(join(dir, "src/index.ts"))}); console.log('IMPORTED');`;
+    const child = Bun.spawn([process.execPath, "-e", script], {env: {...env, SUBC_REGISTRATION_FD: "999:1", SUBC_REGISTRATION_PIPE: "unused"}, stdout: "pipe", stderr: "pipe"});
+    expect(await child.exited).toBe(0);
+    expect(await new Response(child.stdout).text()).toBe("IMPORTED\n");
+    expect(await new Response(child.stderr).text()).toBe("");
+  } finally { rmSync(dir, {recursive: true, force: true}); }
+});
+
+for (const mode of ["fallback-missing", "fallback-refused", "fallback-explicit", "fallback-consumer", ...(process.platform === "win32" ? [] : ["fallback-leaked"])]) {
+  test(`${mode}: non-adopted provider keeps TCP HELLO nonce and route identity`, async () => {
+    const result = await run(mode);
+    expect(result.out).toContain("FALLBACK_OK");
+    expect(result.operations.filter(op => op === "HELLO")).toHaveLength(mode === "fallback-leaked" ? 2 : mode === "fallback-consumer" ? 0 : 1);
+    expect(result.operations).toContain("route.open");
+    expect(result.operations).not.toContain("claim.mint");
+    expect(result.err).toBe("");
+  }, 15000);
+}
+
+test("adopted provider close does not exit the process", async () => {
+  const result = await run("close");
+  expect(result.out).toContain("LOCAL_CLOSE_OK");
+}, 15000);
+
+test("EOF before registration does not exit the process", async () => {
+  const result = await run("before-hello");
+  expect(result.out).toContain("REGISTRATION_FAILED_OK");
+}, 15000);
 
 test("an inherited registration variable without its descriptor connects direct", async () => {
   const result = await run("direct");

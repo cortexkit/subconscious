@@ -2719,7 +2719,7 @@ async fn prepare_connection<H: ModuleHandler>(
     handler: H,
     mut options: ServeOptions,
 ) -> Result<Option<(ModuleHandle, ModuleServeFuture)>, SubcModuleError> {
-    options.registration_channel = registration::supervised();
+    options.registration_channel = registration::adopt();
     let stream = tokio::select! {
         biased;
         () = options.stop_handle.token.cancelled() => return Ok(None),
@@ -2944,6 +2944,7 @@ where
         dispatcher.abort_all();
         dispatcher.tasks.wait().await;
         let daemon_eof = matches!(loop_result, Ok(ConnectionEnd::Eof));
+        let locally_closed = matches!(loop_result, Ok(ConnectionEnd::Closed));
         // The module ended the connection itself: a stop, an internal close
         // or a module-side error. Close it in order, so the daemon reads a
         // FIN rather than a reset. When the daemon ended it (EOF, GOODBYE or
@@ -2986,7 +2987,7 @@ where
                 "daemon EOF: replies could not be delivered during drain"
             );
         }
-        if options.registration_channel {
+        if options.registration_channel && !locally_closed {
             // An inherited registration cannot be recreated. Finish the hook
             // and teardown before letting the supervisor restart the process.
             std::process::exit(if loop_result.is_ok() { 0 } else { 1 });

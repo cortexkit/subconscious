@@ -564,6 +564,7 @@ export class SubcProvider {
   readonly closed: Promise<void>;
   private resolveClosed: () => void = () => undefined;
   private closeStarted = false;
+  private locallyClosed = false;
   private closedErr: Error | null = null;
   // In-flight data requests are keyed by generation, channel, and correlation id.
   // A socket drop only makes the reply path stale; handlers may still finish their
@@ -811,7 +812,7 @@ export class SubcProvider {
       owner.bind((body) => provider.configControl(body));
       void provider.closed.then(() => {
         owner.broker?.close();
-        setImmediate(() => process.exit(1));
+        if (!provider.locallyClosed) setImmediate(() => process.exit(1));
       });
     }
     await provider.config?.refresh();
@@ -820,6 +821,7 @@ export class SubcProvider {
 
   async close(): Promise<void> {
     if (!this.closeStarted) {
+      this.locallyClosed = true;
       this.endServing(new SubcProviderError("provider closed", "provider_closed"));
       const sock = this.sock;
       try {
@@ -1632,15 +1634,16 @@ async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions)
   if (opts.config?.anchorRetryMs !== undefined && (!Number.isInteger(opts.config.anchorRetryMs)
     || opts.config.anchorRetryMs < 1 || opts.config.anchorRetryMs > 30000)) throw new Error("anchorRetryMs must be 1..30000");
   const owner = registrationOwner();
-  // Nonce-only providers retain the legacy restart policy. A named channel
-  // never falls back to that bearer identity, even if validation refused it.
+  // Adopt only when serving starts. Inherited metadata alone does not change
+  // the legacy TCP/nonce path used by ordinary children and older modules.
+  owner.adopt();
   const envModuleId = nonEmpty(process.env[SUBC_MODULE_ID_ENV]);
   // The nonce comes from the process-wide accessor, which reads the daemon's
   // descriptor at most once. A refused descriptor fails the connect, unless the
   // caller supplied the nonce itself, in which case it only means "not
   // supervised".
   let processNonce: string | undefined;
-  if (owner.named) {
+  if (owner.supervised) {
     if (opts.launchNonce !== undefined) throw new SubcProviderError("channel registration cannot override identity", "claim_identity_conflict");
   } else if (opts.launchNonce === undefined) {
     try {

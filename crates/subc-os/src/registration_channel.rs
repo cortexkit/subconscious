@@ -223,6 +223,7 @@ pub enum RegistrationRefusal {
     WrongInode,
     NamedSocket,
     WrongPeer,
+    Closed,
     Unsupported,
 }
 
@@ -235,6 +236,7 @@ impl fmt::Display for RegistrationRefusal {
             Self::WrongInode => "registration socket identity does not match",
             Self::NamedSocket => "registration socket or its peer is named",
             Self::WrongPeer => "registration peer is not the expected process",
+            Self::Closed => "registration channel is already closed",
             Self::Unsupported => "registration channel is unsupported on this platform",
         })
     }
@@ -511,6 +513,31 @@ mod unix {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if peer_pid(fd) != Some(daemon) {
                 return Err(RegistrationRefusal::WrongPeer);
+            }
+            // Older SDKs can leak this endpoint through exec. The daemon shuts
+            // it down when the owner registers by nonce, so it no longer proves
+            // supervision. Peek without consuming handshake bytes or blocking.
+            let mut byte = 0_u8;
+            loop {
+                let read = unsafe {
+                    libc::recv(
+                        fd,
+                        std::ptr::from_mut(&mut byte).cast(),
+                        1,
+                        libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                    )
+                };
+                if read > 0 {
+                    break;
+                }
+                let error = io::Error::last_os_error();
+                if read < 0 && error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if read < 0 && error.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
+                return Err(RegistrationRefusal::Closed);
             }
             Ok(fd)
         };
@@ -859,6 +886,20 @@ mod tests {
             unix::inode_matches(0, 13),
             "zero inode must retain the other three validators"
         );
+    }
+
+    #[test]
+    fn retired_endpoint_is_not_supervision() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let fd = stream.into_raw_fd();
+        peer.shutdown(std::net::Shutdown::Both).unwrap();
+        refuse(
+            format!("{fd}:{}", inode(fd)),
+            std::process::id(),
+            RegistrationRefusal::Closed,
+        );
+        // Refusal must leave the descriptor open without taking ownership.
+        assert_eq!(unsafe { libc::close(fd) }, 0);
     }
 
     fn child(test: &str, mode: &str) -> Command {

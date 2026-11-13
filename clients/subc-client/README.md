@@ -246,6 +246,8 @@ compute canonical configuration or approval digests; echo daemon-provided ones.
 | `anchor_pending` | `anchor_pending` | Keep the view/outcome and retry on a hint or bounded backoff |
 | Unknown string | `unknown` with `rawState` | Preserve the spelling; never activate it |
 
+For view statuses other than `active`, `pending` or `unstamped`, `failed` publishes a failed state while `gated` and unknown spellings publish `unknown` with `rawState`; none is applied or acknowledged.
+
 Refusal states include the original error in `refusal.cause`. None ends serving
 or exits the process. `onError` reports unexpected transport/protocol/callback
 failures without falling back to files. `config.changed` resynchronizes without

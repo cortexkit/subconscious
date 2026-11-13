@@ -2,7 +2,8 @@
 //! `route.open` attests about its opener (`caller` on `route.bind`) and its
 //! target (`target` on the reply), the epoch fence at bind commit, and the
 //! authority changes that close routes. The first-party mark is false on
-//! every wire here; each test pins that where it reads an attestation.
+//! every wire in this file's own tests, and each pins that where it reads an
+//! attestation; the nested `first_party_mark` tests raise and lower it.
 
 use super::claims::tests::{
     mint, network_primary, network_primary_with_hello, request, rig, swap_candidate, Net, Rig,

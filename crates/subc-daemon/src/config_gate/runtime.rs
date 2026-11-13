@@ -480,7 +480,7 @@ impl Drop for OwnerGuard<'_> {
         // Lower the marks this state rules out (an unstamp, an ungated
         // module, an active generation the spawn never acknowledged) before
         // the owner is released: delivery, then record, then forwarding.
-        mark::sweep(self.4, &self.0, &next);
+        mark::sweep(self.4, &mut self.0, &next);
         let observed = self.0.observed_snapshot.clone();
         let projection = self.4.status_projection(&mut self.0, observed, &next);
         if let Ok(mut cache) = self.1.write() {

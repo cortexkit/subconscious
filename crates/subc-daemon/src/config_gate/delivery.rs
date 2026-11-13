@@ -134,6 +134,10 @@ pub(super) struct DeliveryState {
     // Transport cleanup may precede the process-exit observation. Retain the
     // last active child's assigned generation, not an unattempted deferred one.
     last_target_attempt: HashMap<String, (u64, u64)>,
+    /// Every spawn admitted under the stamp, which carries or may still earn
+    /// the first-party mark. Unlike the rest of this state it survives an
+    /// authority exit, so a committed unstamp still finds the spawns to lower.
+    mark_records: Vec<std::sync::Weak<crate::spawn_authority::SpawnAuthorityRecord>>,
 }
 
 impl DeliveryState {
@@ -141,8 +145,34 @@ impl DeliveryState {
         *self = Self {
             next_spawn: self.next_spawn,
             next_attempt: self.next_attempt,
+            mark_records: std::mem::take(&mut self.mark_records),
             ..Self::new(generation)
         };
+    }
+    /// Remember `spawn` for the mark sweep when it was admitted under the
+    /// stamp with an authority record.
+    pub(super) fn track_mark(&mut self, spawn: &DeliverySpawn) {
+        let Some(record) = spawn.authority.as_ref().filter(|_| spawn.stamped) else {
+            return;
+        };
+        if !self
+            .mark_records
+            .iter()
+            .any(|known| std::ptr::eq(known.as_ptr(), std::sync::Arc::as_ptr(record)))
+        {
+            self.mark_records.push(std::sync::Arc::downgrade(record));
+        }
+    }
+    /// The live spawns remembered for the mark sweep; forgets dead ones.
+    pub(super) fn mark_records(
+        &mut self,
+    ) -> Vec<std::sync::Arc<crate::spawn_authority::SpawnAuthorityRecord>> {
+        self.mark_records
+            .retain(|record| record.upgrade().is_some_and(|record| record.alive()));
+        self.mark_records
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect()
     }
     pub(super) fn started_at_generation(&self) -> u64 {
         self.initial_generation
@@ -164,12 +194,6 @@ impl DeliveryState {
     }
     pub(super) fn fenced_modules(&self) -> impl Iterator<Item = String> + '_ {
         self.exited.keys().cloned()
-    }
-    /// Every spawn the gate is tracking, registered or not.
-    pub(super) fn tracked_spawns(&self) -> impl Iterator<Item = &DeliverySpawn> + '_ {
-        self.children
-            .values()
-            .chain(self.unregistered_children.values())
     }
 }
 
@@ -1040,6 +1064,7 @@ impl RuntimeOwner {
             health,
             authority.map(|record| (record, stamped)),
         )?;
+        state.delivery.track_mark(&spawn);
         state
             .delivery
             .unregistered_children
@@ -1162,6 +1187,7 @@ impl RuntimeOwner {
         spawn: &DeliverySpawn,
     ) -> Result<()> {
         let mut state = self.lock()?;
+        state.delivery.track_mark(spawn);
         state.delivery.children.insert(connection, spawn.clone());
         if let Some(bound) = state
             .delivery

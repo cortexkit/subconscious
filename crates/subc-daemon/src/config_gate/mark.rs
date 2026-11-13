@@ -89,7 +89,8 @@ impl RuntimeOwner {
         let Some(record) = spawn.authority() else {
             return Ok(());
         };
-        let state = self.lock()?;
+        let mut state = self.lock()?;
+        state.delivery.track_mark(spawn);
         record.note_ready();
         evaluate(self, &state, spawn);
         Ok(())
@@ -103,7 +104,8 @@ impl RuntimeOwner {
         if spawn.authority().is_none() {
             return Ok(());
         }
-        let state = self.lock()?;
+        let mut state = self.lock()?;
+        state.delivery.track_mark(spawn);
         evaluate(self, &state, spawn);
         Ok(())
     }
@@ -251,24 +253,23 @@ fn active_generation(body: &crate::config_store::StoreBody, module: &str) -> Opt
 /// its delivery state, with the admission view it is about to publish.
 pub(super) fn sweep(
     owner: &RuntimeOwner,
-    state: &OwnerState,
+    state: &mut OwnerState,
     view: &super::admission::AdmissionCache,
 ) {
+    let records = state.delivery.mark_records();
     let (store, body) = state.store.loaded_admission_state();
-    for spawn in state.delivery.tracked_spawns() {
-        let Some(record) = spawn.authority() else {
-            continue;
-        };
+    for record in &records {
         let facts = record.mark_facts();
-        if !facts.marked && !(facts.unmarked && spawn.stamped()) {
+        if !facts.marked && !facts.unmarked {
             continue;
         }
+        let module = record.module_id();
         // A committed unstamp lowers at once, even while the daemon is still
         // holding launches for its authority exit.
         let view = if store == StoreState::Unstamped {
             MarkView::NotGated
         } else {
-            view.mark_view(spawn.module())
+            view.mark_view(module)
         };
         let lower = match view {
             MarkView::Undecided => false,
@@ -278,7 +279,7 @@ pub(super) fn sweep(
             } => {
                 facts.marked
                     && delivers_config
-                    && facts.acknowledged_active != active_generation(body, spawn.module())
+                    && facts.acknowledged_active != active_generation(body, module)
             }
         };
         if lower {

@@ -134,6 +134,69 @@ async fn legacy() -> Legacy {
 }
 
 #[tokio::test]
+async fn audit_registration_wire_start_keeps_unrecorded_gate_error_code() {
+    operator_gate_error_reply("start").await;
+}
+
+#[tokio::test]
+async fn audit_registration_wire_enable_keeps_unrecorded_gate_error_code() {
+    operator_gate_error_reply("enable").await;
+}
+
+#[tokio::test]
+async fn audit_registration_wire_restart_keeps_unrecorded_gate_error_code() {
+    operator_gate_error_reply("restart").await;
+}
+
+async fn operator_gate_error_reply(operation: &str) {
+    let fixture = legacy().await;
+    match operation {
+        "start" => fixture.module.drain().await.unwrap(),
+        "enable" => {
+            fixture.module.set_enabled(false).await.unwrap();
+        }
+        "restart" => {}
+        _ => unreachable!(),
+    }
+    assert!(fixture.owner.check_module_hold("a").is_ok());
+    assert!(!fixture.owner.has_recorded_admission_hold("a"));
+    fixture.owner.exhaust_delivery_spawns_for_test();
+    registration_declaration_poll(fixture.handler.clone(), "config.status").await;
+    let request = if operation == "restart" {
+        json!({"op":"supervisor.restart","module_id":"a"})
+    } else {
+        json!({"op":"supervisor.set_enabled","module_id":"a","enabled":true})
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let ctx = crate::RouteCtx {
+        connection_id: ConnectionId::new(50),
+        egress: crate::FrameSink::new(tx),
+    };
+    let frames = fixture
+        .handler
+        .handle_control_frame(&ctx, crate::control::claims::tests::request(request))
+        .await
+        .unwrap();
+    let frame = if frames.is_empty() {
+        rx.recv().await.unwrap().frame
+    } else {
+        frames[0].clone()
+    };
+    let reply: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+    assert_eq!(reply["code"], "config_gated", "{operation}: {reply}");
+    assert!(
+        reply["message"]
+            .as_str()
+            .unwrap()
+            .contains("delivery_spawn_exhausted"),
+        "{reply}"
+    );
+    assert!(!fixture.owner.has_recorded_admission_hold("a"));
+}
+
+#[tokio::test]
 async fn audit_registration_committed_stamp_retries_or_parks_cutover_without_failed_apply() {
     for mode in ["busy", "recovery", "refused"] {
         let fixture = legacy().await;

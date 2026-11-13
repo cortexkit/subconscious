@@ -149,21 +149,23 @@ async fn approval_latch_clears_after_a_successful_registered_reload() {
         .unwrap()
         .wait_launch()
         .await;
-    let mut primary = crate::control::claims::tests::Net::new(fixture.router.clone()).await;
-    let connection = primary.connection_id(&fixture.handler);
-    let hello = primary.call(module_hello(Some(proof), connection)).await;
+    let connection = ConnectionId::new(445);
+    let hello = fixture
+        .handler
+        .handle_control(connection, module_hello(Some(proof), connection))
+        .unwrap();
     assert_eq!(
-        hello.header.ty,
+        hello[0].header.ty,
         subc_protocol::FrameType::HelloAck,
         "{}",
-        String::from_utf8_lossy(&hello.body)
+        String::from_utf8_lossy(&hello[0].body)
     );
     reload.await.unwrap().unwrap();
     let reconcile = fixture
         .handler
         .reconcile_exit_for_test(fixture.owner.clone(), 1)
         .await;
-    drop(primary);
+    fixture.registry.deregister_connection(connection).unwrap();
     drop(fixture.primary);
     actor.stop().await.unwrap();
     assert!(

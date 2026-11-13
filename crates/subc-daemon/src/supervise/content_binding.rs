@@ -95,13 +95,6 @@ impl LiveProgramBinding {
                 if let Some(registration) = self.registration.upgrade() {
                     registration.retire();
                 }
-                #[cfg(all(test, unix))]
-                let kill_now = !self.kill_deferred.load(Ordering::Acquire);
-                #[cfg(not(all(test, unix)))]
-                let kill_now = true;
-                if kill_now {
-                    self.kill_container();
-                }
                 let module = self
                     .launch
                     .lock()
@@ -113,6 +106,23 @@ impl LiveProgramBinding {
                         &self.base,
                         subc_config::raw_digest(error.detail.as_bytes()),
                     );
+                }
+                // A registration or route check can kill a child while its
+                // supervisor waits. Record the refused program's admission hold
+                // before the supervisor can reap that child and choose a retry.
+                #[cfg(all(test, unix))]
+                let kill_now = !self.kill_deferred.load(Ordering::Acquire);
+                #[cfg(not(all(test, unix)))]
+                let kill_now = true;
+                if kill_now {
+                    self.kill_container();
+                    #[cfg(test)]
+                    {
+                        let hook = self.owner.content_kill_hook.lock().unwrap().take();
+                        if let Some(hook) = hook {
+                            hook();
+                        }
+                    }
                 }
             }
         }

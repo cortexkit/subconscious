@@ -411,3 +411,6 @@ async fn delivery_failure_park_saves_the_daemon_attempt_before_release() {
 
 #[path = "audit_reconcile_tests.rs"]
 mod reconcile_tests;
+
+#[path = "audit_content_tests.rs"]
+mod content_tests;

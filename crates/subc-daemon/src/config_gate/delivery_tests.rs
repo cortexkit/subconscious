@@ -1115,6 +1115,51 @@ async fn config_delivery_program_only_change_waits_for_a_child_started_from_the_
     assert_active(&owner, replacement, 2);
 }
 
+/// A configuration change approved before a child of the newly approved
+/// program has started supersedes the pending program change. The process
+/// running is still the old program's, so it cannot acknowledge the later
+/// generation either, though that generation's program matches the last
+/// approval.
+#[tokio::test]
+async fn config_delivery_change_after_an_inactive_program_change_still_waits_for_the_new_program() {
+    use std::io::Write;
+    let (rig, owner) = rig();
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(rig.path.join("program"))
+        .unwrap()
+        .write_all(b"replacement program bytes")
+        .unwrap();
+    let plan = plan_kinds_from_disk(&owner, &[]).unwrap();
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let challenge = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
+    owner
+        .finish_approval(
+            challenge.attempt(),
+            &Rig::facts(),
+            ApprovalReply::Presence(super::super::super::PresenceDecision::InteractiveApproval),
+            2,
+        )
+        .unwrap();
+    assert_eq!(approve(&rig, &owner, 3), 3);
+    assert!(
+        owner
+            .module_get(INCUMBENT, "a", ConfigGetRequest::new())
+            .unwrap()
+            .pending
+            .is_none(),
+        "the old program's process cannot receive a generation that runs the new program"
+    );
+    assert_active(&owner, INCUMBENT, 1);
+    assert_eq!(
+        owner.pending_config_restarts().unwrap(),
+        vec![("a".to_owned(), 3)]
+    );
+}
+
 #[tokio::test]
 async fn config_delivery_mixed_live_and_next_supervision_defer_live_fields_in_plan_and_activation()
 {

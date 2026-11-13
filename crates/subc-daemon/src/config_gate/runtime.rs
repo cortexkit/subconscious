@@ -534,6 +534,10 @@ pub struct PreparedPlan {
     pub base_schemas: BTreeMap<String, subc_config::Schema>,
     pub kind: PlanKind,
     pub review_modules: std::collections::BTreeSet<String>,
+    /// Modules in `review_modules` only because their newly approved program
+    /// is active and has not yet reviewed their approved layers. A missing
+    /// reviewer drops such a module from this plan instead of failing it.
+    pub rereview_modules: std::collections::BTreeSet<String>,
     base_revision: u64,
     active_generations: BTreeMap<crate::config_store::Tuple, Option<u64>>,
     touched_modules: BTreeSet<String>,
@@ -1295,12 +1299,33 @@ impl RuntimeOwner {
                     .filter_map(|(key, _)| key.module().map(str::to_owned)),
             );
         }
-        let review_modules: BTreeSet<String> = touched_modules
+        let mut review_modules: BTreeSet<String> = touched_modules
             .iter()
             .filter(|module| candidate.modules.contains_key(*module))
             .filter(|module|matches!(kind,PlanKind::Stamp|PlanKind::Unstamp) || candidate.diagnostic.changed_keys(&old).iter().any(|key|matches!(key,super::InputKey::Layer {module:owner,..}|super::InputKey::Declaration(owner) if owner==*module)))
             .cloned()
             .collect();
+        // A program change is approved launch-only: neither the build being
+        // approved nor the one still running can review for it. Once the new
+        // program is active, the next plan re-reviews the approved layers with
+        // it. While it is not yet active the module waits, and the plan
+        // carries its earlier reviewer forward.
+        let mut rereview_modules = BTreeSet::new();
+        if matches!(kind, PlanKind::Change | PlanKind::Rollback(_))
+            && state.store.status().state == StoreState::Stamped
+        {
+            for (module, rereview) in
+                super::reviewed_build::pending(state.store.body()?, candidate.modules.keys())?
+            {
+                if rereview == super::reviewed_build::Rereview::Ready
+                    && !review_modules.contains(&module)
+                {
+                    touched_modules.insert(module.clone());
+                    review_modules.insert(module.clone());
+                    rereview_modules.insert(module);
+                }
+            }
+        }
         let program_keys: Vec<_> = candidate
             .diagnostic
             .inputs
@@ -1389,6 +1414,7 @@ impl RuntimeOwner {
             base_schemas,
             kind,
             review_modules,
+            rereview_modules,
             base_revision,
             active_generations,
             touched_modules,
@@ -1457,11 +1483,12 @@ impl RuntimeOwner {
         let mut handles = prepared.candidate.take_handles();
         handles.append(&mut prepared.observed_handles);
         let OwnerState { gate, store, .. } = &mut *state;
-        let view = gate.plan(
+        let view = gate.plan_reviewed(
             store,
             prepared.kind,
             prepared.candidate.diagnostic,
             &current.diagnostic,
+            Some(&prepared.review_modules),
             review,
         )?;
         if let Err(error) = self.check_route_policy_authority(&view.plan.changeset) {
@@ -1865,7 +1892,24 @@ impl RuntimeOwner {
         if cfg!(feature = "dev-placement") {
             status.development_switches.push("dev-placement".into());
         }
+        let declared: Vec<String> = Self::declarations(&mut state)
+            .map(|declarations| declarations.into_keys().collect())
+            .unwrap_or_default();
         if let Ok(body) = state.store.body() {
+            if body.stamped {
+                for (module, rereview) in
+                    super::reviewed_build::pending(body, &declared).unwrap_or_default()
+                {
+                    status.warnings.push(match rereview {
+                        super::reviewed_build::Rereview::WaitingForProgram => format!(
+                            "module {module}: needs configuration re-review: its approved program has not reviewed its approved layers; the re-review waits until that program is running and active"
+                        ),
+                        super::reviewed_build::Rereview::Ready => format!(
+                            "module {module}: needs configuration re-review: its approved program has not reviewed its approved layers; the next configuration plan re-reviews them with the running program"
+                        ),
+                    });
+                }
+            }
             if body.stamped {
                 current_snapshot = super::GateSnapshot::from_store(&body.approved).ok();
             }

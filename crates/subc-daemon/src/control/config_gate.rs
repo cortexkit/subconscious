@@ -775,56 +775,72 @@ impl ControlHandler {
                         ))
                     }
                 };
-                let prepared =
+                let mut prepared =
                     config_work(runtime.clone(), move |owner| owner.prepare(kind)).await?;
                 let mut fields = Vec::new();
+                let mut unavailable_rereviews = Vec::new();
                 for (module, captured) in &prepared.candidate.modules {
                     if !prepared.review_modules.contains(module) {
                         continue;
                     }
-                    let registration = self
-                        .registry
-                        .get_module(module)
-                        .map_err(|_| {
-                            GateError::new("config_unavailable", "registry is unavailable")
-                        })?
-                        .ok_or_else(|| {
-                            GateError::new(
+                    let base = prepared.bases.get(module);
+                    let reply: std::result::Result<Vec<u8>, GateError> = async {
+                        let registration = self
+                            .registry
+                            .get_module(module)
+                            .map_err(|_| {
+                                GateError::new("config_unavailable", "registry is unavailable")
+                            })?
+                            .ok_or_else(|| {
+                                GateError::new(
+                                    "module_review_unavailable",
+                                    format!("{module}: no active reviewer"),
+                                )
+                            })?;
+                        let admission = self.review_admission();
+                        let reviewer = registration.clone();
+                        config_work(runtime.clone(), move |_| admission.check(&reviewer)).await?;
+                        if !registration
+                            .control_ops
+                            .iter()
+                            .any(|op| op == "config.review")
+                        {
+                            return Err(GateError::new(
                                 "module_review_unavailable",
-                                format!("{module}: no active reviewer"),
+                                format!("{module}: config.review is not opted in"),
+                            ));
+                        }
+                        let request = subc_protocol::config::ConfigReviewRequest::new(
+                            base.map_or(0, |b| b.generation),
+                            captured.view.layers.clone(),
+                            base.cloned(),
+                        );
+                        let bytes = serde_json::to_vec(&request).map_err(|_| {
+                            GateError::new(
+                                "config_unavailable",
+                                "could not encode immutable review",
                             )
                         })?;
-                    let admission = self.review_admission();
-                    let reviewer = registration.clone();
-                    config_work(runtime.clone(), move |_| admission.check(&reviewer)).await?;
-                    if !registration
-                        .control_ops
-                        .iter()
-                        .any(|op| op == "config.review")
-                    {
-                        return Err(GateError::new(
-                            "module_review_unavailable",
-                            format!("{module}: config.review is not opted in"),
-                        ));
-                    }
-                    let base = prepared.bases.get(module);
-                    let request = subc_protocol::config::ConfigReviewRequest::new(
-                        base.map_or(0, |b| b.generation),
-                        captured.view.layers.clone(),
-                        base.cloned(),
-                    );
-                    let bytes = serde_json::to_vec(&request).map_err(|_| {
-                        GateError::new("config_unavailable", "could not encode immutable review")
-                    })?;
-                    let reply = self
-                        .config_rpc(
+                        self.config_rpc(
                             &runtime,
                             module,
                             registration.connection_id,
                             "config.review",
                             bytes,
                         )
-                        .await?;
+                        .await
+                    }
+                    .await;
+                    let reply = match reply {
+                        Ok(reply) => reply,
+                        // A re-review the new program cannot answer now stays
+                        // pending in status; it does not hold up this plan.
+                        Err(_) if prepared.rereview_modules.contains(module) => {
+                            unavailable_rereviews.push(module.clone());
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let reply = serde_json::from_slice(&reply).map_err(|_| {
                         GateError::new(
                             "module_review_invalid",
@@ -839,6 +855,10 @@ impl ControlHandler {
                         &captured.view,
                         reply,
                     )?);
+                }
+                for module in unavailable_rereviews {
+                    prepared.review_modules.remove(&module);
+                    prepared.rereview_modules.remove(&module);
                 }
                 let view = config_work(runtime, move |owner| {
                     owner.finish_plan(prepared, move |old, new| {

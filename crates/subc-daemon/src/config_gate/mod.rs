@@ -11,6 +11,7 @@ mod approval;
 pub mod capture;
 pub(crate) mod program;
 pub(crate) mod review;
+mod reviewed_build;
 pub mod runtime;
 mod snapshot;
 mod strict_json;
@@ -169,6 +170,23 @@ impl ConfigGate {
         observed: &GateSnapshot,
         review: impl FnOnce(&GateSnapshot, &GateSnapshot) -> Result<Changeset>,
     ) -> Result<ConfigPlanView> {
+        self.plan_reviewed(store, kind, candidate, observed, None, review)
+    }
+
+    /// As [`Self::plan`], also recording which modules' admitted reviewers
+    /// answered `config.review` for this plan, and which build each module's
+    /// approved configuration now rests on. Without that record the plan
+    /// carries none, and the next reader counts every module as reviewed by
+    /// the programs the plan approved.
+    pub(crate) fn plan_reviewed(
+        &mut self,
+        store: &mut ConfigStore,
+        kind: PlanKind,
+        candidate: GateSnapshot,
+        observed: &GateSnapshot,
+        reviewed: Option<&BTreeSet<String>>,
+        review: impl FnOnce(&GateSnapshot, &GateSnapshot) -> Result<Changeset>,
+    ) -> Result<ConfigPlanView> {
         let status = store.status();
         let recovery = matches!(
             status.state,
@@ -293,6 +311,62 @@ impl ConfigGate {
         });
         if matches!(kind, PlanKind::Rollback(_)) {
             changeset.apply_plan["rollback_programs"] = serde_json::Value::Array(rollback_programs);
+        }
+        let replaces_programs = !recovery && matches!(kind, PlanKind::Change | PlanKind::Rollback(_));
+        if replaces_programs {
+            // A module whose active generation ran an older program than this
+            // plan's (an earlier program change not yet active, say) still has
+            // that older process running. It must not acknowledge this
+            // generation either, even though the program matches the last
+            // approval.
+            let body = store.body()?;
+            for module in &modules {
+                if reviewed_build::active(body, module)?
+                    .is_some_and(|active| active != reviewed_build::identity(&candidate, module))
+                {
+                    changeset
+                        .launch_manifests
+                        .entry(module.clone())
+                        .or_insert_with(|| serde_json::json!({}))
+                        .as_object_mut()
+                        .ok_or_else(|| GateError::invalid("launch manifest must be an object"))?
+                        .insert("program_changed_since_active".into(), serde_json::Value::Bool(true));
+                }
+            }
+        }
+        if let Some(reviewed) = reviewed {
+            let mut record = if replaces_programs {
+                reviewed_build::recorded(store.body()?)?
+            } else {
+                BTreeMap::new()
+            };
+            let present = candidate.modules();
+            record.retain(|module, _| present.contains(module));
+            for module in reviewed {
+                // A stamp records the programs already running. Otherwise the
+                // reviewer is the process that acknowledged the active
+                // generation, or one admitted from the last approval when the
+                // module has never acknowledged one.
+                let program = if replaces_programs {
+                    match reviewed_build::active(store.body()?, module)? {
+                        Some(active) => active,
+                        None => reviewed_build::identity(&approved, module),
+                    }
+                } else {
+                    reviewed_build::identity(&candidate, module)
+                };
+                if let Some(previous) = record.get(module).filter(|previous| **previous != program) {
+                    changeset.policy_changes.push(serde_json::json!({
+                        "module_id": module,
+                        "path": "reviewed_program",
+                        "old": previous,
+                        "new": program,
+                        "reason": "approved configuration re-reviewed by the module's newly approved program",
+                    }));
+                }
+                record.insert(module.clone(), program);
+            }
+            changeset.apply_plan[reviewed_build::REVIEWED_PROGRAMS] = serde_json::json!(record);
         }
         apply::bind_plan(&mut changeset)?;
         let mut plan = Plan::new(

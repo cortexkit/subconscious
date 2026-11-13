@@ -60,9 +60,11 @@ impl Transition {
 /// from the newly approved program, after warm-up, can make it active.
 ///
 /// The daemon reviewer names each changed program file `program:<path>` in the
-/// module's launch manifest, and a rollback marks a program that differs from
-/// its target with `program_changed_since_target`. A stamp or unstamp records
-/// the programs already running rather than replacing them, so it is excluded.
+/// module's launch manifest. A rollback marks a program that differs from its
+/// target with `program_changed_since_target`, and any change or rollback marks
+/// a module whose active generation ran another program with
+/// `program_changed_since_active`. A stamp or unstamp records the programs
+/// already running rather than replacing them, so it is excluded.
 fn changes_program(changeset: &Changeset, module: &str) -> bool {
     let replaces_programs = matches!(
         changeset
@@ -78,7 +80,9 @@ fn changes_program(changeset: &Changeset, module: &str) -> bool {
             .and_then(serde_json::Value::as_object)
             .is_some_and(|manifest| {
                 manifest.keys().any(|key| {
-                    key.starts_with("program:") || key == "program_changed_since_target"
+                    key.starts_with("program:")
+                        || key == "program_changed_since_target"
+                        || key == "program_changed_since_active"
                 })
             })
 }

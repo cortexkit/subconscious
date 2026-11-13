@@ -685,9 +685,9 @@ impl Registry {
             // could otherwise attest differently.
             let declares_caller = |caps: Option<&CapabilityDeclarations>| {
                 caps.is_some_and(|caps| {
-                    caps.provides.iter().any(|cap| {
-                        cap == subc_protocol::peer::CALLER_ATTESTATION_CAPABILITY
-                    })
+                    caps.provides
+                        .iter()
+                        .any(|cap| cap == subc_protocol::peer::CALLER_ATTESTATION_CAPABILITY)
                 })
             };
             if declares_caller(registration.manifest.capabilities.as_ref())

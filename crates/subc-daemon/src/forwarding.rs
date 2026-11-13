@@ -157,9 +157,7 @@ impl TargetAuthority {
                 RouteOpenTargetKind::Spawn,
                 Some(pair.key.spawn),
                 Some(pair.epoch),
-                Some(
-                    crate::spawn_authority::ApprovedDeclarations::none_approved().digest,
-                ),
+                Some(crate::spawn_authority::ApprovedDeclarations::none_approved().digest),
             ),
         };
         RouteOpenTarget::new(incarnation, kind, spawn, epoch, false, digest)

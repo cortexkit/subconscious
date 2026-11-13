@@ -61,7 +61,9 @@ pub(super) fn caller_for_target(
             .iter()
             .any(|cap| cap == CALLER_ATTESTATION_CAPABILITY)
     });
-    caller.filter(|_| declared).and_then(CallerCapture::attestation)
+    caller
+        .filter(|_| declared)
+        .and_then(CallerCapture::attestation)
 }
 
 /// Whether a route admitted under `stamp` acts for someone other than the
@@ -96,7 +98,8 @@ impl ControlHandler {
             if !registration.launch_ready() || !registration.authority.alive() {
                 return None;
             }
-            if consumer_identity.is_some_and(|identity| identity.module_id != registration.module_id)
+            if consumer_identity
+                .is_some_and(|identity| identity.module_id != registration.module_id)
             {
                 return None;
             }

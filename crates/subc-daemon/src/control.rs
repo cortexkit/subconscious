@@ -143,6 +143,7 @@ const SUBC_UNADVERTISED_CONTROL_OPS: &[&str] = &[
     "config.rollback",
 ];
 
+mod caller_attestation;
 mod channel_operations;
 #[cfg(all(test, unix, feature = "test-support"))]
 #[path = "control/channel_operations_tests.rs"]
@@ -152,7 +153,6 @@ pub(crate) mod claims;
 #[path = "control/config_advertisement_tests.rs"]
 mod config_advertisement_tests;
 mod config_gate;
-mod caller_attestation;
 use caller_attestation::{caller_for_target, scope_acts_for_another};
 #[cfg(all(test, unix, feature = "test-support"))]
 #[path = "control/caller_attestation_tests.rs"]
@@ -6131,7 +6131,8 @@ impl ControlHandler {
         // binding or launch nonce is checked here, once, and the answer is
         // reused where the principal is enforced further down, so the order
         // of refusals is unchanged.
-        let attested = self.attest_route_open_consumer(ctx.connection_id, consumer_identity.as_ref());
+        let attested =
+            self.attest_route_open_consumer(ctx.connection_id, consumer_identity.as_ref());
         let mut caller = RouteOpenCaller::new(
             attested.as_ref().map(|attested| &attested.principal),
             scope.as_ref(),
@@ -6534,8 +6535,7 @@ impl ControlHandler {
         // This is attested, control-plane policy for supervised module origins.
         // Keep it before route reservation and out of the opaque forwarding hot
         // path: data frames must never acquire a per-frame capability check.
-        if let Some(opening_registration) =
-            self.caller_registration(&attested, &admission_registry)
+        if let Some(opening_registration) = self.caller_registration(&attested, &admission_registry)
         {
             let opening_module_id = opening_registration.manifest.module_id.as_str();
             if let Some(capability) =
@@ -6561,8 +6561,7 @@ impl ControlHandler {
 
         if admission_facts.is_some() {
             let carrier_matches = caller_module_id.is_some()
-                && self.admission_facts_carrier_module_id.as_deref()
-                    == caller_module_id.as_deref();
+                && self.admission_facts_carrier_module_id.as_deref() == caller_module_id.as_deref();
             if !carrier_matches {
                 return Ok(vec![self.route_open_refusal_frame(
                     ctx,

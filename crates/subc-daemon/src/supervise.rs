@@ -17035,7 +17035,9 @@ mod terminal_history_tests {
         let runtime = supervisor.runtime_config();
         let spec = windowed_crash_spec("budget-recording-panic");
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        runtime.spawn_events.emit_spawned(&spec.module_id, None, 1, 1);
+        runtime
+            .spawn_events
+            .emit_spawned(&spec.module_id, None, 1, 1);
         // Exhausting the event sequence makes emit_exited panic before the
         // terminal write, exercising publication on the recording unwind.
         runtime.spawn_events.0.lock().unwrap().seq = u64::MAX;
@@ -17883,7 +17885,11 @@ mod terminal_history_tests {
         assert_eq!(feed.emit_spawned("relaunched", Some(next), 7, 1), next);
         // A process with no pre-allocated number is numbered after both.
         assert!(feed.emit_spawned("relaunched", None, 8, 2) > next);
-        assert_eq!(feed.allocate_generation("other").1, 1, "numbering is per module");
+        assert_eq!(
+            feed.allocate_generation("other").1,
+            1,
+            "numbering is per module"
+        );
     }
 
     #[test]

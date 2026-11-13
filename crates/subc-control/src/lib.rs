@@ -911,6 +911,11 @@ pub struct SpawnCursor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LiveSpawn {
     pub module_id: String,
+    /// Names one launch of this module: unique and increasing per module
+    /// within a daemon incarnation. The daemon assigns it when the launch
+    /// starts, before the process is running, and it is the `spawn` a caller
+    /// or target attestation names. A launch that never runs keeps its number,
+    /// so successive generations may skip.
     pub spawn_generation: u64,
     pub pid: u32,
     pub spawned_at_ms: u64,
@@ -943,6 +948,7 @@ pub struct SpawnEvent {
     pub cursor: SpawnCursor,
     pub kind: SpawnEventKind,
     pub module_id: String,
+    /// The launch's generation; see [`LiveSpawn::spawn_generation`].
     pub spawn_generation: u64,
     pub pid: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]

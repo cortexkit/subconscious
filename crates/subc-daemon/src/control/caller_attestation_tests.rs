@@ -109,6 +109,15 @@ fn open_frame(
     busy_refusals: bool,
     consumer_identity: Option<subc_control::ConsumerIdentity>,
 ) -> Frame {
+    open_frame_scoped(module_id, busy_refusals, consumer_identity, None)
+}
+
+fn open_frame_scoped(
+    module_id: &str,
+    busy_refusals: bool,
+    consumer_identity: Option<subc_control::ConsumerIdentity>,
+    scope: Option<subc_protocol::scope::ScopeSelector>,
+) -> Frame {
     let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
         busy_refusals: busy_refusals.then_some(true),
         target: RouteTarget::ToolProvider {
@@ -119,7 +128,7 @@ fn open_frame(
         consumer_capabilities: None,
         role_versions: None,
         admission_facts: None,
-        scope: None,
+        scope,
     })
     .unwrap();
     Frame::build(FrameType::Request, control_flags(), 0, 0, OPEN_CORR, body).unwrap()
@@ -128,7 +137,10 @@ fn open_frame(
 /// The next `route.bind` the target receives, skipping anything else.
 async fn next_bind(target: &mut Net) -> Frame {
     loop {
-        let frame = target.recv().await.expect("the target must receive the bind");
+        let frame = target
+            .recv()
+            .await
+            .expect("the target must receive the bind");
         if frame.header.ty == FrameType::Request
             && frame.header.channel == 0
             && body(&frame)["op"] == "route.bind"
@@ -175,7 +187,9 @@ async fn open(
     module_id: &str,
     busy_refusals: bool,
 ) -> (Value, Frame) {
-    opener.send(open_frame(module_id, busy_refusals, None)).await;
+    opener
+        .send(open_frame(module_id, busy_refusals, None))
+        .await;
     let bind = next_bind(target).await;
     ack(target, &bind).await;
     let reply = open_reply(opener).await;
@@ -209,7 +223,10 @@ async fn caller_attestation_claim_bound_openers_attest_their_spawn_and_claim() {
         assert_eq!(caller["claim"], claim, "{bind}");
         assert_eq!(caller["spawn"], spawn, "{bind}");
         assert_eq!(caller["authority_epoch"], 0, "{bind}");
-        assert_eq!(caller["incarnation"], rig.handler.supervisor.daemon_incarnation());
+        assert_eq!(
+            caller["incarnation"],
+            rig.handler.supervisor.daemon_incarnation()
+        );
         assert_eq!(caller["origin"], "other");
         assert_eq!(caller["approved_declarations_digest"], "");
         // The mark is hard-false until the mark itself is built.
@@ -273,9 +290,12 @@ async fn caller_attestation_rides_the_modern_and_the_legacy_bind_encoder() {
         ],
     )
     .await;
-    let mut legacy =
-        unsupervised_target(&rig, "legacy-encoder-target", &[CALLER_ATTESTATION_CAPABILITY])
-            .await;
+    let mut legacy = unsupervised_target(
+        &rig,
+        "legacy-encoder-target",
+        &[CALLER_ATTESTATION_CAPABILITY],
+    )
+    .await;
     let mut own = claimed(&mut rig, ClaimPurpose::SelfConnection).await;
     let (bind, _) = open(&mut own, &mut modern, "modern-target", false).await;
     assert!(bind["identity"].get("project_root").is_none(), "{bind}");
@@ -295,7 +315,13 @@ async fn caller_attestation_reply_target_reports_the_reserved_endpoint() {
     // Both reply constructions: the one prebuilt at reservation, and the one
     // rebuilt at commit for an opener that asked for busy refusals.
     for busy_refusals in [false, true] {
-        let (_, reply) = open(&mut opener, &mut unsupervised, "plain-target", busy_refusals).await;
+        let (_, reply) = open(
+            &mut opener,
+            &mut unsupervised,
+            "plain-target",
+            busy_refusals,
+        )
+        .await;
         let target = &body(&reply)["target"];
         assert_eq!(
             target,
@@ -345,10 +371,72 @@ async fn caller_attestation_reply_target_never_reports_a_prefix_childs_owner() {
 }
 
 #[tokio::test]
+async fn caller_attestation_flow_scope_attests_relay_for_a_self_claim_carrier() {
+    use subc_protocol::scope::{ScopeKind, ScopeRecord, ScopeSelector, FLOW_SCOPES_CAPABILITY};
+    let mut rig = super::claims::tests::rig_with(|handler| {
+        handler.with_scope_authority_owners(vec!["claims-module".into()])
+    })
+    .await;
+    let mut target = unsupervised_target(
+        &rig,
+        "flow-target",
+        &[CALLER_ATTESTATION_CAPABILITY, FLOW_SCOPES_CAPABILITY],
+    )
+    .await;
+    // The carrier owns a flow scope and opens a route under it on its own
+    // `self` connection: the route acts for the flow's code, not the carrier.
+    let mut record = ScopeRecord::new("flow-scope", 1, ScopeKind::Head);
+    record.attributes.flow_id = Some("flow:7".into());
+    let synced = rig
+        .primary
+        .call(
+            &rig.router,
+            request(ModuleControlRequestFromModule::ScopeSync {
+                generation: 1,
+                scopes: vec![record],
+            }),
+        )
+        .await;
+    assert_eq!(synced.header.ty, FrameType::Response, "{}", text(&synced));
+    let mut own = claimed(&mut rig, ClaimPurpose::SelfConnection).await;
+    own.send(open_frame_scoped(
+        "flow-target",
+        false,
+        None,
+        Some(ScopeSelector::new(
+            Principal::Reserved {
+                module_id: "claims-module".into(),
+            },
+            "flow-scope".to_string(),
+            Some(1),
+        )),
+    ))
+    .await;
+    if let Ok(reply) = tokio::time::timeout(Duration::from_millis(300), open_reply(&mut own)).await
+    {
+        panic!(
+            "the open was answered before any bind: {} (sync: {})",
+            text(&reply),
+            text(&synced)
+        );
+    }
+    let bind = body(&next_bind(&mut target).await);
+    assert!(bind.to_string().contains("flow:7"), "{bind}");
+    let caller = &bind["caller"];
+    assert_eq!(caller["claim"], "relay", "{bind}");
+    assert_eq!(caller["first_party"], false, "{bind}");
+    assert!(caller.get("declaration").is_none(), "{bind}");
+}
+
+#[tokio::test]
 async fn caller_attestation_stale_caller_epoch_settles_as_a_refusal() {
     let mut rig = rig().await;
-    let mut target =
-        unsupervised_target(&rig, "stale-caller-target", &[CALLER_ATTESTATION_CAPABILITY]).await;
+    let mut target = unsupervised_target(
+        &rig,
+        "stale-caller-target",
+        &[CALLER_ATTESTATION_CAPABILITY],
+    )
+    .await;
     let mut own = claimed(&mut rig, ClaimPurpose::SelfConnection).await;
     own.send(open_frame("stale-caller-target", false, None))
         .await;
@@ -393,8 +481,7 @@ async fn caller_attestation_stale_target_epoch_settles_without_closing_the_modul
 #[tokio::test]
 async fn caller_attestation_authority_change_closes_unscoped_routes_of_the_spawn() {
     let mut rig = rig().await;
-    let (mut target, target_spawn, _module) =
-        supervised_target(&rig, "change-target", &[]).await;
+    let (mut target, target_spawn, _module) = supervised_target(&rig, "change-target", &[]).await;
     let mut own = claimed(&mut rig, ClaimPurpose::SelfConnection).await;
     let (_, reply) = open(&mut own, &mut target, "change-target", false).await;
     assert_eq!(reply.header.ty, FrameType::Response, "{}", text(&reply));
@@ -459,7 +546,8 @@ async fn caller_attestation_deny_edges_read_the_opening_spawns_own_registration(
     let mut swap = swap_candidate(&rig, "deny-module").await;
     // Only the warming candidate denies the capability; the active
     // registration under the same id does not.
-    let mut capabilities = json!({"provides": [], "requires": [], "must_never_reach": ["guarded-cap/v1"]});
+    let mut capabilities =
+        json!({"provides": [], "requires": [], "must_never_reach": ["guarded-cap/v1"]});
     let update = swap
         .candidate
         .call(request(json!({
@@ -501,7 +589,10 @@ async fn spawn_authority_record_dies_at_the_child_exit_observation() {
     })
     .await
     .expect("the exit observation must mark the record dead");
-    assert!(spawn.authority.capture().is_none(), "a dead record attests nothing");
+    assert!(
+        spawn.authority.capture().is_none(),
+        "a dead record attests nothing"
+    );
     assert!(spawn.authority.epoch_for_test() > 0);
 }
 

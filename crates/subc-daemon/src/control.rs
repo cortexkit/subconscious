@@ -527,6 +527,8 @@ pub struct ControlHandler {
     #[cfg(test)]
     recovery_exit_test_after_step: Option<fn(usize) -> Result<(), crate::config_gate::GateError>>,
     #[cfg(test)]
+    apply_reconcile_pause: Arc<Mutex<Option<AsyncTestPause>>>,
+    #[cfg(test)]
     recovery_exit_test_quiet_retry: bool,
     #[cfg(test)]
     recovery_exit_test_retry_pause: Option<fn(u64) -> Option<PathBuf>>,
@@ -1185,6 +1187,8 @@ impl ControlHandler {
             app_open_test_launch: None,
             #[cfg(test)]
             recovery_exit_test_after_step: None,
+            #[cfg(test)]
+            apply_reconcile_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             recovery_exit_test_quiet_retry: false,
             #[cfg(test)]

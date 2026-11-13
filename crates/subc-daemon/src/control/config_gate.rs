@@ -750,6 +750,8 @@ impl ControlHandler {
                 } else {
                     work.await?
                 };
+                #[cfg(test)]
+                self.pause_before_apply_reconcile_for_test().await;
                 self.reconcile_authority_exit(exit_runtime.clone(), generation)
                     .await?;
                 let restart_required = self

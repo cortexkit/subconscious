@@ -492,6 +492,21 @@ async fn audit_registration_new_module_spawn_error_returns_rescan_failed_from_ap
 
 #[cfg(all(feature = "test-support", feature = "dev-desktop-approval"))]
 async fn committed_enable_reply(non_hold_error: bool, absent_from_roster: bool) {
+    committed_enable_ordered(non_hold_error, absent_from_roster, false).await;
+}
+
+#[cfg(all(feature = "test-support", feature = "dev-desktop-approval"))]
+#[tokio::test]
+async fn approved_creation_worker_first_failure_cannot_be_reconciled_as_success() {
+    committed_enable_ordered(true, true, true).await;
+}
+
+#[cfg(all(feature = "test-support", feature = "dev-desktop-approval"))]
+async fn committed_enable_ordered(
+    non_hold_error: bool,
+    absent_from_roster: bool,
+    worker_first: bool,
+) {
     struct Presence;
     impl crate::operator_confirm::OperatorProvider for Presence {
         fn config_gate_ready(&self) -> bool {
@@ -561,15 +576,52 @@ async fn committed_enable_reply(non_hold_error: bool, absent_from_roster: bool) 
         connection_id: ConnectionId::new(50),
         egress: crate::FrameSink::new(tx),
     };
-    let frames = handler
-        .handle_control_frame(
-            &ctx,
-            crate::control::claims::tests::request(
-                json!({"op":"config.apply","digest":plan.digest}),
-            ),
-        )
+    let (reached, arrived) = tokio::sync::oneshot::channel();
+    let (release, proceed) = tokio::sync::oneshot::channel();
+    if worker_first {
+        handler.pause_apply_reconcile_for_test(reached, proceed);
+    }
+    let apply_handler = handler.clone();
+    let apply = tokio::spawn(async move {
+        apply_handler
+            .handle_control_frame(
+                &ctx,
+                crate::control::claims::tests::request(
+                    json!({"op":"config.apply","digest":plan.digest}),
+                ),
+            )
+            .await
+            .unwrap()
+    });
+    if worker_first {
+        arrived.await.unwrap();
+        let worker = handler.spawn_config_delivery_worker().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if fixture
+                    .handle
+                    .get("a")
+                    .is_some_and(|module| module.state().unwrap() == ModuleState::Failed)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .unwrap();
+        .expect("the real worker must create and fail the absent actor before the apply pass");
+        fixture
+            .handle
+            .get("a")
+            .unwrap()
+            .config_exit_hold()
+            .await
+            .unwrap();
+        worker.abort();
+        let _ = worker.await;
+        release.send(()).unwrap();
+    }
+    let frames = apply.await.unwrap();
     let frame = if frames.is_empty() {
         rx.recv().await.unwrap().frame
     } else {
@@ -597,6 +649,21 @@ async fn committed_enable_reply(non_hold_error: bool, absent_from_roster: bool) 
             "{reply}"
         );
         assert_eq!(parked.state, ModuleState::Failed);
+        if worker_first {
+            let (_, _, _, approved) = fixture
+                .owner
+                .authority_exit_configuration(1)
+                .unwrap()
+                .expect("the failed generation must remain unreconciled");
+            assert!(approved.changes_entry("a"));
+            assert!(
+                reconciled
+                    .reconcile_approved_configuration(approved)
+                    .await
+                    .is_err(),
+                "every reconcile must retain the generation's launch failure"
+            );
+        }
         assert!(fixture.owner.check_module_hold("a").is_ok());
         assert!(fixture
             .owner

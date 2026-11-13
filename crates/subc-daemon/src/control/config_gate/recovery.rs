@@ -2,6 +2,23 @@ use super::*;
 
 impl ControlHandler {
     #[cfg(all(test, unix))]
+    pub(crate) fn pause_apply_reconcile_for_test(
+        &self,
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.apply_reconcile_pause.lock().unwrap() = Some((reached, release));
+    }
+
+    #[cfg(test)]
+    pub(in crate::control) async fn pause_before_apply_reconcile_for_test(&self) {
+        let pause = self.apply_reconcile_pause.lock().unwrap().take();
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.await;
+        }
+    }
+    #[cfg(all(test, unix))]
     pub(crate) async fn reconcile_cutover_for_test(
         &self,
         owner: Arc<crate::config_gate::runtime::RuntimeOwner>,

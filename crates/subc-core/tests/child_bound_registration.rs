@@ -328,7 +328,11 @@ async fn gated(typescript: bool) {
     assert_eq!(refused["code"], "reserved_module", "{refused}");
 }
 
+/// Run `cargo test -p subc-core --locked --features test-support,subc-daemon/dev-desktop-approval --test child_bound_registration child_bound_rust_real_daemon -- --ignored --exact --nocapture`.
+/// Approving the daemon's configuration needs the development desktop-approval
+/// surface, so ordinary CI skips this case like the gated config-status SDK tests.
 #[tokio::test]
+#[ignore = "requires the development desktop-approval surface; see doc comment"]
 async fn child_bound_rust_real_daemon() {
     gated(false).await;
 }

@@ -1035,6 +1035,86 @@ async fn config_delivery_mixed_module_restart_and_next_supervision_wait_for_spaw
     .await;
 }
 
+/// Replacing a module's program under the same path, with its layers and
+/// declaration unchanged, yields a plan without reviewed fields. The process
+/// still running was launched from the old program, so it must not acknowledge
+/// that generation: only a child spawned for it can, after warm-up.
+#[tokio::test]
+async fn config_delivery_program_only_change_waits_for_a_child_started_from_the_new_program() {
+    use std::io::Write;
+    let (rig, owner) = rig();
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(rig.path.join("program"))
+        .unwrap()
+        .write_all(b"replacement program bytes")
+        .unwrap();
+    let plan = owner
+        .finish_plan(owner.prepare(PlanKind::Change).unwrap(), daemon_review)
+        .unwrap();
+    assert!(plan.plan.changeset.fields.is_empty());
+    assert!(plan.plan.changeset.launch_manifests.contains_key("a"));
+    assert_eq!(
+        plan.plan.changeset.apply_plan["module_transitions"]["a"]["transition"],
+        "module_restart"
+    );
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let challenge = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
+    assert_eq!(
+        owner
+            .finish_approval(
+                challenge.attempt(),
+                &Rig::facts(),
+                ApprovalReply::Presence(
+                    super::super::super::PresenceDecision::InteractiveApproval
+                ),
+                2,
+            )
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        owner.pending_config_restarts().unwrap(),
+        vec![("a".to_owned(), 2)],
+        "the approved program change schedules a restart"
+    );
+    let old = owner
+        .module_get(INCUMBENT, "a", ConfigGetRequest::new())
+        .unwrap();
+    assert!(
+        old.pending.is_none(),
+        "the old program's process cannot receive the new program's generation"
+    );
+    assert!(owner.ready(INCUMBENT, "a", 2).unwrap().is_none());
+    assert_active(&owner, INCUMBENT, 1);
+    let spawn = owner
+        .spawned(
+            "a",
+            tokio::time::Instant::now(),
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .unwrap();
+    let replacement = ConnectionId::new(30);
+    rig.declare(&owner, replacement.get());
+    owner.registered(replacement, &spawn).unwrap();
+    let view = pending(&owner, replacement);
+    assert_eq!(view.generation, 2);
+    assert_eq!(
+        applied(&owner, replacement, &view, true).unwrap(),
+        AppliedDisposition::WaitingForReadiness
+    );
+    assert_eq!(
+        owner.ready(replacement, "a", 2).unwrap(),
+        Some(AppliedDisposition::Active)
+    );
+    assert_active(&owner, replacement, 2);
+}
+
 #[tokio::test]
 async fn config_delivery_mixed_live_and_next_supervision_defer_live_fields_in_plan_and_activation()
 {

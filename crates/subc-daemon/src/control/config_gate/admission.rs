@@ -530,6 +530,13 @@ mod dual_path_tests {
             FrameType::Error,
             "protocol:none has no legitimate HELLO holder"
         );
+        let error = serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap();
+        assert_eq!(error["code"], "swap_token_invalid");
+        let message = error["message"].as_str().unwrap();
+        assert!(
+            message.contains("a protocol:none module may not register") && !message.contains("swap"),
+            "the refusal names the protocol:none reason, not a swap: {message}"
+        );
         f.stop().await;
         f.handler.supervisor.retire("ckbus");
         let reply = f.hello(false, Some("stale"));

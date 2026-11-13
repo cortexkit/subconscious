@@ -35,11 +35,16 @@ impl Transition {
     }
 
     pub(crate) fn for_module(changeset: &Changeset, module: &str) -> Result<Self> {
+        let floor = if changes_program(changeset, module) {
+            Self::ModuleRestart
+        } else {
+            Self::Live
+        };
         changeset
             .fields
             .iter()
             .filter(|field| field.module_id == module)
-            .try_fold(Self::Live, |current, field| {
+            .try_fold(floor, |current, field| {
                 Ok(current.max(Self::from_apply(field.apply)?))
             })
     }
@@ -47,6 +52,35 @@ impl Transition {
     pub(crate) fn requires_spawn(self) -> bool {
         self >= Self::NextSupervision
     }
+}
+
+/// Whether an ordinary change or rollback replaces the module's approved
+/// program. The process already running was launched from the previous program,
+/// so it must not acknowledge this generation: only a replacement child started
+/// from the newly approved program, after warm-up, can make it active.
+///
+/// The daemon reviewer names each changed program file `program:<path>` in the
+/// module's launch manifest, and a rollback marks a program that differs from
+/// its target with `program_changed_since_target`. A stamp or unstamp records
+/// the programs already running rather than replacing them, so it is excluded.
+fn changes_program(changeset: &Changeset, module: &str) -> bool {
+    let replaces_programs = matches!(
+        changeset
+            .apply_plan
+            .get("operation")
+            .and_then(serde_json::Value::as_str),
+        Some("change" | "rollback")
+    );
+    replaces_programs
+        && changeset
+            .launch_manifests
+            .get(module)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|manifest| {
+                manifest.keys().any(|key| {
+                    key.starts_with("program:") || key == "program_changed_since_target"
+                })
+            })
 }
 
 /// The resulting transition is approval input, not an execution-time guess.
@@ -60,6 +94,14 @@ pub(super) fn bind_plan(changeset: &mut Changeset) -> Result<()> {
         *kind = (*kind).max(Transition::from_apply(field.apply)?);
         if field.apply == ApplyKind::Live {
             live_fields.push(field.path.clone());
+        }
+    }
+    for module in changeset.launch_manifests.keys() {
+        if changes_program(changeset, module) {
+            let (kind, _) = policies
+                .entry(module.as_str())
+                .or_insert((Transition::Live, vec![]));
+            *kind = (*kind).max(Transition::ModuleRestart);
         }
     }
     let mut transitions = BTreeMap::new();

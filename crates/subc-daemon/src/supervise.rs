@@ -2582,6 +2582,9 @@ pub(crate) enum SwapHelloAdmission {
     /// A swap is open and the HELLO carries a nonce the supervisor did not
     /// mint for this id, no nonce, or a token already used.
     Refused,
+    /// The id belongs to a supervised `protocol: none` module. Such a module
+    /// never registers, so no HELLO may claim its id, with or without a nonce.
+    ProtocolNone,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3206,7 +3209,10 @@ impl SupervisorHandle {
         module_id: &str,
         presented: Option<&str>,
     ) -> SwapHelloAdmission {
-        if self.module_is_gated(module_id) || self.protocol_none(module_id) {
+        if self.protocol_none(module_id) {
+            return SwapHelloAdmission::ProtocolNone;
+        }
+        if self.module_is_gated(module_id) {
             return SwapHelloAdmission::Refused;
         }
         let swaps = self

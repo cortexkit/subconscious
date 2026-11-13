@@ -1231,7 +1231,12 @@ fn config_owner_recovery_refuses_changes_but_can_plan_and_commit_restamp() {
         )
         .unwrap();
     assert!(owner.is_recovering());
-    assert_eq!(owner.status().unwrap().state, "store_unverified");
+    let status = owner.status().unwrap();
+    assert_eq!(status.state, "stamped");
+    assert!(status
+        .warnings
+        .iter()
+        .any(|warning| warning == "approved recovery exit is waiting for reconciliation"));
     owner.complete_authority_exit(1).unwrap();
     assert_eq!(owner.status().unwrap().state, "stamped");
 }

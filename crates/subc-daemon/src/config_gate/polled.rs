@@ -151,11 +151,16 @@ impl RuntimeOwner {
         status.ungated_inputs = self.startup_overrides.clone();
         status.warnings = store.warnings;
         if state.recovery_exit_hold {
-            status.state = "store_unverified".into();
+            // Actor admission can remain held after a restamp has replaced and
+            // verified the store. That pending work does not revoke its trust.
+            if store.state != StoreState::Stamped {
+                status.state = "store_unverified".into();
+            }
             status
                 .warnings
                 .push("approved recovery exit is waiting for reconciliation".into());
-        } else if state.stamp_channel_cutover {
+        }
+        if state.stamp_channel_cutover {
             // The stamped snapshot already governs admission. Keep the warning
             // until processes launched with nonce-based registration have stopped
             // and their replacements have started or been parked by admission.

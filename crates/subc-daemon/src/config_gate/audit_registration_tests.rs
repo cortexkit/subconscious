@@ -214,6 +214,8 @@ async fn audit_registration_recovery_restamp_reports_commit_while_actor_reconcil
     let actor = fixture.module.status().unwrap();
     let pending = fixture.owner.stamp_channel_cutover_pending();
     let status = registration_declaration_diagnostic(&fixture.handler, "config.status").await;
+    let refreshed = fixture.owner.status().unwrap();
+    let admission_held = fixture.owner.exit_is_held("a");
     drop(held);
     drop(fixture.primary);
     fixture.module.stop().await.unwrap();
@@ -221,7 +223,9 @@ async fn audit_registration_recovery_restamp_reports_commit_while_actor_reconcil
     assert_eq!(actor.state, ModuleState::Restarting);
     assert!(!actor.process_alive);
     assert!(pending);
+    assert!(admission_held);
     assert_eq!(status["status"]["state"], "stamped", "{status}");
+    assert_eq!(refreshed.state, "stamped");
     assert!(
         status["status"]["warnings"]
             .as_array()

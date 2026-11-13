@@ -1790,7 +1790,9 @@ impl RuntimeOwner {
         }
         .into();
         if state.recovery_exit_hold {
-            status.state = "store_unverified".into();
+            if store_status.state != StoreState::Stamped {
+                status.state = "store_unverified".into();
+            }
             status
                 .warnings
                 .push("approved recovery exit is waiting for reconciliation".into());

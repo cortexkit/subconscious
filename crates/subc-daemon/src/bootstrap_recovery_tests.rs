@@ -1103,6 +1103,15 @@ async fn config_recovery_spawned_unstamp_reconciles_changed_existing_actor_while
 }
 
 #[cfg(feature = "dev-desktop-approval")]
+fn recovery_exit_pending(status: &Value) -> bool {
+    status["status"]["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|warning| warning == "approved recovery exit is waiting for reconciliation")
+}
+
+#[cfg(feature = "dev-desktop-approval")]
 #[tokio::test]
 async fn config_recovery_spawned_partial_exit_failure_keeps_the_hold_and_retries() {
     let _serial = DAEMONS.lock().await;
@@ -1130,7 +1139,10 @@ async fn config_recovery_spawned_partial_exit_failure_keeps_the_hold_and_retries
         "a partially reconciled exit must not start modules"
     );
     let status = rpc(&mut client, json!({"op":"config.status"})).await;
-    assert_eq!(status["status"]["state"], "store_unverified", "{status}");
+    // The restamp has verified the store; the pending marker, not store trust,
+    // tracks the admission hold until supervision finishes reconciling.
+    assert_eq!(status["status"]["state"], "stamped", "{status}");
+    assert!(recovery_exit_pending(&status), "{status}");
     // File polling below cannot trigger configuration retries. Suppress state
     // notifications during the pending exit to exercise the daemon's timer alone.
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1152,7 +1164,7 @@ async fn config_recovery_spawned_partial_exit_failure_keeps_the_hold_and_retries
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let status = rpc(&mut client, json!({"op":"config.status"})).await;
-            if status["status"]["state"] == "stamped" {
+            if status["status"]["state"] == "stamped" && !recovery_exit_pending(&status) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1500,7 +1512,8 @@ async fn config_recovery_superseding_failed_exit_keeps_its_own_timer() {
         status["status"]["approved_but_inactive"][0]["generation"], 2,
         "{status}"
     );
-    assert_eq!(status["status"]["state"], "store_unverified", "{status}");
+    assert_eq!(status["status"]["state"], "stamped", "{status}");
+    assert!(recovery_exit_pending(&status), "{status}");
     // Only the coordinator's timer may wake after its stale generation returns.
     // The second commit really ran inline reconciliation and hit the same fault.
     std::fs::remove_file(rig.dir.join("fail-exit-step")).unwrap();
@@ -1509,7 +1522,7 @@ async fn config_recovery_superseding_failed_exit_keeps_its_own_timer() {
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let status = rpc(&mut client, json!({"op":"config.status"})).await;
-            if status["status"]["state"] == "stamped" {
+            if status["status"]["state"] == "stamped" && !recovery_exit_pending(&status) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;

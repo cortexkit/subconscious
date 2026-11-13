@@ -127,39 +127,28 @@ async fn approval_latch_clears_after_a_successful_registered_reload() {
     let actor = fixture.handle.get("a").unwrap();
     let reloading = actor.clone();
     let reload = tokio::spawn(async move { reloading.reload().await });
-    let proof = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(proof) = fixture.handle.registration_proof_for_test("a") {
-                if fixture
-                    .handle
-                    .wait_program_binding_for_test("a", &proof)
-                    .await
-                {
-                    break proof;
-                }
-            }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while actor.status().unwrap().spawn_generation == 0 {
             tokio::task::yield_now().await;
         }
     })
     .await
     .unwrap();
-    fixture
-        .handle
-        .registration_for_test("a")
-        .unwrap()
-        .wait_launch()
-        .await;
+    assert!(actor.status().unwrap().process_alive);
+    assert!(fixture.registry.get_module("a").unwrap().is_none());
+    // Supply only HELLO's published registry result. The real Reload still
+    // starts its child and must observe registration before acknowledging it;
+    // authentication is covered by the separate registration-channel fixtures.
     let connection = ConnectionId::new(445);
-    let hello = fixture
-        .handler
-        .handle_control(connection, module_hello(Some(proof), connection))
+    fixture
+        .registry
+        .register_with_control_ops(
+            subc_protocol::manifest::ModuleManifest::builder("a", "1.0.0").build(),
+            subc_protocol::PROTOCOL_VERSION,
+            connection,
+            vec![],
+        )
         .unwrap();
-    assert_eq!(
-        hello[0].header.ty,
-        subc_protocol::FrameType::HelloAck,
-        "{}",
-        String::from_utf8_lossy(&hello[0].body)
-    );
     reload.await.unwrap().unwrap();
     let reconcile = fixture
         .handler

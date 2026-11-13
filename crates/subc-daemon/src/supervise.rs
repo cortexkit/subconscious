@@ -17870,6 +17870,22 @@ mod terminal_history_tests {
         assert_eq!(entry.disposition, TerminalDisposition::Failed);
     }
 
+    /// A launch is numbered before it starts. One that never runs keeps its
+    /// number, and the next launch of the module is numbered after it.
+    #[test]
+    fn spawn_generation_of_a_failed_launch_is_never_reused() {
+        let feed = super::SpawnEventFeed::default();
+        feed.configure_incarnation("launch-numbering".to_string());
+        let (incarnation, failed) = feed.allocate_generation("relaunched");
+        assert_eq!(incarnation, "launch-numbering");
+        let (_, next) = feed.allocate_generation("relaunched");
+        assert!(next > failed);
+        assert_eq!(feed.emit_spawned("relaunched", Some(next), 7, 1), next);
+        // A process with no pre-allocated number is numbered after both.
+        assert!(feed.emit_spawned("relaunched", None, 8, 2) > next);
+        assert_eq!(feed.allocate_generation("other").1, 1, "numbering is per module");
+    }
+
     #[test]
     fn wait_error_exit_path_preserves_spawn_event_density() {
         let feed = super::SpawnEventFeed::default();

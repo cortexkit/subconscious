@@ -3594,6 +3594,27 @@ impl ForwardingTable {
         published_epoch_locked(&self.read_inner().unwrap(), key)
     }
 
+    /// The caller and target authority each live route opened by `client`
+    /// recorded at commit.
+    #[cfg(test)]
+    pub(crate) fn route_authority_for_test(
+        &self,
+        client: ConnectionId,
+    ) -> Vec<(Option<AuthorityPair>, Option<AuthorityPair>)> {
+        self.read_inner()
+            .unwrap()
+            .client_to_module
+            .iter()
+            .filter(|(key, _)| key.connection_id == client)
+            .map(|(_, route)| {
+                (
+                    route.caller_authority.clone(),
+                    route.target_authority.clone(),
+                )
+            })
+            .collect()
+    }
+
     /// The published tag of one scope, for tests of the commit re-check.
     #[cfg(test)]
     pub(crate) fn published_scope_tag(&self, owner: &str, scope_ref: &str) -> Option<ScopeTag> {

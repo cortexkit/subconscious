@@ -31,7 +31,10 @@ async fn gated_claim_fixture() -> GatedClaimFixture {
 async fn refused_live_binding_without_a_current_approval_uses_ordinary_exit_accounting() {
     let fixture = gated_claim_fixture().await;
     let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Unstamp);
-    fixture.owner.complete_authority_exit(generation).unwrap();
+    fixture
+        .owner
+        .complete_authority_exit_for_test(generation)
+        .unwrap();
     assert!(!fixture.owner.has_recorded_admission_hold("a"));
     let before = fixture.module.status().unwrap();
     let kill = fixture.spawn.defer_content_kill_for_test();
@@ -360,7 +363,10 @@ async fn claims_mint_obeys_recovery_and_resumes_after_approved_exit() {
         .spawn
         .set_content_probe_for_test(Arc::new(|| Ok(())));
     let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Unstamp);
-    fixture.owner.complete_authority_exit(generation).unwrap();
+    fixture
+        .owner
+        .complete_authority_exit_for_test(generation)
+        .unwrap();
     assert!(!fixture.owner.check_recovery().unwrap());
     drop(fixture.primary);
     fixture.module.stop().await.unwrap();
@@ -4318,7 +4324,7 @@ async fn registration_declaration_unsupported_admission_never_spawns_or_spends_b
     wire_fixture_document(&rig, json!(["600"]));
     let owner = Arc::new(rig.owner("unsupported-channel"));
     rig.stamp(&owner);
-    owner.complete_authority_exit(1).unwrap();
+    owner.complete_authority_exit_for_test(1).unwrap();
     let path = rig.path.join("subc.jsonc");
     let mut document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -4475,7 +4481,7 @@ async fn registration_declaration_stamp_restarts_nonce_spawn_before_completing_c
         "{response}"
     );
     owner.daemon_entry_reconciled(&approved, "a").unwrap();
-    owner.complete_authority_exit(1).unwrap();
+    owner.complete_authority_exit_for_test(1).unwrap();
     assert_eq!(owner.polled_status().unwrap().state, "stamped");
     assert!(!owner.stamp_channel_cutover_pending());
     drop(channel);

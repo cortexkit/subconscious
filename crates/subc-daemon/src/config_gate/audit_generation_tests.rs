@@ -52,7 +52,7 @@ async fn audit_registration_release_before_park_does_not_strand_the_actor() {
             3,
         )
         .unwrap();
-    owner.complete_authority_exit(generation).unwrap();
+    owner.complete_authority_exit_for_test(generation).unwrap();
     for exit in owner.delivery_exits().unwrap() {
         owner.delivery_release_exit(&exit).unwrap();
     }
@@ -165,7 +165,7 @@ async fn failed_retry_through_recovery(operator_restart: Option<bool>) {
             3,
         )
         .unwrap();
-    owner.complete_authority_exit(generation).unwrap();
+    owner.complete_authority_exit_for_test(generation).unwrap();
     assert!(owner.check_module_hold("a").is_ok());
     assert!(!module.release_config_hold().await.unwrap());
     let after = module.status().unwrap();
@@ -795,7 +795,7 @@ async fn audit_registration_status_uses_one_publication_across_a_commit() {
     .unwrap();
     let owner = std::sync::Arc::new(rig.owner("atomic-status"));
     rig.stamp(&owner);
-    owner.complete_authority_exit(1).unwrap();
+    owner.complete_authority_exit_for_test(1).unwrap();
     let handler = std::sync::Arc::new(
         crate::ControlHandler::new(std::sync::Arc::new(crate::Registry::default()))
             .with_config_runtime(owner.clone()),

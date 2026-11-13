@@ -142,7 +142,7 @@ impl RuntimeOwner {
         module: &str,
     ) -> Result<()> {
         let mut state = self.lock()?;
-        if state.authority_exit != Some(approved.generation) {
+        if !Self::authority_exit_matches(&state, approved) {
             return Err(GateError::stale());
         }
         let changed = if let Some(entry) = approved
@@ -167,9 +167,12 @@ impl RuntimeOwner {
     }
 
     /// Release admission only after all committed-exit reconciliation succeeds.
-    pub(crate) fn complete_authority_exit(&self, generation: u64) -> Result<()> {
+    pub(crate) fn complete_authority_exit(
+        &self,
+        approved: &ApprovedDaemonConfiguration,
+    ) -> Result<()> {
         let mut state = self.lock()?;
-        if state.authority_exit != Some(generation) {
+        if !Self::authority_exit_matches(&state, approved) {
             return Err(GateError::stale());
         }
         // Actors created under an exit hold may not have been observed by the
@@ -190,6 +193,32 @@ impl RuntimeOwner {
             self.retire_unstamped_bindings();
         }
         Ok(())
+    }
+
+    fn authority_exit_matches(state: &OwnerState, approved: &ApprovedDaemonConfiguration) -> bool {
+        state.authority_exit == Some(approved.generation)
+            && std::sync::Arc::ptr_eq(
+                &state.authority_incarnation,
+                &approved.authority_incarnation,
+            )
+            && state
+                .store
+                .loaded_admission_state()
+                .1
+                .generations
+                .get(&approved.generation)
+                .is_some_and(|entry| entry.generation.plan_digest == approved.approval_digest)
+    }
+
+    /// Test helper that loads the current approved configuration before completing
+    /// its exit. Production callers must carry their original approved configuration.
+    #[cfg(test)]
+    pub(crate) fn complete_authority_exit_for_test(&self, generation: u64) -> Result<()> {
+        let approved = self
+            .authority_exit_configuration(generation)?
+            .ok_or_else(GateError::stale)?
+            .3;
+        self.complete_authority_exit(&approved)
     }
 
     pub(super) fn retire_unstamped_bindings(&self) {

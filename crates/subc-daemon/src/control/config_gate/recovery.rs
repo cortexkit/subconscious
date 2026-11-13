@@ -264,10 +264,7 @@ impl ControlHandler {
         // complete_authority_exit releases admission and clears the pending
         // recovery-exit marker. Earlier failure leaves both the hold and marker
         // intact for the configuration-delivery coordinator to retry.
-        config_work(owner, move |owner| {
-            owner.complete_authority_exit(generation)
-        })
-        .await?;
+        config_work(owner, move |owner| owner.complete_authority_exit(&approved)).await?;
         Ok(())
     }
 }

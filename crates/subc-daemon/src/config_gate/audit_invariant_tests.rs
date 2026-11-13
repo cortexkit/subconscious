@@ -274,7 +274,10 @@ async fn superseded_program_exit(release_before_park: bool) {
     std::fs::copy(fixture.rig.path.join("program"), &replacement).unwrap();
     std::fs::rename(replacement, fixture.rig.path.join("program")).unwrap();
     let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Change);
-    fixture.owner.complete_authority_exit(generation).unwrap();
+    fixture
+        .owner
+        .complete_authority_exit_for_test(generation)
+        .unwrap();
     assert!(!fixture.owner.has_recorded_admission_hold("a"));
     if release_before_park {
         for exit in fixture.owner.delivery_exits().unwrap() {
@@ -355,7 +358,10 @@ async fn delivery_failure_park_saves_the_daemon_attempt_before_release() {
         .reconcile_approved_configuration(approved)
         .await
         .unwrap();
-    fixture.owner.complete_authority_exit(configured).unwrap();
+    fixture
+        .owner
+        .complete_authority_exit_for_test(configured)
+        .unwrap();
     let connection = fixture.primary.connection_id(&fixture.handler);
     std::fs::write(
         fixture
@@ -382,7 +388,10 @@ async fn delivery_failure_park_saves_the_daemon_attempt_before_release() {
     let parked = fixture.module.status().unwrap();
     assert!(!parked.process_alive);
     let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Unstamp);
-    fixture.owner.complete_authority_exit(generation).unwrap();
+    fixture
+        .owner
+        .complete_authority_exit_for_test(generation)
+        .unwrap();
     let mut missing = spec(&fixture.rig);
     missing.program = fixture.rig.path.join("missing-program");
     fixture

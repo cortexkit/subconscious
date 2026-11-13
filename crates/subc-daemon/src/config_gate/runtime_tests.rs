@@ -1239,7 +1239,7 @@ fn config_owner_recovery_refuses_changes_but_can_plan_and_commit_restamp() {
         .warnings
         .iter()
         .any(|warning| warning == "approved recovery exit is waiting for reconciliation"));
-    owner.complete_authority_exit(1).unwrap();
+    owner.complete_authority_exit_for_test(1).unwrap();
     assert_eq!(owner.status().unwrap().state, "stamped");
 }
 
@@ -1718,7 +1718,7 @@ async fn registration_declaration_polled_reads_do_not_join_the_owner() {
     let rig = Rig::new();
     let owner = std::sync::Arc::new(rig.owner("polled-held-owner"));
     rig.stamp(&owner);
-    owner.complete_authority_exit(1).unwrap();
+    owner.complete_authority_exit_for_test(1).unwrap();
     let handler = std::sync::Arc::new(
         crate::ControlHandler::new(std::sync::Arc::new(crate::Registry::default()))
             .with_config_runtime(owner.clone()),
@@ -1755,7 +1755,7 @@ async fn registration_declaration_raw_config_edit_is_pending_while_owner_is_held
     let owner = std::sync::Arc::new(rig.owner("polled-config-edit"));
     rig.declare(&owner, 10);
     rig.stamp(&owner);
-    owner.complete_authority_exit(1).unwrap();
+    owner.complete_authority_exit_for_test(1).unwrap();
     assert_eq!(owner.polled_status().unwrap().pending_proposals, 0);
     let handler = std::sync::Arc::new(
         crate::ControlHandler::new(std::sync::Arc::new(crate::Registry::default()))
@@ -1800,7 +1800,7 @@ fn registration_declaration_commit_is_visible_in_the_next_projection() {
         .warnings
         .iter()
         .any(|warning| warning.contains("registration channel cutover")));
-    owner.complete_authority_exit(1).unwrap();
+    owner.complete_authority_exit_for_test(1).unwrap();
     assert_eq!(owner.polled_status().unwrap().state, "stamped");
 }
 
@@ -1900,7 +1900,7 @@ fn registration_declaration_polled_status_preserves_gated_declaration_diagnostic
     let owner = rig.owner("polled-declaration-diagnostics");
     rig.declare(&owner, 10);
     rig.stamp(&owner);
-    owner.complete_authority_exit(1).unwrap();
+    owner.complete_authority_exit_for_test(1).unwrap();
     let mut changed = rig.declaration.clone();
     changed.schema["properties"]["limit"]["default"] = json!(7);
     owner

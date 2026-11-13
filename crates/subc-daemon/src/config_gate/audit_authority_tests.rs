@@ -52,7 +52,7 @@ fn authority_commit_declined_identical_restamp_keeps_token_and_exit() {
     let rig = Rig::new();
     let owner = rig.owner("declined-authority");
     assert_eq!(rig.stamp(&owner), 1);
-    owner.complete_authority_exit(1).unwrap();
+    owner.complete_authority_exit_for_test(1).unwrap();
     let old_digest = owner
         .lock()
         .unwrap()
@@ -98,7 +98,7 @@ fn authority_commit_anchor_error_still_rotates_rebuilt_authority() {
     let key = crate::config_store::TestStoreKey::default();
     let owner = sealed_owner(&rig, key.clone());
     assert_eq!(rig.stamp(&owner), 1);
-    owner.complete_authority_exit(1).unwrap();
+    owner.complete_authority_exit_for_test(1).unwrap();
     tamper(&rig, &owner);
     let before = owner.lock().unwrap().authority_incarnation.clone();
     let sequence = owner.lock().unwrap().store.publication_sequence();
@@ -169,4 +169,53 @@ fn authority_commit_failed_duplicate_keeps_pending_exit_and_token() {
     );
     assert_eq!(state.authority_exit, Some(1));
     assert!(state.recovery_exit_hold);
+}
+
+#[test]
+fn authority_witness_old_incarnation_cannot_record_or_complete_repeated_generation() {
+    let rig = Rig::new();
+    let owner = rig.owner("stale-owner-witness");
+    assert_eq!(rig.stamp(&owner), 1);
+    let old = owner.authority_exit_configuration(1).unwrap().unwrap().3;
+    tamper(&rig, &owner);
+    assert_eq!(rig.stamp(&owner), 1);
+    let fresh = owner.authority_exit_configuration(1).unwrap().unwrap().3;
+    assert_eq!(old.generation, fresh.generation);
+    assert_eq!(old.approval_digest, fresh.approval_digest);
+    assert!(!std::sync::Arc::ptr_eq(
+        &old.authority_incarnation,
+        &fresh.authority_incarnation
+    ));
+    assert_eq!(
+        owner.daemon_entry_reconciled(&old, "a").unwrap_err().code,
+        "plan_stale"
+    );
+    assert!(owner.lock().unwrap().reconciled_entries.is_empty());
+    assert_eq!(
+        owner.complete_authority_exit(&old).unwrap_err().code,
+        "plan_stale"
+    );
+    assert_eq!(owner.pending_authority_exit().unwrap(), Some(1));
+
+    let mut wrong_digest = fresh.clone();
+    wrong_digest.approval_digest = subc_config::raw_digest(b"not the committed approval");
+    assert_eq!(
+        owner
+            .daemon_entry_reconciled(&wrong_digest, "a")
+            .unwrap_err()
+            .code,
+        "plan_stale"
+    );
+    assert_eq!(
+        owner
+            .complete_authority_exit(&wrong_digest)
+            .unwrap_err()
+            .code,
+        "plan_stale"
+    );
+    assert!(owner.lock().unwrap().reconciled_entries.is_empty());
+    assert_eq!(owner.pending_authority_exit().unwrap(), Some(1));
+    owner.daemon_entry_reconciled(&fresh, "a").unwrap();
+    owner.complete_authority_exit(&fresh).unwrap();
+    assert!(owner.pending_authority_exit().unwrap().is_none());
 }

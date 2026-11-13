@@ -259,7 +259,7 @@ async fn recovery_slow_retry_roundtrip(
                 2,
             )
             .unwrap();
-        owner.complete_authority_exit(generation).unwrap();
+        owner.complete_authority_exit_for_test(generation).unwrap();
         assert!(owner.check_module_hold("slow-retry-child").is_ok());
         let mut missing = crashing_spec();
         missing.program = dir.join("missing-program");

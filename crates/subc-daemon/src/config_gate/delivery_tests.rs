@@ -241,7 +241,7 @@ fn config_delivery_daemon_approval_preserves_failed_and_active_module_state() {
         .authority_exit_configuration(generation)
         .unwrap()
         .is_some());
-    owner.complete_authority_exit(generation).unwrap();
+    owner.complete_authority_exit_for_test(generation).unwrap();
     let reply = owner
         .module_get(INCUMBENT, "a", ConfigGetRequest::new())
         .unwrap();

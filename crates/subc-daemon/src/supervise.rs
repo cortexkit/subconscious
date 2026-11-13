@@ -9281,6 +9281,13 @@ async fn handle_supervisor_command(
                 let retry_failed = enabled && child.is_none()
                     && lock_snapshot(snapshot)?.state == ModuleState::Failed
                     && (retry_approved_failure || approved.changes_entry(&spec.module_id));
+                if retry_failed {
+                    // This approval owns a new start, so the failed attempt's
+                    // daemon retry must not survive either result of that start.
+                    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                        state.failed_retry.cancel();
+                    })?;
+                }
                 if enabled != next.enabled || retry_failed {
                     let held = next.enabled && runtime.config_delivery.as_ref()
                         .is_some_and(|delivery| delivery.0.has_recorded_admission_hold(&spec.module_id)

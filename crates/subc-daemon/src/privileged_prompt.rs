@@ -458,6 +458,7 @@ mod tests {
             bound_at: tokio::time::Instant::now(),
             flow: Arc::new(ChannelFlow::new(64 * 1024)),
             scope: None,
+            accepts_close_reasons: None,
         };
         let frame = Frame::build(
             FrameType::Request,

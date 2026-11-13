@@ -100,6 +100,8 @@ pub(crate) struct RouteBinding {
     /// The scope the route was admitted under, with the tag its bind was
     /// stamped at. A scope change finds the routes to close by it.
     pub scope: Option<BoundScope>,
+    /// Close reasons this route's opener can decode, captured from route.open.
+    pub accepts_close_reasons: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -311,6 +313,7 @@ pub(crate) fn send_module_route_goodbye(
 #[derive(Debug, Clone)]
 pub(crate) struct EndpointRoute {
     pub goodbye_target: GoodbyeTarget,
+    pub accepts_close_reasons: Option<Vec<String>>,
     pub principal: Principal,
     pub bound_at: Instant,
     pub draining: bool,
@@ -329,6 +332,7 @@ pub(crate) struct ScopeDrainedRoute {
     pub module_id: String,
     pub client: GoodbyeTarget,
     pub module: GoodbyeTarget,
+    pub accepts_close_reasons: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -471,6 +475,7 @@ struct PendingRouteBindRelayEntry {
     client_permit: crate::router::EgressPermit,
     route_open_frame: Frame,
     busy_refusals: bool,
+    accepts_close_reasons: Option<Vec<String>>,
     request_window: usize,
     watch_window: Option<usize>,
     principal: Principal,
@@ -1368,6 +1373,7 @@ impl ForwardingTable {
         operator_app: Option<crate::operator_apps::OperatorAppStamp>,
         deadline: Instant,
         busy_refusals: bool,
+        accepts_close_reasons: Option<Vec<String>>,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         // Reserve egress capacity before taking the forwarding lock. The permit is
         // held until the bind reaches one terminal state, so an accepted bind can
@@ -1394,6 +1400,7 @@ impl ForwardingTable {
             deadline,
             client_permit,
             busy_refusals,
+            accepts_close_reasons,
         )
     }
 
@@ -1444,6 +1451,7 @@ impl ForwardingTable {
             Instant::now() + std::time::Duration::from_secs(60),
             permit,
             busy_refusals,
+            None,
         )
     }
 
@@ -1632,6 +1640,7 @@ impl ForwardingTable {
         deadline: Instant,
         client_permit: crate::router::EgressPermit,
         busy_refusals: bool,
+        accepts_close_reasons: Option<Vec<String>>,
     ) -> Result<PendingRouteBindRelay, ForwardingError> {
         let mut inner = self.write_inner()?;
         // HELLO and route.open can run on different tasks. Decide the role under
@@ -1729,6 +1738,7 @@ impl ForwardingTable {
                 client_permit,
                 route_open_frame,
                 busy_refusals,
+                accepts_close_reasons,
                 request_window: window_for(&module.concurrency),
                 watch_window: (busy_refusals && module.concurrency == Concurrency::ModuleManaged)
                     .then_some(DEFAULT_MODULE_MANAGED_WATCH_WINDOW),
@@ -3337,6 +3347,7 @@ impl ForwardingTable {
                         module_id: Some(route.module_id.clone()),
                     },
                     module,
+                    accepts_close_reasons: route.accepts_close_reasons.clone(),
                 });
             }
         }
@@ -3528,6 +3539,7 @@ fn endpoint_routes_locked(
                 module_id: Some(route.module_id.clone()),
             },
             principal: route.principal.clone(),
+            accepts_close_reasons: route.accepts_close_reasons.clone(),
             bound_at: route.bound_at,
             draining,
             drain_reason,
@@ -3738,6 +3750,7 @@ fn commit_route_locked(
             ChannelFlow::new(pending.request_window)
         }),
         scope: pending.scope,
+        accepts_close_reasons: pending.accepts_close_reasons,
     });
     inner
         .client_to_module
@@ -5060,6 +5073,7 @@ mod tests {
                 None,
                 Instant::now() + Duration::from_secs(60),
                 false,
+                None,
             ),
         )
         .await

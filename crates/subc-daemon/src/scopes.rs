@@ -2435,6 +2435,7 @@ mod tests {
                         None,
                         tokio::time::Instant::now() + std::time::Duration::from_secs(5),
                         false,
+                        None,
                     )
                     .await
                     .unwrap(),

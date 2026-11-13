@@ -624,6 +624,7 @@ struct RouteOpenRequest {
     busy_refusals: Option<bool>,
     admission_facts: Option<serde_json::Value>,
     scope: Option<ScopeSelector>,
+    accepts_close_reasons: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -1156,6 +1157,7 @@ impl ControlHandler {
                 subc_protocol::scope::FLOW_IDENTITY_SCOPES_CAPABILITY.to_string(),
                 subc_protocol::scope::SCOPE_SERVED_BY_CAPABILITY.to_string(),
                 subc_control::ACTIVITY_LEDGER_CAPABILITY.to_string(),
+                subc_protocol::ROUTE_CLOSE_REASONS_CAPABILITY.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
             route_bind_relay_timeouts: BTreeMap::new(),
@@ -4213,6 +4215,18 @@ impl ControlHandler {
                 scope,
                 ..
             } => {
+                let extensions = match serde_json::from_slice::<subc_control::RouteOpenRequestExt>(
+                    &frame.body,
+                ) {
+                    Ok(extensions) => extensions,
+                    Err(err) => {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            "invalid_control_body",
+                            format!("malformed route.open extensions: {err}"),
+                        )?]);
+                    }
+                };
                 self.handle_route_open(
                     ctx,
                     frame,
@@ -4225,6 +4239,7 @@ impl ControlHandler {
                         busy_refusals,
                         admission_facts,
                         scope,
+                        accepts_close_reasons: extensions.accepts_close_reasons,
                     },
                     route_open_timings.get_or_insert_with(RouteOpenTimings::new),
                 )
@@ -6057,6 +6072,7 @@ impl ControlHandler {
             busy_refusals,
             admission_facts,
             scope,
+            accepts_close_reasons,
         } = request;
         let target_module_id = target_module_id(&target).to_string();
         timings.module_id.clone_from(&target_module_id);
@@ -6681,6 +6697,7 @@ impl ControlHandler {
                 operator_app.clone(),
                 relay_deadline,
                 busy_refusals == Some(true),
+                accepts_close_reasons,
             )
             .await
         {
@@ -10101,18 +10118,39 @@ fn send_goodbye_target_best_effort(
     );
 }
 
+fn route_close_reason_for_opener(
+    reason: RouteCloseReason,
+    accepts_close_reasons: Option<&[String]>,
+) -> RouteCloseReason {
+    if reason == RouteCloseReason::AuthorityChanged
+        && !accepts_close_reasons
+            .is_some_and(|reasons| reasons.iter().any(|reason| reason == "authority_changed"))
+    {
+        // Older readers forbid reopening for unknown reasons. Reload already
+        // permits reopening and, like an authority change, requires a new bind.
+        RouteCloseReason::Reload
+    } else {
+        reason
+    }
+}
+
 pub(crate) fn send_route_control_pushes(
     forwarding: &ForwardingTable,
     routes: Vec<EndpointRoute>,
     push: ClientControlPush,
 ) {
-    let mut targets: Vec<(GoodbyeTarget, Vec<u16>)> = Vec::new();
+    let reason = match &push {
+        ClientControlPush::RouteClosing { reason, .. }
+        | ClientControlPush::RouteClosed { reason, .. } => *reason,
+    };
+    let mut targets: Vec<(GoodbyeTarget, RouteCloseReason, Vec<u16>)> = Vec::new();
     for route in routes {
+        let recipient_reason =
+            route_close_reason_for_opener(reason, route.accepts_close_reasons.as_deref());
         let target = route.goodbye_target;
-        if let Some((existing, channels)) = targets
-            .iter_mut()
-            .find(|(existing, _)| existing.connection_id == target.connection_id)
-        {
+        if let Some((existing, _, channels)) = targets.iter_mut().find(|(existing, reason, _)| {
+            existing.connection_id == target.connection_id && *reason == recipient_reason
+        }) {
             debug_assert_eq!(
                 existing.negotiated_ver, target.negotiated_ver,
                 "one connection cannot negotiate multiple frame versions"
@@ -10123,18 +10161,25 @@ pub(crate) fn send_route_control_pushes(
             continue;
         }
         let channel = target.channel;
-        targets.push((target, vec![channel]));
+        targets.push((target, recipient_reason, vec![channel]));
     }
-    for (target, mut channels) in targets {
+    for (target, recipient_reason, mut channels) in targets {
         channels.sort_unstable();
         let mut push = push.clone();
         match &mut push {
             ClientControlPush::RouteClosing {
-                channels: covered, ..
+                channels: covered,
+                reason,
+                ..
             }
             | ClientControlPush::RouteClosed {
-                channels: covered, ..
-            } => *covered = channels,
+                channels: covered,
+                reason,
+                ..
+            } => {
+                *covered = channels;
+                *reason = recipient_reason;
+            }
         }
         let body = match serde_json::to_vec(&push) {
             Ok(body) => body,
@@ -19435,6 +19480,9 @@ mod tests {
     /// may sync is decided by the registration and launch nonce of the module
     /// connection, never by the request body.
     mod scopes {
+        mod close_reasons {
+            include!("route_close_reason_tests.rs");
+        }
         mod idle_tests {
             use super::*;
             include!("scope_idle_tests.rs");

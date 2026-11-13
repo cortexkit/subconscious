@@ -570,7 +570,7 @@ mod dual_path_tests {
                 };
                 let refused = f
                     .handler
-                    .route_open_principal(&hello(None), Some(identity))
+                    .route_open_principal(ConnectionId::new(9999), &hello(None), Some(identity))
                     .unwrap()
                     .unwrap_err();
                 assert_eq!(
@@ -611,7 +611,7 @@ mod dual_path_tests {
             launch_nonce: nonce.clone(),
         };
         assert!(
-            matches!(f.handler.route_open_principal(&hello(None), Some(identity)).unwrap(),
+            matches!(f.handler.route_open_principal(ConnectionId::new(9999), &hello(None), Some(identity)).unwrap(),
             Ok(Principal::Reserved { module_id }) if module_id == "ckbus")
         );
         let reads = f

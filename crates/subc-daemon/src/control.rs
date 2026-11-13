@@ -1937,7 +1937,7 @@ impl ControlHandler {
     ) -> Result<Frame, RouterError> {
         // Sent before the request reaches `handle_route_open`, so the caller
         // fields come from the raw frame here.
-        let caller = self.route_open_caller_from_frame(frame);
+        let caller = self.route_open_caller_from_frame(ctx.connection_id, frame);
         self.route_open_admission_refusal_frame(
             ctx,
             &caller,
@@ -5289,7 +5289,11 @@ impl ControlHandler {
                             )?])
                         }
                     };
-                    self.route_open_principal(&frame, identity.consumer_identity)?
+                    self.route_open_principal(
+                        ctx.connection_id,
+                        &frame,
+                        identity.consumer_identity,
+                    )?
                 }
             },
         };
@@ -5680,14 +5684,22 @@ impl ControlHandler {
         )?])
     }
 
-    /// The principal a route.open's `consumer_identity` attests: `Direct`
-    /// when it presents none, `Reserved` when its launch nonce verifies, and
-    /// `None` when it does not. Only a read of the supervisor's nonces, so it
-    /// can run before any refusal check without changing which check refuses.
+    /// Resolve the caller from its connection claim before consulting legacy
+    /// nonce identity. All consumer claim purposes attest their owner's reserved
+    /// principal; their distinct purposes remain on the connection binding.
+    /// A failed or conflicting claim never falls back to treating the caller as direct.
     fn attest_route_open_consumer(
         &self,
+        connection_id: ConnectionId,
         consumer_identity: Option<&ConsumerIdentity>,
     ) -> Option<Principal> {
+        if let Some(binding) = self.claims.binding(connection_id) {
+            return (consumer_identity.is_none() && binding.consumer_live(connection_id)).then(
+                || Principal::Reserved {
+                    module_id: binding.registration.module_id.clone(),
+                },
+            );
+        }
         let Some(consumer_identity) = consumer_identity else {
             return Some(Principal::Direct);
         };
@@ -5704,7 +5716,11 @@ impl ControlHandler {
     /// The caller fields for a refusal that only has the raw request frame,
     /// such as the connection-level admission refusal sent before the request
     /// reaches [`Self::handle_route_open`].
-    fn route_open_caller_from_frame(&self, frame: &Frame) -> RouteOpenCaller {
+    fn route_open_caller_from_frame(
+        &self,
+        connection_id: ConnectionId,
+        frame: &Frame,
+    ) -> RouteOpenCaller {
         let Ok(ClientControlRequest::RouteOpen {
             identity,
             consumer_identity,
@@ -5714,22 +5730,23 @@ impl ControlHandler {
         else {
             return RouteOpenCaller::unknown();
         };
-        let principal = self.attest_route_open_consumer(consumer_identity.as_ref());
+        let principal = self.attest_route_open_consumer(connection_id, consumer_identity.as_ref());
         RouteOpenCaller::new(principal.as_ref(), scope.as_ref(), &identity)
     }
 
     fn route_open_principal(
         &self,
+        connection_id: ConnectionId,
         frame: &Frame,
         consumer_identity: Option<ConsumerIdentity>,
     ) -> Result<Result<Principal, Frame>, RouterError> {
-        let attested = self.attest_route_open_consumer(consumer_identity.as_ref());
+        let attested = self.attest_route_open_consumer(connection_id, consumer_identity.as_ref());
         self.route_open_principal_attested(frame, consumer_identity, attested)
     }
 
     /// [`Self::route_open_principal`] with `attested` already taken by
-    /// [`Self::attest_route_open_consumer`] for `consumer_identity`, so one
-    /// open checks the launch nonce once.
+    /// [`Self::attest_route_open_consumer`], so one open resolves its connection
+    /// claim or launch nonce once.
     fn route_open_principal_attested(
         &self,
         frame: &Frame,
@@ -5739,16 +5756,15 @@ impl ControlHandler {
         if let Some(principal) = attested {
             return Ok(Ok(principal));
         }
-        let Some(consumer_identity) = consumer_identity else {
-            return Ok(Ok(Principal::Direct));
-        };
-
         Ok(Err(control_error_frame(
             frame,
             "bad_consumer_identity",
-            format!(
-                "consumer_identity for module_id '{}' did not match a supervised launch nonce",
-                consumer_identity.module_id
+            consumer_identity.map_or_else(
+                || "connection claim is no longer authorized for routes".to_string(),
+                |identity| format!(
+                    "consumer_identity for module_id '{}' conflicts with its connection claim or did not match a supervised launch nonce",
+                    identity.module_id
+                ),
             ),
         )?))
     }
@@ -6080,10 +6096,11 @@ impl ControlHandler {
         );
 
         // The caller's attested principal, requested scope and harness, for
-        // every `route.open refused` line below. The launch nonce is checked
+        // every `route.open refused` line below. Connection authority is checked
         // here, once, and the answer is reused where the principal is
         // enforced further down, so the order of refusals is unchanged.
-        let attested = self.attest_route_open_consumer(consumer_identity.as_ref());
+        let attested =
+            self.attest_route_open_consumer(ctx.connection_id, consumer_identity.as_ref());
         let mut caller = RouteOpenCaller::new(attested.as_ref(), scope.as_ref(), &identity);
 
         // A malformed declaration is refused first, before anything about the
@@ -10498,7 +10515,10 @@ mod tests {
         // Absent consumer_identity is the ordinary case: a human at a terminal, or
         // any process holding the connection file. Nothing was proved, so nothing
         // may be granted beyond the unattested floor.
-        let stamped = handler.route_open_principal(&frame, None).unwrap().unwrap();
+        let stamped = handler
+            .route_open_principal(ConnectionId::new(1), &frame, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             stamped,
             Principal::Direct,
@@ -10511,6 +10531,7 @@ mod tests {
         // to an ordinary unattested connection.
         let forged = handler
             .route_open_principal(
+                ConnectionId::new(1),
                 &frame,
                 Some(ConsumerIdentity {
                     module_id: "aft".to_string(),

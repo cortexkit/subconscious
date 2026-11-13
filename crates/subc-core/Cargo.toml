@@ -52,6 +52,11 @@ name = "privacy-aft-stub"
 path = "tests/fixtures/privacy-aft-stub.rs"
 required-features = ["test-support"]
 
+[[bin]]
+name = "channel-module-rs"
+path = "tests/fixtures/channel_module_rs/main.rs"
+required-features = ["test-support"]
+
 [features]
 bench-harness = ["subc-daemon/bench-harness"]
 loom = ["subc-daemon/loom"]

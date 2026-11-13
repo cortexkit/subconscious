@@ -27,6 +27,48 @@ async fn gated_claim_fixture() -> GatedClaimFixture {
     gated_claim_fixture_with_support(None).await
 }
 
+#[tokio::test]
+async fn refused_live_binding_without_a_current_approval_parks_instead_of_respawning() {
+    let fixture = gated_claim_fixture().await;
+    let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Unstamp);
+    fixture.owner.complete_authority_exit(generation).unwrap();
+    assert!(!fixture.owner.has_recorded_admission_hold("a"));
+    let before = fixture.module.status().unwrap();
+    let kill = fixture.spawn.defer_content_kill_for_test();
+    fixture.spawn.set_content_probe_for_test(Arc::new(|| {
+        Err(GateError::new(
+            "program_refused",
+            "the old live image failed its content witness",
+        ))
+    }));
+    assert_eq!(fixture.spawn.check().unwrap_err(), "program_refused");
+    assert!(fixture.spawn.content_was_refused_for_test());
+    // The binding latches refusal even though unstamp removed its approved base;
+    // recording that old-base refusal must not manufacture a new admission hold.
+    assert!(!fixture.owner.has_recorded_admission_hold("a"));
+    drop(kill);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.module.status().unwrap().process_alive {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.module.config_exit_hold().await.unwrap();
+    let after = fixture.module.status().unwrap();
+    drop(fixture.primary);
+    fixture.module.set_enabled(false).await.unwrap();
+    fixture.module.stop().await.unwrap();
+    assert_eq!(
+        after.state,
+        ModuleState::Stopped,
+        "an irreversibly refused child must not enter the budget-free spawn loop"
+    );
+    assert_eq!(after.spawn_generation, before.spawn_generation);
+    assert_eq!(after.restart_count, before.restart_count);
+    assert!(!after.respawn_pending);
+}
+
 async fn gated_claim_fixture_with_support(support: Option<bool>) -> GatedClaimFixture {
     use crate::control::claims::tests::Net;
     let rig = rig();

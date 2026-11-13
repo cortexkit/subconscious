@@ -35,6 +35,16 @@ async fn staged_unstamp_enable_preserves_a_live_child_instead_of_parking_it() {
         state.enabled = false
     })
     .unwrap();
+    std::fs::write(
+        spec.program
+            .parent()
+            .unwrap()
+            .join("store")
+            .join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(owner.check_recovery().unwrap());
     let plan = owner
         .finish_plan(
             owner
@@ -67,6 +77,7 @@ async fn staged_unstamp_enable_preserves_a_live_child_instead_of_parking_it() {
         )
         .unwrap();
     assert!(owner.can_stage_unstamp_enable());
+    assert!(owner.has_recorded_admission_hold("a"));
     let (tx, rx) = oneshot::channel();
     let command = SupervisorCommand::SetEnabled {
         enabled: true,
@@ -93,7 +104,7 @@ async fn staged_unstamp_enable_preserves_a_live_child_instead_of_parking_it() {
     let parked = lock_snapshot(&module.inner.snapshot)
         .unwrap()
         .config_hold_parked;
-    assert_eq!(child.as_ref().unwrap().spawned_at, child_spawned_at);
+    let retained_child = child.as_ref().unwrap().spawned_at;
     let (tx, rx) = oneshot::channel();
     assert!(
         !handle_supervisor_command(
@@ -115,6 +126,7 @@ async fn staged_unstamp_enable_preserves_a_live_child_instead_of_parking_it() {
     rx.await.unwrap().unwrap();
     assert!(staged.enabled && staged.process_alive);
     assert_eq!(staged.state, ModuleState::Running);
+    assert_eq!(retained_child, child_spawned_at);
     assert_eq!(staged.spawn_generation, before.spawn_generation);
     assert!(
         !parked,

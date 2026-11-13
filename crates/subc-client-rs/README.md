@@ -5,6 +5,7 @@ declare, review and apply daemon-provided configuration. Its compile-checked
 counter sample shows the complete adoption in fewer than 60 lines. Gate refusals
 never authorize reading local files; `config_files` runs only with an older daemon
 whose HELLO_ACK lacks `config.gate`.
+View statuses other than `active`, `pending` or `unstamped` are reported through `on_config_error` as protocol errors and are never applied or acknowledged.
 
 Rust module serving and consumer APIs for the Subconscious daemon.
 

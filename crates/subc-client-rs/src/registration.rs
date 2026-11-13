@@ -13,6 +13,7 @@ use subc_protocol::claim::{
 
 static OWNER: OnceLock<Weak<ModuleHandleShared>> = OnceLock::new();
 static HELPER_BOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SUPERVISED: OnceLock<bool> = OnceLock::new();
 
 #[derive(Default)]
 pub(crate) struct Session {
@@ -47,17 +48,23 @@ impl fmt::Display for ClaimError {
 impl Error for ClaimError {}
 
 pub(crate) fn supervised() -> bool {
-    static LOGGED: OnceLock<()> = OnceLock::new();
-    let supervised = os::supervised();
-    LOGGED.get_or_init(|| {
+    SUPERVISED.get().copied().unwrap_or(false)
+}
+
+pub(crate) fn adopt() -> bool {
+    *SUPERVISED.get_or_init(|| {
+        let supervised = os::supervised();
         if let Some(reason) = os::registration_refusal() {
             tracing::warn!(%reason, "registration channel not adopted");
         }
-    });
-    supervised
+        supervised
+    })
 }
 
 pub(crate) fn take_stream() -> Result<Option<Box<dyn ModuleStream>>, SubcModuleError> {
+    if !supervised() {
+        return Ok(None);
+    }
     let Some(channel) = os::take_registration_channel()
         .map_err(|error| SubcModuleError::RegistrationChannel(io::Error::other(error)))?
     else {

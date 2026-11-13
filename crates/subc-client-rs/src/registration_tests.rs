@@ -66,17 +66,34 @@ async fn child_case(scenario: &str, test: &str, path: &Path) {
     let manifest = ModuleManifest::builder("channel-worker", "1.0.0")
         .registration_channel(true)
         .build();
-    let (handle, serving) = serve_with_handle(path, manifest.clone(), Hook)
+    if scenario == "lazy" {
+        assert!(
+            take_stream().unwrap().is_none(),
+            "transport lookup adopted before serving"
+        );
+        assert!(!bound(), "consumer identity lookup adopted before serving");
+    }
+    let stop = ModuleStopHandle::default();
+    let (handle, serving) = ServeOptions::default()
+        .with_stop_handle(stop.clone())
+        .serve_with_handle(path, manifest.clone(), Hook)
         .await
+        .unwrap()
         .unwrap();
     assert!(supervised());
     if scenario == "eof" {
         serving.await.unwrap();
         panic!("adopted channel EOF returned instead of ending the process");
     }
+    if scenario == "close" {
+        stop.stop();
+        serving.await.unwrap();
+        println!("LOCAL_CLOSE_RETURNED");
+        std::process::exit(0);
+    }
     let serving = tokio::spawn(serving);
     match scenario {
-        "second_take" => {
+        "second_take" | "lazy" => {
             assert!(matches!(
                 serve_with_handle(path, manifest, Hook).await,
                 Err(SubcModuleError::RegistrationChannel(_))
@@ -369,6 +386,15 @@ async fn run(scenario: &'static str, test: &str) {
 
         return;
     }
+    if scenario == "close" {
+        while read_frame(&mut registration).await.unwrap().is_some() {}
+        let output = assert_child(&mut child).await;
+        assert!(
+            output.contains("LOCAL_CLOSE_RETURNED"),
+            "local stop exited the process: {output}"
+        );
+        return;
+    }
 
     let (minted, mut claims) = mpsc::channel(16);
     let broker = tokio::spawn(async move {
@@ -422,7 +448,7 @@ async fn run(scenario: &'static str, test: &str) {
     });
     let tcp = tokio::spawn(async move {
         let expected = match scenario {
-            "second_take" => 0,
+            "second_take" | "lazy" => 0,
             "pool" => 3,
             "reconnect" => 2,
             _ => 1,
@@ -500,7 +526,7 @@ async fn run(scenario: &'static str, test: &str) {
     tcp.await.unwrap();
     let purposes = broker.await.unwrap();
     let expected_mints = match scenario {
-        "direct" | "second_take" => 0,
+        "direct" | "second_take" | "lazy" => 0,
         "pool" => 3,
         "reconnect" => 2,
         _ => 1,
@@ -543,3 +569,5 @@ contract_test!(rate_limit_observes_retry_after_ms, "rate");
 contract_test!(bound_connection_refuses_identity_override, "identity");
 contract_test!(only_explicit_helper_handoff_delegates_claim, "helper");
 contract_test!(registration_is_never_reconnected, "second_take");
+contract_test!(consumer_lookup_does_not_adopt_before_serving, "lazy");
+contract_test!(local_stop_returns_without_exiting, "close");

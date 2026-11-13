@@ -172,6 +172,21 @@ test("NACK keeps N and reports N+1, including anchor_pending retry on a hint", a
   expect(r.calls.filter((c) => c.op === "config.applied").at(-1)?.result).toBe("nack");
 });
 
+test("fresh config establishes active recovery before a NACKed pending delivery", async () => {
+  const applied: number[] = [];
+  const r = rig({ apply: value => {
+    applied.push(value.generation);
+    return { result: value.generation === 1 ? "ack" : "nack", reasons: ["not ready"] };
+  } });
+  r.reply(sampleView(1, "active"), sampleView(2));
+  await r.config.refresh();
+  expect(applied).toEqual([1, 2]);
+  expect(r.config.state).toEqual({ state: "failed", view: sampleView(1, "active"), reasons: ["not ready"] });
+  expect(r.calls.filter(c => c.op === "config.applied")).toEqual([
+    { op: "config.applied", generation: 2, attempt: 12, project_id: undefined, result: "nack", reasons: ["not ready"] },
+  ]);
+});
+
 test("only missing config.gate enables legacy files; reconnect declares on the new connection", async () => {
   const r = rig();
   r.legacy();

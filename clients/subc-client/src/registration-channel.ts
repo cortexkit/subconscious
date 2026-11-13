@@ -44,38 +44,28 @@ export function registrationNamed(): boolean {
 /** There is one owner even when two SDK module copies are imported. The native
  * decision is process-cached too, and refuses a second transfer of the handle. */
 class RegistrationOwner {
-  readonly supervised: boolean;
-  readonly missing: boolean;
+  supervised = false;
+  private decided = false;
   private socket?: SubcSocket;
   private taken = false;
   helperTaken = false;
   broker?: ClaimBroker;
-  readonly named = registrationNamed();
-  constructor() {
-    if (!this.named) { this.supervised = false; this.missing = false; return; }
+  adopt(): void {
+    if (this.decided) return;
+    this.decided = true;
+    if (!registrationNamed()) return;
     let helper: Native;
     try { helper = native(); }
-    catch { this.supervised = false; this.missing = true; return; }
-    this.missing = false;
+    catch { return; }
     this.supervised = helper.supervised();
-    const refusal = helper.registrationRefusal();
-    if (refusal) console.warn(`subc registration refused: ${refusal}`);
     if (this.supervised) {
       const channel = helper.takeRegistrationChannel();
       if (!channel) throw new ClaimError("registration_adoption_failed");
       const stream = new RegistrationDuplex(channel);
-      // EOF cannot be repaired by reconnecting. Defer exit one turn so pending
-      // socket readers observe closure and provider lifecycle hooks can run.
-      stream.once("end", () => setImmediate(() => process.exit(1)));
-      stream.once("error", () => setImmediate(() => process.exit(1)));
       this.socket = SubcSocket.adopt(stream);
     }
   }
   take(): SubcSocket | undefined {
-    if (this.missing) {
-      setImmediate(() => process.exit(1));
-      throw new ClaimError("registration_native_unavailable");
-    }
     if (!this.supervised) return undefined;
     if (this.taken) throw new ClaimError("registration_already_taken");
     this.taken = true;
@@ -151,7 +141,3 @@ export function prepareHelperClaim(childSlot = 3): HelperClaimHandoff {
     abort() { active = false; prepared.abort(); },
   };
 }
-
-// Validate immediately when a supervised process imports the SDK, before it can
-// launch ordinary children. Plain clients never load the native addon.
-if (registrationNamed()) registrationOwner();

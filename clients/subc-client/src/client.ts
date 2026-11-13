@@ -30,7 +30,7 @@ import {
   type Frame,
 } from "./envelope.js";
 import { launchNonceOrUndefinedAsync } from "./launch-nonce.js";
-import { bindConsumer, boundIdentityOverride, hasClaimBinding, registrationOwner } from "./registration-channel.js";
+import { bindConsumer, boundIdentityOverride, hasClaimBinding } from "./registration-channel.js";
 import { RequestGate, type RequestSlot } from "./request-gate.js";
 import type { ManifestProvenance, Principal } from "./provider.js";
 import {
@@ -2914,7 +2914,7 @@ function validatedRouteScope(scope: RouteScope | undefined): RouteScope | undefi
 
 async function routeOpenConsumerIdentity(opts: RouteOpenOptions = {}): Promise<ConsumerIdentity | undefined> {
   boundIdentityOverride(opts.consumerIdentity);
-  if (registrationOwner().named || hasClaimBinding()) return undefined;
+  if (hasClaimBinding()) return undefined;
   if (opts.consumerIdentity !== undefined) return opts.consumerIdentity ?? undefined;
   const moduleId = process.env[SUBC_MODULE_ID_ENV];
   // The nonce comes from the one process-wide accessor, never straight from the

@@ -245,6 +245,19 @@ export class ModuleConfig {
       if (reply.op !== "config.get") throw new Error("invalid config.get reply");
       const active = reply.active === null ? undefined : immutable(view(reply.active));
       const pending = reply.pending === undefined ? undefined : immutable(view(reply.pending));
+      // A fresh process needs a recovery view before trying a delivery that can
+      // be rejected. Never ACK that already-active view as the pending attempt.
+      if (!this.lastView && pending && active) {
+        if (active.status !== "active" || unknownView(active) !== undefined) throw new Error("invalid recovery view");
+        const recovered = await this.options.apply(active);
+        if (!this.live(epoch)) return;
+        if (recovered.result !== "ack") {
+          this.publish({ state: "failed", view: this.lastView, reasons: recovered.reasons ?? [] });
+          return;
+        }
+        this.lastView = active;
+        this.publish({ state: "active", view: active });
+      }
       const target = pending ?? active;
       if (!target) throw new Error("config.get returned no view");
       const unknown = unknownView(target);

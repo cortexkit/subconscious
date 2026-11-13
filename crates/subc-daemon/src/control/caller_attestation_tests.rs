@@ -17,6 +17,9 @@ use subc_protocol::peer::CALLER_ATTESTATION_CAPABILITY;
 
 const OPEN_CORR: u64 = 41;
 
+#[path = "first_party_mark_tests.rs"]
+mod first_party_mark;
+
 fn text(frame: &Frame) -> String {
     String::from_utf8_lossy(&frame.body).into_owned()
 }
@@ -821,7 +824,7 @@ fn caller_attestation_federated_and_flow_scopes_attest_relay() {
         authority: record.capture().unwrap(),
         claim: subc_protocol::peer::CallerClaim::Own,
     };
-    let relayed = own.relayed().attestation().unwrap();
+    let relayed = own.relayed().attestation("target").unwrap();
     assert_eq!(relayed.claim, subc_protocol::peer::CallerClaim::Relay);
     assert!(!relayed.first_party);
 }

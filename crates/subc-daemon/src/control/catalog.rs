@@ -62,7 +62,13 @@ impl ControlHandler {
             |capture| capture.incarnation.clone(),
         ));
         entry.spawn = authority.as_ref().map(|capture| capture.key.spawn);
-        entry.first_party = Some(false);
+        // The active spawn's mark, read from its record like the approvals.
+        // Discovery only: providers authorize on the bind's `caller`.
+        entry.first_party = Some(
+            authority
+                .as_ref()
+                .is_some_and(|capture| capture.first_party),
+        );
         entry.origin = Some(CatalogOrigin::Other);
         entry.requested_declarations_digest = Some(declarations_digest(&requested)?);
         entry.approved_declarations_digest = Some(approved.digest);

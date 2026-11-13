@@ -7049,6 +7049,7 @@ impl ControlHandler {
             .with_caller(caller_for_target(
                 caller_capture.as_ref(),
                 relay_capabilities,
+                &target_module_id,
             ));
         let relay_body = crate::bind_compat::encode_bind(
             &relay,

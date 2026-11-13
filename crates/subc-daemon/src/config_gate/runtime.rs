@@ -52,6 +52,7 @@ pub struct RuntimeOwner {
     module_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     delivery_changed: std::sync::Arc<tokio::sync::Notify>,
     route_policy_authority: std::sync::OnceLock<std::sync::Arc<dyn RoutePolicyAuthority>>,
+    mark_publisher: std::sync::OnceLock<std::sync::Arc<dyn mark::MarkPublisher>>,
     binding_retirements: Mutex<BTreeMap<usize, Box<dyn Fn() + Send + Sync>>>,
     canceled_approvals: Mutex<Vec<u64>>,
     // Reader and Drop callbacks must not wait behind a keychain or disk check.
@@ -476,6 +477,10 @@ impl Drop for OwnerGuard<'_> {
             .refused_generations
             .retain(|module, base| valid.contains(&(module.clone(), base.clone())));
         let next = admission::AdmissionCache::from_state(&self.0);
+        // Lower the marks this state rules out (an unstamp, an ungated
+        // module, an active generation the spawn never acknowledged) before
+        // the owner is released: delivery, then record, then forwarding.
+        mark::sweep(self.4, &self.0, &next);
         let observed = self.0.observed_snapshot.clone();
         let projection = self.4.status_projection(&mut self.0, observed, &next);
         if let Ok(mut cache) = self.1.write() {
@@ -599,6 +604,8 @@ pub(crate) mod delivery;
 
 #[path = "admission.rs"]
 mod admission;
+#[path = "mark.rs"]
+pub(crate) mod mark;
 #[path = "recovery.rs"]
 mod recovery;
 #[path = "route_policy.rs"]
@@ -785,6 +792,7 @@ impl RuntimeOwner {
             module_gates: Mutex::new(HashMap::new()),
             delivery_changed,
             route_policy_authority: std::sync::OnceLock::new(),
+            mark_publisher: std::sync::OnceLock::new(),
             binding_retirements: Mutex::new(BTreeMap::new()),
             canceled_approvals: Mutex::new(Vec::new()),
             approval_request_index: Mutex::new(HashMap::new()),

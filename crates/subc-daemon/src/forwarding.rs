@@ -9,7 +9,8 @@
 //! Spawn authority: an authority change takes the spawn's authority record
 //! state, then `inner` (see `crate::spawn_authority`). Code holding `inner`
 //! never takes a record's authority state; it reads only the record's
-//! immutable identity and the epochs published into `spawn_epochs`.
+//! immutable identity and the epochs and first-party marks published into
+//! `spawn_epochs` and `spawn_marks`.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -135,33 +136,38 @@ pub(crate) enum TargetAuthority {
     Prefix,
     /// A registration with no supervised spawn behind it.
     Unsupervised,
-    /// A supervised spawn's own registration, at the epoch the forwarding
-    /// table had published when the endpoint was reserved.
-    Spawn(AuthorityPair, crate::spawn_authority::ApprovedDeclarations),
+    /// A supervised spawn's own registration, at the epoch and with the mark
+    /// the forwarding table had published when the endpoint was reserved.
+    Spawn(
+        AuthorityPair,
+        crate::spawn_authority::ApprovedDeclarations,
+        bool,
+    ),
 }
 
 impl TargetAuthority {
     fn pair(&self) -> Option<&AuthorityPair> {
         match self {
-            Self::Spawn(pair, _) => Some(pair),
+            Self::Spawn(pair, _, _) => Some(pair),
             Self::Prefix | Self::Unsupervised => None,
         }
     }
 
     /// The `target` key of the `route.open` reply. The approved set is the
-    /// serving spawn record's value; the mark remains forced off.
+    /// serving spawn record's value; the mark is the one published for it.
     fn reply_target(&self, incarnation: &str) -> Result<RouteOpenTarget, ForwardingError> {
-        let (kind, spawn, epoch, digest) = match self {
-            Self::Prefix => (RouteOpenTargetKind::Prefix, None, None, None),
-            Self::Unsupervised => (RouteOpenTargetKind::Unsupervised, None, None, None),
-            Self::Spawn(pair, approved) => (
+        let (kind, spawn, epoch, first_party, digest) = match self {
+            Self::Prefix => (RouteOpenTargetKind::Prefix, None, None, false, None),
+            Self::Unsupervised => (RouteOpenTargetKind::Unsupervised, None, None, false, None),
+            Self::Spawn(pair, approved, first_party) => (
                 RouteOpenTargetKind::Spawn,
                 Some(pair.key.spawn),
                 Some(pair.epoch),
+                *first_party,
                 Some(approved.digest.clone()),
             ),
         };
-        RouteOpenTarget::new(incarnation, kind, spawn, epoch, false, digest)
+        RouteOpenTarget::new(incarnation, kind, spawn, epoch, first_party, digest)
             .map_err(|err| ForwardingError::RouteOpenBuild(err.to_string()))
     }
 }
@@ -682,6 +688,9 @@ struct ForwardingInner {
     /// spawn with no entry is at the initial epoch. A bind whose captured
     /// caller or target epoch is older than this is refused at commit.
     spawn_epochs: HashMap<SpawnKey, u64>,
+    /// The spawns whose first-party mark is raised, published by activation
+    /// and withdrawn by lowering or death, for the reply's `target`.
+    spawn_marks: HashSet<SpawnKey>,
     next_generation: u64,
     reserved_client: HashMap<ClientRouteKey, ModuleRouteKey>,
     reserved_module: HashMap<ModuleRouteKey, ClientRouteKey>,
@@ -3544,22 +3553,33 @@ impl ForwardingTable {
     /// that commits after it sees the new epoch and is refused as stale.
     ///
     /// Unlike [`Self::publish_scope_changes`], every client route is scanned,
-    /// scoped or not. Once a spawn is dead (`alive` false), the epochs of its
-    /// module's older spawns are dropped: their connections are gone and the
-    /// liveness checks at commit refuse any bind still naming them.
+    /// scoped or not. Once a spawn is dead (`alive` false), the epochs and
+    /// marks of its module's older spawns are dropped: their connections are
+    /// gone and the liveness checks at commit refuse any bind still naming
+    /// them. `first_party` is the spawn's mark after the change; a lowering
+    /// withdraws it here, in the same critical section as the epoch.
     pub(crate) fn publish_authority_change(
         &self,
         key: &SpawnKey,
         epoch: u64,
         alive: bool,
+        first_party: bool,
     ) -> Result<Vec<AuthorityClosedRoute>, ForwardingError> {
         let mut inner = self.write_inner()?;
         if !alive {
             inner
                 .spawn_epochs
                 .retain(|other, _| other.module_id != key.module_id || other.spawn >= key.spawn);
+            inner
+                .spawn_marks
+                .retain(|other| other.module_id != key.module_id || other.spawn > key.spawn);
         }
         inner.spawn_epochs.insert(key.clone(), epoch);
+        if alive && first_party {
+            inner.spawn_marks.insert(key.clone());
+        } else {
+            inner.spawn_marks.remove(key);
+        }
         let older = |pair: &Option<AuthorityPair>| {
             pair.as_ref()
                 .is_some_and(|pair| pair.key == *key && pair.epoch < epoch)
@@ -3594,6 +3614,16 @@ impl ForwardingTable {
             }
         }
         Ok(closed)
+    }
+
+    /// Publish a spawn's activated first-party mark, so `route.open` replies
+    /// reserved from now on report it. The caller holds the spawn's authority
+    /// record state. The epoch is unchanged and no route is closed: routes
+    /// bound before activation keep the `first_party: false` they were
+    /// attested with.
+    pub(crate) fn publish_spawn_mark(&self, key: &SpawnKey) -> Result<(), ForwardingError> {
+        self.write_inner()?.spawn_marks.insert(key.clone());
+        Ok(())
     }
 
     /// The epoch published for a spawn, for tests of the commit re-check.
@@ -4098,9 +4128,10 @@ fn target_authority_locked(inner: &ForwardingInner, module: &ModuleConnection) -
             TargetAuthority::Spawn(
                 AuthorityPair {
                     epoch: published_epoch_locked(inner, &key),
-                    key,
+                    key: key.clone(),
                 },
                 record.approved().clone(),
+                inner.spawn_marks.contains(&key),
             )
         }
         None => TargetAuthority::Unsupervised,

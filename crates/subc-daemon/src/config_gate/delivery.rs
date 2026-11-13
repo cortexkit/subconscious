@@ -17,6 +17,10 @@ fn allocate_spawn(
     at: tokio::time::Instant,
     register: Duration,
     health: Duration,
+    authority: Option<(
+        std::sync::Arc<crate::spawn_authority::SpawnAuthorityRecord>,
+        bool,
+    )>,
 ) -> Result<DeliverySpawn> {
     #[cfg(test)]
     if state.delivery.failed_spawn_module.as_deref() == Some(module) {
@@ -31,11 +35,15 @@ fn allocate_spawn(
             "delivery spawn identifiers exhausted",
         )
     })?;
+    let (authority, stamped) =
+        authority.map_or((None, false), |(record, stamped)| (Some(record), stamped));
     Ok(DeliverySpawn {
         id: state.delivery.next_spawn,
         module: module.into(),
         generation,
         deadline: at + register + health + CONFIG_WARMUP_SLACK,
+        authority,
+        stamped,
     })
 }
 
@@ -54,6 +62,14 @@ struct Attempt {
     catchup: bool,
     write_deadline: Option<tokio::time::Instant>,
     policy_probe_requested: bool,
+    /// The spawn this attempt was assigned to, when it carries an authority
+    /// record. Its acknowledgement counts toward that spawn's first-party
+    /// mark only, never another spawn's.
+    spawn: Option<DeliverySpawn>,
+    /// A catch-up assigned only so a fresh spawn acknowledges the active
+    /// generation for its first-party mark. Its refusal or timeout leaves the
+    /// spawn unmarked and starts no recovery.
+    mark_only: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +78,11 @@ pub struct DeliverySpawn {
     module: String,
     generation: u64,
     deadline: tokio::time::Instant,
+    /// The launch's spawn authority record, when the supervisor launched it.
+    authority: Option<std::sync::Arc<crate::spawn_authority::SpawnAuthorityRecord>>,
+    /// The stamped store gated this module when the spawn was admitted. Only
+    /// such a spawn can ever carry the first-party mark.
+    stamped: bool,
 }
 
 impl DeliverySpawn {
@@ -70,6 +91,26 @@ impl DeliverySpawn {
     }
     pub(crate) fn generation(&self) -> u64 {
         self.generation
+    }
+    pub(crate) fn authority(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::spawn_authority::SpawnAuthorityRecord>> {
+        self.authority.as_ref()
+    }
+    pub(crate) fn stamped(&self) -> bool {
+        self.stamped
+    }
+    /// Attach a launch's authority record, as the supervisor's admission path
+    /// does, to a spawn a test allocated directly.
+    #[cfg(test)]
+    pub(crate) fn with_authority_for_test(
+        mut self,
+        record: std::sync::Arc<crate::spawn_authority::SpawnAuthorityRecord>,
+        stamped: bool,
+    ) -> Self {
+        self.authority = Some(record);
+        self.stamped = stamped;
+        self
     }
 }
 
@@ -123,6 +164,12 @@ impl DeliveryState {
     }
     pub(super) fn fenced_modules(&self) -> impl Iterator<Item = String> + '_ {
         self.exited.keys().cloned()
+    }
+    /// Every spawn the gate is tracking, registered or not.
+    pub(super) fn tracked_spawns(&self) -> impl Iterator<Item = &DeliverySpawn> + '_ {
+        self.children
+            .values()
+            .chain(self.unregistered_children.values())
     }
 }
 
@@ -294,6 +341,8 @@ impl DeliveryState {
             catchup: false,
             write_deadline: None,
             policy_probe_requested: false,
+            spawn: None,
+            mark_only: false,
         })
     }
 }
@@ -364,6 +413,20 @@ pub(super) fn bind_get(
             view.status = ConfigStatus::Pending;
         }
     }
+    if reply.pending.is_none() && request.generation.is_none() {
+        let generation = reply.active.as_ref().map(|view| view.generation);
+        if let Some(attempt) = generation
+            .map(|generation| mark_acknowledgement(state, connection, module, generation))
+            .transpose()?
+            .flatten()
+        {
+            state.delivery.attempts.insert(connection, attempt);
+            reply.pending = reply.active.clone();
+            if let Some(view) = &mut reply.pending {
+                view.status = ConfigStatus::Pending;
+            }
+        }
+    }
     if let Some(pending) = &mut reply.pending {
         let matches = state
             .delivery
@@ -387,6 +450,7 @@ pub(super) fn bind_get(
                     .map(|warmup| warmup.deadline);
             }
             attempt.ready &= super::route_policy::ready(state, module, pending.generation)?;
+            attempt.spawn = state.delivery.children.get(&connection).cloned();
             state.delivery.attempts.insert(connection, attempt);
         }
         pending.attempt = state
@@ -394,7 +458,12 @@ pub(super) fn bind_get(
             .attempts
             .get(&connection)
             .map(|bound| bound.id);
-        if state.active_declarations.get(module) == Some(&connection) {
+        let mark_only = state
+            .delivery
+            .attempts
+            .get(&connection)
+            .is_some_and(|bound| bound.mark_only);
+        if state.active_declarations.get(module) == Some(&connection) && !mark_only {
             if let Some(spawn) = state.delivery.children.get(&connection) {
                 let id = spawn.id;
                 state
@@ -416,6 +485,57 @@ pub(super) fn bind_get(
         ));
     }
     Ok(reply)
+}
+
+/// The catch-up attempt that asks a fresh spawn to acknowledge its module's
+/// active generation, so the spawn can earn the first-party mark (the
+/// first-party mark design, §2: a spawn is marked only after it acknowledged
+/// the active generation and reported ready, on every start path). Delivering
+/// the active view at launch is not proof the spawn applied it, and without a
+/// pending change a crash, health, manual or boot restart is otherwise never
+/// asked for an acknowledgement.
+///
+/// Assigned only to the active target of a stamped, gated module whose spawn
+/// carries an authority record that could still be marked, at most once per
+/// active generation; never when a pending change already has an attempt.
+/// Unstamped and ungated modules are never asked, so their delivery is
+/// unchanged. A refusal or timeout leaves the spawn unmarked and starts no
+/// recovery.
+fn mark_acknowledgement(
+    state: &mut OwnerState,
+    connection: ConnectionId,
+    module: &str,
+    generation: u64,
+) -> Result<Option<Attempt>> {
+    if state.store.loaded_admission_state().0 != crate::config_store::StoreState::Stamped
+        || state.active_declarations.get(module) != Some(&connection)
+        || state.delivery.attempts.contains_key(&connection)
+    {
+        return Ok(None);
+    }
+    let Some(spawn) = state
+        .delivery
+        .children
+        .get(&connection)
+        .filter(|spawn| spawn.stamped && spawn.module == module)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let Some(record) = spawn.authority.as_ref() else {
+        return Ok(None);
+    };
+    let facts = record.mark_facts();
+    if !facts.unmarked || !facts.origin_qualifies || !record.request_acknowledgement(generation) {
+        return Ok(None);
+    }
+    let mut attempt = state
+        .delivery
+        .allocate(module, generation, Transition::Live)?;
+    attempt.catchup = true;
+    attempt.mark_only = true;
+    attempt.spawn = Some(spawn);
+    Ok(Some(attempt))
 }
 
 impl RuntimeOwner {
@@ -889,6 +1009,7 @@ impl RuntimeOwner {
         register: Duration,
         health: Duration,
         active: bool,
+        authority: Option<std::sync::Arc<crate::spawn_authority::SpawnAuthorityRecord>>,
     ) -> Result<Option<DeliverySpawn>> {
         let mut state = OwnerGuard(
             self.inner.try_lock().map_err(|error| {
@@ -906,6 +1027,10 @@ impl RuntimeOwner {
             self,
         );
         state.store.check()?;
+        // Admission under the stamped gate is the only way to the mark: a
+        // stamp never marks a child admitted before it.
+        let stamped = admission.gated()
+            && state.store.loaded_admission_state().0 == crate::config_store::StoreState::Stamped;
         let spawn = allocate_spawn(
             &mut state,
             module,
@@ -913,6 +1038,7 @@ impl RuntimeOwner {
             at,
             register,
             health,
+            authority.map(|record| (record, stamped)),
         )?;
         state
             .delivery
@@ -1025,6 +1151,7 @@ impl RuntimeOwner {
             spawned_at,
             register_timeout,
             first_health_budget,
+            None,
         )
         .map(Some)
     }
@@ -1305,6 +1432,7 @@ impl RuntimeOwner {
         };
         let mut attempt = state.delivery.allocate(module, generation, transition)?;
         attempt.catchup = catchup;
+        attempt.spawn = state.delivery.children.get(&connection).cloned();
         // Swap readiness completed before promotion. Its new target now gets
         // a full live ACK window, independently of the finished spawn budget.
         // A route obligation still needs its own post-install probe: the
@@ -1471,7 +1599,21 @@ impl RuntimeOwner {
                 return Ok(AppliedDisposition::Ignored);
             }
             state.delivery.attempts.remove(&connection);
-            if !ack {
+            if bound.mark_only {
+                // Asked only for the mark: a refusal or timeout leaves the
+                // spawn unmarked and starts no recovery.
+                return Ok(if ack {
+                    super::mark::acknowledged(self, &state, bound.spawn.as_ref(), bound.generation);
+                    AppliedDisposition::CatchupComplete
+                } else {
+                    super::mark::acknowledgement_refused(self, &state, bound.spawn.as_ref());
+                    AppliedDisposition::Ignored
+                });
+            }
+            if ack {
+                super::mark::acknowledged(self, &state, bound.spawn.as_ref(), bound.generation);
+            } else {
+                super::mark::delivery_failed(self, bound.spawn.as_ref());
                 state.delivery.recoveries.push((
                     connection,
                     module.into(),
@@ -1525,6 +1667,11 @@ impl RuntimeOwner {
                     keep_running,
                 },
             ));
+        }
+        if ack && result.is_ok() {
+            super::mark::acknowledged(self, &state, bound.spawn.as_ref(), bound.generation);
+        } else if !ack {
+            super::mark::delivery_failed(self, bound.spawn.as_ref());
         }
         result?;
         Ok(if ack {

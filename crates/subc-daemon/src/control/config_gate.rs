@@ -390,6 +390,9 @@ impl ControlHandler {
             self.clone(),
             Arc::downgrade(&runtime),
         )));
+        runtime.install_mark_publisher(Arc::new(caller_attestation::ControlMarkPublisher(
+            self.clone(),
+        )));
         self.config_runtime = Some(runtime);
         self
     }

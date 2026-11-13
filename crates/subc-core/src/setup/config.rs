@@ -461,6 +461,19 @@ fn desired_values_with_key(
                 "storage.backend".to_string(),
                 Value::String("sqlite".to_string()),
             );
+            // The shim connects to this supervised gateway's connection file;
+            // installing its binary alone leaves agent connections unavailable.
+            // `reserved` makes the daemon accept this registration only with the
+            // one-time launch nonce it gave the process it spawned, so no other
+            // local program can register as the gateway.
+            values.insert(
+                "modules.subc-mcp".to_string(),
+                serde_json::json!({
+                    "program": binary_home.join(platform_binary("ck-subc-mcp")).to_string_lossy(),
+                    "args": ["module"],
+                    "reserved": true,
+                }),
+            );
         }
         Component::Aft | Component::Mc | Component::Insula | Component::Synapse => {
             let module_id = component.module_id().expect("non-core modules have an id");
@@ -611,6 +624,54 @@ mod tests {
 
     fn fixture_path(name: &str) -> ScratchDir {
         ScratchDir::new(name)
+    }
+
+    #[test]
+    fn core_gateway_fresh_plan_configures_the_reserved_module() {
+        let root = fixture_path("core-gateway-fresh");
+        let change = plan_component(root.join("subc.jsonc"), Component::Core, &root)
+            .expect("plan")
+            .expect("fresh config changes");
+        let planned: Value = serde_json::from_str(&change.after).expect("json");
+        let binary = if cfg!(windows) {
+            "ck-subc-mcp.exe"
+        } else {
+            "ck-subc-mcp"
+        };
+        assert_eq!(
+            planned["modules"]["subc-mcp"],
+            serde_json::json!({
+                "program": root.join(binary).to_string_lossy(),
+                "args": ["module"],
+                "reserved": true,
+            })
+        );
+    }
+
+    #[test]
+    fn core_gateway_existing_correct_entry_is_untouched() {
+        let root = fixture_path("core-gateway-existing");
+        let config = root.join("subc.jsonc");
+        let original = format!(
+            "{{\n  // operator's gateway entry\n  \"version\": 1,\n  \"storage\": {{\"backend\": \"sqlite\"}},\n  \"modules\": {{\"subc-mcp\": {{\"program\": {}, \"args\": [\"module\"], \"reserved\": true}}}}\n}}\n",
+            serde_json::to_string(&root.join(platform_binary("ck-subc-mcp"))).unwrap()
+        );
+        fs::write(&config, &original).unwrap();
+        assert!(plan_component(&config, Component::Core, &root)
+            .expect("matching config")
+            .is_none());
+        assert_eq!(fs::read_to_string(&config).unwrap(), original);
+    }
+
+    #[test]
+    fn core_gateway_conflicting_entry_refuses_by_name_without_writing() {
+        let root = fixture_path("core-gateway-conflict");
+        let config = root.join("subc.jsonc");
+        let original = r#"{"version":1,"storage":{"backend":"sqlite"},"modules":{"subc-mcp":{"program":"operator-gateway"}}}"#;
+        fs::write(&config, original).unwrap();
+        let conflict = plan_component(&config, Component::Core, &root).expect_err("conflict");
+        assert_eq!(conflict.key, "modules.subc-mcp");
+        assert_eq!(fs::read_to_string(&config).unwrap(), original);
     }
 
     #[test]
@@ -975,12 +1036,15 @@ mod tests {
             r#"{"version":1,"storage":{"backend":"sqlite","data_home":"/srv/ck"},"modules":{}}"#,
         )
         .expect("write");
-        assert!(
-            plan_component(&explicit, Component::Core, root.path())
-                .expect("plan")
-                .is_none(),
-            "an explicit data_home under the same backend is already correct"
-        );
+        let change = plan_component(&explicit, Component::Core, root.path())
+            .expect("plan")
+            .expect("gateway is missing");
+        apply(&change).expect("apply gateway");
+        let written: Value = serde_json::from_str(&fs::read_to_string(&explicit).unwrap()).unwrap();
+        assert_eq!(written["storage"]["data_home"], "/srv/ck");
+        assert!(plan_component(&explicit, Component::Core, root.path())
+            .expect("plan")
+            .is_none());
 
         let other = root.join("other.jsonc");
         fs::write(
@@ -1047,7 +1111,7 @@ mod tests {
         fs::write(&config, r#"{"version":1,"storage":{"backend":"sqlite"}}"#).expect("write");
         let keys =
             pending_dotted_keys(&config, Component::Core, root.path(), None).expect("pending");
-        assert!(keys.is_empty(), "no core keys remain to write: {keys:?}");
+        assert_eq!(keys, ["modules.subc-mcp"]);
         assert!(restart_required_from_pending_keys(true, &keys).is_empty());
     }
 }

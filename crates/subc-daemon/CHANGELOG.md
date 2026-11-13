@@ -313,6 +313,50 @@
 
 - Explicitly accept subc-presence's non-interactive policy authorization for legacy privileged-operation prompts and module `operator.confirm` requests, preserving their existing behavior.
 
+## 0.44.14
+
+- Satisfy Rust 1.100 clippy (`needless_bool` in the running-image match,
+  `needless_range_loop` in an overload-hold test). No behaviour change.
+
+## 0.44.13
+
+- Add supervisor `state` and `expected_back` recovery metadata to route-open
+  availability refusals for supervised targets, preserving existing codes,
+  messages and readiness details. Unknown recovery verdicts remain absent;
+  required-capability refusals do not predict another module's recovery.
+  Declared-not-ready, not-yet-registered (`module_warming`) and planned-replacement
+  refusals expect the module to serve again without spending crash-restart
+  budget, even when that budget is zero.
+
+## 0.44.12
+
+- Hold silence-based health restarts while the host is overloaded, using distinct late modules and a daemon scheduler-lag tick over a 60-second window. Held probes report degraded health with `host overloaded`; lane loss, process exits, and restart budgets keep their existing behavior. Resume counting new failures when the hold clears, and log hold transitions.
+
+## 0.44.11
+
+- Test-only: the resource fixture's CPU-burning child no longer waits forever for the test's next marker. It gives up after a minute, or as soon as the test's scratch directory is gone, so a failed or cancelled test run no longer leaves it running. No daemon runtime changes.
+
+## 0.44.10
+
+- Test-only: let resource fixtures exit cooperatively after supervisor draining begins on Windows. Hold the shared resource-reader isolation guard only during reader work, not fixture setup and shutdown. No daemon runtime changes.
+
+## 0.44.9
+
+- Advertise and serve `catalog.update_role_declarations` on registered module connections. Replace or clear the whole map atomically; refuse invalid maps with `invalid_role_declarations` and preserve the previous catalog entry. Require protocol 0.36.3 and control 0.38.3.
+
+## 0.44.8
+
+- Retain agent-command starts pending validation when its deadline or revision retries are exhausted, without extending the validation window. Acknowledge start-only batches; retain starts but return retryable `busy` for unapplied finished/known entries in mixed batches. Keep retries idempotent, isolate declaration tests from native walk cost, and configure the rescan test's required macOS launch helper.
+- Bypass pre-declaration cached walks when validating pending starts and retry every five seconds while pending starts remain, on every platform, without extra idle walks or extending their 60-second expiry. Isolate cache and pipeline-budget fixtures from native process-walk latency and unrelated reader-pool contention.
+
+## 0.44.7
+
+- Retain agent-command starts whose ownership snapshots are incomplete, reserving root capacity for up to 60 seconds and revalidating on fresh observations. Begin prospective CPU attribution only after acceptance; drop exited or expired pending roots without moving earlier CPU. Keep declaration replies unchanged and wait for acceptance in the Windows finish-accounting fixture.
+
+## 0.44.6
+
+- Wait for complete process-tree observations in Windows resource-accounting tests before checking CPU retention and stopped attribution. Production accounting and its unreadable-tree rules are unchanged.
+
 ## 0.44.5
 
 - Add owner-restricted route.authorize over shared pure route admission, with exact claim matching and restart-stable content versions. Ordinary opens keep their existing refusal precedence; authorization does not promise transient availability.

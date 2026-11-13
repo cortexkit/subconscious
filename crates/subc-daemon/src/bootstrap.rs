@@ -1188,6 +1188,7 @@ async fn serve_bound_daemon(
     let registry = Arc::new(Registry::default());
     let process_liveness = Arc::new(SupervisorProcessLiveness::new());
     let supervisor_handle = SupervisorHandle::new();
+    let _host_health_task = AbortOnDrop::new(supervisor_handle.spawn_host_health_monitor());
     #[cfg(feature = "test-support")]
     supervisor_handle.set_shutdown_intent_window(shutdown_intent_window);
     let connected_clients = ConnectedClients::new();

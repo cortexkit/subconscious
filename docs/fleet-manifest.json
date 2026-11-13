@@ -94,9 +94,9 @@
       "acquisition": "source",
       "lock_refresh": "manual"
     },
-    "prefrontal-routing": {
+    "striatum": {
       "repo": "cortexkit/striatum",
-      "binary": "ck-prefrontal-routing",
+      "binary": "ck-striatum",
       "acquisition": "source",
       "lock_refresh": "manual"
     },

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     fmt,
     sync::{Mutex, MutexGuard},
@@ -642,6 +642,28 @@ impl Registry {
             .lock_inner()?
             .find_by_connection(connection_id)
             .map(|(_, registration)| registration.clone()))
+    }
+
+    /// Replace only the validated role declarations owned by this connection.
+    pub fn replace_role_declarations_for_connection(
+        &self,
+        connection_id: ConnectionId,
+        role_declarations: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<Option<ModuleRegistration>, RegistryError> {
+        let mut inner = self.lock_inner()?;
+        let Some((slot, _)) = inner.find_by_connection(connection_id) else {
+            return Ok(None);
+        };
+        let registration = inner
+            .registration_mut(slot, connection_id)
+            .expect("registration discovered under the same registry lock must still exist");
+        registration.manifest.role_declarations = role_declarations;
+        let updated = registration.clone();
+        if matches!(slot, SlotKind::Active) && !inner.unpublished.contains(&connection_id) {
+            inner.bump_generation();
+        }
+        inner.notify_module_changed(&updated.manifest.module_id);
+        Ok(Some(updated))
     }
 
     /// Replace the provider role list and, when supplied, the attested capability

@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
     fs,
+    future::Future,
+    io::{Read, Seek, SeekFrom},
+    panic::Location,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -96,9 +99,56 @@ impl RunningDaemon {
 impl Drop for RunningDaemon {
     fn drop(&mut self) {
         self.task.abort();
+        if std::thread::panicking() {
+            // The in-process daemon has no log sink. Preserve captured module
+            // output in the test log before the runner discards the fixture.
+            if let Ok(entries) = fs::read_dir(self.temp_dir.join("run").join("logs")) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.to_string_lossy().ends_with(".stderr.log") {
+                        match captured_log_tail(&path) {
+                            Ok(tail) => eprintln!(
+                                "Captured module output {} (last up to 40 lines / 64 KiB):\n{tail}",
+                                path.display()
+                            ),
+                            Err(error) => eprintln!("Cannot read {}: {error}", path.display()),
+                        }
+                    }
+                }
+            }
+        }
         // The temp dir is owned by the `cortexkit_test_support::ScratchDir` guard, whose `Drop` removes
         // the tree (or preserves it on panic).
     }
+}
+
+fn captured_log_tail(path: &Path) -> std::io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let start = file.metadata()?.len().saturating_sub(64 * 1024);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::new();
+    file.take(64 * 1024).read_to_end(&mut bytes)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines().rev().take(40).collect::<Vec<_>>();
+    lines.reverse();
+    Ok(lines.join("\n"))
+}
+
+#[test]
+fn module_capture_tail_is_bounded() {
+    let dir = unique_temp_dir("daemon-module-log-tail");
+    let path = dir.join("module.stderr.log");
+    let text = (0..45)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    fs::write(&path, text).unwrap();
+    let tail = captured_log_tail(&path).unwrap();
+    assert_eq!(tail.lines().count(), 40);
+    assert!(tail.starts_with("line 5\n"));
+    assert!(tail.ends_with("\nline 44"));
+
+    fs::write(&path, "x".repeat(128 * 1024)).unwrap();
+    assert_eq!(captured_log_tail(&path).unwrap().len(), 64 * 1024);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1776,42 +1826,52 @@ fn module_doc(
     })
 }
 
-async fn wait_for_client(path: &Path, wait: Duration) -> TcpStream {
-    let deadline = Instant::now() + wait;
-    loop {
-        match connect_authed_client(path).await {
-            Ok(client) => return client,
-            Err(err) if Instant::now() < deadline => {
-                let _ = err;
-                sleep(Duration::from_millis(20)).await;
+#[track_caller]
+fn wait_for_client(path: &Path, wait: Duration) -> impl Future<Output = TcpStream> + '_ {
+    let caller = Location::caller();
+    async move {
+        let deadline = Instant::now() + wait;
+        loop {
+            match connect_authed_client(path).await {
+                Ok(client) => return client,
+                Err(err) if Instant::now() < deadline => {
+                    let _ = err;
+                    sleep(Duration::from_millis(20)).await;
+                }
+                Err(err) => panic!(
+                    "daemon did not accept authenticated client within {wait:?} at {caller}: {err}"
+                ),
             }
-            Err(err) => panic!("daemon did not accept authenticated client within {wait:?}: {err}"),
         }
     }
 }
 
-async fn wait_for_supervisor_entry(
-    path: &Path,
-    module_id: &str,
-    predicate: impl Fn(&SupervisorEntry) -> bool,
+#[track_caller]
+fn wait_for_supervisor_entry<'a>(
+    path: &'a Path,
+    module_id: &'a str,
+    predicate: impl Fn(&SupervisorEntry) -> bool + 'a,
     wait: Duration,
-) -> SupervisorEntry {
-    let deadline = Instant::now() + wait;
-    let mut corr = 1_000;
-    loop {
-        let modules = supervisor_modules(path, corr).await;
-        if let Some(entry) = modules
-            .into_iter()
-            .find(|entry| entry.module_id == module_id && predicate(entry))
-        {
-            return entry;
+) -> impl Future<Output = SupervisorEntry> + 'a {
+    let caller = Location::caller();
+    async move {
+        let deadline = Instant::now() + wait;
+        let mut corr = 1_000;
+        loop {
+            let modules = supervisor_modules(path, corr).await;
+            if let Some(entry) = modules
+                .into_iter()
+                .find(|entry| entry.module_id == module_id && predicate(entry))
+            {
+                return entry;
+            }
+            if Instant::now() >= deadline {
+                let modules = supervisor_modules(path, corr + 10_000).await;
+                panic!("module {module_id} did not reach expected supervisor state within {wait:?} at {caller}; modules: {modules:?}");
+            }
+            corr += 1;
+            sleep(Duration::from_millis(20)).await;
         }
-        if Instant::now() >= deadline {
-            let modules = supervisor_modules(path, corr + 10_000).await;
-            panic!("module {module_id} did not reach expected supervisor state within {wait:?}; modules: {modules:?}");
-        }
-        corr += 1;
-        sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -1823,18 +1883,28 @@ async fn supervisor_modules(path: &Path, corr: u64) -> Vec<SupervisorEntry> {
     }
 }
 
-async fn wait_for_catalog_module(path: &Path, module_id: &str, wait: Duration) {
-    let deadline = Instant::now() + wait;
-    let mut corr = 2_000;
-    loop {
-        if catalog_modules(path, Some(module_id), corr).await.len() == 1 {
-            return;
+#[track_caller]
+fn wait_for_catalog_module<'a>(
+    path: &'a Path,
+    module_id: &'a str,
+    wait: Duration,
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        let deadline = Instant::now() + wait;
+        let mut corr = 2_000;
+        loop {
+            if catalog_modules(path, Some(module_id), corr).await.len() == 1 {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "module {module_id} did not register in catalog within {wait:?} at {caller}"
+                );
+            }
+            corr += 1;
+            sleep(Duration::from_millis(20)).await;
         }
-        if Instant::now() >= deadline {
-            panic!("module {module_id} did not register in catalog within {wait:?}");
-        }
-        corr += 1;
-        sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -1934,42 +2004,58 @@ async fn supervisor_rescan_error(path: &Path, corr: u64) -> ErrorBody {
     .expect_err("supervisor.rescan should return a typed error")
 }
 
-async fn wait_for_supervisor_absent(path: &Path, module_id: &str, wait: Duration) {
-    let deadline = Instant::now() + wait;
-    let mut corr = 3_000;
-    loop {
-        if supervisor_modules(path, corr)
-            .await
-            .iter()
-            .all(|entry| entry.module_id != module_id)
-        {
-            return;
+#[track_caller]
+fn wait_for_supervisor_absent<'a>(
+    path: &'a Path,
+    module_id: &'a str,
+    wait: Duration,
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        let deadline = Instant::now() + wait;
+        let mut corr = 3_000;
+        loop {
+            if supervisor_modules(path, corr)
+                .await
+                .iter()
+                .all(|entry| entry.module_id != module_id)
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "module {module_id} remained in supervisor.list after {wait:?} at {caller}"
+            );
+            corr += 1;
+            sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            Instant::now() < deadline,
-            "module {module_id} remained in supervisor.list after {wait:?}"
-        );
-        corr += 1;
-        sleep(Duration::from_millis(20)).await;
     }
 }
 
-async fn wait_for_catalog_absent(path: &Path, module_id: &str, wait: Duration) {
-    let deadline = Instant::now() + wait;
-    let mut corr = 4_000;
-    loop {
-        if catalog_modules(path, Some(module_id), corr)
-            .await
-            .is_empty()
-        {
-            return;
+#[track_caller]
+fn wait_for_catalog_absent<'a>(
+    path: &'a Path,
+    module_id: &'a str,
+    wait: Duration,
+) -> impl Future<Output = ()> + 'a {
+    let caller = Location::caller();
+    async move {
+        let deadline = Instant::now() + wait;
+        let mut corr = 4_000;
+        loop {
+            if catalog_modules(path, Some(module_id), corr)
+                .await
+                .is_empty()
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "module {module_id} remained in catalog after {wait:?} at {caller}"
+            );
+            corr += 1;
+            sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            Instant::now() < deadline,
-            "module {module_id} remained in catalog after {wait:?}"
-        );
-        corr += 1;
-        sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -2051,7 +2137,7 @@ where
         .await
         .unwrap();
     stream.flush().await.unwrap();
-    let response = read_frame_timeout(stream).await;
+    let response = read_frame_timeout_for(stream, format!("tool {name} corr={corr}")).await;
     assert_eq!(response.header.ty, FrameType::Response);
     assert_eq!(response.header.channel, route.channel);
     assert_eq!(response.header.corr, corr);
@@ -2083,11 +2169,12 @@ async fn control_rpc_result_on_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let description = format!("control RPC {request:?} corr={corr}");
     write_frame(stream, &control_request_frame(corr, request))
         .await
         .unwrap();
     stream.flush().await.unwrap();
-    let frame = read_frame_timeout(stream).await;
+    let frame = read_frame_timeout_for(stream, description).await;
     assert_eq!(frame.header.channel, 0);
     assert_eq!(frame.header.corr, corr);
     match frame.header.ty {
@@ -2160,18 +2247,65 @@ fn data_request(route: RouteHandle, corr: u64, body: &[u8]) -> Frame {
     .unwrap()
 }
 
-async fn read_frame_timeout<S>(stream: &mut S) -> Frame
+// Capture the call site before constructing the future: #[track_caller] on an
+// async fn does not propagate the caller location when the future is polled.
+#[track_caller]
+fn read_frame_timeout<S>(stream: &mut S) -> impl Future<Output = Frame> + '_
 where
     S: AsyncRead + Unpin,
 {
-    timeout(READ_TIMEOUT, async {
-        read_frame(stream)
-            .await
-            .unwrap()
-            .expect("connection should stay open")
-    })
-    .await
-    .expect("timed out waiting for frame")
+    read_frame_timeout_for(stream, "frame".to_string())
+}
+
+#[track_caller]
+fn read_frame_timeout_for<S>(
+    stream: &mut S,
+    description: String,
+) -> impl Future<Output = Frame> + '_
+where
+    S: AsyncRead + Unpin,
+{
+    let caller = Location::caller();
+    async move {
+        timeout(READ_TIMEOUT, async {
+            read_frame(stream)
+                .await
+                .unwrap()
+                .expect("connection should stay open")
+        })
+        .await
+        .unwrap_or_else(|error| panic!("timed out waiting for {description} at {caller}: {error}"))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn frame_timeout_reports_call_site() {
+    let (_writer, mut reader) = tokio::io::duplex(64);
+    let caller_line = line!() + 2;
+    let task = tokio::spawn(async move {
+        read_frame_timeout(&mut reader).await;
+    });
+    let error = task
+        .await
+        .expect_err("a frame that never arrives must time out");
+    let message = error.into_panic().downcast::<String>().unwrap();
+    assert!(message.contains("timed out waiting for frame"), "{message}");
+    assert!(
+        message.contains(&format!("{}:{caller_line}:", file!())),
+        "{message}"
+    );
+}
+
+#[tokio::test]
+#[should_panic(expected = "module never-registers did not register in catalog")]
+async fn catalog_wait_is_bounded_for_unregistered_module() {
+    let daemon = RunningDaemon::start("daemon-catalog-wait-bounded", None).await;
+    wait_for_catalog_module(
+        &daemon.connection_file_path,
+        "never-registers",
+        Duration::from_millis(100),
+    )
+    .await;
 }
 
 fn unique_temp_dir(name: &str) -> ScratchDir {

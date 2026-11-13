@@ -485,16 +485,12 @@ async fn spawned_executables_are_ckdev_copies() {
 }
 
 fn test_module(id: &str) -> Module {
-    // Cargo test builds examples beside the integration-test deps directory, even
-    // with a custom target directory or a release profile. A direct executable
+    // Cargo test builds examples in the profile folder's examples/, even with a
+    // custom target directory or a release profile. A direct executable
     // preserves the image identity checked by macOS's privacy trampoline.
-    let executable = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples/bus-test-module");
+    let executable = cortexkit_test_support::cargo_profile_dir()
+        .join("examples")
+        .join(format!("bus-test-module{}", std::env::consts::EXE_SUFFIX));
     assert!(
         executable.is_file(),
         "Cargo must build the bus-test-module example"

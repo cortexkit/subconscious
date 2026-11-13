@@ -29,8 +29,9 @@ use subc_protocol::{
         validate_hello_display_name, validate_hello_event_declarations,
         validate_hello_flow_operations, validate_hello_operation_deferral,
         validate_hello_rich_ui_descriptor, validate_hello_role_declarations,
-        validate_hello_self_signal_declarations, CapabilityDeclarations, CapabilityNeed,
-        Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
+        validate_hello_self_signal_declarations, validate_role_declarations_value,
+        CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
+        ProviderRole,
     },
     peer::{ObservedPeer, RouteBindPeer, OBSERVED_PEER_CAPABILITY, OPERATOR_APP_CAPABILITY},
     scope::{
@@ -42,7 +43,7 @@ use subc_protocol::{
         validate_role_versions, HealthReport, ModuleControlPush, ModuleControlRequest,
         ModuleControlRequestFromModule, ModuleControlResponse, ModuleControlResponseToModule,
         OperatorConfirmRequest, MODULE_CONTROL_OP_HEALTH_CHECK, MODULE_TO_SUBC_OP_CATALOG_UPDATE,
-        ROLE_VERSIONS_FIELD,
+        MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS, ROLE_VERSIONS_FIELD,
     },
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
     Priority, RouteTarget, PROTOCOL_VERSION,
@@ -162,6 +163,7 @@ const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
     "claim.mint",
     "claim.present",
     MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+    MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS,
     "supervisor.live_roots",
     "supervisor.agent_commands",
     SCOPE_SYNC_OP,
@@ -2298,6 +2300,7 @@ impl ControlHandler {
                         matches!(
                             probe.op.as_str(),
                             "catalog.update"
+                                | "catalog.update_role_declarations"
                                 | "scope.describe"
                                 | "supervisor.live_roots"
                                 | "activity.record"
@@ -4468,6 +4471,13 @@ impl ControlHandler {
                 capabilities,
                 ready,
             } => self.handle_catalog_update(connection_id, frame, provides, capabilities, ready),
+            ModuleControlRequestFromModule::CatalogUpdateRoleDeclarations { role_declarations } => {
+                self.handle_catalog_update_role_declarations(
+                    connection_id,
+                    frame,
+                    role_declarations,
+                )
+            }
             ModuleControlRequestFromModule::LiveRoots {} => {
                 let registered = self
                     .registry
@@ -5039,6 +5049,41 @@ impl ControlHandler {
             &response,
             "ModuleControlResponseToModule::ScopeDescribe",
         )?])
+    }
+
+    fn handle_catalog_update_role_declarations(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+        role_declarations: serde_json::Value,
+    ) -> Result<Vec<Frame>, RouterError> {
+        if let Err(err) = validate_role_declarations_value(Some(&role_declarations)) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_role_declarations",
+                err.to_string(),
+            )?]);
+        }
+        let declarations = serde_json::from_value(role_declarations)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        if self
+            .registry
+            .replace_role_declarations_for_connection(connection_id, declarations)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+            .is_none()
+        {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "not_registered",
+                "catalog.update_role_declarations requires an active module registration owned by this connection",
+            )?]);
+        }
+        control_response_body_frame(
+            &frame,
+            &ModuleControlResponseToModule::CatalogUpdateRoleDeclarations {},
+            "ModuleControlResponseToModule::CatalogUpdateRoleDeclarations",
+        )
+        .map(|frame| vec![frame])
     }
 
     fn handle_catalog_update(
@@ -5771,7 +5816,55 @@ impl ControlHandler {
         message: impl Into<String>,
     ) -> Result<Frame, RouterError> {
         self.observe_route_open_refusal(ctx, caller, module_id, reason, code);
-        control_error_frame(frame, code, message.into())
+        let detail = if matches!(
+            reason,
+            "registration_not_active"
+                | "supervisor_not_live"
+                | "no_forwarding_connection"
+                | "reloading"
+        ) {
+            // A planned restart, reload or swap is already replacing the
+            // process; it does not need a slot in the crash-restart budget.
+            let expected_back = (reason == "reloading").then_some(true);
+            self.route_open_recovery_detail(module_id, frame.header.corr, None, expected_back)?
+        } else {
+            None
+        };
+        control_error_body_frame(
+            frame,
+            ErrorBody {
+                code: code.to_string(),
+                message: message.into(),
+                detail,
+            },
+        )
+    }
+
+    fn route_open_recovery_detail(
+        &self,
+        module_id: &str,
+        corr: u64,
+        detail: Option<serde_json::Value>,
+        expected_back: Option<bool>,
+    ) -> Result<Option<serde_json::Value>, RouterError> {
+        let Some((status, _)) = self.supervisor_status(module_id, corr)? else {
+            return Ok(detail);
+        };
+        let mut detail = detail.unwrap_or_else(|| serde_json::json!({}));
+        detail["state"] = serde_json::json!(status.state.to_string());
+        if let Some(expected_back) = expected_back {
+            detail["expected_back"] = serde_json::json!(expected_back);
+        } else if let Some(module) = self.supervisor.get(module_id) {
+            match module.will_recover_after_connection_loss() {
+                Ok(expected_back) => detail["expected_back"] = serde_json::json!(expected_back),
+                Err(err) => warn!(
+                    %module_id,
+                    error = %err,
+                    "failed to read route.open recovery verdict; omitting expected_back"
+                ),
+            }
+        }
+        Ok(Some(detail))
     }
 
     /// Answer a waiting `route.open` whose relayed bind was refused.
@@ -6038,7 +6131,23 @@ impl ControlHandler {
                 status.state, status.enabled, status.live
             )
         };
-        control_error_frame(frame, code, message)
+        // `module_warming` here means the process is starting, running or
+        // being restarted and has not registered yet. Nothing has to be
+        // restarted for it to serve, so the crash budget does not decide it.
+        let expected_back = (code == error_codes::MODULE_WARMING).then_some(true);
+        control_error_body_frame(
+            frame,
+            ErrorBody {
+                code: code.to_string(),
+                message,
+                detail: self.route_open_recovery_detail(
+                    module_id,
+                    frame.header.corr,
+                    None,
+                    expected_back,
+                )?,
+            },
+        )
     }
 
     async fn handle_route_open(
@@ -6232,6 +6341,8 @@ impl ControlHandler {
             // an outage from the caller's side even though its process is up.
             self.route_outages
                 .record_not_serving(&target_module_id, "declared_not_ready");
+            // The registered process can declare itself ready without a
+            // restart, so an exhausted crash budget does not prevent serving.
             return Ok(vec![control_error_body_frame(
                 &frame,
                 ErrorBody {
@@ -6239,9 +6350,12 @@ impl ControlHandler {
                     message: format!(
                         "module_id '{target_module_id}' is registered and has declared itself not ready; retry"
                     ),
-                    detail: Some(serde_json::json!({
-                        "reason": "declared_not_ready"
-                    })),
+                    detail: self.route_open_recovery_detail(
+                        &target_module_id,
+                        frame.header.corr,
+                        Some(serde_json::json!({ "reason": "declared_not_ready" })),
+                        Some(true),
+                    )?,
                 },
             )?]);
         }
@@ -9643,6 +9757,9 @@ fn principal_label(principal: &Principal) -> String {
 fn module_control_request_op(request: &ModuleControlRequestFromModule) -> &'static str {
     match request {
         ModuleControlRequestFromModule::CatalogUpdate { .. } => MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+        ModuleControlRequestFromModule::CatalogUpdateRoleDeclarations { .. } => {
+            MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS
+        }
         ModuleControlRequestFromModule::LiveRoots {} => "supervisor.live_roots",
         ModuleControlRequestFromModule::ScopeSync { .. } => SCOPE_SYNC_OP,
         ModuleControlRequestFromModule::ScopeApply { .. } => SCOPE_APPLY_OP,
@@ -10195,6 +10312,7 @@ pub(crate) fn send_route_control_pushes(
 mod tests {
     include!("control/agent_commands_tests.rs");
     include!("control/resource_revision_tests.rs");
+    include!("control/route_open_recovery_tests.rs");
     #[tokio::test]
     async fn route_busy_wait_attribution_resolves_targets_instead_of_trusting_selectors() {
         let registry = Arc::new(Registry::default());
@@ -10350,10 +10468,10 @@ mod tests {
     ///
     /// `CARGO_BIN_EXE_*` (compile-time `env!` and runtime `std::env::var` alike)
     /// is only populated for `tests/*.rs` integration test binaries -- this file
-    /// compiles as part of the library target, which gets neither. This test's
-    /// own executable path is `<target-dir>/<profile>/deps/subc_core-<hash>`,
-    /// and the sibling binary lives two directories up at
-    /// `<target-dir>/<profile>/fake-aft-stub`.
+    /// compiles as part of the library target, which gets neither. The binary
+    /// lives in the profile folder this test was built into,
+    /// `<target-dir>/<profile>/fake-aft-stub`, which `cargo_profile_bin` finds
+    /// from the test's own path.
     ///
     /// THE BINARY IS NOT ALWAYS THERE, and the existence check below is why.
     /// `cargo test -p subc-core` builds every target including `[[bin]]`, so the
@@ -10365,14 +10483,7 @@ mod tests {
     /// run is worse than one that fails, because it reports health it never
     /// verified.
     fn fake_aft_stub_path() -> PathBuf {
-        let mut path = std::env::current_exe().expect("current_exe available in tests");
-        path.pop(); // .../deps/
-        path.pop(); // .../<profile>/
-        path.push(if cfg!(windows) {
-            "fake-aft-stub.exe"
-        } else {
-            "fake-aft-stub"
-        });
+        let path = cortexkit_test_support::cargo_profile_bin("fake-aft-stub");
         assert!(
             path.exists(),
             "fake-aft-stub not built at {}: run `cargo test -p subc-core` (which builds \
@@ -11279,6 +11390,9 @@ mod tests {
         assert!(ack
             .subc_ops
             .contains(&MODULE_TO_SUBC_OP_CATALOG_UPDATE.to_string()));
+        assert!(ack
+            .subc_ops
+            .contains(&MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS.to_string()));
 
         let registration = registry.get_module("aft").unwrap().unwrap();
         assert_eq!(registration.negotiated_ver, PROTOCOL_VERSION);
@@ -11718,6 +11832,172 @@ mod tests {
             serde_json::to_vec(&body).unwrap(),
         )
         .unwrap()
+    }
+
+    fn update_role_declarations_frame(declarations: Value) -> Frame {
+        Frame::build(
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            303,
+            serde_json::to_vec(&json!({
+                "op": "catalog.update_role_declarations",
+                "role_declarations": declarations,
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn role_declarations_update_replaces_then_clears_catalog() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let (ctx, mut rx) = route_ctx(ConnectionId::new(301));
+        let initial = json!({"media-provider/v1": {"engines": ["old"]}, "old/v1": {}});
+        hello_via_sink(
+            &handler,
+            &ctx,
+            &mut rx,
+            hello_with_role_declarations(initial.clone()),
+        )
+        .await;
+        assert_eq!(
+            role_declarations_catalog(&handler).0["role_declarations"],
+            initial
+        );
+        let before = registry.get_module("role-test").unwrap().unwrap();
+        for declarations in [
+            json!({"media-provider/v1": {"engines": ["new"]}}),
+            json!({}),
+        ] {
+            let response = handler
+                .handle_control_frame(&ctx, update_role_declarations_frame(declarations.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response[0].header.ty, FrameType::Response);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&response[0].body).unwrap(),
+                json!({"op": "catalog.update_role_declarations"})
+            );
+            let (raw, entry) = role_declarations_catalog(&handler);
+            assert_eq!(
+                serde_json::to_value(entry.role_declarations).unwrap(),
+                declarations
+            );
+            if declarations.as_object().unwrap().is_empty() {
+                assert!(raw.get("role_declarations").is_none());
+            } else {
+                assert_eq!(raw["role_declarations"], declarations);
+            }
+            let after = registry.get_module("role-test").unwrap().unwrap();
+            let mut expected = before.manifest.clone();
+            expected.role_declarations = serde_json::from_value(declarations).unwrap();
+            assert_eq!(after.manifest, expected);
+            assert_eq!(after.ready, before.ready);
+        }
+    }
+
+    #[tokio::test]
+    async fn role_declarations_update_refuses_invalid_maps_without_changing_catalog() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(registry);
+        let (ctx, mut rx) = route_ctx(ConnectionId::new(301));
+        let initial = json!({"media-provider/v1": {"engines": ["old"]}});
+        hello_via_sink(
+            &handler,
+            &ctx,
+            &mut rx,
+            hello_with_role_declarations(initial.clone()),
+        )
+        .await;
+        for (invalid, reason) in [
+            (json!(null), "role_declarations must be an object"),
+            (json!([]), "role_declarations must be an object"),
+            (
+                json!({"bad key": {}}),
+                "role_declarations key must use capability-name grammar",
+            ),
+            (
+                json!({"media-provider/v1": []}),
+                "role_declarations values must be objects",
+            ),
+            (
+                json!({"media-provider/v1": {"padding": "x".repeat(16384)}}),
+                "role_declarations exceeds 16384 compact JSON bytes",
+            ),
+        ] {
+            let response = handler
+                .handle_control_frame(&ctx, update_role_declarations_frame(invalid))
+                .await
+                .unwrap();
+            let error = parse_error(&response[0]);
+            assert_eq!(error["code"], "invalid_role_declarations");
+            assert_eq!(error["message"], reason);
+            assert_eq!(
+                role_declarations_catalog(&handler).0["role_declarations"],
+                initial
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn role_declarations_update_is_owned_by_the_registered_connection() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        let (owner, mut owner_rx) = route_ctx(ConnectionId::new(301));
+        let initial = json!({"media-provider/v1": {"engines": ["old"]}});
+        hello_via_sink(
+            &handler,
+            &owner,
+            &mut owner_rx,
+            hello_with_role_declarations(initial.clone()),
+        )
+        .await;
+        let (other, mut other_rx) = route_ctx(ConnectionId::new(302));
+        let replacement = json!({"media-provider/v1": {"engines": ["other"]}});
+        let response = handler
+            .handle_control_frame(&other, update_role_declarations_frame(replacement.clone()))
+            .await
+            .unwrap();
+        assert_eq!(parse_error(&response[0])["code"], "not_registered");
+        hello_via_sink(
+            &handler,
+            &other,
+            &mut other_rx,
+            hello_frame("other", PROTOCOL_VERSION, 304),
+        )
+        .await;
+        let response = handler
+            .handle_control_frame(&other, update_role_declarations_frame(replacement.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response[0].header.ty, FrameType::Response);
+        assert_eq!(
+            serde_json::to_value(
+                registry
+                    .get_module("role-test")
+                    .unwrap()
+                    .unwrap()
+                    .manifest
+                    .role_declarations
+            )
+            .unwrap(),
+            initial
+        );
+        assert_eq!(
+            serde_json::to_value(
+                registry
+                    .get_module("other")
+                    .unwrap()
+                    .unwrap()
+                    .manifest
+                    .role_declarations
+            )
+            .unwrap(),
+            replacement
+        );
     }
 
     fn role_declarations_catalog(handler: &ControlHandler) -> (Value, CatalogEntry) {
@@ -15633,7 +15913,6 @@ mod tests {
 
     #[tokio::test]
     async fn slow_step_before_pid_read_does_not_spend_its_budget() {
-        let _guard = crate::subtree_resources::fault_read_guard().await;
         let dir = cortexkit_test_support::ScratchDir::new("pid-read-budget");
         let supervisor =
             Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
@@ -15672,8 +15951,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         tokio::time::sleep(crate::subtree_resources::READ_TIMEOUT * 2).await;
-        let reading = crate::subtree_resources::read_process(module.clone()).await;
-        module.stop().await.unwrap();
+        let reading = {
+            let _guard = crate::subtree_resources::fault_read_guard().await;
+            crate::subtree_resources::read_process(module.clone()).await
+        };
+        stop_resource_fixture(&module, &dir).await;
         assert!(
             matches!(reading, subc_control::ChildResourceUsage::Measured(_)),
             "{reading:?}"
@@ -15683,10 +15965,39 @@ mod tests {
     #[test]
     fn pid_resource_read_fixture() {
         if std::env::var_os("SUBC_SUBTREE_PID_FIXTURE").is_some() {
-            loop {
-                std::thread::park_timeout(Duration::from_secs(600));
+            let dir = std::path::PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap());
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while !dir.join("stop-module").exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
             }
+            std::fs::write(dir.join("module-stopped"), "").unwrap();
         }
+    }
+
+    async fn stop_resource_fixture(
+        module: &crate::supervise::SupervisedModule,
+        dir: &std::path::Path,
+    ) {
+        let stopping = module.stop();
+        tokio::pin!(stopping);
+        tokio::select! {
+            result = &mut stopping => result.unwrap(),
+            () = async {
+                while module.state().unwrap() != crate::supervise::ModuleState::Draining {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                std::fs::write(dir.join("stop-module"), "").unwrap();
+            } => stopping.await.unwrap(),
+        }
+        #[cfg(windows)]
+        assert!(
+            dir.join("module-stopped").exists(),
+            "the resource fixture must exit cooperatively, not wait for the drain kill"
+        );
+        assert_eq!(
+            module.state().unwrap(),
+            crate::supervise::ModuleState::Stopped
+        );
     }
 
     #[tokio::test]
@@ -15721,7 +16032,6 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_list_reads_process_resources_before_a_stalled_tree() {
-        let _guard = crate::subtree_resources::fault_read_guard().await;
         let dir = cortexkit_test_support::ScratchDir::new("list-process-priority");
         let registry = Arc::new(Registry::default());
         let handle = SupervisorHandle::new();
@@ -15762,13 +16072,15 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let guard = crate::subtree_resources::fault_read_guard().await;
         let (target, release, _) = crate::subtree_resources::held();
         module.set_subtree_target_for_test(target);
         let handler = ControlHandler::new(registry).with_supervisor(handle);
         let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
         let replies = handler.handle_supervisor_list(frame).await.unwrap();
         drop(release);
-        module.stop().await.unwrap();
+        drop(guard);
+        stop_resource_fixture(&module, &dir).await;
         let body: Value = serde_json::from_slice(&replies[0].body).unwrap();
         assert_eq!(
             body["modules"][0]["resources"]["status"], "measured",
@@ -15843,7 +16155,6 @@ mod tests {
 
     #[tokio::test]
     async fn supervisor_list_slow_subtree_does_not_hold_connection_reader() {
-        let _guard = crate::subtree_resources::fault_read_guard().await;
         let registry = Arc::new(Registry::default());
         let handle = SupervisorHandle::new();
         let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
@@ -15864,6 +16175,7 @@ mod tests {
                 true,
             )
             .unwrap();
+        let _guard = crate::subtree_resources::fault_read_guard().await;
         let (target, release, began) = crate::subtree_resources::held();
         // Optional list work may be skipped when its deadline is already spent.
         // Establish the stalled fixture before asking the list to observe it.
@@ -16844,6 +17156,14 @@ mod tests {
         let client_connection = ConnectionId::new(96);
         let (client_ctx, _client_rx) = route_ctx(client_connection);
         let capture = EventCapture::default();
+        // tracing-core decides once per callsite whether its events are enabled,
+        // and caches the answer. If a parallel test with no subscriber reaches
+        // this callsite first, the cached answer is "disabled" and this test's
+        // capture sees nothing. Keeping a second dispatch alive makes tracing-core
+        // ask every live subscriber instead, while only this test's default
+        // receives the events.
+        static INTEREST_ANCHOR: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        INTEREST_ANCHOR.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
         let _subscriber =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
         let (route_task, bind) = relay_route_open(

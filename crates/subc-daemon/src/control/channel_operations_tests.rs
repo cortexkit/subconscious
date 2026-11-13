@@ -226,14 +226,18 @@ async fn channel_operations_catalog_and_activity_record_rows_serve_every_live_ro
     let rig = rig_with(move |handler| handler.with_activity_ledger(&ledger, "roles".into())).await;
     let mut swap = swap_candidate(&rig, "roles-record").await;
     let update = json!({"op":"catalog.update","provides":[],"ready":false});
+    let declarations = operation_body("catalog.update_role_declarations");
     let record =
         json!({"op":"activity.record","kind":"roles-record.settled","summary":"Step done"});
     ok(&ask(&mut swap.incumbent, &update).await);
+    ok(&ask(&mut swap.incumbent, &declarations).await);
     ok(&ask(&mut swap.incumbent, &record).await);
     ok(&ask(&mut swap.candidate, &update).await);
+    ok(&ask(&mut swap.candidate, &declarations).await);
     ok(&ask(&mut swap.candidate, &record).await);
     let _release = cut_over(&rig, &mut swap).await;
     ok(&ask(&mut swap.incumbent, &update).await);
+    ok(&ask(&mut swap.incumbent, &declarations).await);
     ok(&ask(&mut swap.incumbent, &record).await);
     drop(swap);
     drop(rig);
@@ -522,6 +526,8 @@ async fn channel_operations_registration_reads_row_keeps_each_existing_requireme
 fn operation_body(op: &str) -> Value {
     if op == "claim.mint" {
         serde_json::to_value(ClaimMintRequest::new(ClaimPurpose::SelfConnection)).unwrap()
+    } else if op == "catalog.update_role_declarations" {
+        json!({"op":op,"role_declarations":{}})
     } else {
         json!({ "op": op })
     }
@@ -535,6 +541,7 @@ const MODULE_TO_DAEMON_OPERATIONS: &[(&str, bool)] = &[
     ("config.get", true),
     ("config.applied", true),
     ("catalog.update", true),
+    ("catalog.update_role_declarations", true),
     ("activity.record", true),
     ("claim.mint", true),
     ("operator.confirm", true),
@@ -620,6 +627,32 @@ async fn channel_operations_refuse_consumer_claims_and_exited_spawns() {
             "{op}"
         );
     }
+}
+
+#[tokio::test]
+async fn channel_operations_role_declarations_share_catalog_update_refusals() {
+    let mut rig = rig().await;
+    let claim = mint(&mut rig, ClaimPurpose::SelfConnection).await.claim;
+    let mut net = Net::new(rig.router.clone()).await;
+    ok(&net.call(request(ClaimPresentRequest::new(claim))).await);
+    let catalog = json!({"op":"catalog.update","provides":[]});
+    let declarations = operation_body("catalog.update_role_declarations");
+    assert_eq!(
+        code(&ask(&mut net, &catalog).await),
+        CLAIM_OPERATION_NOT_ALLOWED
+    );
+    assert_eq!(
+        code(&ask(&mut net, &declarations).await),
+        CLAIM_OPERATION_NOT_ALLOWED
+    );
+    assert_eq!(
+        code(&after_exit(&rig, &catalog).await),
+        REGISTRATION_CHANNEL_CLOSED
+    );
+    assert_eq!(
+        code(&after_exit(&rig, &declarations).await),
+        REGISTRATION_CHANNEL_CLOSED
+    );
 }
 
 /// A fixture whose handler keeps an activity ledger.
@@ -761,6 +794,7 @@ async fn channel_operations_prefix_registration_dies_with_its_owner() {
     let child_id = child.ctx.connection_id;
     let brokered = [
         json!({"op":"catalog.update","provides":[],"ready":false}),
+        operation_body("catalog.update_role_declarations"),
         json!({"op":"activity.record","kind":"claims:roles-child.settled","summary":"Settled"}),
         json!({"op":"scope.describe","owner":{"kind":"reserved","module_id":"claims-module"},"ref":"missing"}),
         json!({"op":"supervisor.live_roots"}),
@@ -1053,7 +1087,7 @@ async fn channel_operations_declaration_running_during_cleanup_is_refused() {
         serde_json::from_slice::<ErrorBody>(&reply.body)
             .unwrap()
             .message,
-        "resource state is busy after revalidation; retry",
+        "resource state is busy after revalidation; retry uncompleted finished and known entries",
         "the cancelled commit fence, not a timeout, must refuse the declaration"
     );
     cleanup_release.send(()).unwrap();

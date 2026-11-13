@@ -213,12 +213,47 @@ Tests: `connection_describe_wire_shapes` (`crates/subc-control/src/connection_de
 Retry rules for the refusals are in [`wire-contract.md`](wire-contract.md)
 section 5.1.
 
+Availability refusals for a supervised target include `detail.state`, the
+supervisor's module-state string (for example `starting`, `stopped`, `failed` or
+`disabled`), and `detail.expected_back`, the daemon's own verdict that the target
+is expected to serve again without operator action. For a lost process or
+connection, a true verdict means the module is enabled and restarting, has a
+respawn pending, or has restart budget left. It is not a promise that recovery
+will succeed. False means
+the daemon does not expect to bring the module back on its own; an absent verdict
+means unknown, including when the supervisor's recovery state cannot be read.
+
+These details accompany supervised-but-unregistered `module_warming` and
+`target_unavailable` replies, including waiting for a previous process, and the
+registered-target checks for an inactive registration, a non-live supervisor
+process, no forwarding connection, and `module_reloading`. A
+`module_warming` refusal with `detail.reason: "declared_not_ready"` keeps that
+reason and adds the recovery details for supervised targets. Targets that
+registered without a supervisor entry omit both new fields.
+For a supervised target, `declared_not_ready` always reports `expected_back: true`:
+the registered process can become ready without restarting. A supervised-but-unregistered
+`module_warming` also reports true, because the process is starting, running or
+restarting and only has to register. A `module_reloading` refusal also reports
+true, whether the daemon is draining the module or the supervisor is replacing its
+process, because the planned restart, reload or
+swap is already replacing the process and does not spend crash-restart budget.
+An exhausted crash budget does not change these verdicts; if the replacement
+fails, later opens can report `failed` and `expected_back: false`.
+`required_capability_unprovided` keeps its reason and capability details without
+`expected_back`: recovery depends on another module. `unknown_module`,
+`module_removed` and `module_no_protocol` are unchanged.
+
 ## 3. Daemon pushes to clients
 
 | Op | When | Fields |
 | --- | --- | --- |
 | `route.closing` | A module's routes are about to close. | `module_id`, `channels` (this connection's only), `reason`. |
 | `route.closed` | The routes have closed. | As above, plus `drained` (whether in-flight work finished), `abandoned` (pending binds forced down), `excluded_subscriptions`, and `terminal` (whether the daemon will leave the module down until an operator acts). |
+
+An absent `terminal` means unknown, as with older daemons. The Rust SDK preserves
+the optional flag on route-end `OutcomeUnknown` and `NotSent` errors through
+`CallError::terminal()`, alongside the unchanged `close_reason()`. The flag is
+informational: restart and reload reasons still classify as `MayReopen`.
 
 `reason` is one of `reload`, `restart`, `disable`, `crash`,
 `capability_denied`, `scope_ended`, `scope_carrier_removed`,
@@ -261,9 +296,44 @@ to a module that lists it.
 | --- | --- | --- |
 | `route.status` | Push | Report a status string for one of the module's routes, read back by `route.poll`. |
 | `catalog.update` | Request | Replace the module's `provides` roles, optionally its capability declaration, and optionally its readiness, without re-registering. Test: `catalog_update_refreshes_catalog_without_disrupting_bound_routes` (`crates/subc-core/tests/catalog_update.rs`). |
+| `catalog.update_role_declarations` | Request | Replace the module's complete `role_declarations` map, or clear it with `{}`, without changing provider roles, capabilities or readiness. Served since daemon 0.44.9. |
 | `supervisor.live_roots` | Request | Count live and pending routes per canonical project root, also including the workdir of each bound scoped route. A route contributes once when both paths match. |
 | `scope.sync`, `scope.apply`, `scope.describe` | Request | Register, change and read scopes. See [`scopes.md`](scopes.md). |
 | `operator.confirm` | Request | Ask the person at the machine to confirm one in-flight write (section 5.1). |
+
+### Live role-declaration updates
+
+Send a channel-0 `REQUEST` on the module's own HELLO-registered connection:
+
+```json
+{"op":"catalog.update_role_declarations","role_declarations":{"media-provider/v1":{"engines":["image"]}}}
+```
+
+The map replaces the whole registered map, not individual entries; keys absent
+from the replacement disappear. `"role_declarations": {}` clears it. After the
+daemon replies `{"op":"catalog.update_role_declarations"}`, `catalog.list`
+serves the replacement (an empty map is omitted from catalog entries). The body
+does not name a module: ownership comes only from the registered connection.
+`catalog.update` still leaves role declarations unchanged.
+
+The daemon advertises `catalog.update_role_declarations` in `HELLO_ACK.subc_ops`.
+Check that exact op, not `catalog.update`: older daemons refuse an unknown op
+rather than silently accepting an unknown member of `catalog.update`.
+Rust's `ModuleHandle::update_role_declarations` returns
+`CatalogUpdateError::NotSupported` without sending when the op is not advertised.
+
+Refusals are channel-0 `ERROR` frames and leave the previous map unchanged:
+
+| Code | Meaning |
+| --- | --- |
+| `not_registered` | The request is not on the module's own registered connection. |
+| `invalid_control_body` | The request body is malformed, including a missing `role_declarations` member. |
+| `invalid_role_declarations` | The member is not an object, a key violates capability-name grammar, a value is not an object, or the whole map exceeds 16384 compact JSON bytes. The error message names the failed rule. |
+
+The map follows the same shape, key and byte-limit rules as HELLO. Unlike HELLO,
+which drops a bad map with a warning and continues registration, live updates
+are refused. Role-specific object contents remain opaque to the daemon. The Rust
+SDK preserves validation refusals as `CatalogUpdateError::Rejected(ErrorBody)`.
 
 ### 5.1 `operator.confirm`
 

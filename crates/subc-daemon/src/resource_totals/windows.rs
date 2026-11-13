@@ -143,19 +143,32 @@ mod stopped_group_tests {
 
     #[test]
     fn stopped_windows_command_emits_no_agent_groups() {
-        let table = ProcessTable::read().unwrap();
-        let member = table.process(std::process::id()).unwrap();
-        let root = AgentCommandRoot {
-            pid: member.pid,
-            start_time_ms: member.start_time_ms,
-        };
-        let mut command = Command {
-            native_start: member.start_time,
-            live: true,
-            ..Command::default()
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (table, root, mut command, live) = loop {
+            let table = ProcessTable::read().unwrap();
+            if let Some(member) = table.process(std::process::id()) {
+                let root = AgentCommandRoot {
+                    pid: member.pid,
+                    start_time_ms: member.start_time_ms,
+                };
+                let command = Command {
+                    native_start: member.start_time,
+                    live: true,
+                    ..Command::default()
+                };
+                if let Some(live) = command.live_members(root, &table) {
+                    break (table, root, command, live);
+                }
+            }
+            // Other tests' descendants can exit during this process's tree walk.
+            // Establish a complete live tree before testing stopped attribution.
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a complete live command tree"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         };
         let module = Module::default();
-        let live = command.live_members(root, &table).unwrap();
         assert!(!module
             .group_credit
             .groups(&live, true, None)

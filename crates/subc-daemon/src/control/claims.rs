@@ -2702,6 +2702,7 @@ pub(crate) mod tests {
         for op in [
             "unknown.push",
             "catalog.update",
+            "catalog.update_role_declarations",
             "scope.sync",
             "config.applied",
         ] {
@@ -2955,6 +2956,7 @@ pub(crate) mod tests {
         );
         for body in [
             serde_json::json!({"op":"catalog.update","provides":[],"ready":false}),
+            serde_json::json!({"op":"catalog.update_role_declarations","role_declarations":{}}),
             serde_json::json!({"op":"supervisor.live_roots"}),
             serde_json::json!({"op":"activity.record","kind":"claims:brokered.settled","summary":"Worker settled"}),
             serde_json::json!({"op":"scope.describe","owner":{"kind":"reserved","module_id":"claims-module"},"ref":"missing"}),

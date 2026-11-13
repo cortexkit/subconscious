@@ -20,6 +20,15 @@
   refusing relative, duplicated and otherwise unknown startup arguments. Without
   that argument the daemon opens no configuration authority store.
 
+## 0.21.5
+
+- Configure the reserved, supervised MCP gateway during core setup, including repair of older installs missing its entry, and rescan the daemon after core configuration.
+- List only optional modules available to add on this host in bare setup and dry-run output, without prompting for a selection. Correct the Insula note: cookies come only from vault deposits on every OS, never browser stores.
+
+## 0.21.4
+
+- Raise dependency pins to subc-daemon 0.44.9, subc-client-rs 0.38.4, subc-control 0.38.3 and subc-protocol 0.36.3.
+
 ## 0.21.3
 
 - Require subc-client-rs 0.38.0 for scoped managed calls and watches. This dependency-only patch keeps wire behavior unchanged.

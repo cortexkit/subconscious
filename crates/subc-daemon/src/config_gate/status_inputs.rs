@@ -171,7 +171,8 @@ mod tests {
             ("config_gate/program.rs", 1),
             ("config_gate/runtime.rs", 1),
             ("config_store/writer_lock.rs", 1),
-            ("control.rs", 3),
+            // Inline test reads, including XDG_DATA_HOME for the fixture stop marker.
+            ("control.rs", 4),
             ("daemon_config.rs", 4),
             ("live_children.rs", 1),
             ("privileged_prompt.rs", 1),

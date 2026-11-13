@@ -1,5 +1,5 @@
 use super::*;
-use crate::resource_totals::{CommitFence, Declaration};
+use crate::resource_totals::{CommitFence, Declaration, DeclarationArrival};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Weak,
@@ -8,6 +8,8 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 mod refusals;
 
 const IN_FLIGHT: usize = 4;
+// Native macOS process-table walks measured 104–131 ms, so even one revision
+// conflict can exhaust this window. Retain starts on expiry; other entries must stay retryable.
 const VALIDATION_WINDOW: Duration = Duration::from_millis(200);
 const REPLY_WINDOW: Duration = Duration::from_millis(200);
 
@@ -30,6 +32,7 @@ struct Work {
     frame: Frame,
     batch: Declaration,
     fence: Arc<CommitFence>,
+    arrival: DeclarationArrival,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -96,6 +99,7 @@ impl Queues {
         frame: Frame,
         batch: Declaration,
     ) -> Result<Vec<Frame>, RouterError> {
+        let arrival = handler.resource_tracker.declaration_arrival();
         if let Some(error) = super::check_batch(
             &frame,
             batch.started.len(),
@@ -151,6 +155,7 @@ impl Queues {
             frame,
             batch,
             fence,
+            arrival,
             _permit: permit,
         });
         if let Err(error) = sent {
@@ -217,15 +222,19 @@ async fn run(queue: Weak<Queue>, mut receiver: mpsc::Receiver<Work>) {
         let corr = work.frame.header.corr;
         let started = work.batch.started.clone();
         let fence = Arc::clone(&work.fence);
+        let retention = Arc::new(CommitFence::default());
         let reply = validate(
             work.handler,
             work.ctx.connection_id,
             work.frame.clone(),
             work.batch,
             work.fence,
+            Arc::clone(&retention),
+            work.arrival,
         )
         .await;
         if !fence.committed()
+            && !retention.committed()
             && reply.as_ref().map_or(true, |frames| {
                 frames
                     .iter()
@@ -263,6 +272,8 @@ async fn validate(
     frame: Frame,
     batch: Declaration,
     fence: Arc<CommitFence>,
+    retention: Arc<CommitFence>,
+    arrival: DeclarationArrival,
 ) -> Result<Vec<Frame>, RouterError> {
     static SLOTS: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
     // Declarations have their own bounded readers, not the list/sampler pool.
@@ -275,11 +286,39 @@ async fn validate(
         .and_then(|owner| owner.agent_validation_window_for_test())
         .map_or(deadline, |window| tokio::time::Instant::now() + window);
     let corr = frame.header.corr;
-    let timed_out = || RouterError::backend(0, corr, "agent command validation timed out; retry");
-    let permit = tokio::time::timeout_at(deadline, Arc::clone(slots).acquire_owned())
-        .await
-        .map_err(|_| timed_out())?
-        .map_err(|_| timed_out())?;
+    let timeout_frame = frame.clone();
+    let pending_handler = handler.clone();
+    let pending_batch = batch.clone();
+    let timed_out = || {
+        control_error_frame(
+            &timeout_frame,
+            "busy",
+            "agent command validation timed out; retry",
+        )
+        .map(|reply| vec![reply])
+    };
+    let retain = || {
+        // An empty start batch has no pending metadata to retain. Answer with
+        // the same busy frame without waiting for the registry after expiry.
+        if pending_batch.started.is_empty() {
+            return timed_out();
+        }
+        pending_handler.handle_agent_commands_fenced(
+            connection,
+            timeout_frame.clone(),
+            pending_batch.clone(),
+            DeclarationValidation {
+                fence: &retention,
+                arrival,
+                defer: Some("agent command validation timed out; retry uncompleted finished and known entries"),
+            },
+        )
+    };
+    let permit = match tokio::time::timeout_at(deadline, Arc::clone(slots).acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        _ if fence.cancel_for_retention() => return retain(),
+        _ => return timed_out(),
+    };
     let worker_fence = Arc::clone(&fence);
     #[cfg(test)]
     let clock = handler
@@ -295,10 +334,12 @@ async fn validate(
         handler.handle_agent_commands_fenced(
             connection,
             frame,
-            batch.started,
-            batch.finished,
-            batch.known,
-            &worker_fence,
+            batch,
+            DeclarationValidation {
+                fence: &worker_fence,
+                arrival,
+                defer: None,
+            },
         )
     });
     #[cfg(test)]
@@ -310,7 +351,8 @@ async fn validate(
     let result = tokio::time::timeout_at(deadline, &mut worker).await;
     match result {
         Ok(result) => result.map_err(|error| RouterError::backend(0, corr, error.to_string()))?,
-        Err(_) if fence.cancel() => Err(timed_out()),
+        Err(_) if fence.cancel_for_retention() => retain(),
+        Err(_) if !fence.committed() => timed_out(),
         // The atomic commit decision preceded the timeout. Its short mutation
         // must supply the actual reply, never an error claiming it was cancelled.
         Err(_) => worker
@@ -343,12 +385,15 @@ mod tests {
         });
         wait_locked.recv().unwrap();
         let attempted = registry.observe_next_lock_attempt();
+        let arrival = handler.resource_tracker.declaration_arrival();
         let validation = tokio::spawn(validate(
             handler,
             ConnectionId::new(906),
             frame(1),
             Declaration::default(),
             Arc::new(CommitFence::default()),
+            Arc::new(CommitFence::default()),
+            arrival,
         ));
         // Keep virtual time stationary until validation attempts the held registry lock.
         loop {
@@ -361,10 +406,19 @@ mod tests {
         tokio::time::advance(Duration::from_millis(199)).await;
         assert!(!validation.is_finished());
         tokio::time::advance(Duration::from_millis(1)).await;
-        let error = validation.await.unwrap().unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("agent command validation timed out"));
+        let replies = validation.await.unwrap().unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].header.ty, FrameType::Error);
+        assert_eq!(
+            replies[0].body,
+            control_error_frame(
+                &frame(1),
+                "busy",
+                "agent command validation timed out; retry",
+            )
+            .unwrap()
+            .body
+        );
         drop(release);
         holder.join().unwrap();
     }

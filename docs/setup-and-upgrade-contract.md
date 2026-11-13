@@ -248,7 +248,12 @@ stores are never treated as managed binaries.
 
 The command surface is:
 
-- `ck setup` installs and wires core, then offers eligible optional components.
+- `ck setup` installs and wires core, then lists eligible optional modules in
+  one plain line with `ck setup <name>` as the add command, without prompting to
+  select modules. Only missing components with a complete release on the host
+  are listed; installed, unavailable and unpublished components are omitted.
+  The line is absent when there is nothing to add, and appears in both dry runs
+  and ordinary setup.
 - `ck setup aft` and `ck setup mc` explicitly add a component.
 - `ck setup --with aft,mc` selects optional components explicitly.
 - `ck setup --dry-run` is strictly read-only: it prints the full setup plan,
@@ -262,8 +267,12 @@ The command surface is:
   refusals do not ask. `--yes` (`-y`) skips this question, not safety checks or
   the separate `--confirm` required for conversion. If either stream is not a
   terminal, setup proceeds without a question for scripted callers. The shell
-  and PowerShell bootstrap installers only print `Next: ck setup`; they do not
-  invoke it.
+  and PowerShell bootstrap installers print `Next: ck setup`; they do not
+  invoke it. The shell installer cannot change the PATH of the shell that ran
+  it, so when its inherited PATH lacks the command directory it first names the
+  profile it changed and prints the `source` command that loads it in the
+  current terminal. The PowerShell installer updates the current session's
+  PATH itself.
 - `ck setup aft --convert` and `ck setup mc --convert` are explicit conversion
   paths and require confirmation before any mutation.
 - `ck setup --uninstall` prints a removal plan, deregisters only manifest-owned
@@ -303,6 +312,21 @@ Configuration writes are additive. Setup prints the proposed diff before a
 write and refuses a conflicting user-owned value by naming the key and leaving
 the file byte-identical. Adding one component must not disturb another
 component’s valid configuration.
+
+Core configuration includes `version: 1`, `storage.backend: "sqlite"`, and
+`modules.subc-mcp` with `program` set to the binary home's `ck-subc-mcp`
+(`ck-subc-mcp.exe` on Windows), `args: ["module"]`, and `reserved: true`.
+The shim needs the connection file written by this daemon-supervised gateway;
+installing the binary alone is not enough. Rerunning setup on an older install
+adds the missing entry and rescans the daemon so it starts the gateway. An
+already-correct entry is left byte-identical; a different entry refuses by
+naming `modules.subc-mcp`. `reserved: true` makes the daemon accept the
+gateway's registration only with the one-time launch nonce it handed that
+process at spawn, so no other local program can register as `subc-mcp`, and
+providers see the gateway as `reserved:subc-mcp`.
+
+Insula never reads browser stores. Its cookie providers use vault deposits on
+every OS; file/API providers do not depend on browser-cookie encryption.
 
 After successful wiring, setup validates with `ck daemon triage`, `ck health`,
 and `ck fleet lint`, and then prints the MCP harness snippet. The relevant
@@ -525,9 +549,12 @@ Restart semantics are target-specific:
 - The daemon restarts through its platform service manager, with a 30-second
   drain and service-manager initiation acknowledgement. It does not use the
   module restart path.
-- Managed modules restart through `supervisor.restart`, with initiation
+- Supervised modules, including core setup's `subc-mcp`, restart through
+  `supervisor.restart`, with initiation
   acknowledgement and completion polling; their clients absorb the transition
-  through retry patience.
+  through retry patience. A module absent from the supervisor roster keeps its
+  binary upgrade and post-verification, but reports that its restart was omitted.
+  Upgrade does not add a separate process-start path for unsupervised modules.
 - Completion polling waits up to 180 seconds for a restarted target to be live
   and healthy: the drain may spend its full 30 seconds whenever a consumer holds
   a route open, and a module's own startup follows it (`aft` reports healthy

@@ -5248,8 +5248,8 @@ fn fake_aft_stub_command() -> (PathBuf, Vec<String>) {
     }
 
     if let Ok(current_exe) = env::current_exe() {
-        if let Some(target_debug) = current_exe.parent().and_then(Path::parent) {
-            let candidate = target_debug.join(format!("fake-aft-stub{}", env::consts::EXE_SUFFIX));
+        if let Some(profile) = cortexkit_test_support::cargo_profile_dir_of(&current_exe) {
+            let candidate = profile.join(format!("fake-aft-stub{}", env::consts::EXE_SUFFIX));
             if candidate_is_fresh(&candidate) {
                 return (candidate, Vec::new());
             }

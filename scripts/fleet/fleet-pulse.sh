@@ -744,7 +744,7 @@ printed=0
 # correct for anything that agrees with itself.
 module_repo() {
   case "$1" in
-    prefrontal-core | prefrontal-routing) echo prefrontal ;;
+    prefrontal-core) echo prefrontal ;;
     subc-mcp)     echo subconscious ;;
     *)            echo "$1" ;;
   esac

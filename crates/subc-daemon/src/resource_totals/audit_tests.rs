@@ -46,6 +46,7 @@ fn omitted_identity_proofs_have_the_same_hard_bound_as_loss_identities() {
         module_pid: 1,
         before_cpu: None,
         started: Vec::new(),
+        pending: Vec::new(),
         finished: Vec::new(),
         known: Some(Vec::new()),
         table,
@@ -371,6 +372,7 @@ fn overlapping_started_and_known_roots_are_refused_in_both_orders() {
                 candidates.reverse();
             }
             let batch = Prepared {
+                pending: Vec::new(),
                 scope_target: crate::subtree_resources::Target::Unavailable("no_container"),
                 #[cfg(unix)]
                 scope: None,

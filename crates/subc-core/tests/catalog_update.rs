@@ -351,9 +351,15 @@ async fn declared_not_ready_refuses_without_relay_until_catalog_update_marks_rea
     assert_eq!(first.header.ty, FrameType::Error);
     let first_error: ErrorBody = serde_json::from_slice(&first.body).unwrap();
     assert_eq!(first_error.code, "module_warming");
+    // A registered module that declared itself not ready is expected back
+    // without a restart, so the refusal says so beside its reason.
     assert_eq!(
         first_error.detail,
-        Some(serde_json::json!({"reason": "declared_not_ready"}))
+        Some(serde_json::json!({
+            "reason": "declared_not_ready",
+            "state": "running",
+            "expected_back": true
+        }))
     );
 
     fs::write(&update_path, b"ready").unwrap();
@@ -459,9 +465,18 @@ async fn declared_not_ready_and_supervised_absence_are_observably_distinct() {
 
     assert_eq!(
         declared_error.detail,
-        Some(serde_json::json!({"reason": "declared_not_ready"}))
+        Some(serde_json::json!({
+            "reason": "declared_not_ready",
+            "state": "running",
+            "expected_back": true
+        }))
     );
-    assert_eq!(absent_error.detail, None);
+    // The supervised module that never registered carries no reason, only
+    // the supervisor's state and its recovery verdict.
+    assert_eq!(
+        absent_error.detail,
+        Some(serde_json::json!({"state": "running", "expected_back": true}))
+    );
 
     declared.stop().await.unwrap();
     absent.stop().await.unwrap();

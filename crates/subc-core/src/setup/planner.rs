@@ -40,6 +40,15 @@ impl SetupPlan {
             + usize::from(self.permission_repair)
     }
 
+    pub fn optional_components_line(&self) -> Option<String> {
+        self.operations
+            .iter()
+            .find_map(|operation| match operation {
+                SetupOperation::OfferOptionalComponents { .. } => Some(operation.to_string()),
+                _ => None,
+            })
+    }
+
     /// The dry-run text an operator reads before consenting. `ck setup`
     /// prints this verbatim.
     pub fn render(&self) -> String {
@@ -147,9 +156,20 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
 
     record_detection_outcomes(observed, &mut plan);
     let selected = selected_components(request);
-    if request.optional_components.is_empty() {
-        plan.operations
-            .push(SetupOperation::OfferOptionalComponents);
+    if request.optional_components.is_empty() && request.convert.is_none() {
+        let components = Component::ALL
+            .into_iter()
+            .filter(|component| {
+                *component != Component::Core
+                    && !component.is_declared_unsupported_on(*target)
+                    && observed.component_state(*component) == ComponentState::Missing
+                    && observed.release(*component) == ReleaseAvailability::Available
+            })
+            .collect::<Vec<_>>();
+        if !components.is_empty() {
+            plan.operations
+                .push(SetupOperation::OfferOptionalComponents { components });
+        }
     }
 
     if let Some(component) = request.convert {
@@ -236,9 +256,7 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
                         key_path: request.claustrum_key_path.clone(),
                     });
                 }
-                if component.module_id().is_some() {
-                    newly_configured_modules.push(component);
-                }
+                newly_configured_modules.push(component);
             }
             ComponentState::Configured => {
                 plan.outcomes
@@ -293,10 +311,14 @@ pub fn plan_setup(observed: &SetupObserved, request: &SetupRequest) -> SetupPlan
     }
 
     for component in newly_configured_modules {
+        // Core also configures the MCP gateway. A live daemon must rescan to
+        // discover that entry, just as it does for optional modules.
         plan.operations
             .push(SetupOperation::RescanComponent { component });
-        plan.operations
-            .push(SetupOperation::EnableComponent { component });
+        if component.module_id().is_some() {
+            plan.operations
+                .push(SetupOperation::EnableComponent { component });
+        }
     }
 
     // After every rescan this run makes: a rescan applies a new health check
@@ -822,6 +844,78 @@ mod tests {
             inventory_owned_paths: 0,
             bus_monitoring: BusMonitoring::NotDeclared,
         }
+    }
+
+    #[test]
+    fn optional_components_line_lists_only_missing_installable_modules() {
+        let mut observed = observed_setup();
+        observed.platform = PlatformObservation::Supported(AlphaTarget::WindowsX64);
+        observed.releases.insert(
+            Component::Synapse,
+            ReleaseAvailability::Incomplete {
+                missing_asset: "ck-synapse-windows-x64.zip".into(),
+            },
+        );
+        let plan = plan_setup(&observed, &SetupRequest::install(Vec::new()));
+        let lines = plan
+            .operations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert!(
+            lines.contains(
+                &"Optional modules: insula, claustrum. Add one with `ck setup <name>`.".to_string()
+            ),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn optional_components_line_is_absent_when_everything_is_installed() {
+        let mut observed = observed_setup();
+        for component in Component::ALL {
+            observed
+                .components
+                .insert(component, ComponentState::Correct);
+        }
+        let plan = plan_setup(&observed, &SetupRequest::install(Vec::new()));
+        assert!(!plan
+            .operations
+            .iter()
+            .any(|operation| operation.to_string().to_lowercase().contains("optional")));
+    }
+
+    #[test]
+    fn core_gateway_configuration_is_rescanned_on_an_existing_runtime() {
+        let mut observed = observed_setup();
+        observed.core_binary_present = true;
+        observed.runtime = RuntimeState::Correct;
+        let plan = plan_setup(&observed, &SetupRequest::install(Vec::new()));
+        let configure = plan
+            .operations
+            .iter()
+            .position(|operation| {
+                matches!(
+                    operation,
+                    SetupOperation::ConfigureComponent {
+                        component: Component::Core
+                    }
+                )
+            })
+            .unwrap();
+        let rescan = plan
+            .operations
+            .iter()
+            .position(|operation| {
+                matches!(
+                    operation,
+                    SetupOperation::RescanComponent {
+                        component: Component::Core
+                    }
+                )
+            })
+            .expect("core gateway needs a rescan");
+        assert!(configure < rescan);
     }
 
     fn installed_core_setup(installed_version: Option<&str>) -> SetupObserved {

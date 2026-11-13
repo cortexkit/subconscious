@@ -559,12 +559,23 @@ async fn windows_declared_tree(contained: bool) {
         tracker: &Arc<Tracker>,
         launch: &crate::supervise::ResourceLaunch,
     ) -> AgentCommandResources {
-        observe(tracker, launch, None)
-            .await
-            .agent_commands
-            .expect("a fresh complete walk reports agent commands")
-            .pop()
-            .unwrap()
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            // A fresh snapshot can still contain unreadable descendants while
+            // processes exit. Retry the walk, not the accounting assertions.
+            let readings = observe(tracker, launch, None).await;
+            if let Some(mut agents) = readings.agent_commands {
+                return agents
+                    .pop()
+                    .expect("a complete walk reports agent commands");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for a complete resource walk: {:?}",
+                readings.reasons
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
     let earlier_table = ProcessTable::read().unwrap();
     let mut command = ProcessCommand::new(std::env::current_exe().unwrap());
@@ -607,7 +618,7 @@ async fn windows_declared_tree(contained: bool) {
     };
     let tracker = Arc::new(Tracker::default());
     let generation = launch.generation();
-    tracker.declare(
+    let committed = tracker.declare(
         "test-module",
         std::process::id(),
         generation,
@@ -617,6 +628,29 @@ async fn windows_declared_tree(contained: bool) {
             ..Declaration::default()
         },
     );
+    assert!(
+        committed.rejected.is_empty() && !committed.roots_full,
+        "start refused: rejected={:?}, roots_full={}",
+        committed.rejected,
+        committed.roots_full
+    );
+    // Acknowledged starts can be pending while the process walk is incomplete.
+    // Tick until validation accepts the root; never re-declare or move CPU early.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if tracker.state.lock().unwrap().modules["test-module"]
+            .roots
+            .contains_key(&identity)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "acknowledged root was not accepted: {identity:?}"
+        );
+        let _ = observe(&tracker, &launch, None).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let baseline_root = tracker.state.lock().unwrap().modules["test-module"].roots[&identity]
         .cpu_floor
         .own((identity.pid, subc_os::start_time(identity.pid).unwrap()))
@@ -633,7 +667,7 @@ async fn windows_declared_tree(contained: bool) {
         "a snapshot from before acceptance cannot move CPU"
     );
     assert!(
-        tracker.has_live_roots(),
+        tracker.needs_retry(),
         "a snapshot from before declaration must not disable the command tick"
     );
     writeln!(root.stdin.as_mut().unwrap(), "burn").unwrap();
@@ -679,7 +713,7 @@ async fn windows_declared_tree(contained: bool) {
         let after_exit = tick(&tracker, &launch).await;
         assert!(after_exit.cpu_ms >= after.cpu_ms);
         assert!(
-            !tracker.has_live_roots(),
+            !tracker.needs_retry(),
             "exited roots must stop the five-second tick"
         );
     }
@@ -827,12 +861,19 @@ fn windows_finish_reference_respects_rounded_job_counter_growth() {
 
 #[tokio::test]
 async fn process_walk_is_shared_within_a_second() {
+    let _readers = crate::subtree_resources::fault_read_guard().await;
     let tracker = Arc::new(Tracker::default());
+    let reads = tracker.inject_sampler_tables_for_test((1..=2).map(|revision| {
+        ProcessTable::from_test_members(revision, revision, Vec::new(), Vec::new())
+    }));
     let first = tracker.table().await.unwrap();
     let shared = tracker.table().await.unwrap();
     assert!(Arc::ptr_eq(&first, &shared));
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
     tracker.cache.lock().unwrap().as_mut().unwrap().0 = Instant::now() - Duration::from_secs(2);
     let fresh = tracker.table().await.unwrap();
+    assert_eq!(fresh.revision(), 2);
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
     assert!(
         !Arc::ptr_eq(&first, &fresh),
         "expired snapshots must trigger a new process walk"

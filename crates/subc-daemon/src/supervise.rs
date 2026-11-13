@@ -4654,8 +4654,8 @@ impl SupervisedModule {
     pub(crate) fn check_approved_start_failure(
         &self,
         generation: &crate::config_gate::runtime::ApprovalIdentity,
-    ) -> Result<(), SuperviseError> {
-        let mut state = lock_snapshot(&self.inner.snapshot)?;
+    ) -> Result<bool, SuperviseError> {
+        let state = lock_snapshot(&self.inner.snapshot)?;
         if let Some((failed_generation, detail)) = &state.approved_start_failure {
             if failed_generation == generation {
                 return Err(SuperviseError::ReloadFailed {
@@ -4664,8 +4664,7 @@ impl SupervisedModule {
                 });
             }
         }
-        state.approved_start_failure = None;
-        Ok(())
+        Ok(state.approved_start_failure.is_some())
     }
 
     pub(crate) async fn config_policy_probe(
@@ -9230,7 +9229,7 @@ async fn handle_supervisor_command(
                 let next = approved.module_entry(&spec.module_id).map_err(|error| {
                     SuperviseError::InvalidSpec { reason: error.to_string() }
                 })?;
-                {
+                let retry_approved_failure = {
                     let mut state = lock_snapshot(snapshot)?;
                     if let Some((generation, detail)) = &state.approved_start_failure {
                         if *generation == approved.identity() && next.enabled {
@@ -9241,8 +9240,10 @@ async fn handle_supervisor_command(
                             });
                         }
                     }
+                    let retry = state.approved_start_failure.is_some();
                     state.approved_start_failure = None;
-                }
+                    retry
+                };
                 stage_supervisor_configuration(
                     spec, runtime, snapshot, next.module_spec(), next.health,
                     next.drain_timeout_ms,
@@ -9255,7 +9256,14 @@ async fn handle_supervisor_command(
                     active.registration_deadline = Some(active.spawned_at + next.register_timeout);
                 }
                 let enabled = lock_snapshot(snapshot)?.enabled;
-                if enabled != next.enabled {
+                // An approval retries a changed failed entry or its own earlier
+                // failed start, not an unrelated crash-budget failure. For an
+                // unchanged entry, reconciled means the approved configuration
+                // is effective; it does not claim the process has recovered.
+                let retry_failed = enabled && child.is_none()
+                    && lock_snapshot(snapshot)?.state == ModuleState::Failed
+                    && (retry_approved_failure || approved.changes_entry(&spec.module_id));
+                if enabled != next.enabled || retry_failed {
                     let held = next.enabled && runtime.config_delivery.as_ref()
                         .is_some_and(|delivery| delivery.0.has_recorded_admission_hold(&spec.module_id)
                             || delivery.0.check_module_hold(&spec.module_id).is_err_and(|error| error.code == "config_delivery_deferred"));

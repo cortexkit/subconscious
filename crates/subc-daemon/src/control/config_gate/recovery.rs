@@ -170,10 +170,10 @@ impl ControlHandler {
                 let module_id = module.module_id.clone();
                 let result = async {
                     if let Some(existing) = self.supervisor.get(&module.module_id) {
-                        existing
+                        let retry_approved_failure = existing
                             .check_approved_start_failure(&approved.identity())
                             .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
-                        if approved.changes_entry(&module.module_id) {
+                        if approved.changes_entry(&module.module_id) || retry_approved_failure {
                             existing
                                 .reconcile_approved_configuration(approved.clone())
                                 .await

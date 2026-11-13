@@ -405,3 +405,6 @@ async fn delivery_failure_park_saves_the_daemon_attempt_before_release() {
     fixture.module.stop().await.unwrap();
     assert!(next_retry.is_some(), "a delivery-failure park must retain daemon attribution so a failing release schedules its slow retry");
 }
+
+#[path = "audit_reconcile_tests.rs"]
+mod reconcile_tests;

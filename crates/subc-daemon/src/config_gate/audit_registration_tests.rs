@@ -669,6 +669,9 @@ async fn committed_enable_ordered(
                     .is_err(),
                 "every reconcile must retain the generation's launch failure"
             );
+            reconciled.set_enabled(false).await.unwrap();
+            assert!(reconciled.check_approved_start_failure(1).is_err(),
+                "a later disable is not an operator start and cannot erase the approved generation's failure");
         }
         assert!(fixture.owner.check_module_hold("a").is_ok());
         assert!(fixture

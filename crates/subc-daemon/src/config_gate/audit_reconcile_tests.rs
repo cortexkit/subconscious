@@ -6,6 +6,125 @@ async fn approval_changed_crash_failed_success_cancels_predecessor_retry() {
 }
 
 #[tokio::test]
+async fn approval_incarnation_restarts_gate_stopped_unchanged_entry() {
+    new_approval_restarts_gate_stopped(false).await;
+}
+
+#[tokio::test]
+async fn recovery_incarnation_restarts_gate_stopped_with_repeated_generation() {
+    new_approval_restarts_gate_stopped(true).await;
+}
+
+async fn new_approval_restarts_gate_stopped(recovery: bool) {
+    let fixture = legacy().await;
+    entry(&fixture.rig, "protocol", json!("none"));
+    let first = fixture.rig.stamp(&fixture.owner);
+    let first_approved = fixture
+        .owner
+        .authority_exit_configuration(first)
+        .unwrap()
+        .unwrap()
+        .3;
+    fixture
+        .handler
+        .reconcile_exit_for_test(fixture.owner.clone(), first)
+        .await
+        .unwrap();
+    fixture.module.seed_crash_budget_for_test(100);
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(fixture.module.status().unwrap().pid.unwrap() as i32)
+            .unwrap(),
+        rustix::process::Signal::KILL,
+    )
+    .unwrap();
+    until(|| {
+        fixture.module.state().unwrap() == ModuleState::Failed
+            && fixture.module.retry_deadline_for_test().is_some()
+    })
+    .await;
+    assert!(!fixture
+        .module
+        .check_approved_start_failure(&first_approved.identity())
+        .unwrap());
+    fixture
+        .module
+        .config_exit_failed(
+            crate::supervise::ModuleStopReason {
+                code: "config_exit_record_failed".into(),
+                error_kind: "injected_terminal_failure".into(),
+            },
+            Some(first_approved.identity()),
+        )
+        .unwrap();
+    let before = fixture.module.status().unwrap();
+    assert!(before.enabled && !before.process_alive);
+    assert_eq!(fixture.module.retry_deadline_for_test(), None);
+    assert!(!fixture.module.release_config_hold().await.unwrap());
+    fixture
+        .module
+        .reconcile_approved_configuration(first_approved.clone())
+        .await
+        .unwrap();
+    assert_eq!(fixture.module.state().unwrap(), ModuleState::Stopped);
+    assert_eq!(
+        fixture.module.status().unwrap().spawn_generation,
+        before.spawn_generation
+    );
+    let next = if recovery {
+        std::fs::write(
+            fixture
+                .rig
+                .path
+                .join("store")
+                .join(crate::config_store::STORE_FILE),
+            b"tampered",
+        )
+        .unwrap();
+        assert!(fixture.owner.check_recovery().unwrap());
+        approve(&fixture.rig, &fixture.owner, PlanKind::Stamp)
+    } else {
+        approve(&fixture.rig, &fixture.owner, PlanKind::Change)
+    };
+    let approved = fixture
+        .owner
+        .authority_exit_configuration(next)
+        .unwrap()
+        .unwrap()
+        .3;
+    assert!(!approved.changes_entry("a"));
+    if recovery {
+        assert_eq!(next, first);
+        assert_eq!(
+            approved.identity().approval_digest,
+            first_approved.identity().approval_digest
+        );
+        assert_ne!(approved.identity(), first_approved.identity());
+    }
+    assert!(!fixture
+        .module
+        .check_approved_start_failure(&approved.identity())
+        .unwrap());
+    fixture
+        .handler
+        .reconcile_exit_for_test(fixture.owner.clone(), next)
+        .await
+        .unwrap();
+    if recovery {
+        assert_eq!(
+            fixture.module.config_hold_origin_for_test(),
+            (false, Some(approved.identity()))
+        );
+        assert!(fixture.module.release_config_hold().await.unwrap());
+    }
+    let after = fixture.module.status().unwrap();
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+    assert!(after.process_alive, "{after:?}");
+    assert!(after.spawn_generation > before.spawn_generation);
+    assert_eq!(after.stop_reason, None);
+}
+
+#[tokio::test]
 async fn approval_changed_crash_failed_failure_cancels_predecessor_retry() {
     changed_crash_failed_start_cancels_retry(true).await;
 }

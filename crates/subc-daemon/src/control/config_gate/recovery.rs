@@ -198,7 +198,10 @@ impl ControlHandler {
                         let retry_approved_failure = existing
                             .check_approved_start_failure(&approved.identity())
                             .map_err(|error| GateError::new("rescan_failed", error.to_string()))?;
-                        if approved.changes_entry(&module.module_id) || retry_approved_failure {
+                        if approved.changes_entry(&module.module_id)
+                            || retry_approved_failure
+                            || existing.needs_approved_gate_restart(&approved.identity())
+                        {
                             existing
                                 .reconcile_approved_configuration(approved.clone())
                                 .await

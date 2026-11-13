@@ -290,7 +290,13 @@ async fn terminal_config_exit_failure_cannot_be_revived_by_a_hold_release() {
         error_kind: "injected_terminal_failure".into(),
     };
     assert!(fixture.module.config_hold_origin_for_test().0);
-    fixture.module.config_exit_failed(reason.clone()).unwrap();
+    fixture
+        .module
+        .config_exit_failed(
+            reason.clone(),
+            fixture.owner.terminal_exit_approval_identity().unwrap(),
+        )
+        .unwrap();
     assert_eq!(fixture.module.config_hold_origin_for_test(), (false, None));
     let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Unstamp);
     fixture

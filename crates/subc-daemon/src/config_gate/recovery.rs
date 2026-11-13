@@ -227,6 +227,22 @@ impl RuntimeOwner {
             }))
     }
 
+    /// Tag a terminal exit with the retained approval even if its store is now
+    /// unverified. This identity only prevents a same-approval restart; it never
+    /// supplies a launch command or admits a process from unverified contents.
+    pub(crate) fn terminal_exit_approval_identity(&self) -> Result<Option<ApprovalIdentity>> {
+        let state = self.lock()?;
+        let body = state.store.loaded_admission_state().1;
+        Ok(body
+            .generations
+            .get(&body.last_generation)
+            .map(|entry| ApprovalIdentity {
+                generation: body.last_generation,
+                approval_digest: entry.generation.plan_digest.clone(),
+                authority_incarnation: state.authority_incarnation.clone(),
+            }))
+    }
+
     /// Test helper that loads the current approved configuration before completing
     /// its exit. Production callers must carry their original approved configuration.
     #[cfg(test)]

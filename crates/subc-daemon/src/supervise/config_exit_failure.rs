@@ -12,6 +12,7 @@ impl SupervisedModule {
     pub(crate) fn config_exit_failed(
         &self,
         reason: ModuleStopReason,
+        approval: Option<crate::config_gate::runtime::ApprovalIdentity>,
     ) -> Result<(), SuperviseError> {
         update_snapshot(&self.inner.snapshot, Some(self.module_id()), |state| {
             state.state = ModuleState::Stopped;
@@ -22,6 +23,21 @@ impl SupervisedModule {
             state.config_hold_approval = None;
             clear_current_process_facts(state);
             state.stop_reason = Some(reason);
+            state.config_exit_failed_approval = approval;
         })
+    }
+}
+
+impl SupervisorSnapshot {
+    pub(super) fn needs_approved_gate_restart(
+        &self,
+        approval: &crate::config_gate::runtime::ApprovalIdentity,
+    ) -> bool {
+        self.enabled
+            && self.state == ModuleState::Stopped
+            && !self.process_alive
+            && !self.config_hold_parked
+            && self.stop_reason.is_some()
+            && self.config_exit_failed_approval.as_ref() != Some(approval)
     }
 }

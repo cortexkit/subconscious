@@ -1638,6 +1638,7 @@ struct SupervisorSnapshot {
     legacy_registration_spawn: bool,
     registration_declaration: Option<String>,
     stop_reason: Option<ModuleStopReason>,
+    config_exit_failed_approval: Option<crate::config_gate::runtime::ApprovalIdentity>,
     subtree_target: crate::subtree_resources::Target,
     failed_retry: FailedRetry,
     exec_outcome: Option<Arc<crate::activity::ExecOutcome>>,
@@ -1802,6 +1803,7 @@ impl SupervisorSnapshot {
             legacy_registration_spawn: false,
             registration_declaration: None,
             stop_reason: None,
+            config_exit_failed_approval: None,
             subtree_target: crate::subtree_resources::Target::Unavailable("not_running"),
             failed_retry: FailedRetry::default(),
             exec_outcome: None,
@@ -4679,6 +4681,14 @@ impl SupervisedModule {
                 .as_ref()
                 .is_some_and(|(failed, _)| failed == identity)
         })
+    }
+
+    pub(crate) fn needs_approved_gate_restart(
+        &self,
+        approval: &crate::config_gate::runtime::ApprovalIdentity,
+    ) -> bool {
+        lock_snapshot(&self.inner.snapshot)
+            .is_ok_and(|state| state.needs_approved_gate_restart(approval))
     }
 
     #[cfg(all(test, unix))]
@@ -9342,14 +9352,23 @@ async fn handle_supervisor_command(
                 // failed start, not an unrelated crash-budget failure. For an
                 // unchanged entry, reconciled means the approved configuration
                 // is effective; it does not claim the process has recovered.
+                // A terminal gate stop is different: a new approval owns its
+                // recovery even when the daemon entry itself did not change.
+                let retry_gate_stopped = lock_snapshot(snapshot)?
+                    .needs_approved_gate_restart(&approved.identity());
                 let retry_failed = enabled && child.is_none()
-                    && lock_snapshot(snapshot)?.state == ModuleState::Failed
-                    && (retry_approved_failure || approved.changes_entry(&spec.module_id));
+                    && ((lock_snapshot(snapshot)?.state == ModuleState::Failed
+                        && (retry_approved_failure || approved.changes_entry(&spec.module_id)))
+                        || retry_gate_stopped);
                 if retry_failed {
                     // This approval owns a new start, so the failed attempt's
                     // daemon retry must not survive either result of that start.
                     update_snapshot(snapshot, Some(&spec.module_id), |state| {
                         state.failed_retry.cancel();
+                        if retry_gate_stopped {
+                            state.stop_reason = None;
+                            state.config_exit_failed_approval = None;
+                        }
                     })?;
                 }
                 if enabled != next.enabled || retry_failed {
@@ -15640,6 +15659,7 @@ fn set_running(
         child.registration_spawn.is_some() && child.admission_base.is_none();
     state.registration_declaration = child.registration_declaration.clone();
     state.stop_reason = None;
+    state.config_exit_failed_approval = None;
     state.waiting_for_previous_pid = None;
     state.waiting_for_previous_detail = None;
     // Every caller of this is a plain spawn, which always uses the primary key;

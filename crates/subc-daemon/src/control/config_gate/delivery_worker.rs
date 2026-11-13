@@ -706,7 +706,12 @@ async fn record_exit(
         if reason.code != "config_exit_hold_failed" {
             let _ = hold_exited_module(&module).await;
         }
-        if let Err(error) = module.config_exit_failed(reason.clone()) {
+        let approval = owner
+            .on_blocking(|owner| owner.terminal_exit_approval_identity())
+            .await
+            .ok()
+            .flatten();
+        if let Err(error) = module.config_exit_failed(reason.clone(), approval) {
             warn!(module_id=%exited.module, %error, "configuration exit stopped-state diagnostic could not be retained");
         }
     }

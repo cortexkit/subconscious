@@ -92,3 +92,62 @@ async fn delivery_failure_release_retry_is_timed_from_its_own_failure() {
         after_release.spawn_generation
     );
 }
+
+#[tokio::test]
+async fn terminal_config_exit_failure_cannot_be_revived_by_a_hold_release() {
+    let fixture = gated_claim_fixture().await;
+    entry(&fixture.rig, "drain_timeout_ms", json!(0));
+    let configured = approve(&fixture.rig, &fixture.owner, PlanKind::Change);
+    let approved = fixture
+        .owner
+        .authority_exit_configuration(configured)
+        .unwrap()
+        .unwrap()
+        .3;
+    fixture
+        .module
+        .reconcile_approved_configuration(approved)
+        .await
+        .unwrap();
+    fixture
+        .owner
+        .complete_authority_exit_for_test(configured)
+        .unwrap();
+    std::fs::write(
+        fixture
+            .rig
+            .path
+            .join("store")
+            .join(crate::config_store::STORE_FILE),
+        b"tampered",
+    )
+    .unwrap();
+    assert!(fixture.owner.check_recovery().unwrap());
+    fixture
+        .module
+        .config_delivery_failed(fixture.primary.connection_id(&fixture.handler), true)
+        .await
+        .unwrap();
+    until(|| fixture.module.state().unwrap() == ModuleState::Stopped).await;
+    let reason = crate::supervise::ModuleStopReason {
+        code: "config_exit_failed".into(),
+        error_kind: "injected_terminal_failure".into(),
+    };
+    fixture.module.config_exit_failed(reason.clone()).unwrap();
+    let generation = approve(&fixture.rig, &fixture.owner, PlanKind::Unstamp);
+    fixture
+        .owner
+        .complete_authority_exit_for_test(generation)
+        .unwrap();
+    let released = fixture.module.release_config_hold().await;
+    let after = fixture.module.status().unwrap();
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+    assert!(
+        !released.unwrap(),
+        "a terminal configuration-exit failure is no longer parked"
+    );
+    assert_eq!(after.state, ModuleState::Stopped);
+    assert_eq!(after.stop_reason, Some(reason));
+    assert!(!after.process_alive);
+}

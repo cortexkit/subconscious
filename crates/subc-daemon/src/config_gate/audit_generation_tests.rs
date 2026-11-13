@@ -288,6 +288,17 @@ async fn audit_registration_hold_keeps_disabled_actor_disabled() {
 #[cfg(unix)]
 #[tokio::test]
 async fn audit_registration_fence_only_approved_enable_releases_its_parked_actor() {
+    fence_only_approved_enable(false).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn audit_registration_active_generation_fence_only_enable_uses_deferred_arm() {
+    fence_only_approved_enable(true).await;
+}
+
+#[cfg(unix)]
+async fn fence_only_approved_enable(has_active: bool) {
     use crate::supervise::ModuleState;
     let (rig, owner, supervisor, _) = supervised_fixture(false);
     std::fs::write(rig.path.join("a.seen"), b"keep running").unwrap();
@@ -303,6 +314,10 @@ async fn audit_registration_fence_only_approved_enable_releases_its_parked_actor
         )
         .await
         .unwrap();
+    if has_active {
+        applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+        assert_active(&owner, INCUMBENT, 1);
+    }
     let spawn = owner
         .spawned(
             "a",
@@ -313,6 +328,16 @@ async fn audit_registration_fence_only_approved_enable_releases_its_parked_actor
         .unwrap()
         .unwrap();
     owner.delivery_child_exited(&spawn).unwrap();
+    if has_active {
+        assert!(
+            !owner.has_recorded_admission_hold("a"),
+            "the recorded-hold arm must not satisfy this fixture"
+        );
+        assert_eq!(
+            owner.check_module_hold("a").unwrap_err().code,
+            "config_delivery_deferred"
+        );
+    }
     let approved = owner.authority_exit_configuration(1).unwrap().unwrap().3;
     module
         .reconcile_approved_configuration(approved)

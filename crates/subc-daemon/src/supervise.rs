@@ -1628,6 +1628,9 @@ struct SupervisorSnapshot {
     admission_refused: Option<String>,
     /// Distinguishes an admission-parked actor from an unrelated terminal exit.
     config_hold_parked: bool,
+    /// Preserve daemon attribution for a paused start so a failing release can
+    /// schedule the next slow retry instead of treating the start as operator work.
+    config_hold_daemon_initiated: bool,
     /// Retain an approved launch failure across competing reconciliation passes.
     approved_start_failure: Option<(u64, String)>,
     legacy_registration_spawn: bool,
@@ -1791,6 +1794,7 @@ impl SupervisorSnapshot {
         Self {
             admission_refused: None,
             config_hold_parked: false,
+            config_hold_daemon_initiated: false,
             approved_start_failure: None,
             legacy_registration_spawn: false,
             registration_declaration: None,
@@ -7054,6 +7058,9 @@ fn park_config_spawn(
     }
     update_snapshot(snapshot, Some(&spec.module_id), |state| {
         state.admission_refused = admission_refused;
+        if !state.config_hold_parked {
+            state.config_hold_daemon_initiated = runtime.recovery_is_daemon;
+        }
         state.config_hold_parked = true;
         state.state = ModuleState::Stopped;
         state.respawn_pending = false;
@@ -9066,17 +9073,19 @@ async fn handle_supervisor_command(
         ..
     } = command
     {
-        let parked = lock_snapshot(snapshot).is_ok_and(|state| {
-            state.config_hold_parked
+        let parked = lock_snapshot(snapshot).ok().and_then(|state| {
+            (state.config_hold_parked
                 && state.enabled
                 && !state.process_alive
                 && child.is_none()
-                && state.state == ModuleState::Stopped
+                && state.state == ModuleState::Stopped)
+                .then_some(state.config_hold_daemon_initiated)
         });
         // Clearing a configuration-delivery block must not restart a child that
         // exited on its own or exhausted its crash budget. Resume only an actor
         // stopped by a configuration hold; otherwise leave its slow retry alone.
-        let result = if parked {
+        let result = if let Some(daemon_initiated) = parked {
+            runtime.recovery_is_daemon = daemon_initiated;
             set_child_enabled_with_budget_policy(
                 spec,
                 runtime,
@@ -9085,7 +9094,7 @@ async fn handle_supervisor_command(
                 snapshot,
                 child,
                 true,
-                &runtime.failure_context(false),
+                &runtime.failure_context(daemon_initiated),
                 false,
             )
             .await
@@ -9100,6 +9109,7 @@ async fn handle_supervisor_command(
         SupervisorCommand::UpdateConfiguration { .. }
             | SupervisorCommand::ApprovedConfiguration { .. }
             | SupervisorCommand::ConfigPolicyProbe { .. }
+            | SupervisorCommand::ConfigExitHold { .. }
     ) {
         runtime.recovery_is_daemon = false;
     }
@@ -9152,6 +9162,7 @@ async fn handle_supervisor_command(
                         changed = !state.enabled;
                         state.enabled = true;
                         if child.is_none() {
+                            state.config_hold_daemon_initiated = false;
                             state.config_hold_parked = true;
                             state.state = ModuleState::Stopped;
                             state.failed_retry.cancel();
@@ -9181,9 +9192,15 @@ async fn handle_supervisor_command(
             | SupervisorCommand::SetEnabled { .. }
             | SupervisorCommand::Restart { .. }
     ) {
+        let starts = matches!(
+            command,
+            SupervisorCommand::Restart { .. } | SupervisorCommand::SetEnabled { enabled: true, .. }
+        );
         let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
             state.failed_retry.cancel();
-            state.approved_start_failure = None;
+            if starts {
+                state.approved_start_failure = None;
+            }
         });
     }
     match command {
@@ -9227,6 +9244,7 @@ async fn handle_supervisor_command(
                         reset_restart_count(snapshot, &spec.module_id)?;
                         update_snapshot(snapshot, Some(&spec.module_id), |state| {
                             state.enabled = true;
+                            state.config_hold_daemon_initiated = false;
                             state.config_hold_parked = true;
                             state.state = ModuleState::Stopped;
                         })?;

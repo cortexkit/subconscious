@@ -155,8 +155,8 @@ async fn recovery_slow_retry_roundtrip(release_after_park: bool) {
     worker.abort();
     let _ = worker.await;
     if release_after_park {
-        // A daemon-internal hold notification must not turn this already parked
-        // daemon retry into an operator-owned attempt.
+        // A hold notification from the daemon must not make this parked retry
+        // count as a new attempt requested by the operator.
         module.config_exit_hold().await.unwrap();
         let plan = owner
             .prepare(crate::config_gate::PlanKind::Unstamp)

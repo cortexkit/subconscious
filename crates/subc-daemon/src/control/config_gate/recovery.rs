@@ -1,7 +1,7 @@
 use super::*;
 
 impl ControlHandler {
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, unix, feature = "test-support", feature = "dev-desktop-approval"))]
     pub(crate) fn pause_apply_reconcile_for_test(
         &self,
         reached: tokio::sync::oneshot::Sender<()>,

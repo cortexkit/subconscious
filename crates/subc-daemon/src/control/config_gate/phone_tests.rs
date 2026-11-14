@@ -539,6 +539,23 @@ impl Fixture {
             .is_empty());
     }
 
+    fn reject(&self, correlation: u64, code: &str) {
+        let frame = Frame::build(
+            FrameType::Error,
+            control_flags(),
+            0,
+            0,
+            correlation,
+            serde_json::to_vec(&subc_protocol::ErrorBody::new(code, "card unavailable")).unwrap(),
+        )
+        .unwrap();
+        assert!(self
+            .handler
+            .handle_module_relay_response(PHONE, frame)
+            .unwrap()
+            .is_empty());
+    }
+
     async fn stop(self) {
         self.handler.registry.deregister_connection(PHONE).unwrap();
         self.module.stop().await.unwrap();
@@ -665,6 +682,42 @@ async fn config_phone_relay_approves_the_exact_plan_with_wire_correlation_and_re
         "answered cards need no withdrawal"
     );
     fixture.stop().await;
+}
+
+async fn assert_phone_error_preserves_plan(reply_code: &str, expected_code: &str) {
+    let mut fixture = Fixture::new().await;
+    let apply = fixture.apply();
+    let (correlation, _) = fixture.request().await;
+    fixture.reject(correlation, reply_code);
+    assert_eq!(apply.await.unwrap().unwrap_err().code, expected_code);
+    assert_eq!(fixture.owner.history().unwrap().0.len(), 1);
+    let facts = fixture
+        .handler
+        .config_approval_facts(&RouteCtx {
+            connection_id: CALLER,
+            egress: crate::FrameSink::new(mpsc::channel(1).0),
+        })
+        .await;
+    assert!(fixture
+        .owner
+        .begin_approval(&fixture.plan.digest, &facts)
+        .is_ok());
+    fixture.owner.disconnected(CALLER);
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn config_phone_relay_surface_unavailable_error_preserves_the_pending_plan() {
+    assert_phone_error_preserves_plan(
+        "approval_surface_unavailable",
+        "approval_surface_unavailable",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn config_phone_relay_other_error_still_declines_and_preserves_the_pending_plan() {
+    assert_phone_error_preserves_plan("card_rejected", "approval_declined").await;
 }
 
 #[tokio::test(start_paused = true)]

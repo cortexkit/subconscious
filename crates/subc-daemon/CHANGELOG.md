@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.46.2
+
+- Report `approval_surface_unavailable` when the phone approval service replies
+  with that error, rather than reporting a declined approval. No generation is
+  created and the reviewed plan remains pending; other phone errors still
+  report `approval_declined`.
+
 ## 0.46.1
 
 - Require subc-os 0.1.37, so a daemon signed with an Apple Development

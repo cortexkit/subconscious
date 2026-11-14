@@ -118,9 +118,12 @@ use the interactive OS prompt alone. Stamp, ordinary unstamp, rollback,
 declaration changes and program changes are never small. Recovery unstamp is
 the exception, using the fixed sentence “Config files become authoritative again”. No legacy
 `privileged_operator_prompt: "log"` policy or operator-app shortcut approves a
-plan. Unavailable review returns `approval_surface_unavailable`; declined or
-unanswered approval returns `approval_declined`. Changed plan inputs return
-`plan_stale`, without supplying a new digest.
+plan. Unavailable review returns `approval_surface_unavailable`. If the phone
+approval service answers the consent request with an error whose code is
+`approval_surface_unavailable`, `config.apply` returns that code too: no
+generation is created and the plan stays pending. Other phone error codes,
+declined approval and unanswered cards return `approval_declined`. Changed plan
+inputs return `plan_stale`, without supplying a new digest.
 
 Approval of daemon entries is not live reconciliation. The intended activation
 boundary is the next deliberate daemon start; status compares approved entries

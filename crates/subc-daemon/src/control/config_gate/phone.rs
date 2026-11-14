@@ -175,6 +175,11 @@ impl ControlHandler {
                         serde_json::from_slice::<subc_protocol::consent::ConsentResponse>(&bytes)
                             .ok()
                     }
+                    ModuleControlRpcOutcome::Rejected(error)
+                        if error.code == "approval_surface_unavailable" =>
+                    {
+                        return Err(unavailable());
+                    }
                     _ => None,
                 };
                 if response.is_some() {

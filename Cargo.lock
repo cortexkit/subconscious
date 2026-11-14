@@ -3022,7 +3022,7 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.46.1"
+version = "0.46.2"
 dependencies = [
  "base64",
  "cortexkit-log",

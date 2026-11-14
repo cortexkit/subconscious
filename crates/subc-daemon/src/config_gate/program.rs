@@ -195,13 +195,15 @@ pub(super) fn before_capture_for_test(hook: impl FnOnce() + 'static) {
 
 #[cfg(all(test, unix))]
 pub(crate) fn native_fixture_for_test() -> std::path::PathBuf {
-    let executable = std::env::current_exe().unwrap();
-    let deps = executable.parent().unwrap();
-    let name = "config-gate-fixture";
-    [deps.join(name), deps.parent().unwrap().join(name)]
-        .into_iter()
-        .find(|path| path.is_file())
-        .expect("config-gate-fixture not built; run scripts/test-daemon-lib.sh")
+    // Resolved from the Cargo profile directory, not from this test binary's
+    // location: newer Cargo places test binaries under `build/<pkg>/<hash>/out/`,
+    // away from the profile directory where `cargo build --bins` puts the fixture.
+    let fixture = cortexkit_test_support::cargo_profile_bin("config-gate-fixture");
+    assert!(
+        fixture.is_file(),
+        "config-gate-fixture not built; build subc-daemon's bins with test-support first"
+    );
+    fixture
 }
 
 pub(crate) fn capture(spec: &ModuleSpec, covered: &[String]) -> Result<ProgramLaunch> {

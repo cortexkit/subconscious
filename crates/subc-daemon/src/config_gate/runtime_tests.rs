@@ -561,7 +561,17 @@ impl Rig {
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        std::fs::create_dir(&path).unwrap();
+        std::fs::create_dir(&path)
+            .or_else(|error| {
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+                // A dead test process may have left this PID/counter directory.
+                // Recreate it exclusively instead of reusing its old contents.
+                std::fs::remove_dir_all(&path)?;
+                std::fs::create_dir(&path)
+            })
+            .unwrap();
         std::fs::create_dir(path.join("cortexkit")).unwrap();
         std::fs::create_dir(path.join("store")).unwrap();
         std::fs::write(path.join("program"), b"captured program identity").unwrap();

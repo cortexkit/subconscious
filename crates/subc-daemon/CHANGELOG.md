@@ -46,6 +46,11 @@
 - **Rust migration:** adopt control 0.40 types together with client 0.40.
   Public supervisor and configuration APIs expose the updated control family.
 
+## 0.45.4
+
+- While unstamped, notify opted-in modules of declared user-file edits within
+  about two seconds, without pushing for unchanged bytes or changing stamped delivery.
+
 ## 0.45.3
 
 - Windows agent commands whose pid had last belonged to the exited parent of a

@@ -4,6 +4,8 @@ use super::*;
 mod audit_generation;
 #[path = "mark_tests.rs"]
 mod mark_tests;
+#[path = "unstamped_tests.rs"]
+mod unstamped;
 use crate::config_gate::runtime::{AppliedDisposition, DeliveryObserver};
 use subc_protocol::config::{ConfigAppliedRequest, ConfigApplyResult};
 

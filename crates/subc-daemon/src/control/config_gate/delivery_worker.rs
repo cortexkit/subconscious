@@ -415,6 +415,7 @@ async fn module_worker(
     registration: crate::registry::ModuleRegistration,
     wake: Arc<Notify>,
 ) {
+    let mut user_file_watch = crate::config_gate::runtime::unstamped::UserFileWatch::default();
     loop {
         let next = {
             let Some(control) = handler.upgrade() else {
@@ -424,6 +425,22 @@ async fn module_worker(
                 break;
             };
             let module = &registration.manifest.module_id;
+            let connection = registration.connection_id;
+            let watched_module = module.clone();
+            let (watch, unstamped) = owner
+                .on_blocking(move |owner| {
+                    let mut watch = user_file_watch;
+                    let unstamped = owner
+                        .poll_unstamped_user_file(connection, &watched_module, &mut watch)
+                        .unwrap_or(true);
+                    Ok((watch, unstamped))
+                })
+                .await
+                .unwrap_or_default();
+            user_file_watch = watch;
+            let next_poll = unstamped.then(|| {
+                Instant::now() + crate::config_gate::runtime::unstamped::USER_FILE_POLL_INTERVAL
+            });
             let Ok(gate) = owner.module_gate(module) else {
                 break;
             };
@@ -456,7 +473,6 @@ async fn module_worker(
             else {
                 break;
             };
-            let connection = registration.connection_id;
             let anchor_hint = owner
                 .on_blocking(move |owner| owner.take_anchor_hint(connection))
                 .await
@@ -493,14 +509,18 @@ async fn module_worker(
                     _guard = gate.lock().await;
                 }
             }
-            let view = module_work(owner, module, move |owner, module| {
-                owner.module_get(
-                    connection,
-                    &module,
-                    subc_protocol::config::ConfigGetRequest::new(),
-                )
-            })
-            .await;
+            let view = if unstamped {
+                Ok(subc_protocol::config::ConfigGetReply::new(None, None))
+            } else {
+                module_work(owner, module, move |owner, module| {
+                    owner.module_get(
+                        connection,
+                        &module,
+                        subc_protocol::config::ConfigGetRequest::new(),
+                    )
+                })
+                .await
+            };
             if let Ok(view) = view {
                 if let Some(pending) = view.pending {
                     if let Some(attempt) = pending.attempt {
@@ -661,9 +681,25 @@ async fn module_worker(
                     None
                 }
                 Some(window) => window.deadline,
-                None => None,
+                None => next_poll,
             }
         };
+        #[cfg(test)]
+        {
+            let idle = handler.upgrade().and_then(|control| {
+                control
+                    .config_runtime
+                    .as_ref()
+                    .and_then(|owner| owner.user_file_test_idle.lock().unwrap().clone())
+            });
+            if let Some(idle) = idle {
+                // Tests hold the worker at its timer boundary while editing files.
+                let (resume, released) = tokio::sync::oneshot::channel();
+                if idle.send((registration.connection_id, resume)).is_ok() {
+                    let _ = released.await;
+                }
+            }
+        }
         tokio::select! {
             _ = wake.notified() => {},
             _ = async { match next { Some(at) => sleep_until(at).await, None => std::future::pending().await } } => {},

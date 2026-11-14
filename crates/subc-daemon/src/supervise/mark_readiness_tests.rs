@@ -7,6 +7,7 @@ use crate::spawn_authority::{MarkStatus, SpawnAuthorityRecord};
 use subc_protocol::peer::CallerOrigin;
 
 const OWN: ConnectionId = ConnectionId::new(40);
+const OLDER: ConnectionId = ConnectionId::new(41);
 
 fn healthy() -> HealthReport {
     HealthReport {
@@ -76,7 +77,7 @@ async fn first_party_mark_healthy_probe_marks_only_the_childs_own_registration()
     assert_eq!(record.mark_status(), MarkStatus::AwaitingReadiness);
 
     macro_rules! probe {
-        () => {
+        ($probed:expr) => {
             handle_health_report(
                 &spec,
                 &runtime,
@@ -87,6 +88,7 @@ async fn first_party_mark_healthy_probe_marks_only_the_childs_own_registration()
                 healthy(),
                 1,
                 None,
+                Some($probed),
             )
             .await
         };
@@ -98,7 +100,7 @@ async fn first_party_mark_healthy_probe_marks_only_the_childs_own_registration()
         forwarding
             .bind_target_authority(OWN, SpawnAuthorityRecord::new(other, 99, &spec.module_id))
             .unwrap();
-        probe!();
+        probe!(OWN);
         assert!(!record.first_party(), "{other}");
         assert_eq!(
             record.mark_status(),
@@ -106,10 +108,22 @@ async fn first_party_mark_healthy_probe_marks_only_the_childs_own_registration()
             "{other}"
         );
     }
-    // The child's own registration answering healthy marks it.
+    // The child's own registration is the module's now, but this answer came
+    // from an older registration probed before it took over: the answer is
+    // that registration's, not this child reporting ready.
     forwarding
         .bind_target_authority(OWN, record.clone())
         .unwrap();
-    probe!();
+    forwarding
+        .bind_target_authority(
+            OLDER,
+            SpawnAuthorityRecord::new("older", 98, &spec.module_id),
+        )
+        .unwrap();
+    probe!(OLDER);
+    assert!(!record.first_party());
+    assert_eq!(record.mark_status(), MarkStatus::AwaitingReadiness);
+    // The child's own registration answering healthy marks it.
+    probe!(OWN);
     assert!(record.first_party(), "{:?}", record.mark_status());
 }

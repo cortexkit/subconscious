@@ -613,6 +613,7 @@ async fn healthy_checks_for_the_restart_policy_window_reset_the_schedule() {
             },
             1,
             None,
+            None,
         )
         .await;
         assert_eq!(lock_snapshot(&snapshot).unwrap().failed_retry.attempt, 1);
@@ -631,6 +632,7 @@ async fn healthy_checks_for_the_restart_policy_window_reset_the_schedule() {
             metrics: None,
         },
         1,
+        None,
         None,
     )
     .await;

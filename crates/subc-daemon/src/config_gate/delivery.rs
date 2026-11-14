@@ -10,6 +10,7 @@ use crate::config_store::Tuple;
 pub(crate) const CONFIG_LIVE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const CONFIG_WARMUP_SLACK: Duration = Duration::from_secs(10);
 
+#[allow(clippy::too_many_arguments)]
 fn allocate_spawn(
     state: &mut OwnerState,
     module: &str,
@@ -21,6 +22,7 @@ fn allocate_spawn(
         std::sync::Arc<crate::spawn_authority::SpawnAuthorityRecord>,
         bool,
     )>,
+    program: Option<super::admission::AdmittedProgram>,
 ) -> Result<DeliverySpawn> {
     #[cfg(test)]
     if state.delivery.failed_spawn_module.as_deref() == Some(module) {
@@ -44,6 +46,7 @@ fn allocate_spawn(
         deadline: at + register + health + CONFIG_WARMUP_SLACK,
         authority,
         stamped,
+        program,
     })
 }
 
@@ -83,6 +86,10 @@ pub struct DeliverySpawn {
     /// The stamped store gated this module when the spawn was admitted. Only
     /// such a spawn can ever carry the first-party mark.
     stamped: bool,
+    /// The program the spawn was admitted under, when the stamped store
+    /// gated its module. A placement or approval that supersedes it rules
+    /// the spawn out of the mark.
+    program: Option<super::admission::AdmittedProgram>,
 }
 
 impl DeliverySpawn {
@@ -99,6 +106,9 @@ impl DeliverySpawn {
     }
     pub(crate) fn stamped(&self) -> bool {
         self.stamped
+    }
+    pub(super) fn admitted_program(&self) -> Option<&super::admission::AdmittedProgram> {
+        self.program.as_ref()
     }
     /// Attach a launch's authority record, as the supervisor's admission path
     /// does, to a spawn a test allocated directly.
@@ -137,8 +147,12 @@ pub(super) struct DeliveryState {
     /// Every spawn admitted under the stamp, which carries or may still earn
     /// the first-party mark. Unlike the rest of this state it survives
     /// `reset_for_authority_exit`, so a committed unstamp still finds the
-    /// spawns whose marks must be lowered.
-    mark_records: Vec<std::sync::Weak<crate::spawn_authority::SpawnAuthorityRecord>>,
+    /// spawns whose marks must be lowered. Each is kept with the program it
+    /// was admitted under.
+    mark_records: Vec<(
+        std::sync::Weak<crate::spawn_authority::SpawnAuthorityRecord>,
+        Option<super::admission::AdmittedProgram>,
+    )>,
 }
 
 impl DeliveryState {
@@ -159,20 +173,25 @@ impl DeliveryState {
         if !self
             .mark_records
             .iter()
-            .any(|known| std::ptr::eq(known.as_ptr(), std::sync::Arc::as_ptr(record)))
+            .any(|(known, _)| std::ptr::eq(known.as_ptr(), std::sync::Arc::as_ptr(record)))
         {
-            self.mark_records.push(std::sync::Arc::downgrade(record));
+            self.mark_records
+                .push((std::sync::Arc::downgrade(record), spawn.program.clone()));
         }
     }
-    /// The live spawns remembered for the mark sweep; forgets dead ones.
+    /// The live spawns remembered for the mark sweep, each with the program
+    /// it was admitted under; forgets dead ones.
     pub(super) fn mark_records(
         &mut self,
-    ) -> Vec<std::sync::Arc<crate::spawn_authority::SpawnAuthorityRecord>> {
+    ) -> Vec<(
+        std::sync::Arc<crate::spawn_authority::SpawnAuthorityRecord>,
+        Option<super::admission::AdmittedProgram>,
+    )> {
         self.mark_records
-            .retain(|record| record.upgrade().is_some_and(|record| record.alive()));
+            .retain(|(record, _)| record.upgrade().is_some_and(|record| record.alive()));
         self.mark_records
             .iter()
-            .filter_map(std::sync::Weak::upgrade)
+            .filter_map(|(record, program)| Some((record.upgrade()?, program.clone())))
             .collect()
     }
     pub(super) fn started_at_generation(&self) -> u64 {
@@ -1073,6 +1092,7 @@ impl RuntimeOwner {
             register,
             health,
             authority.map(|record| (record, stamped)),
+            admission.admitted_program(),
         )?;
         state.delivery.track_mark(&spawn);
         state
@@ -1177,8 +1197,8 @@ impl RuntimeOwner {
     ) -> Result<Option<DeliverySpawn>> {
         let mut state = self.lock()?;
         state.store.check()?;
-        let generation =
-            super::admission::AdmissionCache::from_state(&state).spawn_generation(module)?;
+        let admission = super::admission::AdmissionCache::from_state(&state);
+        let generation = admission.spawn_generation(module)?;
         allocate_spawn(
             &mut state,
             module,
@@ -1187,6 +1207,7 @@ impl RuntimeOwner {
             register_timeout,
             first_health_budget,
             None,
+            admission.admitted_program(module),
         )
         .map(Some)
     }

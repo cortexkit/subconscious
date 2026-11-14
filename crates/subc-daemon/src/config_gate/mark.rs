@@ -32,11 +32,13 @@
 //!
 //! A spawn is lowered for good when the store is unstamped, when its module is
 //! no longer gated, when its own delivery fails (a refused or timed-out
-//! acknowledgement of a pending generation), or when its module's active
+//! acknowledgement of a pending generation), when its module's active
 //! generation moves to one the spawn never acknowledged (a rollback or a
-//! restore). Lowering bumps the spawn's epoch and closes its routes, each with
-//! the close reason its opener can decode. Revoked origin evidence lowers
-//! through [`RuntimeOwner::lower_mark`].
+//! restore), or when a placement or approval changes the program record or
+//! the development origin evidence its module is admitted under. Lowering
+//! bumps the spawn's epoch and closes its routes, each with the close reason
+//! its opener can decode. Lowering a spawn not yet marked closes nothing; it
+//! only rules the spawn out of a later activation.
 
 use std::sync::Arc;
 
@@ -111,15 +113,6 @@ impl RuntimeOwner {
         evaluate(self, &state, spawn);
         Ok(())
     }
-
-    /// Lower `record`'s mark for a reason the gate does not observe itself,
-    /// such as revoked or tampered origin evidence.
-    #[allow(dead_code)]
-    pub(crate) fn lower_mark(&self, record: &Arc<SpawnAuthorityRecord>) -> Result<()> {
-        let _state = self.lock()?;
-        self.mark_publisher().lower(record);
-        Ok(())
-    }
 }
 
 /// `spawn` acknowledged `generation`, which is now its module's active
@@ -181,11 +174,23 @@ fn evaluate(owner: &RuntimeOwner, state: &OwnerState, spawn: &DeliverySpawn) {
     if !facts.unmarked {
         return;
     }
-    let view = owner
+    let (view, program) = owner
         .published
         .read()
-        .map(|published| published.admission.mark_view(spawn.module()))
-        .unwrap_or(MarkView::Undecided);
+        .map(|published| {
+            (
+                published.admission.mark_view(spawn.module()),
+                published.admission.admitted_program(spawn.module()),
+            )
+        })
+        .unwrap_or((MarkView::Undecided, None));
+    if superseded(spawn.admitted_program(), program.as_ref()) {
+        // Admitted under a program or origin evidence a later placement or
+        // approval replaced: rule it out for good, even if a later commit
+        // restores the same program.
+        owner.mark_publisher().lower(record);
+        return;
+    }
     let status = blocker(state, spawn, record, view);
     match status {
         None => {
@@ -247,6 +252,19 @@ fn blocker(
     None
 }
 
+/// Whether a spawn admitted under `admitted` no longer runs the program its
+/// module is admitted under `now`. Unknown on either side decides nothing:
+/// a store in recovery changes no mark, and a spawn admitted without the
+/// stamp's gate is never eligible anyway.
+fn superseded(
+    admitted: Option<&super::admission::AdmittedProgram>,
+    now: Option<&super::admission::AdmittedProgram>,
+) -> bool {
+    admitted
+        .zip(now)
+        .is_some_and(|(admitted, now)| admitted != now)
+}
+
 fn active_generation(body: &crate::config_store::StoreBody, module: &str) -> Option<u64> {
     body.versions
         .iter()
@@ -263,7 +281,7 @@ pub(super) fn sweep(
 ) {
     let records = state.delivery.mark_records();
     let (store, body) = state.store.loaded_admission_state();
-    for record in &records {
+    for (record, admitted) in &records {
         let facts = record.mark_facts();
         if !facts.marked && !facts.unmarked {
             continue;
@@ -271,20 +289,25 @@ pub(super) fn sweep(
         let module = record.module_id();
         // A committed unstamp lowers the mark immediately, regardless of the
         // current launch-admission view.
-        let view = if store == StoreState::Unstamped {
+        let mark_view = if store == StoreState::Unstamped {
             MarkView::NotGated
         } else {
             view.mark_view(module)
         };
-        let lower = match view {
+        let lower = match mark_view {
             MarkView::Undecided => false,
             MarkView::NotGated => true,
             MarkView::Gated {
                 delivers_config, ..
             } => {
-                facts.marked
-                    && delivers_config
-                    && facts.acknowledged_active != active_generation(body, module)
+                // A placement or approval that changed the module's program
+                // record or origin evidence lowers every spawn admitted under
+                // the old one, marked or not; a later spawn admitted under
+                // the new evidence earns its own mark.
+                superseded(admitted.as_ref(), view.admitted_program(module).as_ref())
+                    || (facts.marked
+                        && delivers_config
+                        && facts.acknowledged_active != active_generation(body, module))
             }
         };
         if lower {

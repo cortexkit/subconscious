@@ -6297,11 +6297,15 @@ async fn run_health_probe_cycle(
         .then_some(runtime.health.http.as_deref())
         .flatten();
     let result = match http {
-        Some(url) => probe_http_health(url, runtime.health.deadline).await,
-        None => probe_module_health(&spec.module_id, runtime, None).await,
+        Some(url) => probe_http_health(url, runtime.health.deadline)
+            .await
+            .map(|report| (report, None)),
+        None => probe_module_health_from(&spec.module_id, runtime, None)
+            .await
+            .map(|(report, probed)| (report, Some(probed))),
     };
     match result {
-        Ok(report) => {
+        Ok((report, probed)) => {
             handle_health_report(
                 spec,
                 runtime,
@@ -6312,6 +6316,7 @@ async fn run_health_probe_cycle(
                 report,
                 now_ms,
                 delivery_probe,
+                probed,
             )
             .await;
         }
@@ -6541,6 +6546,18 @@ async fn probe_module_health(
     runtime: &SupervisorRuntimeConfig,
     drain_deadline: Option<Instant>,
 ) -> Result<HealthReport, HealthProbeError> {
+    probe_module_health_from(module_id, runtime, drain_deadline)
+        .await
+        .map(|(report, _)| report)
+}
+
+/// [`probe_module_health`], also returning the connection whose registration
+/// answered, so its answer is credited to that registration and no other.
+async fn probe_module_health_from(
+    module_id: &str,
+    runtime: &SupervisorRuntimeConfig,
+    drain_deadline: Option<Instant>,
+) -> Result<(HealthReport, ConnectionId), HealthProbeError> {
     let Some(forwarding) = runtime.forwarding.as_ref() else {
         return Err(HealthProbeError::misconfigured(
             "supervisor was not configured with a forwarding table",
@@ -6571,7 +6588,10 @@ async fn probe_module_health(
         // ask. That is the module being absent, not slow.
         HealthProbeError::lane_dead(format!("failed to begin health.check RPC: {err}"))
     })?;
-    await_health_probe(forwarding, pending, deadline, runtime.health.deadline).await
+    let probed = pending.endpoint.connection_id;
+    await_health_probe(forwarding, pending, deadline, runtime.health.deadline)
+        .await
+        .map(|report| (report, probed))
 }
 
 /// [`probe_module_health`] for one endpoint rather than the id's active one.
@@ -6708,6 +6728,9 @@ async fn await_health_probe(
     }
 }
 
+/// Act on a health probe's answer. `probed` is the connection whose
+/// registration answered (`None` for an HTTP probe, which reaches no
+/// registration); only that registration's spawn is credited with readiness.
 #[allow(clippy::too_many_arguments)]
 async fn handle_health_report(
     spec: &ModuleSpec,
@@ -6719,6 +6742,7 @@ async fn handle_health_report(
     report: HealthReport,
     now_ms: u64,
     delivery_probe: Option<crate::config_gate::runtime::DeliveryProbe>,
+    probed: Option<ConnectionId>,
 ) {
     let delivery_failed = match (&runtime.config_delivery, delivery_probe) {
         (Some(delivery), Some(probe)) => {
@@ -6744,7 +6768,7 @@ async fn handle_health_report(
             .mark_readiness(
                 &spec.module_id,
                 runtime.forwarding.as_deref(),
-                registry,
+                probed,
                 spawn,
                 report.status == HealthStatus::Ok,
             )

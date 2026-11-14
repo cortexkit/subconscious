@@ -231,6 +231,118 @@ fn replace_program(rig: &Rig) -> Digest {
 }
 
 #[cfg(all(unix, feature = "dev-placement"))]
+#[tokio::test]
+async fn first_party_mark_placement_without_a_qualifying_manifest_lowers_and_rules_out_spawns() {
+    use crate::{
+        program_origin::LaunchWitness,
+        spawn_authority::{MarkStatus, SpawnAuthorityRecord},
+    };
+    use std::{sync::Arc, time::Duration};
+    use subc_protocol::peer::CallerOrigin;
+    let rig = program_rig();
+    let owner = Arc::new(rig.owner("placement-mark"));
+    rig.stamp(&owner);
+    let forwarding = Arc::new(crate::ForwardingTable::default());
+    let _handler = crate::ControlHandler::with_forwarding(
+        Arc::new(crate::Registry::default()),
+        forwarding.clone(),
+    )
+    .with_config_runtime(owner.clone());
+    let path = rig.path.join("program");
+    let digest = replace_program(&rig);
+    let manifest = json!({"module_id":"a", "hosts_third_party_code":false,
+        "provenance":{"build_git_sha":"a".repeat(40)}});
+    owner
+        .place_program_with_manifest("a", path.to_str().unwrap(), &digest, Some(&manifest))
+        .unwrap()
+        .unwrap();
+
+    // Two spawns admitted under that placement: one marked and serving a
+    // route, one still waiting to report ready.
+    let spec = module_spec(&rig);
+    let witness = LaunchWitness::capture(&spec).unwrap();
+    let launch = |spawn: u64| {
+        let admission = owner.prepare_spawn(&spec).unwrap();
+        let record = SpawnAuthorityRecord::new("incarnation", spawn, "a");
+        admission.initialize_origin(&record, &witness);
+        record.set_development_daemon_for_test(true);
+        assert_eq!(record.capture().unwrap().origin, CallerOrigin::Development);
+        let delivery = owner
+            .delivery_spawned_for_admission_in_slot(
+                "a",
+                &admission,
+                tokio::time::Instant::now(),
+                Duration::from_secs(5),
+                Duration::from_secs(5),
+                true,
+                Some(record.clone()),
+            )
+            .unwrap()
+            .unwrap();
+        (record, delivery)
+    };
+    let (marked, marked_spawn) = launch(1);
+    owner.mark_ready(&marked_spawn).unwrap();
+    assert!(marked.first_party(), "{:?}", marked.mark_status());
+    let module_connection = ConnectionId::new(40);
+    let (module_tx, _module_rx) = tokio::sync::mpsc::channel(32);
+    forwarding
+        .register_module_connection(
+            module_connection,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(module_tx),
+        )
+        .unwrap();
+    forwarding
+        .bind_target_authority(module_connection, marked.clone())
+        .unwrap();
+    let (client_tx, _client_rx) = tokio::sync::mpsc::channel(32);
+    let route = forwarding
+        .begin_route_bind_relay_for_test(
+            ConnectionId::new(41),
+            crate::FrameSink::new(client_tx),
+            1,
+            "a",
+        )
+        .unwrap();
+    forwarding
+        .complete_pending_relay(
+            module_connection,
+            route.corr,
+            crate::forwarding::RouteBindRelayOutcome::Accepted,
+        )
+        .unwrap();
+    assert_eq!(forwarding.active_binding_count().unwrap(), 1);
+    let (waiting, waiting_spawn) = launch(2);
+    assert!(!waiting.first_party());
+
+    // The same bytes are placed again with no manifest: a spawn admitted now
+    // would have no development origin, so neither running spawn may keep
+    // or earn the mark.
+    let digest = replace_program(&rig);
+    owner
+        .place_program("a", path.to_str().unwrap(), &digest)
+        .unwrap()
+        .unwrap();
+    assert!(!marked.first_party());
+    assert_eq!(marked.mark_status(), MarkStatus::Lowered);
+    assert_eq!(
+        marked.epoch_for_test(),
+        crate::spawn_authority::INITIAL_AUTHORITY_EPOCH + 1
+    );
+    assert_eq!(
+        forwarding.active_binding_count().unwrap(),
+        0,
+        "the lowered spawn's route is closed"
+    );
+    owner.mark_ready(&waiting_spawn).unwrap();
+    assert!(!waiting.first_party(), "{:?}", waiting.mark_status());
+    assert_eq!(waiting.mark_status(), MarkStatus::Lowered);
+}
+
+#[cfg(all(unix, feature = "dev-placement"))]
 #[test]
 fn config_placement_preserves_active_pending_and_nack_restores_active() {
     let rig = program_rig();

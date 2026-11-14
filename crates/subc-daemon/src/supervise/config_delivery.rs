@@ -333,33 +333,30 @@ impl ConfigDelivery {
         failed || owned_failure
     }
 
-    /// A health probe of `module`'s registration answered: `ready` when it
-    /// reported ready. Counts toward `spawn`'s first-party mark only when the
-    /// probed registration is that spawn's own.
+    /// A health probe answered: `ready` when it reported ready. `probed` is
+    /// the connection whose registration answered. Counts toward `spawn`'s
+    /// first-party mark only when that registration is the spawn's own,
+    /// whatever registration the module has by the time the answer is read.
     pub(super) async fn mark_readiness(
         &self,
         module: &str,
         forwarding: Option<&ForwardingTable>,
-        registry: &Registry,
+        probed: Option<ConnectionId>,
         spawn: &DeliverySpawn,
         ready: bool,
     ) {
         let Some(record) = spawn.authority() else {
             return;
         };
-        let own = forwarding.is_some_and(|forwarding| {
-            registry
-                .get_module(module)
-                .ok()
-                .flatten()
-                .and_then(|registration| {
-                    forwarding
-                        .target_authority_for_connection(registration.connection_id)
-                        .ok()
-                        .flatten()
-                })
-                .is_some_and(|probed| Arc::ptr_eq(&probed, record))
-        });
+        let own = forwarding
+            .zip(probed)
+            .and_then(|(forwarding, probed)| {
+                forwarding
+                    .target_authority_for_connection(probed)
+                    .ok()
+                    .flatten()
+            })
+            .is_some_and(|answered| Arc::ptr_eq(&answered, record));
         if !own {
             return;
         }

@@ -33,6 +33,16 @@ struct ModuleAdmission {
     command: Option<ModuleSpec>,
 }
 
+/// The program a spawn of a module is admitted under: the approved program
+/// record and the development origin evidence placed for it. A spawn's mark
+/// holds only while its module is still admitted under the same program; a
+/// placement or an approved change of either supersedes it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AdmittedProgram {
+    program_base: Digest,
+    evidence: Option<crate::program_origin::ProgramOriginEvidence>,
+}
+
 /// A module as the first-party mark sees it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum MarkView {
@@ -72,6 +82,14 @@ impl AdmissionCache {
     pub(super) fn spawn_generation(&self, module: &str) -> Result<u64> {
         self.decision(module)
             .map(|authority| authority.map_or(0, |authority| authority.generation))
+    }
+    /// The program a spawn of `module` is admitted under now, while the
+    /// stamped store gates it. `None` when nothing about it is decided.
+    pub(super) fn admitted_program(&self, module: &str) -> Option<AdmittedProgram> {
+        (self.state == StoreState::Stamped)
+            .then(|| self.modules.get(module))
+            .flatten()
+            .map(ModuleAdmission::admitted_program)
     }
     pub(super) fn registration_declarations(&self) -> Option<BTreeMap<String, String>> {
         (self.state == StoreState::Stamped).then(|| {
@@ -299,6 +317,15 @@ pub(crate) struct SpawnAdmission {
     pub(crate) launch: Option<program::ProgramLaunch>,
 }
 
+impl ModuleAdmission {
+    fn admitted_program(&self) -> AdmittedProgram {
+        AdmittedProgram {
+            program_base: self.program_base.clone(),
+            evidence: self.evidence.clone(),
+        }
+    }
+}
+
 impl SpawnAdmission {
     pub(crate) fn initialize_origin(
         &self,
@@ -325,6 +352,13 @@ impl SpawnAdmission {
         self.authority
             .as_ref()
             .map_or(0, |authority| authority.generation)
+    }
+    /// The program this spawn is admitted under, when the stamped store
+    /// gated its module.
+    pub(crate) fn admitted_program(&self) -> Option<AdmittedProgram> {
+        self.authority
+            .as_ref()
+            .map(ModuleAdmission::admitted_program)
     }
     /// The stamped store gated this module at admission.
     pub(crate) fn gated(&self) -> bool {

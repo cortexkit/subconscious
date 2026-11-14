@@ -71,6 +71,46 @@ fn file_object_id(file: &File) -> Result<FileObjectId> {
     });
 }
 
+/// A cheap change detector; bytes are compared only after this metadata changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UserFileMetadata {
+    identity: FileObjectId,
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl UserFileMetadata {
+    pub(crate) fn read(path: &Path) -> Result<Option<Self>> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(capture_error(error)),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(GateError::new(
+                "path_invalid",
+                "user file must be a regular file",
+            ));
+        }
+        #[cfg(unix)]
+        let identity = {
+            use std::os::unix::fs::MetadataExt;
+            FileObjectId::Unix {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        };
+        #[cfg(windows)]
+        let identity =
+            file_object_id(&subc_os::open_regular_nofollow(path).map_err(capture_error)?)?;
+        Ok(Some(Self {
+            identity,
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        }))
+    }
+}
+
 /// The planning adapter must supply a complete authoritative revision, never
 /// roots proposed by a module or a caller's current working directory.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

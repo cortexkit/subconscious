@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "audit_generation_tests.rs"]
 mod audit_generation;
+#[path = "unstamped_tests.rs"]
+mod unstamped;
 use crate::config_gate::runtime::{AppliedDisposition, DeliveryObserver};
 use subc_protocol::config::{ConfigAppliedRequest, ConfigApplyResult};
 

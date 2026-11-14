@@ -21,7 +21,13 @@ use crate::{
     ConnectionId,
 };
 
+#[cfg(test)]
+type UserFileTestIdle =
+    tokio::sync::mpsc::UnboundedSender<(ConnectionId, tokio::sync::oneshot::Sender<()>)>;
+
 pub struct RuntimeOwner {
+    #[cfg(test)]
+    pub(crate) user_file_test_idle: Mutex<Option<UserFileTestIdle>>,
     #[cfg(test)]
     config_park_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -622,6 +628,8 @@ mod placement;
 mod polled;
 #[path = "published.rs"]
 mod published;
+#[path = "unstamped.rs"]
+pub(crate) mod unstamped;
 pub(crate) use published::Published;
 #[path = "status_inputs.rs"]
 mod status_inputs;
@@ -725,6 +733,8 @@ impl RuntimeOwner {
         }));
         let delivery_changed = std::sync::Arc::new(tokio::sync::Notify::new());
         let owner = Self {
+            #[cfg(test)]
+            user_file_test_idle: Mutex::new(None),
             #[cfg(test)]
             polled_capture_hook: Mutex::new(None),
             #[cfg(test)]
@@ -984,6 +994,7 @@ impl RuntimeOwner {
         if active {
             state.active_declarations.insert(module.into(), connection);
         }
+        self.notify_delivery_changed();
         Ok(())
     }
 

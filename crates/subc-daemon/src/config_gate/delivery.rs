@@ -82,6 +82,7 @@ pub(super) struct DeliveryState {
     policy_epochs: HashMap<String, u64>,
     attempts: HashMap<ConnectionId, Attempt>,
     served: HashMap<ConnectionId, (Option<u64>, Option<u64>)>,
+    pub(super) unstamped_views: HashMap<ConnectionId, std::sync::Arc<ConfigView>>,
     stamp_running: HashSet<ConnectionId>,
     initial_generation: u64,
     children: HashMap<ConnectionId, DeliverySpawn>,
@@ -242,6 +243,7 @@ impl DeliveryState {
     pub(super) fn disconnected(&mut self, connection: ConnectionId) {
         self.attempts.remove(&connection);
         self.served.remove(&connection);
+        self.unstamped_views.remove(&connection);
         self.stamp_running.remove(&connection);
         self.children.remove(&connection);
         self.healthy_children
@@ -1129,6 +1131,18 @@ impl RuntimeOwner {
                 reply.pending.as_ref().map(|view| view.generation),
             ),
         );
+        if let Some(view) = reply
+            .active
+            .as_ref()
+            .filter(|view| view.status == ConfigStatus::Unstamped)
+        {
+            state
+                .delivery
+                .unstamped_views
+                .insert(connection, std::sync::Arc::new(view.clone()));
+        } else {
+            state.delivery.unstamped_views.remove(&connection);
+        }
         Ok(())
     }
     /// Completion is supplied by the supervisor after registration, the first

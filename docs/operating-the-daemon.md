@@ -130,6 +130,11 @@ can approve a stamp and return `approval_surface_unavailable`, remaining
 unstamped. Development builds with `dev-desktop-approval` can exercise desktop
 approval, still bound to the digest and an interactive OS prompt.
 
+While unstamped, an opted-in module that has sent `config.declare` is told of
+edits to its declared user file within about 2 s through `config.changed`.
+Its next `config.get` returns the current file bytes. Creating or deleting the
+file also triggers a notification; touching it or rewriting the same bytes does not.
+
 An approved stamp switches authority from live files to the approved store.
 After stamping, edits are proposals, not authority. The whole `subc.jsonc`
 document is covered, including ungated modules' entries and top-level policy.

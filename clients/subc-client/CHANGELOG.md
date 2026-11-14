@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.26.0
+
+- Use the script runner's provided `ck:registration` helper when available, while
+  retaining the package-local native helper for ordinary Node and Bun launches.
+- Add the `ck-script-runner` export condition for single-file bundles without
+  native addon fallbacks. Bundle with `--conditions=ck-script-runner` for the runner.
+
 ## 0.25.0
 
 - Compiled Bun modules now embed the platform's native registration helper and

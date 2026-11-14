@@ -1,12 +1,21 @@
 {
   "name": "@cortexkit/subc-client",
-  "version": "0.25.0",
+  "version": "0.26.0",
   "description": "TypeScript client for the subc daemon. Wire-compatible (byte-for-byte) with the Rust subc-transport handshake and subc-protocol envelope.",
   "type": "module",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./registration-native": {
+      "ck-script-runner": {
+        "bun": "./src/registration-native-runner.ts",
+        "default": "./dist/registration-native-runner.js"
+      },
+      "types": "./dist/registration-native.d.ts",
+      "bun": "./src/registration-native.ts",
+      "default": "./dist/registration-native.js"
     }
   },
   "files": [

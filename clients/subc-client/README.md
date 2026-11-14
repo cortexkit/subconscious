@@ -394,6 +394,16 @@ matching the Node process's architecture. Run `bun run typecheck` and
 verification, build the addon in the same job that runs these tests. Artifacts
 are not committed.
 
+### Bundling for the script runner
+
+Use `bun build --target=bun --format=esm --conditions=ck-script-runner --outfile=example.js entry.ts`
+to create a single ESM bundle for `ck-script-runner-bun`. The condition selects a
+registration helper loader that uses only the runner's provided `ck:registration`
+module, without native-addon fallbacks. Without that provided module, registration
+fails with `registration_helper_unavailable`. Normal Node and Bun imports retain
+the package-local native helper. Check the result with
+`ck-script-runner-bun --check example.js` before configuring it as a script module.
+
 ### Releasing the npm package
 
 1. Update `package.json` and the changelog, commit the release, and wait for the

@@ -14,6 +14,7 @@ test("bun build --compile embeds the registration helper", async () => {
   for (const name of Object.keys(env)) if (name.startsWith("SUBC_")) delete env[name];
   try {
     cpSync(fileURLToPath(new URL("../src", import.meta.url)), join(sdk, "src"), {recursive: true});
+    cpSync(fileURLToPath(new URL("../package.json", import.meta.url)), join(sdk, "package.json"));
     cpSync(fileURLToPath(new URL("../native", import.meta.url)), join(sdk, "native"), {recursive: true});
     writeFileSync(join(dir, "module.ts"), `
       import { ClaimError } from "./sdk/src/index.ts";

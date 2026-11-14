@@ -122,6 +122,7 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
   let childFixture = fixture;
   if (mode === "fallback-missing") {
     cpSync(fileURLToPath(new URL("../src", import.meta.url)), join(dir, "src"), {recursive: true});
+    cpSync(fileURLToPath(new URL("../package.json", import.meta.url)), join(dir, "package.json"));
     cpSync(fileURLToPath(new URL("fixtures", import.meta.url)), join(dir, "tests/fixtures"), {recursive: true});
     childFixture = join(dir, "tests/fixtures/registration-child.ts");
   }
@@ -143,6 +144,7 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
 test("adopt fails closed when a named registration channel cannot load its helper", async () => {
   const dir = mkdtempSync(resolve("target/scratch/no-native-"));
   cpSync(fileURLToPath(new URL("../src", import.meta.url)), join(dir, "src"), {recursive: true});
+  cpSync(fileURLToPath(new URL("../package.json", import.meta.url)), join(dir, "package.json"));
   try {
     const file = join(dir, "src/registration-channel.ts");
     for (const named of [false, true]) {
@@ -171,6 +173,7 @@ test("adopt fails closed when a named registration channel cannot load its helpe
 test("import neither loads the native helper nor validates inherited registration metadata", async () => {
   const dir = mkdtempSync(resolve("target/scratch/lazy-registration-"));
   cpSync(fileURLToPath(new URL("../src", import.meta.url)), join(dir, "src"), {recursive: true});
+  cpSync(fileURLToPath(new URL("../package.json", import.meta.url)), join(dir, "package.json"));
   mkdirSync(join(dir, "native"));
   writeFileSync(join(dir, "native/index.js"), `console.warn('NATIVE_LOADED'); module.exports = { supervised() { console.warn('VALIDATED'); return false; }, registrationRefusal() { return 'refused'; } };`);
   try {

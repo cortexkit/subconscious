@@ -1,4 +1,4 @@
-import { createRequire } from "node:module";
+import { native, type Native, type NativeChannel } from "@cortexkit/subc-client/registration-native";
 import { Duplex } from "node:stream";
 import { ClaimBroker, ClaimError, readClaimRefusal, readClaimPresentReply } from "./claim.js";
 import { SubcSocket } from "./socket.js";
@@ -7,44 +7,6 @@ import { FrameType, Priority, buildFlags, buildFrame, encodeFrame } from "./enve
 /** SDK-local registration failures, not daemon-authored claim refusal codes. */
 export type RegistrationErrorCode = "registration_helper_unavailable" | "registration_adoption_failed"
   | "registration_already_taken" | "registration_owner_conflict" | "registration_not_ready" | "registration_closed";
-
-interface NativeChannel { read(): Promise<Buffer>; write(bytes: Buffer): Promise<void>; close(): void }
-interface NativeHandoff {
-  environment: Record<string, string>; childFd: number | null;
-  complete(pid: number, claim: string): Promise<void>; abort(): void;
-}
-interface Native {
-  supervised(): boolean; registrationRefusal(): string | null;
-  takeRegistrationChannel(): NativeChannel | null;
-  prepareHelperClaim(slot: number): NativeHandoff;
-  helperClaim(): Promise<string | null>;
-}
-let addon: Native | undefined;
-function native(): Native {
-  if (addon) return addon;
-  if (!["darwin", "linux", "win32"].includes(process.platform) || !["arm64", "x64"].includes(process.arch)) {
-    throw new Error(`registration native platform unsupported: ${process.platform}-${process.arch}`);
-  }
-  // Node ESM has no require; Bun's own require must stay visible to its bundler.
-  if (typeof require === "undefined") {
-    return addon = createRequire(import.meta.url)(`../native/subc-registration-${process.platform}-${process.arch}.node`) as Native;
-  }
-  // Literal paths let Bun embed the addon when compiling a standalone module.
-  // Bun's bundler treats an unresolvable require inside a try block as optional
-  // instead of failing the build, so a development checkout that built only its
-  // own platform's binary still compiles. The catch only rethrows.
-  try {
-    switch (`${process.platform}-${process.arch}`) {
-      case "darwin-arm64": return addon = require("../native/subc-registration-darwin-arm64.node") as Native;
-      case "darwin-x64": return addon = require("../native/subc-registration-darwin-x64.node") as Native;
-      case "linux-arm64": return addon = require("../native/subc-registration-linux-arm64.node") as Native;
-      case "linux-x64": return addon = require("../native/subc-registration-linux-x64.node") as Native;
-      case "win32-arm64": return addon = require("../native/subc-registration-win32-arm64.node") as Native;
-      case "win32-x64": return addon = require("../native/subc-registration-win32-x64.node") as Native;
-      default: throw new Error(`registration native platform unsupported: ${process.platform}-${process.arch}`);
-    }
-  } catch (error) { throw error; }
-}
 
 /** Native reads and writes remain on the N-API runtime, including
  * Windows duplex pipes using asynchronous I/O. Node never opens a second handle under the pipe name. */

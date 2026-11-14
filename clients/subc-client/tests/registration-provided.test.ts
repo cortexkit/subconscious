@@ -10,6 +10,8 @@ test("registration uses the runner-provided helper before native files", async (
   writeFileSync(entry, `
     import { plugin } from "bun";
     plugin({name: "provided-registration", setup(build) {
+      // Resolve like the runner; Windows Bun 1.3.14 does not infer this namespace from onLoad.
+      build.onResolve({filter: /^registration$/, namespace: "ck"}, ({path}) => ({path, namespace: "ck"}));
       build.onLoad({filter: /^registration$/, namespace: "ck"}, () => ({
         loader: "object", exports: { supervised() { console.log("PROVIDED_HELPER_USED"); return false; } }
       }));
@@ -24,6 +26,24 @@ test("registration uses the runner-provided helper before native files", async (
     const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
     expect({ code, out, err }).toEqual({ code: 0, out: "PROVIDED_HELPER_USED\n", err: "" });
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("registration falls back to the native helper without a provided module", async () => {
+  const loader = fileURLToPath(new URL("../src/registration-native.ts", import.meta.url));
+  const script = `
+    const {native} = await import(${JSON.stringify(loader)});
+    const helper = native();
+    if (typeof helper.takeRegistrationChannel !== "function"
+        || typeof helper.prepareHelperClaim !== "function"
+        || typeof helper.helperClaim !== "function"
+        || helper.supervised() !== false) throw new Error("native helper was not selected");
+    console.log("NATIVE_HELPER_USED");
+  `;
+  const child = Bun.spawn([process.execPath, "-e", script], {
+    env: { ...process.env, SUBC_REGISTRATION_FD: "999:1", SUBC_REGISTRATION_PIPE: "not-a-real-pipe" }, stdout: "pipe", stderr: "pipe",
+  });
+  const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect({ code, out, err }).toEqual({ code: 0, out: "NATIVE_HELPER_USED\n", err: "" });
 });
 
 test("runner export condition fails closed without the provided helper", async () => {

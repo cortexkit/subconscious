@@ -95,6 +95,9 @@ add an installer component; manual configuration is sufficient.
   created or reused thread ids are omitted. Zero-tick threads count as idle.
   No stacks are returned. Windows is unsupported.
 - The window must be an integer from 1 through 10. Invalid requests run nothing.
+  Profiling is refused before capture when the host's one-minute load average
+  exceeds twice its logical CPU count. If the load cannot be read, capture
+  proceeds. A refusal for host load does not consume the module's cooldown.
   One capture runs at a time per `inspect` process; contenders are refused, never
   queued. A module has a 60-second cooldown after an attempted capture completes
   (including failure/cancellation), using a monotonic clock. No measurements or
@@ -203,11 +206,12 @@ stderr. Bind rejections use the SDK's typed error frame.
 | `unknown_module` | ID absent from the supervised roster | terminal |
 | `not_running` | No live process in the spawn snapshot | terminal |
 | `busy` | Another capture is active in this inspect process | terminal |
+| `host_busy` | Host load is too high to profile safely | terminal |
 | `rate_limited` | Cooldown; `detail.retry_after_ms` is time remaining | terminal |
 | `module_restarted` | PID/generation changed or disappeared during capture | terminal |
 | `unsupported_platform` | OS has no profiling backend | terminal |
 | `sampler_failed` | Capture failed or exceeded its deadline; static short reason | terminal |
 | `roster_unavailable` | Daemon cannot provide list or spawn snapshot | terminal |
 
-A watch flow should skip `busy`, `rate_limited`, `not_running` and
+A watch flow should skip `busy`, `host_busy`, `rate_limited`, `not_running` and
 `module_restarted`, then try on its next normal tick, not immediately retry.

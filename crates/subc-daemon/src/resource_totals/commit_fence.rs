@@ -14,6 +14,10 @@ impl CommitFence {
     pub(crate) fn committed(&self) -> bool {
         self.0.load(Ordering::Acquire) == COMMITTING
     }
+    /// A timeout or explicit cancellation won: no commit can follow.
+    pub(crate) fn cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire) == CANCELLED
+    }
     pub(crate) fn cancel(&self) -> bool {
         match self
             .0
@@ -23,6 +27,15 @@ impl CommitFence {
             Err(COMMITTING) => false,
             Err(_) => false,
         }
+    }
+
+    /// Only the winner of a new timeout may replace validation with retention.
+    /// If the caller already cancelled explicitly, this returns false, so a
+    /// cancelled declaration is never retained as pending afterwards.
+    pub(crate) fn cancel_for_retention(&self) -> bool {
+        self.0
+            .compare_exchange(OPEN, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Call only after every lock and validation needed for commit is held.
@@ -37,6 +50,31 @@ impl CommitFence {
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn only_a_new_timeout_can_authorize_pending_retention() {
+        let cancelled = CommitFence::default();
+        assert!(cancelled.cancel());
+        assert!(!cancelled.cancel_for_retention());
+        let timed_out = CommitFence::default();
+        assert!(timed_out.cancel_for_retention());
+        assert!(!timed_out.cancel_for_retention());
+        assert!(!timed_out.claim_commit(), "late validation cannot publish");
+        let committed = CommitFence::default();
+        assert!(committed.claim_commit());
+        assert!(!committed.cancel_for_retention());
+    }
+
+    #[test]
+    fn only_a_won_cancellation_reports_cancelled() {
+        let open = CommitFence::default();
+        assert!(!open.cancelled());
+        assert!(open.claim_commit());
+        assert!(!open.cancelled(), "a committing fence is not cancelled");
+        let timed_out = CommitFence::default();
+        assert!(timed_out.cancel_for_retention());
+        assert!(timed_out.cancelled());
+    }
 
     #[test]
     fn timeout_and_commit_have_one_atomic_winner() {

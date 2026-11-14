@@ -117,10 +117,7 @@ const GRANDCHILD_APPEARANCE_DEADLINE: Duration = Duration::from_secs(10);
 /// test rather than an unbuilt dependency: `cargo test -p subc-jobobject` builds
 /// `[[bin]]` targets, `--lib` does not.
 fn fixture_path() -> PathBuf {
-    let mut path = std::env::current_exe().expect("current_exe available in tests");
-    path.pop();
-    path.pop();
-    path.push("jobobject-fixture.exe");
+    let path = cortexkit_test_support::cargo_profile_bin("jobobject-fixture");
     assert!(
         path.exists(),
         "jobobject-fixture not built at {}: run `cargo test -p subc-jobobject` \

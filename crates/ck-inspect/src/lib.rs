@@ -174,6 +174,7 @@ impl Roster for SubcConsumer {
 #[async_trait]
 trait Sampler: Send + Sync {
     fn supported(&self) -> bool;
+    fn host_load(&self) -> Option<(f64, usize)>;
     async fn capture(
         &self,
         profile: Profile,
@@ -185,6 +186,12 @@ struct OsSampler;
 impl Sampler for OsSampler {
     fn supported(&self) -> bool {
         cfg!(any(target_os = "macos", target_os = "linux"))
+    }
+    fn host_load(&self) -> Option<(f64, usize)> {
+        Some((
+            subc_os::host::load_average()?[0],
+            std::thread::available_parallelism().ok()?.get(),
+        ))
     }
     async fn capture(
         &self,
@@ -310,6 +317,18 @@ impl Inspect {
                     return Err(Refusal::new(
                         "unsupported_platform",
                         "profiling is supported only on macOS and Linux",
+                    ));
+                }
+                // Apply the same admission rule on Linux for consistent profiles,
+                // even though its /proc reader does not suspend the target.
+                if self
+                    .sampler
+                    .host_load()
+                    .is_some_and(|(load, cpus)| load > 2.0 * cpus as f64)
+                {
+                    return Err(Refusal::new(
+                        "host_busy",
+                        "host load is too high to profile safely",
                     ));
                 }
                 let _permit = self.bounds.enter(&module_id)?;

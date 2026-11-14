@@ -1,24 +1,35 @@
 # Changelog
 
-## Unreleased
+## 0.21.6
 
-- Add `ck config` status, plan, apply-by-digest, stamp, unstamp, history,
-  rollback and development program placement. Preserve the complete daemon
-  view and report uncertain commit outcomes without retrying them.
+- Add `ck config` status, plan, apply-by-digest, stamp, unstamp, history and
+  rollback commands. The gate ships with the stamp off: unstamped installs
+  behave as before, and editing a file does not approve it while stamped.
+  Configure one absolute `ck-subc --config-store-root` service argument to open
+  the approved store; embedded or standalone daemons without a root open none.
+- Review an immutable plan before applying its digest. Stamping and changes to
+  the consent module require trusted desktop review and interactive OS presence;
+  other eligible changes can use bounded OS confirmation or phone consent.
+  Approval records a generation, not a promise that every module has applied it.
+  Status distinguishes pending delivery, active configuration, recovery and
+  daemon settings requiring a restart. An uncertain commit is not retried.
+- Stamped startup uses the last active approved daemon configuration, not edited
+  live files. Rollback uses retained configuration bytes and freshly checks
+  programs at the restored paths; program changes require review again.
+- Support child-bound registration over the daemon's private inherited channel
+  and explicit provider claims. Upgrade supervised module SDKs and enable their
+  registration-channel support before stamping: stamped script entry points are
+  refused. The development-only program-placement command records an unapproved
+  placement and cannot replace production approval.
 
-- Require subc-daemon 0.41.10 or newer for connection-bound configuration delivery
-  and pending ACK visibility until the authority-store anchor commits.
+## 0.21.5
 
-- Require subc-daemon 0.41.9 or newer so configuration approval binds to a
-  complete plan delivered to a verified desktop and requires interactive OS
-  confirmation. No development identity verifier is shipped.
+- Configure the reserved, supervised MCP gateway during core setup, including repair of older installs missing its entry, and rescan the daemon after core configuration.
+- List only optional modules available to add on this host in bare setup and dry-run output, without prompting for a selection. Correct the Insula note: cookies come only from vault deposits on every OS, never browser stores.
 
-- Raise the daemon dependency floor for bounded authority-store publication and
-  protected daemon configuration history.
+## 0.21.4
 
-- Accept a single absolute `ck-subc --config-store-root` service argument while
-  refusing relative, duplicated and otherwise unknown startup arguments. Without
-  that argument the daemon opens no configuration authority store.
+- Raise dependency pins to subc-daemon 0.44.9, subc-client-rs 0.38.4, subc-control 0.38.3 and subc-protocol 0.36.3.
 
 ## 0.21.3
 

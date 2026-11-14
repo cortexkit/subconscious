@@ -258,12 +258,16 @@ async fn incomplete_pass_changes_neither_committed_view_reason_nor_time() {
 
 #[tokio::test]
 async fn minute_sample_uses_its_own_walk_instead_of_a_recent_cached_table() {
+    let _readers = crate::subtree_resources::fault_read_guard().await;
     let tracker = Arc::new(Tracker::default());
     let cached = table(1, 10);
     *tracker.cache.lock().unwrap() = Some((Instant::now(), Arc::clone(&cached)));
+    let reads = tracker.inject_sampler_tables_for_test([(*table(2, 20)).clone()]);
     let readings = tracker.read(Vec::new(), true, "minute_fixture").await;
     let cache = tracker.cache.lock().unwrap();
     assert!(!Arc::ptr_eq(&cached, &cache.as_ref().unwrap().1));
+    assert_eq!(cache.as_ref().unwrap().1.revision(), 2);
+    assert_eq!(reads.load(Ordering::SeqCst), 1);
     assert!(readings.daemon.as_ref().unwrap().measured_at_ms.is_some());
 }
 

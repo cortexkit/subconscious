@@ -29,11 +29,15 @@ struct FakeSampler {
     supported: bool,
     failure: bool,
     calls: AtomicUsize,
+    load: Mutex<Option<(f64, usize)>>,
 }
 #[async_trait]
 impl Sampler for FakeSampler {
     fn supported(&self) -> bool {
         self.supported
+    }
+    fn host_load(&self) -> Option<(f64, usize)> {
+        *self.load.lock().unwrap()
     }
     async fn capture(
         &self,
@@ -76,6 +80,7 @@ fn service(
         supported,
         failure,
         calls: AtomicUsize::new(0),
+        load: Mutex::new(None),
     });
     (
         Inspect {
@@ -238,6 +243,22 @@ async fn unsupported_platform_refusal() {
         "unsupported_platform"
     );
     assert_eq!(sampler.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn host_load_refusal_preserves_cooldown_and_safe_or_unreadable_load_proceeds() {
+    for next_load in [Some((3.9, 2)), Some((4.0, 2)), None] {
+        let (service, sampler) = service(vec![entry()], vec![vec![spawn(72, 3)]; 3], true, false);
+        *sampler.load.lock().unwrap() = Some((4.1, 2));
+        let refusal = service.query(&request(1)).await.unwrap_err();
+        assert_eq!(refusal.code, "host_busy");
+        assert_eq!(refusal.reason, "host load is too high to profile safely");
+        assert_eq!(sampler.calls.load(Ordering::SeqCst), 0);
+
+        *sampler.load.lock().unwrap() = next_load;
+        service.query(&request(1)).await.unwrap();
+        assert_eq!(sampler.calls.load(Ordering::SeqCst), 1);
+    }
 }
 #[tokio::test]
 async fn sampler_failed_refusal_has_no_raw_output() {
@@ -418,6 +439,7 @@ fn every_refusal_is_terminal_with_detail() {
         "unknown_module",
         "not_running",
         "busy",
+        "host_busy",
         "rate_limited",
         "module_restarted",
         "unsupported_platform",

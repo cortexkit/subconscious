@@ -1,317 +1,118 @@
 # Changelog
 
-## Unreleased
+## 0.45.2
 
-- Report live opted-in modules with no approved configuration as gated, and hint
-  connections whose configuration replies waited for a recovered anchor. Add an
-  explicit `test-support`/`ckdev-`-guarded file-key store and scripted OS-confirmation
-  approval for isolated daemon/CLI/SDK acceptance; default-feature binaries contain
-  no switch.
-- Add the opt-in `dev-placement` feature and owner-only `config.place_program`.
-  Record program-only development generations without changing configuration
-  delivery pointers; release daemons refuse their identities until approval.
-  Report ungated modules, interpreter-only coverage and startup override names.
+- The Windows write-exclusion test waits for the second child's own registration
+  instead of reusing the stopped child's retired one.
+- An unstamped macOS module whose program re-execs another program is no longer
+  refused and restarted. Orphan cleanup records the image actually observed.
+- Use native sleeping fixtures and bounded launch, reply, and synchronization
+  waits to make supervision and registration-claim tests deterministic.
+- Make configuration-gate test fixtures and readiness waits valid on macOS.
+- Recreate stale PID-reused scratch directories once in configuration-gate tests.
+- Declare registration-channel support in Windows configuration-admission test
+  fixtures so they exercise file-handle retention and nonce withholding after
+  stamping the configuration gate. Production admission rules are unchanged.
 
-- Keep approved daemon configuration in a separately published memory view, so
-  polled supervisor lists do not wait for configuration publication, disk checks
-  or the platform keychain. Invalidate the view when authority becomes unverified.
+## 0.45.0
 
-- Record file-preview proposals without recording client candidate text, and
-  read approved daemon entries for reservation release and configured enabled
-  reporting. Report approved-but-inactive daemon settings separately from
-  supervisor state and include an explicit `restart_required` in config apply
-  replies. Document approval, unstamp and platform limitations, including the
-  remaining approved-entry reconciliation and bootstrap integration gaps.
+- Add an opt-in configuration gate backed by a separately approved store. The
+  gate ships with the stamp off, and unstamped installs behave as before.
+  Stamped installs treat live-file edits as proposals, not authority; missing
+  or unverified stores enter recovery without replacing running active views.
+- Review immutable plans before approval. Stamping and consent-module changes
+  require trusted desktop review and interactive OS presence; eligible changes
+  can use bounded OS confirmation or phone consent. Production requires a
+  verified desktop; development-only approval and placement features are not
+  production approval bypasses. Embedded daemons open no store without an
+  explicit root.
+- Deliver approved generations to opted-in modules only while they are serving.
+  Bind delivery and ACK/NACK to the active connection and durable publication,
+  retain the last active view on refusal, and report pending, refused and
+  restart-required outcomes separately. Stamped boot loads the last active
+  approved daemon generation rather than edited live files.
+- Roll back retained configuration bytes while freshly capturing programs at
+  their restored paths. Program changes are reviewed again, even when module
+  configuration bytes are unchanged. Approval never restarts the daemon itself.
+- Bind supervised registration to a private inherited child channel, with
+  explicit bounded claims for helper and provider identities. Upgrade module
+  SDKs and declare registration-channel support before stamping. Stamped script
+  entry points are refused; unstamped script launches retain legacy behavior.
+  Retired children cannot retain registration or agent-command authority.
+- Preserve narrowed process-table accounting and shared declaration walks.
+  Retaining newly reported command-process roots while validation is pending
+  and committing their accounting both recheck the current child-bound
+  registration or legacy launch nonce.
+- **Rust migration:** exhaustive `ConfiguredModule` literals must add
+  `registration_channel` (`false` preserves legacy configuration). Set it to
+  `true` only for modules supporting the private channel. `BootstrapError`
+  adds `ConfigStore` and is now non-exhaustive; add a wildcard match arm.
+  Adopt protocol 0.37, control/client 0.39 and transport 0.18 types together.
 
-- Retire binding authority at direct macOS privacy-confirmation exit observations
-  and on uncertain synchronous waits. Publish identity reservations atomically
-  with their launch-nonce sample. Upgrade a carried retirement hook's live holder
-  before its signal, so a partial upgrade cannot suppress last-publication cleanup.
+## 0.44.15
 
-- Retain a separate dead-binding refusal for every nonce still recognized by
-  current, reserved or draining-swap admission; prune only after rotation or swap
-  closure removes its last acceptance surface. Retire registration-timeout reaps
-  before health probing, keep a superseding recovery exit's retry timer armed,
-  and limit held enable staging to a committed unstamp that is still pending.
+- Agent-command declarations and the resource sampler walk only the processes
+  accounting can ask about: supervised module processes and container members,
+  declared roots, and every pid held in module state (command roots, members,
+  pending, omitted and lost roots, CPU-ledger and credit identities). A table
+  that turns out not to cover state committed during the walk is not used:
+  validation retries with a fresh walk, and the sampler pass stays incomplete.
+  On macOS a declaration's walk drops from hundreds of milliseconds to about
+  10 ms.
+- Declarations arriving while a validation walk runs share the next walk
+  instead of each starting one. A declaration still uses only a walk that
+  began after it arrived.
+- A declaration retry after busy accounting state reuses the walk it already
+  took. After a commit conflict it walks again.
+- Stop retrying a declaration once its validation has timed out or been
+  cancelled, so abandoned validations no longer hold the reader slots with
+  further walks.
+- Log each validated declaration's arrival-to-validation latency at debug
+  level.
 
-- Refuse retired launch nonces without blocking fresh unstamped respawns, and
-  retire binding authority immediately when plain or swap child waits return.
-  Recheck retired bindings before publishing unstamped HELLO registrations.
-  Retry pending recovery exits on a one-second exponential backoff capped at
-  sixty seconds, and stage enable edits from newly authoritative files without spawning
-  until reconciliation releases admission.
+## 0.44.14
 
-- Keep committed recovery exits held and retryable until all supervision,
-  capability-reservation and activity configuration succeeds. Validate the exact
-  captured daemon document and inherit loaded/default bootstrap fields whole.
-  Retain bounded negative binding records after child exit so neither normal
-  HELLO nor recovery can mistake a dead nonce for an unbound legacy launch.
+- Satisfy Rust 1.100 clippy (`needless_bool` in the running-image match,
+  `needless_range_loop` in an overload-hold test). No behaviour change.
 
-- Keep missing or unverified configuration stores in recovery: bind the control
-  plane from built-in defaults, hold all future supervised launches and retries,
-  admit only already-bound supervised launch nonces, and refuse other control
-  operations before the generic privileged-operation prompt. Preserve running modules' in-memory active
-  views. Recovery unstamp uses the OS prompt's fixed explanation; desktop re-stamp
-  and unstamp replace rejected configuration-store history only after fresh input validation.
-- Notify opted-in modules whose file views change when unstamping, without
-  requiring a new edit, delivery attempt or process restart. Install recovered
-  reservation policy before releasing the recovery hold.
+## 0.44.13
 
-- Recheck live content after every gated exec, including children without HELLO,
-  and refuse a ready binding when the running process's approved content cannot
-  be verified.
-  Serialize HELLO's final checks with registration publication and retire content
-  bindings after unstamp. Route revocation rechecks the exact ACK and deadline
-  under the forwarding write lock. Swap cutover uses synchronous loaded-state
-  checks without awaiting the configuration owner; deferred attempts back off
-  while stop and child exit remain selectable.
-  The checks verify the supervised child's image and possession of its launch
-  nonce, not the HELLO sender's process identity. A same-user process that learns
-  the nonce (including a Windows descendant inheriting it) can impersonate the
-  child while that child's image remains approved. Peer authentication remains
-  required before releasing or enabling the configuration gate.
+- Add supervisor `state` and `expected_back` recovery metadata to route-open
+  availability refusals for supervised targets, preserving existing codes,
+  messages and readiness details. Unknown recovery verdicts remain absent;
+  required-capability refusals do not predict another module's recovery.
+  Declared-not-ready, not-yet-registered (`module_warming`) and planned-replacement
+  refusals expect the module to serve again without spending crash-restart
+  budget, even when that budget is zero.
 
-- Release Windows program write-exclusion handles once HELLO acknowledges a
-  normal launch or the warmed replacement in a blue/green swap, including
-  sink-backed connections whose acknowledgement is queued instead of returned
-  as a frame.
+## 0.44.12
 
-- Classify stable malformed or oversized program captures as definite refusals,
-  preserve transient capture deferral, and do not misclassify an unchanged
-  approved symlink. Refusal-list capacity cannot remove records that keep a
-  refused module stopped. Retain and report overflow when removing a record
-  would silently allow a refused module to respawn.
+- Hold silence-based health restarts while the host is overloaded, using distinct late modules and a daemon scheduler-lag tick over a 60-second window. Held probes report degraded health with `host overloaded`; lane loss, process exits, and restart budgets keep their existing behavior. Resume counting new failures when the hold clears, and log hold transitions.
 
-- Recheck the current process's content at HELLO, not only its initial executable
-  inode or readiness latch. Hash Linux's live executable descriptor; compare
-  macOS kernel code-directory hashes with validated approved-file hashes; retain
-  Windows write-exclusion handles until HELLO or exit. Rehash script and declared
-  files at spawn and HELLO. Refuse unsigned macOS gated images and unsupported
-  gated platforms, and kill the whole container on a definite content mismatch.
-- Bind refusal publication to the approved program identities used by the failed
-  check, retire volatile holds
-  with durable records, and defer transient capture failures with bounded delay.
-  Keep registered actors and exit observations responsive to commands while
-  configuration authority is busy. Approving only executable or launch-field
-  changes does not require the running module's configuration-review RPC;
-  module-layer and declaration changes still require that review.
-- Bind route-policy installation to its active connection, delivery attempt and
-  unexpired ACK. While approved configuration is authoritative, refuse executing
-  rescans before the generic privileged-operation prompt, record their proposals,
-  and prevent live file reconfiguration from replacing approved supervision
-  policy, including while a swap candidate warms.
-- Preserve configured reservation policy instead of adding sticky legacy nonce
-  reservations for gated launches. Explicit nonce and current-content checks
-  protect gated identities even while stopped or held. Module reconnects after
-  promotion and disabling configuration approval with unstamp preserve the
-  configured reservation policy.
+## 0.44.11
 
-- Admit every supervised launch against approved configuration and covered program
-  files. Resolve executable and supported shebang interpreters once, bind the
-  executed image to the retained hash witness, and withhold HELLO service until
-  that binding passes. Show interpreter-only coverage without inferring code from
-  arguments. Linux and Windows refuse bare program names when PATH is absent.
-- Hold refused modules without respawns, slow retries, critical-spawn alerts or
-  additional crash-budget entries. Keep existing processes serving, preserve the
-  pending-exit fence, defer contended admission without blocking supervisor
-  commands, and resume enabled held modules after approval. Persist at most 256
-  refused program identities in the integrity-covered store, pruning oldest first
-  and clearing a module's entries when its approved program base changes.
-- Launch rollback commands at their restored paths and recheck their current
-  identities. For module-owned route policy, wait for the configuration ACK before
-  revoking old routes and their scope-admission stamps with the existing reload
-  close reason; require a fresh health probe before activation. Refuse
-  daemon-owned route-policy fields.
-- Advertise `config.gate` only when bootstrap explicitly activates a config store;
-  embedded runtime installation alone does not advertise it. Carry the caller's
-  tracing dispatcher and span into blocking HELLO work, preserving the existing
-  admission log exactly once with its connection context. Verify
-  the reviewer's active connection, launch nonce and live executable identity
-  before sending configuration or consent reviews. Wire spawn and swap test
-  pauses and defer tamper activity emission until module gates have been released.
-- Refuse a stamped wrapper whose observed spawn image replaces its covered
-  interpreter with another executable. Configure the final executable directly,
-  or keep the covered wrapper alive while running the other program as a child.
+- Test-only: the resource fixture's CPU-burning child no longer waits forever for the test's next marker. It gives up after a minute, or as soon as the test's scratch directory is gone, so a failed or cancelled test run no longer leaves it running. No daemon runtime changes.
 
-- Build macOS privacy-trampoline commands from the same retained regular file
-  used for launch validation, including shebang inspection. Resolve PATH once,
-  honor its last override and executable permissions, and refuse absent names
-  instead of falling back to the working directory.
-- Retain each configuration caller's cancellation token until publication starts,
-  so task drops and disconnects still prevent a commit after queued cleanup has
-  been processed. Refuse publication if the caller-request index's mutex was
-  poisoned: cancellation tracking can no longer be trusted. Reader reservations
-  own cleanup before dispatch, including authorization refusals and unpolled tasks.
-  Send phone withdrawal only after the card was enqueued, and record at most
-  one late-cancellation diagnostic per attempt.
-- Check cancellation-index health under its lock at the publication claim, and
-  refuse duplicate in-flight Apply correlations before dispatch so they cannot
-  cancel the original caller's attempt. Match Darwin's default executable search
-  path when neither the module nor daemon environment supplies PATH.
-- Relay immutable `consent/v1` approval cards only through the policy-enabled,
-  admitted active phone module. Bind each card to its daemon-allocated request
-  correlation, bound the wait for an answer to five minutes, and withdraw unanswered
-  or invalidated cards with channel-zero Cancel without closing the module's
-  other routes.
-  Pending cards also observe the consent module's actual process identity and
-  active registration: process exits and swap cutovers withdraw them even when
-  the module does not advertise `config.review` or have a pending generation.
-- Keep the caller's reader running during configuration approval, so channel-zero
-  Cancel and disconnect withdraw pending OS prompts and phone cards without
-  recording a generation. Configuration still prompts for the specific plan,
-  never a second generic privileged prompt.
-- After a phone answer, a separate 30 s bound covers everything up to the start
-  of durable publication. Expiry before that commit point refuses
-  `config_commit_timeout` and records no generation; publication that has started
-  completes and returns its real outcome, retaining its operation and module
-  locks even when the caller disconnects.
-- Build rollback plans from retained byte-exact configuration and freshly
-  captured programs at the restored paths. Show when a program changed since
-  the selected generation, preserve edited files as proposals, and
-  select programs from the approved rollback inputs at their restored paths.
-- Under `dev-desktop-approval` only, accept same-user local complete desktop
-  reviews without app verification, while retaining OS presence and writer
-  receipts. Persist `unverified_development_desktop` explicitly in status and
-  history; production builds still require desktop attestation.
-- Bind user-scope generation delivery attempts to individual connections and
-  successful writer flushes. Preserve serial supersession, independent module
-  outcomes and promoted-child catch-up without replacing the stored active or
-  recovery generation for a module.
-- Keep an ACK's previous active vector visible until its store publication is
-  anchored. A NACK can override the unanchored ACK without losing another
-  module's independently acknowledged configuration.
-  No delivery bypasses an earlier pending anchor; after repair, a failure not
-  yet anchored may return at most once per daemon start, never within the same
-  run and never after its failed mark is anchored.
-- Bind whole-generation apply precedence into the reviewed plan. Keep deferred
-  configuration bytes away from an old instance until the required supervision
-  or daemon boundary; approval never restarts the daemon itself.
-- Add a non-interactive pending-anchor retry schedule with bounded backoff and
-  state-change logging. Background control waiters no longer retain an embedded
-  daemon's configuration store after their owner is dropped.
-- Isolate each module's delivery write and acknowledgment deadlines. Observe
-  supervised launches and first healthy probes, and bind promoted targets under
-  the same module lock as forwarding cutover and registration promotion.
-- Release the module gate during writer flushes, then recheck the connection's
-  role, generation and attempt before accepting the receipt. Discard obsolete
-  receipts without overwriting a newer served view or a promoted child's catch-up.
-- Run delivery-worker, approval, route-policy and health-observation store work
-  on blocking workers. Keep reader cancellation, disconnect and phone withdrawal
-  queues independent of the store mutex, so they cannot park behind a keychain
-  load or a whole-store integrity check.
-- Add `Supervisor::spawn_async` and use child-free blocking preparation on all
-  daemon-owned launch paths, including retries and swap candidates. Keep the
-  synchronous embedder API explicitly blocking. Recheck the captured generation,
-  launch attempt and executable identity under the module gate immediately before
-  creating a child; a changed witness refuses `plan_stale`. Cancelled preparation
-  drops its launch reservation without ever creating a process.
-  Capture executable identity from a retained nonblocking regular-file handle,
-  preserving original symlink launch names while refusing FIFO and symlink
-  substitutions. Use native volume/file identity on Windows and effective-user
-  executable access for PATH search. Own new Linux cgroup cleanup before any
-  fallible admission or command preparation.
-  Reserve Apply cancellation in the reader before deferred dispatch, retain
-  drop-safe ownership across blocking approval allocation and phone RPC binding,
-  and linearize withdrawal with the publication claim. Post-claim Cancel keeps
-  the real apply outcome and records `config.cancel_too_late` diagnostically,
-  without a new wire reply. Desktop receipt work never holds the peer mutex while
-  waiting on the owner and cannot revive a disconnected caller's receipt.
-  Keep the background scope-expiry timer running after its startup caller
-  releases the control handler, retaining only scope/routing state and no
-  configuration-store owner.
-- Fence respawn until a spontaneous warm-up exit's configuration failure is
-  recorded. Waiting spends no extra crash budget; intentional restarts preserve
-  pending configuration, and a failed first generation stays stopped.
-  Exit reconciliation releases the module gate before waiting for supervisor
-  commands, so an earlier queued restart cannot deadlock the stopped-state hold.
-  Retry reconciliation three times with 50/100 ms backoff, allowing five seconds
-  for each supervisor reply to the command holding the exited module stopped.
-  On exhaustion retain the exit fence, stop the
-  module with a named daemon-local reason and error kind, and emit a matching
-  `config.exit_failure` activity and warning instead of silently parking it.
+## 0.44.10
 
-- Refuse route-policy changes until a trusted policy installer is supplied.
-  Retain reversible installations until the generation is durably active, and
-  restore the captured policy before publishing a failed generation.
-- Serialize final approval publication with module cutover, after operator
-  presence. Bound swap configuration readiness from the original launch, and
-  leave connections open when a configuration response cannot flush in time.
+- Test-only: let resource fixtures exit cooperatively after supervisor draining begins on Windows. Hold the shared resource-reader isolation guard only during reader work, not fixture setup and shutdown. No daemon runtime changes.
 
-- Apply approved module restarts without clearing or spending the crash budget.
-  Delivery-failure recovery spends one crash-budget entry because the module
-  rejected its configuration; it is not an approved configuration restart.
-  A candidate launched before a newer required start is abandoned without
-  cutover; one replacement uses the current configured command. Retain the
-  successful supersession outcome in daemon-local status.
-- Keep default `server.describe` configuration capabilities disabled, even with
-  a local store installed. Refusals for missing authoritative project-membership
-  validation, active-scope usage tracking or approved-program launch selection
-  happen before any plan, approval or generation is written. Observing the
-  on-disk proposal before those refusals is allowed and does not approve it.
-- Require route-rebind readiness from a health probe begun after policy
-  installation. Queue an immediate ordinary supervisor probe, bind its result
-  to the child and policy installation, and recover once on failure or timeout.
+## 0.44.9
 
-- Bind desktop approval to the complete immutable plan actually flushed to the
-  same live connection. Recheck its digest/revision and desktop identity after
-  presence; replacement, disconnect, expiry and consumption discard the binding.
-- Recognize trusted desktop identity separately from an operator app's permission
-  to skip ordinary prompts. Code signing, the minimum admitted signed version
-  and, on Windows, the exact verified process retained in the daemon's launch
-  record are still required. Development recognition requires a verifier object
-  supplied through the daemon's Rust constructor; the shipped daemon leaves
-  `dev_desktop_verifier_unspecified` refused.
-- Report which trusted desktop, phone and interactive OS confirmation methods
-  are available. Attempt OS confirmation only when its provider is ready and,
-  on Linux, the per-user polkit policy is installed.
+- Advertise and serve `catalog.update_role_declarations` on registered module connections. Replace or clear the whole map atomically; refuse invalid maps with `invalid_role_declarations` and preserve the previous catalog entry. Require protocol 0.36.3 and control 0.38.3.
 
-- Share the 64 MiB authority-store read and publication bound. Before publishing,
-  prune the oldest unprotected history into permanent audit summaries, or refuse
-  `store_too_large` without changing committed bytes when protected versions do
-  not fit.
-- Protect the daemon's two most recent distinct approved input versions, ignoring
-  development generations and duplicate carriers, alongside module tuple heads
-  in both recent-count and byte-pressure pruning.
+## 0.44.8
 
-- Own immutable configuration captures and approval state behind one serialized
-  daemon owner. Retain approved raw layer bytes alongside redacted diagnostic
-  snapshots, validate module reviews, and connect configuration control to a
-  config-store root explicitly supplied by its caller.
-- Keep configuration-store control inactive in embedded daemons unless their
-  caller supplies a config-store root. Drain queued configuration-store
-  activities through the daemon's activity ledger.
-- Hold a per-store lifetime writer lock independent of discovery paths, expire
-  idle plans after one hour, and preserve the approved old schema's redaction
-  and apply policy across declaration transitions.
+- Retain agent-command starts pending validation when its deadline or revision retries are exhausted, without extending the validation window. Acknowledge start-only batches; retain starts but return retryable `busy` for unapplied finished/known entries in mixed batches. Keep retries idempotent, isolate declaration tests from native walk cost, and configure the rescan test's required macOS launch helper.
+- Bypass pre-declaration cached walks when validating pending starts and retry every five seconds while pending starts remain, on every platform, without extra idle walks or extending their 60-second expiry. Isolate cache and pipeline-budget fixtures from native process-walk latency and unrelated reader-pool contention.
 
-- Read the configuration authority store through a no-follow, nonblocking
-  regular-file handle and enforce a 64 MiB read bound. Refuse substituted
-  symlinks, FIFOs and oversized files as unverified stores.
+## 0.44.7
 
-- Raise the operating-system helper requirement with the co-bumped daemon.
+- Retain agent-command starts whose ownership snapshots are incomplete, reserving root capacity for up to 60 seconds and revalidating on fresh observations. Begin prospective CPU attribution only after acceptance; drop exited or expired pending roots without moving earlier CPU. Keep declaration replies unchanged and wait for acceptance in the Windows finish-accounting fixture.
 
-- Clarify the separation between redacted diagnostic captures and approved raw
-  delivery bytes, which may contain vault reference strings but never secrets.
+## 0.44.6
 
-- Add immutable configuration planning and approval over the durable store,
-  read-set freshness, reverse-configuration rollback and bound consent/v1 cards.
-- Require desktop review for stamps and consent-module changes, lossless small
-  OS prompts, and interactive presence even for attested operator apps. Share
-  legacy prompt cooldowns without inheriting log mode or operator-app shortcuts.
-- Add the separate `dev-desktop-approval` feature. Configuration client dispatch
-  returns `config_gate_inactive` until runtime snapshot and delivery wiring is
-  installed; the config capability is not yet advertised.
-
-- Add the configuration store engine: owner-only atomic publication, sealed
-  content MACs and anchors, digest-only integrity checks, recovery exits and
-  revision high-water handling. Approval and delivery remain blocked while an
-  anchor update is pending.
-- Persist generation history, protected active/recovery/pending versions, prune
-  audit records and snapshot-based proposals rebased on generation commits.
-- Add isolated file-key, root, failure and pause hooks behind `test-support`
-  and the development executable-name check.
-
-- Explicitly accept subc-presence's non-interactive policy authorization for legacy privileged-operation prompts and module `operator.confirm` requests, preserving their existing behavior.
+- Wait for complete process-tree observations in Windows resource-accounting tests before checking CPU retention and stopped attribution. Production accounting and its unreadable-tree rules are unchanged.
 
 ## 0.44.5
 

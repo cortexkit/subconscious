@@ -822,6 +822,7 @@ pub struct ControlPush {
 /// as [`Self::Unknown`] and classify it conservatively rather than refusing to
 /// deliver the enclosing control push.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RouteCloseReason {
     Reload,
     Restart,
@@ -859,6 +860,21 @@ pub enum RouteEndReason {
     ClosedByCaller,
     ConnectionLost,
     Unknown,
+}
+
+#[derive(Debug, Clone)]
+struct RouteEnd {
+    reason: RouteEndReason,
+    terminal: Option<bool>,
+}
+
+impl From<RouteEndReason> for RouteEnd {
+    fn from(reason: RouteEndReason) -> Self {
+        Self {
+            reason,
+            terminal: None,
+        }
+    }
 }
 
 /// Whether a closed route may be reopened automatically from its reason alone.
@@ -3072,7 +3088,7 @@ pub enum OutcomeUnknownCause {
 struct OutcomeUnknownSource {
     message: String,
     cause: OutcomeUnknownCause,
-    route_reason: Option<RouteEndReason>,
+    route_reason: Option<RouteEnd>,
 }
 
 impl fmt::Display for OutcomeUnknownSource {
@@ -3113,7 +3129,7 @@ struct NotSentSource {
     message: String,
     cause: NotSentCause,
     never_forwarded: bool,
-    route_reason: Option<RouteEndReason>,
+    route_reason: Option<RouteEnd>,
     refusal: Option<Box<RouteOpenRefused>>,
 }
 
@@ -3173,6 +3189,10 @@ impl CallError {
     /// Why the route ended. The error remains `NotSent` or `OutcomeUnknown`:
     /// this reason never makes a sent call safe to resend.
     pub fn close_reason(&self) -> Option<&RouteEndReason> {
+        self.route_end().map(|end| &end.reason)
+    }
+
+    fn route_end(&self) -> Option<&RouteEnd> {
         match self {
             Self::NotSent(source) => source
                 .downcast_ref::<NotSentSource>()?
@@ -3184,6 +3204,15 @@ impl CallError {
                 .as_ref(),
             _ => None,
         }
+    }
+
+    /// The daemon's recovery verdict from `route.closed`, if it carried one.
+    /// `Some(true)` means the daemon will leave the module down until an operator
+    /// acts. `None` means unknown: older daemons, client-side ends and non-route
+    /// errors have no verdict. This flag does not change resend safety or the
+    /// close reason's reopen disposition.
+    pub fn terminal(&self) -> Option<bool> {
+        self.route_end()?.terminal
     }
 
     /// Why the outcome is unknown, without parsing the error's message.
@@ -3621,8 +3650,8 @@ struct Inner {
     retirement_notify: Arc<Notify>,
     retirement_task: Option<JoinHandle<()>>,
     route_modules: HashMap<u16, String>,
-    route_end_reasons: HashMap<u16, (RouteEndReason, bool)>,
-    legacy_channel_reasons: HashMap<u16, RouteCloseReason>,
+    route_end_reasons: HashMap<u16, (RouteEnd, bool)>,
+    legacy_channel_reasons: HashMap<u16, RouteEnd>,
     push_event_receivers: HashMap<RouteHandle, mpsc::Sender<PushEvent>>,
     /// Consumer-level receiver for daemon-originated channel-0 control pushes
     /// (`route.closing`, `route.closed`, future ops). Connection-independent:
@@ -3644,6 +3673,16 @@ impl Inner {
         let Some(reason) = push.route_close_reason() else {
             return;
         };
+        let end = RouteEnd {
+            reason: RouteEndReason::Daemon(reason),
+            terminal: (push.op == "route.closed")
+                .then(|| {
+                    push.body
+                        .get("terminal")
+                        .and_then(serde_json::Value::as_bool)
+                })
+                .flatten(),
+        };
         if let Some(channels) = push.body.get("channels") {
             if let Some(channels) = channels.as_array() {
                 for channel in channels
@@ -3657,33 +3696,31 @@ impl Inner {
                             .get(&channel)
                             .is_some_and(|(_, final_reason)| *final_reason)
                     {
-                        self.route_end_reasons.insert(
-                            channel,
-                            (RouteEndReason::Daemon(reason.clone()), final_reason),
-                        );
+                        self.route_end_reasons
+                            .insert(channel, (end.clone(), final_reason));
                     }
                 }
             }
         } else if let Some(module) = push.body.get("module_id").and_then(|v| v.as_str()) {
             for (&channel, target) in &self.route_modules {
                 if target == module {
-                    self.legacy_channel_reasons.insert(channel, reason.clone());
+                    self.legacy_channel_reasons.insert(channel, end.clone());
                 }
             }
         }
     }
 
-    fn route_end_reason(&self, channel: u16) -> RouteEndReason {
+    fn route_end(&self, channel: u16) -> RouteEnd {
         self.route_end_reasons
             .get(&channel)
             .map(|(reason, _)| reason.clone())
-            .or_else(|| {
-                self.legacy_channel_reasons
-                    .get(&channel)
-                    .cloned()
-                    .map(RouteEndReason::Daemon)
-            })
-            .unwrap_or(RouteEndReason::Unknown)
+            .or_else(|| self.legacy_channel_reasons.get(&channel).cloned())
+            .unwrap_or_else(|| RouteEndReason::Unknown.into())
+    }
+
+    #[cfg(test)]
+    fn route_end_reason(&self, channel: u16) -> RouteEndReason {
+        self.route_end(channel).reason
     }
 
     fn cache_route(&mut self, key: RouteKey, route: RouteState) -> RouteState {
@@ -5767,9 +5804,10 @@ impl Shared {
         self.validate_current_handle(handle)?;
         let route = {
             let mut inner = self.lock_inner();
-            inner
-                .route_end_reasons
-                .insert(handle.channel, (RouteEndReason::ClosedByCaller, true));
+            inner.route_end_reasons.insert(
+                handle.channel,
+                (RouteEndReason::ClosedByCaller.into(), true),
+            );
             inner.remove_route_by_handle(handle)
         };
         let mut closing = RouteCloseGuard::new(
@@ -5799,9 +5837,10 @@ impl Shared {
             }
             let route = inner.remove_route(key);
             if let Some(route) = &route {
-                inner
-                    .route_end_reasons
-                    .insert(route.handle.channel, (RouteEndReason::ClosedByCaller, true));
+                inner.route_end_reasons.insert(
+                    route.handle.channel,
+                    (RouteEndReason::ClosedByCaller.into(), true),
+                );
             }
             route
         };
@@ -5853,9 +5892,9 @@ impl Shared {
     fn route_not_sent_error(&self, handle: RouteHandle) -> CallError {
         let inner = self.lock_inner();
         let reason = if inner.generation != handle.connection_token() || inner.writer.is_none() {
-            RouteEndReason::ConnectionLost
+            RouteEndReason::ConnectionLost.into()
         } else {
-            inner.route_end_reason(handle.channel)
+            inner.route_end(handle.channel)
         };
         CallError::NotSent(Box::new(NotSentSource {
             message: "route flow-control semaphore closed".into(),
@@ -5879,7 +5918,7 @@ impl Shared {
             inner.release_wire_slots(handle);
             inner
                 .route_end_reasons
-                .insert(handle.channel, (close_reason.clone(), true));
+                .insert(handle.channel, (close_reason.clone().into(), true));
             drain_pending_handle(&mut inner.pending, handle, true)
         };
         settle_route_pending_entries(entries, reason.to_string(), close_reason);
@@ -7181,7 +7220,7 @@ async fn dispatch_frame(shared: &Arc<Shared>, generation: u64, frame: Frame) -> 
         }
         FrameType::Goodbye => {
             let handle = RouteHandle::new(frame.header.channel, frame.header.epoch, generation);
-            let close_reason = shared.lock_inner().route_end_reason(handle.channel);
+            let close_reason = shared.lock_inner().route_end(handle.channel);
             shared.invalidate_routes_for_handle(handle);
             let pending = {
                 let mut inner = shared.lock_inner();
@@ -7633,9 +7672,10 @@ fn classify_failure_with_not_sent_cause(
 fn settle_route_pending_entries(
     entries: Vec<PendingEntry>,
     message: String,
-    reason: RouteEndReason,
+    reason: impl Into<RouteEnd>,
 ) {
-    let cause = if reason == RouteEndReason::ConnectionLost {
+    let reason = reason.into();
+    let cause = if reason.reason == RouteEndReason::ConnectionLost {
         OutcomeUnknownCause::ConnectionFailed
     } else {
         OutcomeUnknownCause::RouteEnded
@@ -7646,9 +7686,10 @@ fn settle_route_pending_entries(
 fn settle_route_pending_entries_with_cause(
     entries: Vec<PendingEntry>,
     message: String,
-    reason: RouteEndReason,
+    reason: impl Into<RouteEnd>,
     cause: OutcomeUnknownCause,
 ) {
+    let reason = reason.into();
     for entry in entries {
         let err = if entry.accepted {
             CallError::outcome_unknown_source(OutcomeUnknownSource {
@@ -9018,6 +9059,7 @@ mod tests {
             shared.lock_inner().route_end_reason(7),
             RouteEndReason::Unknown
         );
+        assert_eq!(shared.lock_inner().route_end(7).terminal, None);
     }
 
     #[test]
@@ -9117,10 +9159,28 @@ mod tests {
                 settle_route_pending_entries(vec![entry], "route ended".into(), reason.clone());
                 let err = rx.await.unwrap().into_call_result().err().unwrap();
                 assert_eq!(err.close_reason(), Some(&reason));
+                assert_eq!(err.terminal(), None);
                 assert_eq!(matches!(err, CallError::OutcomeUnknown(_)), accepted);
                 assert_eq!(matches!(err, CallError::NotSent(_)), !accepted);
             }
         }
+    }
+
+    #[test]
+    fn route_closing_does_not_supply_or_overwrite_a_terminal_verdict() {
+        let shared = Shared::new(PathBuf::new(), ConsumerOptions::default());
+        shared.control_push(
+            br#"{"op":"route.closing","channels":[7],"reason":"restart","terminal":true}"#,
+        );
+        assert_eq!(shared.lock_inner().route_end(7).terminal, None);
+        shared.control_push(
+            br#"{"op":"route.closed","channels":[7],"reason":"restart","terminal":false}"#,
+        );
+        shared.control_push(
+            br#"{"op":"route.closing","channels":[7],"reason":"restart","terminal":true}"#,
+        );
+        assert_eq!(shared.lock_inner().route_end(7).terminal, Some(false));
+        assert_eq!(CallError::not_sent("not a route end").terminal(), None);
     }
 
     #[test]

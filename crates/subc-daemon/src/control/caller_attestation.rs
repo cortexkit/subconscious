@@ -147,8 +147,8 @@ impl crate::config_gate::runtime::mark::MarkPublisher for ControlMarkPublisher {
 impl ControlHandler {
     /// Attest a `route.open`'s opener. `None` when it claims an identity it
     /// cannot prove: a launch nonce that does not verify, a claim binding
-    /// whose launch has ended, or a `consumer_identity` naming another module
-    /// than the binding. A claim-bound connection is attested by its binding
+    /// whose launch has ended, or any `consumer_identity` supplied alongside
+    /// a binding. A claim-bound connection is attested by its binding
     /// alone; its principal is always `reserved:<the binding's module>`.
     pub(super) fn attest_route_open_consumer(
         &self,
@@ -165,11 +165,9 @@ impl ControlHandler {
                 // added later attests nothing until a rule for it exists.
                 _ => return None,
             };
-            if !registration.launch_ready() || !registration.authority.alive() {
-                return None;
-            }
-            if consumer_identity
-                .is_some_and(|identity| identity.module_id != registration.module_id)
+            if consumer_identity.is_some()
+                || !binding.consumer_live(connection)
+                || !registration.authority.alive()
             {
                 return None;
             }

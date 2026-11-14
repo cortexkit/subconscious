@@ -233,7 +233,7 @@ async fn windows_channel_gated_spawn_withholds_nonce() {
         path.join("subc.jsonc"),
         serde_json::to_vec(&serde_json::json!({
             "version": 1,
-            "modules": {"channel-probe": {"program": program, "args": ["/C", "exit 0"]}}
+            "modules": {"channel-probe": {"program": program, "args": ["/C", "exit 0"], "registration_channel": true}}
         }))
         .unwrap(),
     )

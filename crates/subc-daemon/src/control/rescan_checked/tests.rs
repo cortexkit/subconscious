@@ -45,9 +45,15 @@ impl Rig {
     fn new(config: &Path, incarnation: &str) -> Self {
         let registry = Arc::new(Registry::default());
         let handle = SupervisorHandle::new();
-        let supervisor = Supervisor::new(registry.clone(), RestartPolicy::new(0, Duration::ZERO))
-            .with_handle(handle.clone())
-            .with_daemon_incarnation(incarnation.to_string());
+        // On macOS every child, even one with no control protocol, is started
+        // through the privacy trampoline (the helper that execs it as its own
+        // responsible process, so it never borrows the daemon's privacy grants).
+        // `new_for_test` configures that test helper; a bare
+        // `Supervisor::new` refuses to spawn without it.
+        let supervisor =
+            Supervisor::new_for_test(registry.clone(), RestartPolicy::new(0, Duration::ZERO))
+                .with_handle(handle.clone())
+                .with_daemon_incarnation(incarnation.to_string());
         let ledger = ScratchDir::new("rescan-checked-ledger");
         let handler = ControlHandler::new(registry)
             .with_supervisor(handle)
@@ -268,7 +274,9 @@ async fn audit4_rescan_prefix_transfer_survives_an_old_plain_spawn_spec() {
     let refused = outsider.call(&router, prefix_hello("p:child")).await;
     let mut primary = Wire::new(&router);
     let launch = handle.registration_for_test("a-new-owner").unwrap();
-    launch.wait_launch().await;
+    tokio::time::timeout(std::time::Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     launch.bind(primary.connection.id());
     let primary_reply = primary.call(&router, prefix_hello("a-new-owner")).await;
     assert_eq!(primary_reply.header.ty, FrameType::HelloAck);

@@ -85,6 +85,88 @@ fn read_kinfo_proc(pid: u32) -> Result<Option<KinfoProc>, ()> {
     Ok(Some(info))
 }
 
+/// Every live process's pid, current parent and birth time from one
+/// `sysctl(KERN_PROC_ALL)` call, the same `kinfo_proc` records that
+/// [`read_identity`] reads one at a time. Zombies and pid 0 (`kernel_task`)
+/// are left out: a per-pid identity read reports a zombie as gone, and the
+/// pid listing never included pid 0.
+pub(crate) fn process_list() -> std::io::Result<Vec<(u32, Option<u32>, Option<u64>)>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
+    for _ in 0..4 {
+        let mut len: libc::size_t = 0;
+        // SAFETY: a null buffer asks only for the byte count, written to `len`.
+        #[allow(unsafe_code)]
+        let sized = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if sized != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // Room for processes started between the two calls.
+        let capacity = len / KINFO_PROC_SIZE + 256;
+        let mut records: Vec<KinfoProc> = (0..capacity)
+            .map(|_| KinfoProc([0; KINFO_PROC_SIZE]))
+            .collect();
+        let mut len: libc::size_t = capacity * KINFO_PROC_SIZE;
+        // SAFETY: `records` is a writable, `kinfo_proc`-aligned buffer of
+        // `len` bytes; the kernel writes at most `len` bytes and stores the
+        // count it wrote in `len`. No new value is set.
+        #[allow(unsafe_code)]
+        let read = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                records.as_mut_ptr().cast::<c_void>(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if read != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOMEM) {
+                continue;
+            }
+            return Err(error);
+        }
+        if len % KINFO_PROC_SIZE != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "process records have an unexpected size",
+            ));
+        }
+        records.truncate(len / KINFO_PROC_SIZE);
+        return Ok(records
+            .iter()
+            .filter(|info| info.0[P_STAT_OFFSET] != SZOMB)
+            .filter_map(|info| {
+                let field = |offset: usize| {
+                    info.0[offset..offset + 4]
+                        .try_into()
+                        .ok()
+                        .map(i32::from_ne_bytes)
+                };
+                let pid = u32::try_from(field(P_PID_OFFSET)?)
+                    .ok()
+                    .filter(|pid| *pid > 0)?;
+                let parent = field(PARENT_PID_OFFSET).and_then(|parent| u32::try_from(parent).ok());
+                Some((pid, parent, birth_time(info)))
+            })
+            .collect());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        "process table outgrew its snapshot buffer",
+    ))
+}
+
 pub(crate) fn read_identity(pid: u32) -> crate::IdentityRead {
     use crate::IdentityRead;
     match read_kinfo_proc(pid) {

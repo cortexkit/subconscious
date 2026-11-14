@@ -36,7 +36,7 @@ pub use policy_cache::{
 pub use subc_control::{AppOpenReply, AppOpenStatus, CatalogOrigin, CatalogWatchResponse};
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     env,
     error::Error,
     ffi::OsString,
@@ -85,7 +85,7 @@ use subc_protocol::{
         ModuleControlCommand, ModuleControlRequest, ModuleControlRequestFromModule,
         ModuleControlResponse, ModuleControlResponseToModule, OperatorConfirmKind,
         OperatorConfirmReply, OperatorConfirmRequest, MODULE_CONTROL_OP_HEALTH_CHECK,
-        MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+        MODULE_TO_SUBC_OP_CATALOG_UPDATE, MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS,
     },
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
@@ -494,6 +494,7 @@ struct ModuleHandleShared {
     negotiated_ver: u8,
     daemon_capabilities: Vec<String>,
     supports_catalog_update: bool,
+    supports_role_declarations_update: bool,
     supports_live_roots: bool,
     supports_agent_commands: bool,
     supports_scope_sync: bool,
@@ -571,6 +572,10 @@ impl ModuleHandle {
                     .subc_ops
                     .iter()
                     .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE),
+                supports_role_declarations_update: ack
+                    .subc_ops
+                    .iter()
+                    .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS),
                 supports_live_roots: ack.subc_ops.iter().any(|op| op == "supervisor.live_roots"),
                 supports_agent_commands: ack
                     .subc_ops
@@ -671,6 +676,58 @@ impl ModuleHandle {
         provides: Vec<ProviderRole>,
     ) -> Result<(), CatalogUpdateError> {
         self.catalog_update_inner(Some(provides), None, None).await
+    }
+
+    /// Replace this module's complete registered role-declaration map in place.
+    ///
+    /// An empty map (`{}` on the wire) clears all declarations. Requires
+    /// subc-daemon 0.44.9 or later; returns [`CatalogUpdateError::NotSupported`]
+    /// without sending when HELLO_ACK does not advertise the operation. Invalid
+    /// declarations are refused by the daemon as [`CatalogUpdateError::Rejected`],
+    /// preserving the previous map and the refusal's code and reason.
+    pub async fn update_role_declarations(
+        &self,
+        role_declarations: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<(), CatalogUpdateError> {
+        if !self.shared.supports_role_declarations_update {
+            return Err(CatalogUpdateError::NotSupported);
+        }
+        let body = serde_json::to_vec(
+            &ModuleControlRequestFromModule::CatalogUpdateRoleDeclarations {
+                role_declarations: serde_json::to_value(role_declarations)
+                    .map_err(|err| CatalogUpdateError::Protocol(err.to_string()))?,
+            },
+        )
+        .map_err(|err| CatalogUpdateError::Protocol(err.to_string()))?;
+        let (corr, writer, rx) = self.shared.begin_catalog_update()?;
+        let _pending = CatalogUpdateGuard {
+            shared: self.shared.clone(),
+            corr,
+        };
+        let frame = Frame::build_with_version(
+            self.shared.negotiated_ver,
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .map_err(|err| CatalogUpdateError::Protocol(err.to_string()))?;
+        if writer.send(frame).await.is_err() {
+            return Err(CatalogUpdateError::ConnectionClosed);
+        }
+        match timeout(CATALOG_UPDATE_TIMEOUT, rx).await {
+            Ok(Ok(Ok(reply))) => match reply.control()? {
+                ModuleControlResponseToModule::CatalogUpdateRoleDeclarations {} => Ok(()),
+                _ => Err(CatalogUpdateError::Protocol(
+                    "unexpected catalog.update_role_declarations response".into(),
+                )),
+            },
+            Ok(Ok(Err(err))) => Err(err),
+            Ok(Err(_)) => Err(CatalogUpdateError::ConnectionClosed),
+            Err(_) => Err(CatalogUpdateError::Timeout),
+        }
     }
 
     /// Replace provider roles and attest a new static capability declaration.
@@ -1719,7 +1776,8 @@ impl OperatorConfirmError {
 
 impl Error for OperatorConfirmError {}
 
-/// Errors returned by [`ModuleHandle::catalog_update`] and [`ModuleHandle::set_ready`].
+/// Errors returned by [`ModuleHandle::catalog_update`], [`ModuleHandle::set_ready`]
+/// and [`ModuleHandle::update_role_declarations`].
 #[derive(Debug)]
 pub enum CatalogUpdateError {
     NotSupported,
@@ -2541,12 +2599,59 @@ impl ServeOptions {
         manifest: ModuleManifest,
         handler: H,
     ) -> Result<(), SubcModuleError> {
-        if let Some((_handle, future)) =
-            prepare_connection(connection_file, manifest, handler, self).await?
+        if let Some((_handle, future)) = self
+            .serve_with_handle(connection_file, manifest, handler)
+            .await?
         {
             future.await?;
         }
         Ok(())
+    }
+
+    /// Connect and register using the same launch inputs as [`Self::serve`],
+    /// returning a cloneable handle and the future that keeps the module serving.
+    ///
+    /// Reads `--subc <connection-file>` (or `--subc=<connection-file>`) from argv
+    /// and overrides the manifest's module id with `SUBC_MODULE_ID` when present.
+    /// Uses this options value's stop handle and writer drain timeout. A requested
+    /// stop before registration completes returns `Ok(None)`; this is an expected
+    /// outcome, not a connection error.
+    ///
+    /// The returned serve future **must be awaited or spawned**. A module can give
+    /// the returned handle to its handler's shared state before starting that future.
+    /// Spawn the serve future before slow startup work or awaiting control RPCs:
+    /// it reads their replies and answers health and stop.
+    pub async fn serve_from_env_with_handle<H: ModuleHandler>(
+        self,
+        mut manifest: ModuleManifest,
+        handler: H,
+    ) -> Result<Option<(ModuleHandle, ModuleServeFuture)>, SubcModuleError> {
+        let connection_file = parse_subc_arg(env::args_os().skip(1))?;
+        if let Some(module_id) = module_id_from_env()? {
+            manifest.module_id = module_id;
+        }
+        self.serve_with_handle(&connection_file, manifest, handler)
+            .await
+    }
+
+    /// Connect with an explicit connection file and an unchanged manifest,
+    /// returning a cloneable handle and the future that keeps the module serving.
+    ///
+    /// Uses this options value's stop handle and writer drain timeout. A requested
+    /// stop before registration completes returns `Ok(None)`; this is an expected
+    /// outcome, not a connection error.
+    ///
+    /// The returned serve future **must be awaited or spawned**. A module can give
+    /// the returned handle to its handler's shared state before starting that future.
+    /// Spawn the serve future before slow startup work or awaiting control RPCs:
+    /// it reads their replies and answers health and stop.
+    pub async fn serve_with_handle<H: ModuleHandler>(
+        self,
+        connection_file: &Path,
+        manifest: ModuleManifest,
+        handler: H,
+    ) -> Result<Option<(ModuleHandle, ModuleServeFuture)>, SubcModuleError> {
+        prepare_connection(connection_file, manifest, handler, self).await
     }
 }
 
@@ -2565,17 +2670,16 @@ impl ServeOptions {
 /// [`ModuleHandle::set_ready`]. Spawn the serve future before slow startup work
 /// or awaiting control RPCs: it reads their replies and answers health and stop.
 pub async fn serve_from_env_with_handle<H>(
-    mut manifest: ModuleManifest,
+    manifest: ModuleManifest,
     handler: H,
 ) -> Result<(ModuleHandle, ModuleServeFuture), SubcModuleError>
 where
     H: ModuleHandler,
 {
-    let connection_file = parse_subc_arg(env::args_os().skip(1))?;
-    if let Some(module_id) = module_id_from_env()? {
-        manifest.module_id = module_id;
-    }
-    serve_with_handle(&connection_file, manifest, handler).await
+    ServeOptions::default()
+        .serve_from_env_with_handle(manifest, handler)
+        .await?
+        .ok_or(SubcModuleError::ConnectionClosedBeforeHelloAck)
 }
 
 /// Run a module with an explicit connection-file path. The manifest is sent as
@@ -2603,7 +2707,8 @@ pub async fn serve_with_handle<H>(
 where
     H: ModuleHandler,
 {
-    prepare_connection(connection_file, manifest, handler, ServeOptions::default())
+    ServeOptions::default()
+        .serve_with_handle(connection_file, manifest, handler)
         .await?
         .ok_or(SubcModuleError::ConnectionClosedBeforeHelloAck)
 }
@@ -2614,7 +2719,7 @@ async fn prepare_connection<H: ModuleHandler>(
     handler: H,
     mut options: ServeOptions,
 ) -> Result<Option<(ModuleHandle, ModuleServeFuture)>, SubcModuleError> {
-    options.registration_channel = registration::supervised();
+    options.registration_channel = registration::adopt();
     let stream = tokio::select! {
         biased;
         () = options.stop_handle.token.cancelled() => return Ok(None),
@@ -2839,6 +2944,7 @@ where
         dispatcher.abort_all();
         dispatcher.tasks.wait().await;
         let daemon_eof = matches!(loop_result, Ok(ConnectionEnd::Eof));
+        let locally_closed = matches!(loop_result, Ok(ConnectionEnd::Closed));
         // The module ended the connection itself: a stop, an internal close
         // or a module-side error. Close it in order, so the daemon reads a
         // FIN rather than a reset. When the daemon ended it (EOF, GOODBYE or
@@ -2881,7 +2987,7 @@ where
                 "daemon EOF: replies could not be delivered during drain"
             );
         }
-        if options.registration_channel {
+        if options.registration_channel && !locally_closed {
             // An inherited registration cannot be recreated. Finish the hook
             // and teardown before letting the supervisor restart the process.
             std::process::exit(if loop_result.is_ok() { 0 } else { 1 });
@@ -3601,9 +3707,7 @@ async fn send_hello(
                 .map(|nonce| nonce.value().to_string()),
         }
     };
-    if !registration::supervised() {
-        stamp_launch_nonce_source(&mut manifest, launch_nonce.as_deref());
-    }
+    stamp_launch_nonce_source(&mut manifest, launch_nonce.as_deref());
     let mut control_ops = vec![MODULE_CONTROL_OP_HEALTH_CHECK.to_string()];
     if config_gate {
         control_ops.push(config::CONFIG_REVIEW_OP.to_owned());
@@ -4279,6 +4383,67 @@ mod tests {
 
     fn json_body(body: &[u8]) -> serde_json::Value {
         serde_json::from_slice(body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn role_declarations_update_requires_its_own_advertised_op() {
+        for ops in [vec![], vec![MODULE_TO_SUBC_OP_CATALOG_UPDATE]] {
+            let (handle, mut rx) = test_module_handle(&ops);
+            assert!(matches!(
+                handle.update_role_declarations(BTreeMap::new()).await,
+                Err(CatalogUpdateError::NotSupported)
+            ));
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn role_declarations_update_sends_map_and_preserves_refusal() {
+        let (handle, mut rx) =
+            test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE_ROLE_DECLARATIONS]);
+        let initial_roles = vec![test_provider_role(&["original"])];
+        handle.shared.lock_inner().current_provides = Some(initial_roles.clone());
+        for declarations in [
+            json!({"media-provider/v1": {"engines": ["image"]}}),
+            json!({}),
+        ] {
+            let map = serde_json::from_value(declarations.clone()).unwrap();
+            let (result, ()) = tokio::join!(handle.update_role_declarations(map), async {
+                let frame = rx.recv().await.unwrap();
+                assert_eq!(frame.header.ty, FrameType::Request);
+                assert_eq!(frame.header.channel, 0);
+                assert_eq!(
+                    json_body(&frame.body),
+                    json!({"op": "catalog.update_role_declarations", "role_declarations": declarations})
+                );
+                handle.handle_control_reply(control_reply(
+                    FrameType::Response,
+                    frame.header.corr,
+                    serde_json::to_vec(&json!({"op": "catalog.update_role_declarations"})).unwrap(),
+                ));
+            });
+            result.unwrap();
+        }
+        let (result, ()) = tokio::join!(handle.update_role_declarations(BTreeMap::new()), async {
+            let frame = rx.recv().await.unwrap();
+            handle.handle_control_reply(control_reply(FrameType::Error, frame.header.corr,
+                serde_json::to_vec(&json!({"code": "invalid_role_declarations", "message": "role_declarations key must use capability-name grammar"})).unwrap()));
+        });
+        let Err(CatalogUpdateError::Rejected(body)) = result else {
+            panic!("expected typed refusal")
+        };
+        assert_eq!(body.code, "invalid_role_declarations");
+        assert_eq!(
+            body.message,
+            "role_declarations key must use capability-name grammar"
+        );
+        assert_eq!(
+            handle.shared.lock_inner().current_provides,
+            Some(initial_roles)
+        );
     }
 
     async fn ack_catalog_update(
@@ -6288,9 +6453,10 @@ pub fn launch_nonce_source() -> Option<LaunchNonceSource> {
 /// Fill in `launch_nonce_source` on a module's declared provenance, so
 /// `ck provenance` can tell a module reading the pipe from one still reading
 /// the environment variable. Only when the module declared provenance and left the field
-/// unset, and only when the nonce HELLO carries is the one the accessor read:
-/// a nonce retained by the module itself came from somewhere this SDK cannot
-/// vouch for.
+/// unset. A registration channel supplies authority without sending a nonce,
+/// but an unstamped launch may still supply a legacy nonce whose source is
+/// diagnostic. Otherwise the nonce HELLO carries must be the one the accessor
+/// read: a module-retained nonce may have come from somewhere else.
 fn stamp_launch_nonce_source(manifest: &mut ModuleManifest, sent: Option<&str>) {
     let Some(provenance) = manifest.provenance.as_mut() else {
         return;
@@ -6299,7 +6465,7 @@ fn stamp_launch_nonce_source(manifest: &mut ModuleManifest, sent: Option<&str>) 
         return;
     }
     if let Ok(Some(nonce)) = launch_nonce() {
-        if sent == Some(nonce.value()) {
+        if registration::supervised() || sent == Some(nonce.value()) {
             provenance.launch_nonce_source =
                 Some(LaunchNonceSource::from_wire_name(nonce.source().as_str()));
         }

@@ -17,10 +17,22 @@ fn burn() {
     }
 }
 
-fn wait(path: &std::path::Path) {
+/// Waits for the test to write `path`. A failed or cancelled test may never
+/// write it, and its scratch directory may already be gone, so this gives up
+/// after a minute or as soon as the directory disappears. The burning child is
+/// orphaned once its parent exits, so an unbounded wait here would outlive the
+/// test run indefinitely.
+fn wait(path: &std::path::Path) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
     while !path.exists() {
+        if std::time::Instant::now() >= deadline
+            || !path.parent().is_some_and(std::path::Path::exists)
+        {
+            return false;
+        }
         std::thread::sleep(Duration::from_millis(5));
     }
+    true
 }
 
 fn main() {
@@ -40,10 +52,14 @@ fn main() {
         )
         .unwrap();
         std::fs::write(dir.join("root-ready"), format!("{pid} {start}")).unwrap();
-        wait(&dir.join("burn-root"));
+        if !wait(&dir.join("burn-root")) {
+            return;
+        }
         burn();
         std::fs::write(dir.join("root-burned"), "").unwrap();
-        wait(&dir.join("finish-root"));
+        if !wait(&dir.join("finish-root")) {
+            return;
+        }
         let resources = subc_os::resource_usage(pid).unwrap();
         std::fs::write(
             dir.join("root-cpu"),
@@ -64,7 +80,15 @@ fn main() {
     .unwrap();
     assert!(child.wait().unwrap().success());
     std::fs::write(dir.join("reaped"), "").unwrap();
-    loop {
-        std::thread::park_timeout(Duration::from_secs(60));
+    // This fixture has no daemon connection to observe EOF on, and Windows
+    // has no graceful stop signal, so a plain stop would wait out the whole
+    // drain timeout and then kill it. Instead the test writes `stop-module`
+    // once the supervisor has started stopping this module (state Draining),
+    // and the fixture exits normally on every OS. The wait is bounded so a
+    // failed test cannot leave the fixture parked forever.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !dir.join("stop-module").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
     }
+    std::fs::write(dir.join("module-stopped"), "").unwrap();
 }

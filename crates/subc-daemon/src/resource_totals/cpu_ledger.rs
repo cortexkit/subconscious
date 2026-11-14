@@ -55,6 +55,11 @@ impl Ledger {
     pub(super) fn total(&self) -> u64 {
         self.total
     }
+
+    /// Identities whose liveness the next observation checks.
+    pub(super) fn identities(&self) -> impl Iterator<Item = Identity> + '_ {
+        self.members.keys().chain(self.outside.keys()).copied()
+    }
     #[cfg(test)]
     pub(super) fn tracked(&self) -> usize {
         self.members.len() + self.outside.len()

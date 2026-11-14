@@ -72,9 +72,26 @@ async fn refused_live_binding_without_a_current_approval_uses_ordinary_exit_acco
 }
 
 async fn gated_claim_fixture_with_support(support: Option<bool>) -> GatedClaimFixture {
+    let sleep = sleep_program();
+    gated_claim_fixture_with_program(support, sleep.to_str().unwrap(), json!(["600"])).await
+}
+
+/// A copyable stand-in for `sleep`: the native config-gate fixture, which
+/// sleeps for a numeric first argument. A copy of /bin/sleep is not portable;
+/// where coreutils is one multi-call binary, the copy picks its utility from
+/// its new file name and fails.
+fn sleep_program() -> std::path::PathBuf {
+    crate::config_gate::program::native_fixture_for_test()
+}
+
+async fn gated_claim_fixture_with_program(
+    support: Option<bool>,
+    program: &str,
+    args: serde_json::Value,
+) -> GatedClaimFixture {
     use crate::control::claims::tests::Net;
-    let rig = rig();
-    wire_fixture_document(&rig, json!(["600"]));
+    let rig = rig_with_program(program);
+    wire_fixture_document(&rig, args);
     let owner = Arc::new(rig.owner("claims-recovery"));
     rig.stamp(&owner);
     let handle = channel_handle();
@@ -88,7 +105,9 @@ async fn gated_claim_fixture_with_support(support: Option<bool>) -> GatedClaimFi
     let proof = handle.registration_proof_for_test("a").unwrap();
     assert!(handle.wait_program_binding_for_test("a", &proof).await);
     let spawn = handle.registration_for_test("a").unwrap();
-    spawn.wait_launch().await;
+    tokio::time::timeout(Duration::from_secs(6), spawn.wait_launch())
+        .await
+        .expect("registration launch must settle");
     let control = Arc::new(
         crate::ControlHandler::with_forwarding(registry, forwarding)
             .with_supervisor(handle.clone())
@@ -376,12 +395,10 @@ async fn claims_mint_obeys_recovery_and_resumes_after_approved_exit() {
         .await
         .unwrap();
     let proof = fixture.handle.registration_proof_for_test("a").unwrap();
-    fixture
-        .handle
-        .registration_for_test("a")
-        .unwrap()
-        .wait_launch()
-        .await;
+    let launch = fixture.handle.registration_for_test("a").unwrap();
+    tokio::time::timeout(Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     let mut primary = Net::new(fixture.router.clone()).await;
     let ping = subc_protocol::Frame::build(
         subc_protocol::FrameType::Ping,
@@ -897,7 +914,72 @@ async fn gated_channel_agent_commands_commit_through_the_channel_spawn() {
     fixture.module.stop().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gated_channel_deferred_agent_commands_retain_starts_then_commit() {
+    use crate::control::claims::tests::request;
+    let mut fixture =
+        gated_claim_fixture_with_program(None, "/bin/sh", json!(["-c", "sleep 600 & wait"])).await;
+    fixture
+        .owner
+        .set_agent_validation_window_for_test(Duration::from_millis(200));
+    assert!(fixture.handle.spawn_launch_nonce_for("a").is_none());
+    let pid = reported_pid(&fixture.module).await;
+    let (table, root) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let table = subc_os::ProcessTable::read().unwrap();
+            let root = table
+                .members()
+                .find(|process| process.parent_pid == pid)
+                .map(|process| subc_protocol::session::AgentCommandRoot {
+                    pid: process.pid,
+                    start_time_ms: process.start_time_ms,
+                });
+            if let Some(root) = root {
+                break (table, root);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the gated shell must spawn its command child");
+    let tracker = &fixture.handler.resource_tracker;
+    // Force the unchanged validation deadline to expire with a real child
+    // start. Unlike an empty batch, it must retain pending roots on the channel.
+    tracker.inject_validation_table_for_test(table.clone(), Duration::from_secs(1));
+    let declaration = json!({
+        "op":"supervisor.agent_commands", "started":[root], "finished":[],
+    });
+    let reply = fixture.primary.call(request(declaration.clone())).await;
+    assert_eq!(
+        reply.header.ty,
+        subc_protocol::FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    assert_eq!(tracker.root_counts_for_test("a"), (0, 1, 0));
+
+    tracker.inject_validation_table_for_test(table, Duration::ZERO);
+    fixture
+        .owner
+        .set_agent_validation_window_for_test(AGENT_COMMAND_CONTRACT_TEST_WINDOW);
+    let reply = fixture.primary.call(request(declaration)).await;
+    assert_eq!(
+        reply.header.ty,
+        subc_protocol::FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&reply.body)
+    );
+    assert_eq!(tracker.root_counts_for_test("a"), (1, 0, 0));
+    tracker.clear_validation_table_for_test();
+    drop(fixture.primary);
+    fixture.module.stop().await.unwrap();
+}
+
 fn rig() -> Rig {
+    rig_with_program(sleep_program().to_str().unwrap())
+}
+
+fn rig_with_program(program: &str) -> Rig {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/scratch")
@@ -908,7 +990,7 @@ fn rig() -> Rig {
         ));
     std::fs::create_dir_all(path.join("store")).unwrap();
     std::fs::create_dir_all(path.join("cortexkit")).unwrap();
-    std::fs::copy("/bin/sleep", path.join("program")).unwrap();
+    std::fs::copy(program, path.join("program")).unwrap();
     #[cfg(target_os = "macos")]
     assert!(
         std::process::Command::new("/usr/bin/codesign")
@@ -925,7 +1007,11 @@ fn rig() -> Rig {
         path.join("cortexkit/a.jsonc").to_string_lossy(),
         vec![],
     );
-    Rig { path, declaration }
+    Rig {
+        path,
+        declaration,
+        program_mode: std::sync::OnceLock::new(),
+    }
 }
 
 fn spec(rig: &Rig) -> ModuleSpec {
@@ -1284,17 +1370,14 @@ async fn gated_nonce_policy_refuses_stopped_uncached_identity_over_real_server()
     server.abort();
 }
 
-async fn reported_pid(module: &crate::supervise::SupervisedModule) -> u32 {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(pid) = module.status().unwrap().pid {
-                return pid;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the owned child must cross its exec acknowledgement before observation")
+async fn registration_launch_ready(handle: &SupervisorHandle, module: &str) {
+    let spawn = handle.registration_for_test(module).unwrap();
+    // Binding verification precedes exec acknowledgement on macOS. Direct HELLO
+    // fixtures must also wait for the channel service's launch-ready barrier.
+    tokio::time::timeout(Duration::from_secs(5), spawn.wait_launch())
+        .await
+        .expect("the captured registration launch must finish");
+    assert!(spawn.launch_ready(), "the captured launch must be ready");
 }
 
 fn approve(_rig: &Rig, owner: &RuntimeOwner, kind: PlanKind) -> u64 {
@@ -1553,13 +1636,52 @@ fn config_admission_refusal_from_an_old_base_cannot_hold_the_new_approval() {
         .is_empty());
 }
 
+/// A program change is approved launch-only, because neither the new program
+/// (refused to start until approved) nor the old one can review for it. Once a child of the new program
+/// has made that generation active, the next plan re-reviews the approved
+/// layers with it and records that build; status names the module until then.
 #[test]
-fn config_admission_program_only_approval_of_a_held_module_needs_no_live_reviewer() {
+fn config_admission_program_change_is_approved_launch_only_then_rereviewed_by_the_new_program() {
+    use crate::config_gate::runtime::{AppliedDisposition, DeliveryObserver};
     use std::io::Write;
+    fn acknowledge(owner: &RuntimeOwner, connection: ConnectionId) -> AppliedDisposition {
+        let reply = owner
+            .module_get(connection, "a", ConfigGetRequest::new())
+            .unwrap();
+        owner
+            .module_view_delivered(connection, "a", &reply, tokio::time::Instant::now(), true)
+            .unwrap();
+        let view = reply.pending.unwrap();
+        owner
+            .module_applied(
+                connection,
+                "a",
+                subc_protocol::config::ConfigAppliedRequest::new(
+                    view.generation,
+                    view.attempt.unwrap(),
+                    subc_protocol::config::ConfigApplyResult::Ack,
+                    vec![],
+                ),
+            )
+            .unwrap()
+    }
+    fn rereview_warning(owner: &RuntimeOwner) -> Option<String> {
+        owner
+            .status()
+            .unwrap()
+            .warnings
+            .into_iter()
+            .find(|warning| warning.starts_with("module a: needs configuration re-review"))
+    }
     let rig = rig();
     let owner = rig.owner("held-program-review");
     rig.declare(&owner, 10);
     rig.stamp(&owner);
+    assert_eq!(
+        acknowledge(&owner, ConnectionId::new(10)),
+        AppliedDisposition::Active
+    );
+    assert_eq!(rereview_warning(&owner), None);
     std::fs::OpenOptions::new()
         .append(true)
         .open(rig.path.join("program"))
@@ -1573,8 +1695,78 @@ fn config_admission_program_only_approval_of_a_held_module_needs_no_live_reviewe
     let prepared = owner.prepare(PlanKind::Change).unwrap();
     assert!(
         !prepared.review_modules.contains("a"),
-        "a stopped program-only hold cannot answer its own review RPC"
+        "the program change is approved launch-only: no running build can review for it"
     );
+    assert_eq!(approve(&rig, &owner, PlanKind::Change), 2);
+    let waiting = rereview_warning(&owner).expect("status names the module awaiting re-review");
+    assert!(
+        waiting.contains("waits until that program is running"),
+        "{waiting}"
+    );
+    assert!(
+        !owner
+            .prepare(PlanKind::Change)
+            .unwrap()
+            .review_modules
+            .contains("a"),
+        "the old program still running cannot re-review for the new one"
+    );
+    let spawn = owner
+        .spawned(
+            "a",
+            tokio::time::Instant::now(),
+            Duration::from_secs(120),
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .unwrap();
+    let replacement = ConnectionId::new(30);
+    rig.declare(&owner, replacement.get());
+    owner.registered(replacement, &spawn).unwrap();
+    assert_eq!(
+        acknowledge(&owner, replacement),
+        AppliedDisposition::WaitingForReadiness
+    );
+    assert_eq!(
+        owner.ready(replacement, "a", 2).unwrap(),
+        Some(AppliedDisposition::Active)
+    );
+    let ready = rereview_warning(&owner).expect("re-review is still owed");
+    assert!(
+        ready.contains("the next configuration plan re-reviews"),
+        "{ready}"
+    );
+    let prepared = owner.prepare(PlanKind::Change).unwrap();
+    assert!(prepared.review_modules.contains("a"));
+    assert!(prepared.rereview_modules.contains("a"));
+    let plan = owner.finish_plan(prepared, daemon_review).unwrap();
+    let entry = plan
+        .plan
+        .changeset
+        .policy_changes
+        .iter()
+        .find(|change| change["path"] == "reviewed_program")
+        .expect("the plan shows the re-review it binds");
+    assert_eq!(entry["module_id"], "a");
+    assert_ne!(entry["old"], entry["new"]);
+    owner
+        .desktop_view_delivered(ConnectionId::new(7), &plan)
+        .unwrap();
+    let challenge = owner.begin_approval(&plan.digest, &Rig::facts()).unwrap();
+    owner
+        .finish_approval(
+            challenge.attempt(),
+            &Rig::facts(),
+            ApprovalReply::Presence(super::super::super::PresenceDecision::InteractiveApproval),
+            3,
+        )
+        .unwrap();
+    assert_eq!(rereview_warning(&owner), None);
+    assert!(!owner
+        .prepare(PlanKind::Change)
+        .unwrap()
+        .review_modules
+        .contains("a"));
 }
 
 #[test]
@@ -1596,15 +1788,11 @@ fn config_admission_missing_approved_command_never_falls_back_to_the_live_spec()
 }
 
 #[tokio::test]
-async fn config_admission_spawn_rehashes_scripts_and_covered_files_after_preparation() {
+async fn config_admission_spawn_rehashes_programs_and_covered_files_after_preparation() {
     use std::io::Write;
-    for script_changed in [false, true] {
+    for program_changed in [false, true] {
         let rig = rig();
-        std::fs::write(
-            rig.path.join("program"),
-            "#!/bin/sh\nwhile :; do /bin/sleep 600; done\n",
-        )
-        .unwrap();
+        rig.write_native_program("sleep");
         let covered = rig.path.join("covered");
         std::fs::write(&covered, b"approved").unwrap();
         let mut doc: serde_json::Value =
@@ -1617,7 +1805,7 @@ async fn config_admission_spawn_rehashes_scripts_and_covered_files_after_prepara
         .unwrap();
         let owner = Arc::new(rig.owner("spawn-double-check"));
         rig.stamp(&owner);
-        let path = if script_changed {
+        let path = if program_changed {
             rig.path.join("program")
         } else {
             covered
@@ -1762,10 +1950,10 @@ fn config_admission_declared_files_are_covered_but_argument_files_are_not() {
 }
 
 #[test]
-fn config_admission_shebang_forms_resolve_interpreter_once_and_reject_env_options() {
+fn config_admission_shebang_forms_are_refused() {
     let rig = rig();
     let interpreter = rig.path.join("node");
-    std::fs::copy("/bin/sleep", &interpreter).unwrap();
+    std::fs::copy(sleep_program(), &interpreter).unwrap();
     let script = rig.path.join("main.cjs");
     std::fs::write(&script, "#!/usr/bin/env node\ncode\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1774,32 +1962,78 @@ fn config_admission_shebang_forms_resolve_interpreter_once_and_reject_env_option
     spec.env
         .push(("PATH".into(), rig.path.to_string_lossy().into_owned()));
     spec.args = vec!["argument".into()];
-    let launch = crate::config_gate::program::capture(&spec, &[]).unwrap();
-    assert_eq!(launch.spec.program, interpreter);
-    assert_eq!(
-        launch.spec.args,
-        [script.to_string_lossy().as_ref(), "argument"]
-    );
-    assert_eq!(launch.inputs.len(), 2);
-    assert!(launch.inputs.values().any(|input| matches!(&input.value, subc_config::RecordedValue::Value { value } if value["coverage"] == "interpreter only covered")));
     for rejected in [
+        "#!/usr/bin/env node\n",
+        "#!/bin/sleep 600\n",
         "#!/usr/bin/env -S node --flag\n",
         "#!relative\n",
         "#!/usr/bin/env NAME=value\n",
+        "#!\n",
     ] {
         std::fs::write(&script, rejected).unwrap();
-        assert_eq!(
-            crate::config_gate::program::capture(&spec, &[])
-                .err()
-                .unwrap()
-                .code,
-            "program_refused"
-        );
+        let error = crate::config_gate::program::capture(&spec, &[])
+            .err()
+            .expect("a shebang script must not be admitted");
+        assert_eq!(error.code, "program_refused");
+        assert!(error
+            .detail
+            .contains("script modules are refused while the config gate is on"));
+        assert!(error
+            .detail
+            .contains("interpreter re-reads the script by path after the check"));
+        assert!(error.detail.contains("compiled program"));
     }
-    std::fs::write(&script, "#!/bin/sleep 600\n").unwrap();
-    let launch = crate::config_gate::program::capture(&spec, &[]).unwrap();
-    assert_eq!(launch.spec.args[0], "600");
-    assert_eq!(launch.inputs.len(), 2);
+}
+
+#[test]
+fn config_admission_known_interpreters_are_refused_even_with_covered_scripts() {
+    let rig = rig();
+    let script = rig.path.join("main.cjs");
+    std::fs::write(&script, "code\n").unwrap();
+    for name in [
+        "node",
+        "bun",
+        "deno",
+        "python",
+        "python3",
+        "python3.12",
+        "sh",
+        "bash",
+        "python.exe",
+    ] {
+        let interpreter = rig.path.join(name);
+        std::fs::copy(sleep_program(), &interpreter).unwrap();
+        let mut spec = spec(&rig);
+        spec.program = interpreter;
+        spec.args = vec![script.to_string_lossy().into_owned()];
+        for covered in [vec![], vec![script.to_string_lossy().into_owned()]] {
+            let error = crate::config_gate::program::capture(&spec, &covered)
+                .err()
+                .expect("an interpreter must not be admitted, even when its script is covered");
+            assert_eq!(error.code, "program_refused");
+            assert!(error
+                .detail
+                .contains("interpreter re-reads the script by path after the check"));
+            assert!(error.detail.contains("compiled program"));
+        }
+    }
+}
+
+#[test]
+fn config_admission_refuses_in_place_script_substitution_before_capture() {
+    let rig = rig();
+    let spec = spec(&rig);
+    let path = spec.program.clone();
+    let identity = subc_os::file_identity(&path).unwrap();
+    crate::config_gate::program::before_capture_for_test(move || {
+        std::fs::write(&path, b"#!/bin/sh\nexec /bin/sleep 600\n").unwrap();
+        assert_eq!(subc_os::file_identity(&path), Some(identity));
+    });
+    let error = crate::config_gate::program::capture(&spec, &[])
+        .err()
+        .expect("the hashed bytes are a script, even though classification saw a native image");
+    assert_eq!(error.code, "program_refused");
+    assert!(error.detail.contains("compiled program"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -2224,7 +2458,7 @@ async fn config_admission_rollback_executes_the_current_restored_path_and_rechec
     rig.stamp(&owner);
     let restored = spec(&rig);
     let other = rig.path.join("new-program");
-    std::fs::copy("/bin/sleep", &other).unwrap();
+    std::fs::copy(sleep_program(), &other).unwrap();
     let mut doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(rig.path.join("subc.jsonc")).unwrap()).unwrap();
     doc["modules"]["a"]["program"] = json!(other);
@@ -2234,7 +2468,7 @@ async fn config_admission_rollback_executes_the_current_restored_path_and_rechec
     )
     .unwrap();
     approve(&rig, &owner, PlanKind::Change);
-    std::fs::copy("/bin/sleep", rig.path.join("restored-replacement")).unwrap();
+    std::fs::copy(sleep_program(), rig.path.join("restored-replacement")).unwrap();
     std::fs::rename(rig.path.join("restored-replacement"), &restored.program).unwrap();
     let generation = approve(&rig, &owner, PlanKind::Rollback(1));
     let approved = owner.approved_rollback_commands(generation).unwrap();
@@ -2632,7 +2866,7 @@ fn config_admission_daemon_restart_precedence_keeps_the_active_command_until_a_n
 #[tokio::test]
 async fn config_admission_exited_before_binding_keeps_its_real_exit_without_admitting_hello() {
     let rig = rig();
-    std::fs::write(rig.path.join("program"), "#!/bin/sh\nexit 23\n").unwrap();
+    rig.write_native_program("exit23");
     let mut doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(rig.path.join("subc.jsonc")).unwrap()).unwrap();
     doc["modules"]["a"]["protocol"] = json!("subc");
@@ -2692,7 +2926,7 @@ async fn config_admission_exited_before_binding_keeps_its_real_exit_without_admi
 #[tokio::test]
 async fn config_admission_wrapper_exec_to_a_different_program_is_program_refused() {
     let rig = rig();
-    std::fs::write(rig.path.join("program"), "#!/bin/sh\nexec /bin/sleep 600\n").unwrap();
+    rig.write_native_program("exec-sleep");
     let owner = Arc::new(rig.owner("wrapper-exec"));
     rig.stamp(&owner);
     let supervisor = Supervisor::new_for_test(
@@ -2812,11 +3046,10 @@ async fn config_admission_hello_accepts_only_the_approved_current_native_image()
     assert!(handle.wait_program_binding_for_test("a", &nonce).await);
     // The channel service waits for launch confirmation before dispatching
     // HELLO. A direct-handler fixture must wait for the same transition.
-    handle
-        .registration_for_test("a")
-        .unwrap()
-        .wait_launch()
-        .await;
+    let launch = handle.registration_for_test("a").unwrap();
+    tokio::time::timeout(Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     assert!(
         !module.configuration().unwrap().0.reserved,
         "the launch-local nonce gate must not rewrite approved role policy"
@@ -2991,6 +3224,7 @@ async fn config_recovery_hello_accepts_only_a_preexisting_bound_launch() {
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
     let nonce = handle.registration_proof_for_test("a").unwrap();
     assert!(handle.wait_program_binding_for_test("a", &nonce).await);
+    registration_launch_ready(&handle, "a").await;
     std::fs::write(
         rig.path.join("store").join(crate::config_store::STORE_FILE),
         b"tampered",
@@ -3023,7 +3257,12 @@ async fn config_recovery_hello_accepts_only_a_preexisting_bound_launch() {
             .handle_control(ConnectionId::new(445), frame)
             .unwrap();
         if presented.as_deref().is_some_and(|nonce| nonce != "wrong") {
-            assert_eq!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
+            assert_eq!(
+                reply[0].header.ty,
+                subc_protocol::FrameType::HelloAck,
+                "{}",
+                String::from_utf8_lossy(&reply[0].body)
+            );
         } else {
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&reply[0].body).unwrap()["code"],
@@ -3152,15 +3391,11 @@ async fn config_admission_post_exec_checks_protocol_none_covered_files_after_pri
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
-async fn config_admission_hello_rechecks_script_and_declared_file_content() {
+async fn config_admission_hello_rechecks_declared_file_content_after_append_or_replacement() {
     use std::io::Write;
-    for script_changed in [false, true] {
+    for replace_path in [false, true] {
         let rig = rig();
-        std::fs::write(
-            rig.path.join("program"),
-            "#!/bin/sh\nwhile :; do /bin/sleep 600; done\n",
-        )
-        .unwrap();
+        rig.write_native_program("sleep");
         wire_fixture_document(&rig, json!([]));
         let covered = rig.path.join("covered");
         std::fs::write(&covered, b"approved").unwrap();
@@ -3188,17 +3423,23 @@ async fn config_admission_hello_rechecks_script_and_declared_file_content() {
                 )
                 .await
         );
-        let changed = if script_changed {
-            rig.path.join("program")
+        registration_launch_ready(&handle, "a").await;
+        let changed = if replace_path {
+            let replacement = rig.path.join("changed-covered");
+            std::fs::copy(&covered, &replacement).unwrap();
+            replacement
         } else {
-            covered
+            covered.clone()
         };
         std::fs::OpenOptions::new()
             .append(true)
-            .open(changed)
+            .open(&changed)
             .unwrap()
             .write_all(b"\n# unapproved bytes\n")
             .unwrap();
+        if replace_path {
+            std::fs::rename(changed, covered).unwrap();
+        }
         refused_content_hello(&rig, owner, handle, registry, module).await;
     }
 }
@@ -3208,32 +3449,7 @@ async fn config_admission_hello_rechecks_script_and_declared_file_content() {
 async fn config_admission_hello_rejects_a_wrapper_that_execs_after_the_spawn_sample() {
     let rig = rig();
     let marker = rig.path.join("release-wrapper");
-    #[cfg(target_os = "linux")]
-    std::fs::write(
-        rig.path.join("program"),
-        "#!/bin/sh\nwhile [ ! -f \"$1\" ]; do /bin/sleep 0.01; done\nexec /bin/sleep 600\n",
-    )
-    .unwrap();
-    #[cfg(target_os = "macos")]
-    {
-        // Approved macOS programs must be signed images. A native wrapper
-        // keeps the late exec under test without requiring script admission.
-        let source = rig.path.join("late-exec.c");
-        std::fs::write(&source, include_str!("../../tests/fixtures/late-exec.c")).unwrap();
-        assert!(std::process::Command::new("/usr/bin/cc")
-            .arg(&source)
-            .arg("-o")
-            .arg(rig.path.join("program"))
-            .status()
-            .unwrap()
-            .success());
-        assert!(std::process::Command::new("/usr/bin/codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(rig.path.join("program"))
-            .status()
-            .unwrap()
-            .success());
-    }
+    rig.write_native_program("wait-exec");
     wire_fixture_document(&rig, json!([marker]));
     let owner = Arc::new(rig.owner("late-exec"));
     rig.stamp(&owner);
@@ -3844,6 +4060,7 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
             .wait_program_binding_for_test("a", &candidate_proof)
             .await
     );
+    registration_launch_ready(&handle, "a").await;
     candidate_proof.bind(candidate);
     let registering = crate::ControlHandler::new(registry.clone())
         .with_supervisor(handle.clone())
@@ -3868,7 +4085,12 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
             .unwrap(),
         )
         .unwrap();
-    assert_eq!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
+    assert_eq!(
+        reply[0].header.ty,
+        subc_protocol::FrameType::HelloAck,
+        "{}",
+        String::from_utf8_lossy(&reply[0].body)
+    );
     let (tx, _candidate_frames) = tokio::sync::mpsc::channel(32);
     forwarding
         .register_candidate_module_connection(
@@ -3928,6 +4150,7 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
     let fresh = handle.registration_proof_for_test("a").unwrap();
     assert_ne!(fresh, current);
     assert!(handle.wait_program_binding_for_test("a", &fresh).await);
+    registration_launch_ready(&handle, "a").await;
     let connection = ConnectionId::new(713);
     let reply = handler
         .handle_control(connection, module_hello(Some(fresh), connection))
@@ -3937,7 +4160,8 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
     assert_eq!(
         reply[0].header.ty,
         subc_protocol::FrameType::HelloAck,
-        "a restarted unreserved module must register over its fresh channel"
+        "a restarted unreserved module must register over its fresh channel: {}",
+        String::from_utf8_lossy(&reply[0].body)
     );
 }
 
@@ -4409,7 +4633,7 @@ async fn registration_declaration_stamp_restarts_nonce_spawn_before_completing_c
         .with_forwarding(forwarding.clone())
         .with_config_runtime(owner.clone());
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
-    let old = module.status().unwrap();
+    let old = reported_status(&module).await;
     let nonce = handle.spawn_launch_nonce_for("a").unwrap();
     let handler = Arc::new(
         crate::ControlHandler::with_forwarding(registry.clone(), forwarding)
@@ -4449,7 +4673,7 @@ async fn registration_declaration_stamp_restarts_nonce_spawn_before_completing_c
         .reconcile_approved_configuration(approved.clone())
         .await
         .unwrap();
-    let fresh = module.status().unwrap();
+    let fresh = reported_status(&module).await;
     assert!(
         fresh.process_alive,
         "cutover must launch before reconciliation returns: {fresh:?}"
@@ -4462,11 +4686,10 @@ async fn registration_declaration_stamp_restarts_nonce_spawn_before_completing_c
     let proof = handle.registration_proof_for_test("a").unwrap();
     assert!(handle.wait_program_binding_for_test("a", &proof).await);
     let mut channel = Net::new(router).await;
-    handle
-        .registration_for_test("a")
-        .unwrap()
-        .wait_launch()
-        .await;
+    let launch = handle.registration_for_test("a").unwrap();
+    tokio::time::timeout(Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     assert_eq!(
         channel
             .call(module_hello(Some(proof), ConnectionId::new(2)))

@@ -2,8 +2,9 @@
 # Run subc-daemon's library tests with their helper programs in place.
 #
 # Several daemon tests start helper programs (fake-aft-stub,
-# ckdev-resource-helper, the privacy trampoline fixture and others) and find
-# them by walking up from the test binary. `cargo test` builds the test binary
+# ckdev-resource-helper, config-gate-fixture, the privacy trampoline fixture and
+# others) and find them by walking up from the test binary. `cargo test` builds
+# the test binary
 # but not those helpers, and a separate `cargo build` may not put them where
 # the walk looks, so a plain `cargo test -p subc-daemon --lib` fails dozens of
 # tests on a fresh build-server checkout for reasons unrelated to the code.
@@ -46,10 +47,19 @@ deps=$(dirname "$test_binary")
 printf '%s\n' "$helpers" | awk '{print $3}' | while read -r helper; do
   [ -n "$helper" ] || continue
   for dir in "$deps" "$(dirname "$deps")"; do
-    # Skip a destination that already is this file: cargo hard-links built
-    # binaries between the two folders, and Windows paths may be spelled
-    # differently, so compare files rather than path strings.
-    [ "$helper" -ef "$dir/$(basename "$helper")" ] || cp "$helper" "$dir/"
+    dest="$dir/$(basename "$helper")"
+    # Skip a destination that already is this file or has the same bytes:
+    # cargo hard-links built binaries between the two folders, and Windows
+    # paths may be spelled differently, so compare files rather than path
+    # strings.
+    [ "$helper" -ef "$dest" ] && continue
+    cmp -s "$helper" "$dest" && continue
+    # Copy beside the destination, then rename over it. A test still running
+    # from another invocation may be executing the old helper, and writing
+    # into a running executable fails ("Text file busy" on Linux), while
+    # replacing its name does not.
+    tmp="$dest.tmp.$$"
+    cp "$helper" "$tmp" && mv -f "$tmp" "$dest"
   done
 done
 exec "$test_binary" "$@"

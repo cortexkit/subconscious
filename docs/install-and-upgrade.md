@@ -109,6 +109,18 @@ The components `ck setup` knows are `aft`, `mc`, `insula`, `claustrum` and
 declares a minimum daemon version is refused before anything is downloaded
 when the installed daemon is older; run `ck upgrade` first.
 
+Bare `ck setup` lists optional modules that are not set up and have a complete
+release for this host, for example:
+
+```text
+Optional modules: aft, insula, claustrum, synapse. Add one with `ck setup <name>`.
+```
+
+The list reflects this host's available releases; it is omitted when there is
+nothing to add. Setup does not prompt to select modules.
+Insula's file/API providers do not read browser stores; cookies come only from
+vault deposits on every OS.
+
 `ck setup aft --convert` and `ck setup mc --convert` move an existing
 standalone installation under the daemon. They print the plan and change
 nothing until you add `--confirm`.
@@ -118,6 +130,13 @@ nothing until you add `--confirm`.
 The modules the daemon runs are presented to an agent as one MCP server,
 `ck subc-mcp shim`.
 Name the harness so the tool surface can be shaped for it.
+
+Core setup installs and configures the supervised `subc-mcp` gateway, including
+its `module` argument and `reserved: true` admission. The shim connects to that
+gateway's runtime connection file; it does not start a second gateway. For an
+older install missing the gateway entry, run `ck setup` again. Setup adds the
+entry and rescans the daemon, but refuses a conflicting user-owned entry at
+`modules.subc-mcp` rather than replacing it.
 
 Claude Code:
 
@@ -145,8 +164,10 @@ Any other MCP host: run `ck subc-mcp shim --harness <name>` as a stdio server.
 
 Session attribution works when the daemon supervises `subc-mcp`: the module
 registers records using its current supervised launch nonce. Its module entry
-does not need `reserved: true` for this authority. Core setup installs its
-binary but does not currently write that module entry. Attribution requires
+uses `reserved: true` for admission as `reserved:subc-mcp`; the supervised
+launch nonce, not the reserved flag alone, supplies attribution authority.
+Core setup writes this entry on fresh installs and repairs its absence on a
+rerun. Attribution requires
 daemon 0.36.35 or newer advertising `scope-workdir/v1` through
 `server.describe`, as well as scope sync/apply support. Older daemons keep
 serving tools without attribution.
@@ -205,8 +226,10 @@ kept.
   one start retry. If it ends again, upgrade reports "the daemon did not stay
   running", including process presence, task/job state and last result, rather
   than spending the 180-second health budget on a start that has already ended.
-- Modules restart through `supervisor.restart`; the upgrade waits up to 180
-  seconds for each to report healthy.
+- Supervised modules, including `subc-mcp` configured by core setup, restart
+  through `supervisor.restart`; the upgrade waits up to 180 seconds for each to
+  report healthy. If a module is not supervised on this host, upgrade says its
+  restart was omitted rather than starting an independent process.
 - `ck` replaces itself last. On Windows the old binary is left as
   `ck.exe.old` and removed by the next successful `ck` run.
 

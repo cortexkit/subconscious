@@ -569,6 +569,11 @@ fn redact_launch_values(value: &Value) -> Result<Value> {
 }
 
 pub(crate) fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
+    let (file, input, _) = capture_program_classified(path)?;
+    Ok((file, input))
+}
+
+pub(crate) fn capture_program_classified(path: &Path) -> Result<(File, CapturedInput, bool)> {
     use sha2::{Digest as _, Sha256};
     if !path.is_absolute() {
         return Err(GateError::new(
@@ -600,8 +605,12 @@ pub(crate) fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
     let id = file_object_id(&file)?;
     let mut hasher = Sha256::new();
     let mut length = 0;
+    // Classify the same byte stream that supplies the approved hash, not an
+    // earlier path open that could have seen different content on this inode.
+    let mut prefix = Vec::with_capacity(2);
     #[cfg(target_os = "macos")]
     let signatures = subc_os::code_signature::file_signature(&file, |chunk| {
+        prefix.extend_from_slice(&chunk[..chunk.len().min(2 - prefix.len())]);
         length += chunk.len() as u64;
         hasher.update(chunk);
     });
@@ -614,6 +623,7 @@ pub(crate) fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
             if count == 0 {
                 break;
             }
+            prefix.extend_from_slice(&buffer[..count.min(2 - prefix.len())]);
             length += count as u64;
             if length > PROGRAM_FILE_LIMIT {
                 return Err(GateError::new(
@@ -681,6 +691,7 @@ pub(crate) fn capture_program(path: &Path) -> Result<(File, CapturedInput)> {
             state,
             value: RecordedValue::new(identity),
         },
+        prefix == b"#!",
     ))
 }
 

@@ -8,12 +8,16 @@ pub(crate) mod declaration_loss;
 mod finish_cpu;
 mod funded_groups;
 mod overlap;
+mod pending;
+mod shared_reads;
 pub(crate) use commit_fence::CommitFence;
 #[cfg(test)]
 mod audit_tests;
 #[cfg(test)]
 mod committed_tests;
 mod cpu_ledger;
+#[cfg(test)]
+mod latency_bench;
 mod prospective;
 mod time;
 use self::time::{Clock, RecentLoss};
@@ -50,6 +54,7 @@ pub(crate) struct Tracker {
     state: Mutex<State>,
     committed: Mutex<committed::View>,
     walk: tokio::sync::Mutex<()>,
+    declaration_reads: shared_reads::SharedReads<Option<Arc<ProcessTable>>>,
     view_refreshing: Arc<AtomicBool>,
     #[cfg(test)]
     view_refreshes: std::sync::atomic::AtomicUsize,
@@ -59,6 +64,26 @@ pub(crate) struct Tracker {
     own_probe: Option<OwnProbe>,
     #[cfg(test)]
     revision_conflicts: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    validation_table: Mutex<Option<ValidationTable>>,
+    #[cfg(test)]
+    sampler_tables: Arc<Mutex<std::collections::VecDeque<ProcessTable>>>,
+    #[cfg(test)]
+    sampler_reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ValidationTable {
+    table: ProcessTable,
+    first_delay: Option<Duration>,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DeclarationArrival {
+    queued_at: Duration,
+    declared_at: Instant,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -71,6 +96,9 @@ pub(crate) struct Declaration {
 #[derive(Default)]
 pub(crate) struct Receipt {
     finish_until: Option<u64>,
+    /// A paired counter and table that an attempt read but could not use
+    /// because the state was busy, kept for the next attempt.
+    snapshot: Option<validation::Snapshot>,
     loss_epoch: Option<u64>,
     #[cfg(windows)]
     windows_stop_cpu: windows::StopBoundary,
@@ -117,6 +145,7 @@ struct Module {
     pid: Option<u32>,
     outside_only: bool,
     roots: BTreeMap<AgentCommandRoot, Command>,
+    pending: BTreeMap<AgentCommandRoot, pending::PendingRoot>,
     finished: BTreeMap<AgentCommandRoot, u64>,
     finished_live: BTreeMap<AgentCommandRoot, (u64, Instant)>,
     omitted: BTreeMap<AgentCommandRoot, OmittedRoot>,
@@ -248,7 +277,72 @@ struct OmittedRoot {
     accepted_at: Instant,
 }
 
+impl DeclarationArrival {
+    /// Time since the declaration arrived.
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.declared_at.elapsed()
+    }
+}
+
 impl Tracker {
+    pub(crate) fn declaration_arrival(&self) -> DeclarationArrival {
+        DeclarationArrival {
+            queued_at: self.clock.now(),
+            declared_at: Instant::now(),
+        }
+    }
+
+    pub(crate) fn retain_started(
+        &self,
+        module_id: &str,
+        generation: u128,
+        module_pid: u32,
+        started: &[AgentCommandRoot],
+        arrival: DeclarationArrival,
+        fence: &CommitFence,
+    ) -> Option<Committed> {
+        let losses = self.declaration_loss(module_id);
+        let mut state = self.state.try_lock().ok()?;
+        if !fence.claim_commit() {
+            return None;
+        }
+        let module = state.modules.entry(module_id.to_owned()).or_default();
+        module.set_clock(self.clock.clone());
+        module.declaration_loss = losses;
+        let mut rejected = Vec::new();
+        let mut lost = Vec::new();
+        let now = now_ms();
+        for &root in started {
+            let result = module.pend_at(generation, module_pid, root, arrival, now);
+            if result.log_rejected {
+                rejected.push(root);
+            }
+            if result.full {
+                lost.push(root);
+            }
+        }
+        let recovered = declaration_loss::recover(module, started, None);
+        declaration_loss::commit(&module.declaration_loss, &recovered, None, &lost);
+        state.revision = state.revision.wrapping_add(1);
+        self.wake.notify_one();
+        Some(Committed {
+            rejected,
+            roots_full: !lost.is_empty(),
+            _retired: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn root_counts_for_test(&self, module_id: &str) -> (usize, usize, usize) {
+        let state = self.state.lock().unwrap();
+        let module = &state.modules[module_id];
+        (
+            module.roots.len(),
+            module.pending.len(),
+            module.finished.len(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn inject_model_loss_for_test(&self, id: &str) {
         self.state
@@ -282,6 +376,77 @@ impl Tracker {
     #[cfg(test)]
     pub(crate) fn inject_revision_conflicts(&self, count: usize) {
         self.revision_conflicts.store(count, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_validation_table_for_test(
+        &self,
+        table: ProcessTable,
+        first_delay: Duration,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *self.validation_table.lock().unwrap() = Some(ValidationTable {
+            table,
+            first_delay: Some(first_delay),
+            reads: Arc::clone(&reads),
+        });
+        reads
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_validation_table_for_test(&self) {
+        *self.validation_table.lock().unwrap() = None;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_sampler_tables_for_test(
+        &self,
+        tables: impl IntoIterator<Item = ProcessTable>,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        *self.sampler_tables.lock().unwrap() = tables.into_iter().collect();
+        Arc::clone(&self.sampler_reads)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn read_with_native_table_for_test(
+        self: &Arc<Self>,
+        modules: Vec<SupervisedModule>,
+        sample: bool,
+        caller: &'static str,
+    ) -> Readings {
+        // These fixtures check attribution, not native acquisition latency.
+        // Collect a fresh real table outside the bounded sampler reader pool.
+        self.inject_sampler_tables_for_test([ProcessTable::read().unwrap()]);
+        let _readers = crate::subtree_resources::fault_read_guard().await;
+        self.read(modules, sample, caller).await
+    }
+
+    fn validation_table(&self, interest: Option<BTreeSet<u32>>) -> Option<ProcessTable> {
+        #[cfg(test)]
+        {
+            let injected = self.validation_table.lock().unwrap().as_mut().map(|read| {
+                read.reads.fetch_add(1, Ordering::SeqCst);
+                (read.table.clone(), read.first_delay.take())
+            });
+            if let Some((table, delay)) = injected {
+                if let Some(delay) = delay {
+                    std::thread::sleep(delay);
+                }
+                return Some(table);
+            }
+        }
+        // Declarations arriving during a walk share the next one instead of
+        // each starting its own.
+        self.declaration_reads
+            .read(interest, |interest| {
+                match interest {
+                    Some(interest) => ProcessTable::read_for(&interest),
+                    None => ProcessTable::read(),
+                }
+                .ok()
+                .map(Arc::new)
+            })
+            .map(|table| ProcessTable::clone(&table))
     }
     #[cfg(all(test, windows))]
     pub(crate) fn command_process(
@@ -369,7 +534,20 @@ impl Tracker {
         // can cause a retry. Even a failed first read closes the finish window;
         // a later attempt cannot borrow subsequently observed CPU.
         let first_pass = receipt.finish_until.is_none();
-        let snapshot = validation::Snapshot::read(&target);
+        let mut request = BTreeSet::new();
+        shared_reads::declaration_pids(module_pid, &batch, &mut request);
+        // A retry after this method found the state busy reuses that
+        // attempt's snapshot: nothing was applied from it, its walk still
+        // began after this declaration arrived, and its counter was still
+        // read before that walk. A retry after a commit conflict reads again.
+        let snapshot = receipt.snapshot.take().or_else(|| {
+            let interest = self.interest().map(|mut interest| {
+                interest.extend(request.iter().copied());
+                shared_reads::container_pids(&target, &mut interest);
+                interest
+            });
+            validation::Snapshot::read_with(&target, || self.validation_table(interest))
+        });
         let finish_until = *receipt.finish_until.get_or_insert_with(|| {
             snapshot
                 .as_ref()
@@ -381,12 +559,27 @@ impl Tracker {
             .then(|| target.counter_identity())
             .flatten();
         let (expected_revision, mut module) = {
-            let state = self.state.try_lock().ok()?;
+            let Ok(state) = self.state.try_lock() else {
+                receipt.snapshot = Some(snapshot);
+                return None;
+            };
             (
                 state.revision,
                 state.modules.get(module_id).cloned().unwrap_or_default(),
             )
         };
+        // State committed during the walk can name a pid the walk did not
+        // examine. Retry with a walk that does, rather than answer from a
+        // table that cannot speak for that pid.
+        module.interest(&mut request);
+        if !shared_reads::covers(&snapshot.table, &request) {
+            tracing::debug!(
+                cause = "interest",
+                phase = "declaration_table",
+                "resource pass incomplete"
+            );
+            return None;
+        }
         let trusted = {
             let carried = counter.is_some_and(|counter| module.counter == Some(counter));
             let mut trusted: BTreeMap<_, _> = module
@@ -556,6 +749,9 @@ impl Tracker {
         module.observation_before = prepared.before_cpu.map_or(0, |(_, cpu)| cpu);
         let mut applied = Application::default();
         for (root, verified) in prepared.started {
+            if let Some(key) = module.pending_key(root) {
+                module.pending.remove(&key);
+            }
             let result = module.accept_checked(generation, root, verified, &prepared.table, now);
             if result.log_rejected {
                 applied.rejected.push(root);
@@ -563,6 +759,24 @@ impl Tracker {
             if result.full {
                 applied.roots_full = true;
                 applied.lost.push(root);
+            }
+        }
+        for root in prepared.pending {
+            let result = module.pend(generation, root, &prepared.table, now);
+            if result.log_rejected {
+                applied.rejected.push(root);
+            }
+            if result.full {
+                applied.roots_full = true;
+                applied.lost.push(root);
+            }
+        }
+        for finished in &prepared.finished {
+            if let Some(key) = module.pending_key(AgentCommandRoot {
+                pid: finished.pid,
+                start_time_ms: finished.start_time_ms,
+            }) {
+                module.pending.remove(&key);
             }
         }
         // Retained identity-specific process handles can read final CPU after exit.
@@ -650,6 +864,13 @@ impl Tracker {
             );
         }
         if let Some(known) = prepared.known {
+            module.pending.retain(|pending, _| {
+                known.iter().any(|(root, _)| {
+                    root.pid == pending.pid
+                        && root.start_time_ms.abs_diff(pending.start_time_ms)
+                            < subc_os::process_start_time_precision_ms()
+                })
+            });
             let mut required: BTreeSet<_> = module
                 .roots
                 .iter()
@@ -680,6 +901,9 @@ impl Tracker {
             // Check overlaps before replacing the accepted set: removing old
             // roots first would conceal an overlapping ancestor in the resync.
             for (root, verified) in known {
+                if module.pending_key(root).is_some() {
+                    continue;
+                }
                 let result =
                     module.accept_checked(generation, root, verified, &prepared.table, now);
                 if result.log_rejected {
@@ -741,7 +965,31 @@ impl Tracker {
         applied
     }
 
+    fn cached_table_covers_pending(&self, table: &ProcessTable) -> bool {
+        let Ok(state) = self.state.try_lock() else {
+            return false;
+        };
+        let pending_after = state
+            .modules
+            .values()
+            .filter_map(Module::oldest_pending_declaration)
+            .min();
+        pending_after
+            .is_none_or(|declared| table.started_at().is_some_and(|began| began > declared))
+    }
+
+    #[cfg(test)]
     async fn table(&self) -> Option<Arc<ProcessTable>> {
+        self.table_for(None, Vec::new()).await
+    }
+
+    /// The sampler's walk, narrowed to `interest` plus the members of the
+    /// container `targets`, or a full walk when `interest` is `None`.
+    async fn table_for(
+        &self,
+        interest: Option<BTreeSet<u32>>,
+        targets: Vec<crate::subtree_resources::Target>,
+    ) -> Option<Arc<ProcessTable>> {
         {
             let Ok(cache) = self.cache.try_lock() else {
                 tracing::debug!(
@@ -752,7 +1000,12 @@ impl Tracker {
                 return None;
             };
             if let Some((at, table)) = cache.as_ref() {
-                if at.elapsed() < Duration::from_secs(1) {
+                if at.elapsed() < Duration::from_secs(1)
+                    && self.cached_table_covers_pending(table)
+                    && interest
+                        .as_ref()
+                        .is_none_or(|interest| shared_reads::covers(table, interest))
+                {
                     return Some(Arc::clone(table));
                 }
             }
@@ -773,13 +1026,35 @@ impl Tracker {
         }
         let refresh = Refresh(Arc::clone(&self.refreshing));
         let cache = Arc::clone(&self.cache);
+        #[cfg(test)]
+        let supplied = Arc::clone(&self.sampler_tables);
+        #[cfg(test)]
+        let reads = Arc::clone(&self.sampler_reads);
         crate::subtree_resources::bounded(
             read_deadline(),
             move |_| {
                 let _refresh = refresh;
+                let interest = interest.map(|mut interest| {
+                    for target in &targets {
+                        shared_reads::container_pids(target, &mut interest);
+                    }
+                    interest
+                });
+                let walk = move || match interest {
+                    Some(interest) => ProcessTable::read_for(&interest),
+                    None => ProcessTable::read(),
+                };
                 // Publish even a late result. No cache or attribution lock is
                 // held while walking the host's process table.
-                let table = Arc::new(ProcessTable::read().map_err(|error| {
+                #[cfg(test)]
+                let table = {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    let table = supplied.lock().unwrap().pop_front();
+                    table.map_or_else(walk, Ok)
+                };
+                #[cfg(not(test))]
+                let table = walk();
+                let table = Arc::new(table.map_err(|error| {
                     tracing::debug!(cause = "unreadable", phase = "process_table", %error, "resource pass incomplete");
                 }).ok()?);
                 let Ok(mut cache) = cache.try_lock() else {
@@ -802,7 +1077,7 @@ impl Tracker {
         generation: u128,
         target: crate::subtree_resources::Target,
         batch: Declaration,
-    ) {
+    ) -> Committed {
         let prepared = self
             .prepare(
                 module_id,
@@ -814,7 +1089,7 @@ impl Tracker {
             )
             .unwrap();
         self.commit_fenced(module_id, generation, prepared, &CommitFence::default())
-            .unwrap();
+            .unwrap()
     }
 
     pub(crate) async fn read(
@@ -862,7 +1137,16 @@ impl Tracker {
             |_| BTreeMap::new(),
         )
         .await;
-        let Some(table) = self.table().await else {
+        let interest = self.interest().map(|mut interest| {
+            interest.extend(launches.values().flatten().filter_map(|launch| launch.pid));
+            interest
+        });
+        let containers = launches
+            .values()
+            .flatten()
+            .map(|launch| launch.target.clone())
+            .collect();
+        let Some(table) = self.table_for(interest, containers).await else {
             return Readings::default();
         };
         let tracker = Arc::clone(self);
@@ -1048,6 +1332,18 @@ impl Tracker {
         }
         let mut candidate = state.clone();
         drop(state);
+        // State committed during the walk can name a pid the walk did not
+        // examine; leave this pass incomplete rather than answer for it.
+        let mut required = self.state_interest(&candidate);
+        required.extend(observed.values().filter_map(|observed| observed.4));
+        if !shared_reads::covers(&table, &required) {
+            tracing::debug!(
+                cause = "interest",
+                phase = "observation_table",
+                "resource pass incomplete"
+            );
+            return None;
+        }
         let state = &mut candidate;
         state.revision = state.revision.wrapping_add(1);
         #[cfg(windows)]
@@ -1103,8 +1399,10 @@ impl Tracker {
                 changed_domain && (module.table_revision >= table.revision() || overlapping);
             if !stale_transition {
                 if let (Some(_), Some(counter)) = (&tree, counter) {
-                    module.bind_counter(generation, counter, owner, pid);
+                    module.bind_counter(generation, counter, owner.clone(), pid);
                 }
+                module.observation_before = before.get(&id).map_or(0, |(_, cpu)| *cpu);
+                module.validate_pending(&id, generation, owner.as_ref(), &table, now);
             }
             let result = if stale_transition || (tree.is_none() && !module.outside_only) {
                 None
@@ -1487,11 +1785,11 @@ impl Module {
         {
             return Acceptance::default();
         }
-        let retained = self.roots.len() + self.finished_live.len();
+        let retained = self.roots.len() + self.finished_live.len() + self.pending.len();
         let resumed = usize::from(resume.is_some_and(|root| {
             self.finished_live.contains_key(&root) || self.roots.contains_key(&root)
         }));
-        let full = verified.is_some() && retained.saturating_sub(resumed) >= 1_024;
+        let full = verified.is_some() && retained.saturating_sub(resumed) >= pending::ROOT_LIMIT;
         let verified = verified.filter(|_| !full).filter(|candidate| {
             !self.roots.iter().any(|(root, command)| {
                 if resume == Some(*root) {
@@ -1862,23 +2160,18 @@ pub(crate) fn spawn(
         let mut minute = tokio::time::interval(Duration::from_secs(60));
         minute.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            #[cfg(windows)]
-            {
-                tokio::select! {
-                    _ = minute.tick() => { tracker.read(supervisor.list(), true, "resource_sampler").await; }
-                    _ = tracker.wake.notified() => { tracker.read(supervisor.list(), false, "agent_commands").await; }
-                    _ = tokio::time::sleep(Duration::from_secs(5)), if tracker.has_live_roots() => {
-                        tracker.read(supervisor.list(), false, "agent_commands").await;
-                    }
-                }
-            }
-            #[cfg(not(windows))]
-            {
-                tokio::select! {
-                    _ = minute.tick() => { tracker.read(supervisor.list(), true, "resource_sampler").await; }
-                    _ = tracker.wake.notified() => { tracker.read(supervisor.list(), false, "agent_commands").await; }
-                }
-            }
+            let sample = tracker.next_sample(&mut minute).await;
+            tracker
+                .read(
+                    supervisor.list(),
+                    sample,
+                    if sample {
+                        "resource_sampler"
+                    } else {
+                        "agent_commands"
+                    },
+                )
+                .await;
             if owner.upgrade().is_none() {
                 break;
             }
@@ -1886,15 +2179,27 @@ pub(crate) fn spawn(
     });
 }
 
-#[cfg(windows)]
 impl Tracker {
-    fn has_live_roots(&self) -> bool {
+    async fn next_sample(&self, minute: &mut tokio::time::Interval) -> bool {
+        tokio::select! {
+            _ = minute.tick() => true,
+            _ = self.wake.notified() => false,
+            // macOS walks take 0.2–1.2 s, so declarations often miss the 200 ms
+            // window and depend on fresh retries before pending starts expire.
+            _ = tokio::time::sleep(Duration::from_secs(5)), if self.needs_retry() => false,
+        }
+    }
+
+    fn needs_retry(&self) -> bool {
         self.state
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .modules
             .values()
-            .any(|module| module.roots.values().any(|root| root.live))
+            .any(|module| {
+                !module.pending.is_empty()
+                    || (cfg!(windows) && module.roots.values().any(|root| root.live))
+            })
     }
 }
 

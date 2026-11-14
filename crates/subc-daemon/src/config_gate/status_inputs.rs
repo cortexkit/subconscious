@@ -43,23 +43,6 @@ pub(super) fn report_snapshot(
             _ => None,
         })
         .collect();
-    status.interpreter_only_covered = snapshot
-        .inputs
-        .iter()
-        .filter_map(|(key, input)| {
-            let InputKey::Program { module, .. } = key else {
-                return None;
-            };
-            let subc_config::RecordedValue::Value { value } = &input.value else {
-                return None;
-            };
-            (value.get("coverage").and_then(serde_json::Value::as_str)
-                == Some("interpreter only covered"))
-            .then(|| module.clone())
-        })
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
 }
 
 #[cfg(test)]
@@ -171,10 +154,13 @@ mod tests {
             ("config_gate/program.rs", 1),
             ("config_gate/runtime.rs", 1),
             ("config_store/writer_lock.rs", 1),
-            ("control.rs", 3),
+            // Inline test reads, including XDG_DATA_HOME for the fixture stop marker.
+            ("control.rs", 4),
             ("daemon_config.rs", 4),
             ("live_children.rs", 1),
             ("privileged_prompt.rs", 1),
+            // Ignored benchmark inputs, not startup overrides.
+            ("resource_totals/latency_bench.rs", 2),
             ("run_dir_lock.rs", 2),
             ("supervise.rs", 12),
             ("systemd_kill_mode.rs", 1),

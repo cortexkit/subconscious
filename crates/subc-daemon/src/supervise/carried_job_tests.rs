@@ -76,13 +76,7 @@ impl Fixture {
         let dir = ScratchDir::new(label);
         let holder_file = dir.join("holder.pid");
         let record = dir.join("live-children.json");
-        let stub = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("fake-aft-stub.exe");
+        let stub = cortexkit_test_support::cargo_profile_bin("fake-aft-stub");
         assert!(
             stub.is_file(),
             "build prerequisite: cargo build -p subc-core --bin fake-aft-stub"

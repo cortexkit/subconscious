@@ -12,6 +12,8 @@ mod status_placement;
 struct Rig {
     path: std::path::PathBuf,
     declaration: ConfigDeclareRequest,
+    #[cfg(unix)]
+    program_mode: std::sync::OnceLock<&'static str>,
 }
 
 #[test]
@@ -185,7 +187,7 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     .unwrap();
     let covered = rig.path.join("covered.txt");
     std::fs::write(&covered, b"approved").unwrap();
-    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":program,"args":["-t","127.0.0.1"],"protocol":"subc","overlap":"safe","program_files":[covered]}}})).unwrap()).unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":program,"args":["-t","127.0.0.1"],"protocol":"subc","registration_channel":true,"overlap":"safe","program_files":[covered]}}})).unwrap()).unwrap();
     let owner = Arc::new(rig.owner("windows-handle-lifetime"));
     rig.stamp(&owner);
     let registry = Arc::new(crate::Registry::default());
@@ -207,11 +209,10 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     let excluded = before.as_ref().err().and_then(|error| error.raw_os_error());
     drop(before);
     let rejected_proof = handle.registration_proof_for_test("a").unwrap();
-    handle
-        .registration_for_test("a")
-        .unwrap()
-        .wait_launch()
-        .await;
+    let launch = handle.registration_for_test("a").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     let handler = crate::ControlHandler::with_forwarding(registry.clone(), forwarding)
         .with_supervisor(handle.clone())
         .with_config_runtime(owner);
@@ -263,14 +264,37 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         .unwrap()
         .starts_with("HELLO protocol_ver 0 does not match manifest protocol_ver"));
     handler.cleanup_connection(ConnectionId::new(778)).unwrap();
+    let rejected_registration = handle.registration_for_test("a").unwrap();
     rejected_module.stop().await.unwrap();
     let module = supervisor.spawn_async(spec).await.unwrap();
+    // spawn_async can return before the supervisor has launched the second
+    // child (seen on GitHub's Windows runner), and until then the handle still
+    // serves the stopped child's retired registration. Wait for the new one;
+    // a HELLO sent with the old proof would go unanswered.
+    let registration = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(current) = handle.registration_for_test("a") {
+                if !Arc::ptr_eq(&current, &rejected_registration) {
+                    break current;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the second child must get its own registration");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        registration.wait_launch(),
+    )
+    .await
+    .expect("registration launch must settle");
+    assert!(
+        registration.launch_ready(),
+        "the second launch must be ready before its HELLO: {:?}",
+        module.status()
+    );
     let proof = handle.registration_proof_for_test("a").unwrap();
-    handle
-        .registration_for_test("a")
-        .unwrap()
-        .wait_launch()
-        .await;
     let ordinary_excluded = std::fs::OpenOptions::new()
         .write(true)
         .open(&covered)
@@ -289,7 +313,15 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         )
         .await
         .unwrap();
-    let ack = rx.try_recv().unwrap();
+    // A refused HELLO enqueues no ACK and returns its refusal as the reply, so
+    // name that refusal instead of the bare empty-channel error.
+    let ack = rx.try_recv().unwrap_or_else(|error| {
+        let replies: Vec<_> = reply
+            .iter()
+            .map(|frame| String::from_utf8_lossy(&frame.body).into_owned())
+            .collect();
+        panic!("HELLO was not acknowledged ({error:?}); the handler replied {replies:?}")
+    });
     let after = std::fs::OpenOptions::new().write(true).open(&covered);
     let released = after.is_ok();
     drop(after);
@@ -392,6 +424,28 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         candidate_released,
         "a production swap-candidate ACK must release its strict handles too"
     );
+}
+
+#[cfg(unix)]
+async fn reported_status(
+    module: &crate::supervise::SupervisedModule,
+) -> crate::supervise::ModuleStatus {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = module.status().unwrap();
+            if status.pid.is_some() {
+                return status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the owned child must cross its exec acknowledgement before observation")
+}
+
+#[cfg(unix)]
+async fn reported_pid(module: &crate::supervise::SupervisedModule) -> u32 {
+    reported_status(module).await.pid.unwrap()
 }
 
 #[cfg(unix)]
@@ -559,7 +613,17 @@ impl Rig {
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        std::fs::create_dir(&path).unwrap();
+        std::fs::create_dir(&path)
+            .or_else(|error| {
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+                // A dead test process may have left this PID/counter directory.
+                // Recreate it exclusively instead of reusing its old contents.
+                std::fs::remove_dir_all(&path)?;
+                std::fs::create_dir(&path)
+            })
+            .unwrap();
         std::fs::create_dir(path.join("cortexkit")).unwrap();
         std::fs::create_dir(path.join("store")).unwrap();
         std::fs::write(path.join("program"), b"captured program identity").unwrap();
@@ -584,7 +648,12 @@ impl Rig {
             path.join("cortexkit/a.jsonc").to_string_lossy(),
             vec![],
         );
-        Self { path, declaration }
+        Self {
+            path,
+            declaration,
+            #[cfg(unix)]
+            program_mode: std::sync::OnceLock::new(),
+        }
     }
 
     fn owner(&self, incarnation: &str) -> RuntimeOwner {
@@ -624,7 +693,46 @@ impl Rig {
         }
     }
 
+    #[cfg(unix)]
+    fn write_native_program(&self, mode: &'static str) {
+        // Cargo builds the native fixture alongside the test binary; no shell
+        // wrapper or runtime compiler is needed for gated launch fixtures.
+        let binary = crate::config_gate::program::native_fixture_for_test();
+        std::fs::copy(binary, self.path.join("program")).unwrap();
+        self.program_mode
+            .set(mode)
+            .expect("fixture mode already set");
+        #[cfg(target_os = "macos")]
+        assert!(std::process::Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(self.path.join("program"))
+            .status()
+            .unwrap()
+            .success());
+    }
+
     fn stamp(&self, owner: &RuntimeOwner) -> u64 {
+        #[cfg(unix)]
+        if let Some(mode) = self.program_mode.get() {
+            let path = self.path.join("subc.jsonc");
+            let mut doc: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            for entry in doc["modules"].as_object_mut().unwrap().values_mut() {
+                if entry["program"] == json!(self.path.join("program")) {
+                    let args = entry
+                        .as_object_mut()
+                        .unwrap()
+                        .entry("args")
+                        .or_insert_with(|| json!([]))
+                        .as_array_mut()
+                        .unwrap();
+                    if args.first() != Some(&json!(mode)) {
+                        args.insert(0, json!(mode));
+                    }
+                }
+            }
+            std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        }
         let prepared = owner.prepare(PlanKind::Stamp).unwrap();
         let plan = owner.finish_plan(prepared, daemon_review).unwrap();
         owner
@@ -1502,7 +1610,7 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
     .unwrap();
     let covered = rig.path.join("covered.txt");
     std::fs::write(&covered, b"approved").unwrap();
-    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":program,"args":["-t","127.0.0.1"],"protocol":"subc","overlap":"safe","program_files":[covered]}}})).unwrap()).unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"),serde_json::to_vec(&json!({"version":1,"modules":{"a":{"program":program,"args":["-t","127.0.0.1"],"protocol":"subc","registration_channel":true,"overlap":"safe","program_files":[covered]}}})).unwrap()).unwrap();
     let owner = Arc::new(rig.owner("removed-registration"));
     rig.stamp(&owner);
     let registry = Arc::new(crate::Registry::default());
@@ -1521,11 +1629,10 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
         .module_spec();
     let module = supervisor.spawn_async(spec).await.unwrap();
     let initial_proof = handle.registration_proof_for_test("a").unwrap();
-    handle
-        .registration_for_test("a")
-        .unwrap()
-        .wait_launch()
-        .await;
+    let launch = handle.registration_for_test("a").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     assert!(
         handle
             .wait_program_binding_for_test("a", &initial_proof)
@@ -1594,7 +1701,9 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
         (initial_proof, None)
     };
     let launch = handle.registration_for_test("a").unwrap();
-    launch.wait_launch().await;
+    tokio::time::timeout(std::time::Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     assert_eq!(launch.is_candidate(), candidate);
     let hold = Arc::new(std::sync::Barrier::new(2));
     let handler = handler.with_hello_registry_to_forwarding_hold(hold.clone());

@@ -117,6 +117,13 @@ waiting for impossible room.
 | Swap candidate ready timeout | 100 s | `DEFAULT_SWAP_READY_TIMEOUT`, supervise.rs:407 |
 | Spawn event ring (`supervisor.spawn_subscribe`) | 4096 events | `SPAWN_EVENT_RING_CAPACITY`, supervise.rs:105 |
 
+The daemon holds `no-answer` health restarts during host overload: either at least
+`max(3, ceil(running subc modules / 4))` distinct modules have timed out or answered late
+within 60 s, or its fixed 1 s scheduler tick has fired more than 2 s late within that
+window. Held probes still report degraded health with `host overloaded`, but do not
+accumulate restart failures. Counting starts afresh when the signal clears; a dead
+control lane, process exit, and the crash budget retain their normal behavior.
+
 What a module must do:
 - **Exit on EOF of its daemon connection** within its shutdown budget, and re-raise a caught stop
   signal instead of exiting 0.

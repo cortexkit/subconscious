@@ -10,6 +10,7 @@ pub struct TestSupport {
     root: PathBuf,
     key_file: Option<PathBuf>,
     pause_at: Option<(PausePoint, PathBuf)>,
+    fail_at: Option<PausePoint>,
     fail_anchor: bool,
     anchor_failure_file: Option<PathBuf>,
     deny_key: bool,
@@ -27,6 +28,7 @@ impl TestSupport {
             root,
             key_file,
             pause_at: None,
+            fail_at: None,
             fail_anchor: false,
             anchor_failure_file: None,
             deny_key: false,
@@ -70,6 +72,11 @@ impl TestSupport {
         Ok(store)
     }
     pub fn pause(&self, point: PausePoint) -> io::Result<()> {
+        if self.fail_at == Some(point) {
+            return Err(io::Error::other(format!(
+                "injected publication failure at {point:?}"
+            )));
+        }
         if let Some((configured, path)) = &self.pause_at {
             if *configured == point {
                 fs::write(path.with_extension("reached"), b"ready")?;
@@ -121,6 +128,19 @@ impl ConfigStore {
     }
     pub fn test_support(&self) -> Option<&TestSupport> {
         self.hooks.as_ref()
+    }
+    #[cfg(test)]
+    pub(crate) fn set_test_publication_failure(&mut self, point: PausePoint) {
+        let hooks = self.hooks.get_or_insert_with(|| TestSupport {
+            root: self.root.0.clone(),
+            key_file: None,
+            pause_at: None,
+            fail_at: None,
+            fail_anchor: false,
+            anchor_failure_file: None,
+            deny_key: false,
+        });
+        hooks.fail_at = Some(point);
     }
     /// Changing the failure flag never bypasses a pending anchor; retry remains
     /// explicit so the delivery caller cannot mistake a flag change for a commit.

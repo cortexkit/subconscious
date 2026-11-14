@@ -158,6 +158,34 @@ fn publication_sequence_survives_repeated_counters_and_anchor_error() {
         "anchor retry is not a new publication"
     );
 }
+
+#[cfg(feature = "test-support")]
+#[test]
+fn publication_sequence_advances_when_renamed_publication_cannot_sync_parent() {
+    let rig = Rig::new();
+    let mut store = rig.open(false);
+    store
+        .commit_generation(entry(CommitKind::Stamp), snapshot(1, 1), snapshot(1, 1), 1)
+        .unwrap();
+    let before = rig.bytes();
+    let sequence = store.publication_sequence();
+    store.set_test_publication_failure(disk::PausePoint::AfterRenameBeforeSync);
+    let error = store
+        .commit_generation(
+            entry(CommitKind::Approved),
+            snapshot(2, 1),
+            snapshot(2, 1),
+            2,
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("AfterRenameBeforeSync"),
+        "{error}"
+    );
+    assert_ne!(rig.bytes(), before, "the replacement really happened");
+    assert_eq!(store.publication_sequence(), sequence + 1);
+    assert_eq!(store.loaded_status().state, StoreState::StoreUnverified);
+}
 fn entry(kind: CommitKind) -> HistoryEntry {
     HistoryEntry {
         delivery: None,
@@ -528,7 +556,7 @@ fn config_store_start_format_corruption_missing_key_denial_and_modes() {
     assert_eq!(rig.open(false).status().state, StoreState::StoreUnverified);
     rig.replace(b"truncated");
     let mut corrupted = rig.open(false);
-    assert_eq!(corrupted.status().state, StoreState::Unstamped);
+    assert_eq!(corrupted.status().state, StoreState::StoreUnverified);
     assert_eq!(corrupted.take_activities()[0].event, "config.tamper");
     fs::remove_file(rig.path.join(STORE_FILE)).unwrap();
     assert_eq!(rig.open(false).status().state, StoreState::Unstamped);
@@ -1212,3 +1240,6 @@ fn registration_declaration_loaded_status_matches_checked_status_without_io() {
         .iter()
         .any(|(operation, _)| *operation == "store_hash"));
 }
+
+#[path = "boot_tests.rs"]
+mod boot;

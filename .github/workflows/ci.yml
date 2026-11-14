@@ -286,16 +286,17 @@ jobs:
       # window reached production ungated. A red job that means "lint failed and
       # tests passed" is honest; one that means "lint failed and tests are
       # unknown" is not, and the two are indistinguishable from the outside.
-      # The full suite finishes in minutes on every platform (the whole
-      # cross-built set ran in under three minutes on a Windows VM). A step
-      # that is still running at this bound is hung, and a hung step must end
-      # by timeout rather than by the runner dying: a timed-out step keeps its
-      # log, and libtest names any test that has run for over sixty seconds in
-      # that log, while a runner that loses communication with the server
-      # uploads nothing (2026-09-09, Windows, 2h46m, no log).
+      # The bound covers building as well as running: on GitHub's Windows
+      # runner the step took 31 to 37 minutes on master in November 2026, and
+      # the daemon's development-approval tests add a second daemon build with
+      # their own features. A step still running at this bound is hung, and a
+      # hung step must end by timeout rather than by the runner dying: a
+      # timed-out step keeps its log, and libtest names any test that has run
+      # for over sixty seconds in that log, while a runner that loses
+      # communication with the server uploads nothing.
       - name: Test
         if: ${{ !cancelled() }}
-        timeout-minutes: 40
+        timeout-minutes: 60
         run: bash scripts/gate.sh test workspace
 
       # Root can create cgroup v2 directories under /sys/fs/cgroup; require these tests so they cannot skip in CI.
@@ -388,7 +389,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y polkitd pkexec policykit-1 python3-dbus
+          sudo apt-get install -y polkitd pkexec python3-dbus
           sudo useradd --create-home --shell /bin/sh subc-polkit-test
           trap 'sudo userdel --remove subc-polkit-test' EXIT
           echo 'subc-polkit-test:polkit-fixture-password' | sudo chpasswd
@@ -517,10 +518,18 @@ jobs:
       - name: Cross-repo crates moved with their versions
         if: ${{ !cancelled() && matrix.os == 'ubuntu' }}
         run: |
-          # A push compares against its own before-state; a PR against its base.
-          # Both are fetched shallow by default, so deepen enough to resolve them.
+          # A push to master compares against its own before-state; a PR against
+          # its base. A push to any other branch compares against where it left
+          # master: it reaches siblings only when it lands there, and comparing
+          # against its own previous push would demand a new version for every
+          # push of code that was never released.
+          # All are fetched shallow by default, so deepen enough to resolve them.
           if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
             BASE="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.ref }}" != "refs/heads/master" ]; then
+            git fetch --unshallow origin 2>/dev/null || git fetch origin || true
+            git fetch origin master:refs/remotes/origin/master || true
+            BASE="$(git merge-base refs/remotes/origin/master HEAD || true)"
           else
             BASE="${{ github.event.before }}"
           fi
@@ -586,6 +595,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ matrix.bun }}
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ matrix.pkg == 'subc-client' }}
       # Store depends on the sibling private-files package through its lock
       # until that package is on npm, and log depends on store. Build
       # private-files first so a fresh checkout has its JavaScript and
@@ -607,6 +618,9 @@ jobs:
         # resolve fresh versions and report green on dependencies that were
         # never committed, so the drift it should surface becomes invisible.
         run: bun install --frozen-lockfile
+      - name: Build host native registration helper
+        if: ${{ matrix.pkg == 'subc-client' }}
+        run: bun run build:native
       # Same reasoning as the Rust lane: Install is setup, so a failure there
       # makes this impossible rather than skipped. But Typecheck is a CHECK, and
       # the Test step below must not lose its answer to a type error.
@@ -630,17 +644,12 @@ jobs:
       # the golden-conformance suite pin BYTES; only this pins a live handshake.
       #
       # It ran nowhere for a half-true reason, which is why it survived review:
-      # the suite is off by default so the unit lane can stay bun-only, and this
-      # job genuinely had no Rust toolchain. True, and it explains the DEFAULT
-      # rather than the absence -- nobody had added the toolchain to the one job
-      # that runs bun. A justification that answers a neighbouring question is
-      # stickier than a false one, because checking it returns a real reason and
-      # the reader stops.
+      # the suite is off by default. The subc-client legs install Rust above for
+      # the registration helper; the Linux leg also builds the daemon below to
+      # exercise the live handshake rather than relying only on mock peers.
       #
       # Restricted to the subc-client leg: the store and log packages have no
       # daemon tests, so building a daemon there would be pure cost.
-      - uses: dtolnay/rust-toolchain@stable
-        if: ${{ !cancelled() && matrix.pkg == 'subc-client' && matrix.os == 'ubuntu-latest' }}
       # tests/live-daemon.ts builds the daemon itself when target/debug/ck-subc is
       # missing, so this step is not what makes the suite work -- it moves the
       # build OUT of the first test, where a cold compile would run against bun's

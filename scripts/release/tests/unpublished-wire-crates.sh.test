@@ -36,8 +36,8 @@ write_current_responses() {
   local dir="$1"
   mkdir -p "$dir"
   local crate
-  for crate in subc-protocol subc-config subc-transport subc-control subc-client-rs \
-    subc-jsonc subc-cgroup subc-uptime subc-os subc-jobobject subc-presence \
+  for crate in subc-config subc-protocol subc-os subc-transport subc-control subc-client-rs \
+    subc-jsonc subc-cgroup subc-uptime subc-jobobject subc-presence \
     subc-daemon cortexkit-bus-testkit; do
     write_response "$dir" "$crate" "$(manifest_version "$crate")"
   done
@@ -102,6 +102,20 @@ check_case dependency-order \
 subc-control $(manifest_version subc-control)" 0 \
   bash "$detector" --registry-json-dir "$two_behind"
 
+config_and_dependents="$test_root/config-and-dependents"
+write_current_responses "$config_and_dependents"
+for crate in subc-config subc-protocol subc-os subc-transport subc-control subc-client-rs; do
+  write_response "$config_and_dependents" "$crate" 0.0.0
+done
+check_case config-and-os-before-their-dependents \
+  "subc-config $(manifest_version subc-config)
+subc-protocol $(manifest_version subc-protocol)
+subc-os $(manifest_version subc-os)
+subc-transport $(manifest_version subc-transport)
+subc-control $(manifest_version subc-control)
+subc-client-rs $(manifest_version subc-client-rs)" 0 \
+  bash "$detector" --registry-json-dir "$config_and_dependents"
+
 daemon_and_leaves="$test_root/daemon-and-leaves"
 write_current_responses "$daemon_and_leaves"
 for crate in subc-config subc-jsonc subc-cgroup subc-uptime subc-os subc-jobobject subc-presence \
@@ -112,10 +126,10 @@ for crate in subc-config subc-jsonc subc-cgroup subc-uptime subc-os subc-jobobje
 done
 check_case daemon-after-its-leaves \
   "subc-config $(manifest_version subc-config)
+subc-os $(manifest_version subc-os)
 subc-jsonc $(manifest_version subc-jsonc)
 subc-cgroup $(manifest_version subc-cgroup)
 subc-uptime $(manifest_version subc-uptime)
-subc-os $(manifest_version subc-os)
 subc-jobobject $(manifest_version subc-jobobject)
 subc-presence $(manifest_version subc-presence)
 subc-daemon $(manifest_version subc-daemon)" 0 \

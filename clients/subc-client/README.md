@@ -246,6 +246,8 @@ compute canonical configuration or approval digests; echo daemon-provided ones.
 | `anchor_pending` | `anchor_pending` | Keep the view/outcome and retry on a hint or bounded backoff |
 | Unknown string | `unknown` with `rawState` | Preserve the spelling; never activate it |
 
+For view statuses other than `active`, `pending` or `unstamped`, `failed` publishes a failed state while `gated` and unknown spellings publish `unknown` with `rawState`; none is applied or acknowledged.
+
 Refusal states include the original error in `refusal.cause`. None ends serving
 or exits the process. `onError` reports unexpected transport/protocol/callback
 failures without falling back to files. `config.changed` resynchronizes without
@@ -365,10 +367,8 @@ and architecture (including emulation). The loader only loads the adjacent file:
 no environment override, system search, download or install-time compilation.
 These binaries are loaded code and must be pinned with the SDK inside the
 module's release directory, whose code the daemon verifies before launch (the
-admitted bundle). Release assembly builds the six targets on their
-native toolchains and collects them in `native/`; the prepublish check refuses an
-incomplete six-target bundle. This does not add release CI or claim the unbuilt
-targets were qualified.
+admitted bundle). Release assembly builds the six targets and collects them in
+`native/`; the prepublish check refuses an incomplete six-target bundle.
 
 For development and SDK tests, run `bun run build:native` in this package first.
 It builds the new Rust crate in the normal Cargo target directory and stages the
@@ -377,6 +377,33 @@ matching the Node process's architecture. Run `bun run typecheck` and
 `bun test tests/claim.test.ts tests/registration-channel.test.ts`. In CI or remote
 verification, build the addon in the same job that runs these tests. Artifacts
 are not committed.
+
+### Releasing the npm package
+
+1. Update `package.json` and the changelog, commit the release, and wait for the
+   PR or `train/**` checks. Changes to the SDK, its native helper or the npm
+   workflow run the six-target build and assembly without publishing. The final
+   bundle-check step runs `bun run prepublishOnly` (the TypeScript build plus
+   `node scripts/check-registration-bundle.mjs`). A host-only `build:native` is
+   sufficient for development, but not for a release.
+2. Tag that commit as `subc-client@<version>` with the version in `package.json`,
+   then push the tag. Only a matching npm tag can publish; PRs and branch pushes
+   cannot. See [trusted publishing setup](../../docs/npm-trusted-publishing.md)
+   for the one-time npm configuration.
+3. The [npm release workflow](../../.github/workflows/release-npm.yml) builds
+   Linux x64 on `ubuntu-latest` and arm64 on `ubuntu-24.04-arm`, both macOS
+   architectures on `macos-latest`, and both Windows MSVC architectures on
+   `windows-latest` (cross-compiling arm64). It uploads
+   `subc-client-prebuild-<platform>-<arch>` artifacts, where platform is `linux`,
+   `darwin` or `win32`, and arch is `x64` or `arm64`.
+4. The publish job merges those artifacts into `native/`, with the loader,
+   declarations and native `package.json` beside
+   `subc-registration-<platform>-<arch>.node`. It runs typechecks, tests and
+   `prepublishOnly`, asserts the tag version, then publishes through npm OIDC.
+   The PR/train bundle-check job uses the same artifacts and assembly layout.
+   The six-target check proves bundle completeness, not runtime qualification
+   on every architecture; the main CI TypeScript jobs build and exercise their
+   own host helper. Do not commit generated native binaries.
 
 ## Explicit helper handoff
 

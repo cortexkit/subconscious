@@ -449,7 +449,7 @@ const MACHINE_HELP: &str = "ck machine — this machine's id, the name the daemo
 
 const DAEMON_HELP: &str = "ck daemon — daemon version, uptime, connection info, offline triage, and CI lint\n\nusage:\n  ck [--json] [--verbose] daemon\n  ck [--json] daemon triage\n  ck daemon lint [<config>] [--verbose]\n\n  triage reads only the local run directory; it never contacts the daemon.\n  lint reads module manifests without connecting to the daemon.";
 
-const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run] [--verbose] [--yes|-y]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n  ck setup operator-prompt [--uninstall]\n\n  Bare setup installs core and offers optional components. --dry-run prints the\n  complete plan without changing anything. Interactive setup shows that plan and\n  asks Continue? [y/N] before changes; --yes (-y) skips the question. Piped or\n  non-terminal setup proceeds without a question. --convert is explicit and requires\n  --confirm before it can apply a conversion plan. --verbose includes plan outcomes\n  and download diagnostics when a network request fails.";
+const SETUP_HELP: &str = "ck setup — plan managed CortexKit installation\n\nusage:\n  ck setup [aft|mc|insula|claustrum|synapse] [--with aft,mc,insula,claustrum,synapse] [--dry-run] [--verbose] [--yes|-y]\n  ck setup claustrum [--key-path <file>]\n  ck setup <aft|mc> --convert [--confirm]\n  ck setup --uninstall [--dry-run]\n  ck setup operator-prompt [--uninstall]\n\n  Bare setup installs core and lists available optional modules to add with\n  `ck setup <name>`; it does not prompt to select optional modules. --dry-run prints the\n  complete plan without changing anything. Interactive setup shows that plan and\n  asks Continue? [y/N] before changes; --yes (-y) skips the question. Piped or\n  non-terminal setup proceeds without a question. --convert is explicit and requires\n  --confirm before it can apply a conversion plan. --verbose includes plan outcomes\n  and download diagnostics when a network request fails.";
 
 const UPGRADE_HELP: &str = "ck upgrade — plan managed component upgrades\n\nusage:\n  ck upgrade [--dry-run] [--verbose]\n  ck upgrade --check [--verbose]\n\n  --check reports available updates without changing anything. --dry-run prints\n  the complete plan without changing anything. --verbose includes plan outcomes\n  and execution evidence. --check exits 0 for current binaries or available\n  updates, and 1 when ownership is missing or an unowned destination is found.";
 
@@ -7657,8 +7657,16 @@ fn setup_command(program: &Path, request: &setup::SetupRequest, ckni: bool) -> R
         for line in setup_no_change_summary(&observed, request) {
             println!("{line}");
         }
+        if let Some(line) = plan.optional_components_line() {
+            println!("{line}");
+        }
         print_verbose_setup_outcomes(&plan, request.verbose);
         return Ok(());
+    }
+    // The offer is informational, not a mutation for the executor to apply.
+    // Print it once for both dry runs and ordinary setup, without prompting.
+    if let Some(line) = plan.optional_components_line() {
+        println!("{line}");
     }
     if request.dry_run {
         backend.print_dry_run(&plan).map_err(CkError::Message)?;
@@ -7751,34 +7759,14 @@ fn setup_no_change_summary(
         .map(|component| component.module_id().unwrap_or(component.label()))
         .collect::<Vec<_>>();
     installed.sort_unstable();
-    let mut lines = vec![if installed.is_empty() {
+    vec![if installed.is_empty() {
         "CortexKit is set up: daemon running.".to_string()
     } else {
         format!(
             "CortexKit is set up: daemon running, {} ok.",
             installed.join(" · ")
         )
-    }];
-
-    let mut missing = setup::Component::ALL
-        .into_iter()
-        .filter(|component| *component != setup::Component::Core)
-        .filter(|component| observed.component_state(*component) != setup::ComponentState::Correct)
-        .map(setup::Component::label)
-        .collect::<Vec<_>>();
-    missing.sort_unstable();
-    if !missing.is_empty() {
-        let commands = missing
-            .iter()
-            .map(|component| format!("`ck setup {component}`"))
-            .collect::<Vec<_>>()
-            .join(" or ");
-        lines.push(format!(
-            "Optional modules not installed: {} — run {commands}.",
-            missing.join(", ")
-        ));
-    }
-    lines
+    }]
 }
 
 fn setup_unavailable_message(

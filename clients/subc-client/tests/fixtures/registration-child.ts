@@ -15,11 +15,56 @@ if (mode === "direct" || mode === "helper-child") {
   await client.close();
   process.exit(0);
 }
+if (mode === "fallback-consumer") {
+  const client = await SubcClient.connect({connectionFile});
+  for (const consumerIdentity of [undefined, {module_id: "test-channel", launch_nonce: "route-nonce"}]) {
+    let routed = false;
+    try { await client.routeOpen({kind: "management_surface", module_id: "target"}, {project_root: "/", harness: "test", session: "test"}, {consumerIdentity}); }
+    catch (error) { routed = (error as {code?: string}).code === "target_not_found"; }
+    assert(routed);
+  }
+  await client.close();
+  console.log("FALLBACK_OK");
+  process.exit(0);
+}
 const manifest = managementSurfaceManifest({moduleId: "test-channel", operations: []});
 manifest.registration_channel = true;
-const provider = await SubcProvider.connect({connectionFile, manifest, handler: async () => new Uint8Array(), reconnectOnDrop: true});
+if (mode === "before-hello") {
+  try {
+    await SubcProvider.connect({connectionFile, manifest, handler: async () => new Uint8Array()});
+    throw new Error("unexpected registration");
+  } catch (error) { assert((error as Error).message !== "unexpected registration"); }
+  await new Promise(r => setTimeout(r, 30));
+  console.log("REGISTRATION_FAILED_OK");
+  process.exit(0);
+}
+const provider = await SubcProvider.connect({connectionFile, manifest, handler: async () => new Uint8Array(), reconnectOnDrop: true,
+  ...(mode === "fallback-explicit" ? {launchNonce: "explicit-nonce"} : {})});
+if (mode.startsWith("fallback-")) {
+  assert(!registrationOwner().supervised);
+  const client = await SubcClient.connect({connectionFile});
+  let routed = false;
+  try { await client.routeOpen({kind: "management_surface", module_id: "target"}, {project_root: "/", harness: "test", session: "test"},
+    mode === "fallback-explicit" ? {consumerIdentity: {module_id: "test-channel", launch_nonce: "route-nonce"}} : {}); }
+  catch (error) { routed = (error as {code?: string}).code === "target_not_found"; }
+  assert(routed);
+  await client.close();
+  await provider.close();
+  await new Promise(r => setTimeout(r, 30));
+  console.log("FALLBACK_OK");
+  process.exit(0);
+}
 assert(registrationOwner().supervised);
-if (mode === "eof") {
+let nonceConflict = false;
+try { await SubcProvider.connect({connectionFile, manifest, handler: async () => new Uint8Array(), launchNonce: "conflicting-nonce"}); }
+catch (error) { nonceConflict = (error as {code?: string}).code === "claim_identity_conflict"; }
+assert(nonceConflict);
+if (mode === "close") {
+  await provider.close();
+  await new Promise(r => setTimeout(r, 30));
+  console.log("LOCAL_CLOSE_OK");
+  process.exit(0);
+} else if (mode === "eof") {
   setInterval(() => {}, 1000);
   await provider.closed;
   console.log("CLOSED_HOOK");

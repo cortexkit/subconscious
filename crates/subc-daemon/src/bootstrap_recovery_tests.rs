@@ -583,6 +583,24 @@ async fn config_approved_daemon_restart_setting_stays_inactive() {
     );
     drop(stream);
     drop(daemon);
+    // A crash or an ordinary start is not the restart the approval waits for.
+    let ordinary = rig.start().await;
+    let mut stream = rig.local().await;
+    wait_approved_running(&mut stream).await;
+    let info = subc_transport::connection_file::read(rig.dir.join("connection.json")).unwrap();
+    assert!(
+        info.endpoints.iter().all(|endpoint| endpoint.port != port),
+        "an ordinary start must keep the last active listener"
+    );
+    // The operator's restart path durably assigns the waiting generation.
+    let intent = rpc(
+        &mut stream,
+        json!({"op":"daemon.shutdown_intent","intent":"restart"}),
+    )
+    .await;
+    assert!(intent.get("expires_at_ms").is_some(), "{intent}");
+    drop(stream);
+    drop(ordinary);
     drop(port_reservation);
     edit_approved_file(&rig, |doc| {
         doc["modules"] = json!({});
@@ -593,7 +611,7 @@ async fn config_approved_daemon_restart_setting_stays_inactive() {
     let module = wait_approved_running(&mut stream).await;
     assert_eq!(
         module["max_restarts"], 9,
-        "boot must select the newest approval, not the initial stamp"
+        "the restart intent must boot the newest approval, not the initial stamp"
     );
     let info = subc_transport::connection_file::read(rig.dir.join("connection.json")).unwrap();
     assert!(
@@ -681,6 +699,7 @@ fn open_store(root: crate::config_store::StoreRoot) -> crate::config_store::Conf
     TestSupport::new(root.path().to_path_buf(), key)
         .unwrap()
         .with_key_denial(std::env::var_os("RECOVERY_DENIED").is_some())
+        .with_anchor_failure(std::env::var_os("RECOVERY_ANCHOR_FAIL").is_some())
         .open()
         .unwrap()
 }
@@ -831,6 +850,24 @@ fn config_recovery_fixture() {
                         1,
                     )
                     .unwrap();
+            }
+            "publish-unanchored" => {
+                // Publish a stamped revision whose anchor update fails, as a
+                // crash between publication and anchor would leave it.
+                let mut store = open_store(
+                    crate::config_store::StoreRoot::from_service_definition(root.join("store"))
+                        .unwrap(),
+                );
+                let changed = BTreeMap::from([(
+                    "unanchored-proposal".to_owned(),
+                    subc_config::RecordedValue::new(json!(1)),
+                )]);
+                let error = store.observe(changed).unwrap_err();
+                assert_eq!(
+                    error.code,
+                    crate::config_store::StoreErrorCode::AnchorPending,
+                    "{error}"
+                );
             }
             "daemon" | "daemon-eager" => {
                 let eager = std::env::var("RECOVERY_ROLE").unwrap() == "daemon-eager";
@@ -1464,6 +1501,48 @@ async fn config_recovery_spawned_invalid_files_and_denied_key_refuse_without_wri
         assert_eq!(rig.retained(), before);
         drop(daemon);
     }
+}
+
+#[tokio::test]
+async fn config_recovery_spawned_pending_anchor_at_start_serves_recovery() {
+    let _serial = DAEMONS.lock().await;
+    let rig = Rig::new(true);
+    rig.seed();
+    let published = rig
+        .command("publish-unanchored")
+        .env("RECOVERY_ANCHOR_FAIL", "1")
+        .status()
+        .unwrap();
+    assert!(
+        published.success(),
+        "{}",
+        std::fs::read_to_string(rig.dir.join("publish-unanchored.err")).unwrap()
+    );
+    // The anchor retry at start fails as well: the daemon must still serve,
+    // in recovery, instead of exiting with the operator locked out.
+    let mut command = rig.command("daemon");
+    command.env("RECOVERY_ANCHOR_FAIL", "1");
+    let mut daemon = Process(command.spawn().unwrap());
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while subc_transport::connection_file::read(rig.dir.join("connection.json")).is_err() {
+            assert!(
+                daemon.0.try_wait().unwrap().is_none(),
+                "daemon exited: {}",
+                std::fs::read_to_string(rig.dir.join("daemon.err")).unwrap()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut client = rig.local().await;
+    let status = rpc(&mut client, json!({"op":"config.status"})).await;
+    assert_eq!(status["status"]["state"], "store_unverified", "{status}");
+    assert!(
+        status.to_string().to_lowercase().contains("anchor"),
+        "{status}"
+    );
+    drop(daemon);
 }
 
 #[cfg(feature = "dev-desktop-approval")]

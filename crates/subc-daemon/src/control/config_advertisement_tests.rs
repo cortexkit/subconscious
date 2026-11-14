@@ -78,18 +78,15 @@ fn config_admission_gate_capability_requires_explicit_store_activation() {
 #[cfg(unix)]
 #[tokio::test]
 async fn config_admission_production_reviewer_requires_the_active_live_child_nonce_and_image() {
-    use std::os::unix::fs::PermissionsExt;
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/scratch")
         .join(format!("config-review-admission-{}", std::process::id()));
     std::fs::create_dir_all(path.join("store")).unwrap();
-    let program = path.join("reviewer.sh");
-    std::fs::write(&program, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
-    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let program = crate::config_gate::program::native_fixture_for_test();
     std::fs::write(
         path.join("subc.jsonc"),
         serde_json::to_vec(
-            &json!({"version":1,"modules":{"a":{"program":program,"reserved":true}}}),
+            &json!({"version":1,"modules":{"a":{"program":program,"args":["sleep"],"reserved":true}}}),
         )
         .unwrap(),
     )

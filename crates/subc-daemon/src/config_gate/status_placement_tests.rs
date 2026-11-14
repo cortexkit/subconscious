@@ -153,7 +153,13 @@ fn config_status_lists_ungated_modules() {
 #[cfg(unix)]
 fn program_rig() -> Rig {
     let rig = Rig::new();
-    std::fs::copy("/bin/sleep", rig.path.join("program")).unwrap();
+    // The native fixture sleeps for a numeric argument; a copied /bin/sleep
+    // fails where coreutils is one multi-call binary.
+    std::fs::copy(
+        crate::config_gate::program::native_fixture_for_test(),
+        rig.path.join("program"),
+    )
+    .unwrap();
     std::fs::write(rig.path.join("subc.jsonc"), serde_json::to_vec(&json!({
         "version":1,"modules":{"a":{"program":rig.path.join("program"),"args":["600"],"protocol":"none","env":{
             "HOME":rig.path,"XDG_DATA_HOME":rig.path,"XDG_CONFIG_HOME":rig.path,"XDG_RUNTIME_DIR":rig.path,"SUBC_CONNECTION_FILE":rig.path.join("connection.json")
@@ -465,7 +471,7 @@ fn config_placement_channel_is_refused_for_non_development_commits() {
 }
 
 #[test]
-fn config_status_lists_interpreter_only_covered() {
+fn config_status_refuses_interpreters_instead_of_reporting_partial_coverage() {
     let rig = Rig::new();
     #[cfg(unix)]
     let interpreter = "/bin/sh";
@@ -483,7 +489,25 @@ fn config_status_lists_interpreter_only_covered() {
     )
     .unwrap();
     let owner = rig.owner("interpreter-status");
-    assert_eq!(owner.status().unwrap().interpreter_only_covered, ["a"]);
+    assert_eq!(owner.status().unwrap_err().code, "program_refused");
+    assert_eq!(
+        owner.prepare(PlanKind::Stamp).err().unwrap().code,
+        "program_refused"
+    );
+    std::fs::write(
+        rig.path.join("subc.jsonc"),
+        serde_json::to_vec(&json!({
+            "version":1,"modules":{"a":{"program":rig.path.join("program")}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let status = owner.status().unwrap();
+    assert!(status.interpreter_only_covered.is_empty());
+    assert_eq!(
+        serde_json::to_value(status).unwrap()["interpreter_only_covered"],
+        json!([])
+    );
 }
 
 #[test]

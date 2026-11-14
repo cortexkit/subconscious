@@ -105,6 +105,8 @@ pub(crate) mod containment;
 mod containment_tests;
 mod slow_retry;
 use slow_retry::{FailedRetry, FailureContext};
+mod host_health;
+use host_health::HostHealth;
 
 #[cfg(all(test, unix))]
 mod mark_readiness_tests;
@@ -193,25 +195,20 @@ struct PrivacyExec {
     expected: Option<subc_os::FileIdentity>,
     trampoline: Option<subc_os::FileIdentity>,
     signature: Option<Arc<subc_os::privacy_identity::SuspendedSignature>>,
-    script: bool,
     module_id: String,
     #[cfg(test)]
     confirmation_pause: Option<(String, Option<tokio::net::TcpStream>)>,
     #[cfg(test)]
     image_probe: Option<fn(u32) -> Option<subc_os::Observation>>,
+    #[cfg(test)]
+    image_read_delay: Option<Duration>,
 }
 
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) fn test_privacy_trampoline() -> PathBuf {
-    // Cargo's unit-test executable lives in <profile>/deps; its fixture bin
-    // lives beside that directory. This honors custom CARGO_TARGET_DIR too.
-    let path = std::env::current_exe()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("privacy-trampoline-fixture");
+    // The fixture bin lives in the profile folder the unit-test executable was
+    // built into. This honors custom CARGO_TARGET_DIR too.
+    let path = cortexkit_test_support::cargo_profile_bin("privacy-trampoline-fixture");
     // Without the fixture every macOS spawn is refused, and the tests that
     // spawn fail later as a module in state Failed, which names the wrong
     // cause. `cargo test -p subc-daemon --lib` alone does not build it.
@@ -310,11 +307,6 @@ fn privacy_command(
         })
         .transpose()
         .map_err(|error| failure(error.to_string()))?;
-    let script = !gated && {
-        use std::io::Read;
-        let mut prefix = [0; 2];
-        (&binding._file).read_exact(&mut prefix).is_ok() && &prefix == b"#!"
-    };
     if expected == trampoline_image {
         return Err(failure(
             "privacy identity module executable is missing or is the trampoline itself".to_string(),
@@ -344,10 +336,15 @@ fn privacy_command(
             expected,
             trampoline: trampoline_image,
             signature,
-            script,
             module_id: spec.module_id.clone(),
             #[cfg(test)]
             image_probe: None,
+            #[cfg(test)]
+            image_read_delay: spec
+                .env
+                .iter()
+                .find(|(key, _)| key == "SUBC_TEST_PRIVACY_IMAGE_DELAY_MS")
+                .map(|(_, millis)| Duration::from_millis(millis.parse().unwrap())),
             #[cfg(test)]
             confirmation_pause: spec
                 .env
@@ -689,13 +686,18 @@ impl SupervisedChild {
                 Ok(Some(_)) => None,
                 Err(error) => Some(format!("privacy identity trampoline wait failed: {error}")),
                 Ok(None) => {
+                    #[cfg(test)]
+                    if let Some(delay) = pending.image_read_delay {
+                        tokio::time::sleep(delay).await;
+                    }
                     let image = observe_spawned_image(self.pid);
                     #[cfg(test)]
                     let image = pending.image_probe.map_or(image, |probe| probe(self.pid));
+                    // An unstamped module can re-exec before we wake to read its
+                    // image. Only the trampoline image proves exec never happened;
+                    // retain the observed image for later orphan identification.
                     if let Some(image) = image.filter(|image| {
-                        image.executable.is_some()
-                            && image.executable != pending.trampoline
-                            && (image.executable == pending.expected || pending.script)
+                        image.executable.is_some() && image.executable != pending.trampoline
                     }) {
                         match self
                             .roster_guard
@@ -728,7 +730,7 @@ impl SupervisedChild {
                             Err(_) => Some("privacy identity module executable remained unreadable until the 5s exec deadline".to_string()),
                         }
                     } else {
-                        Some("privacy identity trampoline executable mismatch: expected the module program, not ck-subc".to_string())
+                        Some("privacy identity trampoline did not exec the module".to_string())
                     }
                 }
             },
@@ -1696,6 +1698,7 @@ struct SupervisorSnapshot {
     /// Diagnostic attached to the next drain's terminal record, if any.
     drain_disposition_detail: Option<String>,
     health: ModuleHealthStatus,
+    last_probe_evidence: Option<HealthProbeEvidence>,
     /// Whether the current process was started as a swap candidate and so
     /// lives in the module's alternate cgroup. The next swap's candidate takes
     /// the other one, so the two processes of a swap never share a cgroup. A
@@ -1841,6 +1844,7 @@ impl SupervisorSnapshot {
             last_exit: None,
             drain_disposition_detail: None,
             health: ModuleHealthStatus::default(),
+            last_probe_evidence: None,
             in_alternate_slot: false,
             draining_to_replace: false,
             configuration_updated_since_spawn: false,
@@ -2426,6 +2430,7 @@ struct SupervisorRuntimeConfig {
     /// REMOVES the per-module override can re-resolve to it.
     default_drain_timeout: Duration,
     health: HealthConfig,
+    host_health: HostHealth,
     connection_file_path: Option<PathBuf>,
     capture_logs_dir: Option<PathBuf>,
     forwarding: Option<Arc<ForwardingTable>>,
@@ -2489,6 +2494,7 @@ pub struct SupervisorHandle {
     identity_sample_pause: Arc<Mutex<Option<IdentitySamplePause>>>,
     #[cfg(all(test, unix))]
     plain_identity_policy_pause: Arc<Mutex<Option<(String, IdentitySamplePause)>>>,
+    host_health: HostHealth,
     restart_intent: Arc<Mutex<DaemonRestartIntent>>,
     activity: Arc<Mutex<Option<crate::activity::ActivityLedger>>>,
     activity_images: Arc<Mutex<HashMap<String, activity::ActivityImage>>>,
@@ -2614,6 +2620,12 @@ pub(crate) enum SwapHelloAdmission {
     /// A swap is open and the HELLO carries a nonce the supervisor did not
     /// mint for this id, no nonce, or a token already used.
     Refused,
+    /// The id belongs to a supervised `protocol: none` module. Such a module
+    /// never registers, so no HELLO may claim its id, with or without a nonce.
+    ProtocolNone,
+    /// The id is gated. Its supervised child registers only over the
+    /// registration channel it inherited at launch, never by HELLO alone.
+    ChannelRequired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3238,8 +3250,11 @@ impl SupervisorHandle {
         module_id: &str,
         presented: Option<&str>,
     ) -> SwapHelloAdmission {
-        if self.module_is_gated(module_id) || self.protocol_none(module_id) {
-            return SwapHelloAdmission::Refused;
+        if self.protocol_none(module_id) {
+            return SwapHelloAdmission::ProtocolNone;
+        }
+        if self.module_is_gated(module_id) {
+            return SwapHelloAdmission::ChannelRequired;
         }
         let swaps = self
             .swaps
@@ -3399,6 +3414,7 @@ impl SupervisorHandle {
         let Some(module) = self.get(module_id) else {
             return Ok(false);
         };
+        self.host_health.record_late_module(module_id);
         update_snapshot(&module.inner.snapshot, Some(module_id), |state| {
             state.health.late_answer_count = state.health.late_answer_count.saturating_add(1);
             state.health.last_late_answer_latency_ms = Some(latency_ms);
@@ -3412,6 +3428,10 @@ impl SupervisorHandle {
             state.health.consecutive_failures = 0;
         })?;
         Ok(true)
+    }
+
+    pub(crate) fn spawn_host_health_monitor(&self) -> JoinHandle<()> {
+        self.host_health.spawn_monitor()
     }
 
     /// Arm the one-shot marker for the module process that this caller
@@ -3537,6 +3557,7 @@ pub struct Supervisor {
     process_liveness: Arc<SupervisorProcessLiveness>,
     supervisor_handle: Option<SupervisorHandle>,
     health: HealthConfig,
+    host_health: HostHealth,
     daemon_start_clock: crate::clock::StartClock,
     terminal_journal: Option<Arc<crate::terminal_journal::TerminalJournal>>,
     spawn_events: SpawnEventFeed,
@@ -3885,6 +3906,7 @@ impl Supervisor {
             process_liveness: Arc::new(SupervisorProcessLiveness::default()),
             supervisor_handle: None,
             health: HealthConfig::default(),
+            host_health: HostHealth::default(),
             daemon_start_clock: crate::clock::StartClock::capture(),
             terminal_journal: None,
             spawn_events: SpawnEventFeed::default(),
@@ -3969,6 +3991,7 @@ impl Supervisor {
         if let Some(delivery) = &self.config_delivery {
             supervisor_handle.install_binding_retirement(&delivery.0);
         }
+        self.host_health = supervisor_handle.host_health.clone();
         self.spawn_events = supervisor_handle.spawn_events.clone();
         self.supervisor_handle = Some(supervisor_handle);
         self
@@ -4549,6 +4572,7 @@ impl Supervisor {
             effective_drain_timeout,
             default_drain_timeout: self.drain_timeout,
             health: self.health.clone(),
+            host_health: self.host_health.clone(),
             connection_file_path: self.connection_file_path.clone(),
             capture_logs_dir: self.capture_logs_dir.clone(),
             forwarding: self.forwarding.clone(),
@@ -4591,6 +4615,7 @@ impl Supervisor {
         runtime: &SupervisorRuntimeConfig,
         snapshot: SharedSnapshot,
     ) -> (SupervisedModule, mpsc::Receiver<SupervisorCommand>) {
+        runtime.host_health.track(spec, &snapshot);
         let configuration = Arc::new(Mutex::new(SupervisedConfiguration {
             spec: spec.clone(),
             enabled: snapshot.lock().unwrap_or_else(|p| p.into_inner()).enabled,
@@ -6071,6 +6096,7 @@ impl HealthProbeRuntime {
                     let unknown = ModuleHealthStatus::default();
                     if state.health != unknown {
                         state.health = unknown;
+                        state.last_probe_evidence = None;
                     }
                 });
             } else if self.next_probe_at.is_none() {
@@ -6115,6 +6141,7 @@ impl HealthProbeRuntime {
                     || state.health.metrics.is_some()
                 {
                     state.health.status = SupervisorHealthStatus::Unknown;
+                    state.last_probe_evidence = None;
                     state.health.consecutive_failures = 0;
                     state.health.last_probe_ms = None;
                     state.health.detail = None;
@@ -6134,6 +6161,7 @@ impl HealthProbeRuntime {
             );
             let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
                 state.health.status = SupervisorHealthStatus::Unknown;
+                state.last_probe_evidence = None;
                 state.health.consecutive_failures = 0;
                 state.health.detail = None;
                 state.health.metrics = None;
@@ -6163,41 +6191,10 @@ impl HealthProbeRuntime {
     }
 }
 
-/// What a failed health probe actually OBSERVED, kept apart from how it reads.
-///
-/// This was a struct with a single `message: String`, and every one of the
-/// fifteen construction sites collapsed into it. Each site knows exactly what it
-/// saw -- the lane is gone, the module did not answer in time, the module
-/// answered with the wrong thing -- and `handle_health_probe_failure` then
-/// treated all of them identically: increment a counter, compare to a threshold,
-/// restart the module. THE DISTINCTION EXISTED AT EVERY CALL SITE AND WAS
-/// DESTROYED BEFORE THE DECISION THAT NEEDED IT.
-///
-/// The distinction that matters is not severity, it is EVIDENTIAL WEIGHT:
-///
-/// * `LaneDead` is PROOF. The module's control connection is gone; nothing will
-///   answer on it again.
-/// * `NoAnswer` is ABSENCE OF EVIDENCE. It is consistent with a wedged module
-///   AND with a perfectly healthy one that lost a CPU race -- which is what
-///   happens under machine load, and is how this supervisor killed a healthy
-///   module three times in one day.
-/// * `BadAnswer` proves the module is ALIVE. It replied; the reply was wrong.
-///   Restarting on it is defensible, but it is not the silence case and should
-///   never be counted as one.
-/// * `Misconfigured` is a daemon-side fault. The module has not been asked
-///   anything, so it cannot be evidence about the module at all.
-///
-/// The asymmetry is the whole point: under saturation the WEAKEST signal is the
-/// one that fires most often, and while every variant collapsed into one string
-/// it carried the same weight as the strongest.
-///
-/// LIVE BEHAVIOUR TODAY, stated here because this doc block describes the
-/// DESIGN and a reader stopping at it gets the build backwards: the restart
-/// decision does NOT yet consult this classification -- consecutive `NoAnswer`
-/// probes still increment the failure streak and drive escalation at the
-/// threshold (see `is_proof_of_death` below for why that is deliberate and
-/// what gates the change). Absence of evidence restarts modules today.
-#[derive(Debug)]
+/// Evidence is separate from diagnostic prose so host starvation can hold only
+/// silence-based restarts. A missing lane is still actionable during overload;
+/// a timeout can instead mean the host has not scheduled a healthy module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HealthProbeEvidence {
     /// The module's control lane is gone. Proof of death.
     LaneDead,
@@ -6245,13 +6242,8 @@ impl HealthProbeError {
     /// variant that fires under CPU starvation, and treating it as proof is the
     /// defect this enum exists to make impossible to reintroduce silently.
     ///
-    /// NOT YET CONSULTED BY THE RESTART DECISION, deliberately. Requiring proof
-    /// to restart also needs a bound for the case it excludes -- a genuinely
-    /// wedged module, alive but never answering -- and that bound must come from
-    /// the distribution of real late-answer latencies, which nothing measures
-    /// yet. Landing the classification first makes the later change a one-line
-    /// decision against evidence that already exists, rather than two unproven
-    /// changes at once.
+    /// Outside a host-overload hold, silence still reaches the normal failure
+    /// threshold so an isolated, genuinely wedged module can recover.
     #[allow(dead_code)]
     fn is_proof_of_death(&self) -> bool {
         matches!(self.evidence, HealthProbeEvidence::LaneDead)
@@ -6759,6 +6751,7 @@ async fn handle_health_report(
     let metrics = truncate_health_metrics(report.metrics);
     let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
         state.health.status = status;
+        state.last_probe_evidence = None;
         state.health.last_probe_ms = Some(now_ms);
         state.health.detail = detail.clone();
         state.health.metrics = metrics.clone();
@@ -6819,23 +6812,41 @@ async fn handle_health_probe_failure(
         _ => false,
     };
     let threshold = runtime.health.failure_threshold.max(1);
+    let held = if err.evidence == HealthProbeEvidence::NoAnswer {
+        runtime.host_health.record_late_module(&spec.module_id)
+    } else {
+        false
+    };
     let mut failures = 0;
     // Carry the evidence class into the operator-visible detail. Without it,
     // "module did not answer within 5s" and "the control lane is gone" are two
     // prose strings in the same field, and the reader has to know the codebase to
     // tell which one is proof of anything.
-    let detail = format!("[{}] {err}", err.label());
+    let detail = if held {
+        format!("[{}] {err}; host overloaded", err.label())
+    } else {
+        format!("[{}] {err}", err.label())
+    };
     let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
+        state.last_probe_evidence = Some(err.evidence);
         state
             .failed_retry
             .observe_health(false, runtime.restart_policy.window);
         // A failed wire probe invalidates the last report, even before the
         // restart threshold. HTTP probes already mark failures as Failing.
-        if state.spawned_protocol.unwrap_or(spec.protocol) == ModuleProtocol::Subc {
+        if held {
+            state.health.status = SupervisorHealthStatus::Degraded;
+        } else if state.spawned_protocol.unwrap_or(spec.protocol) == ModuleProtocol::Subc {
             state.health.status = SupervisorHealthStatus::Unknown;
         }
         state.health.last_probe_ms = Some(now_ms);
-        state.health.consecutive_failures = state.health.consecutive_failures.saturating_add(1);
+        // Held silence breaks the streak: after the host recovers, only new
+        // failures count. Replaying pre-overload misses would restart immediately.
+        state.health.consecutive_failures = if held {
+            0
+        } else {
+            state.health.consecutive_failures.saturating_add(1)
+        };
         state.health.detail = Some(detail.clone());
         state.health.metrics = None;
         failures = state.health.consecutive_failures;
@@ -6844,7 +6855,7 @@ async fn handle_health_probe_failure(
     if delivery_failed {
         return;
     }
-    if failures < threshold {
+    if held || failures < threshold {
         warn!(
             module_id = %spec.module_id,
             consecutive_failures = failures,
@@ -10075,10 +10086,12 @@ fn stage_supervisor_configuration(
     }
     let health_changed = runtime.health != health;
     runtime.health = health;
-    // Reset the old endpoint's failure streak when its live policy changes.
+    // Reset the cadence and old endpoint's failure streak on a live
+    // health-policy change rather than waiting for its old deadline.
     if health_changed {
         let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-            state.health = ModuleHealthStatus::default()
+            state.health = ModuleHealthStatus::default();
+            state.last_probe_evidence = None;
         });
     }
     runtime.drain_timeout = drain_timeout_ms
@@ -15747,6 +15760,7 @@ fn set_running(
     // Probe samples belong to one process. Keep module-level escalation and
     // late-answer history, but never charge a new child for its predecessor's misses.
     state.health.status = SupervisorHealthStatus::Unknown;
+    state.last_probe_evidence = None;
     state.health.consecutive_failures = 0;
     state.health.detail = None;
     state.health.metrics = None;
@@ -15913,6 +15927,7 @@ fn lock_snapshot(
 
 #[cfg(test)]
 mod terminal_history_tests {
+    include!("supervise_route_open_recovery_tests.rs");
     use std::{
         path::PathBuf,
         sync::Arc,
@@ -15948,14 +15963,7 @@ mod terminal_history_tests {
     /// not build `[[bin]]` targets, and a bare spawn then fails with a raw
     /// `NotFound` that reads as a broken test rather than an unbuilt dependency.
     pub(super) fn fake_aft_stub_path() -> PathBuf {
-        let mut path = std::env::current_exe().expect("current_exe available in tests");
-        path.pop();
-        path.pop();
-        path.push(if cfg!(windows) {
-            "fake-aft-stub.exe"
-        } else {
-            "fake-aft-stub"
-        });
+        let path = cortexkit_test_support::cargo_profile_bin("fake-aft-stub");
         assert!(
             path.exists(),
             "fake-aft-stub not built at {}: run `cargo test -p subc-core` (which builds \
@@ -21077,10 +21085,7 @@ mod job_containment_tests {
     /// documents: `--lib` does not build `[[bin]]` targets, and a bare spawn
     /// failure then reads as a broken test rather than an unbuilt dependency.
     fn stub_path() -> PathBuf {
-        let mut path = std::env::current_exe().expect("current_exe available in tests");
-        path.pop();
-        path.pop();
-        path.push("fake-aft-stub.exe");
+        let path = cortexkit_test_support::cargo_profile_bin("fake-aft-stub");
         assert!(
             path.exists(),
             "fake-aft-stub not built at {}: run `cargo test -p subc-core` (which builds \
@@ -21573,12 +21578,114 @@ mod privacy_exec_boundary_tests {
 
     #[tokio::test]
     #[cfg_attr(not(target_os = "macos"), ignore = "requires macOS privacy trampoline")]
+    async fn macos_unstamped_reexec_records_the_observed_native_image() {
+        #[cfg(target_os = "macos")]
+        {
+            let root = cortexkit_test_support::ScratchDir::new("privacy-reexec");
+            let record = root.join("live-children.json");
+            let supervisor =
+                Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                    .with_live_children_record(&record);
+            let runtime = supervisor.runtime_config();
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+            let fixture = crate::config_gate::program::native_fixture_for_test();
+            let mut spec = spec(
+                "/bin/sh",
+                &["-c", "exec \"$1\" 600", "reexec", fixture.to_str().unwrap()],
+            );
+            spec.env
+                .push(("SUBC_TEST_PRIVACY_IMAGE_DELAY_MS".into(), "5".into()));
+            let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
+            let native_image = subc_os::file_identity(&fixture).unwrap();
+            // Native image installation, not shell startup speed, establishes
+            // that this launch has crossed the re-exec boundary before sampling.
+            let reexec = tokio::time::timeout(Duration::from_secs(5), async {
+                while observe_spawned_image(child.pid).and_then(|image| image.executable)
+                    != Some(native_image)
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            child.confirm_privacy_exec().await;
+            let failure = child.spawn_failure.clone();
+            let ready = child.report_ready.get().is_some();
+            let confirmed = crate::live_children::read_record(&record).unwrap();
+            child.start_kill().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            child.release_roster();
+
+            reexec.expect("the shell must re-exec the native fixture");
+            assert_eq!(
+                failure, None,
+                "an unstamped program may re-exec before observation"
+            );
+            assert!(ready);
+            assert_eq!(confirmed.len(), 1);
+            assert_eq!(confirmed[0].executable, Some(native_image.into()));
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "requires macOS privacy trampoline")]
+    async fn macos_unstamped_ack_without_exec_still_refuses_the_trampoline() {
+        #[cfg(target_os = "macos")]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let supervisor =
+                Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
+            let runtime = supervisor.runtime_config();
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+            let fixture = crate::config_gate::program::native_fixture_for_test();
+            let mut spec = spec(fixture.to_str().unwrap(), &["600"]);
+            spec.env.push((
+                "SUBC_TEST_PRIVACY_EXEC_BARRIER".into(),
+                listener.local_addr().unwrap().to_string(),
+            ));
+            let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
+            let mut exec = accept(listener).await;
+            let mut ready = [0];
+            exec.read_exact(&mut ready).unwrap();
+            assert_eq!(&ready, b"R");
+            assert_eq!(
+                observe_spawned_image(child.pid).unwrap().executable,
+                subc_os::file_identity(&test_privacy_trampoline())
+            );
+            // Simulate a broken trampoline that acknowledges exec but keeps
+            // running its own image, held at the fixture's pre-exec barrier.
+            let (reader, writer) = std::io::pipe().unwrap();
+            drop(writer);
+            child.privacy_exec.as_mut().unwrap().reader =
+                tokio::io::unix::AsyncFd::new(reader).unwrap();
+            child.confirm_privacy_exec().await;
+            let failure = child.spawn_failure.clone();
+            let ready = child.report_ready.get().is_some();
+            child.start_kill().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            child.release_roster();
+            assert_eq!(
+                failure.as_deref(),
+                Some("privacy identity trampoline did not exec the module")
+            );
+            assert!(!ready);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "requires macOS privacy trampoline")]
     async fn macos_resumed_121_is_a_module_exit_not_a_trampoline_refusal() {
         #[cfg(target_os = "macos")]
         {
             let registry = Arc::new(Registry::default());
             let policy = RestartPolicy::new(0, Duration::ZERO);
-            let spec = spec("/bin/sh", &["-c", "exit 121"]);
+            let fixture = crate::config_gate::program::native_fixture_for_test();
+            let spec = spec(fixture.to_str().unwrap(), &["exit121"]);
             let scratch = cortexkit_test_support::ScratchDir::new("resumed-exit");
             let supervisor = Supervisor::new_for_test(Arc::clone(&registry), policy)
                 .with_config_runtime(suspended_spawn_tests::gated_owner(&scratch, &spec, true));

@@ -214,7 +214,7 @@ async fn stale_config_exit_hold_keeps_reload_work_and_answers_its_caller() {
     let (_scratch, owner, supervisor, _, spec) =
         crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
     assert!(!owner.has_recorded_admission_hold("a"));
-    std::fs::write(&spec.args[0], b"keep running").unwrap();
+    std::fs::write(&spec.args[1], b"keep running").unwrap();
     let RegisteredConfiguredModule {
         mut spec,
         mut runtime,
@@ -396,7 +396,7 @@ async fn stale_config_exit_hold_preserves_previous_instance_wait() {
 async fn staged_unstamp_enable_preserves_a_live_child_instead_of_parking_it() {
     let (_scratch, owner, supervisor, _, spec) =
         crate::config_gate::runtime::RuntimeOwner::unactivated_supervisor_fixture_for_test();
-    std::fs::write(&spec.args[0], b"keep running").unwrap();
+    std::fs::write(&spec.args[1], b"keep running").unwrap();
     let RegisteredConfiguredModule {
         mut spec,
         mut runtime,

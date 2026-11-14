@@ -551,8 +551,9 @@ async fn non_advertising_module_is_unknown_and_never_probed() {
 ///   at this cadence and threshold. Without it, every "was not restarted"
 ///   assertion above could be satisfied by a prober that does nothing at all.
 /// * `registers_but_silent_none` is THE ARM THE GATE IS TESTED BY. It is the
-///   same fixture as the control, differing only in the declaration, so it can
-///   only stay unrestarted if the suppression is reached.
+///   same health advertisement and silence as the control, installed through
+///   the embedding API because a protocol-none child cannot register itself
+///   over a connection. Its process only stays unrestarted if suppression runs.
 ///
 /// The third arm exists because the first CANNOT detect the gate being removed:
 /// today's prober only ever arms for a module that is registered AND advertises
@@ -593,25 +594,36 @@ async fn a_protocol_none_module_is_never_probed_while_its_subc_twin_is_restarted
     silent_subc_spec.protocol = ModuleProtocol::Subc;
     let registers_but_silent_subc = supervisor.spawn(silent_subc_spec).unwrap();
 
-    let mut silent_none_spec = stub_spec_with_env(
-        &server,
-        "silent-none-twin",
-        [
-            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
-            ("FAKE_AFT_HEALTH_NEVER_REPLY", "1"),
-        ],
-    );
-    silent_none_spec.protocol = ModuleProtocol::None;
-    // A protocol-none spawn carries no `--subc` (a stock binary would exit on
-    // the unknown flag). This twin is deliberately a subc-wire stub DECLARED
-    // none, so it must be handed the connection file itself to register at all;
-    // the arm proves the declaration governs probing even for a process that
-    // does speak the wire.
-    silent_none_spec.args = vec![
-        "--subc".to_string(),
-        server.connection_file_path.to_string_lossy().into_owned(),
-    ];
-    let registers_but_silent_none = supervisor.spawn(silent_none_spec).unwrap();
+    // Production admission intentionally refuses a protocol-none child's HELLO.
+    // Seed only this contrived health edge through the embedding APIs: a live
+    // endpoint advertises health.check but retains requests without replying.
+    // Publish before spawn so the first prober refresh observes the registration,
+    // even if no later registry notification wakes the non-wire child.
+    let connection = subc_daemon::ConnectionId::new(1_000_001);
+    let (silent_sink, _silent_frames) = tokio::sync::mpsc::channel(16);
+    let manifest = ModuleManifest::builder("silent-none-twin", "1.0.0").build();
+    server
+        .forwarding
+        .register_module_connection(
+            connection,
+            manifest.module_id.clone(),
+            PROTOCOL_VERSION,
+            Concurrency::ModuleManaged,
+            subc_daemon::FrameSink::new(silent_sink),
+        )
+        .unwrap();
+    server
+        .registry
+        .register_with_control_ops(
+            manifest,
+            PROTOCOL_VERSION,
+            connection,
+            vec![subc_protocol::session::MODULE_CONTROL_OP_HEALTH_CHECK.to_string()],
+        )
+        .unwrap();
+    let registers_but_silent_none = supervisor
+        .spawn(never_connecting_spec("silent-none-twin", None, SigtermMode::Default).0)
+        .unwrap();
 
     // The control first: it is the only arm that can fail by waiting, and it
     // establishes that a prober capable of restarting is running before the two
@@ -668,6 +680,8 @@ async fn a_protocol_none_module_is_never_probed_while_its_subc_twin_is_restarted
     );
 
     never_connects_none.stop().await.unwrap();
+    // No socket reader owns cleanup for the embedding-only registration.
+    server.registry.deregister_connection(connection).unwrap();
     registers_but_silent_none.stop().await.unwrap();
     registers_but_silent_subc.stop().await.unwrap();
 }

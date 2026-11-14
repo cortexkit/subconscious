@@ -66,6 +66,7 @@ async fn liveness_probe_convicts_half_open_socket_and_next_call_recovers() {
     let target = target();
     let identity = identity();
 
+    open_route_first(&consumer).await;
     let first = consumer
         .call(
             target.clone(),
@@ -75,7 +76,7 @@ async fn liveness_probe_convicts_half_open_socket_and_next_call_recovers() {
         )
         .await
         .expect_err("the deaf connection must time out after accepting the data frame");
-    assert!(matches!(first, CallError::OutcomeUnknown(_)));
+    assert!(matches!(first, CallError::OutcomeUnknown(_)), "{first:?}");
     assert_eq!(first.outcome_cause(), Some(OutcomeUnknownCause::Deadline));
     assert_eq!(first.close_reason(), None);
 
@@ -127,6 +128,7 @@ async fn liveness_probe_withholds_conviction_while_a_control_request_is_pending(
         () = sleep(Duration::from_millis(50)) => {}
     }
 
+    open_route_first(&consumer).await;
     let first = consumer
         .call(
             target.clone(),
@@ -136,7 +138,7 @@ async fn liveness_probe_withholds_conviction_while_a_control_request_is_pending(
         )
         .await
         .expect_err("the deaf connection must time out after accepting the data frame");
-    assert!(matches!(first, CallError::OutcomeUnknown(_)));
+    assert!(matches!(first, CallError::OutcomeUnknown(_)), "{first:?}");
 
     // Give a (wrong) conviction ample time to fire, then prove it did not: the
     // second call must try its replacement route on the SAME connection. The
@@ -151,7 +153,7 @@ async fn liveness_probe_withholds_conviction_while_a_control_request_is_pending(
         )
         .await
         .expect_err("the corpse is deliberately kept while the control op explains the silence");
-    assert!(matches!(second, CallError::NotSent(_)));
+    assert!(matches!(second, CallError::NotSent(_)), "{second:?}");
     assert_eq!(
         second.not_sent_cause(),
         Some(NotSentCause::RouteOpenAbandoned)
@@ -176,6 +178,7 @@ async fn liveness_probe_keeps_silent_but_healthy_socket_for_next_call() {
     let target = target();
     let identity = identity();
 
+    open_route_first(&consumer).await;
     let first = consumer
         .call(
             target.clone(),
@@ -185,7 +188,7 @@ async fn liveness_probe_keeps_silent_but_healthy_socket_for_next_call() {
         )
         .await
         .expect_err("the held request must settle as outcome_unknown");
-    assert!(matches!(first, CallError::OutcomeUnknown(_)));
+    assert!(matches!(first, CallError::OutcomeUnknown(_)), "{first:?}");
 
     // This daemon answers the probe's Ping, proving the connection is healthy even
     // though the request has no reply. Waiting through the window gives a faulty
@@ -204,10 +207,22 @@ async fn liveness_probe_keeps_silent_but_healthy_socket_for_next_call() {
         )
         .await
         .expect_err("the second held request must remain on the same connection");
-    assert!(matches!(second, CallError::OutcomeUnknown(_)));
+    assert!(matches!(second, CallError::OutcomeUnknown(_)), "{second:?}");
     assert_eq!(daemon.connection_count(), 1);
 
     consumer.close().await;
+}
+
+/// Opens the route with a generous budget before the short call, so the call's
+/// 100 ms is spent on the data request alone. Opening it inside the call also
+/// spends, from that budget, the `server.describe` request that learns whether
+/// the daemon accepts route close reasons and the route.open itself, and on a
+/// loaded runner that can end the call before its data frame is sent.
+async fn open_route_first(consumer: &SubcConsumer) {
+    consumer
+        .open_route(target(), identity(), call_options(Duration::from_secs(2)))
+        .await
+        .expect("open the route before the short call");
 }
 
 fn consumer_options() -> ConsumerOptions {

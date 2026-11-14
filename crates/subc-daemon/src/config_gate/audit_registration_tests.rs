@@ -376,7 +376,7 @@ async fn audit_registration_committed_stamp_retries_or_parks_cutover_without_fai
 #[tokio::test]
 async fn audit_registration_stamp_protocol_none_stops_the_running_nonce_child() {
     let fixture = legacy().await;
-    let old = fixture.module.status().unwrap();
+    let old = reported_status(&fixture.module).await;
     entry(&fixture.rig, "protocol", json!("none"));
     fixture.rig.stamp(&fixture.owner);
     fixture
@@ -384,7 +384,7 @@ async fn audit_registration_stamp_protocol_none_stops_the_running_nonce_child() 
         .reconcile_cutover_for_test(fixture.owner.clone(), 1)
         .await
         .unwrap();
-    let next = fixture.module.status().unwrap();
+    let next = reported_status(&fixture.module).await;
     assert!(next.process_alive);
     assert_ne!(next.pid, old.pid);
     assert_eq!(next.protocol, subc_control::ModuleProtocol::None);
@@ -835,7 +835,7 @@ async fn audit_registration_missing_support_holds_crash_budget_and_reapproval_re
         .with_config_runtime(owner.clone());
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
     module.seed_crash_budget_for_test(2);
-    let before = module.status().unwrap();
+    let before = reported_status(&module).await;
     assert_eq!(before.restart_count, 2);
     entry(&rig, "registration_channel", json!(false));
     approve(&rig, &owner, PlanKind::Change);

@@ -141,11 +141,10 @@ mod dual_path_tests {
             let spec = Self::spec(&path);
             let module = supervisor.spawn_async(spec).await.unwrap();
             if protocol == "subc" {
-                handle
-                    .registration_for_test("ckbus")
-                    .unwrap()
-                    .wait_launch()
-                    .await;
+                let launch = handle.registration_for_test("ckbus").unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(6), launch.wait_launch())
+                    .await
+                    .expect("registration launch must settle");
             }
             let handler = ControlHandler::with_forwarding(registry, forwarding)
                 .with_supervisor(handle)
@@ -401,7 +400,9 @@ mod dual_path_tests {
             .await
             .unwrap();
         let current = f.handler.supervisor.registration_for_test("ckbus").unwrap();
-        current.wait_launch().await;
+        tokio::time::timeout(std::time::Duration::from_secs(6), current.wait_launch())
+            .await
+            .expect("replacement registration launch must settle");
         assert!(!Arc::ptr_eq(&old, &current));
         assert!(f.module.status().unwrap().process_alive);
         assert!(old.has_program_binding());
@@ -515,6 +516,38 @@ mod dual_path_tests {
         f.stop().await;
     }
 
+    /// The supervisor's swap gate refuses a gated id on its own, behind the
+    /// handler's earlier reserved-module check. A handler without the
+    /// configuration runtime reaches it directly.
+    #[tokio::test]
+    async fn dual_path_gated_hello_without_its_channel_names_the_channel_requirement() {
+        let f = Fixture::new(true, "subc").await;
+        assert!(f.handler.supervisor.module_is_gated("ckbus"));
+        let handler = ControlHandler::with_forwarding(
+            Arc::new(Registry::default()),
+            Arc::new(ForwardingTable::default()),
+        )
+        .with_supervisor(f.handler.supervisor.clone());
+        let mut replies = handler
+            .handle_hello(PRIMARY, Some(f.sink.clone()), hello(None))
+            .unwrap();
+        let reply = if replies.is_empty() {
+            f.frames.lock().unwrap().try_recv().unwrap().frame
+        } else {
+            replies.remove(0)
+        };
+        assert_eq!(reply.header.ty, FrameType::Error);
+        let error = serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap();
+        assert_eq!(error["code"], "swap_token_invalid");
+        let message = error["message"].as_str().unwrap();
+        assert!(
+            message.contains("must register over its supervised registration channel")
+                && !message.contains("swap"),
+            "the refusal names the channel requirement, not a swap: {message}"
+        );
+        f.stop().await;
+    }
+
     #[tokio::test]
     async fn dual_path_protocol_none_gets_no_channel_or_nonce_and_refuses_hello() {
         let f = Fixture::new(false, "none").await;
@@ -529,6 +562,14 @@ mod dual_path_tests {
             reply.header.ty,
             FrameType::Error,
             "protocol:none has no legitimate HELLO holder"
+        );
+        let error = serde_json::from_slice::<serde_json::Value>(&reply.body).unwrap();
+        assert_eq!(error["code"], "swap_token_invalid");
+        let message = error["message"].as_str().unwrap();
+        assert!(
+            message.contains("a protocol:none module may not register")
+                && !message.contains("swap"),
+            "the refusal names the protocol:none reason, not a swap: {message}"
         );
         f.stop().await;
         f.handler.supervisor.retire("ckbus");
@@ -560,7 +601,7 @@ mod dual_path_tests {
                 assert!(!handle.reserved_hello_authorized("ckbus", Some("same-body-nonce")));
                 assert_eq!(
                     handle.swap_hello_admission("ckbus", Some("same-body-nonce")),
-                    SwapHelloAdmission::Refused
+                    SwapHelloAdmission::ChannelRequired
                 );
                 assert!(!handle.reserved_hello_authorized("child:tool", Some("same-body-nonce")));
                 assert!(!handle.spawned_consumer_authorized("ckbus", "same-body-nonce"));
@@ -570,7 +611,7 @@ mod dual_path_tests {
                 };
                 let refused = f
                     .handler
-                    .route_open_principal(&hello(None), Some(identity))
+                    .route_open_principal(ConnectionId::new(9999), &hello(None), Some(identity))
                     .unwrap()
                     .unwrap_err();
                 assert_eq!(
@@ -611,7 +652,7 @@ mod dual_path_tests {
             launch_nonce: nonce.clone(),
         };
         assert!(
-            matches!(f.handler.route_open_principal(&hello(None), Some(identity)).unwrap(),
+            matches!(f.handler.route_open_principal(ConnectionId::new(9999), &hello(None), Some(identity)).unwrap(),
             Ok(Principal::Reserved { module_id }) if module_id == "ckbus")
         );
         let reads = f

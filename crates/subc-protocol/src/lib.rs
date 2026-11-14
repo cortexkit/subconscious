@@ -452,6 +452,7 @@ pub use frame::{Frame, FrameBuildError};
 /// Why subc is closing a module's client routes.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum RouteCloseReason {
     Reload,
     Restart,

@@ -317,6 +317,9 @@ run_installer "$linux_home" "$linux_output" \
 grep -Fq 'index.json' "$linux_home/requests.log" || fail 'Linux installer did not fetch the release index'
 grep -Fq 'ck-linux-x64.zip' "$linux_home/requests.log" || fail 'Linux archive name was not requested'
 grep -Fq 'Next: ck setup' "$linux_output" || fail 'installer did not print the setup command'
+# The installer's own PATH lacks cmd, as in a terminal that ran curl | bash:
+# it must say how to load the new PATH here, or `ck setup` fails as typed.
+grep -Fxq "  source $linux_home/.bashrc" "$linux_output" || fail 'installer did not say how to load PATH in this terminal'
 [[ ! -e "$linux_home/setup-called" ]] || fail 'installer started the extracted ck process'
 [[ -x "$linux_home/.local/share/cortexkit/cmd/ck" ]] || fail 'installer did not place ck in cmd'
 assert_mode "$linux_home/.local/share/cortexkit" 700
@@ -371,6 +374,12 @@ run_installer "$linux_home" "$rerun_output" \
   CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic
 grep -Fq 'already matches verified download' "$rerun_output" || fail 'identical destination was not reported as a no-op'
 grep -Fq 'Next: ck setup' "$rerun_output" || fail 'no-op installer did not print the setup command'
+onpath_output="$test_root/linux-onpath-output"
+run_installer "$linux_home" "$onpath_output" \
+  CK_TEST_OS=Linux CK_TEST_ARCH=x86_64 CK_TEST_KERNEL=generic \
+  PATH="$stub_dir:$linux_home/.local/share/cortexkit/cmd:$PATH"
+grep -Fq 'Next: ck setup' "$onpath_output" || fail 'on-PATH installer did not print the setup command'
+! grep -Fq 'source ' "$onpath_output" || fail 'installer asked to load PATH although cmd was already on it'
 [[ ! -e "$linux_home/setup-called" ]] || fail 'no-op installer started the extracted ck process'
 [[ "$(grep -Fc '# cortexkit-managed PATH begin' "$linux_home/.bashrc")" == "1" ]] || fail 'no-op installer duplicated the PATH block'
 [[ "$(shasum -a 256 "$linux_manifest" | awk '{print $1}')" == "$manifest_before" ]] || fail 're-run rewrote an existing manifest (setup rows would be lost)'

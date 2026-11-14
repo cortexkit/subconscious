@@ -1,17 +1,55 @@
 # Changelog
 
-## Unreleased
+## 0.39.1
 
-- Correct the adopting sample's closed schema and review of absent or unchanged
-  fields; exercise the documented hooks against a gate-capable daemon.
-- Add optional `ModuleHandler` configuration hooks: declare once, review immutable
-  snapshots, apply complete views, and observe wire-named delivery/refusal states.
-  Existing handlers advertise and send no new operations. Only a daemon without
-  `config.gate` invokes the opted-in module's legacy file-reader hook.
-- Retain the last view on `config_gated` and `not_delivery_target`, expose a typed
-  no-approved-config detail when no view exists, and retry `anchor_pending`
-  reports on the next change hint. Configuration work does not block the reader,
-  health checks, drain hooks or stop. Re-export shared schema helpers for reviews.
+- Preserve legacy launch-nonce source diagnostics in HELLO provenance when an
+  supervised module registers over its private channel with the configuration
+  gate unstamped. The nonce
+  itself remains absent from channel HELLOs; channel authority is unchanged.
+
+## 0.39.0
+
+- **Rust migration:** `RouteCloseReason` adds `AuthorityChanged` and is now
+  non-exhaustive. Add a wildcard match arm; the new reason is reopenable.
+  Adopt protocol 0.37, control 0.39 and transport 0.18 public types together.
+- Add optional `ModuleHandler` configuration hooks to declare, review immutable
+  changes, apply complete views and observe delivery or refusal state. Adoption
+  occurs only when serving, not when constructing a handler or merely declaring
+  a schema. Existing handlers send no new operations. A legacy file reader is
+  called only when the daemon does not advertise `config.gate`.
+- Preserve the last active view on gated/refused delivery and expose typed
+  no-approved-configuration availability on a first refusal. Connection-bound
+  ACK/NACK and retries of application reports while the daemon finishes securing
+  the approved generation keep configuration work off the reader's health,
+  drain and stop paths. Rollback delivery uses approved retained bytes; changed
+  programs still require renewed approval by the daemon.
+- Use the inherited private registration channel for supported supervised
+  launches and expose bounded claims for helper/provider identities. Upgrade
+  module SDKs and opt in to channel support before stamping; stamped script
+  entry points are refused. The gate ships with the stamp off and unstamped
+  installs behave as before.
+- Expose catalog subscriptions and optional route-target/caller authority
+  metadata. Discovery is not authorization evidence; unknown wire close reasons
+  are retained and treated conservatively. The configuration sample now reviews
+  absent and unchanged fields under a closed schema.
+
+## 0.38.6
+
+- Expose the daemon's optional `route.closed` terminal flag through
+  `CallError::terminal()` for `OutcomeUnknown` and `NotSent`. Older daemons and
+  client-side route ends report `None`. Close reasons and automatic reopen
+  classification are unchanged: restart and reload remain `MayReopen`.
+
+## 0.38.5
+
+- Add `ServeOptions::serve_from_env_with_handle` and `ServeOptions::serve_with_handle`
+  to obtain a module handle before callers bind while preserving a custom stop
+  handle and writer drain timeout. A requested stop before registration completes
+  returns `Ok(None)` rather than an error. The free serving functions are unchanged.
+
+## 0.38.4
+
+- Add `ModuleHandle::update_role_declarations` for daemon 0.44.9 or later. Gate sends on HELLO_ACK advertisement, replace or clear the whole map, and preserve typed daemon refusals. Require protocol 0.36.3 and control 0.38.3.
 
 ## 0.38.3
 

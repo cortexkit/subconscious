@@ -62,11 +62,14 @@ async fn recovery_slow_retry_roundtrip(
 ) {
     let dir = cortexkit_test_support::ScratchDir::new("recovery-slow-retry");
     let path = dir.join("subc.jsonc");
+    let mut crash = crashing_spec();
+    crash.program = crate::config_gate::program::native_fixture_for_test();
+    crash.args = vec!["exit17".into()];
     std::fs::write(
         &path,
         serde_json::to_vec(&serde_json::json!({
             "version":1,"modules":{"slow-retry-child":{
-                "program":"/bin/sh", "args":["-c","exit 17"], "protocol":"none"
+                "program":crash.program, "args":crash.args, "protocol":"none"
             }}
         }))
         .unwrap(),
@@ -93,7 +96,7 @@ async fn recovery_slow_retry_roundtrip(
         .with_config_runtime(owner.clone());
     let module = supervisor
         .supervise_configured_requested_async(
-            crashing_spec(),
+            crash.clone(),
             true,
             HealthConfig::default(),
             None,
@@ -184,7 +187,7 @@ async fn recovery_slow_retry_roundtrip(
             entering.try_recv().is_ok()
         })
         .await;
-        let error = owner.prepare_spawn(&crashing_spec()).err().unwrap();
+        let error = owner.prepare_spawn(&crash).err().unwrap();
         assert_eq!(error.code, "config_delivery_deferred");
         assert_eq!(error.detail, "configuration publication is busy");
         Some((publisher, release))
@@ -261,7 +264,7 @@ async fn recovery_slow_retry_roundtrip(
             .unwrap();
         owner.complete_authority_exit_for_test(generation).unwrap();
         assert!(owner.check_module_hold("slow-retry-child").is_ok());
-        let mut missing = crashing_spec();
+        let mut missing = crash;
         missing.program = dir.join("missing-program");
         module
             .update_configuration(missing, HealthConfig::default(), None)

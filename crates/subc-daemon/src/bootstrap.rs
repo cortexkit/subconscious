@@ -898,38 +898,16 @@ fn load_bootstrap_authority(
         BootstrapConfig::new(&config.connection_file_path, DEFAULT_SUBC_PORT)
     } else if store_state == Some(crate::config_store::StoreState::Stamped) {
         let store = store.expect("stamped store was just checked");
-        store
-            .delivery_ready()
-            .map_err(|error| BootstrapError::ConfigStore(error.to_string()))?;
-        let body = store
-            .body()
-            .map_err(|error| BootstrapError::ConfigStore(error.to_string()))?;
-        let layer = body
-            .generations
-            .get(&body.last_generation)
-            .and_then(|entry| entry.delivery.as_ref())
-            .and_then(|delivery| delivery.daemon.as_ref())
-            .ok_or_else(|| {
-                BootstrapError::ConfigStore("approved daemon snapshot is absent".into())
-            })?;
-        let bytes = layer.bytes.as_deref().ok_or_else(|| {
-            BootstrapError::ConfigStore("approved daemon bytes are absent".into())
-        })?;
-        let path = layer
-            .path
-            .as_deref()
-            .ok_or_else(|| BootstrapError::ConfigStore("approved daemon path is absent".into()))?;
-        let doc = std::str::from_utf8(bytes)
-            .map_err(|error| BootstrapError::ConfigStore(error.to_string()))?;
-        let (daemon, activity) = daemon_config::parse_with_activity(doc, Path::new(path))
-            .map_err(BootstrapError::DaemonConfig)?;
-        let port = daemon.port;
-        BootstrapConfig::new(
-            &config.connection_file_path,
-            port.unwrap_or(DEFAULT_SUBC_PORT),
-        )
-        .with_parsed_daemon_config(Some(daemon), activity)
-        .with_daemon_config_source(PathBuf::from(path), port)
+        match stamped_authority(&config.connection_file_path, store) {
+            Ok(authority) => authority,
+            Err(reason) => {
+                // A stamped daemon never falls back to files, and exiting would
+                // leave the operator no way to reach recovery.
+                tracing::error!(%reason, "approved configuration unusable; starting in recovery");
+                store.enter_recovery(&reason);
+                BootstrapConfig::new(&config.connection_file_path, DEFAULT_SUBC_PORT)
+            }
+        }
     } else if config.defer_file_load {
         BootstrapConfig::from_env_with_daemon_config_path(
             config
@@ -976,6 +954,41 @@ fn load_bootstrap_authority(
         test_listener_bind: config.test_listener_bind,
         ..authority
     })
+}
+
+/// Authority from the approved daemon generation the store selects for this
+/// start. Every failure is a reason to enter recovery, never to exit.
+fn stamped_authority(
+    connection_file_path: &Path,
+    store: &mut crate::config_store::ConfigStore,
+) -> Result<BootstrapConfig, String> {
+    let generation = store
+        .select_boot_generation()
+        .map_err(|error| error.to_string())?;
+    let body = store.body().map_err(|error| error.to_string())?;
+    let layer = body
+        .generations
+        .get(&generation)
+        .and_then(|entry| entry.delivery.as_ref())
+        .and_then(|delivery| delivery.daemon.as_ref())
+        .ok_or("approved daemon snapshot is absent")?;
+    let bytes = layer
+        .bytes
+        .as_deref()
+        .ok_or("approved daemon bytes are absent")?;
+    let path = layer
+        .path
+        .as_deref()
+        .ok_or("approved daemon path is absent")?;
+    let doc = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+    let (daemon, activity) = daemon_config::parse_with_activity(doc, Path::new(path))
+        .map_err(|error| format!("approved daemon configuration is invalid: {error}"))?;
+    let port = daemon.port;
+    Ok(
+        BootstrapConfig::new(connection_file_path, port.unwrap_or(DEFAULT_SUBC_PORT))
+            .with_parsed_daemon_config(Some(daemon), activity)
+            .with_daemon_config_source(PathBuf::from(path), port),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1188,6 +1201,7 @@ async fn serve_bound_daemon(
     let registry = Arc::new(Registry::default());
     let process_liveness = Arc::new(SupervisorProcessLiveness::new());
     let supervisor_handle = SupervisorHandle::new();
+    let _host_health_task = AbortOnDrop::new(supervisor_handle.spawn_host_health_monitor());
     #[cfg(feature = "test-support")]
     supervisor_handle.set_shutdown_intent_window(shutdown_intent_window);
     let connected_clients = ConnectedClients::new();
@@ -1360,6 +1374,7 @@ async fn serve_bound_daemon(
         control =
             control.with_activity_ledger_config(&run_dir, daemon_incarnation, activity_config);
     }
+    let daemon_ready_runtime = config_runtime.clone();
     if let Some(runtime) = config_runtime {
         control = control.with_explicit_config_store(runtime);
     }
@@ -1472,6 +1487,14 @@ async fn serve_bound_daemon(
     )
     .await;
     published?;
+    // Serving and discoverable: a daemon booted from a restart intent records
+    // readiness, which makes that generation the daemon's active one. Without
+    // this record the next start treats the warm-up as failed.
+    if let Some(owner) = daemon_ready_runtime {
+        if let Err(error) = owner.on_blocking(|owner| owner.record_daemon_ready()).await {
+            warn!(%error, "daemon readiness was not recorded in the approved store");
+        }
+    }
     #[cfg(test)]
     startup_publication_hook::run(&bound.connection_file_path).await;
     drop(publication_lock);
@@ -2260,6 +2283,7 @@ fn non_empty_os_var(key: &str) -> Option<OsString> {
 /// Bootstrap-layer errors are deliberately typed so startup never panics for
 /// ordinary daemon-discovery races or stale filesystem state.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BootstrapError {
     ConfigStore(String),
     /// The bound server could not authenticate its own readiness probe.
@@ -2535,6 +2559,128 @@ mod tests {
             config.privileged_operator_prompt,
             daemon_config::PrivilegedOperatorPrompt::default()
         );
+    }
+
+    /// An approved generation whose daemon bytes listen on `port`. Changing
+    /// the port is a setting only bootstrap reads, so it waits for a restart.
+    fn approved_port_entry(
+        kind: crate::config_store::CommitKind,
+        port: u16,
+    ) -> crate::config_store::HistoryEntry {
+        use subc_protocol::config::{ConfigLayer, ConfigLayerSnapshot};
+        crate::config_store::HistoryEntry {
+            generation: subc_config::Generation::new(
+                0,
+                subc_config::ApprovalChannel::OsPrompt,
+                subc_config::raw_digest(b"approved-plan"),
+                subc_config::InputVector::default(),
+                subc_config::Changeset::new(),
+            ),
+            kind,
+            approval_id: "approval".into(),
+            outcome: "approved".into(),
+            tuples: Default::default(),
+            configuration: Default::default(),
+            delivery: Some(crate::config_store::DeliverySnapshot {
+                daemon: Some(ConfigLayerSnapshot::file(
+                    "subc",
+                    ConfigLayer::User,
+                    "/approved/subc.jsonc",
+                    Some(format!(r#"{{"version":1,"port":{port},"modules":{{}}}}"#).into_bytes()),
+                )),
+                modules: Default::default(),
+                declarations: Default::default(),
+            }),
+        }
+    }
+
+    fn approve_port(
+        store: &mut crate::config_store::ConfigStore,
+        kind: crate::config_store::CommitKind,
+        port: u16,
+    ) {
+        store
+            .commit_generation(
+                approved_port_entry(kind, port),
+                Default::default(),
+                Default::default(),
+                1,
+            )
+            .unwrap();
+    }
+
+    fn stamped_boot(
+        scratch: &Path,
+        store: &mut crate::config_store::ConfigStore,
+    ) -> BootstrapConfig {
+        let mut config = BootstrapConfig::new(scratch.join("connection.json"), 1)
+            .with_daemon_config_source(scratch.join("subc.jsonc"), Some(1));
+        config.defer_file_load = true;
+        load_bootstrap_authority(config, Some(store)).unwrap()
+    }
+
+    #[test]
+    fn config_stamped_boot_uses_last_active_generation_until_restart_intent() {
+        use crate::config_store::{CommitKind, ConfigStore, StoreRoot};
+        let scratch = unique_temp_dir("stamped-boot-selection");
+        let root = scratch.join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let open = || {
+            ConfigStore::open_digest_only_for_tests(
+                StoreRoot::from_service_definition(root.clone()).unwrap(),
+            )
+        };
+        let mut store = open();
+        approve_port(&mut store, CommitKind::Stamp, 41001);
+        approve_port(&mut store, CommitKind::Approved, 41002);
+        drop(store);
+        let mut store = open();
+        assert_eq!(
+            stamped_boot(&scratch, &mut store).port,
+            41001,
+            "an ordinary start must not boot an approval still waiting for a daemon restart"
+        );
+        assert_eq!(store.assign_daemon_restart().unwrap(), Some(2));
+        drop(store);
+        let mut store = open();
+        assert_eq!(stamped_boot(&scratch, &mut store).port, 41002);
+    }
+
+    #[test]
+    fn config_stamped_boot_enters_recovery_when_anchor_retry_fails_at_start() {
+        use crate::config_store::{CommitKind, ConfigStore, StoreRoot, StoreState, TestStoreKey};
+        let scratch = unique_temp_dir("stamped-boot-anchor-pending");
+        let root = scratch.join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let key = TestStoreKey::default();
+        let open = || {
+            ConfigStore::open_sealed_for_tests(
+                StoreRoot::from_service_definition(root.clone()).unwrap(),
+                key.clone(),
+            )
+        };
+        let mut store = open();
+        approve_port(&mut store, CommitKind::Stamp, 41001);
+        // Crash between publication and anchor: the bytes are renamed into
+        // place but the anchor never catches up, and keeps failing at start.
+        key.fail_anchor(true);
+        assert!(store
+            .commit_generation(
+                approved_port_entry(CommitKind::Approved, 41001),
+                Default::default(),
+                Default::default(),
+                2,
+            )
+            .is_err());
+        drop(store);
+        let mut store = open();
+        let status = store.status();
+        assert_eq!(status.state, StoreState::Stamped);
+        assert!(status.anchor_pending);
+        let config = stamped_boot(&scratch, &mut store);
+        assert_eq!(config.port, DEFAULT_SUBC_PORT);
+        assert!(config.configured_modules.is_empty());
+        assert_eq!(store.status().state, StoreState::StoreUnverified);
     }
 
     #[test]

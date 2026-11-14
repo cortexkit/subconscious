@@ -76,6 +76,25 @@ impl RuntimeOwner {
         Ok(())
     }
 
+    /// A daemon that booted from a restart intent is serving. Recording that
+    /// readiness makes its generation the daemon's active generation.
+    pub(crate) fn record_daemon_ready(&self) -> Result<()> {
+        let mut state = self.lock()?;
+        state.store.record_daemon_ready()?;
+        Ok(())
+    }
+
+    /// The operator is restarting the daemon: durably name the approved
+    /// generation the next start may warm up, before this daemon exits.
+    pub(crate) fn assign_daemon_restart(&self) -> Result<Option<u64>> {
+        let mut state = self.lock()?;
+        if state.store.loaded_admission_state().0 != StoreState::Stamped {
+            return Ok(None);
+        }
+        Self::check_authority(&mut state, false)?;
+        Ok(state.store.assign_daemon_restart()?)
+    }
+
     pub(crate) fn approved_daemon_configuration(&self) -> Result<Option<DaemonConfig>> {
         let mut state = self.lock()?;
         Self::check_authority(&mut state, false)?;

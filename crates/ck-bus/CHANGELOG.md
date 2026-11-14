@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.6
+
+- Let the SDK attest supervised vault calls implicitly, using a connection
+  claim or the legacy launch nonce instead of a conflicting explicit identity.
+  This restores bootstrap when the configuration gate is not stamped but the
+  module uses the private registration channel.
+- Require client 0.39.1 for launch-nonce provenance diagnostics and daemon
+  0.45.1 for the native Windows admission fixtures.
+
+## 0.6.5
+
+- Raise SDK and test-helper requirements to client/control 0.39, protocol
+  0.37, transport 0.18, daemon 0.45 and bus-testkit 0.8. This binary-only
+  dependency update keeps bus behavior unchanged and does not enable stamping.
+
 ## 0.6.4
 
 - The routing module's new id, `striatum`, gets the same bus access as `prefrontal-routing`, from the shared bus naming tables (cortexkit-bus-naming 0.3.4) that define each module's event durable and live-hint reads: its own event durable `m_striatum` reading Insula's quota events, the runners' content-free `step.finished.v1` live hints, and the standard participant grants for its own id. Bootstrap creates `m_striatum` beside `m_prefrontal-routing`, which is unchanged. The new id stays reserved and disabled in the daemon until the routing module moves.

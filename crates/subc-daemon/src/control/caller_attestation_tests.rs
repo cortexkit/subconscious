@@ -380,6 +380,46 @@ async fn relay_seams_authority_change_preserves_each_openers_close_reasons() {
 }
 
 #[tokio::test]
+async fn caller_attestation_claim_bound_own_identity_is_refused() {
+    let mut rig = rig().await;
+    let _target =
+        unsupervised_target(&rig, "attest-target", &[CALLER_ATTESTATION_CAPABILITY]).await;
+    let nonce = rig.handler.supervisor.spawn_nonce("claims-module").unwrap();
+    let mut opener = claimed(&mut rig, ClaimPurpose::SelfConnection).await;
+    opener
+        .send(open_frame(
+            "attest-target",
+            false,
+            Some(ConsumerIdentity {
+                module_id: "claims-module".into(),
+                launch_nonce: nonce,
+            }),
+        ))
+        .await;
+    let reply = open_reply(&mut opener).await;
+    assert_eq!(reply.header.ty, FrameType::Error, "{}", text(&reply));
+    assert_eq!(body(&reply)["code"], "bad_consumer_identity");
+}
+
+#[tokio::test]
+async fn caller_attestation_claim_bound_without_identity_preserves_capture() {
+    let mut rig = rig().await;
+    let opener = claimed(&mut rig, ClaimPurpose::SelfConnection).await;
+    let attested = rig
+        .handler
+        .attest_route_open_consumer(connection_of(&rig, &opener), None)
+        .expect("a live claim attests its owner without a nonce identity");
+    assert!(matches!(
+        attested.principal,
+        Principal::Reserved { ref module_id } if module_id == "claims-module"
+    ));
+    let (record, claim) = attested.spawn.as_ref().expect("the launch is captured");
+    assert!(Arc::ptr_eq(record, &rig.spawn.authority));
+    assert_eq!(*claim, subc_protocol::peer::CallerClaim::Own);
+    assert!(attested.capture().unwrap().is_some());
+}
+
+#[tokio::test]
 async fn caller_attestation_claim_bound_openers_attest_their_spawn_and_claim() {
     let mut rig = rig().await;
     let mut target =

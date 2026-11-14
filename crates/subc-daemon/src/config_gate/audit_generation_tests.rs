@@ -10,7 +10,7 @@ async fn audit_registration_release_before_park_does_not_strand_the_actor() {
         .spawn_async(supervised_spec(&rig, "a"))
         .await
         .unwrap();
-    let before = module.status().unwrap();
+    let before = reported_status(&module).await;
     let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     *owner.config_park_hook.lock().unwrap() = Some(Box::new(move || {
@@ -106,18 +106,14 @@ async fn audit_registration_failed_retry_survives_refused_operator_restart() {
 #[cfg(unix)]
 async fn failed_retry_through_recovery(operator_restart: Option<bool>) {
     use crate::supervise::ModuleState;
-    let (rig, owner, supervisor, _) = supervised_fixture_with_program(
-        true,
-        false,
-        b"#!/bin/sh\nprintf 'started\\n' >> \"$2\"\nwhile :; do /bin/sleep 600; done\n",
-    );
+    let (rig, owner, supervisor, _) = supervised_fixture_with_program(true, false, "mark-sleep");
     let module = supervisor
         .spawn_async(supervised_spec(&rig, "a"))
         .await
         .unwrap();
     module.seed_crash_budget_for_test(3);
     rustix::process::kill_process(
-        rustix::process::Pid::from_raw(module.status().unwrap().pid.unwrap() as i32).unwrap(),
+        rustix::process::Pid::from_raw(reported_pid(&module).await as i32).unwrap(),
         rustix::process::Signal::KILL,
     )
     .unwrap();
@@ -193,8 +189,8 @@ async fn audit_registration_fence_release_preserves_deliberate_clean_exit() {
 #[cfg(unix)]
 async fn terminal_fence_release(crash: bool) {
     use crate::supervise::ModuleState;
-    let (rig, owner, supervisor, _) = supervised_fixture_with_program(true, false,
-        b"#!/bin/sh\nprintf 'started\\n' >> \"$2\"\nwhile [ ! -e \"$1\" ]; do /bin/sleep 0.01; done\nexit 0\n");
+    let (rig, owner, supervisor, _) =
+        supervised_fixture_with_program(true, false, "mark-wait-exit0");
     let module = supervisor
         .spawn_async(supervised_spec(&rig, "a"))
         .await
@@ -202,7 +198,7 @@ async fn terminal_fence_release(crash: bool) {
     if crash {
         module.seed_crash_budget_for_test(3);
         rustix::process::kill_process(
-            rustix::process::Pid::from_raw(module.status().unwrap().pid.unwrap() as i32).unwrap(),
+            rustix::process::Pid::from_raw(reported_pid(&module).await as i32).unwrap(),
             rustix::process::Signal::KILL,
         )
         .unwrap();
@@ -383,7 +379,7 @@ async fn audit_registration_deferred_generation_survives_two_active_child_exits(
     approve_kinds(&rig, &owner, &[subc_config::ApplyKind::DaemonRestart]);
     let worker = handler.spawn_config_delivery_worker().unwrap();
     for _ in 0..2 {
-        let before = module.status().unwrap();
+        let before = reported_status(&module).await;
         rustix::process::kill_process(
             rustix::process::Pid::from_raw(before.pid.unwrap() as i32).unwrap(),
             rustix::process::Signal::KILL,
@@ -398,6 +394,7 @@ async fn audit_registration_deferred_generation_survives_two_active_child_exits(
             },
         )
         .await;
+        reported_pid(&module).await;
     }
     let (still_pending, never_redeliver) = {
         let mut state = owner.lock().unwrap();
@@ -648,7 +645,7 @@ async fn declaration_after_crash(deferred: bool) {
         .spawn_async(supervised_spec(&rig, "a"))
         .await
         .unwrap();
-    let before = module.status().unwrap();
+    let before = reported_status(&module).await;
     let path = rig.path.join("subc.jsonc");
     let mut document: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -693,7 +690,11 @@ async fn declaration_after_crash(deferred: bool) {
         }
     })
     .await;
-    let after = module.status().unwrap();
+    let after = if deferred {
+        reported_status(&module).await
+    } else {
+        module.status().unwrap()
+    };
     if deferred {
         assert_eq!(after.registration_declaration.as_deref(), Some("declared"));
         assert_eq!(after.restart_count, 1);
@@ -727,7 +728,7 @@ async fn audit_registration_release_consumed_behind_exit_fence_is_retried_after_
         .spawn_async(supervised_spec(&rig, "a"))
         .await
         .unwrap();
-    let before = module.status().unwrap();
+    let before = reported_status(&module).await;
     let fenced_spawn = owner
         .spawned(
             "a",
@@ -778,7 +779,7 @@ async fn audit_registration_release_consumed_behind_exit_fence_is_retried_after_
         module.status().unwrap().process_alive
     })
     .await;
-    let after = module.status().unwrap();
+    let after = reported_status(&module).await;
     worker.abort();
     let _ = worker.await;
     module.stop().await.unwrap();

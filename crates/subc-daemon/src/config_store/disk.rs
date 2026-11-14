@@ -11,6 +11,8 @@ pub enum PausePoint {
     BeforeRename,
     AfterRename,
     #[cfg(feature = "test-support")]
+    AfterRenameBeforeSync,
+    #[cfg(feature = "test-support")]
     BeforeAnchor,
     #[cfg(feature = "test-support")]
     SpawnBeforeExec,
@@ -132,7 +134,21 @@ pub(super) fn publish(
         file.sync_all()?;
         drop(file);
         pause(PausePoint::BeforeRename)?;
-        subc_os::durable_replace(&temp, path)?;
+        #[cfg(feature = "test-support")]
+        let replaced = subc_os::durable_replace_with_rename_hook(&temp, path, || {
+            pause(PausePoint::AfterRenameBeforeSync)
+        });
+        #[cfg(not(feature = "test-support"))]
+        let replaced = subc_os::durable_replace(&temp, path);
+        if let Err(error) = replaced {
+            if error.renamed() {
+                // Run AfterRename so the store advances its publication sequence
+                // even though durability failed. Preserve that original error
+                // if a diagnostic hook also fails.
+                let _ = pause(PausePoint::AfterRename);
+            }
+            return Err(error.into());
+        }
         pause(PausePoint::AfterRename)?;
         Ok(())
     })();

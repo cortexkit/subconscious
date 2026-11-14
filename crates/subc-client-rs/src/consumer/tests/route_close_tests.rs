@@ -184,3 +184,82 @@ async fn route_close_cancel_route_when_writer_becomes_ready() {
 async fn route_close_cancel_handle_when_writer_becomes_ready() {
     cancel_when_writer_becomes_ready(true).await;
 }
+#[tokio::test]
+async fn route_closed_terminal_survives_goodbye_for_sent_and_unsent_calls() {
+    for terminal in [Some(true), Some(false), None] {
+        for accepted in [false, true] {
+            for channels in [true, false] {
+                for reason in [RouteCloseReason::Restart, RouteCloseReason::Reload] {
+                    let (shared, consumer, mut rx, _peer, _key, route) = route_teardown_stand_in();
+                    rx.recv().await.unwrap();
+                    shared
+                        .lock_inner()
+                        .route_modules
+                        .insert(route.handle.channel, "provider".into());
+                    let mut request = Box::pin(consumer.request(
+                        &route.handle,
+                        b"unanswered".to_vec(),
+                        CallOptions::default(),
+                    ));
+                    assert_pending(request.as_mut()).await;
+                    let command = rx.recv().await.unwrap();
+                    if accepted {
+                        assert!(shared.mark_pending_accepted(command.pending.unwrap()));
+                    }
+                    let wire_reason = match reason {
+                        RouteCloseReason::Restart => "restart",
+                        RouteCloseReason::Reload => "reload",
+                        _ => unreachable!(),
+                    };
+                    let mut body = serde_json::json!({
+                        "op": "route.closed",
+                        "module_id": "provider",
+                        "reason": wire_reason,
+                    });
+                    if let Some(terminal) = terminal {
+                        body["terminal"] = serde_json::json!(terminal);
+                    }
+                    if channels {
+                        body["channels"] = serde_json::json!([route.handle.channel]);
+                    }
+                    let push = Frame::build(
+                        FrameType::Push,
+                        Flags(0),
+                        0,
+                        0,
+                        0,
+                        serde_json::to_vec(&body).unwrap(),
+                    )
+                    .unwrap();
+                    dispatch_frame(&shared, 1, push).await;
+                    let goodbye = Frame::build(
+                        FrameType::Goodbye,
+                        Flags(0),
+                        route.handle.channel,
+                        route.handle.epoch,
+                        0,
+                        vec![],
+                    )
+                    .unwrap();
+                    dispatch_frame(&shared, 1, goodbye).await;
+                    let error = request.await.unwrap_err();
+                    assert_eq!(error.terminal(), terminal);
+                    assert_eq!(
+                        error.close_reason(),
+                        Some(&RouteEndReason::Daemon(reason.clone()))
+                    );
+                    assert_eq!(
+                        error.outcome_cause(),
+                        accepted.then_some(OutcomeUnknownCause::RouteEnded)
+                    );
+                    assert_eq!(
+                        error.not_sent_cause(),
+                        (!accepted).then_some(NotSentCause::WriterRejected)
+                    );
+                    assert_eq!(reason.disposition(), RouteCloseDisposition::MayReopen);
+                    consumer.close().await;
+                }
+            }
+        }
+    }
+}

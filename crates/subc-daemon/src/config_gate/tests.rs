@@ -801,6 +801,54 @@ fn approval_raise_only_checks_unchanged_project_then_binds_it_in_read_set() {
 }
 
 #[test]
+fn approval_rollback_copies_the_restored_generations_reviewed_program_record() {
+    let mut rig = Rig::new();
+    let modules = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
+    let stamp = rig
+        .gate
+        .plan_reviewed(
+            &mut rig.store,
+            PlanKind::Stamp,
+            rig.current.clone(),
+            &rig.current,
+            ReviewRecord::Reviewed(&modules),
+            complex,
+        )
+        .unwrap();
+    let record = stamp.plan.changeset.apply_plan[reviewed_build::REVIEWED_PROGRAMS].clone();
+    assert_eq!(
+        record.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(rig.approve(&stamp, &facts(true)).unwrap(), 1);
+    rig.edit(layer("a", "user"), json!(20));
+    let view = rig.change(false);
+    assert_eq!(rig.approve(&view, &facts(true)).unwrap(), 2);
+    let restored = rig
+        .gate
+        .rollback(&mut rig.store, 1, &rig.current, &rig.current, complex)
+        .unwrap();
+    assert_eq!(
+        restored.plan.changeset.apply_plan[reviewed_build::REVIEWED_PROGRAMS],
+        record,
+        "the restored generation's reviewers are known"
+    );
+    let unrecorded = rig
+        .gate
+        .rollback(&mut rig.store, 2, &rig.current, &rig.current, complex)
+        .unwrap();
+    assert!(
+        unrecorded
+            .plan
+            .changeset
+            .apply_plan
+            .get(reviewed_build::REVIEWED_PROGRAMS)
+            .is_none(),
+        "a generation without a record lends none to its rollback"
+    );
+}
+
+#[test]
 fn approval_rollback_reverses_config_but_shows_current_program_and_is_stale_checked() {
     let mut rig = Rig::new();
     rig.stamp();

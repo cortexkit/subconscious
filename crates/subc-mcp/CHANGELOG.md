@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.3
+
+- Raise requirements to client/control 0.39, protocol 0.37, transport 0.18
+  and daemon 0.45 test helpers. This binary-only dependency update keeps gateway
+  behavior unchanged and does not enable stamping.
+
 ## 0.2.2
 
 - Require subc-client-rs 0.38.0 for scoped managed calls and watches. This dependency-only patch keeps wire behavior unchanged.

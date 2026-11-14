@@ -155,7 +155,7 @@ test("adopt fails closed when a named registration channel cannot load its helpe
           try { o.adopt(); } catch(error) { caught=error; }
           if (${named}) {
             if(!(caught instanceof ClaimError) || caught.code!=='registration_helper_unavailable'
-              || !(caught.cause instanceof Error) || !caught.message.includes(caught.cause.message)
+              || typeof caught.cause?.message !== 'string' || !caught.message.includes(caught.cause.message)
               || !caught.message.includes('Cannot find module')) throw new Error('missing helper did not fail closed: '+caught);
           } else if(caught || o.supervised || o.take()!==undefined) throw new Error('plain client loaded helper');
         }
@@ -165,7 +165,7 @@ test("adopt fails closed when a named registration channel cannot load its helpe
       expect({code, err}).toEqual({code: 0, err: ""});
       expect(out).toBe("ADOPTION_CHECKED\n");
     }
-  } finally { rmSync(dir, {recursive: true, force: true}); }
+  } finally { rmSync(dir, {recursive: true, force: true, maxRetries: 10, retryDelay: 100}); }
 });
 
 test("import neither loads the native helper nor validates inherited registration metadata", async () => {

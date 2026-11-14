@@ -48,6 +48,7 @@ test("bun build --compile embeds the registration helper", async () => {
   } finally {
     for (const socket of sockets) socket.destroy();
     server.close();
-    rmSync(dir, {recursive: true, force: true});
+    // Windows can keep a just-exited executable locked for a moment.
+    rmSync(dir, {recursive: true, force: true, maxRetries: 20, retryDelay: 100});
   }
 }, 60000);

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.0
+
+- Declare that the MCP adapter hosts third-party code so its origin evidence
+  cannot qualify the code it hosts for the first-party mark.
+- Breaking dependency upgrade to client 0.40; the public credential resolver,
+  module handler and attestation errors expose SDK types. Require daemon 0.46
+  for tests and upgrade direct SDK dependencies together.
+
 ## 0.7.1
 
 - Use SDK self-attestation for vault credential reads instead of an explicit

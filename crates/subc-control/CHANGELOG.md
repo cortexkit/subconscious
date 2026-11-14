@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.40.0
+
+- **Rust migration:** `ConfigControlRequest::PlaceProgram` adds `manifest`;
+  existing variant literals must add `manifest: None` to retain their behavior.
+  The optional offline manifest records development origin evidence, not an
+  approval. Supervisor `spawn_generation` and `spawn` fields count process
+  launches; promoting a candidate registration does not renumber its launch.
+
 ## 0.39.0
 
 - Adopt protocol 0.37 public types. **Rust migration:** `RouteCloseReason`

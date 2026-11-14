@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.4
+
+- Dependency-only upgrade to client/control 0.40 and daemon 0.46; the gateway
+  binary uses these types internally and MCP behavior is unchanged.
+
 ## 0.2.3
 
 - Raise requirements to client/control 0.39, protocol 0.37, transport 0.18

@@ -1,6 +1,6 @@
 [package]
 name = "subc-mcp"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "MIT"
 publish = false
@@ -20,8 +20,8 @@ serde_json = "1"
 ryu-js = "1"
 rmcp = { version = "3.8", default-features = false, features = ["server", "transport-async-rw"] }
 cortexkit-paths = "0.1.1"
-subc-client-rs = { path = "../subc-client-rs", version = "0.39.0" }
-subc-control = { path = "../subc-control", version = "0.39.0" }
+subc-client-rs = { path = "../subc-client-rs", version = "0.40.0" }
+subc-control = { path = "../subc-control", version = "0.40.0" }
 subc-jsonc = { path = "../subc-jsonc" }
 subc-os = { path = "../subc-os", version = "0.1.35" }
 subc-protocol = { path = "../subc-protocol", version = "0.37.0" }
@@ -34,4 +34,4 @@ sha2 = "0.10"
 [dev-dependencies]
 cortexkit-test-support = "0.1.3"
 rmcp = { version = "3.8", default-features = false, features = ["client", "transport-async-rw"] }
-subc-daemon = { path = "../subc-daemon", version = "0.45.0", features = ["test-support"] }
+subc-daemon = { path = "../subc-daemon", version = "0.46.0", features = ["test-support"] }

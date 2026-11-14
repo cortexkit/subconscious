@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.0
+
+- Dependency-only breaking upgrade to client/control 0.40; public UI state,
+  resource, activity and settings APIs expose their types. Upgrade direct SDK
+  dependencies together; UI behavior is unchanged.
+
 ## 0.8.0
 
 - Adopt client/control 0.39, protocol 0.37 and transport 0.18 types. Public

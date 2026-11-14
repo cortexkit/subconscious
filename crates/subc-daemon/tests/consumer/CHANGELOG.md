@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.6
+
+- Dependency-only upgrade to daemon 0.46 for the external consumer fixture.
+
 ## 0.0.5
 
 - Raise integration-consumer requirements to daemon 0.45, protocol 0.37

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.0
+
+- Dependency-only breaking upgrade to client/control 0.40; public daemon control
+  and signer APIs expose their types. Upgrade direct SDK dependencies together.
+
 ## 0.8.1
 
 - Use implicit SDK identity in the supervised publisher example and connect its

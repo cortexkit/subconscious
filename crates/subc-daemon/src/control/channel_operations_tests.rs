@@ -556,7 +556,14 @@ const MODULE_TO_DAEMON_OPERATIONS: &[(&str, bool)] = &[
     ("claim.present", false),
     ("activity.query", false),
     ("activity.subscribe", false),
+    ("catalog.watch", false),
 ];
+
+#[test]
+fn channel_operations_catalog_watch_is_a_client_read() {
+    assert!(MODULE_TO_DAEMON_OPERATIONS.contains(&("catalog.watch", false)));
+    assert!(!REGISTRATION_OPERATIONS.contains(&"catalog.watch"));
+}
 
 fn registration_operations() -> Vec<&'static str> {
     MODULE_TO_DAEMON_OPERATIONS

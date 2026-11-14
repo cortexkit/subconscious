@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.40.0
+
+- Dependency-only breaking upgrade to control 0.40: public re-exports, activity,
+  catalog, supervisor and consumer APIs expose its types. Upgrade direct
+  control dependencies together; wire behavior is unchanged.
+
 ## 0.39.1
 
 - Preserve legacy launch-nonce source diagnostics in HELLO provenance when an

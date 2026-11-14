@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.21.7
+
+- Accept an optional offline manifest for `ck config place-program`, carrying
+  development origin evidence without executing the program or granting approval.
+- Require daemon 0.46, client/control 0.40 and UI 0.9 for the first-party mark
+  release. These dependency types are internal to the CLI and setup API.
+
 ## 0.21.6
 
 - Add `ck config` status, plan, apply-by-digest, stamp, unstamp, history and

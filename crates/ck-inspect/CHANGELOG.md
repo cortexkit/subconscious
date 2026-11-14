@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.2
+
+- Dependency-only upgrade to client/control 0.40; the public manifest and serve
+  API exposes neither dependency's types, and inspection behavior is unchanged.
+
 ## 0.5.1
 
 - Refuse profiles when one-minute host load exceeds twice the logical CPU count,

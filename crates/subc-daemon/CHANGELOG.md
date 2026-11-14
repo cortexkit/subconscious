@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.46.0
+
+- Activate the first-party mark only after a qualifying spawn acknowledges its
+  approved configuration and reports ready. Revoking a spawn's mark closes its
+  existing routes and refuses pending route opens captured before the change.
+  Catalog watchers are notified; route-close reasons are sent only to recipients
+  declaring that they understand them. Provider declarations are fixed at
+  registration and approvals bind their canonical digest; catalog discovery is
+  not authorization evidence.
+- Derive development origin from the reviewed program and optional offline
+  placement manifest. A development manifest may declare third-party hosting;
+  release origin still requires signed evidence rather than a declaration.
+- A route.open on a connection whose launch has ended is refused
+  `registration_channel_closed` (was `bad_consumer_identity`). Connections
+  authenticated with `claim.present` must omit `consumer_identity`, including
+  their own module id.
+- Adapt the first-party mark's supervisor readiness test to the native fixture's
+  mode argument, keeping its child alive until the readiness assertions finish.
+- **Rust migration:** adopt control 0.40 types together with client 0.40.
+  Public supervisor and configuration APIs expose the updated control family.
+
 ## 0.45.2
 
 - The Windows write-exclusion test waits for the second child's own registration

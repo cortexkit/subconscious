@@ -20,8 +20,10 @@ fn healthy() -> HealthReport {
 async fn first_party_mark_healthy_probe_marks_only_the_childs_own_registration() {
     let (_rig, _owner, supervisor, spec, acknowledge) =
         crate::config_gate::runtime::RuntimeOwner::mark_supervisor_fixture_for_test();
-    // The fixture's program exits at once unless it has run before.
-    std::fs::write(&spec.args[0], b"").unwrap();
+    // The native fixture's first argument selects its mode; the next is the
+    // seen marker that keeps this child running instead of exiting at once.
+    assert_eq!(spec.args[0], "mark-first-exit23");
+    std::fs::write(&spec.args[1], b"").unwrap();
     let forwarding = Arc::new(crate::forwarding::ForwardingTable::default());
     let mut runtime = supervisor.runtime_config();
     runtime.forwarding = Some(forwarding.clone());

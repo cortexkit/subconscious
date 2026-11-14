@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.7
+
+- Dependency-only upgrade to client/control 0.40, daemon 0.46 and testkit 0.9;
+  the binary uses these types internally and bus behavior is unchanged.
+
 ## 0.6.6
 
 - Let the SDK attest supervised vault calls implicitly, using a connection

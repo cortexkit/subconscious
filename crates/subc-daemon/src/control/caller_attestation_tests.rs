@@ -386,15 +386,16 @@ async fn caller_attestation_claim_bound_own_identity_is_refused() {
         unsupervised_target(&rig, "attest-target", &[CALLER_ATTESTATION_CAPABILITY]).await;
     let nonce = rig.handler.supervisor.spawn_nonce("claims-module").unwrap();
     let mut opener = claimed(&mut rig, ClaimPurpose::SelfConnection).await;
+    let identity = ConsumerIdentity {
+        module_id: "claims-module".into(),
+        launch_nonce: nonce,
+    };
+    assert!(rig
+        .handler
+        .attest_route_open_consumer(connection_of(&rig, &opener), Some(&identity))
+        .is_none());
     opener
-        .send(open_frame(
-            "attest-target",
-            false,
-            Some(ConsumerIdentity {
-                module_id: "claims-module".into(),
-                launch_nonce: nonce,
-            }),
-        ))
+        .send(open_frame("attest-target", false, Some(identity)))
         .await;
     let reply = open_reply(&mut opener).await;
     assert_eq!(reply.header.ty, FrameType::Error, "{}", text(&reply));

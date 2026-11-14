@@ -264,24 +264,37 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         .unwrap()
         .starts_with("HELLO protocol_ver 0 does not match manifest protocol_ver"));
     handler.cleanup_connection(ConnectionId::new(778)).unwrap();
+    let rejected_registration = handle.registration_for_test("a").unwrap();
     rejected_module.stop().await.unwrap();
     let module = supervisor.spawn_async(spec).await.unwrap();
-    let proof = handle.registration_proof_for_test("a").unwrap();
-    let registration = handle.registration_for_test("a").unwrap();
+    // spawn_async can return before the supervisor has launched the second
+    // child (seen on GitHub's Windows runner), and until then the handle still
+    // serves the stopped child's retired registration. Wait for the new one;
+    // a HELLO sent with the old proof would go unanswered.
+    let registration = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(current) = handle.registration_for_test("a") {
+                if !Arc::ptr_eq(&current, &rejected_registration) {
+                    break current;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the second child must get its own registration");
     tokio::time::timeout(
         std::time::Duration::from_secs(6),
         registration.wait_launch(),
     )
     .await
     .expect("registration launch must settle");
-    // A launch that ended without becoming ready (or a registration left over
-    // from the stopped first child) would make the HELLO below go unanswered;
-    // say which, with the module's status, instead of a bare missing ACK.
     assert!(
         registration.launch_ready(),
         "the second launch must be ready before its HELLO: {:?}",
         module.status()
     );
+    let proof = handle.registration_proof_for_test("a").unwrap();
     let ordinary_excluded = std::fs::OpenOptions::new()
         .write(true)
         .open(&covered)

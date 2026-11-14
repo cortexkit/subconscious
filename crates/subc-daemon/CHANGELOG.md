@@ -1,7 +1,9 @@
 # Changelog
 
-## 0.45.1
+## 0.45.2
 
+- The Windows write-exclusion test waits for the second child's own registration
+  instead of reusing the stopped child's retired one.
 - An unstamped macOS module whose program re-execs another program is no longer
   refused and restarted. Orphan cleanup records the image actually observed.
 - Use native sleeping fixtures and bounded launch, reply, and synchronization

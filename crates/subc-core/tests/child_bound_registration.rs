@@ -59,16 +59,28 @@ impl Rig {
             fs::create_dir_all(root.join(dir)).unwrap();
         }
         fs::write(root.join("operator"), "approve\n".repeat(16)).unwrap();
+        let typescript_program = typescript.then(|| {
+            let program = root.join("channel-module-ts");
+            let output = Command::new(
+                std::env::var_os("CHILD_BOUND_BUN")
+                    .expect("set CHILD_BOUND_BUN to the absolute bun path"),
+            )
+            .args(["build", "--compile"])
+            .arg(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/channel_module.ts"))
+            .arg("--outfile")
+            .arg(&program)
+            .output()
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "compile TypeScript module: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            program
+        });
         let module = |id: &str| {
-            let (program, args) = if typescript && id == "caller" {
-                (
-                    PathBuf::from(
-                        std::env::var_os("CHILD_BOUND_BUN")
-                            .expect("set CHILD_BOUND_BUN to the absolute bun path"),
-                    ),
-                    vec![PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("tests/fixtures/channel_module.ts")],
-                )
+            let (program, args): (PathBuf, Vec<PathBuf>) = if typescript && id == "caller" {
+                (typescript_program.clone().unwrap(), vec![])
             } else {
                 (env!("CARGO_BIN_EXE_channel-module-rs").into(), vec![])
             };
@@ -339,9 +351,13 @@ async fn child_bound_rust_real_daemon() {
 
 /// Build `cargo build --locked -p subc-core -p subc-daemon -p subc-os --bins --features subc-core/test-support,subc-daemon/test-support,subc-daemon/dev-desktop-approval`.
 /// Build the bundle-local helper with `bun run --cwd clients/subc-client build:native`.
+/// The test compiles its TypeScript module with `bun build --compile`; the
+/// configuration gate deliberately refuses interpreter-plus-script launches.
+/// Blocker: a compiled Bun module does not adopt its native registration channel
+/// (the daemon's inherited authentication socket), so it cannot register after stamping.
 /// Run `CHILD_BOUND_BUN="$(command -v bun)" cargo test --locked -p subc-core --features test-support,subc-daemon/dev-desktop-approval --test child_bound_registration child_bound_typescript_real_daemon -- --ignored --exact --nocapture`.
 #[tokio::test]
-#[ignore = "requires bun and the bundle-local registration native helper; see doc comment"]
+#[ignore = "compiled Bun module does not adopt its native registration channel; see doc comment"]
 async fn child_bound_typescript_real_daemon() {
     gated(true).await;
 }

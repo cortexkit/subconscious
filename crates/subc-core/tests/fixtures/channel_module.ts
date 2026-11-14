@@ -1,6 +1,7 @@
 import { appendFileSync, existsSync, renameSync, writeFileSync } from "node:fs";
 import { SubcClient, SubcProvider, managementSurfaceManifest } from "../../../../clients/subc-client/src/index.ts";
 import { launchNonceAsync } from "../../../../clients/subc-client/src/launch-nonce.ts";
+import { registrationOwner } from "../../../../clients/subc-client/src/registration-channel.ts";
 
 const root = process.env.CHANNEL_MODULE_ROOT!;
 const moduleId = process.env.SUBC_MODULE_ID!;
@@ -23,6 +24,9 @@ const provider = await SubcProvider.connect({
     onState: (state) => event({ event: "config", state: state.state }),
   },
 });
+if (!registrationOwner().supervised) {
+  throw new Error("compiled TypeScript module did not adopt its native registration channel");
+}
 while (!existsSync(`${root}/go`)) await new Promise((resolve) => setTimeout(resolve, 20));
 const sync = await provider.scopeSync(1, []);
 const apply = await provider.scopeApply(2, [], []);

@@ -153,7 +153,7 @@ pub(super) fn acknowledgement_refused(
         record.set_unmarked_status(MarkStatus::AcknowledgementRefused);
         tracing::warn!(
             module_id = record.module_id(),
-            spawn = record.spawn(),
+            spawn = record.spawn_number(),
             "spawn is not marked first-party: it did not acknowledge its module's active configuration"
         );
     }
@@ -189,7 +189,7 @@ fn evaluate(owner: &RuntimeOwner, state: &OwnerState, spawn: &DeliverySpawn) {
             if owner.mark_publisher().activate(record) {
                 tracing::info!(
                     module_id = record.module_id(),
-                    spawn = record.spawn(),
+                    spawn = record.spawn_number(),
                     "spawn marked first-party"
                 );
             }
@@ -198,7 +198,7 @@ fn evaluate(owner: &RuntimeOwner, state: &OwnerState, spawn: &DeliverySpawn) {
             if record.set_unmarked_status(status) {
                 tracing::warn!(
                     module_id = record.module_id(),
-                    spawn = record.spawn(),
+                    spawn = record.spawn_number(),
                     "spawn is not marked first-party: it has not reported ready. A module must \
                      reach ready without first-party grants and use them once they work"
                 );

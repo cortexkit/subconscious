@@ -43,7 +43,7 @@ impl ControlHandler {
             {
                 info!(
                     module_id = record.module_id(),
-                    spawn = record.spawn(),
+                    spawn = record.spawn_number(),
                     code = error.code,
                     "development provider declarations remain unapproved"
                 );

@@ -264,13 +264,24 @@ impl Fixture {
         std::fs::create_dir_all(path.join("cortexkit")).unwrap();
         std::fs::copy(
             if development_module {
-                "/bin/sleep"
+                crate::config_gate::program::native_fixture_for_test()
             } else {
-                "/bin/sh"
+                std::path::PathBuf::from("/bin/sh")
             },
             path.join("program"),
         )
         .unwrap();
+        // Re-sign the copied native fixture before macOS verifies its
+        // executable image at launch.
+        #[cfg(target_os = "macos")]
+        if development_module {
+            assert!(std::process::Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(path.join("program"))
+                .status()
+                .unwrap()
+                .success());
+        }
         // Keep the dummy phone surface's native image stable for content verification:
         // a shell can exec sleep after its own image was sampled.
         let phone_program = std::path::PathBuf::from("/bin/sleep");
@@ -278,7 +289,7 @@ impl Fixture {
             path.join("subc.jsonc"),
             serde_json::to_vec(&json!({"version":1,"modules":{
                 "a":{"program":path.join("program"),"registration_channel":true,
-                    "args": if development_module { vec!["600"] } else { vec![] }},
+                    "args": if development_module { vec!["sleep"] } else { vec![] }},
                 "callosum":{"program":phone_program,"args":["600"],"reserved":true,"registration_channel":true,
                     "overlap": if lifecycle { "safe" } else { "exclusive" }}
             }}))
@@ -1289,6 +1300,7 @@ async fn origins_hello_files_one_phone_card_and_publishes_approved_entries() {
     })
     .await
     .unwrap();
+    assert!(spawn.launch_ready(), "{:?}", module.status().unwrap());
     spawn.authority.initialize_origin(
         subc_protocol::peer::CallerOrigin::Development,
         Default::default(),
@@ -1315,7 +1327,7 @@ async fn origins_hello_files_one_phone_card_and_publishes_approved_entries() {
     )
     .unwrap();
     let (sender, mut module_frames) = mpsc::channel(8);
-    fixture
+    let responses = fixture
         .handler
         .handle_hello(
             connection,
@@ -1323,6 +1335,7 @@ async fn origins_hello_files_one_phone_card_and_publishes_approved_entries() {
             hello.clone(),
         )
         .unwrap();
+    assert!(responses.is_empty(), "HELLO refused: {responses:?}");
     let ack = module_frames.recv().await.unwrap();
     assert_eq!(ack.frame.header.ty, FrameType::HelloAck);
     assert!(spawn

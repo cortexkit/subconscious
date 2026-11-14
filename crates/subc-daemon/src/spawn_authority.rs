@@ -339,7 +339,7 @@ impl SpawnAuthorityRecord {
         self.lock().approved = ApprovedDeclarations { entries, digest };
     }
 
-    pub(crate) fn spawn(&self) -> u64 {
+    pub(crate) fn spawn_number(&self) -> u64 {
         self.spawn
     }
 

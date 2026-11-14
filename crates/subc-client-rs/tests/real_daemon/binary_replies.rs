@@ -51,8 +51,10 @@ async fn payload_catalog_bridge_preserves_declarations_and_legacy_wire_bytes() {
     write_frame(&mut client, &request).await.unwrap();
     let reply = read_frame_timeout(&mut client).await;
     assert_eq!(reply.header.ty, FrameType::Response);
-    // Pin the daemon's actual entry bytes, not a re-serialization of the new type.
-    let legacy_entry = br#"{"module_id":"subc-client-rs-legacy-payload","ready":true,"module_version":"1.0.0","roles":[],"control_ops":["route.bind","route.status","health.check"]}"#;
+    // Pin the legacy fields in the daemon's actual bytes, not a serialization
+    // of the new type. Catalog authority metadata is appended to the entry;
+    // older readers ignore those additions but still receive these bytes.
+    let legacy_entry = br#"{"module_id":"subc-client-rs-legacy-payload","ready":true,"module_version":"1.0.0","roles":[],"control_ops":["route.bind","route.status","health.check"],"incarnation":""#;
     assert!(
         reply
             .body
@@ -61,6 +63,15 @@ async fn payload_catalog_bridge_preserves_declarations_and_legacy_wire_bytes() {
         "actual catalog body: {}",
         String::from_utf8_lossy(&reply.body)
     );
+    let wire: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+    let legacy = &wire["modules"][0];
+    assert!(legacy["incarnation"]
+        .as_str()
+        .is_some_and(|id| !id.is_empty()));
+    assert_eq!(legacy["first_party"], false);
+    assert_eq!(legacy["origin"], "other");
+    assert_eq!(legacy["approved_declarations"], serde_json::json!({}));
+    assert_eq!(legacy["requested_declarations"], serde_json::json!({}));
     assert!(!String::from_utf8(reply.body)
         .unwrap()
         .contains("operation_payload"));

@@ -425,7 +425,7 @@ async fn caller_attestation_claim_bound_openers_attest_their_spawn_and_claim() {
     let mut rig = rig().await;
     let mut target =
         unsupervised_target(&rig, "attest-target", &[CALLER_ATTESTATION_CAPABILITY]).await;
-    let spawn = rig.spawn.authority.spawn();
+    let spawn = rig.spawn.authority.spawn_number();
     for (purpose, claim) in [
         (ClaimPurpose::SelfConnection, "own"),
         (ClaimPurpose::Helper, "brokered"),
@@ -483,7 +483,7 @@ async fn caller_attestation_nonce_consumer_attests_legacy() {
     let bind = next_bind(&mut target).await;
     let caller = &body(&bind)["caller"];
     assert_eq!(caller["claim"], "legacy", "{}", text(&bind));
-    assert_eq!(caller["spawn"], rig.spawn.authority.spawn());
+    assert_eq!(caller["spawn"], rig.spawn.authority.spawn_number());
     assert_eq!(caller["first_party"], false);
 }
 
@@ -559,7 +559,7 @@ async fn caller_attestation_reply_target_reports_the_reserved_endpoint() {
             &json!({
                 "incarnation": incarnation,
                 "kind": "spawn",
-                "spawn": spawn.authority.spawn(),
+                "spawn": spawn.authority.spawn_number(),
                 "authority_epoch": 0,
                 "first_party": false,
                 "approved_declarations_digest":
@@ -865,7 +865,7 @@ async fn spawn_authority_promoted_candidate_keeps_its_launch_generation() {
         .registration_for_test("promoted-module")
         .unwrap();
     assert!(candidate.is_candidate());
-    let generation = candidate.authority.spawn();
+    let generation = candidate.authority.spawn_number();
     let incarnation = candidate.authority.capture().unwrap().incarnation;
     let incumbent = catalog_entry(&rig, "promoted-module").await;
     assert_ne!(incumbent["spawn"], generation);

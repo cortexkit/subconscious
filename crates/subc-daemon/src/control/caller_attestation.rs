@@ -104,7 +104,7 @@ impl crate::config_gate::runtime::mark::MarkPublisher for ControlMarkPublisher {
                 let record = record.clone();
                 self.after_locks(move |handler| {
                     if let Err(err) = handler.registry.catalog_authority_changed() {
-                        warn!(module_id = record.module_id(), spawn = record.spawn(), error = %err,
+                        warn!(module_id = record.module_id(), spawn = record.spawn_number(), error = %err,
                             "failed to advance the catalog after a first-party mark activation");
                     }
                 });
@@ -112,7 +112,7 @@ impl crate::config_gate::runtime::mark::MarkPublisher for ControlMarkPublisher {
             }
             Ok(false) => false,
             Err(err) => {
-                warn!(module_id = record.module_id(), spawn = record.spawn(), error = %err,
+                warn!(module_id = record.module_id(), spawn = record.spawn_number(), error = %err,
                     "failed to publish a first-party mark activation");
                 false
             }
@@ -137,7 +137,7 @@ impl crate::config_gate::runtime::mark::MarkPublisher for ControlMarkPublisher {
                 });
             }
             Err(err) => {
-                warn!(module_id = record.module_id(), spawn = record.spawn(), error = %err,
+                warn!(module_id = record.module_id(), spawn = record.spawn_number(), error = %err,
                     "failed to publish a first-party mark lowering");
             }
         }
@@ -263,7 +263,7 @@ impl ControlHandler {
         let (closed, alive) = match published {
             Ok(published) => published,
             Err(err) => {
-                warn!(module_id = record.module_id(), spawn = record.spawn(), error = %err,
+                warn!(module_id = record.module_id(), spawn = record.spawn_number(), error = %err,
                     "failed to publish a spawn authority change");
                 return;
             }
@@ -285,7 +285,7 @@ impl ControlHandler {
         alive: bool,
     ) {
         if let Err(err) = self.registry.catalog_authority_changed() {
-            warn!(module_id = record.module_id(), spawn = record.spawn(), error = %err,
+            warn!(module_id = record.module_id(), spawn = record.spawn_number(), error = %err,
                 "failed to advance the catalog after a spawn authority change");
         }
         if closed.is_empty() {

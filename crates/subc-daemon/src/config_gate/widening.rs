@@ -58,7 +58,7 @@ impl super::super::ConfigGate {
         let approval = DevelopmentApproval {
             module_id: record.module_id().into(),
             incarnation: capture.incarnation,
-            spawn: record.spawn(),
+            spawn: record.spawn_number(),
             origin: capture.origin,
             requested_entries,
         };

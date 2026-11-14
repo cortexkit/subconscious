@@ -15725,7 +15725,7 @@ fn set_running(
         child
             .registration_spawn
             .as_ref()
-            .map(|spawn| spawn.authority.spawn()),
+            .map(|spawn| spawn.authority.spawn_number()),
         child.pid,
         child.spawned_at_ms,
     );

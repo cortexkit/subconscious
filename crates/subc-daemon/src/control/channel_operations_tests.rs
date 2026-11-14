@@ -961,7 +961,9 @@ async fn unregistered_channel(
         .await
         .unwrap();
     let spawn = handle.registration_for_test(module_id).unwrap();
-    spawn.wait_launch().await;
+    tokio::time::timeout(std::time::Duration::from_secs(6), spawn.wait_launch())
+        .await
+        .expect("registration launch must settle");
     let nonce = handle
         .spawn_launch_nonce_for(module_id)
         .expect("an ungated spawn also gets a launch nonce");

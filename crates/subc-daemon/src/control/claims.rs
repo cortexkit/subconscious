@@ -315,18 +315,58 @@ pub(super) struct Claims(
     #[cfg(test)] Mutex<Vec<u64>>,
     #[cfg(test)] Mutex<Option<Arc<AttachHold>>>,
     #[cfg(test)] Mutex<Option<Arc<tokio::sync::Barrier>>>,
-    #[cfg(test)] Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)] Mutex<Option<Arc<AttachHold>>>,
     #[cfg(test)] Mutex<Option<&'static str>>,
-    #[cfg(test)] Mutex<Option<Arc<std::sync::Barrier>>>,
-    #[cfg(test)] Mutex<Option<Arc<std::sync::Barrier>>>,
+    #[cfg(test)] Mutex<Option<Arc<AttachHold>>>,
+    #[cfg(test)] Mutex<Option<Arc<AttachHold>>>,
     #[cfg(test)] Mutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)] Mutex<Option<Arc<tokio::sync::Barrier>>>,
 );
 
 #[cfg(test)]
+#[derive(Default)]
 struct AttachHold {
     reached: tokio::sync::Notify,
-    release: std::sync::Barrier,
+    released: Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl AttachHold {
+    fn pause(&self) {
+        self.reached.notify_one();
+        let (released, _) = self
+            .release
+            .wait_timeout_while(
+                self.released.lock().unwrap(),
+                Duration::from_secs(5),
+                |released| !*released,
+            )
+            .unwrap();
+        let did_release = *released;
+        drop(released);
+        assert!(
+            did_release,
+            "test must release the paused claim publication"
+        );
+    }
+
+    #[cfg(unix)]
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release.notify_all();
+    }
+}
+
+// A failed assertion must release the handler even while the runtime unwinds.
+#[cfg(all(test, unix))]
+struct ReleaseHold(Arc<AttachHold>);
+
+#[cfg(all(test, unix))]
+impl Drop for ReleaseHold {
+    fn drop(&mut self) {
+        self.0.release();
+    }
 }
 
 impl Claims {
@@ -349,8 +389,7 @@ impl Claims {
         };
         let hold = slot.lock().unwrap().take();
         if let Some(hold) = hold {
-            hold.wait();
-            hold.wait();
+            hold.pause();
         }
     }
 
@@ -992,8 +1031,7 @@ impl ControlHandler {
         permit.finish(&mut state);
         #[cfg(test)]
         if let Some(hold) = self.claims.3.lock().unwrap().take() {
-            hold.reached.notify_one();
-            hold.release.wait();
+            hold.pause();
         }
         Ok(())
     }
@@ -1276,10 +1314,8 @@ pub(crate) mod tests {
     async fn claims_redemption_racing_retirement_is_never_bound_and_alive() {
         let mut rig = rig().await;
         let token = mint(&mut rig, ClaimPurpose::SelfConnection).await.claim;
-        let hold = Arc::new(AttachHold {
-            reached: tokio::sync::Notify::new(),
-            release: std::sync::Barrier::new(2),
-        });
+        let hold = Arc::new(AttachHold::default());
+        let release = ReleaseHold(hold.clone());
         *rig.handler.claims.3.lock().unwrap() = Some(hold.clone());
         let mut net = Net::new(rig.router.clone()).await;
         subc_transport::write_frame(&mut net.client, &request(ClaimPresentRequest::new(token)))
@@ -1295,9 +1331,14 @@ pub(crate) mod tests {
             notify.notify_one();
             spawn.retire();
         });
-        started.notified().await;
-        hold.release.wait();
-        retire.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("retirement worker must start");
+        drop(release);
+        tokio::time::timeout(Duration::from_secs(2), retire)
+            .await
+            .expect("retirement must finish after publication is released")
+            .unwrap();
         while let Some(reply) = net.recv().await {
             assert_eq!(reply.header.ty, FrameType::Response);
         }
@@ -1326,6 +1367,12 @@ pub(crate) mod tests {
         }
 
         pub(crate) async fn call(&mut self, router: &Arc<Router>, frame: Frame) -> Frame {
+            tokio::time::timeout(Duration::from_secs(2), self.call_unbounded(router, frame))
+                .await
+                .expect("a live fixture connection must answer promptly")
+        }
+
+        async fn call_unbounded(&mut self, router: &Arc<Router>, frame: Frame) -> Frame {
             let router = router.clone();
             let ctx = self.ctx.clone();
             let task = tokio::spawn(async move { router.route_for_connection(&ctx, frame).await });
@@ -1339,9 +1386,7 @@ pub(crate) mod tests {
 
         #[cfg(target_os = "linux")]
         pub(crate) async fn call_bounded(&mut self, router: &Arc<Router>, frame: Frame) -> Frame {
-            tokio::time::timeout(Duration::from_secs(2), self.call(router, frame))
-                .await
-                .expect("a live fixture connection must answer promptly")
+            self.call(router, frame).await
         }
 
         async fn closed(&mut self) {
@@ -1409,8 +1454,8 @@ pub(crate) mod tests {
         let module = supervisor
             .spawn_async(ModuleSpec {
                 module_id: module_id.into(),
-                program: "/bin/sh".into(),
-                args: vec!["-c".into(), "exec sleep 300".into()],
+                program: crate::config_gate::program::native_fixture_for_test(),
+                args: vec!["300".into()],
                 env: Vec::new(),
                 reserved: false,
                 reserved_prefixes: Vec::new(),
@@ -1421,7 +1466,9 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let spawn = handle.registration_for_test(module_id).unwrap();
-        spawn.wait_launch().await;
+        tokio::time::timeout(Duration::from_secs(6), spawn.wait_launch())
+            .await
+            .expect("claim fixture launch must settle");
         assert!(
             spawn.launch_ready(),
             "claim fixture launch failed: {:?}",
@@ -1488,8 +1535,8 @@ pub(crate) mod tests {
         let module = supervisor
             .spawn_async(ModuleSpec {
                 module_id: module_id.into(),
-                program: "/bin/sh".into(),
-                args: vec!["-c".into(), "exec sleep 300".into()],
+                program: crate::config_gate::program::native_fixture_for_test(),
+                args: vec!["300".into()],
                 env: Vec::new(),
                 reserved: false,
                 reserved_prefixes: Vec::new(),
@@ -1500,7 +1547,14 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let spawn = handle.registration_for_test(module_id).unwrap();
-        spawn.wait_launch().await;
+        tokio::time::timeout(Duration::from_secs(6), spawn.wait_launch())
+            .await
+            .expect("network claim fixture launch must settle");
+        assert!(
+            spawn.launch_ready(),
+            "network claim fixture launch failed: {:?}",
+            module.status()
+        );
         let mut net = Net::new(rig.router.clone()).await;
         let ping = Frame::build(FrameType::Ping, control_flags(), 0, 0, 2, Vec::new()).unwrap();
         assert_eq!(net.call(ping).await.header.ty, FrameType::Pong);
@@ -2499,8 +2553,9 @@ pub(crate) mod tests {
         child: &mut Net,
         module_id: &str,
         stage: u8,
-    ) -> Arc<std::sync::Barrier> {
-        let hold = Arc::new(std::sync::Barrier::new(2));
+    ) -> ReleaseHold {
+        let hold = Arc::new(AttachHold::default());
+        let release = ReleaseHold(hold.clone());
         let slot = match stage {
             5 => &rig.handler.claims.5,
             7 => &rig.handler.claims.7,
@@ -2509,17 +2564,14 @@ pub(crate) mod tests {
         };
         *slot.lock().unwrap() = Some(hold.clone());
         child.send(prefix_hello(module_id)).await;
-        let reached = hold.clone();
-        tokio::task::spawn_blocking(move || reached.wait())
+        tokio::time::timeout(Duration::from_secs(2), hold.reached.notified())
             .await
-            .unwrap();
-        hold
+            .expect("prefix HELLO must reach its publication pause");
+        release
     }
 
-    async fn release_prefix_hello(hold: Arc<std::sync::Barrier>) {
-        tokio::task::spawn_blocking(move || hold.wait())
-            .await
-            .unwrap();
+    async fn release_prefix_hello(hold: ReleaseHold) {
+        drop(hold);
     }
 
     #[tokio::test]

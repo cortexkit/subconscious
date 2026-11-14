@@ -274,7 +274,9 @@ async fn audit4_rescan_prefix_transfer_survives_an_old_plain_spawn_spec() {
     let refused = outsider.call(&router, prefix_hello("p:child")).await;
     let mut primary = Wire::new(&router);
     let launch = handle.registration_for_test("a-new-owner").unwrap();
-    launch.wait_launch().await;
+    tokio::time::timeout(std::time::Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     launch.bind(primary.connection.id());
     let primary_reply = primary.call(&router, prefix_hello("a-new-owner")).await;
     assert_eq!(primary_reply.header.ty, FrameType::HelloAck);

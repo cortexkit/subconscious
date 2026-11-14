@@ -141,11 +141,10 @@ mod dual_path_tests {
             let spec = Self::spec(&path);
             let module = supervisor.spawn_async(spec).await.unwrap();
             if protocol == "subc" {
-                handle
-                    .registration_for_test("ckbus")
-                    .unwrap()
-                    .wait_launch()
-                    .await;
+                let launch = handle.registration_for_test("ckbus").unwrap();
+                tokio::time::timeout(std::time::Duration::from_secs(6), launch.wait_launch())
+                    .await
+                    .expect("registration launch must settle");
             }
             let handler = ControlHandler::with_forwarding(registry, forwarding)
                 .with_supervisor(handle)
@@ -401,7 +400,9 @@ mod dual_path_tests {
             .await
             .unwrap();
         let current = f.handler.supervisor.registration_for_test("ckbus").unwrap();
-        current.wait_launch().await;
+        tokio::time::timeout(std::time::Duration::from_secs(6), current.wait_launch())
+            .await
+            .expect("replacement registration launch must settle");
         assert!(!Arc::ptr_eq(&old, &current));
         assert!(f.module.status().unwrap().process_alive);
         assert!(old.has_program_binding());

@@ -5,15 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 fn spec(directory: &std::path::Path, name: &str) -> ModuleSpec {
     ModuleSpec {
         module_id: name.into(),
-        program: if cfg!(target_os = "macos") {
-            "/bin/bash"
-        } else {
-            "/bin/sh"
-        }
-        .into(),
+        program: crate::config_gate::program::native_fixture_for_test(),
         args: vec![
-            "-c".into(),
-            "echo exec >\"$1\"; exec /bin/sleep 60".into(),
+            "mark-sleep".into(),
             "admission-test".into(),
             directory.join(format!("{name}.exec")).display().to_string(),
         ],
@@ -560,6 +554,12 @@ async fn rejected_after_holder_fork(shutdown: bool) {
     let supervisor = new_supervisor(&dir);
     let mut module_spec = spec(&dir, "rejected");
     let holder_file = dir.join("holder.pid");
+    module_spec.program = if cfg!(target_os = "macos") {
+        "/bin/bash"
+    } else {
+        "/bin/sh"
+    }
+    .into();
     module_spec.args = vec![
         "-c".into(),
         "/bin/sleep 60 </dev/null >/dev/null 2>&1 & echo $! >\"$1\"; exec /bin/sleep 60".into(),
@@ -682,6 +682,7 @@ async fn privacy_trampoline_behind_the_admission_gate_preserves_the_carried_pgid
     let holder_file = dir.join("privacy-holder.pid");
     // Keep the configured shell image alive through exec confirmation; the
     // carried-group assertions do not require a second image replacement.
+    module_spec.program = "/bin/bash".into();
     module_spec.args = vec!["-c".into(),
         "if [ ! -s \"$1\" ]; then /bin/sleep 60 </dev/null >/dev/null 2>&1 & echo $! >\"$1\"; fi; while :; do /bin/sleep 60; done".into(),
         "privacy-holder".into(), holder_file.display().to_string()];

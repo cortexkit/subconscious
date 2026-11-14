@@ -2,6 +2,10 @@
 
 ## 0.45.1
 
+- An unstamped macOS module whose program re-execs another program is no longer
+  refused and restarted. Orphan cleanup records the image actually observed.
+- Use native sleeping fixtures and bounded launch, reply, and synchronization
+  waits to make supervision and registration-claim tests deterministic.
 - Make configuration-gate test fixtures and readiness waits valid on macOS.
 - Recreate stale PID-reused scratch directories once in configuration-gate tests.
 - Declare registration-channel support in Windows configuration-admission test

@@ -193,12 +193,13 @@ struct PrivacyExec {
     expected: Option<subc_os::FileIdentity>,
     trampoline: Option<subc_os::FileIdentity>,
     signature: Option<Arc<subc_os::privacy_identity::SuspendedSignature>>,
-    script: bool,
     module_id: String,
     #[cfg(test)]
     confirmation_pause: Option<(String, Option<tokio::net::TcpStream>)>,
     #[cfg(test)]
     image_probe: Option<fn(u32) -> Option<subc_os::Observation>>,
+    #[cfg(test)]
+    image_read_delay: Option<Duration>,
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -304,11 +305,6 @@ fn privacy_command(
         })
         .transpose()
         .map_err(|error| failure(error.to_string()))?;
-    let script = !gated && {
-        use std::io::Read;
-        let mut prefix = [0; 2];
-        (&binding._file).read_exact(&mut prefix).is_ok() && &prefix == b"#!"
-    };
     if expected == trampoline_image {
         return Err(failure(
             "privacy identity module executable is missing or is the trampoline itself".to_string(),
@@ -338,10 +334,15 @@ fn privacy_command(
             expected,
             trampoline: trampoline_image,
             signature,
-            script,
             module_id: spec.module_id.clone(),
             #[cfg(test)]
             image_probe: None,
+            #[cfg(test)]
+            image_read_delay: spec
+                .env
+                .iter()
+                .find(|(key, _)| key == "SUBC_TEST_PRIVACY_IMAGE_DELAY_MS")
+                .map(|(_, millis)| Duration::from_millis(millis.parse().unwrap())),
             #[cfg(test)]
             confirmation_pause: spec
                 .env
@@ -683,13 +684,18 @@ impl SupervisedChild {
                 Ok(Some(_)) => None,
                 Err(error) => Some(format!("privacy identity trampoline wait failed: {error}")),
                 Ok(None) => {
+                    #[cfg(test)]
+                    if let Some(delay) = pending.image_read_delay {
+                        tokio::time::sleep(delay).await;
+                    }
                     let image = observe_spawned_image(self.pid);
                     #[cfg(test)]
                     let image = pending.image_probe.map_or(image, |probe| probe(self.pid));
+                    // An unstamped module can re-exec before we wake to read its
+                    // image. Only the trampoline image proves exec never happened;
+                    // retain the observed image for later orphan identification.
                     if let Some(image) = image.filter(|image| {
-                        image.executable.is_some()
-                            && image.executable != pending.trampoline
-                            && (image.executable == pending.expected || pending.script)
+                        image.executable.is_some() && image.executable != pending.trampoline
                     }) {
                         match self
                             .roster_guard
@@ -722,7 +728,7 @@ impl SupervisedChild {
                             Err(_) => Some("privacy identity module executable remained unreadable until the 5s exec deadline".to_string()),
                         }
                     } else {
-                        Some("privacy identity trampoline executable mismatch: expected the module program, not ck-subc".to_string())
+                        Some("privacy identity trampoline did not exec the module".to_string())
                     }
                 }
             },
@@ -21474,6 +21480,107 @@ mod privacy_exec_boundary_tests {
             child.start_kill().unwrap();
             child.wait().await.unwrap();
             child.release_roster();
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "requires macOS privacy trampoline")]
+    async fn macos_unstamped_reexec_records_the_observed_native_image() {
+        #[cfg(target_os = "macos")]
+        {
+            let root = cortexkit_test_support::ScratchDir::new("privacy-reexec");
+            let record = root.join("live-children.json");
+            let supervisor =
+                Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
+                    .with_live_children_record(&record);
+            let runtime = supervisor.runtime_config();
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+            let fixture = crate::config_gate::program::native_fixture_for_test();
+            let mut spec = spec(
+                "/bin/sh",
+                &["-c", "exec \"$1\" 600", "reexec", fixture.to_str().unwrap()],
+            );
+            spec.env
+                .push(("SUBC_TEST_PRIVACY_IMAGE_DELAY_MS".into(), "5".into()));
+            let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
+            let native_image = subc_os::file_identity(&fixture).unwrap();
+            // Native image installation, not shell startup speed, establishes
+            // that this launch has crossed the re-exec boundary before sampling.
+            let reexec = tokio::time::timeout(Duration::from_secs(5), async {
+                while observe_spawned_image(child.pid).and_then(|image| image.executable)
+                    != Some(native_image)
+                {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            child.confirm_privacy_exec().await;
+            let failure = child.spawn_failure.clone();
+            let ready = child.report_ready.get().is_some();
+            let confirmed = crate::live_children::read_record(&record).unwrap();
+            child.start_kill().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            child.release_roster();
+
+            reexec.expect("the shell must re-exec the native fixture");
+            assert_eq!(
+                failure, None,
+                "an unstamped program may re-exec before observation"
+            );
+            assert!(ready);
+            assert_eq!(confirmed.len(), 1);
+            assert_eq!(confirmed[0].executable, Some(native_image.into()));
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "requires macOS privacy trampoline")]
+    async fn macos_unstamped_ack_without_exec_still_refuses_the_trampoline() {
+        #[cfg(target_os = "macos")]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let supervisor =
+                Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
+            let runtime = supervisor.runtime_config();
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+            let fixture = crate::config_gate::program::native_fixture_for_test();
+            let mut spec = spec(fixture.to_str().unwrap(), &["600"]);
+            spec.env.push((
+                "SUBC_TEST_PRIVACY_EXEC_BARRIER".into(),
+                listener.local_addr().unwrap().to_string(),
+            ));
+            let mut child = spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap();
+            let mut exec = accept(listener).await;
+            let mut ready = [0];
+            exec.read_exact(&mut ready).unwrap();
+            assert_eq!(&ready, b"R");
+            assert_eq!(
+                observe_spawned_image(child.pid).unwrap().executable,
+                subc_os::file_identity(&test_privacy_trampoline())
+            );
+            // Simulate a broken trampoline that acknowledges exec but keeps
+            // running its own image, held at the fixture's pre-exec barrier.
+            let (reader, writer) = std::io::pipe().unwrap();
+            drop(writer);
+            child.privacy_exec.as_mut().unwrap().reader =
+                tokio::io::unix::AsyncFd::new(reader).unwrap();
+            child.confirm_privacy_exec().await;
+            let failure = child.spawn_failure.clone();
+            let ready = child.report_ready.get().is_some();
+            child.start_kill().unwrap();
+            tokio::time::timeout(Duration::from_secs(5), child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            child.release_roster();
+            assert_eq!(
+                failure.as_deref(),
+                Some("privacy identity trampoline did not exec the module")
+            );
+            assert!(!ready);
         }
     }
 

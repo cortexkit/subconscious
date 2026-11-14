@@ -104,13 +104,15 @@ async fn path_launch(last_override: bool) {
     let early = root.join("early");
     let later = root.join("later");
     let marker = root.join("executed");
+    let fixture = crate::config_gate::program::native_fixture_for_test();
     std::fs::create_dir(&early).unwrap();
     std::fs::create_dir(&later).unwrap();
     std::fs::write(
         early.join("command"),
         format!(
-            "#!/bin/sh\nprintf wrong > '{}'\nexec /bin/sleep 600\n",
-            marker.display()
+            "#!/bin/sh\nprintf wrong > '{}'\n'{}' 600\n:\n",
+            marker.display(),
+            fixture.display()
         ),
     )
     .unwrap();
@@ -132,7 +134,10 @@ async fn path_launch(last_override: bool) {
     let mut spec = spec("command".into(), env);
     spec.args = vec![
         "-c".into(),
-        format!("printf right > '{}'; exec /bin/sleep 600", marker.display()),
+        "printf right > \"$1\"; \"$2\" 600; :".into(),
+        "binding-path".into(),
+        marker.display().to_string(),
+        fixture.display().to_string(),
     ];
     let supervisor = Supervisor::new_for_test(
         Arc::new(Registry::default()),
@@ -140,14 +145,21 @@ async fn path_launch(last_override: bool) {
     );
     let module = supervisor.spawn_async(spec).await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(6);
-    while !marker.exists() && Instant::now() < deadline {
+    while (!marker.exists() || module.status().unwrap().pid.is_none()) && Instant::now() < deadline
+    {
         if module.state().unwrap() == ModuleState::Failed {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let ran = std::fs::read_to_string(&marker).ok();
+    let admitted = module.status().unwrap().pid.is_some();
     module.stop().await.unwrap();
+    // Printing before a refused launch is killed is not successful admission.
+    assert!(
+        admitted,
+        "the selected PATH program must finish privacy exec confirmation"
+    );
     assert_eq!(
         ran.as_deref(),
         Some("right"),

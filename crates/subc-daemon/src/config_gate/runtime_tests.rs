@@ -209,11 +209,10 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     let excluded = before.as_ref().err().and_then(|error| error.raw_os_error());
     drop(before);
     let rejected_proof = handle.registration_proof_for_test("a").unwrap();
-    handle
-        .registration_for_test("a")
-        .unwrap()
-        .wait_launch()
-        .await;
+    let launch = handle.registration_for_test("a").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     let handler = crate::ControlHandler::with_forwarding(registry.clone(), forwarding)
         .with_supervisor(handle.clone())
         .with_config_runtime(owner);
@@ -269,7 +268,12 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     let module = supervisor.spawn_async(spec).await.unwrap();
     let proof = handle.registration_proof_for_test("a").unwrap();
     let registration = handle.registration_for_test("a").unwrap();
-    registration.wait_launch().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        registration.wait_launch(),
+    )
+    .await
+    .expect("registration launch must settle");
     // A launch that ended without becoming ready (or a registration left over
     // from the stopped first child) would make the HELLO below go unanswered;
     // say which, with the module's status, instead of a bare missing ACK.
@@ -1612,11 +1616,10 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
         .module_spec();
     let module = supervisor.spawn_async(spec).await.unwrap();
     let initial_proof = handle.registration_proof_for_test("a").unwrap();
-    handle
-        .registration_for_test("a")
-        .unwrap()
-        .wait_launch()
-        .await;
+    let launch = handle.registration_for_test("a").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     assert!(
         handle
             .wait_program_binding_for_test("a", &initial_proof)
@@ -1685,7 +1688,9 @@ async fn windows_removed_registration_preserves_binding(candidate: bool) {
         (initial_proof, None)
     };
     let launch = handle.registration_for_test("a").unwrap();
-    launch.wait_launch().await;
+    tokio::time::timeout(std::time::Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     assert_eq!(launch.is_candidate(), candidate);
     let hold = Arc::new(std::sync::Barrier::new(2));
     let handler = handler.with_hello_registry_to_forwarding_hold(hold.clone());

@@ -105,7 +105,9 @@ async fn gated_claim_fixture_with_program(
     let proof = handle.registration_proof_for_test("a").unwrap();
     assert!(handle.wait_program_binding_for_test("a", &proof).await);
     let spawn = handle.registration_for_test("a").unwrap();
-    spawn.wait_launch().await;
+    tokio::time::timeout(Duration::from_secs(6), spawn.wait_launch())
+        .await
+        .expect("registration launch must settle");
     let control = Arc::new(
         crate::ControlHandler::with_forwarding(registry, forwarding)
             .with_supervisor(handle.clone())
@@ -393,12 +395,10 @@ async fn claims_mint_obeys_recovery_and_resumes_after_approved_exit() {
         .await
         .unwrap();
     let proof = fixture.handle.registration_proof_for_test("a").unwrap();
-    fixture
-        .handle
-        .registration_for_test("a")
-        .unwrap()
-        .wait_launch()
-        .await;
+    let launch = fixture.handle.registration_for_test("a").unwrap();
+    tokio::time::timeout(Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     let mut primary = Net::new(fixture.router.clone()).await;
     let ping = subc_protocol::Frame::build(
         subc_protocol::FrameType::Ping,
@@ -3046,11 +3046,10 @@ async fn config_admission_hello_accepts_only_the_approved_current_native_image()
     assert!(handle.wait_program_binding_for_test("a", &nonce).await);
     // The channel service waits for launch confirmation before dispatching
     // HELLO. A direct-handler fixture must wait for the same transition.
-    handle
-        .registration_for_test("a")
-        .unwrap()
-        .wait_launch()
-        .await;
+    let launch = handle.registration_for_test("a").unwrap();
+    tokio::time::timeout(Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     assert!(
         !module.configuration().unwrap().0.reserved,
         "the launch-local nonce gate must not rewrite approved role policy"
@@ -4687,11 +4686,10 @@ async fn registration_declaration_stamp_restarts_nonce_spawn_before_completing_c
     let proof = handle.registration_proof_for_test("a").unwrap();
     assert!(handle.wait_program_binding_for_test("a", &proof).await);
     let mut channel = Net::new(router).await;
-    handle
-        .registration_for_test("a")
-        .unwrap()
-        .wait_launch()
-        .await;
+    let launch = handle.registration_for_test("a").unwrap();
+    tokio::time::timeout(Duration::from_secs(6), launch.wait_launch())
+        .await
+        .expect("registration launch must settle");
     assert_eq!(
         channel
             .call(module_hello(Some(proof), ConnectionId::new(2)))

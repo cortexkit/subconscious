@@ -22,9 +22,10 @@ Usage: scripts/gate.sh {fast|lint|test|swift|ts|all} [check]
          Install the Windows Rust target beforehand; cross-checking is not a
          substitute for CI's native Windows/MSVC lint and execution.
   test   SLOW. Linux only; best on a machine with many cores.
-         Build subc-core helper binaries first, then ONE whole-workspace
-         --all-targets --locked --no-fail-fast test invocation, workspace doc
-         tests, and CK alpha's setup, CLI and Unix inode selections with their
+         Build subc-core helper binaries first, then one whole-workspace
+         --all-targets --locked --no-fail-fast test invocation for every crate
+         but the daemon, the daemon's own targets with its dev approval
+         surface, workspace doc tests, and CK alpha's setup, CLI and Unix inode selections with their
          nonzero-test guards. Independent checks still run after a failure.
          Requires CI's nats-server v2.15.0 on PATH (not a stand-in).
   swift  macOS + Xcode only: swift package resolve and swift test, plus generic
@@ -261,7 +262,13 @@ test_check() {
       # Daemon tests launch feature-gated fixtures from both packages. Cargo's
       # test scheduling does not guarantee those binaries exist before a test.
       step 'Build helper binaries (test-support)' cargo build --locked -p subc-core -p subc-daemon --bins --features subc-core/test-support,subc-daemon/test-support
-      step 'Whole-workspace tests' cargo test --workspace --all-targets --locked --no-fail-fast
+      step 'Whole-workspace tests (except the daemon)' cargo test --workspace --exclude subc-daemon --all-targets --locked --no-fail-fast
+      # The config gate's approval tests approve settings changes from a desktop
+      # app the daemon can't verify, which the daemon accepts only when built
+      # with dev-desktop-approval (release daemons never are). Turning the
+      # feature on in the workspace run above would also change the daemon
+      # that other crates' tests link, so the daemon's own targets run here.
+      step 'Daemon tests (test-support, dev-desktop-approval)' cargo test -p subc-daemon --all-targets --locked --no-fail-fast --features test-support,dev-desktop-approval
       # Reuse the compiled test target while also exercising its shell entry point.
       step 'Workspace scratch fence wrapper' bash scripts/checks/test-scratch-fence.sh ;;
     docs) step 'Workspace doctests' cargo test --workspace --doc --locked ;;

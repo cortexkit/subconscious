@@ -18,7 +18,7 @@ async-trait = "0.1"
 rustc-demangle = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-subc-client-rs = { path = "../subc-client-rs", version = "0.39.0" }
+subc-client-rs = { path = "../subc-client-rs", version = "0.39.1" }
 subc-control = { path = "../subc-control", version = "0.39.0" }
 subc-os = { path = "../subc-os", version = "0.1.35" }
 subc-protocol = { path = "../subc-protocol", version = "0.37.0" }

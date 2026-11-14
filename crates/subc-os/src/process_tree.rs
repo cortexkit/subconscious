@@ -309,8 +309,15 @@ impl ProcessTable {
         let (revision, observed_at_ms, started_at) = Self::begin();
         let mut members = BTreeMap::new();
         let mut unreadable = BTreeMap::new();
-        for (pid, parent, name, expected_start) in enumerate()? {
+        let entries = enumerate()?;
+        let listed_at: BTreeMap<u32, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(index, (pid, ..))| (*pid, index))
+            .collect();
+        for (index, (pid, parent, name, expected_start)) in entries.into_iter().enumerate() {
             let parent = parent.or_else(|| crate::parent_pid(pid));
+            let parent = live_parent(parent, index, &listed_at);
             let session_id = None;
             let Some(process) = crate::Process::open(pid).ok().flatten() else {
                 unreadable.insert(pid, (parent, session_id));
@@ -600,6 +607,36 @@ fn possibly_live(pid: u32) -> bool {
 #[cfg(windows)]
 fn possibly_live(_pid: u32) -> bool {
     true
+}
+
+/// Windows never reparents: a process keeps the pid of the parent that
+/// created it, even after that parent exits and the pid is given to a new
+/// process. Otherwise a new process that reuses such a pid inherits unrelated
+/// children: an unopenable one (csrss.exe and wininit.exe name an exited
+/// smss.exe) makes every tree rooted at the new process unknown, and a
+/// readable one makes the new process look like an ancestor.
+///
+/// Creation order, not start time, tells a real parent from a reused pid.
+/// Start times are wall-clock times, and a clock stepped back after boot
+/// makes boot processes look younger than processes started since. The
+/// native listing walks the kernel's active process list
+/// (`PsActiveProcessHead`), which appends each process when it is created, so
+/// a real parent is always listed before its child. A listed parent that
+/// appears after the child is a later process holding a reused pid, and the
+/// child is recorded with no live parent (0, as for System). This ordering is
+/// not documented; `the_native_listing_is_in_creation_order` fails if Windows
+/// stops providing it.
+#[cfg(windows)]
+fn live_parent(
+    parent: Option<u32>,
+    child_at: usize,
+    listed_at: &BTreeMap<u32, usize>,
+) -> Option<u32> {
+    let parent = parent?;
+    let reused = listed_at
+        .get(&parent)
+        .is_some_and(|parent_at| *parent_at > child_at);
+    Some(if reused { 0 } else { parent })
 }
 
 /// One listed process: pid, parent, program name and native start, each

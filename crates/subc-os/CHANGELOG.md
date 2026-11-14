@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.36
+
+- On Windows, a process whose listed parent appears after it in the system
+  process list is recorded with no live parent (the parent exited and its pid
+  was reused). Windows never reparents, so before this a new process holding a
+  reused pid inherited the old children: an unopenable one (csrss.exe and
+  wininit.exe name an exited smss.exe) made every tree rooted at the new
+  process unknown, and a readable one was linked to it as a child. The rule
+  uses the list's creation order, not start times, which move when the clock
+  steps.
+
 ## 0.1.35
 
 - Add bounded, no-follow regular-file capture, retained file identities and

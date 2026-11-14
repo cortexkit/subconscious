@@ -2638,9 +2638,9 @@ mod reconciliation_tests {
         );
         paths.config_store_root = PathBuf::from("relative data/config-store");
         let unit = desired_definition_checked(RuntimePlatform::Linux, &paths).unwrap();
-        let absolute = std::env::current_dir()
-            .unwrap()
-            .join("relative data/config-store");
+        // std::path::absolute is what the renderer calls; on Windows it also
+        // rewrites the separators, so a hand-joined path would not match.
+        let absolute = std::path::absolute("relative data/config-store").unwrap();
         assert!(unit.contains(&format!(
             "--config-store-root {}\n",
             systemd_argument(&absolute.to_string_lossy())

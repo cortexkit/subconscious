@@ -1344,19 +1344,25 @@ impl SetupFixture {
             .join("bin")
             .join(platform_binary("ck-subc"));
         let raw = daemon.to_string_lossy();
-        let xml = raw
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&apos;");
+        let escape_xml = |text: &str| {
+            text.replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+                .replace('\'', "&apos;")
+        };
+        let xml = escape_xml(&raw);
+        // Setup pins the daemon's config store beside bin/ in every definition.
+        let store = self.data_home.join("cortexkit").join("config-store");
+        let raw_store = store.to_string_lossy();
+        let store_xml = escape_xml(&raw_store);
         let definition = if cfg!(target_os = "macos") {
             let recovery = if outdated {
                 ""
             } else {
                 "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ThrottleInterval</key><integer>10</integer>"
             };
-            format!("<plist version=\"1.0\"><dict><key>Label</key><string>cortexkit.subc</string><key>ProgramArguments</key><array><string>{xml}</string></array><key>RunAtLoad</key><true/>{recovery}<key>ExitTimeOut</key><integer>35</integer></dict></plist>")
+            format!("<plist version=\"1.0\"><dict><key>Label</key><string>cortexkit.subc</string><key>ProgramArguments</key><array><string>{xml}</string><string>--config-store-root</string><string>{store_xml}</string></array><key>RunAtLoad</key><true/>{recovery}<key>ExitTimeOut</key><integer>35</integer></dict></plist>")
         } else if cfg!(windows) {
             let user = format!(
                 "{}\\{}",
@@ -1369,15 +1375,18 @@ impl SetupFixture {
             } else {
                 "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>255</Count></RestartOnFailure></Settings>"
             };
-            format!("<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><URI>\\CortexKit\\subc-daemon</URI></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>{recovery}<Actions Context=\"Author\"><Exec><Command>{xml}</Command></Exec></Actions></Task>")
+            format!("<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><URI>\\CortexKit\\subc-daemon</URI></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>{recovery}<Actions Context=\"Author\"><Exec><Command>{xml}</Command><Arguments>--config-store-root &quot;{store_xml}&quot;</Arguments></Exec></Actions></Task>")
         } else {
-            let daemon = raw
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-                .replace('%', "%%")
-                .replace('$', "$$");
+            let systemd = |text: &str| {
+                text.replace('\\', "\\\\")
+                    .replace('"', "\\\"")
+                    .replace('%', "%%")
+                    .replace('$', "$$")
+            };
+            let daemon = systemd(&raw);
+            let store = systemd(&raw_store);
             let timeout = if outdated { "" } else { "TimeoutStopSec=35\n" };
-            format!("[Unit]\nDescription=CortexKit subconscious daemon\n[Service]\nExecStart=\"{daemon}\"\nRestart=on-failure\nDelegate=yes\nDelegateSubgroup=daemon\nKillMode=mixed\n{timeout}[Install]\nWantedBy=default.target\n")
+            format!("[Unit]\nDescription=CortexKit subconscious daemon\n[Service]\nExecStart=\"{daemon}\" --config-store-root \"{store}\"\nRestart=on-failure\nDelegate=yes\nDelegateSubgroup=daemon\nKillMode=mixed\n{timeout}[Install]\nWantedBy=default.target\n")
         };
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, definition).unwrap();
@@ -2670,11 +2679,13 @@ fn setup_definition_command_matches_inventory_binary_path() {
             .expect("service executable element");
             command.text().unwrap().to_string()
         } else {
+            // The daemon path is the first quoted word; the config store
+            // argument follows it on the same line.
             text.lines()
                 .find_map(|line| line.strip_prefix("ExecStart=\""))
+                .and_then(|rest| rest.split_once('"'))
                 .unwrap()
-                .strip_suffix('"')
-                .unwrap()
+                .0
                 .to_string()
         };
         assert_eq!(actual, expected, "the service command must spell the inventory-owned daemon path identically (outdated={outdated})");

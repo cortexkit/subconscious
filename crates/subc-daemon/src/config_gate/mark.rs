@@ -160,10 +160,13 @@ pub(super) fn acknowledgement_refused(
 }
 
 /// `spawn`'s own delivery failed, so it no longer runs the active generation
-/// for sure.
+/// for sure. A marked spawn is lowered; an unmarked one is ruled out of a
+/// later activation the same way, so the order of its failure and its
+/// readiness report never decides whether it can be marked.
 pub(super) fn delivery_failed(owner: &RuntimeOwner, spawn: Option<&DeliverySpawn>) {
     if let Some(record) = spawn.and_then(DeliverySpawn::authority) {
-        if record.mark_facts().marked {
+        let facts = record.mark_facts();
+        if facts.marked || facts.unmarked {
             owner.mark_publisher().lower(record);
         }
     }

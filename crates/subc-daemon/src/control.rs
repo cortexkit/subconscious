@@ -34,6 +34,7 @@ use subc_protocol::{
         ProviderRole,
     },
     peer::{ObservedPeer, RouteBindPeer, OBSERVED_PEER_CAPABILITY, OPERATOR_APP_CAPABILITY},
+    provider_declarations::ProviderDeclarations,
     scope::{
         ScopeEnd, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
         CAP_ROUTE_ROLE_VERSIONS_V1, CAP_SCOPES_V1, SCOPE_APPLY_OP, SCOPE_DESCRIBE_OP,
@@ -437,6 +438,10 @@ pub struct ControlHandler {
     /// forgotten.
     #[cfg(test)]
     cleanup_pause: Arc<Mutex<Option<(u8, TestPause)>>>,
+    /// Runs once in `route.open`'s launch-nonce attestation, right after the
+    /// nonce is resolved, to interleave a nonce withdrawal there.
+    #[cfg(test)]
+    after_nonce_attestation: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
     /// Holds a registration channel's HELLO after its reader resolved the
     /// channel and before the blocking HELLO handler starts.
     #[cfg(test)]
@@ -1130,6 +1135,8 @@ impl ControlHandler {
             activity_request_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             cleanup_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            after_nonce_attestation: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             hello_ingress_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -2753,6 +2760,28 @@ impl ControlHandler {
         }
     }
 
+    /// Run `hook` once, in the next `route.open` that attests a launch nonce,
+    /// right after the nonce is resolved.
+    #[cfg(test)]
+    pub(crate) fn after_nonce_attestation_for_test(&self, hook: impl FnOnce() + Send + 'static) {
+        *self
+            .after_nonce_attestation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_after_nonce_attestation_for_test(&self) {
+        let hook = self
+            .after_nonce_attestation
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     #[cfg(test)]
     async fn pause_hello_ingress_for_test(&self) {
         let pause = self
@@ -3740,38 +3769,37 @@ impl ControlHandler {
         }
         // The spawn whose own registration this HELLO is, for `target` on
         // the route.open reply: its channel, or the launch its nonce was
-        // minted for. A prefix child's HELLO names no spawn of its own.
-        let target_authority = match (&channel_spawn, &prefix_binding) {
+        // minted for. A prefix child's HELLO names no spawn of its own. It is
+        // only looked up here. The connection is bound to it and its
+        // requested declarations are frozen once the registry has accepted
+        // this HELLO (`admit_hello_authority`), so a HELLO refused as a
+        // duplicate, or for any other reason, leaves the spawn untouched: its
+        // closing connection is then no registration of the spawn and ends
+        // none of the spawn's routes.
+        let hello_authority = match (&channel_spawn, &prefix_binding) {
             (Some(spawn), _) => Some(spawn.authority.clone()),
             (None, None) => hello.launch_nonce.as_deref().and_then(|nonce| {
                 self.supervisor
                     .spawned_consumer_record(&hello.manifest.module_id, nonce)
             }),
             (None, Some(_)) => None,
-        };
-        let differing_declarations = target_authority
-            .as_ref()
-            .map(|record| {
-                record.initialize_declarations(
-                    hello
-                        .manifest
-                        .provider_declarations
-                        .clone()
-                        .unwrap_or_default(),
-                )
-            })
-            .unwrap_or_default();
-        if let Some(record) = &target_authority {
-            self.forwarding
-                .bind_target_authority(connection_id, record.clone())
-                .map_err(RouterError::Forwarding)?;
         }
+        .map(|record| HelloAuthority {
+            record,
+            requested: hello
+                .manifest
+                .provider_declarations
+                .clone()
+                .unwrap_or_default(),
+            froze: Default::default(),
+        });
         #[cfg(test)]
         if prefix_binding.is_some() {
             self.claims.pause_prefix_hello_for_test(8);
         }
         if swap_candidate {
             let module_id = hello.manifest.module_id.clone();
+            let mut differing_declarations = Default::default();
             let reply = self.register_swap_candidate(
                 connection_id,
                 sink,
@@ -3780,6 +3808,8 @@ impl ControlHandler {
                 negotiated_ver,
                 control_ops,
                 hello_ack,
+                hello_authority.as_ref(),
+                &mut differing_declarations,
                 #[cfg(windows)]
                 hello.launch_nonce.as_deref(),
             )?;
@@ -3813,7 +3843,10 @@ impl ControlHandler {
                 .flatten()
                 .is_some()
             {
-                self.file_development_widening(target_authority, differing_declarations);
+                self.file_development_widening(
+                    hello_authority.map(|authority| authority.record),
+                    differing_declarations,
+                );
             }
             return Ok(reply);
         }
@@ -3857,6 +3890,19 @@ impl ControlHandler {
                 )?])
             }
         };
+        let differing_declarations =
+            match self.admit_hello_authority(connection_id, hello_authority.as_ref()) {
+                Ok(differing) => differing,
+                Err(err) => {
+                    if matches!(
+                        self.rollback_unpublished_hello(connection_id),
+                        Ok(r) if !r.is_empty()
+                    ) {
+                        crate::supervise::notify_registration_release();
+                    }
+                    return Err(RouterError::Forwarding(err));
+                }
+            };
         #[cfg(test)]
         self.hold_between_registry_and_forwarding();
 
@@ -3919,6 +3965,7 @@ impl ControlHandler {
                 ) {
                     crate::supervise::notify_registration_release();
                 }
+                self.refuse_hello_authority(connection_id, hello_authority.as_ref());
                 return Ok(vec![control_error_frame(
                     &frame,
                     if matches!(err, ForwardingError::ConnectionRoleConflict { .. }) {
@@ -3936,6 +3983,7 @@ impl ControlHandler {
                 connection_id = connection_id.get(),
                 "registration was removed before it could be published"
             );
+            self.refuse_hello_authority(connection_id, hello_authority.as_ref());
             return Ok(reply);
         }
 
@@ -3994,7 +4042,10 @@ impl ControlHandler {
             self.supervisor
                 .retire_unused_registration_channel(&registration.manifest.module_id, false);
         }
-        self.file_development_widening(target_authority, differing_declarations);
+        self.file_development_widening(
+            hello_authority.map(|authority| authority.record),
+            differing_declarations,
+        );
         #[cfg(windows)]
         if let Some(nonce) = hello.launch_nonce.as_deref() {
             self.supervisor
@@ -4036,6 +4087,8 @@ impl ControlHandler {
         negotiated_ver: u8,
         control_ops: Vec<String>,
         hello_ack: Frame,
+        hello_authority: Option<&HelloAuthority>,
+        differing_declarations: &mut ProviderDeclarations,
         #[cfg(windows)] launch_nonce: Option<&str>,
     ) -> Result<Vec<Frame>, RouterError> {
         let module_id = manifest.module_id.clone();
@@ -4051,6 +4104,8 @@ impl ControlHandler {
                     negotiated_ver,
                     control_ops,
                     hello_ack,
+                    hello_authority,
+                    differing_declarations,
                     #[cfg(windows)]
                     launch_nonce,
                 );
@@ -4081,6 +4136,8 @@ impl ControlHandler {
         negotiated_ver: u8,
         control_ops: Vec<String>,
         hello_ack: Frame,
+        hello_authority: Option<&HelloAuthority>,
+        differing_declarations: &mut ProviderDeclarations,
         #[cfg(windows)] launch_nonce: Option<&str>,
     ) -> Result<Vec<Frame>, RouterError> {
         let module_id = manifest.module_id.clone();
@@ -4113,6 +4170,18 @@ impl ControlHandler {
                     "registry_error",
                     err.to_string(),
                 )?])
+            }
+        };
+        *differing_declarations = match self.admit_hello_authority(connection_id, hello_authority) {
+            Ok(differing) => differing,
+            Err(err) => {
+                if matches!(
+                    self.rollback_unpublished_hello(connection_id),
+                    Ok(r) if !r.is_empty()
+                ) {
+                    crate::supervise::notify_registration_release();
+                }
+                return Err(RouterError::Forwarding(err));
             }
         };
         #[cfg(test)]
@@ -4151,6 +4220,7 @@ impl ControlHandler {
                 ) {
                     crate::supervise::notify_registration_release();
                 }
+                self.refuse_hello_authority(connection_id, hello_authority);
                 return Ok(vec![control_error_frame(
                     frame,
                     forwarding_error_code(&err),
@@ -4164,6 +4234,7 @@ impl ControlHandler {
                 connection_id = connection_id.get(),
                 "swap candidate registration was removed before it could be published"
             );
+            self.refuse_hello_authority(connection_id, hello_authority);
             return Ok(reply);
         }
         info!(
@@ -4179,6 +4250,50 @@ impl ControlHandler {
             self.supervisor.program_hello_accepted(&module_id, nonce);
         }
         Ok(reply)
+    }
+
+    /// Bind `connection` to the spawn its HELLO registers as and freeze the
+    /// spawn's requested provider declarations. Runs only once the registry
+    /// has accepted the HELLO, before its endpoint is published, so a route
+    /// reserved on the endpoint always finds the spawn. Returns the requested
+    /// entries that differ from the saved approvals, for a widening request.
+    fn admit_hello_authority(
+        &self,
+        connection: ConnectionId,
+        authority: Option<&HelloAuthority>,
+    ) -> Result<ProviderDeclarations, ForwardingError> {
+        let Some(authority) = authority else {
+            return Ok(ProviderDeclarations::new());
+        };
+        let froze = authority
+            .record
+            .freeze_declarations(authority.requested.clone());
+        authority
+            .froze
+            .store(froze.is_some(), std::sync::atomic::Ordering::Relaxed);
+        self.forwarding
+            .bind_target_authority(connection, authority.record.clone())
+            .inspect_err(|_| self.refuse_hello_authority(connection, Some(authority)))?;
+        Ok(froze.unwrap_or_default())
+    }
+
+    /// Undo [`Self::admit_hello_authority`] for a HELLO refused after the
+    /// registry accepted it, so the refused connection is no registration of
+    /// the spawn and the spawn's declarations are left for the HELLO that
+    /// does register it to freeze.
+    fn refuse_hello_authority(&self, connection: ConnectionId, authority: Option<&HelloAuthority>) {
+        let Some(authority) = authority else {
+            return;
+        };
+        if let Err(err) = self.forwarding.unbind_target_authority(connection) {
+            warn!(error = %err, "failed to unbind a refused HELLO from its spawn");
+        }
+        if authority
+            .froze
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            authority.record.unfreeze_refused_declarations();
+        }
     }
 
     fn build_hello_ack(
@@ -5896,29 +6011,6 @@ impl ControlHandler {
             &response,
             "ClientControlResponse::CatalogList",
         )?])
-    }
-
-    /// The principal a `consumer_identity` attests by launch nonce alone:
-    /// `Direct` when it presents none, `Reserved` when its launch nonce
-    /// verifies, and `None` when it does not. Only a read of the supervisor's
-    /// nonces, so it can run before any refusal check without changing which
-    /// check refuses. `route.open` attests through
-    /// [`Self::attest_route_open_consumer`], which reads a claim binding first.
-    fn attest_nonce_consumer(
-        &self,
-        consumer_identity: Option<&ConsumerIdentity>,
-    ) -> Option<Principal> {
-        let Some(consumer_identity) = consumer_identity else {
-            return Some(Principal::Direct);
-        };
-        self.supervisor
-            .spawned_consumer_authorized(
-                &consumer_identity.module_id,
-                &consumer_identity.launch_nonce,
-            )
-            .then(|| Principal::Reserved {
-                module_id: consumer_identity.module_id.clone(),
-            })
     }
 
     /// The caller fields for a refusal that only has the raw request frame,
@@ -10399,6 +10491,17 @@ pub(crate) fn control_response_body_frame<T: Serialize>(
 /// are load-bearing.
 ///
 /// Pin identity here the moment a consumer branches on a specific code.
+/// The spawn a HELLO would register as and the provider declarations it
+/// requests, carried from the HELLO's checks to the point the registry
+/// accepts it.
+struct HelloAuthority {
+    record: Arc<crate::spawn_authority::SpawnAuthorityRecord>,
+    requested: ProviderDeclarations,
+    /// Whether admitting this HELLO froze the spawn's requested declarations,
+    /// so a refusal after admission undoes that freeze and no other.
+    froze: std::sync::atomic::AtomicBool,
+}
+
 fn forwarding_error_code(err: &ForwardingError) -> &'static str {
     match err {
         ForwardingError::ConnectionRoleConflict { .. } => "invalid_request",

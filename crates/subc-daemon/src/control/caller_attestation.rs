@@ -181,17 +181,30 @@ impl ControlHandler {
         let Some(consumer_identity) = consumer_identity else {
             return Some(ConsumerAttestation::direct());
         };
-        self.attest_nonce_consumer(Some(consumer_identity))
-            .map(|principal| ConsumerAttestation {
-                principal,
-                spawn: self
-                    .supervisor
-                    .spawned_consumer_record(
-                        &consumer_identity.module_id,
-                        &consumer_identity.launch_nonce,
-                    )
-                    .map(|record| (record, CallerClaim::Legacy)),
-            })
+        // One step resolves the nonce's principal and its launch's record, so
+        // a launch ending or a swap nonce withdrawn mid-open can never leave
+        // a `reserved` principal with no record, no caller key and no epoch
+        // fence. Only a nonce no launch was ever recorded for attests the
+        // module with no record.
+        let attested = self.supervisor.attest_spawned_consumer(
+            &consumer_identity.module_id,
+            &consumer_identity.launch_nonce,
+        );
+        #[cfg(test)]
+        self.pause_after_nonce_attestation_for_test();
+        let spawn = match attested {
+            crate::supervise::NonceAttestation::Refused => return None,
+            crate::supervise::NonceAttestation::Unrecorded => None,
+            crate::supervise::NonceAttestation::Spawn(record) => {
+                Some((record, CallerClaim::Legacy))
+            }
+        };
+        Some(ConsumerAttestation {
+            principal: Principal::Reserved {
+                module_id: consumer_identity.module_id.clone(),
+            },
+            spawn,
+        })
     }
 
     /// The registration whose manifest the caller-side `route.open` checks

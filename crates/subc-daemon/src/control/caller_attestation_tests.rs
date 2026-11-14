@@ -488,6 +488,50 @@ async fn caller_attestation_nonce_consumer_attests_legacy() {
 }
 
 #[tokio::test]
+async fn caller_attestation_nonce_withdrawn_mid_open_keeps_the_resolved_record() {
+    let rig = rig().await;
+    let mut target =
+        unsupervised_target(&rig, "withdrawn-target", &[CALLER_ATTESTATION_CAPABILITY]).await;
+    let nonce = rig
+        .handler
+        .supervisor
+        .spawn_nonce("claims-module")
+        .expect("an ungated launch receives a nonce");
+    // The nonce is withdrawn, as a swap promotion or a respawn withdraws
+    // it, right after the open's attestation resolved it.
+    let supervisor = rig.handler.supervisor.clone();
+    rig.handler.after_nonce_attestation_for_test(move || {
+        supervisor.set_spawn_nonce("claims-module", "withdrawn".into());
+    });
+    let mut opener = Net::new(rig.router.clone()).await;
+    opener
+        .send(open_frame(
+            "withdrawn-target",
+            false,
+            Some(subc_control::ConsumerIdentity {
+                module_id: "claims-module".into(),
+                launch_nonce: nonce,
+            }),
+        ))
+        .await;
+    let bind = next_bind(&mut target).await;
+    assert_eq!(
+        rig.handler
+            .supervisor
+            .spawn_nonce("claims-module")
+            .as_deref(),
+        Some("withdrawn"),
+        "the withdrawal ran inside the open"
+    );
+    // The open carries the record it was authorized with: its caller key
+    // and spawn epoch, never a bare reserved principal.
+    let caller = &body(&bind)["caller"];
+    assert_eq!(caller["claim"], "legacy", "{}", text(&bind));
+    assert_eq!(caller["spawn"], rig.spawn.authority.spawn_number());
+    assert_eq!(caller["authority_epoch"], 0);
+}
+
+#[tokio::test]
 async fn caller_attestation_is_absent_for_direct_callers_and_undeclared_targets() {
     let mut rig = rig().await;
     let mut declared =
@@ -761,6 +805,127 @@ async fn caller_attestation_registration_end_is_an_authority_change() {
     })
     .await
     .expect("the ended registration must publish a new epoch");
+}
+
+/// HELLO for `module_id` on a fresh connection, presenting the launch nonce
+/// of the module's live spawn and requesting `declarations`.
+async fn nonce_hello(rig: &Rig, module_id: &str, declarations: serde_json::Value) -> (Net, Frame) {
+    let nonce = rig
+        .handler
+        .supervisor
+        .spawn_nonce(module_id)
+        .expect("an ungated launch receives a nonce");
+    let mut manifest = tool_manifest(module_id, &[], &[]);
+    manifest.provider_declarations = Some(serde_json::from_value(declarations).unwrap());
+    let hello = subc_protocol::ModuleHelloBody {
+        manifest,
+        protocol_ver: PROTOCOL_VERSION,
+        control_ops: None,
+        launch_nonce: Some(nonce),
+    };
+    let mut net = Net::new(rig.router.clone()).await;
+    let reply = net
+        .call(
+            Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                3,
+                serde_json::to_vec(&hello).unwrap(),
+            )
+            .unwrap(),
+        )
+        .await;
+    (net, reply)
+}
+
+/// Close `net` and wait until the daemon has torn its connection down.
+async fn close_and_settle(rig: &Rig, net: Net) {
+    let connection = connection_of(rig, &net);
+    drop(net);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while rig
+            .handler
+            .caller_endpoints
+            .lock()
+            .unwrap()
+            .contains_key(&connection)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the closed connection must be torn down");
+    // Teardown publishes an ended registration's authority change after it
+    // forgets the connection; give that step time to land if it is coming.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+}
+
+#[tokio::test]
+async fn spawn_authority_hello_refused_as_duplicate_leaves_the_live_spawns_routes_open() {
+    let rig = rig().await;
+    let (mut target, spawn, _module) = supervised_target(&rig, "duplicate-target", &[]).await;
+    let mut opener = Net::new(rig.router.clone()).await;
+    let (_, reply) = open(&mut opener, &mut target, "duplicate-target", false).await;
+    assert_eq!(reply.header.ty, FrameType::Response, "{}", text(&reply));
+    let key = spawn.authority.key();
+    assert_eq!(rig.handler.forwarding.published_spawn_epoch(&key), 0);
+
+    let (duplicate, refused) = nonce_hello(&rig, "duplicate-target", json!({})).await;
+    assert_eq!(refused.header.ty, FrameType::Error, "{}", text(&refused));
+    assert_eq!(body(&refused)["code"], "duplicate_module_id");
+    // While the refused connection is open, only the live registration is
+    // the spawn's.
+    assert_eq!(
+        rig.handler.forwarding.connection_for_spawn(&key).unwrap(),
+        Some(connection_of(&rig, &target))
+    );
+    assert!(rig
+        .handler
+        .forwarding
+        .target_authority_for_connection(connection_of(&rig, &duplicate))
+        .unwrap()
+        .is_none());
+    close_and_settle(&rig, duplicate).await;
+
+    assert!(spawn.authority.alive());
+    assert_eq!(
+        rig.handler.forwarding.published_spawn_epoch(&key),
+        0,
+        "the refused connection's close is no authority change of the live spawn"
+    );
+    assert_eq!(spawn.authority.epoch_for_test(), 0);
+    assert_eq!(
+        rig.handler
+            .forwarding
+            .route_authority_for_test(connection_of(&rig, &opener))
+            .len(),
+        1,
+        "the live spawn's route stays open"
+    );
+}
+
+#[tokio::test]
+async fn spawn_authority_refused_hello_leaves_the_spawns_declarations_unfrozen() {
+    let rig = rig().await;
+    // Another connection already holds the module id, so the spawn's own
+    // nonce HELLO is refused as a duplicate.
+    let holder = unsupervised_target(&rig, "unfrozen-target", &[]).await;
+    let (_net, spawn, _module, _) =
+        network_primary_with_hello(&rig, "unfrozen-target", false).await;
+    let (_refused_net, refused) =
+        nonce_hello(&rig, "unfrozen-target", json!({"provider": {"v": 1}})).await;
+    assert_eq!(refused.header.ty, FrameType::Error, "{}", text(&refused));
+    assert_eq!(body(&refused)["code"], "duplicate_module_id");
+
+    // The HELLO that does register the spawn still freezes its own request.
+    let own = serde_json::from_value(json!({"provider": {"v": 2}})).unwrap();
+    assert!(
+        spawn.authority.freeze_declarations(own).is_some(),
+        "a refused HELLO must not freeze the spawn's requested declarations"
+    );
+    drop(holder);
 }
 
 #[tokio::test]

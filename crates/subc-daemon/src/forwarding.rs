@@ -749,6 +749,10 @@ struct ForwardingInner {
     /// The spawns whose first-party mark is raised, published by activation
     /// and withdrawn by lowering or death, for the reply's `target`.
     spawn_marks: HashSet<SpawnKey>,
+    /// Spawns published dead whose `spawn_epochs` entry is kept as a
+    /// tombstone. A module keeps the tombstone of its most recent death, plus
+    /// those a pending bind still names, so they cannot pile up.
+    dead_spawns: HashSet<SpawnKey>,
     next_generation: u64,
     reserved_client: HashMap<ClientRouteKey, ModuleRouteKey>,
     reserved_module: HashMap<ModuleRouteKey, ClientRouteKey>,
@@ -909,6 +913,18 @@ impl ForwardingTable {
         inner
             .target_authority_by_connection
             .insert(connection, record);
+        Ok(())
+    }
+
+    /// Undo [`Self::bind_target_authority`] for a HELLO that was refused
+    /// after it: the connection is no registration of the spawn.
+    pub(crate) fn unbind_target_authority(
+        &self,
+        connection: ConnectionId,
+    ) -> Result<(), ForwardingError> {
+        self.write_inner()?
+            .target_authority_by_connection
+            .remove(&connection);
         Ok(())
     }
     /// The spawn whose own module registration `connection` is, if any.
@@ -3614,11 +3630,14 @@ impl ForwardingTable {
     /// that commits after it sees the new epoch and is refused as stale.
     ///
     /// Unlike [`Self::publish_scope_changes`], every client route is scanned,
-    /// scoped or not. Once a spawn is dead (`alive` false), the epochs and
-    /// marks of its module's older spawns are dropped: their connections are
-    /// gone and the liveness checks at commit refuse any bind still naming
-    /// them. `first_party` is the spawn's mark after the change; a lowering
-    /// withdraws it here, in the same critical section as the epoch.
+    /// scoped or not. Once a spawn is dead (`alive` false), its own mark and
+    /// approved set are dropped and its epoch stays as a tombstone, so a bind
+    /// still naming it is refused as stale. Another spawn of the same module
+    /// is never touched: a blue/green swap candidate takes a higher spawn
+    /// number than the incumbent that keeps serving beside it, so spawn order
+    /// says nothing about which of them is still alive. `first_party` is the
+    /// spawn's mark after the change; a lowering withdraws it here, in the
+    /// same critical section as the epoch.
     pub(crate) fn publish_authority_change(
         &self,
         key: &SpawnKey,
@@ -3640,21 +3659,17 @@ impl ForwardingTable {
         approved: Option<&ApprovedDeclarations>,
     ) -> Result<Vec<AuthorityClosedRoute>, ForwardingError> {
         let mut inner = self.write_inner()?;
-        if let Some(approved) = approved {
+        if !alive {
+            inner.spawn_approved.remove(key);
+            inner.dead_spawns.insert(key.clone());
+            prune_dead_spawn_tombstones_locked(&mut inner, key);
+        } else if let Some(approved) = approved {
             inner.spawn_approved.insert(key.clone(), approved.clone());
         }
-        if !alive {
-            inner
-                .spawn_approved
-                .retain(|other, _| other.module_id != key.module_id || other.spawn >= key.spawn);
-            inner
-                .spawn_epochs
-                .retain(|other, _| other.module_id != key.module_id || other.spawn >= key.spawn);
-            inner
-                .spawn_marks
-                .retain(|other| other.module_id != key.module_id || other.spawn > key.spawn);
-        }
-        inner.spawn_epochs.insert(key.clone(), epoch);
+        // A record's epoch only rises; taking the larger keeps a published
+        // epoch from ever moving backwards, whatever order publications land.
+        let published = inner.spawn_epochs.entry(key.clone()).or_insert(epoch);
+        *published = (*published).max(epoch);
         if !alive || first_party == Some(false) {
             inner.spawn_marks.remove(key);
         } else if first_party == Some(true) {
@@ -4238,6 +4253,38 @@ fn published_epoch_locked(inner: &ForwardingInner, key: &SpawnKey) -> u64 {
         .get(key)
         .copied()
         .unwrap_or(crate::spawn_authority::INITIAL_AUTHORITY_EPOCH)
+}
+
+/// Drop the epoch tombstones of `newest`'s module's earlier dead spawns that
+/// no pending bind names any more. A tombstone a pending bind still names is
+/// kept, so that bind is refused as stale at commit rather than compared with
+/// the initial epoch an absent entry reads as. Live spawns are never in
+/// `dead_spawns`, so their entries are never touched here.
+fn prune_dead_spawn_tombstones_locked(inner: &mut ForwardingInner, newest: &SpawnKey) {
+    let named = inner
+        .pending_relays
+        .values()
+        .flat_map(|pending| {
+            [
+                pending.caller_authority.as_ref(),
+                pending.target_authority.pair(),
+            ]
+        })
+        .flatten()
+        .map(|pair| pair.key.clone())
+        .collect::<HashSet<_>>();
+    let expired = inner
+        .dead_spawns
+        .iter()
+        .filter(|dead| {
+            dead.module_id == newest.module_id && *dead != newest && !named.contains(*dead)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for dead in expired {
+        inner.dead_spawns.remove(&dead);
+        inner.spawn_epochs.remove(&dead);
+    }
 }
 
 fn authority_stale_locked(inner: &ForwardingInner, pair: Option<&AuthorityPair>) -> bool {

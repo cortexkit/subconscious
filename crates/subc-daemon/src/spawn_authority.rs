@@ -383,9 +383,18 @@ impl SpawnAuthorityRecord {
         &self,
         requested: ProviderDeclarations,
     ) -> ProviderDeclarations {
+        self.freeze_declarations(requested).unwrap_or_default()
+    }
+
+    /// [`Self::initialize_declarations`], returning `None` when this call
+    /// froze nothing: the record is dead or an earlier HELLO froze its request.
+    pub(crate) fn freeze_declarations(
+        &self,
+        requested: ProviderDeclarations,
+    ) -> Option<ProviderDeclarations> {
         let mut state = self.lock();
         if !state.alive || state.requested.is_some() {
-            return Default::default();
+            return None;
         }
         let mut differing = ProviderDeclarations::new();
         let mut entries = ProviderDeclarations::new();
@@ -405,7 +414,16 @@ impl SpawnAuthorityRecord {
             entries,
         };
         state.requested = Some(requested);
-        differing
+        Some(differing)
+    }
+
+    /// Undo a freeze made by [`Self::freeze_declarations`] for a HELLO that
+    /// was refused after it, so the HELLO that does register the spawn
+    /// freezes its own request.
+    pub(crate) fn unfreeze_refused_declarations(&self) {
+        let mut state = self.lock();
+        state.requested = None;
+        state.approved = ApprovedDeclarations::none_approved();
     }
 
     /// Authority state precedes forwarding. Only entries

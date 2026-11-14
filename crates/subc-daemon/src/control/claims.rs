@@ -3223,6 +3223,31 @@ pub(crate) mod tests {
 
     pub(crate) async fn swap_candidate(rig: &Rig, module_id: &str) -> SwapRig {
         let (incumbent, _spawn, module, incumbent_id) = network_primary(rig, module_id).await;
+        let (candidate, candidate_id, swap) = start_swap_candidate(rig, module_id, &module).await;
+        SwapRig {
+            incumbent,
+            candidate,
+            module,
+            swap,
+            incumbent_id,
+            candidate_id,
+        }
+    }
+
+    /// Start a blue/green swap of `module`, whose incumbent is already
+    /// registered, and register the candidate's HELLO (not ready). Returns
+    /// the candidate's connection and the running swap.
+    pub(crate) async fn start_swap_candidate(
+        rig: &Rig,
+        module_id: &str,
+        module: &SupervisedModule,
+    ) -> (
+        Net,
+        ConnectionId,
+        tokio::task::JoinHandle<
+            Result<crate::supervise::SwapOutcome, crate::supervise::SuperviseError>,
+        >,
+    ) {
         let swapping = module.clone();
         let swap = tokio::spawn(async move { swapping.swap(Some(Duration::from_secs(5))).await });
         let candidate = tokio::time::timeout(Duration::from_secs(2), async {
@@ -3296,14 +3321,7 @@ pub(crate) mod tests {
             Some(module_id),
             "candidate must be indexed by its connection"
         );
-        SwapRig {
-            incumbent,
-            candidate: net,
-            module,
-            swap,
-            incumbent_id,
-            candidate_id,
-        }
+        (net, candidate_id, swap)
     }
 
     #[tokio::test]

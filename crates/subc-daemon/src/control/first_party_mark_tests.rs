@@ -50,6 +50,127 @@ async fn route_closed(opener: &mut Net) -> Value {
     }
 }
 
+/// A blue/green swap candidate registered beside `incumbent`, numbered
+/// above it as every newer spawn of a module is.
+struct Candidate {
+    net: Net,
+    record: Arc<crate::spawn_authority::SpawnAuthorityRecord>,
+    _swap: tokio::task::JoinHandle<
+        Result<crate::supervise::SwapOutcome, crate::supervise::SuperviseError>,
+    >,
+}
+
+async fn register_candidate(
+    rig: &Rig,
+    module_id: &str,
+    module: &crate::supervise::SupervisedModule,
+    incumbent: &crate::supervise::RegistrationSpawn,
+) -> Candidate {
+    let (net, _, swap) =
+        crate::control::claims::tests::start_swap_candidate(rig, module_id, module).await;
+    let record = rig
+        .handler
+        .supervisor
+        .registration_for_test(module_id)
+        .unwrap()
+        .authority
+        .clone();
+    assert!(
+        record.spawn_number() > incumbent.authority.spawn_number(),
+        "a swap candidate is numbered above its incumbent"
+    );
+    Candidate {
+        net,
+        record,
+        _swap: swap,
+    }
+}
+
+/// End the candidate's registration before cutover and wait until its
+/// death is published.
+async fn candidate_dies(rig: &Rig, candidate: Candidate) {
+    let Candidate { net, record, _swap } = candidate;
+    drop(net);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while record.alive() || rig.handler.forwarding.published_spawn_epoch(&record.key()) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the candidate's death must be published");
+}
+
+#[tokio::test]
+async fn first_party_mark_incumbent_keeps_its_published_authority_when_a_newer_candidate_dies() {
+    let rig = rig().await;
+    let (mut target, spawn, module, _) =
+        network_primary_with_hello(&rig, "swap-marked", false).await;
+    spawn
+        .authority
+        .initialize_origin(CallerOrigin::Development, Default::default(), Some(false));
+    spawn.authority.set_development_daemon_for_test(true);
+    let entries = serde_json::from_value(json!({"provider": {"items": ["one"]}})).unwrap();
+    let mut manifest = tool_manifest("swap-marked", &[], &[]);
+    manifest.provider_declarations = Some(entries);
+    hello(&mut target, manifest).await;
+    let entries = serde_json::from_value(json!({"provider": {"items": ["one"]}})).unwrap();
+    rig.handler
+        .approve_spawn_declarations(&spawn.authority, &entries);
+    assert!(publisher(&rig).activate(&spawn.authority));
+    let approved = spawn.authority.approved();
+    assert_eq!(approved.entries, entries);
+    let key = spawn.authority.key();
+    assert_eq!(rig.handler.forwarding.published_spawn_epoch(&key), 1);
+
+    let candidate = register_candidate(&rig, "swap-marked", &module, &spawn).await;
+    candidate_dies(&rig, candidate).await;
+
+    assert!(
+        spawn.authority.first_party(),
+        "the incumbent's record is untouched"
+    );
+    let mut opener = Net::new(rig.router.clone()).await;
+    let (_, reply) = open(&mut opener, &mut target, "swap-marked", false).await;
+    assert_eq!(reply.header.ty, FrameType::Response, "{}", text(&reply));
+    let target_facts = &body(&reply)["target"];
+    assert_eq!(target_facts["first_party"], true, "{target_facts}");
+    assert_eq!(target_facts["authority_epoch"], 1, "{target_facts}");
+    assert_eq!(
+        target_facts["approved_declarations_digest"], approved.digest,
+        "{target_facts}"
+    );
+    assert_eq!(rig.handler.forwarding.published_spawn_epoch(&key), 1);
+}
+
+#[tokio::test]
+async fn first_party_mark_lowered_incumbent_bind_stays_stale_when_a_newer_candidate_dies() {
+    let rig = rig().await;
+    let (mut target, spawn, module) = supervised_target(&rig, "swap-lowered", &[]).await;
+    spawn.authority.set_origin_for_test(CallerOrigin::Release);
+    let publisher = publisher(&rig);
+    assert!(publisher.activate(&spawn.authority));
+    let candidate = register_candidate(&rig, "swap-lowered", &module, &spawn).await;
+
+    // A bind to the marked incumbent is captured at epoch 0, then the
+    // incumbent is lowered to epoch 1 while the bind waits for its ack.
+    let mut opener = Net::new(rig.router.clone()).await;
+    opener.send(open_frame("swap-lowered", false, None)).await;
+    let pending = next_bind(&mut target).await;
+    publisher.lower(&spawn.authority);
+    let key = spawn.authority.key();
+    assert_eq!(rig.handler.forwarding.published_spawn_epoch(&key), 1);
+
+    candidate_dies(&rig, candidate).await;
+    ack(&mut target, &pending).await;
+    let reply = open_reply(&mut opener).await;
+    assert_eq!(reply.header.ty, FrameType::Error, "{}", text(&reply));
+    assert_eq!(
+        body(&reply)["code"],
+        subc_protocol::error_codes::STALE_AUTHORITY_EPOCH
+    );
+    assert_eq!(rig.handler.forwarding.published_spawn_epoch(&key), 1);
+}
+
 #[tokio::test]
 async fn first_party_mark_activation_keeps_epochs_and_routes_and_a_pending_bind_commits_unmarked() {
     let mut rig = rig().await;

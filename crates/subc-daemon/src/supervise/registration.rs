@@ -21,6 +21,20 @@ use std::sync::{
 /// exit has been observed. Terminal: the channel never carries authority again.
 pub(crate) const REGISTRATION_CHANNEL_CLOSED: &str = "registration_channel_closed";
 
+/// What a consumer's launch nonce attests, from
+/// [`SupervisorHandle::attest_spawned_consumer`].
+#[derive(Debug)]
+pub(crate) enum NonceAttestation {
+    /// The nonce does not attest the module, or the launch it was minted for
+    /// had an authority record that is gone.
+    Refused,
+    /// The nonce attests the module and no launch was ever recorded for it,
+    /// so the consumer is the module with no spawn record behind it.
+    Unrecorded,
+    /// The nonce attests the module through this launch's record.
+    Spawn(Arc<crate::spawn_authority::SpawnAuthorityRecord>),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LaunchState {
     Pending,
@@ -442,12 +456,69 @@ impl SupervisorHandle {
         let Some(nonce) = nonce.filter(|nonce| !nonce.is_empty()) else {
             return;
         };
+        let current = self.current_launch_nonces();
         let mut launches = self
             .nonce_launches
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        launches.retain(|_, launch| launch.strong_count() != 0);
-        launches.insert(nonce, Arc::downgrade(spawn));
+        launches.retain(|nonce, (_, launch)| launch.strong_count() != 0 || current.contains(nonce));
+        launches.insert(nonce, (spawn.module_id.clone(), Arc::downgrade(spawn)));
+    }
+
+    /// Every nonce that can still authorize a consumer: each module's recorded
+    /// spawn nonce and both nonces of each open swap.
+    fn current_launch_nonces(&self) -> std::collections::HashSet<String> {
+        let mut current = self
+            .spawn_nonces
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        for swap in self
+            .swaps
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+        {
+            current.insert(swap.candidate_nonce.clone());
+            current.extend(swap.incumbent_nonce.clone());
+        }
+        current
+    }
+
+    /// What a consumer presenting `presented` as `module_id`'s launch nonce
+    /// attests, decided in one step: the launch the nonce was minted for is
+    /// resolved first and held, then the nonce is authorized exactly as
+    /// `spawned_consumer_authorized` decides. A launch that ends, or a nonce
+    /// that is withdrawn, after that step is caught later by the record's own
+    /// liveness, never turned into a principal with no record.
+    pub(crate) fn attest_spawned_consumer(
+        &self,
+        module_id: &str,
+        presented: &str,
+    ) -> NonceAttestation {
+        let recorded = self
+            .nonce_launches
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(presented)
+            .map(|(module, launch)| (module.clone(), launch.upgrade()));
+        if !self.spawned_consumer_authorized(module_id, presented) {
+            return NonceAttestation::Refused;
+        }
+        match recorded {
+            // No launch was ever recorded for this nonce: the legacy launch
+            // nonce with no registration spawn behind it.
+            None => NonceAttestation::Unrecorded,
+            Some((module, Some(spawn))) if module == module_id => {
+                NonceAttestation::Spawn(spawn.authority.clone())
+            }
+            // The nonce's launch had a record and it is gone, or the launch
+            // belongs to another module. Either way the record that would
+            // fence this consumer is not there, so it attests nothing.
+            Some(_) => NonceAttestation::Refused,
+        }
     }
 
     /// The authority record of the launch whose nonce `presented` is, when it
@@ -458,16 +529,10 @@ impl SupervisorHandle {
         module_id: &str,
         presented: &str,
     ) -> Option<Arc<crate::spawn_authority::SpawnAuthorityRecord>> {
-        if !self.spawned_consumer_authorized(module_id, presented) {
-            return None;
+        match self.attest_spawned_consumer(module_id, presented) {
+            NonceAttestation::Spawn(record) => Some(record),
+            NonceAttestation::Unrecorded | NonceAttestation::Refused => None,
         }
-        self.nonce_launches
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(presented)
-            .and_then(Weak::upgrade)
-            .filter(|spawn| spawn.module_id == module_id)
-            .map(|spawn| spawn.authority.clone())
     }
 
     pub(crate) fn retire_unused_registration_channel(&self, module: &str, candidate: bool) {

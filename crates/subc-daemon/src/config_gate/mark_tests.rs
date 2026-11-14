@@ -429,3 +429,91 @@ fn first_party_mark_failed_delivery_lowers_the_spawn() {
     ));
     assert_unmarked_lowered(&record);
 }
+
+#[test]
+fn first_party_mark_failed_delivery_rules_out_a_spawn_not_yet_marked() {
+    let (rig, owner) = active_then_incumbent_gone();
+    let record = released(2);
+    let spawn = launch(&owner, &record, true);
+    register(&rig, &owner, RESTARTED, &spawn);
+    // The spawn acknowledged the active generation but has not reported
+    // ready when its delivery of the next one fails.
+    assert_eq!(ack(&owner, RESTARTED), AppliedDisposition::CatchupComplete);
+    assert_unmarked(&record, MarkStatus::AwaitingReadiness);
+    approve(&rig, &owner, 2);
+    let view = pending(&owner, RESTARTED);
+    assert_eq!(view.generation, 2);
+    assert!(matches!(
+        applied(&owner, RESTARTED, &view, false).unwrap(),
+        AppliedDisposition::Failed { .. }
+    ));
+    assert_unmarked(&record, MarkStatus::Lowered);
+    // Reporting ready afterwards never activates it, and nothing it
+    // attested changed, so its epoch did not move.
+    owner.mark_ready(&spawn).unwrap();
+    assert_unmarked(&record, MarkStatus::Lowered);
+    assert_eq!(record.epoch_for_test(), INITIAL_AUTHORITY_EPOCH);
+}
+
+#[tokio::test]
+async fn first_party_mark_warm_up_probe_never_consumes_the_mark_acknowledgement() {
+    // Generation 2 rebinds routes, so its route policy is installed and the
+    // ordinary delivery waits on route readiness; it becomes active.
+    let (rig, owner) = rig();
+    applied(&owner, INCUMBENT, &pending(&owner, INCUMBENT), true).unwrap();
+    let owner = std::sync::Arc::new(owner);
+    let forwarding = std::sync::Arc::new(crate::ForwardingTable::default());
+    let (module_tx, _module_rx) = tokio::sync::mpsc::channel(32);
+    forwarding
+        .register_module_connection(
+            INCUMBENT,
+            "a".into(),
+            subc_protocol::PROTOCOL_VERSION,
+            subc_protocol::manifest::Concurrency::ModuleManaged,
+            crate::FrameSink::new(module_tx),
+        )
+        .unwrap();
+    let _handler = crate::ControlHandler::with_forwarding(
+        std::sync::Arc::new(crate::Registry::default()),
+        forwarding,
+    )
+    .with_config_runtime(owner.clone());
+    approve_kinds(&rig, &owner, &[subc_config::ApplyKind::RouteRebind]);
+    let view = pending(&owner, INCUMBENT);
+    assert_eq!(
+        applied(&owner, INCUMBENT, &view, true).unwrap(),
+        AppliedDisposition::WaitingForReadiness
+    );
+    owner
+        .install_approved_route_policy("a", view.generation)
+        .await
+        .expect("the acknowledged route policy installs");
+    owner.ready(INCUMBENT, "a", view.generation).unwrap();
+    assert_active(&owner, INCUMBENT, 2);
+    owner.disconnected(INCUMBENT);
+
+    // A restarted spawn is asked to acknowledge the active generation for
+    // its mark, and a warm-up health probe answers not ready first.
+    let record = released(3);
+    let spawn = launch(&owner, &record, true);
+    register(&rig, &owner, RESTARTED, &spawn);
+    let catchup = pending(&owner, RESTARTED);
+    assert_eq!(catchup.generation, 2);
+    let probe = owner
+        .delivery_health_probe(RESTARTED, "a")
+        .unwrap()
+        .expect("the restarted spawn is probed");
+    assert_eq!(owner.delivery_health_result(probe, false).unwrap(), None);
+    assert_unmarked(&record, MarkStatus::AwaitingAcknowledgement);
+    // Nor is a route-policy probe due for an attempt that only asks for the
+    // acknowledgement.
+    assert_eq!(owner.policy_probe_due(RESTARTED).unwrap(), None);
+
+    // Its own acknowledgement still settles the attempt and earns the mark.
+    assert_eq!(
+        applied(&owner, RESTARTED, &catchup, true).unwrap(),
+        AppliedDisposition::CatchupComplete
+    );
+    owner.mark_ready(&spawn).unwrap();
+    assert!(record.first_party(), "{:?}", record.mark_status());
+}

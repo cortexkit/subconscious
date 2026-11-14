@@ -81,6 +81,7 @@ mod config_delivery;
 mod content_binding;
 mod program_binding;
 mod registration;
+pub(crate) use registration::NonceAttestation;
 #[cfg(all(test, unix))]
 pub(crate) use registration::RegistrationProof;
 pub(crate) use registration::RegistrationSpawn;
@@ -2537,9 +2538,12 @@ pub struct SupervisorHandle {
     /// reserved_nonces because consumer route.open attestation applies to all spawned
     /// modules, while HELLO id-squatting protection remains opt-in via `reserved`.
     spawn_nonces: Arc<Mutex<HashMap<String, String>>>,
-    /// The launch each live launch nonce was minted for, so a nonce-attested
-    /// consumer or registration resolves to that launch's authority record.
-    nonce_launches: Arc<Mutex<HashMap<String, std::sync::Weak<RegistrationSpawn>>>>,
+    /// The launch each live launch nonce was minted for, keyed by nonce, with
+    /// the launch's module id, so a nonce-attested consumer or registration
+    /// resolves to that launch's authority record. An entry whose launch has
+    /// ended stays while its nonce still authorizes, so a nonce whose record
+    /// is gone is told apart from one that never had a record.
+    nonce_launches: Arc<Mutex<HashMap<String, (String, std::sync::Weak<RegistrationSpawn>)>>>,
     /// Reserved namespace prefixes mapped to the supervised owner module whose
     /// current spawn nonce authorizes HELLO claims below the prefix.
     ///

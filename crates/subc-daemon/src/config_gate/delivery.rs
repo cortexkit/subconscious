@@ -570,7 +570,10 @@ impl RuntimeOwner {
             return Ok(None);
         };
         let (module, generation, attempt) = (bound.module.clone(), bound.generation, bound.id);
+        // A mark-only attempt asks for an acknowledgement and nothing else;
+        // readiness and route policy belong to the spawn's ordinary delivery.
         if bound.ready
+            || bound.mark_only
             || bound.policy_probe_requested
             || state.active_declarations.get(&module) != Some(&connection)
             || !state
@@ -684,7 +687,12 @@ impl RuntimeOwner {
             {
                 return Ok(None);
             }
-            let attempt = current.map(|bound| bound.id);
+            // A warm-up probe answering not ready is no answer to a mark-only
+            // attempt: only the spawn's own acknowledgement settles it, so a
+            // spawn still warming up is never refused the mark by a probe.
+            let attempt = current
+                .filter(|bound| !bound.mark_only)
+                .map(|bound| bound.id);
             if !healthy
                 && (!super::route_policy::ready(&mut state, &probe.module, probe.generation)?
                     || !state

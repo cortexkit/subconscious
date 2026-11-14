@@ -32,8 +32,7 @@ async fn new_approval_restarts_gate_stopped(recovery: bool) {
         .unwrap();
     fixture.module.seed_crash_budget_for_test(100);
     rustix::process::kill_process(
-        rustix::process::Pid::from_raw(fixture.module.status().unwrap().pid.unwrap() as i32)
-            .unwrap(),
+        rustix::process::Pid::from_raw(reported_pid(&fixture.module).await as i32).unwrap(),
         rustix::process::Signal::KILL,
     )
     .unwrap();
@@ -140,8 +139,7 @@ async fn changed_crash_failed_start_cancels_retry(fail_start: bool) {
         .unwrap();
     fixture.module.seed_crash_budget_for_test(100);
     rustix::process::kill_process(
-        rustix::process::Pid::from_raw(fixture.module.status().unwrap().pid.unwrap() as i32)
-            .unwrap(),
+        rustix::process::Pid::from_raw(reported_pid(&fixture.module).await as i32).unwrap(),
         rustix::process::Signal::KILL,
     )
     .unwrap();
@@ -277,8 +275,7 @@ async fn approval_reconcile_unchanged_crash_failed_actor_is_not_revived_or_latch
         .unwrap();
     fixture.module.seed_crash_budget_for_test(100);
     rustix::process::kill_process(
-        rustix::process::Pid::from_raw(fixture.module.status().unwrap().pid.unwrap() as i32)
-            .unwrap(),
+        rustix::process::Pid::from_raw(reported_pid(&fixture.module).await as i32).unwrap(),
         rustix::process::Signal::KILL,
     )
     .unwrap();

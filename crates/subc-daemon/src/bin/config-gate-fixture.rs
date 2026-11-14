@@ -46,6 +46,7 @@ fn main() {
         "sleep" => sleep_forever(),
         "exit23" => std::process::exit(23),
         "exit17" => std::process::exit(17),
+        "exit121" => std::process::exit(121),
         "exec-sleep" => exec_sleep(),
         "wait-exec" => {
             wait_for(&args[1]);

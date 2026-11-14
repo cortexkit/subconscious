@@ -2,6 +2,7 @@
 
 ## 0.45.1
 
+- Make configuration-gate test fixtures and readiness waits valid on macOS.
 - Recreate stale PID-reused scratch directories once in configuration-gate tests.
 - Declare registration-channel support in Windows configuration-admission test
   fixtures so they exercise file-handle retention and nonce withholding after

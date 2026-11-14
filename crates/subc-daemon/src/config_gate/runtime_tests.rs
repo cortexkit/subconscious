@@ -405,6 +405,28 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
 }
 
 #[cfg(unix)]
+async fn reported_status(
+    module: &crate::supervise::SupervisedModule,
+) -> crate::supervise::ModuleStatus {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = module.status().unwrap();
+            if status.pid.is_some() {
+                return status;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the owned child must cross its exec acknowledgement before observation")
+}
+
+#[cfg(unix)]
+async fn reported_pid(module: &crate::supervise::SupervisedModule) -> u32 {
+    reported_status(module).await.pid.unwrap()
+}
+
+#[cfg(unix)]
 #[path = "admission_tests.rs"]
 mod admission_tests;
 #[path = "audit_authority_tests.rs"]

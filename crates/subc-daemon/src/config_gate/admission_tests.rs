@@ -1370,17 +1370,14 @@ async fn gated_nonce_policy_refuses_stopped_uncached_identity_over_real_server()
     server.abort();
 }
 
-async fn reported_pid(module: &crate::supervise::SupervisedModule) -> u32 {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if let Some(pid) = module.status().unwrap().pid {
-                return pid;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the owned child must cross its exec acknowledgement before observation")
+async fn registration_launch_ready(handle: &SupervisorHandle, module: &str) {
+    let spawn = handle.registration_for_test(module).unwrap();
+    // Binding verification precedes exec acknowledgement on macOS. Direct HELLO
+    // fixtures must also wait for the channel service's launch-ready barrier.
+    tokio::time::timeout(Duration::from_secs(5), spawn.wait_launch())
+        .await
+        .expect("the captured registration launch must finish");
+    assert!(spawn.launch_ready(), "the captured launch must be ready");
 }
 
 fn approve(_rig: &Rig, owner: &RuntimeOwner, kind: PlanKind) -> u64 {
@@ -3228,6 +3225,7 @@ async fn config_recovery_hello_accepts_only_a_preexisting_bound_launch() {
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
     let nonce = handle.registration_proof_for_test("a").unwrap();
     assert!(handle.wait_program_binding_for_test("a", &nonce).await);
+    registration_launch_ready(&handle, "a").await;
     std::fs::write(
         rig.path.join("store").join(crate::config_store::STORE_FILE),
         b"tampered",
@@ -3260,7 +3258,12 @@ async fn config_recovery_hello_accepts_only_a_preexisting_bound_launch() {
             .handle_control(ConnectionId::new(445), frame)
             .unwrap();
         if presented.as_deref().is_some_and(|nonce| nonce != "wrong") {
-            assert_eq!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
+            assert_eq!(
+                reply[0].header.ty,
+                subc_protocol::FrameType::HelloAck,
+                "{}",
+                String::from_utf8_lossy(&reply[0].body)
+            );
         } else {
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&reply[0].body).unwrap()["code"],
@@ -3421,6 +3424,7 @@ async fn config_admission_hello_rechecks_declared_file_content_after_append_or_r
                 )
                 .await
         );
+        registration_launch_ready(&handle, "a").await;
         let changed = if replace_path {
             let replacement = rig.path.join("changed-covered");
             std::fs::copy(&covered, &replacement).unwrap();
@@ -4057,6 +4061,7 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
             .wait_program_binding_for_test("a", &candidate_proof)
             .await
     );
+    registration_launch_ready(&handle, "a").await;
     candidate_proof.bind(candidate);
     let registering = crate::ControlHandler::new(registry.clone())
         .with_supervisor(handle.clone())
@@ -4081,7 +4086,12 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
             .unwrap(),
         )
         .unwrap();
-    assert_eq!(reply[0].header.ty, subc_protocol::FrameType::HelloAck);
+    assert_eq!(
+        reply[0].header.ty,
+        subc_protocol::FrameType::HelloAck,
+        "{}",
+        String::from_utf8_lossy(&reply[0].body)
+    );
     let (tx, _candidate_frames) = tokio::sync::mpsc::channel(32);
     forwarding
         .register_candidate_module_connection(
@@ -4141,6 +4151,7 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
     let fresh = handle.registration_proof_for_test("a").unwrap();
     assert_ne!(fresh, current);
     assert!(handle.wait_program_binding_for_test("a", &fresh).await);
+    registration_launch_ready(&handle, "a").await;
     let connection = ConnectionId::new(713);
     let reply = handler
         .handle_control(connection, module_hello(Some(fresh), connection))
@@ -4150,7 +4161,8 @@ async fn config_admission_promoted_unreserved_child_restarts_with_a_fresh_channe
     assert_eq!(
         reply[0].header.ty,
         subc_protocol::FrameType::HelloAck,
-        "a restarted unreserved module must register over its fresh channel"
+        "a restarted unreserved module must register over its fresh channel: {}",
+        String::from_utf8_lossy(&reply[0].body)
     );
 }
 
@@ -4622,7 +4634,7 @@ async fn registration_declaration_stamp_restarts_nonce_spawn_before_completing_c
         .with_forwarding(forwarding.clone())
         .with_config_runtime(owner.clone());
     let module = supervisor.spawn_async(spec(&rig)).await.unwrap();
-    let old = module.status().unwrap();
+    let old = reported_status(&module).await;
     let nonce = handle.spawn_launch_nonce_for("a").unwrap();
     let handler = Arc::new(
         crate::ControlHandler::with_forwarding(registry.clone(), forwarding)
@@ -4662,7 +4674,7 @@ async fn registration_declaration_stamp_restarts_nonce_spawn_before_completing_c
         .reconcile_approved_configuration(approved.clone())
         .await
         .unwrap();
-    let fresh = module.status().unwrap();
+    let fresh = reported_status(&module).await;
     assert!(
         fresh.process_alive,
         "cutover must launch before reconciliation returns: {fresh:?}"

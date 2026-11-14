@@ -533,12 +533,22 @@ async fn config_desktop_apply_prompts_before_waiting_for_the_cutover_gate_and_pu
     }
     let (scratch, owner, _) = review_fixture();
     std::fs::create_dir_all(scratch.0.join("cortexkit")).unwrap();
-    std::fs::write(scratch.0.join("program"), b"captured program identity").unwrap();
+    std::fs::copy(
+        crate::config_gate::program::native_fixture_for_test(),
+        scratch.0.join("program"),
+    )
+    .unwrap();
+    assert!(std::process::Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-"])
+        .arg(scratch.0.join("program"))
+        .status()
+        .unwrap()
+        .success());
     std::fs::write(scratch.0.join("cortexkit/a.jsonc"), b"{}").unwrap();
     std::fs::write(
         scratch.0.join("subc.jsonc"),
         serde_json::to_vec(&serde_json::json!({
-            "version":1,"modules":{"a":{"program":scratch.0.join("program")}}
+            "version":1,"modules":{"a":{"program":scratch.0.join("program"),"args":["sleep"],"registration_channel":true}}
         }))
         .unwrap(),
     )
@@ -554,8 +564,9 @@ async fn config_desktop_apply_prompts_before_waiting_for_the_cutover_gate_and_pu
         .unwrap();
     let registry = Arc::new(Registry::default());
     let handle = SupervisorHandle::new();
-    let supervisor = Supervisor::new(registry.clone(), crate::supervise::RestartPolicy::default())
-        .with_handle(handle.clone());
+    let supervisor =
+        Supervisor::new_for_test(registry.clone(), crate::supervise::RestartPolicy::default())
+            .with_handle(handle.clone());
     let handler = Arc::new(
         ControlHandler::new(registry)
             .with_supervisor(handle)

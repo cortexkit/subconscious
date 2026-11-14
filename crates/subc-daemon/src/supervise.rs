@@ -21484,7 +21484,8 @@ mod privacy_exec_boundary_tests {
         {
             let registry = Arc::new(Registry::default());
             let policy = RestartPolicy::new(0, Duration::ZERO);
-            let spec = spec("/bin/sh", &["-c", "exit 121"]);
+            let fixture = crate::config_gate::program::native_fixture_for_test();
+            let spec = spec(fixture.to_str().unwrap(), &["exit121"]);
             let scratch = cortexkit_test_support::ScratchDir::new("resumed-exit");
             let supervisor = Supervisor::new_for_test(Arc::clone(&registry), policy)
                 .with_config_runtime(suspended_spawn_tests::gated_owner(&scratch, &spec, true));

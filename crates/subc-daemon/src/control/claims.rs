@@ -2864,7 +2864,17 @@ pub(crate) mod tests {
             .join(format!("prefix-gate-{}", std::process::id()));
         std::fs::create_dir_all(root.join("store")).unwrap();
         let daemon_path = root.join("subc.jsonc");
-        std::fs::write(&daemon_path, br#"{"version":1,"modules":{"claims:gated":{"program":"/bin/false","protocol":"none"}}}"#).unwrap();
+        std::fs::write(
+            &daemon_path,
+            serde_json::to_vec(&serde_json::json!({
+                "version":1,"modules":{"claims:gated":{
+                    "program":crate::config_gate::program::native_fixture_for_test(),
+                    "args":["exit23"],"protocol":"none"
+                }}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         let owner = Arc::new(RuntimeOwner::new(
             "prefix-gate".into(),
             crate::config_store::ConfigStore::open_digest_only_for_tests(

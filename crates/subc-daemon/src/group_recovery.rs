@@ -633,6 +633,15 @@ mod tests {
         let candidates = || Ok(vec![holder.id(), sentinel.id()]);
         let outcome = sweep_candidates(record, bounds(), candidates).await;
         assert_eq!(outcome, SweepDecision::Terminated);
+        // Group inspection can observe an exited member before its owned child
+        // wait status is available. Wait for that separate kernel transition.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while holder.0.try_wait().unwrap().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the owned holder's exit status must become available");
         assert!(
             holder.0.try_wait().unwrap().is_some(),
             "the owned holder must have exited"

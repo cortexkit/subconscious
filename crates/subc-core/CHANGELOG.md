@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.10
+
+- Tests only: the setup fixtures write the config store argument that 0.21.9
+  installs, and one Windows path assertion uses the same path resolution as
+  the renderer. No change to the shipped CLI.
+
 ## 0.21.9
 
 - Pin the daemon configuration store's absolute path in installed launchd,

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.46.1
+
+- Require subc-os 0.1.37, so a daemon signed with an Apple Development
+  certificate can open its config store's keychain item instead of starting
+  in recovery with every module held.
+
 ## 0.46.0
 
 - Activate the first-party mark only after a qualifying spawn acknowledges its

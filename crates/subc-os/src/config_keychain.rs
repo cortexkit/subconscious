@@ -159,7 +159,7 @@ impl fmt::Display for KeychainError {
             Self::AlreadyExists => "keychain item already exists",
             Self::InvalidData => "invalid or unsupported keychain item format",
             Self::InvalidRequirement => {
-                "signing requirement must bind the Apple anchor, identifier and team"
+                "signing requirement must bind the Apple anchor, identifier and signer (team, or development certificate)"
             }
             Self::RevisionConflict => "keychain revision must advance the high-water mark",
             Self::OsStatus(_) => "Security framework operation failed",

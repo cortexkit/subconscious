@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.37
+
+- The config store's keychain backend accepts the designated requirement
+  codesign writes for an Apple Development certificate (identifier, Apple
+  anchor, leaf common name and the Worldwide Developer Relations intermediate
+  marker), beside the Developer ID form bound to a team. Before, a daemon signed
+  with an Apple Development certificate could not open the keychain, so its
+  config store came up unverified and recovery held every module.
+
 ## 0.1.36
 
 - On Windows, a process whose listed parent appears after it in the system

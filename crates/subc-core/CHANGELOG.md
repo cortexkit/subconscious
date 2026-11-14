@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.21.8
+
+- Build with subc-daemon 0.46.1: a `ck-subc` signed with an Apple Development
+  certificate starts with its config store verified rather than in recovery.
+
 ## 0.21.7
 
 - Accept an optional offline manifest for `ck config place-program`, carrying

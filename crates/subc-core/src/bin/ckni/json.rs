@@ -18,6 +18,7 @@ pub(crate) fn json_form(command: &Command) -> JsonForm {
         Command::HealthDetail { .. } => JsonForm::Schema("ck.health.detail/v1"),
         Command::Activity(_) => JsonForm::Schema("ck.activity/v1"),
         Command::Module(module) => match module {
+            ModuleCommand::CheckScript { .. } => JsonForm::None("module check-script"),
             ModuleCommand::List => JsonForm::Schema("ck.module.list/v1"),
             ModuleCommand::Resources => JsonForm::Schema("ck.module.resources/v1"),
             ModuleCommand::Profile { .. } => JsonForm::Schema("ck.module.profile/v1"),
@@ -217,6 +218,11 @@ mod tests {
                 "module status alpha",
                 PlainOutput::PipedText,
                 JsonForm::Schema("ck.module.status/v1"),
+            ),
+            (
+                "module check-script bundle.js",
+                PlainOutput::PipedText,
+                JsonForm::None("module check-script"),
             ),
             (
                 "module logs",

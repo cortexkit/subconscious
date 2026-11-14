@@ -158,6 +158,7 @@ async fn a_contended_status_snapshot_cannot_park_the_async_runtime() {
     let module = supervisor
         .supervise_configured(
             crate::ModuleSpec {
+                script: None,
                 module_id: "snapshot-lock".into(),
                 program: PathBuf::from("disabled-module"),
                 args: Vec::new(),

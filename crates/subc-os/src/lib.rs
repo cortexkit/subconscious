@@ -94,7 +94,8 @@ pub use durable_replace::durable_replace_with_rename_hook;
 pub use durable_replace::{durable_replace, DurableReplaceError};
 #[cfg(any(unix, windows))]
 pub use retained_file::{
-    open_regular_nofollow, retained_file_identity, OpenRegularError, RetainedFileIdentity,
+    open_regular_nofollow, open_regular_nofollow_all, retained_file_identity, OpenRegularError,
+    RetainedFileIdentity,
 };
 #[cfg(all(unix, feature = "test-support"))]
 pub mod fork_exec_test;
@@ -107,6 +108,7 @@ pub mod privacy_identity;
 pub mod process_group;
 pub mod process_identity;
 pub mod registration_channel;
+pub mod script_pipe;
 pub mod socket_peer;
 #[cfg_attr(not(windows), path = "windows_acl_noop.rs")]
 pub mod windows_acl;

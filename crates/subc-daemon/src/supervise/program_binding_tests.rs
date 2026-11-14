@@ -29,6 +29,7 @@ impl Drop for Scratch {
 
 fn spec(program: PathBuf, env: Vec<(String, String)>) -> ModuleSpec {
     ModuleSpec {
+        script: None,
         module_id: "binding-probe".into(),
         program,
         args: vec![],

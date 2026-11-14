@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.8
+
+- Raise daemon and control test dependencies for script-aware module launches.
+
 ## 0.6.7
 
 - Dependency-only upgrade to client/control 0.40, daemon 0.46 and testkit 0.9;

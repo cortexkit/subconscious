@@ -1458,6 +1458,7 @@ mod tests {
             roster.set_privacy_trampoline(Ok(test_privacy_trampoline()));
             let scratch = cortexkit_test_support::ScratchDir::new("channel-launch");
             let spec = ModuleSpec {
+                script: None,
                 module_id: "channel-module".into(),
                 program: "/bin/sleep".into(),
                 args: vec!["60".into()],

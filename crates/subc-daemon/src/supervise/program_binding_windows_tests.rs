@@ -2,6 +2,7 @@ use super::*;
 
 fn shell_spec() -> ModuleSpec {
     ModuleSpec {
+        script: None,
         module_id: "windows-program-witness".into(),
         program: PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32/cmd.exe"),
         args: vec!["/C".into(), "exit 0".into()],

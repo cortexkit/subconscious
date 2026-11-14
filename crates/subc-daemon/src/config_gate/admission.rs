@@ -326,6 +326,66 @@ impl ModuleAdmission {
     }
 }
 
+#[cfg(all(test, unix))]
+mod script_origin_tests {
+    use super::*;
+
+    #[test]
+    fn script_admission_never_inherits_runner_development_origin_or_mark() {
+        let root = cortexkit_test_support::ScratchDir::new("script-origin");
+        let path = root.join("bundle.js");
+        std::fs::write(&path, b"abc").unwrap();
+        let spec = ModuleSpec {
+            script: Some(path),
+            module_id: "example".into(),
+            program: crate::supervise::script::runner_path().unwrap(),
+            args: vec![],
+            env: vec![],
+            reserved: true,
+            reserved_prefixes: vec![],
+            protocol: subc_control::ModuleProtocol::Subc,
+            overlap: Default::default(),
+            carry_containment: false,
+        };
+        let launch = program::capture(&spec, &[]).unwrap();
+        let witness = crate::program_origin::LaunchWitness::capture(&spec).unwrap();
+        let digest = subc_config::raw_digest(b"approved-script-and-runner");
+        let evidence = crate::program_origin::ProgramOriginEvidence {
+            origin: subc_protocol::peer::CallerOrigin::Development,
+            module_id: "example".into(),
+            published_commit: "a".repeat(40),
+            program_digest: digest.clone(),
+            launch: witness.clone(),
+            hosts_third_party_code: Some(false),
+            declarations: Default::default(),
+        };
+        assert_eq!(
+            crate::program_origin::derive_origin(Some(&evidence), "example", &digest, &witness),
+            subc_protocol::peer::CallerOrigin::Development
+        );
+        let admission = SpawnAdmission {
+            launch: Some(launch),
+            authority: Some(ModuleAdmission {
+                evidence: Some(evidence),
+                approved_declarations: Default::default(),
+                program_base: digest,
+                has_active: true,
+                generation: 1,
+                held: false,
+                snapshot: Default::default(),
+                command: Some(spec),
+            }),
+        };
+        let record = crate::spawn_authority::SpawnAuthorityRecord::new("script-test", 1, "example");
+        admission.initialize_origin(&record, &witness);
+        assert_eq!(
+            record.capture().unwrap().origin,
+            subc_protocol::peer::CallerOrigin::Other
+        );
+        assert!(!record.origin_qualifies_for_mark());
+    }
+}
+
 impl SpawnAdmission {
     pub(crate) fn initialize_origin(
         &self,
@@ -334,12 +394,20 @@ impl SpawnAdmission {
     ) {
         if let Some(authority) = &self.authority {
             record.initialize_origin(
-                crate::program_origin::derive_origin(
-                    authority.evidence.as_ref(),
-                    record.module_id(),
-                    &authority.program_base,
-                    witness,
-                ),
+                if self
+                    .launch
+                    .as_ref()
+                    .is_some_and(|launch| launch.spec.script.is_some())
+                {
+                    subc_protocol::peer::CallerOrigin::Other
+                } else {
+                    crate::program_origin::derive_origin(
+                        authority.evidence.as_ref(),
+                        record.module_id(),
+                        &authority.program_base,
+                        witness,
+                    )
+                },
                 authority.approved_declarations.clone(),
                 authority
                     .evidence
@@ -630,6 +698,26 @@ impl RuntimeOwner {
             None
         };
         Ok(SpawnAdmission { authority, launch })
+    }
+
+    pub(crate) fn approved_script(
+        &self,
+        module: &str,
+        path: &std::path::Path,
+    ) -> Option<CapturedInput> {
+        self.published
+            .read()
+            .ok()?
+            .admission
+            .modules
+            .get(module)?
+            .snapshot
+            .inputs
+            .get(&InputKey::Program {
+                module: module.into(),
+                path: path.to_string_lossy().into_owned(),
+            })
+            .cloned()
     }
 
     /// Called under exactly one module gate. Only the verified memory copy is read.

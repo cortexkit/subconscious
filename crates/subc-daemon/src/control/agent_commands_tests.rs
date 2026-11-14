@@ -154,6 +154,7 @@ async fn exercise_agent_commands_with_validation(
         let module = supervisor
             .supervise_configured(
                 crate::ModuleSpec {
+                    script: None,
                     module_id: "resource-module".into(),
                     program,
                     args: Vec::new(),

@@ -541,7 +541,7 @@ mod macos {
             // for stdio, nonce, registration and acknowledgement. The parent copy stays CLOEXEC; only our
             // child clears that flag.
             #[allow(unsafe_code)]
-            let fd = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 6) };
+            let fd = unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 7) };
             if fd == -1 {
                 return Err(io::Error::last_os_error());
             }
@@ -613,7 +613,7 @@ mod macos {
         }
         let (_reader, ack) = ExecAcknowledgement::pipe().unwrap();
         assert!(
-            ack.writer.as_raw_fd() >= 6,
+            ack.writer.as_raw_fd() >= 7,
             "ack source collided with a child slot"
         );
         assert_eq!(ack.fd(), 5);

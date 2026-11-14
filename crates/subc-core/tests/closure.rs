@@ -743,6 +743,7 @@ fn stub_spec_with_env(module_id: &str, extra_env: Vec<(&str, String)>) -> Module
     );
 
     ModuleSpec {
+        script: None,
         carry_containment: false,
         module_id: module_id.to_string(),
         program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),

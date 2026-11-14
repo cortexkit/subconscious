@@ -2,6 +2,7 @@ use super::*;
 
 fn spec(root: &std::path::Path, protocol: ModuleProtocol, reserved: bool) -> ModuleSpec {
     ModuleSpec {
+        script: None,
         module_id: "protocol-transition".into(),
         program: "/bin/sleep".into(),
         args: vec!["600".into()],

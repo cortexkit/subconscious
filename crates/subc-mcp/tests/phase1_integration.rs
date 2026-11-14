@@ -5199,6 +5199,7 @@ fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) ->
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
     );
     ModuleSpec {
+        script: None,
         carry_containment: false,
         module_id: module_id.to_owned(),
         program,
@@ -5223,6 +5224,7 @@ fn mcp_module_spec(
     xdg_config_home: &Path,
 ) -> ModuleSpec {
     ModuleSpec {
+        script: None,
         carry_containment: false,
         module_id: module_id.to_owned(),
         program: ckdev_subc_mcp(),

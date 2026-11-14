@@ -1415,6 +1415,7 @@ mod tests {
         runtime.register_timeout = Duration::from_secs(5);
         runtime.health.deadline = Duration::from_secs(2);
         let spec = ModuleSpec {
+            script: None,
             module_id: "timed".into(),
             program: PathBuf::from("/bin/sleep"),
             args: vec!["600".into()],
@@ -1604,6 +1605,7 @@ mod tests {
             )
             .unwrap();
         let spec = ModuleSpec {
+            script: None,
             module_id: "timed".into(),
             program: PathBuf::from("/bin/sleep"),
             args: vec!["600".into()],
@@ -2138,6 +2140,7 @@ mod tests {
                 .with_terminal_journal(journal.clone(), "retirement-test".into());
         let runtime = supervisor.runtime_config();
         let spec = ModuleSpec {
+            script: None,
             carry_containment: false,
             module_id: "retiring".into(),
             program: PathBuf::from("/bin/sleep"),

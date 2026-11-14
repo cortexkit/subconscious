@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.47.0
+
+- Upgrading: `ModuleSpec` and `ConfiguredModule` struct literals must add
+  `script: None` for compiled programs (or `Some(path)` for bundled scripts).
+
+- Add opt-in Bun script modules: approve the installed runner and bundled content,
+  read without following symlinks, and deliver the checked bytes over a private pipe.
+- Reject runtime preload settings in script configuration and remove inherited
+  Bun/Node runtime options before starting the runner.
+- Report script content identity and changed-on-disk review status. Identify
+  script modules as user-provided code (`other` origin), never as first-party
+  CortexKit modules.
+
 ## 0.46.2
 
 - Report `approval_surface_unavailable` when the phone approval service replies

@@ -8523,6 +8523,7 @@ fn never_connecting_spec(
 
     (
         ModuleSpec {
+            script: None,
             carry_containment: false,
             module_id: module_id.to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
@@ -8574,6 +8575,7 @@ where
     );
 
     ModuleSpec {
+        script: None,
         carry_containment: false,
         module_id: module_id.to_string(),
         program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),

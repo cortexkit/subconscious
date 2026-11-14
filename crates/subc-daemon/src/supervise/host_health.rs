@@ -220,6 +220,7 @@ mod tests {
             let modules = (0..count)
                 .map(|index| {
                     let spec = ModuleSpec {
+                        script: None,
                         module_id: format!("health-peer-{index}"),
                         program: PathBuf::from("unused-in-memory-peer"),
                         args: Vec::new(),

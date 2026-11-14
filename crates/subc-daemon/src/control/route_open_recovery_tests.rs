@@ -13,6 +13,7 @@ fn recovery_module(
     let module = supervisor
         .supervise_configured(
             ModuleSpec {
+                script: None,
                 module_id: module_id.into(),
                 program: fake_aft_stub_path(),
                 args: vec![],

@@ -34,6 +34,7 @@ pub(super) fn plain_output(command: &Command) -> PlainOutput {
             | ModuleCommand::Start { .. }
             | ModuleCommand::Swap { .. } => PlainOutput::Exempt,
             ModuleCommand::Status { .. }
+            | ModuleCommand::CheckScript { .. }
             | ModuleCommand::Resources
             | ModuleCommand::Profile { .. }
             | ModuleCommand::Logs { .. }

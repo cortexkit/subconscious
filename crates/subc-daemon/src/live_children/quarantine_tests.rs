@@ -139,6 +139,7 @@ async fn quarantine_blocks_only_carried_modules_across_repeated_daemon_startup()
     let path = record_path(&run);
     fs::write(&path, b"lost recovery identity").unwrap();
     let spec = |carry_containment| ModuleSpec {
+        script: None,
         module_id: if carry_containment {
             "carried"
         } else {

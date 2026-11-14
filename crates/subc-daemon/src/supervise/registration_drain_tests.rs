@@ -69,6 +69,7 @@ async fn drain_wire_fixture() -> DrainWireFixture {
     let mut runtime = supervisor.runtime_config();
     runtime.drain_timeout = Duration::from_secs(2);
     let mut spec = ModuleSpec {
+        script: None,
         module_id: "channel-module".into(), program: "/bin/sleep".into(), args: vec!["60".into()],
         env: ["HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"].into_iter()
             .map(|key| (key.into(), scratch.display().to_string())).collect(),

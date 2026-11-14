@@ -274,6 +274,8 @@ impl StorageConfig {
 pub struct ConfiguredModule {
     pub module_id: String,
     pub program: PathBuf,
+    /// Bundled ECMAScript module, read by the daemon and delivered from memory.
+    pub script: Option<PathBuf>,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     /// Effective module logging policy. An absent module block inherits the
@@ -365,6 +367,7 @@ impl ConfiguredModule {
             ));
         }
         ModuleSpec {
+            script: self.script.clone(),
             module_id: self.module_id.clone(),
             program: self.program.clone(),
             args: self.args.clone(),
@@ -446,7 +449,10 @@ enum RawStorageConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawModuleConfig {
-    program: PathBuf,
+    #[serde(default, deserialize_with = "present_value")]
+    program: Option<PathBuf>,
+    #[serde(default, deserialize_with = "present_value")]
+    script: Option<RawScriptConfig>,
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
@@ -485,6 +491,87 @@ struct RawModuleConfig {
     route_bind_relay_timeout_ms: Option<u64>,
     #[serde(default)]
     restart: Option<RawRestartConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawScriptConfig {
+    runtime: String,
+    path: PathBuf,
+}
+
+fn present_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+#[cfg(test)]
+mod script_config_tests {
+    use super::*;
+
+    fn parse(entry: serde_json::Value) -> Result<DaemonConfig, DaemonConfigError> {
+        parse_doc(
+            &serde_json::json!({"version":1,"modules":{"example":entry}}).to_string(),
+            Path::new("subc.jsonc"),
+        )
+    }
+
+    #[test]
+    fn script_config_accepts_bun_and_resolves_only_the_installed_runner() {
+        let config =
+            parse(serde_json::json!({"script":{"runtime":"bun","path":"bundle.js"}})).unwrap();
+        assert_eq!(
+            config.modules[0].program,
+            crate::supervise::script::runner_path().unwrap()
+        );
+        assert_eq!(
+            config.modules[0].module_spec().script,
+            Some(std::path::absolute("bundle.js").unwrap())
+        );
+    }
+
+    #[test]
+    fn script_config_refuses_conflicting_missing_null_and_unknown_runtime_entries() {
+        for entry in [
+            serde_json::json!({}),
+            serde_json::json!({"program":"node","script":{"runtime":"bun","path":"bundle.js"}}),
+            serde_json::json!({"program":null,"script":{"runtime":"bun","path":"bundle.js"}}),
+            serde_json::json!({"program":"node","script":null}),
+            serde_json::json!({"script":{"runtime":"node","path":"bundle.js"}}),
+        ] {
+            assert!(parse(entry.clone()).is_err(), "accepted {entry}");
+        }
+        let error = parse(serde_json::json!({"script":{"runtime":"node","path":"bundle.js"}}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("example") && error.contains("node"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn script_config_refuses_explicit_runtime_preload_environment() {
+        for key in [
+            "NODE_OPTIONS",
+            "BUN_OPTIONS",
+            "BUN_INSTALL",
+            "NODE_PATH",
+            "BUN_CONFIG_PRELOAD",
+            "BUN_CONFIG_any",
+        ] {
+            let env = BTreeMap::from([(key, "unapproved")]);
+            let error =
+                parse(serde_json::json!({"script":{"runtime":"bun","path":"bundle.js"},"env":env}))
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains(key) && error.contains("example"), "{error}");
+            assert!(parse(serde_json::json!({"program":"legacy-interpreter","env":env})).is_ok());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -832,6 +919,23 @@ fn parse_doc_with_activity(
         .modules
         .into_iter()
         .map(|(module_id, module)| {
+            let (program, script) = match (module.program, module.script) {
+                (Some(program), None) => (program, None),
+                (None, Some(script)) if script.runtime == "bun" => {
+                    let script_path = crate::supervise::script::resolve_script_path(&script.path)
+                        .map_err(|error| DaemonConfigError::InvalidValue { path: path.into(), message: format!("module '{module_id}': {error}") })?;
+                    let runner = crate::supervise::script::runner_path()
+                        .map_err(|error| DaemonConfigError::InvalidValue { path: path.into(), message: format!("module '{module_id}': {error}") })?;
+                    (runner, Some(script_path))
+                }
+                (None, Some(script)) => return Err(DaemonConfigError::InvalidValue { path: path.into(), message: format!("module '{module_id}' script runtime '{}' is unsupported; expected bun", script.runtime.escape_debug()) }),
+                _ => return Err(DaemonConfigError::InvalidValue { path: path.into(), message: format!("module '{module_id}' must name exactly one of program or script") }),
+            };
+            if script.is_some() {
+                if let Some(key) = module.env.keys().find(|key| crate::supervise::script::forbidden_env(key)) {
+                    return Err(DaemonConfigError::InvalidValue { path: path.into(), message: format!("module '{module_id}' script env '{key}' is refused: runtime options can execute code before script verification") });
+                }
+            }
             let protocol = parse_module_protocol(module.protocol.as_deref(), path, &module_id)?;
             let health = module
                 .health
@@ -931,31 +1035,30 @@ fn parse_doc_with_activity(
                 .map(|log| parse_logging_config(log, path, &format!("module '{module_id}' log")))
                 .transpose()?
                 .or_else(|| daemon_logging.clone());
-            Ok(ConfiguredModule {
-                module_id,
-                program: module.program,
-                args: module.args,
-                env: module.env.into_iter().collect(),
-                log,
-                enabled: module.enabled,
-                registration_channel: module.registration_channel,
-                reserved: module.reserved,
-                reserved_prefixes: module.reserved_prefixes,
-                protocol,
-                overlap,
-                carry_containment: module.carry_containment,
-                health,
-                // Per-module wins; the daemon-wide value is the fallback. `0` is
-                // legitimate ("never wait"), so this is `.or`, not `filter+or`.
-                drain_timeout_ms: module.drain_timeout_ms.or(default_drain_timeout_ms),
-                register_timeout: Duration::from_secs(register_timeout_s),
-                // Same shape as drain: an explicit per-module value wins over
-                // the daemon-wide default. A `0` here is rejected above
-                // (see "off is not a budget"), so `None` means "use the
-                // daemon-wide value" and `Some(value > 0)` means "use this".
-                route_bind_relay_timeout_ms: per_module_route_bind_relay_timeout_ms,
-                restart,
-            })
+            Ok(ConfiguredModule { module_id,
+            program,
+            script,
+            args: module.args,
+            env: module.env.into_iter().collect(),
+            log,
+            enabled: module.enabled,
+            registration_channel: module.registration_channel,
+            reserved: module.reserved,
+            reserved_prefixes: module.reserved_prefixes,
+            protocol,
+            overlap,
+            carry_containment: module.carry_containment,
+            health,
+            // Per-module wins; the daemon-wide value is the fallback. `0` is
+            // legitimate ("never wait"), so this is `.or`, not `filter+or`.
+            drain_timeout_ms: module.drain_timeout_ms.or(default_drain_timeout_ms),
+            register_timeout: Duration::from_secs(register_timeout_s),
+            // Same shape as drain: an explicit per-module value wins over
+            // the daemon-wide default. A `0` here is rejected above
+            // (see "off is not a budget"), so `None` means "use the
+            // daemon-wide value" and `Some(value > 0)` means "use this".
+            route_bind_relay_timeout_ms: per_module_route_bind_relay_timeout_ms,
+            restart, })
         })
         .collect::<Result<Vec<_>, DaemonConfigError>>()?;
 

@@ -1453,6 +1453,7 @@ pub(crate) mod tests {
             .with_drain_timeout(Duration::ZERO);
         let module = supervisor
             .spawn_async(ModuleSpec {
+                script: None,
                 module_id: module_id.into(),
                 program: crate::config_gate::program::native_fixture_for_test(),
                 args: vec!["300".into()],
@@ -1534,6 +1535,7 @@ pub(crate) mod tests {
                 .with_forwarding(rig.handler.forwarding.clone());
         let module = supervisor
             .spawn_async(ModuleSpec {
+                script: None,
                 module_id: module_id.into(),
                 program: crate::config_gate::program::native_fixture_for_test(),
                 args: vec!["300".into()],
@@ -2862,6 +2864,7 @@ pub(crate) mod tests {
         rig.handler
             .supervisor
             .apply_identity_configuration(&ModuleSpec {
+                script: None,
                 module_id: "claims:no-holder".into(),
                 program: "/bin/false".into(),
                 args: Vec::new(),

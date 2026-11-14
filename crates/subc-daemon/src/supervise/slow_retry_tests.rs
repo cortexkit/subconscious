@@ -13,6 +13,7 @@ async fn wait_for(reason: &str, mut ready: impl FnMut() -> bool) {
 
 fn crashing_spec() -> ModuleSpec {
     ModuleSpec {
+        script: None,
         carry_containment: false,
         module_id: "slow-retry-child".into(),
         program: PathBuf::from("/bin/sh"),
@@ -309,6 +310,7 @@ fn assert_no_timer(module: &SupervisedModule) {
 
 fn sleeping_spec() -> ModuleSpec {
     ModuleSpec {
+        script: None,
         program: PathBuf::from("/bin/sleep"),
         args: vec!["600".into()],
         ..crashing_spec()
@@ -322,6 +324,7 @@ async fn revision_daemon_initial_spawn_failure_schedules_recovery() {
     let module = supervisor
         .supervise_configured(
             ModuleSpec {
+                script: None,
                 program: PathBuf::from("/missing/slow-retry-module"),
                 ..sleeping_spec()
             },
@@ -687,6 +690,7 @@ async fn operator_failure_never_arms_a_slow_retry() {
 
 fn missing_spec() -> ModuleSpec {
     ModuleSpec {
+        script: None,
         program: PathBuf::from("/missing/slow-retry-module"),
         ..sleeping_spec()
     }

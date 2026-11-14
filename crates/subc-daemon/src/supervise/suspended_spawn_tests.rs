@@ -46,6 +46,7 @@ impl Probe {
 
     fn spec(&self, marker: &Path) -> ModuleSpec {
         ModuleSpec {
+            script: None,
             module_id: "suspended-probe".into(),
             program: self.program.clone(),
             args: vec![marker.to_string_lossy().into_owned()],

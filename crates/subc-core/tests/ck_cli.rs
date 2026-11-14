@@ -6977,6 +6977,7 @@ fn stub_spec(module_id: &str) -> ModuleSpec {
 
 fn stub_spec_with_env(module_id: &str, env: Vec<(&str, &str)>) -> ModuleSpec {
     ModuleSpec {
+        script: None,
         carry_containment: false,
         module_id: module_id.to_string(),
         program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
@@ -7145,6 +7146,7 @@ async fn spawn_quota_stub(
     let fixture_json = serde_json::to_string(fixture).unwrap();
     let module = supervisor
         .spawn(ModuleSpec {
+            script: None,
             carry_containment: false,
             module_id: module_id.to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),

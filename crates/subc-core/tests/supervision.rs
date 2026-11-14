@@ -586,6 +586,7 @@ async fn failed_spawn_during_enable_allows_a_later_retry() {
     let module = supervisor
         .supervise_configured(
             ModuleSpec {
+                script: None,
                 carry_containment: false,
                 module_id: "missing-enable-program".to_string(),
                 program: missing_program,
@@ -1154,6 +1155,7 @@ fn stub_spec<'a>(
     );
 
     ModuleSpec {
+        script: None,
         carry_containment: false,
         module_id: module_id.to_string(),
         program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
@@ -1195,6 +1197,7 @@ async fn a_dead_module_leaves_its_stderr_readable_from_the_supervisor() {
     let supervisor = supervisor(&server, 0, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
+            script: None,
             carry_containment: false,
             module_id: "stderr-tail-crasher".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
@@ -1259,6 +1262,7 @@ async fn a_silent_module_reports_captured_and_empty_rather_than_uncaptured() {
     let supervisor = supervisor(&server, 0, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
+            script: None,
             carry_containment: false,
             module_id: "stderr-tail-silent".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
@@ -1332,6 +1336,7 @@ async fn a_supervised_module_inherits_the_parent_environment() {
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
+            script: None,
             carry_containment: false,
             module_id: "env-inherit-probe".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
@@ -1381,6 +1386,7 @@ async fn stderr_from_before_a_restart_survives_with_a_marked_boundary() {
     let supervisor = supervisor(&server, 3, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
+            script: None,
             carry_containment: false,
             module_id: "stderr-tail-looper".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
@@ -1455,6 +1461,7 @@ async fn a_held_stderr_pipe_marks_the_tail_incomplete_and_its_late_output_stays_
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     let module = supervisor
         .spawn(ModuleSpec {
+            script: None,
             carry_containment: false,
             module_id: "stderr-tail-wedged-pump".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")),
@@ -1546,6 +1553,7 @@ async fn child_stdout_and_stderr_reach_the_capture_file_while_only_stderr_reache
         supervisor(&server, 0, Duration::from_millis(10)).with_capture_logs_dir(&logs_dir);
     let module = supervisor
         .spawn(ModuleSpec {
+            script: None,
             carry_containment: false,
             module_id: "two-pipe-capture".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_log-child-fixture")),
@@ -1629,6 +1637,7 @@ async fn concurrent_child_pipes_never_tear_a_line_in_the_capture_file() {
         supervisor(&server, 0, Duration::from_millis(10)).with_capture_logs_dir(&logs_dir);
     let module = supervisor
         .spawn(ModuleSpec {
+            script: None,
             carry_containment: false,
             module_id: "two-pipe-burst".to_string(),
             program: PathBuf::from(env!("CARGO_BIN_EXE_log-child-fixture")),

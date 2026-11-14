@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.40.1
+
+- Add optional script content and runtime details to supervisor status entries.
+
 ## 0.40.0
 
 - **Rust migration:** `ConfigControlRequest::PlaceProgram` adds `manifest`;

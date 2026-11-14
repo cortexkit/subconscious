@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.5
+
+- Update daemon launch fixtures and dependency requirements for script-aware
+  module specifications. Existing compiled-module behavior is unchanged.
+
 ## 0.2.4
 
 - Dependency-only upgrade to client/control 0.40 and daemon 0.46; the gateway

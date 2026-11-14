@@ -135,6 +135,7 @@ fn config_spawn_path_skips_a_non_executable_regular_file() {
     .unwrap();
     std::fs::copy("/bin/sh", later.join("command")).unwrap();
     let spec = ModuleSpec {
+        script: None,
         module_id: "path-probe".into(),
         program: "command".into(),
         args: vec![],
@@ -191,6 +192,7 @@ async fn config_spawn_symlinked_executable_keeps_the_original_launch_name() {
     );
     let module = supervisor
         .spawn_async(ModuleSpec {
+            script: None,
             module_id: "symlink-probe".into(),
             program: alias.clone(),
             args: vec![observed.to_string_lossy().into_owned()],

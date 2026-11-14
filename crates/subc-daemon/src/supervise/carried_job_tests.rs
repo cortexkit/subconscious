@@ -82,6 +82,7 @@ impl Fixture {
             "build prerequisite: cargo build -p subc-core --bin fake-aft-stub"
         );
         let mut spec = ModuleSpec {
+            script: None,
             carry_containment: true,
             module_id: label.into(),
             program: stub,

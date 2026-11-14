@@ -1579,6 +1579,7 @@ async fn supervised_privileged_target(f: &Fixture) -> crate::supervise::Supervis
     let supervisor = crate::Supervisor::new_for_test(registry, crate::RestartPolicy::default())
         .with_handle(f.supervisor.clone());
     let spec = crate::ModuleSpec {
+        script: None,
         carry_containment: false,
         module_id: "held-target".into(),
         program: std::env::current_exe().unwrap(),

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.0.7
+
+- Raise the daemon requirement for the script-aware launch specification API.
+
 ## 0.0.6
 
 - Dependency-only upgrade to daemon 0.46 for the external consumer fixture.

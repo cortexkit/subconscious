@@ -4,6 +4,7 @@ use std::io::Read;
 
 fn spec(scratch: &ScratchDir) -> ModuleSpec {
     ModuleSpec {
+        script: None,
         module_id: "channel-placement-probe".into(),
         program: PathBuf::from("/bin/sh"),
         args: vec![

@@ -1037,6 +1037,7 @@ async fn first_observation(mode: &'static str, caller: bool) {
         Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
     let runtime = supervisor.runtime_config();
     let spec = ModuleSpec {
+        script: None,
         module_id: "retirement-probe".into(),
         program: "/bin/sleep".into(),
         args: vec!["300".into()],

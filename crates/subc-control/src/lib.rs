@@ -2865,6 +2865,9 @@ pub enum ModuleProtocol {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[non_exhaustive]
 pub struct SupervisorEntry {
+    /// Script content approved for the installed runner, when configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<ScriptModuleStatus>,
     /// A hidden previous instance blocks only this module's next spawn. This
     /// PID is not the supervised child and must not be presented as its identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3028,6 +3031,11 @@ pub struct SupervisorEntry {
 }
 
 impl SupervisorEntry {
+    #[must_use]
+    pub fn with_script(mut self, script: Option<ScriptModuleStatus>) -> Self {
+        self.script = script;
+        self
+    }
     /// Set the estimated time of a failed module's next automatic retry.
     #[must_use]
     pub fn with_next_retry_at_ms(mut self, next_retry_at_ms: Option<u64>) -> Self {
@@ -3046,6 +3054,7 @@ impl SupervisorEntry {
     ) -> Self {
         Self {
             module_id: module_id.into(),
+            script: None,
             state: state.into(),
             admission_refused: None,
             next_retry_at_ms: None,
@@ -3234,6 +3243,50 @@ impl SupervisorEntry {
     pub fn with_tree_unavailable(mut self, reason: Option<String>) -> Self {
         self.tree_unavailable = reason;
         self
+    }
+}
+
+/// Content identity is separate from the runner executable's identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScriptModuleStatus {
+    pub runtime: String,
+    pub bun_version: Option<String>,
+    pub path: PathBuf,
+    pub sha256: Option<String>,
+    pub size: Option<u64>,
+    pub needs_review: bool,
+}
+
+#[cfg(test)]
+mod script_status_tests {
+    use super::*;
+
+    #[test]
+    fn script_status_roundtrips_and_old_supervisor_entries_remain_readable() {
+        let old = SupervisorEntry::new(
+            "example",
+            "running",
+            true,
+            true,
+            SupervisorHealthStatus::Unknown,
+        );
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value.get("script").is_none());
+        assert!(serde_json::from_value::<SupervisorEntry>(value)
+            .unwrap()
+            .script
+            .is_none());
+        let current = old.with_script(Some(ScriptModuleStatus {
+            runtime: "bun".into(),
+            bun_version: None,
+            path: "bundle.js".into(),
+            sha256: Some("ab".repeat(32)),
+            size: Some(3),
+            needs_review: true,
+        }));
+        let decoded: SupervisorEntry =
+            serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+        assert_eq!(decoded, current);
     }
 }
 

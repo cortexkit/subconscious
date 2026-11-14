@@ -421,7 +421,7 @@ fn write_domain_probe_cache(path: &Path, cache: &DomainProbeCache) -> Result<(),
     Ok(())
 }
 
-const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] [--verbose] module <verb> [<args>]\n\nverbs:\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
+const MODULE_HELP: &str = "ck module — inspect and control supervised modules\n\nusage: ck [--json] [--verbose] module <verb> [<args>]\n\nverbs:\n  ck module check-script <file>  check a bundle with the installed Bun runner\n  ck module list            all modules with state and health\n  ck module status <id>     one module in detail
   ck module resources      process counters via the inspect module
   ck module profile <id>    sample one process via inspect (--seconds 1..10, default 1)
   ck module logs [<id>]     merged module, plugin, stderr, and daemon logs
@@ -576,6 +576,9 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     if let Command::FleetLint { config, verbose } = &args.command {
         return fleet_lint_command(config.as_deref(), *verbose).await;
     }
+    if let Command::Module(ModuleCommand::CheckScript { file }) = &args.command {
+        return module_check_script(&running_executable()?, file).await;
+    }
     if let Command::Setup(request) = &args.command {
         return setup_command(&running_executable()?, request, ckni);
     }
@@ -678,6 +681,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     let result = match args.command {
         Command::Config(request) => config_cli::run(&mut client, request, json_output).await,
         Command::Dashboard => unreachable!("handled before connecting"),
+        Command::Module(ModuleCommand::CheckScript { .. }) => unreachable!("handled before connecting"),
         Command::Module(ModuleCommand::List) => {
             module_list(
                 &mut client,
@@ -1607,6 +1611,9 @@ struct ModuleLogsOptions {
 }
 
 enum ModuleCommand {
+    CheckScript {
+        file: PathBuf,
+    },
     List,
     Resources,
     Profile {
@@ -3093,6 +3100,49 @@ async fn module_status(
         }
     }
     Ok(())
+}
+
+async fn module_check_script(program: &Path, file: &Path) -> Result<(), CkError> {
+    let runner = program
+        .parent()
+        .ok_or_else(|| CkError::rejected("ck install folder is unavailable".into()))?
+        .join(if cfg!(windows) {
+            "ck-script-runner-bun.exe"
+        } else {
+            "ck-script-runner-bun"
+        });
+    if !runner.is_file() {
+        return Err(CkError::rejected(format!(
+            "ck-script-runner-bun is not installed beside ck ({})",
+            runner.display()
+        )));
+    }
+    let mut command = tokio::process::Command::new(&runner);
+    command.arg("--check").arg(file);
+    // Compiled Bun can run preloads before the runner's own checks execute.
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy();
+        let name = if cfg!(windows) {
+            name.to_ascii_uppercase()
+        } else {
+            name.into_owned()
+        };
+        if matches!(
+            name.as_str(),
+            "NODE_OPTIONS" | "BUN_OPTIONS" | "BUN_INSTALL" | "NODE_PATH"
+        ) || name.starts_with("BUN_CONFIG_")
+        {
+            command.env_remove(key);
+        }
+    }
+    let status = command.status().await.map_err(|error| {
+        CkError::rejected(format!("could not start ck-script-runner-bun: {error}"))
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(CkError::rejected(format!("script check failed ({status})")))
+    }
 }
 
 /// Read `-n <count>` from a verb's own tail.
@@ -6718,6 +6768,9 @@ fn print_status_table(
         .map(running_image_clause)
         .unwrap_or_else(|| "running image status unknown".to_string());
     println!("  binary: {binary} ({image})");
+    for line in script_status_lines(module) {
+        println!("  {line}");
+    }
     print_reload_verdict(module);
     if let Some(entry) = health {
         print_health_detail(entry, 1);
@@ -6765,6 +6818,46 @@ fn module_status_text(module: &Value) -> String {
         module_runtime_status_text(module),
         enabled_drift_marker(module)
     )
+}
+
+fn script_status_lines(module: &Value) -> Vec<String> {
+    let Some(script) = module.get("script").filter(|value| value.is_object()) else {
+        return vec![];
+    };
+    let version = script
+        .get("bun_version")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let path = script
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let digest = script
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let short = digest.chars().take(12).collect::<String>();
+    let size = script
+        .get("size")
+        .and_then(Value::as_u64)
+        .map(|size| size.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let review = if script.get("needs_review").and_then(Value::as_bool) == Some(true) {
+        " (changed; needs review)"
+    } else {
+        ""
+    };
+    vec![
+        format!(
+            "program: script-runner (bun {})",
+            terminal_safe_string(version)
+        ),
+        format!(
+            "script: {} sha256 {} {size}{review}",
+            terminal_safe_string(&display_home_path(Path::new(path))),
+            terminal_safe_string(&short)
+        ),
+    ]
 }
 
 fn enabled_drift_marker(module: &Value) -> &'static str {
@@ -8478,6 +8571,14 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                     })
             };
             let command = match verb.as_str() {
+                "check-script" if tail.len() == 2 => ModuleCommand::CheckScript {
+                    file: PathBuf::from(&tail[1]),
+                },
+                "check-script" => {
+                    return Err(CkError::Usage(
+                        "usage: ck module check-script <file>".into(),
+                    ))
+                }
                 "list" => ModuleCommand::List,
                 "resources" if tail.len() == 1 => ModuleCommand::Resources,
                 "profile" => {
@@ -9019,6 +9120,57 @@ fn a_successful_command_stays_successful_when_old_image_cleanup_fails() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn script_module_status_reports_runner_digest_size_and_review_without_guessing_version() {
+        let module = serde_json::json!({"script":{"path":"/example/bundle.js","sha256":"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad","size":3,"needs_review":true}});
+        let lines = super::script_status_lines(&module);
+        assert_eq!(
+            lines,
+            [
+                "program: script-runner (bun unknown)",
+                "script: /example/bundle.js sha256 ba7816bf8f01 3 (changed; needs review)"
+            ]
+        );
+        assert!(super::script_status_lines(&serde_json::json!({})).is_empty());
+    }
+
+    #[tokio::test]
+    async fn script_module_check_parses_file_and_reports_missing_runner_without_daemon() {
+        let args = ["ck", "module", "check-script", "bundle.js"].map(std::ffi::OsString::from);
+        let parsed = super::parse_args(args).unwrap();
+        assert!(
+            matches!(parsed.command, super::Command::Module(super::ModuleCommand::CheckScript { file }) if file == std::path::Path::new("bundle.js"))
+        );
+        let root = cortexkit_test_support::ScratchDir::new("check-script-missing");
+        let error = super::module_check_script(&root.join("ck"), std::path::Path::new("bundle.js"))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ck-script-runner-bun is not installed beside ck"),
+            "{error}"
+        );
+        assert!(super::MODULE_HELP.contains("check-script <file>"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_module_check_invokes_installed_runner_and_preserves_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = cortexkit_test_support::ScratchDir::new("check-script-args");
+        let runner = root.join("ck-script-runner-bun");
+        std::fs::write(&runner, b"#!/bin/sh\nif [ \"$1\" = --check ] && [ \"$2\" = bundle.js ]; then echo script_import_refused; exit 7; fi\nexit 0\n").unwrap();
+        std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let error = super::module_check_script(&root.join("ck"), std::path::Path::new("bundle.js"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("script check failed"), "{error}");
+        std::fs::write(&runner, b"#!/bin/sh\necho script_check_ok\nexit 0\n").unwrap();
+        super::module_check_script(&root.join("ck"), std::path::Path::new("bundle.js"))
+            .await
+            .unwrap();
+    }
     #[test]
     fn start_and_stop_drift_notices_are_exact_and_only_for_divergence() {
         assert_eq!(enabled_drift_notice("start", &serde_json::json!({"configured_enabled": false})),

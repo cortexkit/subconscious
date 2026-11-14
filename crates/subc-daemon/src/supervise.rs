@@ -81,6 +81,7 @@ mod config_delivery;
 mod content_binding;
 mod program_binding;
 mod registration;
+pub(crate) mod script;
 /// Each launch nonce, mapped to its launch's module id and the launch.
 type NonceLaunches = HashMap<String, (String, std::sync::Weak<RegistrationSpawn>)>;
 pub(crate) use registration::NonceAttestation;
@@ -1095,6 +1096,8 @@ pub(crate) fn notify_registration_release() {
 pub struct ModuleSpec {
     pub module_id: String,
     pub program: PathBuf,
+    /// A bundled Bun ESM file. The program is always the installed runner.
+    pub script: Option<PathBuf>,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     /// When true this is a reserved module: each spawn gets a fresh one-time launch
@@ -1155,6 +1158,10 @@ impl LaunchSpecDigest {
             hash.update(bytes);
         }
         let mut hash = Sha256::new();
+        if let Some(script) = &spec.script {
+            field(&mut hash, b"bun-script");
+            field(&mut hash, script.as_os_str().as_encoded_bytes());
+        }
         if let Some(program) = spec.program.to_str() {
             field(&mut hash, b"utf8-program");
             field(&mut hash, program.as_bytes());
@@ -7476,6 +7483,7 @@ mod tests {
         assert!(handle.removal_tombstone_age_ms(module_id).is_some());
 
         handle.apply_identity_configuration(&ModuleSpec {
+            script: None,
             module_id: module_id.to_string(),
             program: PathBuf::from("/test/module"),
             args: Vec::new(),
@@ -7520,6 +7528,7 @@ mod tests {
 
         let dir = cortexkit_test_support::ScratchDir::new("configured-before-spawn");
         let stub = |module_id: &str, program: PathBuf| ModuleSpec {
+            script: None,
             module_id: module_id.to_string(),
             program,
             args: Vec::new(),
@@ -7653,6 +7662,7 @@ mod tests {
     async fn a_configured_module_reads_starting_while_its_first_process_already_runs() {
         let dir = cortexkit_test_support::ScratchDir::new("starting-while-spawned");
         let spec = ModuleSpec {
+            script: None,
             module_id: "spawned-not-admitted".to_string(),
             program: super::terminal_history_tests::fake_aft_stub_path(),
             args: Vec::new(),
@@ -7731,6 +7741,7 @@ mod tests {
         let snapshot = stale_process_snapshot(ModuleState::Disabled, false);
         let mut child = None;
         let spec = ModuleSpec {
+            script: None,
             module_id: "failed-enable-clears-facts".to_string(),
             program: PathBuf::from("/definitely/missing/failed-enable-module"),
             args: Vec::new(),
@@ -7769,6 +7780,7 @@ mod tests {
             true,
         )));
         let spec = ModuleSpec {
+            script: None,
             module_id: "start-stranded-restarting".to_string(),
             program: super::terminal_history_tests::fake_aft_stub_path(),
             args: Vec::new(),
@@ -7825,6 +7837,7 @@ mod tests {
         let snapshot = stale_process_snapshot(ModuleState::Running, true);
         let mut child = None;
         let spec = ModuleSpec {
+            script: None,
             module_id: "failed-reload-clears-facts".to_string(),
             program: PathBuf::from("/unused/failed-reload-module"),
             args: Vec::new(),
@@ -7858,6 +7871,7 @@ mod tests {
         let snapshot = stale_process_snapshot(ModuleState::Running, true);
         let module = supervisor.supervised_module(
             ModuleSpec {
+                script: None,
                 module_id: "drop-clears-facts".to_string(),
                 program: PathBuf::from("/unused/drop-module"),
                 args: Vec::new(),
@@ -7895,6 +7909,7 @@ mod tests {
     async fn rescan_preserves_running_protocol_until_respawn() {
         let dir = cortexkit_test_support::ScratchDir::new("rescan-protocol");
         let initial = ModuleSpec {
+            script: None,
             module_id: "rescan-protocol".into(),
             program: PathBuf::from("/bin/sleep"),
             args: vec!["60".into()],
@@ -7964,6 +7979,7 @@ mod tests {
             (script, vec![]),
         ] {
             let spec = ModuleSpec {
+                script: None,
                 module_id: "image-identity".into(),
                 program: program.clone(),
                 args,
@@ -8500,6 +8516,7 @@ mod tests {
             Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let snapshot = stale_process_snapshot(ModuleState::Running, true);
         let initial = ModuleSpec {
+            script: None,
             module_id: "rescan-preserves-spawn-facts".to_string(),
             program: PathBuf::from("/spawned/module"),
             args: Vec::new(),
@@ -11541,6 +11558,7 @@ impl Drop for AsyncInitialIdentity<'_> {
 /// this value returns, the async caller validates its launch witness and creates
 /// and publishes the child without another await.
 struct PreparedChild {
+    script_delivery: Option<script::Delivery>,
     registration_spawn: Option<Arc<RegistrationSpawn>>,
     registration_handle: Option<SupervisorHandle>,
     #[cfg(any(unix, windows))]
@@ -11921,11 +11939,30 @@ fn prepare_child_in_slot(
     let gated = spawn_admission
         .as_ref()
         .is_some_and(|admission| admission.approved_base().is_some());
-    let launch_spec = spawn_admission
+    let mut launch_spec = spawn_admission
         .as_ref()
         .and_then(|admission| admission.launch.as_ref())
         .map(|launch| launch.spec.clone())
         .unwrap_or_else(|| spec.clone());
+    if launch_spec.script.is_some() {
+        launch_spec.program = script::runner_path().map_err(|source| SuperviseError::Spawn {
+            program: launch_spec.program.clone(),
+            source,
+            cgroup_path: None,
+        })?;
+    }
+    let script_content = if let Some(path) = &launch_spec.script {
+        Some(
+            spawn_admission
+                .as_ref()
+                .and_then(|admission| admission.launch.as_ref())
+                .and_then(|launch| launch.script.clone())
+                .map_or_else(|| script::ScriptBytes::read(path), Ok)
+                .map_err(|error| config_delivery::gate_hold_error(&launch_spec, error, None))?,
+        )
+    } else {
+        None
+    };
     let spec = &launch_spec;
     if let Some(error) = recovery_block_error(spec, roster) {
         return Err(error);
@@ -12079,6 +12116,9 @@ fn prepare_child_in_slot(
     // resolved CK_LOG into `spec.env`, which is applied below and therefore
     // wins over anything ambient.
     apply_child_env(&mut command, spec);
+    if spec.script.is_some() {
+        script::remove_runtime_env(&mut command, spec);
+    }
     let origin_witness = crate::program_origin::LaunchWitness::capture_command(spec, &command)
         .map_err(|source| SuperviseError::Spawn {
             program: spec.program.clone(),
@@ -12097,6 +12137,22 @@ fn prepare_child_in_slot(
     )?;
     #[cfg(unix)]
     let mut slots = subc_os::registration_channel::ChildDescriptorSlots::default();
+    command.env_remove(subc_os::script_pipe::SCRIPT_FD_ENV);
+    let script_delivery = script_content
+        .map(|content| {
+            script::Delivery::prepare(
+                content,
+                &mut command,
+                #[cfg(unix)]
+                &mut slots,
+            )
+        })
+        .transpose()
+        .map_err(|source| SuperviseError::Spawn {
+            program: spec.program.clone(),
+            source,
+            cgroup_path: None,
+        })?;
     #[cfg(unix)]
     let registration_channel = if spec.protocol == ModuleProtocol::Subc {
         let (parent, child, metadata) = subc_os::registration_channel::registration_socketpair()
@@ -12331,6 +12387,7 @@ fn prepare_child_in_slot(
     }
     validate_spawn_program(spec, spawn_admission.as_ref(), delivery_context)?;
     Ok(PreparedChild {
+        script_delivery,
         registration_spawn,
         registration_handle: handle.cloned(),
         #[cfg(any(unix, windows))]
@@ -12510,6 +12567,9 @@ fn launch_child_in_slot(
         .unwrap_or(group_target);
     #[cfg(not(unix))]
     let mut child = spawned;
+    if let Some(delivery) = prepared.script_delivery {
+        delivery.start(child.id().expect("spawned child has a pid"));
+    }
     #[cfg(test)]
     spawn_record_tests::after_create(&child, spec);
 
@@ -13050,6 +13110,7 @@ mod spawn_record_tests {
 
     fn spec() -> ModuleSpec {
         ModuleSpec {
+            script: None,
             module_id: "spawn-record-worker".into(),
             #[cfg(unix)]
             program: "/bin/sleep".into(),
@@ -15534,6 +15595,7 @@ mod slot_registration_wait_tests {
         let runtime = supervisor.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::disabled()));
         let spec = ModuleSpec {
+            script: None,
             module_id: "enable-stale-registration".to_string(),
             program: PathBuf::from("/missing/enable-retry-test"),
             args: Vec::new(),
@@ -16011,6 +16073,7 @@ mod terminal_history_tests {
         // holder and refuses all comers.
         let supervisor = SupervisorHandle::default();
         supervisor.apply_identity_configuration(&ModuleSpec {
+            script: None,
             module_id: "never-spawned".to_string(),
             program: PathBuf::from("/usr/bin/false"),
             args: Vec::new(),
@@ -16036,6 +16099,7 @@ mod terminal_history_tests {
         // And a real spawn nonce minted later admits exactly that nonce.
         supervisor.set_spawn_nonce("never-spawned", "minted".to_string());
         supervisor.apply_identity_configuration(&ModuleSpec {
+            script: None,
             module_id: "never-spawned".to_string(),
             program: PathBuf::from("/usr/bin/false"),
             args: Vec::new(),
@@ -16214,6 +16278,7 @@ mod terminal_history_tests {
             Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(3, Duration::ZERO));
         let runtime = supervisor.runtime_config();
         let spec = ModuleSpec {
+            script: None,
             module_id: "recovery-snapshot".to_string(),
             program: fake_aft_stub_path(),
             args: Vec::new(),
@@ -16260,6 +16325,7 @@ mod terminal_history_tests {
             Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default())
                 .with_cgroup_placement(None);
         let result = supervisor.spawn(ModuleSpec {
+            script: None,
             module_id: "no-cgroup-placement".to_string(),
             program: fake_aft_stub_path(),
             args: Vec::new(),
@@ -16347,6 +16413,7 @@ mod terminal_history_tests {
             Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(1, Duration::ZERO));
         let module = supervisor
             .spawn(ModuleSpec {
+                script: None,
                 module_id: "terminal-history".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -16396,6 +16463,7 @@ mod terminal_history_tests {
         );
         let module = supervisor
             .spawn(ModuleSpec {
+                script: None,
                 module_id: "disable-during-backoff".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -16451,6 +16519,7 @@ mod terminal_history_tests {
         let ready = dir.join("ready");
         let marker = dir.join("sigterm");
         let spec = ModuleSpec {
+            script: None,
             module_id: module_id.to_string(),
             program: fake_aft_stub_path(),
             args: Vec::new(),
@@ -16570,6 +16639,7 @@ mod terminal_history_tests {
         );
         let module = supervisor
             .spawn(ModuleSpec {
+                script: None,
                 module_id: "none-clean-exit-budget".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -16626,6 +16696,7 @@ mod terminal_history_tests {
         );
         let runtime = supervisor.runtime_config();
         let spec = ModuleSpec {
+            script: None,
             protocol: ModuleProtocol::None,
             ..windowed_crash_spec("budget-publication-order")
         };
@@ -16810,6 +16881,7 @@ mod terminal_history_tests {
         let snapshot = module.inner.snapshot.clone();
         runtime.terminal_ring = module.inner.terminal_ring.clone();
         let spec = ModuleSpec {
+            script: None,
             module_id: module.module_id().into(),
             program: fake_aft_stub_path(),
             protocol: ModuleProtocol::None,
@@ -16975,6 +17047,7 @@ mod terminal_history_tests {
         .with_terminal_journal(path, "health-budget-journal-failure".into());
         let runtime = supervisor.runtime_config();
         let spec = ModuleSpec {
+            script: None,
             program: fake_aft_stub_path(),
             protocol: ModuleProtocol::None,
             env: vec![("FAKE_AFT_EXIT_CODE".into(), "17".into())],
@@ -17015,6 +17088,7 @@ mod terminal_history_tests {
         );
         let runtime = supervisor.runtime_config();
         let spec = ModuleSpec {
+            script: None,
             program: fake_aft_stub_path(),
             protocol: ModuleProtocol::None,
             env: vec![("FAKE_AFT_EXIT_CODE".into(), "17".into())],
@@ -17200,6 +17274,7 @@ mod terminal_history_tests {
         );
         let module = supervisor
             .spawn(ModuleSpec {
+                script: None,
                 module_id: "wire-clean-exit".to_string(),
                 program: fake_aft_stub_path(),
                 args: Vec::new(),
@@ -17243,6 +17318,7 @@ mod terminal_history_tests {
         runtime.test_reload_exit_record_gate = Some(Arc::clone(&gate));
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let spec = ModuleSpec {
+            script: None,
             module_id: "reload-exit-roster".into(),
             program: fake_aft_stub_path(),
             args: Vec::new(),
@@ -17304,6 +17380,7 @@ mod terminal_history_tests {
         );
         let runtime = supervisor.runtime_config();
         let spec = ModuleSpec {
+            script: None,
             module_id: "lifetime-increment-path".to_string(),
             program: PathBuf::from("/unused/lifetime-increment-path"),
             args: Vec::new(),
@@ -17400,6 +17477,7 @@ mod terminal_history_tests {
         );
         let runtime = supervisor.runtime_config();
         let spec = ModuleSpec {
+            script: None,
             module_id: "deliberately-severed".to_string(),
             program: PathBuf::from("/unused/deliberately-severed"),
             args: Vec::new(),
@@ -17456,6 +17534,7 @@ mod terminal_history_tests {
         );
         let runtime = supervisor.runtime_config();
         let spec = ModuleSpec {
+            script: None,
             module_id: "genuine-crash".to_string(),
             program: PathBuf::from("/unused/genuine-crash"),
             args: Vec::new(),
@@ -17504,6 +17583,7 @@ mod terminal_history_tests {
 
     fn windowed_crash_spec(module_id: &str) -> ModuleSpec {
         ModuleSpec {
+            script: None,
             module_id: module_id.to_string(),
             program: PathBuf::from("/unused").join(module_id),
             args: Vec::new(),
@@ -17782,6 +17862,7 @@ mod terminal_history_tests {
         let runtime = supervisor.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let spec = ModuleSpec {
+            script: None,
             module_id: "drain-deliberate-severance".to_string(),
             program: fake_aft_stub_path(),
             args: Vec::new(),
@@ -17850,6 +17931,7 @@ mod terminal_history_tests {
         let runtime = supervisor.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let spec = ModuleSpec {
+            script: None,
             module_id: "ordinary-drain".to_string(),
             program: fake_aft_stub_path(),
             args: Vec::new(),
@@ -18018,6 +18100,7 @@ mod restart_ordering_tests {
         let home = cortexkit_test_support::ScratchDir::new("restart-before-publication");
         let address_file = home.path().join("address");
         let spec = ModuleSpec {
+            script: None,
             module_id: "restart-serving-child".into(),
             program: std::env::current_exe().unwrap(),
             args: vec![
@@ -18156,6 +18239,7 @@ mod restart_ordering_tests {
         let registered = supervisor
             .register_configured_with_health(
                 ModuleSpec {
+                    script: None,
                     module_id: "queued-before-replacement".into(),
                     // `/bin/sleep` itself, not `/bin/sh -c "exec sleep"`: on
                     // macOS a module whose running image is not the configured
@@ -18292,6 +18376,7 @@ mod health_event_tests {
                 .with_forwarding(forwarding.clone())
                 .with_health_config(health.clone());
             let spec = ModuleSpec {
+                script: None,
                 module_id: "event-health-child".into(),
                 // `/bin/sleep` itself, not `/bin/sh -c "exec sleep"`: on macOS
                 // the privacy trampoline refuses a module whose running image
@@ -18619,6 +18704,7 @@ mod health_event_tests {
             RestartPolicy::new(0, Duration::ZERO),
         );
         let spec = ModuleSpec {
+            script: None,
             module_id: "registration-timeout-group".into(),
             program: "/bin/sleep".into(),
             args: vec!["120".into()],
@@ -19623,6 +19709,7 @@ mod health_tombstone_tests {
             .with_handle(supervisor_handle.clone())
             .with_health_config(health);
         let spec = ModuleSpec {
+            script: None,
             module_id: "late-health-module".to_string(),
             program: PathBuf::from("disabled-module"),
             args: Vec::new(),
@@ -19970,6 +20057,7 @@ mod child_env_tests {
 
     fn spec(env: Vec<(String, String)>) -> ModuleSpec {
         ModuleSpec {
+            script: None,
             module_id: "env-plan".to_string(),
             program: PathBuf::from("/nonexistent"),
             args: Vec::new(),
@@ -20398,6 +20486,7 @@ mod cgroup_placement_tests {
                 .with_cgroup_placement(Some(placement.clone()));
         let runtime = supervisor.runtime_config();
         let mut spec = ModuleSpec {
+            script: None,
             module_id: "unique-spawn".into(),
             program: PathBuf::from("/bin/sleep"),
             args: vec!["60".into()],
@@ -20501,6 +20590,7 @@ mod cgroup_placement_tests {
         let error = apply_cgroup_placement(
             &mut command,
             &ModuleSpec {
+                script: None,
                 module_id: "broken-cgroup".to_string(),
                 program: PathBuf::from("true"),
                 args: Vec::new(),
@@ -21171,6 +21261,7 @@ mod job_containment_tests {
         let runtime = supervisor.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let spec = ModuleSpec {
+            script: None,
             module_id: module_id.to_string(),
             program: stub_path(),
             // Zero args deliberately: a `--subc` argument would make the stub dial
@@ -21464,6 +21555,7 @@ mod privacy_trampoline_configuration_tests {
             protocol: subc_control::ModuleProtocol::None,
             overlap: super::ModuleOverlap::Exclusive,
             carry_containment: false,
+            script: None,
         }
     }
 }
@@ -21501,6 +21593,7 @@ mod privacy_exec_boundary_tests {
     #[cfg(target_os = "macos")]
     fn spec(program: &str, args: &[&str]) -> ModuleSpec {
         ModuleSpec {
+            script: None,
             module_id: "privacy-boundary".into(),
             program: program.into(),
             args: args.iter().map(|arg| (*arg).into()).collect(),
@@ -21800,6 +21893,7 @@ mod launch_nonce_descriptor_tests {
         );
         let xdg = |name: &str| (name.to_string(), scratch.join(name).display().to_string());
         let spec = ModuleSpec {
+            script: None,
             module_id: "nonce-descriptor-probe".to_string(),
             program: PathBuf::from("/bin/sh"),
             args: vec!["-c".to_string(), script],
@@ -21912,6 +22006,7 @@ mod cgroup_containment_tests {
         let ready = dir.join("ready");
         let module = supervisor
             .spawn(ModuleSpec {
+                script: None,
                 module_id: "memory-tree".into(),
                 program: PathBuf::from("/bin/sh"),
                 args: vec![
@@ -22025,6 +22120,7 @@ mod cgroup_containment_tests {
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
         let pid_file = dir.join("grandchild.pid");
         let spec = ModuleSpec {
+            script: None,
             module_id: module_id.to_string(),
             program: PathBuf::from("/bin/sh"),
             args: vec![
@@ -22143,6 +22239,7 @@ mod record_write_stall_tests {
     /// measures would then never produce a module at all.
     fn sleeping_spec() -> ModuleSpec {
         ModuleSpec {
+            script: None,
             module_id: "record-write-stall".into(),
             program: "/bin/sleep".into(),
             args: vec!["600".into()],
@@ -22297,6 +22394,7 @@ mod retained_status_tests {
             let supervisor =
                 Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
             let spec = ModuleSpec {
+                script: None,
                 module_id: "retained-status-fixture".into(),
                 program: PathBuf::from("/not-spawned"),
                 args: Vec::new(),

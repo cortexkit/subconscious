@@ -343,6 +343,7 @@ fn check_environment(
 #[test]
 fn windows_channel_protocol_none_gets_no_registration_or_nonce() {
     let spec = ModuleSpec {
+        script: None,
         module_id: "no-channel".into(),
         program: PathBuf::from("unused.exe"),
         args: vec![],

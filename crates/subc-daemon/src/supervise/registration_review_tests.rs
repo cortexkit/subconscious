@@ -12,6 +12,7 @@ async fn registration_channel_sync_spawn_budget_ignores_previous_same_id_configu
     let supervisor = Supervisor::new_for_test(registry.clone(), RestartPolicy::default())
         .with_handle(handle.clone());
     let spec = ModuleSpec {
+        script: None,
         module_id: "channel-module".into(),
         program: "/bin/sleep".into(),
         args: vec!["60".into()],
@@ -772,6 +773,7 @@ async fn registration_channel_failed_ungated_service_keeps_nonce_launch_alive() 
         .with_handle(handle.clone());
     let module = supervisor
         .spawn(ModuleSpec {
+            script: None,
             module_id: "legacy-channel-failure".into(),
             program: "/bin/sleep".into(),
             args: vec!["600".into()],
@@ -817,6 +819,7 @@ async fn registration_channel_macos_direct_exec_reap_never_becomes_ready() {
     let (auth, info) = auth();
     let scratch = cortexkit_test_support::ScratchDir::new("direct-exec-reap");
     let spec = ModuleSpec {
+        script: None,
         module_id: "channel-module".into(),
         program: "/bin/sleep".into(),
         args: vec!["2".into()],

@@ -955,6 +955,7 @@ async fn unregistered_channel(
             .with_forwarding(rig.handler.forwarding.clone());
     let module = supervisor
         .spawn_async(ModuleSpec {
+            script: None,
             module_id: module_id.into(),
             program: "/bin/sh".into(),
             args: vec!["-c".into(), "exec sleep 300".into()],

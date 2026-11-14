@@ -31,6 +31,7 @@ fn config_spawn_unset_path_refuses_bare_program_before_capture_or_spawn() {
 
     assert!(std::env::var_os("PATH").is_none());
     let spec = ModuleSpec {
+        script: None,
         module_id: "missing-path".into(),
         program: "decoy.exe".into(),
         args: vec![],

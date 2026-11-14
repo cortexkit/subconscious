@@ -2065,6 +2065,7 @@ async fn config_delivery_pre_hello_failure_after_stamp_holds_without_an_active_g
 #[cfg(unix)]
 fn supervised_spec(rig: &Rig, module: &str) -> crate::supervise::ModuleSpec {
     crate::supervise::ModuleSpec {
+        script: None,
         module_id: module.into(),
         program: rig.path.join("program"),
         args: rig

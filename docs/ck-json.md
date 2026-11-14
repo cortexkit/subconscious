@@ -49,6 +49,7 @@ by the help next step). Bare `ckni --json` is help and is refused too.
 | `setup` | no JSON form |
 | `upgrade` | no JSON form |
 | `daemon lint` | no JSON form |
+| `module check-script` | no JSON form |
 | `help` | no JSON form |
 | `version` | no JSON form |
 

@@ -7688,6 +7688,13 @@ impl ControlHandler {
                 status.launch_spec_digest.as_ref(),
             ));
             let pending_reload = Some(verdict);
+            let script = configured.script.as_ref().map(|path| {
+                let approved = self
+                    .config_runtime
+                    .as_ref()
+                    .and_then(|owner| owner.approved_script(&status.module_id, path));
+                crate::supervise::script::status(path, approved.as_ref())
+            });
             let configured_enabled = match &approved {
                 ApprovedDaemonView::Approved {
                     config: approved, ..
@@ -7723,6 +7730,7 @@ impl ControlHandler {
                     status.health.status,
                 )
                 .with_configured_enabled(configured_enabled)
+                .with_script(script)
                 .with_admission_refused(admission_refused)
                 .with_next_retry_at_ms(next_retry_at_ms)
                 .with_launch_nonce_env(Some(!cfg!(unix)))
@@ -11498,6 +11506,7 @@ mod tests {
         let source_line = format!("config error: {}", "x".repeat(DEFAULT_MAX_LINE_BYTES));
         let module = supervisor
             .spawn(ModuleSpec {
+                script: None,
                 carry_containment: false,
                 module_id: "stderr-tail-wire".to_string(),
                 program: fake_aft_stub_path(),
@@ -11608,6 +11617,7 @@ mod tests {
                 .with_terminal_journal(journal_path.clone(), "off-worker-daemon".to_string());
         let module = supervisor
             .spawn(ModuleSpec {
+                script: None,
                 carry_containment: false,
                 module_id: "terminal-off-worker".to_string(),
                 program: fake_aft_stub_path(),
@@ -11680,6 +11690,7 @@ mod tests {
                 .with_handle(supervisor_handle.clone());
         let module = supervisor
             .spawn(ModuleSpec {
+                script: None,
                 carry_containment: false,
                 module_id: "terminal-golden".to_string(),
                 program: fake_aft_stub_path(),
@@ -16146,6 +16157,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    script: None,
                     carry_containment: false,
                     module_id: "warming".to_string(),
                     program: fake_aft_stub_path(),
@@ -16269,6 +16281,7 @@ mod tests {
                 .with_handle(handle.clone());
         let module = supervisor
             .spawn(crate::ModuleSpec {
+                script: None,
                 carry_containment: false,
                 module_id: "retry-list".into(),
                 program: PathBuf::from("/bin/sh"),
@@ -16315,6 +16328,7 @@ mod tests {
             Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
         let module = supervisor
             .spawn(crate::ModuleSpec {
+                script: None,
                 carry_containment: false,
                 module_id: "pid-read-budget".into(),
                 program: std::env::current_exe().unwrap(),
@@ -16406,6 +16420,7 @@ mod tests {
         supervisor
             .supervise_configured(
                 crate::ModuleSpec {
+                    script: None,
                     module_id: "disabled-resource-reading".into(),
                     program: std::env::current_exe().unwrap(),
                     args: Vec::new(),
@@ -16436,6 +16451,7 @@ mod tests {
             .with_handle(handle.clone());
         let module = supervisor
             .spawn(crate::ModuleSpec {
+                script: None,
                 carry_containment: false,
                 module_id: "list-process-priority".into(),
                 program: std::env::current_exe().unwrap(),
@@ -16559,6 +16575,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 crate::ModuleSpec {
+                    script: None,
                     carry_containment: false,
                     module_id: "memory-read".into(),
                     program: PathBuf::from("disabled-module"),
@@ -16656,6 +16673,7 @@ mod tests {
         supervisor
             .supervise_configured(
                 crate::ModuleSpec {
+                    script: None,
                     carry_containment: false,
                     module_id: "budget-worker".into(),
                     program: PathBuf::from("disabled-module"),
@@ -16762,6 +16780,7 @@ mod tests {
         supervisor
             .supervise_configured(
                 crate::ModuleSpec {
+                    script: None,
                     carry_containment: false,
                     module_id: "drift".into(),
                     program: PathBuf::from("disabled-module"),
@@ -17122,6 +17141,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    script: None,
                     carry_containment: false,
                     module_id: "warming".to_string(),
                     program: fake_aft_stub_path(),
@@ -17213,6 +17233,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    script: None,
                     carry_containment: false,
                     module_id: module_id.to_string(),
                     program: fake_aft_stub_path(),
@@ -17626,6 +17647,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 ModuleSpec {
+                    script: None,
                     carry_containment: false,
                     module_id: "failed".to_string(),
                     program: missing_program,
@@ -17729,6 +17751,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 crate::ModuleSpec {
+                    script: None,
                     carry_containment: false,
                     module_id: "late-health-response".to_string(),
                     program: PathBuf::from("disabled-module"),
@@ -18334,6 +18357,7 @@ mod tests {
             LaunchSpecAgreement as Agreement, LaunchSpecUnavailableReason as Reason,
         };
         let configured = crate::supervise::ModuleSpec {
+            script: None,
             carry_containment: false,
             module_id: "legacy".into(),
             program: "/module".into(),
@@ -20495,6 +20519,7 @@ mod tests {
             supervisor
                 .supervise_configured(
                     ModuleSpec {
+                        script: None,
                         carry_containment: false,
                         module_id: OWNER.to_string(),
                         program: PathBuf::from("/nonexistent/prefrontal-core"),
@@ -20711,6 +20736,7 @@ mod tests {
             supervisor
                 .supervise_configured(
                     ModuleSpec {
+                        script: None,
                         carry_containment: false,
                         module_id: OWNER.to_string(),
                         program: PathBuf::from("/nonexistent/prefrontal-core"),

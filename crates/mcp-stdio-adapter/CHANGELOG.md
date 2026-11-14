@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.8.1
+
+- Raise the daemon test dependency for the script-aware launch specification API.
+
 ## 0.8.0
 
 - Declare that the MCP adapter hosts third-party code so its origin evidence

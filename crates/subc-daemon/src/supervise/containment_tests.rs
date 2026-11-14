@@ -85,6 +85,7 @@ impl Fixture {
         let record = dir.join("live-children.json");
         let holder_path = dir.join("holder.pid");
         let spec = ModuleSpec {
+            script: None,
             module_id: label.to_owned(),
             program: if cfg!(target_os = "macos") { "/bin/bash" } else { "/bin/sh" }.into(),
             args: vec!["-c".into(),

@@ -20,6 +20,7 @@ async fn route_open_for_recovery_snapshot(
     let module = supervisor
         .supervise_configured(
             ModuleSpec {
+                script: None,
                 module_id: "recovery-snapshot".into(),
                 program: fake_aft_stub_path(),
                 args: vec![],

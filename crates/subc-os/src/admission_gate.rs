@@ -39,7 +39,7 @@ pub struct PlacementBarrier {
 impl AdmissionGate {
     /// Register PID reporting before any callback that can block in child
     /// placement. Install the returned `PlacementBarrier` after those callbacks
-    /// and before `ChildDescriptorSlots` fills slots 3-5.
+    /// and before `ChildDescriptorSlots` fills slots 3-6.
     /// Every descriptor remains CLOEXEC and is outside the reserved slots.
     pub fn install(command: &mut Command) -> io::Result<(Self, PlacementBarrier)> {
         let (ready, report) = io::pipe()?;

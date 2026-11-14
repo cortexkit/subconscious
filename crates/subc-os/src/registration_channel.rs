@@ -101,12 +101,12 @@ impl RegistrationPipe {
 }
 
 /// Parent-owned sources for the final, allocation-free descriptor placement.
-/// Sources stay above all three reserved slots so stdio setup and placement
+/// Sources stay above all four reserved slots so stdio setup and placement
 /// callbacks cannot overwrite one before it is copied.
 #[cfg(unix)]
 #[derive(Default)]
 pub struct ChildDescriptorSlots {
-    pub(crate) sources: [Option<std::os::fd::OwnedFd>; 3],
+    pub(crate) sources: [Option<std::os::fd::OwnedFd>; 4],
 }
 
 #[cfg(unix)]
@@ -126,6 +126,12 @@ impl ChildDescriptorSlots {
         Ok(())
     }
 
+    /// Install the script transport at fd 6, away from runtime IPC at fd 3.
+    pub fn script(&mut self, reader: std::os::fd::OwnedFd) -> std::io::Result<()> {
+        self.sources[3] = Some(outside_child_slots(reader)?);
+        Ok(())
+    }
+
     /// Install after the placement barrier. Drop the command immediately after
     /// spawn to close the parent's copies of the child-only descriptors.
     pub fn install(self, command: &mut std::process::Command) {
@@ -140,7 +146,7 @@ impl ChildDescriptorSlots {
         for (index, source) in self.sources.iter().enumerate() {
             if let Some(source) = source {
                 let slot = index as i32 + 3;
-                // SAFETY: parent preparation owns all sources above slot 5.
+                // SAFETY: parent preparation owns all sources above slot 6.
                 place_descriptor(source.as_raw_fd(), slot)?;
             }
         }
@@ -168,7 +174,7 @@ pub(crate) fn outside_child_slots(
 ) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::{AsRawFd, FromRawFd};
     // SAFETY: duplicate a live descriptor, retaining CLOEXEC in the parent.
-    let copy = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 6) };
+    let copy = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 7) };
     if copy == -1 {
         return Err(std::io::Error::last_os_error());
     }

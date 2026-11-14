@@ -1433,6 +1433,7 @@ pub(crate) mod tests {
 
         fn spec(module_id: &str) -> ModuleSpec {
             ModuleSpec {
+                script: None,
                 carry_containment: false,
                 module_id: module_id.to_owned(),
                 program: PathBuf::from("/bin/sleep"),
@@ -2401,6 +2402,7 @@ pub(crate) mod tests {
             )
             .with_live_children_record(path.clone());
             let spec = |module_id: &str| ModuleSpec {
+                script: None,
                 carry_containment: false,
                 module_id: module_id.to_owned(),
                 program: program.clone(),

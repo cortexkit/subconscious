@@ -1025,6 +1025,100 @@ fn spec(rig: &Rig) -> ModuleSpec {
         .module_spec()
 }
 
+fn script_rig() -> (Rig, std::path::PathBuf, std::path::PathBuf) {
+    let rig = rig();
+    let script = rig.path.join("bundle.js");
+    let receipt = rig.path.join("receipt.json");
+    std::fs::write(&script, b"abc").unwrap();
+    std::fs::write(rig.path.join("subc.jsonc"), json!({"version":1,"modules":{"a":{"script":{"runtime":"bun","path":script},"args":[receipt],"protocol":"none"}}}).to_string()).unwrap();
+    (rig, script, receipt)
+}
+
+async fn script_receipt(path: &std::path::Path) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(bytes) = std::fs::read(path) {
+                if let Ok(value) = serde_json::from_slice(&bytes) {
+                    return value;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("runner must receive the complete script")
+}
+
+#[tokio::test]
+async fn script_admission_swap_after_read_delivers_approved_bytes_and_refuses_next_start() {
+    let (rig, path, receipt) = script_rig();
+    let owner = Arc::new(rig.owner("script-swap"));
+    rig.stamp(&owner);
+    let original = spec(&rig);
+    let changed_path = path.clone();
+    owner.set_spawn_exec_hook_for_test(move || {
+        std::fs::write(changed_path, b"unapproved replacement").unwrap();
+    });
+    let supervisor = Supervisor::new_for_test(
+        Arc::new(crate::Registry::default()),
+        RestartPolicy::default(),
+    )
+    .with_config_runtime(owner.clone());
+    let module = supervisor.spawn_async(original.clone()).await.unwrap();
+    let report = script_receipt(&receipt).await;
+    module.stop().await.unwrap();
+    assert_eq!(report["bytes"], json!([97, 98, 99]));
+    let header = report["header"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|byte| format!("{:02x}", byte.as_u64().unwrap()))
+        .collect::<String>();
+    assert_eq!(header,"434b534352495054010000000300000000000000ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    let env = report["env"].as_str().unwrap();
+    assert!(env.starts_with("6:") && env[2..].parse::<u64>().unwrap() > 0);
+    assert_eq!(
+        owner.prepare_spawn(&original).err().unwrap().code,
+        "program_refused"
+    );
+    assert!(owner.has_recorded_admission_hold("a"));
+    assert!(
+        crate::supervise::script::status(&path, owner.approved_script("a", &path).as_ref())
+            .needs_review
+    );
+}
+
+#[tokio::test]
+async fn script_admission_gate_refuses_direct_interpreter_but_starts_script_form() {
+    let (rig, path, receipt) = script_rig();
+    let interpreter = rig.path.join("bun");
+    std::fs::copy(sleep_program(), &interpreter).unwrap();
+    let mut direct = spec(&rig);
+    direct.script = None;
+    direct.program = interpreter;
+    direct.args = vec![path.to_string_lossy().into_owned()];
+    assert_eq!(
+        crate::config_gate::program::capture(&direct, &[])
+            .err()
+            .unwrap()
+            .code,
+        "program_refused"
+    );
+    let owner = Arc::new(rig.owner("script-start"));
+    rig.stamp(&owner);
+    let module = Supervisor::new_for_test(
+        Arc::new(crate::Registry::default()),
+        RestartPolicy::default(),
+    )
+    .with_config_runtime(owner)
+    .spawn_async(spec(&rig))
+    .await
+    .unwrap();
+    let report = script_receipt(&receipt).await;
+    module.stop().await.unwrap();
+    assert_eq!(report["bytes"], json!([97, 98, 99]));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gated_nonce_policy_stamp_between_agent_validation_and_commit_refuses_wire_declaration() {
     let rig = rig();

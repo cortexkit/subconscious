@@ -25,6 +25,7 @@ pub(crate) struct ProgramLaunch {
     pub(crate) inputs: BTreeMap<InputKey, CapturedInput>,
     pub(crate) files: Vec<File>,
     pub(crate) image: subc_os::RetainedFileIdentity,
+    pub(crate) script: Option<crate::supervise::script::ScriptBytes>,
     bindings: Vec<(std::path::PathBuf, subc_os::RetainedFileIdentity)>,
     #[cfg(windows)]
     _windows_files: Vec<File>,
@@ -134,6 +135,10 @@ pub(crate) fn definite_program_change(approved: &BTreeMap<InputKey, CapturedInpu
         let InputKey::Program { path, .. } = key else {
             return false;
         };
+        if matches!(&expected.value, subc_config::RecordedValue::Value { value } if value.get("kind").and_then(|kind| kind.as_str()) == Some("script")) {
+            return crate::supervise::script::ScriptBytes::read(Path::new(path))
+                .map_or(true, |content| content.input(Path::new(path)) != *expected);
+        }
         if std::fs::metadata(path).is_ok_and(|metadata| !metadata.is_file()) {
             return true;
         }
@@ -207,6 +212,17 @@ pub(crate) fn native_fixture_for_test() -> std::path::PathBuf {
 }
 
 pub(crate) fn capture(spec: &ModuleSpec, covered: &[String]) -> Result<ProgramLaunch> {
+    let mut command = spec.clone();
+    if spec.script.is_some() {
+        command.program = crate::supervise::script::runner_path()
+            .map_err(|error| GateError::new("program_refused", error))?;
+    }
+    let spec = &command;
+    let script = spec
+        .script
+        .as_ref()
+        .map(|path| crate::supervise::script::ScriptBytes::read(path))
+        .transpose()?;
     let binding = resolve(spec)?;
     let mut launch = spec.clone();
     launch.program = std::path::absolute(&binding.path)
@@ -274,11 +290,21 @@ pub(crate) fn capture(spec: &ModuleSpec, covered: &[String]) -> Result<ProgramLa
         windows_files.push(no_delete);
         files.push(file);
     }
+    if let (Some(path), Some(script)) = (&spec.script, &script) {
+        inputs.insert(
+            InputKey::Program {
+                module: spec.module_id.clone(),
+                path: path.to_string_lossy().into_owned(),
+            },
+            script.input(path),
+        );
+    }
     Ok(ProgramLaunch {
         spec: launch,
         inputs,
         files,
         image,
+        script,
         bindings,
         #[cfg(windows)]
         _windows_files: windows_files,
@@ -298,6 +324,7 @@ mod windows_tests {
         let covered = path.join("module.cjs");
         std::fs::write(&covered, "approved code").unwrap();
         let spec = ModuleSpec {
+            script: None,
             module_id: "native-binding".into(),
             program: std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
                 .join("System32/cmd.exe"),

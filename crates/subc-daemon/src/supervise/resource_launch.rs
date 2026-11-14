@@ -249,6 +249,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 crate::ModuleSpec {
+                    script: None,
                     module_id: "resource-launch-test".into(),
                     program: std::env::current_exe().unwrap(),
                     args: Vec::new(),
@@ -330,6 +331,7 @@ mod tests {
         let module = supervisor
             .supervise_configured(
                 crate::ModuleSpec {
+                    script: None,
                     module_id: "channel-fence-test".into(),
                     program: std::env::current_exe().unwrap(),
                     args: Vec::new(),

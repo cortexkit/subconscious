@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.38
+
+- Reserve Unix descriptor 6 for an identity-bearing script pipe and keep all
+  descriptor placement sources above the reserved range.
+- Add all-component no-symlink file opens and validated script-pipe readers.
+
 ## 0.1.37
 
 - The config store's keychain backend accepts the designated requirement

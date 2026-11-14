@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.21.11
+
+- Add `ck module check-script <file>` using the runner installed beside ck,
+  without requiring a running daemon.
+- Show a script module's runtime, content digest, size, and review status.
+
 ## 0.21.10
 
 - Tests only: the setup fixtures write the config store argument that 0.21.9

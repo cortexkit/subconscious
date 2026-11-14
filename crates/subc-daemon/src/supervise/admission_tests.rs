@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 fn spec(directory: &std::path::Path, name: &str) -> ModuleSpec {
     ModuleSpec {
+        script: None,
         module_id: name.into(),
         program: crate::config_gate::program::native_fixture_for_test(),
         args: vec![

@@ -73,6 +73,7 @@ impl Fixture {
         let holder_file = dir.join("holder.pid");
         let target_file = dir.join("holder.target");
         let spec = ModuleSpec {
+            script: None,
             carry_containment: true,
             module_id: label.into(),
             program: "/bin/sh".into(),

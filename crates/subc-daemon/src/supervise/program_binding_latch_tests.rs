@@ -272,6 +272,7 @@ fn config_recovery_binding_retirement_is_nonce_specific_and_idempotent() {
 async fn config_recovery_registration_deadline_reap_retires_before_probe_await() {
     let handle = SupervisorHandle::new();
     let spec = ModuleSpec {
+        script: None,
         module_id: "deadline".into(),
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "exit 0".into()],
@@ -441,6 +442,7 @@ fn config_recovery_r5_identity_configuration_cannot_reaccept_rotated_dead_nonce(
     handle.program_bindings.lock().unwrap().active.clear();
     publication.retire();
     let spec = ModuleSpec {
+        script: None,
         module_id: "identity-race".into(),
         program: "not-executed".into(),
         args: Vec::new(),
@@ -523,6 +525,7 @@ async fn config_recovery_r5_wrapper_wait_error_retires_before_return() {
     let supervisor =
         Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
     let spec = ModuleSpec {
+        script: None,
         module_id: "wait-error".into(),
         program: "/bin/sh".into(),
         args: vec!["-c".into(), "exit 0".into()],
@@ -570,6 +573,7 @@ async fn config_recovery_r5_direct_privacy_confirmation_retires_before_return() 
     let supervisor =
         Supervisor::new_for_test(Arc::new(Registry::default()), RestartPolicy::default());
     let spec = ModuleSpec {
+        script: None,
         module_id: "privacy-reap".into(),
         program: "/bin/sleep".into(),
         args: vec!["600".into()],

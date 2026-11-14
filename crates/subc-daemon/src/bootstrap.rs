@@ -2749,6 +2749,7 @@ mod tests {
         );
         let capture = temp.join("logs").join(format!("{module_id}.stderr.log"));
         let module = ConfiguredModule {
+            script: None,
             carry_containment: false,
             module_id,
             program: PathBuf::from("sh"),

@@ -110,6 +110,7 @@ fn spawn_module(
     )
     .with_cgroup_placement(Some(placement));
     let spec = ModuleSpec {
+        script: None,
         carry_containment: false,
         module_id: "reaped-module".to_string(),
         program: PathBuf::from("/bin/sh"),

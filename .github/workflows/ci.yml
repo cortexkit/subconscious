@@ -293,8 +293,7 @@ jobs:
       # hung step must end by timeout rather than by the runner dying: a
       # timed-out step keeps its log, and libtest names any test that has run
       # for over sixty seconds in that log, while a runner that loses
-      # communication with the server uploads nothing (2026-09-09, Windows,
-      # 2h46m, no log).
+      # communication with the server uploads nothing.
       - name: Test
         if: ${{ !cancelled() }}
         timeout-minutes: 60

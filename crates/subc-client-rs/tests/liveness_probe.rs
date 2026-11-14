@@ -215,8 +215,9 @@ async fn liveness_probe_keeps_silent_but_healthy_socket_for_next_call() {
 
 /// Opens the route with a generous budget before the short call, so the call's
 /// 100 ms is spent on the data request alone. Opening it inside the call also
-/// spends the capability probe and route.open from that budget, and on a loaded
-/// runner that can end the call before its data frame is sent.
+/// spends, from that budget, the `server.describe` request that learns whether
+/// the daemon accepts route close reasons and the route.open itself, and on a
+/// loaded runner that can end the call before its data frame is sent.
 async fn open_route_first(consumer: &SubcConsumer) {
     consumer
         .open_route(target(), identity(), call_options(Duration::from_secs(2)))

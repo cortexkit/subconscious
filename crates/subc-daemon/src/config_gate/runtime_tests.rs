@@ -268,11 +268,16 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
     rejected_module.stop().await.unwrap();
     let module = supervisor.spawn_async(spec).await.unwrap();
     let proof = handle.registration_proof_for_test("a").unwrap();
-    handle
-        .registration_for_test("a")
-        .unwrap()
-        .wait_launch()
-        .await;
+    let registration = handle.registration_for_test("a").unwrap();
+    registration.wait_launch().await;
+    // A launch that ended without becoming ready (or a registration left over
+    // from the stopped first child) would make the HELLO below go unanswered;
+    // say which, with the module's status, instead of a bare missing ACK.
+    assert!(
+        registration.launch_ready(),
+        "the second launch must be ready before its HELLO: {:?}",
+        module.status()
+    );
     let ordinary_excluded = std::fs::OpenOptions::new()
         .write(true)
         .open(&covered)

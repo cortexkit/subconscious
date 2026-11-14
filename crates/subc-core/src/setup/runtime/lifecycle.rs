@@ -443,6 +443,7 @@ mod tests {
         RuntimePaths {
             daemon: "ck-subc.exe".into(),
             definition: "daemon.xml".into(),
+            config_store_root: "config-store".into(),
         }
     }
 

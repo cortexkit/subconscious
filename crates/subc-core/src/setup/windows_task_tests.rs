@@ -33,6 +33,7 @@ fn native_windows_task_export_update_and_ci_live_instance() {
     let root = ScratchDir::new("native-task-definition");
     let paths = RuntimePaths {
         definition: root.join("définition.xml"),
+        config_store_root: root.join("config-store"),
         daemon: PathBuf::from(std::env::var_os("SystemRoot").expect("Windows system root"))
             .join("System32")
             .join("WindowsPowerShell")
@@ -96,9 +97,11 @@ fn native_windows_task_export_update_and_ci_live_instance() {
         let arguments = format!(
             r#"-NoProfile -NonInteractive -Command "[IO.File]::WriteAllText('{marker}', [string]$PID); Start-Sleep -Seconds 180""#
         );
-        let running = old.replace(
-            "</Command>",
-            &format!("</Command><Arguments>{}</Arguments>", xml_text(&arguments)),
+        let (before, rest) = old.split_once("<Arguments>").unwrap();
+        let (_, after) = rest.split_once("</Arguments>").unwrap();
+        let running = format!(
+            "{before}<Arguments>{}</Arguments>{after}",
+            xml_text(&arguments)
         );
         fs::write(&paths.definition, &running).unwrap();
         register();

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.21.9
+
+- Pin the daemon configuration store's absolute path in installed launchd,
+  systemd and Task Scheduler definitions, beneath the private data directory.
+  Windows uses machine-local application data rather than roaming data.
+- Restore the saved service definition when rolling back a daemon upgrade, so
+  older daemons are not restarted with arguments they do not recognize.
+
 ## 0.21.8
 
 - Build with subc-daemon 0.46.1: a `ck-subc` signed with an Apple Development

@@ -400,6 +400,9 @@ pub struct SystemUpgradeBackend {
     activated_inodes: BTreeMap<String, String>,
     rollback_paths: BTreeMap<String, PathBuf>,
     rollback_archive_sha256: BTreeMap<String, Option<String>>,
+    // A binary rollback must also restore its arguments: older daemons reject
+    // config-store-root, even if a newer daemon never became ready.
+    daemon_definition_snapshot: Option<super::runtime::DefinitionSnapshot>,
     /// Per target, where Windows replacement moved the previous image while
     /// its process kept running. The image is deleted once the upgrade of
     /// that target is verified.
@@ -539,6 +542,7 @@ impl SystemUpgradeBackend {
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            daemon_definition_snapshot: None,
             replaced_images: BTreeMap::new(),
             expected_versions,
             planned_from: BTreeMap::new(),
@@ -1016,6 +1020,11 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
         let root = load_current_inventory_root()?;
         let paths =
             super::runtime::runtime_paths(platform, &root.join("bin"), &super::apply::user_home()?);
+        if self.daemon_definition_snapshot.is_none() {
+            self.daemon_definition_snapshot = Some(super::runtime::DefinitionSnapshot::capture(
+                platform, &paths,
+            )?);
+        }
         let detail = super::runtime::restart_with_definition_at(
             platform,
             &paths,
@@ -1133,6 +1142,9 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
     }
 
     fn completed(&mut self, target: UpgradeTarget) {
+        if target.is_daemon() {
+            self.daemon_definition_snapshot = None;
+        }
         // Failed targets keep their recovery evidence; a verified completed
         // replacement no longer needs a private copy of the previous image.
         if let Some(path) = self.rollback_paths.get(target.label()).cloned() {
@@ -1203,6 +1215,16 @@ impl UpgradeExecutionBackend for SystemUpgradeBackend {
             .remove(target.label())
             .flatten();
         self.record_replacement_digest(target, &destination, previous_archive.as_deref())?;
+        if target.is_daemon() {
+            if let Some(snapshot) = &self.daemon_definition_snapshot {
+                snapshot.restore(
+                    &mut super::runtime::SystemCommandRunner,
+                    &mut self.inventory,
+                    self.subc.as_deref(),
+                )?;
+                self.daemon_definition_snapshot = None;
+            }
+        }
         // Restoring `ck` changes its bytes as much as replacing it did, so a
         // Windows `ckni.exe` copy is rewritten to the restored `ck` too.
         let ckni_note = if target.is_self_replacing() {
@@ -1480,6 +1502,7 @@ pub(super) mod tests {
             .collect(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            daemon_definition_snapshot: None,
             replaced_images: BTreeMap::new(),
             expected_versions: [(target.label().to_string(), "0.1.0".into())]
                 .into_iter()
@@ -1724,6 +1747,7 @@ pub(super) mod tests {
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            daemon_definition_snapshot: None,
             replaced_images: BTreeMap::new(),
             expected_versions: BTreeMap::from([(target.label().to_string(), "0.2.0".into())]),
             planned_from: BTreeMap::new(),
@@ -2137,6 +2161,7 @@ pub(super) mod tests {
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::from([(aft.label().to_string(), rollback)]),
             rollback_archive_sha256: BTreeMap::new(),
+            daemon_definition_snapshot: None,
             replaced_images: BTreeMap::new(),
             expected_versions: BTreeMap::new(),
             planned_from: BTreeMap::new(),
@@ -2491,6 +2516,7 @@ exit 1
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            daemon_definition_snapshot: None,
             replaced_images: BTreeMap::new(),
             expected_versions: [(aft.label().to_string(), "2.0.0".to_string())]
                 .into_iter()
@@ -2542,6 +2568,7 @@ exit 1
             activated_inodes: BTreeMap::new(),
             rollback_paths: BTreeMap::new(),
             rollback_archive_sha256: BTreeMap::new(),
+            daemon_definition_snapshot: None,
             replaced_images: BTreeMap::new(),
             expected_versions: [(mcp.label().to_string(), "0.17.36".to_string())]
                 .into_iter()

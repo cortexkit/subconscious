@@ -54,6 +54,7 @@ impl RuntimePlatform {
 pub struct RuntimePaths {
     pub definition: PathBuf,
     pub daemon: PathBuf,
+    pub config_store_root: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -204,21 +205,33 @@ impl CommandRunner for SystemCommandRunner {
     }
 }
 
-pub fn runtime_paths(platform: RuntimePlatform, home: &Path, data_home: &Path) -> RuntimePaths {
-    let daemon = home.join(platform_binary("ck-subc"));
+pub fn runtime_paths(
+    platform: RuntimePlatform,
+    binary_home: &Path,
+    user_home: &Path,
+) -> RuntimePaths {
+    let daemon = binary_home.join(platform_binary("ck-subc"));
+    let config_store_root = binary_home
+        .parent()
+        .unwrap_or(binary_home)
+        .join("config-store");
     let definition = match platform {
-        RuntimePlatform::Macos => data_home
+        RuntimePlatform::Macos => user_home
             .join("Library")
             .join("LaunchAgents")
             .join("cortexkit.subc.plist"),
-        RuntimePlatform::Linux => data_home
+        RuntimePlatform::Linux => user_home
             .join(".config")
             .join("systemd")
             .join("user")
             .join("cortexkit-subc.service"),
-        RuntimePlatform::Windows => data_home.join("cortexkit-subc-daemon.xml"),
+        RuntimePlatform::Windows => user_home.join("cortexkit-subc-daemon.xml"),
     };
-    RuntimePaths { definition, daemon }
+    RuntimePaths {
+        definition,
+        daemon,
+        config_store_root,
+    }
 }
 
 /// How long the service manager lets the daemon run after asking it to stop,
@@ -252,12 +265,15 @@ fn desired_definition_checked(
     platform: RuntimePlatform,
     paths: &RuntimePaths,
 ) -> Result<String, String> {
+    let mut paths = paths.clone();
+    paths.config_store_root = std::path::absolute(&paths.config_store_root)
+        .map_err(|error| format!("could not resolve config store path: {error}"))?;
     let windows_user = if platform == RuntimePlatform::Windows {
         current_windows_user()?
     } else {
         String::new()
     };
-    Ok(desired_definition_for_user(platform, paths, &windows_user))
+    Ok(desired_definition_for_user(platform, &paths, &windows_user))
 }
 
 fn desired_definition_for_user(
@@ -266,6 +282,12 @@ fn desired_definition_for_user(
     windows_user: &str,
 ) -> String {
     let raw_daemon = paths.daemon.to_string_lossy();
+    let raw_store = paths.config_store_root.to_string_lossy();
+    let store = match platform {
+        RuntimePlatform::Linux => systemd_argument(&raw_store),
+        RuntimePlatform::Macos => xml_text(&raw_store),
+        RuntimePlatform::Windows => xml_text(&windows_argument(&raw_store)),
+    };
     let daemon = match platform {
         RuntimePlatform::Linux => systemd_argument(&raw_daemon),
         RuntimePlatform::Macos | RuntimePlatform::Windows => xml_text(&raw_daemon),
@@ -285,7 +307,7 @@ fn desired_definition_for_user(
         // without delaying recovery for long. ExitTimeOut is the stop timeout,
         // see DAEMON_STOP_TIMEOUT_SECS.
         RuntimePlatform::Macos => format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>cortexkit.subc</string><key>ProgramArguments</key><array><string>{daemon}</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ThrottleInterval</key><integer>10</integer><key>ExitTimeOut</key><integer>{DAEMON_STOP_TIMEOUT_SECS}</integer></dict></plist>\n"
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>cortexkit.subc</string><key>ProgramArguments</key><array><string>{daemon}</string><string>--config-store-root</string><string>{store}</string></array><key>RunAtLoad</key><true/><key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict><key>ThrottleInterval</key><integer>10</integer><key>ExitTimeOut</key><integer>{DAEMON_STOP_TIMEOUT_SECS}</integer></dict></plist>\n"
         ),
         // KillMode=mixed: stopping the unit sends SIGTERM to the daemon only,
         // and SIGKILLs the rest of the cgroup after the daemon has exited.
@@ -298,7 +320,7 @@ fn desired_definition_for_user(
         // could not. TimeoutStopSec is the stop timeout, see
         // DAEMON_STOP_TIMEOUT_SECS.
         RuntimePlatform::Linux => format!(
-            "[Unit]\nDescription=CortexKit subconscious daemon\n\n[Service]\nExecStart={daemon}\nRestart=on-failure\nDelegate=yes\nDelegateSubgroup=daemon\nKillMode=mixed\nTimeoutStopSec={DAEMON_STOP_TIMEOUT_SECS}\n\n[Install]\nWantedBy=default.target\n"
+            "[Unit]\nDescription=CortexKit subconscious daemon\n\n[Service]\nExecStart={daemon} --config-store-root {store}\nRestart=on-failure\nDelegate=yes\nDelegateSubgroup=daemon\nKillMode=mixed\nTimeoutStopSec={DAEMON_STOP_TIMEOUT_SECS}\n\n[Install]\nWantedBy=default.target\n"
         ),
         // The Task Scheduler schema namespace is not decoration: `schtasks
         // /Create /XML` refuses a Task element without it ("contains an
@@ -310,7 +332,7 @@ fn desired_definition_for_user(
         // allowed by the schema's unsignedByte (over four hours of retries).
         // Remove runtime/battery limits so power changes do not stop the daemon.
         RuntimePlatform::Windows => format!(
-            "<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><URI>\\CortexKit\\subc-daemon</URI></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{windows_user}</UserId></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><UserId>{windows_user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>255</Count></RestartOnFailure></Settings><Actions Context=\"Author\"><Exec><Command>{daemon}</Command></Exec></Actions></Task>\n"
+            "<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><URI>\\CortexKit\\subc-daemon</URI></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{windows_user}</UserId></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><UserId>{windows_user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>255</Count></RestartOnFailure></Settings><Actions Context=\"Author\"><Exec><Command>{daemon}</Command><Arguments>--config-store-root {store}</Arguments></Exec></Actions></Task>\n"
         ),
     }
 }
@@ -358,6 +380,29 @@ fn systemd_argument(value: &str) -> String {
         .replace('%', "%%")
         .replace('$', "$$");
     format!("\"{escaped}\"")
+}
+
+// Task Scheduler passes Arguments as a Windows command line, not an argv array.
+// Backslashes before quotes (including the closing quote) must be doubled.
+fn windows_argument(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for character in value.chars() {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if character == '"' {
+            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+        } else {
+            quoted.push_str(&"\\".repeat(backslashes));
+        }
+        quoted.push(character);
+        backslashes = 0;
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 /// Query persistence and current liveness independently. A registration that
@@ -584,7 +629,37 @@ fn legacy_definitions(
                 .map(|text| text.replace(&encoded, &raw)),
         );
     }
+    // Before config-store-root was installed, these same templates launched
+    // the daemon without arguments. Keep recognizing owned legacy definitions.
+    definitions.extend(
+        definitions
+            .clone()
+            .iter()
+            .map(|text| without_config_store_argument(platform, text)),
+    );
     definitions
+}
+
+fn without_config_store_argument(platform: RuntimePlatform, text: &str) -> String {
+    let (start_marker, end_marker) = match platform {
+        RuntimePlatform::Macos => ("<string>--config-store-root</string><string>", "</string>"),
+        RuntimePlatform::Linux => (" --config-store-root ", "\n"),
+        RuntimePlatform::Windows => ("<Arguments>--config-store-root ", "</Arguments>"),
+    };
+    let mut legacy = text.to_string();
+    if let Some(start) = text.find(start_marker) {
+        let value_start = start + start_marker.len();
+        if let Some(end) = text[value_start..].find(end_marker) {
+            let end = value_start + end;
+            let end = if platform == RuntimePlatform::Linux {
+                end
+            } else {
+                end + end_marker.len()
+            };
+            legacy.replace_range(start..end, "");
+        }
+    }
+    legacy
 }
 
 pub fn ensure<R: CommandRunner>(
@@ -665,6 +740,20 @@ fn write_definition(
     needs_definition: bool,
     inventory: &mut Inventory,
 ) -> Result<(), String> {
+    let store_root = std::path::absolute(&paths.config_store_root)
+        .map_err(|error| format!("could not resolve config store path: {error}"))?;
+    let store_parent = store_root
+        .parent()
+        .ok_or_else(|| "config store root has no parent".to_string())?;
+    #[cfg(unix)]
+    file_modes::ensure_owned_directory(store_parent, 0o700)?;
+    #[cfg(windows)]
+    subc_os::windows_acl::create_private_dir(store_parent).map_err(|error| {
+        format!(
+            "could not secure config store parent {}: {error}",
+            store_parent.display()
+        )
+    })?;
     if needs_definition {
         let parent = paths.definition.parent().ok_or_else(|| {
             format!(
@@ -868,7 +957,7 @@ $s=New-ScheduledTaskSettingsSet -MultipleInstances $v.MultipleInstancesPolicy -A
 $existing=(Get-ScheduledTask -TaskPath '{task_path}' -TaskName '{task_name}').Settings;
 foreach($name in @('MultipleInstances','DisallowStartIfOnBatteries','StopIfGoingOnBatteries','StartWhenAvailable','RunOnlyIfNetworkAvailable','WakeToRun','ExecutionTimeLimit','RestartCount','RestartInterval')) {{ $existing.$name=$s.$name }};
 $s=$existing;
-$a=New-ScheduledTaskAction -Execute ([string]$x.Task.Actions.Exec.Command);
+$a=New-ScheduledTaskAction -Execute ([string]$x.Task.Actions.Exec.Command) -Argument ([string]$x.Task.Actions.Exec.Arguments);
 $t=New-ScheduledTaskTrigger -AtLogOn -User ([string]$x.Task.Triggers.LogonTrigger.UserId);
 $p=New-ScheduledTaskPrincipal -Id 'Author' -UserId ([string]$x.Task.Principals.Principal.UserId) -LogonType Interactive -RunLevel Limited;
 Set-ScheduledTask -TaskPath '{task_path}' -TaskName '{task_name}' -Action $a -Trigger $t -Principal $p -Settings $s | Out-Null"#
@@ -909,13 +998,73 @@ pub(crate) fn restart_with_definition_at<R: CommandRunner>(
     inventory: &mut Inventory,
     connection: Option<&Path>,
 ) -> Result<String, String> {
+    let desired = desired_definition_checked(platform, paths)?;
+    restart_with_definition_text_at(platform, paths, runner, inventory, connection, &desired)
+}
+
+pub(super) struct DefinitionSnapshot {
+    platform: RuntimePlatform,
+    paths: RuntimePaths,
+    text: String,
+}
+
+impl DefinitionSnapshot {
+    pub(super) fn capture(platform: RuntimePlatform, paths: &RuntimePaths) -> Result<Self, String> {
+        let text = match fs::read_to_string(&paths.definition) {
+            Ok(text) => text,
+            // An upgrade can repair a missing service definition. If its binary
+            // rolls back, the restored daemon still needs an argument-free one.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                without_config_store_argument(
+                    platform,
+                    &desired_definition_checked(platform, paths)?,
+                )
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not save daemon definition {}: {error}",
+                    paths.definition.display()
+                ));
+            }
+        };
+        Ok(Self {
+            platform,
+            paths: paths.clone(),
+            text,
+        })
+    }
+
+    pub(super) fn restore<R: CommandRunner>(
+        &self,
+        runner: &mut R,
+        inventory: &mut Inventory,
+        connection: Option<&Path>,
+    ) -> Result<String, String> {
+        restart_with_definition_text_at(
+            self.platform,
+            &self.paths,
+            runner,
+            inventory,
+            connection,
+            &self.text,
+        )
+    }
+}
+
+fn restart_with_definition_text_at<R: CommandRunner>(
+    platform: RuntimePlatform,
+    paths: &RuntimePaths,
+    runner: &mut R,
+    inventory: &mut Inventory,
+    connection: Option<&Path>,
+    desired: &str,
+) -> Result<String, String> {
     let status = observe(platform, runner)?;
     if let RuntimeState::Unowned { reason } =
         definition_state(platform, paths, status, runner, inventory)?
     {
         return Err(format!("refusal: {reason}"));
     }
-    let desired = desired_definition_checked(platform, paths)?;
     let old = if platform != RuntimePlatform::Linux {
         connected_daemon(runner, &paths.daemon, connection)?
     } else {
@@ -939,8 +1088,8 @@ pub(crate) fn restart_with_definition_at<R: CommandRunner>(
             let changed = fs::read_to_string(&paths.definition)
                 .ok()
                 .and_then(|text| canonical(platform, &text).ok())
-                != Some(canonical(platform, &desired)?);
-            write_definition(platform, paths, &desired, changed, inventory)?;
+                != Some(canonical(platform, desired)?);
+            write_definition(platform, paths, desired, changed, inventory)?;
             if changed && platform == RuntimePlatform::Windows {
                 update_windows_task(paths, runner)?;
             }
@@ -1376,7 +1525,7 @@ mod tests {
             RuntimePlatform::Linux,
             RuntimePlatform::Windows,
         ] {
-            let paths = runtime_paths(platform, root.path(), root.path());
+            let paths = runtime_paths(platform, &root.join("bin"), root.path());
             let mut runner = RecordingRunner::default();
             let missing = service_facts(platform, &paths, &mut runner);
             assert_eq!(missing.summary(), "not installed · ck setup installs it");
@@ -1423,7 +1572,7 @@ mod tests {
     fn start_installed_starts_a_loaded_service_and_refuses_otherwise() {
         let root = fixture_dir("start-installed");
         let platform = RuntimePlatform::Linux;
-        let paths = runtime_paths(platform, root.path(), root.path());
+        let paths = runtime_paths(platform, &root.join("bin"), root.path());
         let err = start_installed(platform, &paths, &mut RecordingRunner::default()).unwrap_err();
         assert!(err.contains("isn't installed"), "{err}");
 
@@ -1560,7 +1709,7 @@ mod tests {
     #[test]
     fn registration_and_start_refusals_carry_the_service_managers_words() {
         let root = fixture_dir("refusal-words");
-        let paths = runtime_paths(RuntimePlatform::Macos, root.path(), root.path());
+        let paths = runtime_paths(RuntimePlatform::Macos, &root.join("bin"), root.path());
         let error = register(RuntimePlatform::Macos, &paths, &mut RefusingRunner).unwrap_err();
         assert!(
             error.contains("Bootstrap failed: 5: Input/output error"),
@@ -1575,7 +1724,7 @@ mod tests {
     #[test]
     fn windows_access_denied_says_no_elevation_is_needed() {
         let root = fixture_dir("windows-access-denied");
-        let paths = runtime_paths(RuntimePlatform::Windows, root.path(), root.path());
+        let paths = runtime_paths(RuntimePlatform::Windows, &root.join("bin"), root.path());
         let error =
             register(RuntimePlatform::Windows, &paths, &mut AccessDeniedRunner).unwrap_err();
 
@@ -1592,7 +1741,7 @@ mod tests {
     #[test]
     fn macos_agent_domain_is_the_real_users_not_roots_and_not_from_the_environment() {
         let root = fixture_dir("gui-domain");
-        let paths = runtime_paths(RuntimePlatform::Macos, root.path(), root.path());
+        let paths = runtime_paths(RuntimePlatform::Macos, &root.join("bin"), root.path());
         let mut runner = RecordingRunner::default();
         // Poison the environment the old code trusted; the kernel must win.
         let previous = std::env::var_os("UID");
@@ -1617,7 +1766,7 @@ mod tests {
     #[test]
     fn ensure_reobserves_liveness_after_registering_and_never_restarts() {
         let root = fixture_dir("ensure-order");
-        let paths = runtime_paths(RuntimePlatform::Macos, root.path(), root.path());
+        let paths = runtime_paths(RuntimePlatform::Macos, &root.join("bin"), root.path());
         let mut inventory = Inventory::load(root.join("installer-manifest.json"), "darwin-arm64")
             .expect("inventory");
         // Every command succeeds and reports `state = running`: bootstrap
@@ -1655,7 +1804,7 @@ mod tests {
     #[test]
     fn macos_start_verb_is_kickstart_without_kill() {
         let root = fixture_dir("start-verb");
-        let paths = runtime_paths(RuntimePlatform::Macos, root.path(), root.path());
+        let paths = runtime_paths(RuntimePlatform::Macos, &root.join("bin"), root.path());
         let mut inventory = Inventory::load(root.join("installer-manifest.json"), "darwin-arm64")
             .expect("inventory");
         // Registered after bootstrap, but never live: `state = waiting`.
@@ -1870,7 +2019,7 @@ mod tests {
     #[test]
     fn changed_live_macos_definition_refuses_without_writing_or_commands() {
         let root = fixture_dir("live-definition-drift");
-        let paths = runtime_paths(RuntimePlatform::Macos, root.path(), root.path());
+        let paths = runtime_paths(RuntimePlatform::Macos, &root.join("bin"), root.path());
         fs::create_dir_all(paths.definition.parent().unwrap()).unwrap();
         fs::write(&paths.definition, "old plist\n").unwrap();
         let mut inventory =
@@ -1911,7 +2060,7 @@ mod tests {
             RuntimePlatform::Windows,
         ] {
             let root = fixture_dir("stopped-definition-drift");
-            let paths = runtime_paths(platform, root.path(), root.path());
+            let paths = runtime_paths(platform, &root.join("bin"), root.path());
             fs::create_dir_all(paths.definition.parent().unwrap()).unwrap();
             let desired = desired_definition(platform, &paths);
             let old = legacy_definitions(platform, &paths, &desired)[1].clone();
@@ -1982,6 +2131,7 @@ mod tests {
         let paths = RuntimePaths {
             daemon: PathBuf::from("/Users/R&D/<user>\"'/ck-subc"),
             definition: PathBuf::from("unused"),
+            config_store_root: PathBuf::from("/Users/R&D/<user>\"'/config-store"),
         };
         for platform in [RuntimePlatform::Macos, RuntimePlatform::Windows] {
             let xml = desired_definition(platform, &paths);
@@ -1997,10 +2147,11 @@ mod tests {
         let paths = RuntimePaths {
             daemon: PathBuf::from("/home/A B/100%/a\"b\\c/$d/ck-subc"),
             definition: PathBuf::from("unused"),
+            config_store_root: PathBuf::from("/home/A B/100%/a\"b\\c/$d/config-store"),
         };
         let unit = desired_definition(RuntimePlatform::Linux, &paths);
         assert!(
-            unit.contains("ExecStart=\"/home/A B/100%%/a\\\"b\\\\c/$$d/ck-subc\"\n"),
+            unit.contains("ExecStart=\"/home/A B/100%%/a\\\"b\\\\c/$$d/ck-subc\" --config-store-root \"/home/A B/100%%/a\\\"b\\\\c/$$d/config-store\"\n"),
             "{unit}"
         );
     }
@@ -2133,7 +2284,7 @@ mod tests {
     #[test]
     fn windows_deregistration_stops_the_daemon_before_deleting_the_task() {
         let root = fixture_dir("win-deregister");
-        let paths = runtime_paths(RuntimePlatform::Windows, root.path(), root.path());
+        let paths = runtime_paths(RuntimePlatform::Windows, &root.join("bin"), root.path());
         let mut runner = RecordingRunner {
             // /End refuses (task not running), taskkill refuses (already
             // exited); /Delete succeeds. Neither refusal may fail the call.
@@ -2174,7 +2325,7 @@ mod tests {
             }
         }
         let root = fixture_dir("deregister-absent");
-        let paths = runtime_paths(RuntimePlatform::Windows, root.path(), root.path());
+        let paths = runtime_paths(RuntimePlatform::Windows, &root.join("bin"), root.path());
         deregister(RuntimePlatform::Windows, &paths, None, &mut NotFound).unwrap();
         let error =
             deregister(RuntimePlatform::Macos, &paths, None, &mut RefusingRunner).unwrap_err();
@@ -2287,6 +2438,11 @@ mod reconciliation_tests {
         fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String> {
             let command = format!("{program} {}", args.join(" "));
             self.calls.push(command.clone());
+            if command.contains("New-ScheduledTaskAction") && command.contains("Set-ScheduledTask")
+            {
+                assert!(command.contains("-Argument ([string]$x.Task.Actions.Exec.Arguments)"));
+                self.task_xml = fs::read_to_string(&self.paths.definition).unwrap();
+            }
             if args
                 .first()
                 .is_some_and(|s| s == "bootstrap" || s == "/Run")
@@ -2328,7 +2484,7 @@ mod reconciliation_tests {
         owned: bool,
     ) -> (ScratchDir, RuntimePaths, Inventory, Manager) {
         let root = ScratchDir::new("definition-reconciliation");
-        let paths = runtime_paths(platform, root.path(), root.path());
+        let paths = runtime_paths(platform, &root.join("bin"), root.path());
         fs::create_dir_all(paths.definition.parent().unwrap()).unwrap();
         let desired = desired_definition_checked(platform, &paths).unwrap();
         let text = if old {
@@ -2364,6 +2520,190 @@ mod reconciliation_tests {
         registered: true,
         live: true,
     };
+
+    fn assert_config_store_install_and_rollback(platform: RuntimePlatform) {
+        let (root, mut paths, mut inventory, mut manager) = fixture(platform, false, true);
+        assert_eq!(paths.config_store_root, root.join("config-store"));
+        paths.config_store_root = root.join("new data/config-store");
+        let desired = desired_definition_checked(platform, &paths).unwrap();
+        let legacy = without_config_store_argument(platform, &desired);
+        assert!(!legacy.contains("--config-store-root"));
+        fs::write(&paths.definition, &legacy).unwrap();
+        manager.task_xml = legacy.clone();
+        assert!(matches!(
+            definition_state(platform, &paths, LIVE, &mut manager, &inventory).unwrap(),
+            RuntimeState::Outdated { .. }
+        ));
+        let snapshot = DefinitionSnapshot::capture(platform, &paths).unwrap();
+        assert!(!paths.config_store_root.parent().unwrap().exists());
+        restart_with_definition_at(platform, &paths, &mut manager, &mut inventory, None).unwrap();
+        assert_eq!(fs::read_to_string(&paths.definition).unwrap(), desired);
+        assert!(
+            !paths.config_store_root.exists(),
+            "only the daemon creates the store"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(paths.config_store_root.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        snapshot
+            .restore(&mut manager, &mut inventory, None)
+            .unwrap();
+        assert_eq!(fs::read_to_string(&paths.definition).unwrap(), legacy);
+        if platform == RuntimePlatform::Windows {
+            assert_eq!(
+                manager.task_xml, legacy,
+                "restore the registered action too"
+            );
+        }
+        assert!(matches!(
+            definition_state(platform, &paths, LIVE, &mut manager, &inventory).unwrap(),
+            RuntimeState::Outdated { .. }
+        ));
+    }
+
+    #[test]
+    fn macos_definition_pins_absolute_config_store_root() {
+        for data in [
+            "/Users/test/.local/share/cortexkit",
+            "/Users/Some & One/.local/share/cortexkit",
+        ] {
+            let paths = RuntimePaths {
+                definition: PathBuf::from("unused.plist"),
+                daemon: PathBuf::from(format!("{data}/bin/{}", platform_binary("ck-subc"))),
+                config_store_root: PathBuf::from(format!("{data}/config-store")),
+            };
+            let plist = desired_definition_for_user(RuntimePlatform::Macos, &paths, "unused");
+            let document = roxmltree::Document::parse_with_options(
+                &plist,
+                roxmltree::ParsingOptions {
+                    allow_dtd: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let arguments = document
+                .descendants()
+                .find(|node| node.has_tag_name("array"))
+                .unwrap();
+            let values = arguments
+                .children()
+                .filter(|node| node.has_tag_name("string"))
+                .map(|node| node.text().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                values,
+                [
+                    format!("{data}/bin/{}", platform_binary("ck-subc")),
+                    "--config-store-root".into(),
+                    format!("{data}/config-store")
+                ]
+            );
+        }
+        assert_config_store_install_and_rollback(RuntimePlatform::Macos);
+    }
+
+    #[test]
+    fn linux_definition_pins_absolute_config_store_root() {
+        for data in [
+            "/home/test/.local/share/cortexkit",
+            "/home/Some One/.local/share/cortexkit",
+        ] {
+            let paths = RuntimePaths {
+                definition: PathBuf::from("unused.service"),
+                daemon: PathBuf::from(format!("{data}/bin/{}", platform_binary("ck-subc"))),
+                config_store_root: PathBuf::from(format!("{data}/config-store")),
+            };
+            let unit = desired_definition_for_user(RuntimePlatform::Linux, &paths, "unused");
+            assert!(
+                unit.contains(&format!(
+                    "ExecStart=\"{data}/bin/{}\" --config-store-root \"{data}/config-store\"\n",
+                    platform_binary("ck-subc")
+                )),
+                "{unit}"
+            );
+        }
+        let mut paths = runtime_paths(
+            RuntimePlatform::Linux,
+            Path::new("relative/bin"),
+            Path::new("unused"),
+        );
+        paths.config_store_root = PathBuf::from("relative data/config-store");
+        let unit = desired_definition_checked(RuntimePlatform::Linux, &paths).unwrap();
+        let absolute = std::env::current_dir()
+            .unwrap()
+            .join("relative data/config-store");
+        assert!(unit.contains(&format!(
+            "--config-store-root {}\n",
+            systemd_argument(&absolute.to_string_lossy())
+        )));
+        assert_config_store_install_and_rollback(RuntimePlatform::Linux);
+    }
+
+    #[test]
+    fn windows_definition_pins_absolute_config_store_root() {
+        for data in [
+            r"C:\Users\test\AppData\Local\cortexkit",
+            r"C:\Users\Some & One\AppData\Local\cortexkit",
+        ] {
+            let paths = RuntimePaths {
+                definition: PathBuf::from("unused.xml"),
+                daemon: PathBuf::from(format!(r"{data}\bin\ck-subc.exe")),
+                config_store_root: PathBuf::from(format!(r"{data}\config-store")),
+            };
+            let xml = desired_definition_for_user(RuntimePlatform::Windows, &paths, "DOMAIN\\test");
+            let document = roxmltree::Document::parse(&xml).unwrap();
+            let arguments = document
+                .descendants()
+                .find(|node| node.has_tag_name("Arguments"))
+                .unwrap()
+                .text()
+                .unwrap();
+            assert_eq!(
+                arguments,
+                format!(r#"--config-store-root "{data}\config-store""#)
+            );
+        }
+        assert_config_store_install_and_rollback(RuntimePlatform::Windows);
+    }
+
+    #[test]
+    fn missing_definition_repair_rolls_back_without_config_store_argument() {
+        for platform in [
+            RuntimePlatform::Macos,
+            RuntimePlatform::Linux,
+            RuntimePlatform::Windows,
+        ] {
+            let (_root, paths, mut inventory, mut manager) = fixture(platform, false, true);
+            fs::remove_file(&paths.definition).unwrap();
+            let snapshot = DefinitionSnapshot::capture(platform, &paths).unwrap();
+            ensure(
+                platform,
+                &paths,
+                RuntimeStatus::default(),
+                &mut manager,
+                &mut inventory,
+            )
+            .unwrap();
+            assert!(fs::read_to_string(&paths.definition)
+                .unwrap()
+                .contains("--config-store-root"));
+            snapshot
+                .restore(&mut manager, &mut inventory, None)
+                .unwrap();
+            assert!(!fs::read_to_string(&paths.definition)
+                .unwrap()
+                .contains("--config-store-root"));
+        }
+    }
 
     #[test]
     fn upgrade_and_setup_restart_even_when_restart_announcement_is_refused() {

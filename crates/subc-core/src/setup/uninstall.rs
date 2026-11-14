@@ -284,6 +284,7 @@ mod tests {
         let runtime_paths = RuntimePaths {
             definition: root.join("unit"),
             daemon: managed.clone(),
+            config_store_root: root.join("config-store"),
         };
         let mut inventory =
             Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
@@ -323,6 +324,7 @@ mod tests {
         let runtime_paths = RuntimePaths {
             definition: root.join("unit"),
             daemon: managed.clone(),
+            config_store_root: root.join("config-store"),
         };
         let mut inventory =
             Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
@@ -386,6 +388,7 @@ mod tests {
         let runtime_paths = RuntimePaths {
             definition: root.join("unit"),
             daemon: root.join("ck-subc"),
+            config_store_root: root.join("config-store"),
         };
         let report = uninstall(
             RuntimePlatform::Linux,

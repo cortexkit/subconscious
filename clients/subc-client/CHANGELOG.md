@@ -2,6 +2,9 @@
 
 ## 0.25.0
 
+- A managed call whose last route.open attempt times out at the retry
+  deadline now fails `not_sent` with the refusal that used up the deadline
+  (for example `module_reloading`), instead of a terminal local timeout.
 - The npm package now carries all six native registration helpers (Linux,
   macOS and Windows, each x64 and arm64). PR and train builds check the same
   assembled bundle as tag releases before publishing is allowed.

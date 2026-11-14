@@ -81,6 +81,8 @@ mod config_delivery;
 mod content_binding;
 mod program_binding;
 mod registration;
+/// Each launch nonce, mapped to its launch's module id and the launch.
+type NonceLaunches = HashMap<String, (String, std::sync::Weak<RegistrationSpawn>)>;
 pub(crate) use registration::NonceAttestation;
 #[cfg(all(test, unix))]
 pub(crate) use registration::RegistrationProof;
@@ -2543,7 +2545,7 @@ pub struct SupervisorHandle {
     /// resolves to that launch's authority record. An entry whose launch has
     /// ended stays while its nonce still authorizes, so a nonce whose record
     /// is gone is told apart from one that never had a record.
-    nonce_launches: Arc<Mutex<HashMap<String, (String, std::sync::Weak<RegistrationSpawn>)>>>,
+    nonce_launches: Arc<Mutex<NonceLaunches>>,
     /// Reserved namespace prefixes mapped to the supervised owner module whose
     /// current spawn nonce authorizes HELLO claims below the prefix.
     ///

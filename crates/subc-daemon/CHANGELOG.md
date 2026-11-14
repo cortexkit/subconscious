@@ -18,6 +18,27 @@
   their own module id.
 - Adapt the first-party mark's supervisor readiness test to the native fixture's
   mode argument, keeping its child alive until the readiness assertions finish.
+- A dying swap candidate no longer erases the published mark, approved
+  declarations or authority epoch of the live incumbent beside it. A dead
+  spawn's epoch is kept while a pending bind names it, so such a bind is
+  still refused `stale_authority_epoch`.
+- A HELLO refused after its checks (a duplicate module id, a registry error,
+  a role conflict) no longer binds its connection to the live spawn or freezes
+  the spawn's requested declarations, so closing it leaves the spawn's routes
+  and epoch alone.
+- A launch-nonce consumer is attested in one step. A nonce whose launch had a
+  record that is gone is refused `bad_consumer_identity` instead of opening as
+  a reserved principal with no record or epoch fence; a nonce no launch was
+  ever recorded for still opens as before.
+- A placement or approval that changes a module's program record or development
+  origin evidence lowers every spawn admitted under the old one, marked or not.
+- A warm-up health probe answering not ready no longer settles, and so refuses,
+  the acknowledgement a spawn is asked for only for its mark.
+- A failed delivery rules a spawn out of the mark even before it is marked.
+- Readiness counts toward a spawn's mark only when the registration that
+  answered the probe is the spawn's own.
+- **Dev dependency:** cortexkit-test-support 0.1.15, which finds helper
+  programs when Cargo keeps its build folder apart from the target folder.
 - **Rust migration:** adopt control 0.40 types together with client 0.40.
   Public supervisor and configuration APIs expose the updated control family.
 

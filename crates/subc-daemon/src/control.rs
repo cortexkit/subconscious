@@ -421,6 +421,10 @@ type TestPause = (
     std::sync::mpsc::Receiver<()>,
 );
 
+/// A test hook run once at a fixed point in a handler.
+#[cfg(test)]
+type TestHook = Box<dyn FnOnce() + Send>;
+
 /// A test hold for async code: signal arrival, then await release.
 #[cfg(test)]
 type AsyncTestPause = (
@@ -441,7 +445,7 @@ pub struct ControlHandler {
     /// Runs once in `route.open`'s launch-nonce attestation, right after the
     /// nonce is resolved, to interleave a nonce withdrawal there.
     #[cfg(test)]
-    after_nonce_attestation: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    after_nonce_attestation: Arc<Mutex<Option<TestHook>>>,
     /// Holds a registration channel's HELLO after its reader resolved the
     /// channel and before the blocking HELLO handler starts.
     #[cfg(test)]
@@ -2762,7 +2766,7 @@ impl ControlHandler {
 
     /// Run `hook` once, in the next `route.open` that attests a launch nonce,
     /// right after the nonce is resolved.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn after_nonce_attestation_for_test(&self, hook: impl FnOnce() + Send + 'static) {
         *self
             .after_nonce_attestation

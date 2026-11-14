@@ -377,8 +377,9 @@ impl SpawnAuthorityRecord {
             && !state.hosts_third_party_code
     }
 
-    /// Freeze the spawn's request once. Matching saved digests approve only the
-    /// exact requested entries, never an entry left over from another process.
+    /// [`Self::freeze_declarations`], with nothing differing when this call
+    /// froze nothing.
+    #[cfg(test)]
     pub(crate) fn initialize_declarations(
         &self,
         requested: ProviderDeclarations,
@@ -386,8 +387,11 @@ impl SpawnAuthorityRecord {
         self.freeze_declarations(requested).unwrap_or_default()
     }
 
-    /// [`Self::initialize_declarations`], returning `None` when this call
-    /// froze nothing: the record is dead or an earlier HELLO froze its request.
+    /// Freeze the spawn's request once and return the requested entries that
+    /// differ from the saved approvals. Matching saved digests approve only
+    /// the exact requested entries, never an entry left over from another
+    /// process. `None` when this call froze nothing: the record is dead or an
+    /// earlier HELLO froze its request.
     pub(crate) fn freeze_declarations(
         &self,
         requested: ProviderDeclarations,

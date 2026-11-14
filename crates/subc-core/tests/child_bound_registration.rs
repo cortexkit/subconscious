@@ -351,13 +351,13 @@ async fn child_bound_rust_real_daemon() {
 
 /// Build `cargo build --locked -p subc-core -p subc-daemon -p subc-os --bins --features subc-core/test-support,subc-daemon/test-support,subc-daemon/dev-desktop-approval`.
 /// Build the bundle-local helper with `bun run --cwd clients/subc-client build:native`.
-/// The test compiles its TypeScript module with `bun build --compile`; the
-/// configuration gate deliberately refuses interpreter-plus-script launches.
-/// Blocker: a compiled Bun module does not adopt its native registration channel
-/// (the daemon's inherited authentication socket), so it cannot register after stamping.
+/// The test compiles its TypeScript module with `bun build --compile`, because with
+/// the configuration gate on, an interpreter launched with a script is refused.
+/// It needs the development desktop-approval surface, so ordinary CI skips it
+/// like the Rust case above.
 /// Run `CHILD_BOUND_BUN="$(command -v bun)" cargo test --locked -p subc-core --features test-support,subc-daemon/dev-desktop-approval --test child_bound_registration child_bound_typescript_real_daemon -- --ignored --exact --nocapture`.
 #[tokio::test]
-#[ignore = "compiled Bun module does not adopt its native registration channel; see doc comment"]
+#[ignore = "requires the development desktop-approval surface; see doc comment"]
 async fn child_bound_typescript_real_daemon() {
     gated(true).await;
 }

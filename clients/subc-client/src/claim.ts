@@ -14,7 +14,16 @@ export function isRetryableClaimCode(code: string): boolean {
 }
 
 export class ClaimError extends Error {
-  constructor(readonly code: string, readonly detail?: unknown) { super(`claim operation refused: ${code}`); }
+  constructor(readonly code: string, readonly detail?: unknown, override readonly cause?: unknown) {
+    super(`claim operation refused: ${code}${cause === undefined ? "" : `: ${causeText(cause)}`}`);
+  }
+}
+
+// Read `message` by shape, not `instanceof Error`: older Bun raises module
+// resolution failures as a ResolveMessage, which is not an Error subclass.
+function causeText(cause: unknown): string {
+  const message = (cause as {message?: unknown} | null)?.message;
+  return typeof message === "string" ? message : String(cause);
 }
 
 function object(value: unknown): Record<string, unknown> {

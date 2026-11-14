@@ -4,6 +4,10 @@ import { ClaimBroker, ClaimError, readClaimRefusal, readClaimPresentReply } from
 import { SubcSocket } from "./socket.js";
 import { FrameType, Priority, buildFlags, buildFrame, encodeFrame } from "./envelope.js";
 
+/** SDK-local registration failures, not daemon-authored claim refusal codes. */
+export type RegistrationErrorCode = "registration_helper_unavailable" | "registration_adoption_failed"
+  | "registration_already_taken" | "registration_owner_conflict" | "registration_not_ready" | "registration_closed";
+
 interface NativeChannel { read(): Promise<Buffer>; write(bytes: Buffer): Promise<void>; close(): void }
 interface NativeHandoff {
   environment: Record<string, string>; childFd: number | null;
@@ -17,7 +21,29 @@ interface Native {
 }
 let addon: Native | undefined;
 function native(): Native {
-  return addon ??= createRequire(import.meta.url)("../native/index.js") as Native;
+  if (addon) return addon;
+  if (!["darwin", "linux", "win32"].includes(process.platform) || !["arm64", "x64"].includes(process.arch)) {
+    throw new Error(`registration native platform unsupported: ${process.platform}-${process.arch}`);
+  }
+  // Node ESM has no require; Bun's own require must stay visible to its bundler.
+  if (typeof require === "undefined") {
+    return addon = createRequire(import.meta.url)(`../native/subc-registration-${process.platform}-${process.arch}.node`) as Native;
+  }
+  // Literal paths let Bun embed the addon when compiling a standalone module.
+  // Bun's bundler treats an unresolvable require inside a try block as optional
+  // instead of failing the build, so a development checkout that built only its
+  // own platform's binary still compiles. The catch only rethrows.
+  try {
+    switch (`${process.platform}-${process.arch}`) {
+      case "darwin-arm64": return addon = require("../native/subc-registration-darwin-arm64.node") as Native;
+      case "darwin-x64": return addon = require("../native/subc-registration-darwin-x64.node") as Native;
+      case "linux-arm64": return addon = require("../native/subc-registration-linux-arm64.node") as Native;
+      case "linux-x64": return addon = require("../native/subc-registration-linux-x64.node") as Native;
+      case "win32-arm64": return addon = require("../native/subc-registration-win32-arm64.node") as Native;
+      case "win32-x64": return addon = require("../native/subc-registration-win32-x64.node") as Native;
+      default: throw new Error(`registration native platform unsupported: ${process.platform}-${process.arch}`);
+    }
+  } catch (error) { throw error; }
 }
 
 /** Native reads and writes remain on the N-API runtime, including
@@ -46,17 +72,22 @@ export function registrationNamed(): boolean {
 class RegistrationOwner {
   supervised = false;
   private decided = false;
+  private adoptionError?: ClaimError;
   private socket?: SubcSocket;
   private taken = false;
   helperTaken = false;
   broker?: ClaimBroker;
   adopt(): void {
+    if (this.adoptionError) throw this.adoptionError;
     if (this.decided) return;
     this.decided = true;
     if (!registrationNamed()) return;
     let helper: Native;
     try { helper = native(); }
-    catch { return; }
+    catch (error) {
+      this.adoptionError = new ClaimError("registration_helper_unavailable", undefined, error);
+      throw this.adoptionError;
+    }
     this.supervised = helper.supervised();
     if (this.supervised) {
       const channel = helper.takeRegistrationChannel();

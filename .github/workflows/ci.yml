@@ -564,7 +564,7 @@ jobs:
   # because they only report once someone is already publishing — the failure
   # arrives attached to the one action you least want to abort.
   ts-client:
-    name: TS (${{ matrix.pkg }}${{ matrix.os == 'windows-latest' && format(', windows, bun {0}', matrix.bun) || '' }})
+    name: TS (${{ matrix.pkg }}, ${{ matrix.os }}, bun ${{ matrix.bun }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -581,6 +581,9 @@ jobs:
         # floating `latest` would change which runtime these legs test under
         # them without a commit.
         include:
+          - pkg: subc-client
+            os: macos-latest
+            bun: latest
           - pkg: subc-client
             os: windows-latest
             bun: '1.3.14'

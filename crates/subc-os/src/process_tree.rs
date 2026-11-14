@@ -309,8 +309,15 @@ impl ProcessTable {
         let (revision, observed_at_ms, started_at) = Self::begin();
         let mut members = BTreeMap::new();
         let mut unreadable = BTreeMap::new();
-        for (pid, parent, name, expected_start) in enumerate()? {
+        let entries = enumerate()?;
+        let listed_at: BTreeMap<u32, usize> = entries
+            .iter()
+            .enumerate()
+            .map(|(index, (pid, ..))| (*pid, index))
+            .collect();
+        for (index, (pid, parent, name, expected_start)) in entries.into_iter().enumerate() {
             let parent = parent.or_else(|| crate::parent_pid(pid));
+            let parent = live_parent(parent, index, &listed_at);
             let session_id = None;
             let Some(process) = crate::Process::open(pid).ok().flatten() else {
                 unreadable.insert(pid, (parent, session_id));
@@ -600,6 +607,36 @@ fn possibly_live(pid: u32) -> bool {
 #[cfg(windows)]
 fn possibly_live(_pid: u32) -> bool {
     true
+}
+
+/// Windows never reparents: a process keeps the pid of the parent that
+/// created it, even after that parent exits and the pid is given to a new
+/// process. Otherwise a new process that reuses such a pid inherits unrelated
+/// children: an unopenable one (csrss.exe and wininit.exe name an exited
+/// smss.exe) makes every tree rooted at the new process unknown, and a
+/// readable one makes the new process look like an ancestor.
+///
+/// Creation order, not start time, tells a real parent from a reused pid.
+/// Start times are wall-clock times, and a clock stepped back after boot
+/// makes boot processes look younger than processes started since. The
+/// native listing walks the kernel's active process list
+/// (`PsActiveProcessHead`), which appends each process when it is created, so
+/// a real parent is always listed before its child. A listed parent that
+/// appears after the child is a later process holding a reused pid, and the
+/// child is recorded with no live parent (0, as for System). This ordering is
+/// not documented; `the_native_listing_is_in_creation_order` fails if Windows
+/// stops providing it.
+#[cfg(windows)]
+fn live_parent(
+    parent: Option<u32>,
+    child_at: usize,
+    listed_at: &BTreeMap<u32, usize>,
+) -> Option<u32> {
+    let parent = parent?;
+    let reused = listed_at
+        .get(&parent)
+        .is_some_and(|parent_at| *parent_at > child_at);
+    Some(if reused { 0 } else { parent })
 }
 
 /// One listed process: pid, parent, program name and native start, each
@@ -934,6 +971,135 @@ mod tests {
         assert!(table.process(pid).is_none());
         assert!(table.unreadable.contains_key(&pid));
         assert_eq!(table.identity_alive(pid, start), None);
+    }
+
+    #[cfg(windows)]
+    struct Kill(std::process::Child);
+
+    #[cfg(windows)]
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A process that waits on its open stdin until killed.
+    #[cfg(windows)]
+    fn waiting_process() -> Kill {
+        Kill(
+            std::process::Command::new("cmd.exe")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    /// Stale-parent detection relies on the native listing being in creation
+    /// order, which Windows does not document. This fails if that changes.
+    #[cfg(windows)]
+    #[test]
+    fn the_native_listing_is_in_creation_order() {
+        let first = waiting_process();
+        let second = waiting_process();
+        let (first, second) = (first.0.id(), second.0.id());
+        let mut rows = entries().unwrap();
+        let at = |pid| rows.iter().position(|row| row.0 == pid).unwrap();
+        assert!(at(std::process::id()) < at(first));
+        assert!(
+            at(first) < at(second),
+            "a process started later is listed later"
+        );
+        // Cross the two links in the same real listing: only the one naming
+        // the earlier process stays.
+        for row in &mut rows {
+            if row.0 == first {
+                row.1 = Some(second);
+            } else if row.0 == second {
+                row.1 = Some(first);
+            }
+        }
+        let table = ProcessTable::read_entries(|| Ok(rows)).unwrap();
+        assert_eq!(table.process(second).unwrap().parent_pid, first);
+        assert_eq!(table.process(first).unwrap().parent_pid, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_listed_parent_that_appears_after_its_child_is_not_its_parent() {
+        // The new process plays one that reuses a pid older processes still
+        // name as their parent, as csrss.exe and wininit.exe name an exited
+        // smss.exe.
+        let root = waiting_process();
+        let root_pid = root.0.id();
+        let root_start = crate::start_time(root_pid).unwrap();
+        let own = std::process::id();
+        let own_start = crate::start_time(own).unwrap();
+        // No process holds this pid, so opening it fails and the walk keeps
+        // it as unreadable, like a protected system process.
+        let unopenable = u32::MAX - 3;
+        let unopenable_row = |start| {
+            (
+                unopenable,
+                Some(root_pid),
+                Some("csrss.exe".into()),
+                Some(start),
+            )
+        };
+        let root_row = (
+            root_pid,
+            Some(own),
+            Some("cmd.exe".into()),
+            Some(root_start),
+        );
+        // Listed before the root, yet with a later start time, as boot
+        // processes look after the clock steps back: order decides.
+        let stale = ProcessTable::read_entries(|| {
+            Ok(vec![
+                (
+                    own,
+                    Some(root_pid),
+                    Some("older.exe".into()),
+                    Some(own_start),
+                ),
+                unopenable_row(root_start + 1),
+                root_row.clone(),
+            ])
+        })
+        .unwrap();
+        assert_eq!(
+            stale.process(own).map(|member| member.parent_pid),
+            Some(0),
+            "a readable process listed before its parent has no live parent"
+        );
+        assert_eq!(stale.unreadable.get(&unopenable), Some(&(Some(0), None)));
+        assert_eq!(
+            stale.process(root_pid).map(|member| member.parent_pid),
+            Some(own),
+            "a parent listed first stays linked"
+        );
+        assert_eq!(
+            stale.tree_identities(root_pid, root_start, true),
+            Some(BTreeSet::from([(root_pid, root_start)])),
+            "an older unreadable process cannot make the new root's tree unknown"
+        );
+        // An unreadable process listed after the root, which the root may
+        // have created, still does, even with an earlier start time.
+        let child = ProcessTable::read_entries(|| {
+            Ok(vec![
+                (own, None, Some("older.exe".into()), Some(own_start)),
+                root_row.clone(),
+                unopenable_row(root_start - 1),
+            ])
+        })
+        .unwrap();
+        assert_eq!(
+            child.unreadable.get(&unopenable),
+            Some(&(Some(root_pid), None))
+        );
+        assert_eq!(child.tree_identities(root_pid, root_start, true), None);
     }
 
     fn member(

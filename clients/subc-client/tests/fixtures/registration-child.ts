@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
-import { SubcClient, SubcProvider, managementSurfaceManifest, prepareHelperClaim } from "../../src/index";
+import { ClaimError, SubcClient, SubcProvider, managementSurfaceManifest, prepareHelperClaim } from "../../src/index";
 import { registrationOwner } from "../../src/registration-channel";
 
 const mode = process.argv[2]!;
@@ -29,6 +29,14 @@ if (mode === "fallback-consumer") {
 }
 const manifest = managementSurfaceManifest({moduleId: "test-channel", operations: []});
 manifest.registration_channel = true;
+if (mode === "fallback-missing") {
+  let caught: unknown;
+  try { await SubcProvider.connect({connectionFile, manifest, handler: async () => new Uint8Array()}); }
+  catch (error) { caught = error; }
+  assert(caught instanceof ClaimError && caught.code === "registration_helper_unavailable");
+  console.log("MISSING_HELPER_REFUSED");
+  process.exit(0);
+}
 if (mode === "before-hello") {
   try {
     await SubcProvider.connect({connectionFile, manifest, handler: async () => new Uint8Array()});

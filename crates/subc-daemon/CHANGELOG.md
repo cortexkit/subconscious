@@ -21,6 +21,15 @@
 - **Rust migration:** adopt control 0.40 types together with client 0.40.
   Public supervisor and configuration APIs expose the updated control family.
 
+## 0.45.3
+
+- Windows agent commands whose pid had last belonged to the exited parent of a
+  still-running process are admitted again. Such a command was kept pending on
+  every retry, because an unopenable system process (csrss.exe, wininit.exe) still
+  named that pid as its parent and made the command's process tree unknown. Requires
+  subc-os 0.1.36, which drops such stale parent links from Windows process
+  tables.
+
 ## 0.45.2
 
 - The Windows write-exclusion test waits for the second child's own registration

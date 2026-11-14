@@ -2,6 +2,12 @@
 
 ## 0.25.0
 
+- Compiled Bun modules now embed the platform's native registration helper and
+  adopt the daemon's private channel automatically. A named channel whose helper
+  cannot load fails with `ClaimError` code `registration_helper_unavailable`,
+  retaining the load error in the message and `cause` instead of silently using
+  launch-secret registration. A loaded helper's not-supervised decision remains
+  nonfatal for inherited metadata in child processes.
 - A managed call whose last route.open attempt times out at the retry
   deadline now fails `not_sent` with the refusal that used up the deadline
   (for example `module_reloading`), instead of a terminal local timeout.

@@ -140,18 +140,32 @@ async function run(mode: string): Promise<{code: number; out: string; err: strin
   }
 }
 
-test("without its native helper the SDK is not supervised; plain clients never load it", async () => {
+test("adopt fails closed when a named registration channel cannot load its helper", async () => {
   const dir = mkdtempSync(resolve("target/scratch/no-native-"));
   cpSync(fileURLToPath(new URL("../src", import.meta.url)), join(dir, "src"), {recursive: true});
   try {
     const file = join(dir, "src/registration-channel.ts");
     for (const named of [false, true]) {
-      const script = `const {registrationOwner}=await import(${JSON.stringify(file)}); const o=registrationOwner(); o.adopt(); if(o.supervised||o.take()!==undefined)process.exit(2); await new Promise(r=>setTimeout(r,20)); console.log('NOT_SUPERVISED');`;
+      const script = `
+        const {registrationOwner}=await import(${JSON.stringify(file)});
+        const {ClaimError}=await import(${JSON.stringify(join(dir, "src/claim.ts"))});
+        const o=registrationOwner();
+        for(let i=0;i<2;i++) {
+          let caught;
+          try { o.adopt(); } catch(error) { caught=error; }
+          if (${named}) {
+            if(!(caught instanceof ClaimError) || caught.code!=='registration_helper_unavailable'
+              || typeof caught.cause?.message !== 'string' || !caught.message.includes(caught.cause.message)
+              || !caught.message.includes('Cannot find module')) throw new Error('missing helper did not fail closed: '+caught);
+          } else if(caught || o.supervised || o.take()!==undefined) throw new Error('plain client loaded helper');
+        }
+        console.log('ADOPTION_CHECKED');`;
       const child = Bun.spawn([process.execPath, "-e", script], {env: {...env, ...(named ? {SUBC_REGISTRATION_FD: "999:1", SUBC_REGISTRATION_PIPE: "\\\\.\\pipe\\subc-test-absent", SUBC_DAEMON_PID: "1"} : {})}, stdout: "pipe", stderr: "pipe"});
-      expect(await child.exited).toBe(0);
-      expect(await new Response(child.stdout).text()).toContain("NOT_SUPERVISED");
+      const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect({code, err}).toEqual({code: 0, err: ""});
+      expect(out).toBe("ADOPTION_CHECKED\n");
     }
-  } finally { rmSync(dir, {recursive: true, force: true}); }
+  } finally { rmSync(dir, {recursive: true, force: true, maxRetries: 10, retryDelay: 100}); }
 });
 
 test("import neither loads the native helper nor validates inherited registration metadata", async () => {
@@ -168,7 +182,29 @@ test("import neither loads the native helper nor validates inherited registratio
   } finally { rmSync(dir, {recursive: true, force: true}); }
 });
 
-for (const mode of ["fallback-missing", "fallback-refused", "fallback-explicit", "fallback-consumer", ...(process.platform === "win32" ? [] : ["fallback-leaked"])]) {
+test("adopt returns quietly when the loaded helper rejects a named channel as not ours", async () => {
+  const file = fileURLToPath(new URL("../src/registration-channel.ts", import.meta.url));
+  const script = `
+    const {registrationOwner}=await import(${JSON.stringify(file)});
+    const owner=registrationOwner();
+    owner.adopt(); owner.adopt();
+    if(owner.supervised || owner.take()!==undefined) throw new Error('unexpected adoption');
+    console.log('NOT_SUPERVISED');`;
+  const child = Bun.spawn([process.execPath, "-e", script], {env: {...env, SUBC_REGISTRATION_FD: "999:1",
+    SUBC_REGISTRATION_PIPE: "\\\\.\\pipe\\subc-test-absent", SUBC_DAEMON_PID: "1"}, stdout: "pipe", stderr: "pipe"});
+  const [code, out, err] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  expect({code, err}).toEqual({code: 0, err: ""});
+  expect(out).toBe("NOT_SUPERVISED\n");
+});
+
+test("a missing helper refuses provider registration instead of falling back to the launch nonce", async () => {
+  const result = await run("fallback-missing");
+  expect(result.out).toContain("MISSING_HELPER_REFUSED");
+  expect(result.operations).toEqual([]);
+  expect(result.err).toBe("");
+}, 15000);
+
+for (const mode of ["fallback-refused", "fallback-explicit", "fallback-consumer", ...(process.platform === "win32" ? [] : ["fallback-leaked"])]) {
   test(`${mode}: non-adopted provider keeps TCP HELLO nonce and route identity`, async () => {
     const result = await run(mode);
     expect(result.out).toContain("FALLBACK_OK");

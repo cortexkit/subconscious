@@ -517,10 +517,18 @@ jobs:
       - name: Cross-repo crates moved with their versions
         if: ${{ !cancelled() && matrix.os == 'ubuntu' }}
         run: |
-          # A push compares against its own before-state; a PR against its base.
-          # Both are fetched shallow by default, so deepen enough to resolve them.
+          # A push to master compares against its own before-state; a PR against
+          # its base. A push to any other branch compares against where it left
+          # master: it reaches siblings only when it lands there, and comparing
+          # against its own previous push would demand a new version for every
+          # push of code that was never released.
+          # All are fetched shallow by default, so deepen enough to resolve them.
           if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
             BASE="${{ github.event.pull_request.base.sha }}"
+          elif [ "${{ github.ref }}" != "refs/heads/master" ]; then
+            git fetch --unshallow origin 2>/dev/null || git fetch origin || true
+            git fetch origin master:refs/remotes/origin/master || true
+            BASE="$(git merge-base refs/remotes/origin/master HEAD || true)"
           else
             BASE="${{ github.event.before }}"
           fi

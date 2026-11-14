@@ -291,7 +291,15 @@ async fn config_admission_windows_keeps_covered_file_write_exclusion_until_hello
         )
         .await
         .unwrap();
-    let ack = rx.try_recv().unwrap();
+    // A refused HELLO enqueues no ACK and returns its refusal as the reply, so
+    // name that refusal instead of the bare empty-channel error.
+    let ack = rx.try_recv().unwrap_or_else(|error| {
+        let replies: Vec<_> = reply
+            .iter()
+            .map(|frame| String::from_utf8_lossy(&frame.body).into_owned())
+            .collect();
+        panic!("HELLO was not acknowledged ({error:?}); the handler replied {replies:?}")
+    });
     let after = std::fs::OpenOptions::new().write(true).open(&covered);
     let released = after.is_ok();
     drop(after);

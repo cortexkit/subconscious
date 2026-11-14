@@ -79,6 +79,13 @@ fn main() {
             log(&args[2], &format!("{}\n", std::process::id()));
             sleep_forever();
         }
+        // A bare number behaves like `sleep <seconds>`. Tests that need a
+        // copyable stand-in program use this rather than copying /bin/sleep:
+        // on systems whose coreutils is one multi-call binary, a copy of
+        // /bin/sleep picks its utility from its new file name and fails.
+        seconds if seconds.parse::<u64>().is_ok() => {
+            std::thread::sleep(Duration::from_secs(seconds.parse().unwrap()));
+        }
         mode => panic!("unknown fixture mode: {mode}"),
     }
 }

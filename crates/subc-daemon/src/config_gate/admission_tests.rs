@@ -72,7 +72,16 @@ async fn refused_live_binding_without_a_current_approval_uses_ordinary_exit_acco
 }
 
 async fn gated_claim_fixture_with_support(support: Option<bool>) -> GatedClaimFixture {
-    gated_claim_fixture_with_program(support, "/bin/sleep", json!(["600"])).await
+    let sleep = sleep_program();
+    gated_claim_fixture_with_program(support, sleep.to_str().unwrap(), json!(["600"])).await
+}
+
+/// A copyable stand-in for `sleep`: the native config-gate fixture, which
+/// sleeps for a numeric first argument. A copy of /bin/sleep is not portable;
+/// where coreutils is one multi-call binary, the copy picks its utility from
+/// its new file name and fails.
+fn sleep_program() -> std::path::PathBuf {
+    crate::config_gate::program::native_fixture_for_test()
 }
 
 async fn gated_claim_fixture_with_program(
@@ -967,7 +976,7 @@ async fn gated_channel_deferred_agent_commands_retain_starts_then_commit() {
 }
 
 fn rig() -> Rig {
-    rig_with_program("/bin/sleep")
+    rig_with_program(sleep_program().to_str().unwrap())
 }
 
 fn rig_with_program(program: &str) -> Rig {
@@ -1947,7 +1956,7 @@ fn config_admission_declared_files_are_covered_but_argument_files_are_not() {
 fn config_admission_shebang_forms_are_refused() {
     let rig = rig();
     let interpreter = rig.path.join("node");
-    std::fs::copy("/bin/sleep", &interpreter).unwrap();
+    std::fs::copy(sleep_program(), &interpreter).unwrap();
     let script = rig.path.join("main.cjs");
     std::fs::write(&script, "#!/usr/bin/env node\ncode\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1996,7 +2005,7 @@ fn config_admission_known_interpreters_are_refused_even_with_covered_scripts() {
         "python.exe",
     ] {
         let interpreter = rig.path.join(name);
-        std::fs::copy("/bin/sleep", &interpreter).unwrap();
+        std::fs::copy(sleep_program(), &interpreter).unwrap();
         let mut spec = spec(&rig);
         spec.program = interpreter;
         spec.args = vec![script.to_string_lossy().into_owned()];
@@ -2452,7 +2461,7 @@ async fn config_admission_rollback_executes_the_current_restored_path_and_rechec
     rig.stamp(&owner);
     let restored = spec(&rig);
     let other = rig.path.join("new-program");
-    std::fs::copy("/bin/sleep", &other).unwrap();
+    std::fs::copy(sleep_program(), &other).unwrap();
     let mut doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(rig.path.join("subc.jsonc")).unwrap()).unwrap();
     doc["modules"]["a"]["program"] = json!(other);
@@ -2462,7 +2471,7 @@ async fn config_admission_rollback_executes_the_current_restored_path_and_rechec
     )
     .unwrap();
     approve(&rig, &owner, PlanKind::Change);
-    std::fs::copy("/bin/sleep", rig.path.join("restored-replacement")).unwrap();
+    std::fs::copy(sleep_program(), rig.path.join("restored-replacement")).unwrap();
     std::fs::rename(rig.path.join("restored-replacement"), &restored.program).unwrap();
     let generation = approve(&rig, &owner, PlanKind::Rollback(1));
     let approved = owner.approved_rollback_commands(generation).unwrap();

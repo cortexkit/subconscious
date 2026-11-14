@@ -14,7 +14,9 @@ export function isRetryableClaimCode(code: string): boolean {
 }
 
 export class ClaimError extends Error {
-  constructor(readonly code: string, readonly detail?: unknown) { super(`claim operation refused: ${code}`); }
+  constructor(readonly code: string, readonly detail?: unknown, override readonly cause?: unknown) {
+    super(`claim operation refused: ${code}${cause === undefined ? "" : `: ${cause instanceof Error ? cause.message : String(cause)}`}`);
+  }
 }
 
 function object(value: unknown): Record<string, unknown> {

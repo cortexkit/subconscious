@@ -342,8 +342,8 @@ all three XDG homes so tests cannot reach the operator's daemon data or config.
 
 Modules using the registration channel declare `registration_channel: true` in
 their manifest. The SDK validates and adopts the process's one inherited channel
-at import, sets close-on-exec before children can be spawned, and caches the
-decision. It uses that channel for HELLO and provider traffic, never reconnects
+when the provider connects (imports remain lazy), sets close-on-exec, and caches
+the decision. It uses that channel for HELLO and provider traffic, never reconnects
 it (even with `reconnectOnDrop: true`), and exits on its EOF. Start the provider
 before opening consumer connections: one process-wide broker mints fresh,
 single-use `self` claims over that registration. Minting or presenting a claim
@@ -352,19 +352,35 @@ Per-request consumer identity overrides are refused on a claim-bound connection.
 Ordinary children inherit no channel and connect as `direct`, even if its public
 environment metadata was inherited. Nonce-only providers still authenticate on the TCP listener and echo their launch nonce in HELLO.
 
+A TypeScript module running under the configuration gate ships as a
+`bun build --compile` executable, not a script launched by Bun. The compiled
+program embeds the SDK's native helper and automatically adopts the daemon's
+private registration channel when its provider connects.
+
 ## Native code and distribution
 
 `clients/subc-registration-native` owns the N-API v8 addon. It shares socket,
 close-on-exec and Windows pipe server-PID validation with `subc-os`. A plain
-client never loads the addon. A process with registration metadata but without
-the matching binary is not supervised; attempting provider registration refuses
-and exits instead of falling back to the listener.
+client never loads the addon. When a registration channel is named, a helper
+load failure throws `ClaimError` with code `registration_helper_unavailable`;
+its message includes the underlying load error, also retained as `cause`.
+Provider registration cannot fall back to the launch nonce in that case. A
+loaded helper that answers `supervised() == false` still means the metadata is
+not this process's channel: adoption returns quietly and legacy behaviour stays
+unchanged. With no registration variable, the helper is not loaded.
+
+The SDK-local `RegistrationErrorCode` type lists `registration_helper_unavailable`,
+`registration_adoption_failed`, `registration_already_taken`,
+`registration_owner_conflict`, `registration_not_ready`, and `registration_closed`.
+These are separate from daemon-authored `ClaimRefusalCode` values;
+`ClaimError.code` remains a string so unknown refusal codes retain their meaning.
 
 The SDK ships **six** native builds, under its `native/` directory:
 `subc-registration-{linux,darwin,win32}-{x64,arm64}.node`, plus the native
 package's loader and declarations. Selection uses the running process's platform
-and architecture (including emulation). The loader only loads the adjacent file:
-no environment override, system search, download or install-time compilation.
+and architecture (including emulation). Plain Node/Bun runs load the adjacent file;
+compiled Bun programs load the embedded binary. There is no environment override,
+system search, download or install-time compilation.
 These binaries are loaded code and must be pinned with the SDK inside the
 module's release directory, whose code the daemon verifies before launch (the
 admitted bundle). Release assembly builds the six targets and collects them in
@@ -374,7 +390,7 @@ For development and SDK tests, run `bun run build:native` in this package first.
 It builds the new Rust crate in the normal Cargo target directory and stages the
 host binary with the loader in `native/`. On Windows it builds the MSVC target
 matching the Node process's architecture. Run `bun run typecheck` and
-`bun test tests/claim.test.ts tests/registration-channel.test.ts`. In CI or remote
+`bun test tests/claim.test.ts tests/registration-channel.test.ts tests/registration-compiled.test.ts`. In CI or remote
 verification, build the addon in the same job that runs these tests. Artifacts
 are not committed.
 
@@ -400,10 +416,12 @@ are not committed.
    declarations and native `package.json` beside
    `subc-registration-<platform>-<arch>.node`. It runs typechecks, tests and
    `prepublishOnly`, asserts the tag version, then publishes through npm OIDC.
-   The PR/train bundle-check job uses the same artifacts and assembly layout.
-   The six-target check proves bundle completeness, not runtime qualification
-   on every architecture; the main CI TypeScript jobs build and exercise their
-   own host helper. Do not commit generated native binaries.
+   Before publishing, the bundle-check jobs use the same assembled artifacts to
+   test a compiled executable on Linux, macOS and Windows; PR/train builds run
+   these checks too. The six-target check proves bundle completeness, not
+   runtime qualification on every architecture. The main CI TypeScript jobs
+   build and exercise their own host helper. Do not commit generated native
+   binaries.
 
 ## Explicit helper handoff
 

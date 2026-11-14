@@ -26,12 +26,16 @@
   a role conflict) no longer binds its connection to the live spawn or freezes
   the spawn's requested declarations, so closing it leaves the spawn's routes
   and epoch alone.
-- A launch-nonce consumer is attested in one step. A nonce whose launch had a
-  record that is gone is refused `bad_consumer_identity` instead of opening as
-  a reserved principal with no record or epoch fence; a nonce no launch was
-  ever recorded for still opens as before.
+- A route.open that presents a launch nonce resolves the nonce and its launch's
+  authority record together. A nonce whose launch had a record that is gone is
+  refused `bad_consumer_identity`; before, the route opened in the module's name
+  with no spawn record, no `caller` attestation and no refusal of a bind made
+  stale by an authority change. A nonce no launch was ever recorded for still
+  opens as before.
 - A placement or approval that changes a module's program record or development
-  origin evidence lowers every spawn admitted under the old one, marked or not.
+  origin evidence permanently withdraws the first-party mark from every spawn
+  admitted under the old one: a marked spawn loses it and its routes close, and
+  a spawn not yet marked can never earn it.
 - A warm-up health probe answering not ready no longer settles, and so refuses,
   the acknowledgement a spawn is asked for only for its mark.
 - A failed delivery rules a spawn out of the mark even before it is marked.

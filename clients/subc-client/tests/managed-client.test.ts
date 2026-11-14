@@ -1281,6 +1281,39 @@ describe("SubcClient managed call", () => {
     }
   });
 
+  test("a route.open left unanswered at the retry deadline reports the earlier refusal as not_sent", async () => {
+    // route.open's control call shares the retry deadline, so the last attempt
+    // can time out locally. The caller's request was never sent either way, so
+    // it must see the refusal that used up the deadline, not that local timeout.
+    const { connFile } = tempConnectionFile();
+    let opens = 0;
+    const daemon = await startFakeDaemon({
+      stats: newStats(),
+      onRouteOpen: (_moduleId, answer) => {
+        opens += 1;
+        // Refuse the first attempt; leave every later one unanswered.
+        if (opens === 1) void answer({ code: "module_reloading", message: "target is reloading" });
+      },
+    });
+    writeConnectionFile(connFile, daemon.port);
+    const client = await SubcClient.connect({
+      connectionFile: connFile,
+      identity: IDENTITY,
+      reconnectBackoff: BACKOFF,
+      routeOpenRetryDeadlineMs: 100,
+      sleep: async () => {},
+    });
+    try {
+      expect(await rejectionOf(client.call("managed-provider", "echo", { n: 1 }))).toMatchObject({
+        kind: "not_sent",
+        code: "module_reloading",
+      });
+      expect(opens).toBe(2);
+    } finally {
+      client.close();
+    }
+  });
+
   test("timeout arbitration recovers a reply that raced the deadline (no lost success, no reconnect)", async () => {
     // The demux-drop bug: under event-loop starvation a reply already in the socket
     // buffer is dispatched only after the request-timeout timer fires, so the naive
